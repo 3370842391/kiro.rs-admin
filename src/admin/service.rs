@@ -59,6 +59,7 @@ struct CachedUpdateCheck {
 struct RuntimeUpdateConfig {
     previous_version: Option<String>,
     last_applied_at: Option<String>,
+    github_token: Option<String>,
     auto_apply: bool,
     auto_apply_time: String,
 }
@@ -68,6 +69,7 @@ impl RuntimeUpdateConfig {
         Self {
             previous_version: config.update_previous_version.clone(),
             last_applied_at: config.update_last_applied_at.clone(),
+            github_token: config.github_token.clone(),
             auto_apply: config.update_auto_apply,
             auto_apply_time: config.update_auto_apply_time.clone(),
         }
@@ -77,6 +79,11 @@ impl RuntimeUpdateConfig {
         UpdateConfigResponse {
             previous_version: self.previous_version.clone(),
             last_applied_at: self.last_applied_at.clone(),
+            github_token_set: self
+                .github_token
+                .as_deref()
+                .map(|t| !t.trim().is_empty())
+                .unwrap_or(false),
             auto_apply: self.auto_apply,
             auto_apply_time: self.auto_apply_time.clone(),
         }
@@ -849,6 +856,16 @@ impl AdminService {
             None => None,
         };
 
+        // GitHub Token：空字符串表示清除，None 表示保持原值
+        let token_update: Option<Option<String>> = req.github_token.as_ref().map(|raw| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+
         {
             let mut runtime = self.update_config.lock();
             if let Some(auto_apply) = req.auto_apply {
@@ -856,6 +873,9 @@ impl AdminService {
             }
             if let Some(time) = &normalized_time {
                 runtime.auto_apply_time = time.clone();
+            }
+            if let Some(token) = &token_update {
+                runtime.github_token = token.clone();
             }
         }
 
@@ -866,6 +886,9 @@ impl AdminService {
             if let Some(time) = normalized_time {
                 c.update_auto_apply_time = time;
             }
+            if let Some(token) = token_update {
+                c.github_token = token;
+            }
         });
 
         Ok(self.get_update_config())
@@ -875,7 +898,13 @@ impl AdminService {
     /// 不替换当前可执行文件，便于用户在正式应用前先确认下载成功。
     /// 下载产物保存到 `<exe>.staged-<version>`，下次 apply 命中同版本时复用。
     pub async fn pull_update_image(&self) -> Result<ImageUpdateResponse, AdminServiceError> {
-        let proxy = self.token_manager.proxy().map(|p| p.url.clone());
+        let (proxy, token) = {
+            let runtime = self.update_config.lock();
+            (
+                self.token_manager.proxy().map(|p| p.url.clone()),
+                runtime.github_token.clone(),
+            )
+        };
         let exe = super::binary_update::current_executable()?;
 
         let version = self.resolve_target_version(false).await?;
@@ -884,8 +913,13 @@ impl AdminService {
         // 已经下载过同版本时直接复用，避免重复网络请求
         let reused = staged.exists();
         if !reused {
-            super::binary_update::download_release_binary(&version, proxy.as_deref(), &staged)
-                .await?;
+            super::binary_update::download_release_binary(
+                &version,
+                proxy.as_deref(),
+                token.as_deref(),
+                &staged,
+            )
+            .await?;
         }
         // 清理其它版本的旧 staged 文件，避免占用磁盘
         cleanup_other_staged(&exe, &version);
@@ -915,7 +949,13 @@ impl AdminService {
     /// `restart: unless-stopped` 接管重启（对应前端「更新并重启」按钮）。
     /// 若 pull 已经把目标版本下载到 `<exe>.staged-<version>`，跳过重复下载。
     pub async fn apply_image_update(&self) -> Result<ImageUpdateResponse, AdminServiceError> {
-        let proxy = self.token_manager.proxy().map(|p| p.url.clone());
+        let (proxy, token) = {
+            let runtime = self.update_config.lock();
+            (
+                self.token_manager.proxy().map(|p| p.url.clone()),
+                runtime.github_token.clone(),
+            )
+        };
         let exe = super::binary_update::current_executable()?;
 
         let version = self.resolve_target_version(true).await?;
@@ -923,8 +963,13 @@ impl AdminService {
 
         let reused = staged.exists();
         if !reused {
-            super::binary_update::download_release_binary(&version, proxy.as_deref(), &staged)
-                .await?;
+            super::binary_update::download_release_binary(
+                &version,
+                proxy.as_deref(),
+                token.as_deref(),
+                &staged,
+            )
+            .await?;
         }
         cleanup_other_staged(&exe, &version);
 
@@ -1096,17 +1141,22 @@ impl AdminService {
             "https://api.github.com/repos/{}/releases/latest",
             GITHUB_RELEASES_REPO
         );
-        let resp = reqwest::Client::new()
+        let token = self.update_config.lock().github_token.clone();
+        let mut req = reqwest::Client::new()
             .get(&url)
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .header("User-Agent", "kiro-rs-update-checker")
-            .timeout(std::time::Duration::from_secs(15))
-            .send()
-            .await
-            .map_err(|e| {
-                AdminServiceError::InternalError(format!("请求 GitHub API 失败: {}", e))
-            })?;
+            .timeout(std::time::Duration::from_secs(15));
+        if let Some(t) = token.as_deref() {
+            let trimmed = t.trim();
+            if !trimmed.is_empty() {
+                req = req.header("Authorization", format!("Bearer {}", trimmed));
+            }
+        }
+        let resp = req.send().await.map_err(|e| {
+            AdminServiceError::InternalError(format!("请求 GitHub API 失败: {}", e))
+        })?;
 
         if !resp.status().is_success() {
             let status = resp.status();

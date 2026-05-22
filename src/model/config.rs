@@ -99,6 +99,12 @@ pub struct Config {
     #[serde(default)]
     pub update_previous_version: Option<String>,
 
+    /// GitHub Personal Access Token（可选）。设置后 GitHub Releases 接口会带上
+    /// `Authorization: Bearer <token>`，把限流从匿名 60/h 提到认证 5000/h。
+    /// 仅需 `public_repo` 读取权限即可。
+    #[serde(default)]
+    pub github_token: Option<String>,
+
     /// 上一次成功完成在线更新的时间（RFC3339）。前端用于显示「上次更新于 …」。
     #[serde(default)]
     pub update_last_applied_at: Option<String>,
@@ -227,6 +233,7 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             update_previous_version: None,
+            github_token: None,
             update_last_applied_at: None,
             update_auto_apply: false,
             update_auto_apply_time: default_update_auto_apply_time(),

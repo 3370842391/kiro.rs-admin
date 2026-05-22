@@ -89,9 +89,15 @@ fn archive_filename(version: &str) -> Result<String, AdminServiceError> {
 /// 下载并校验某个 release 版本的二进制压缩包，把内部的 `kiro-rs` 提取到 `dest`。
 ///
 /// `proxy` 为 `Some` 时所有 HTTP 请求走该代理（与项目其它出站路径一致）。
+/// 下载并校验某个 release 版本的二进制压缩包，把内部的 `kiro-rs` 提取到 `dest`。
+///
+/// `proxy` 为 `Some` 时所有 HTTP 请求走该代理（与项目其它出站路径一致）。
+/// `github_token` 不为空时给所有请求带上 `Authorization: Bearer <token>`，
+/// 把 GitHub API 限流从匿名 60/h 提升到认证 5000/h。
 pub async fn download_release_binary(
     version: &str,
     proxy: Option<&str>,
+    github_token: Option<&str>,
     dest: &Path,
 ) -> Result<(), AdminServiceError> {
     let archive = archive_filename(version)?;
@@ -104,6 +110,14 @@ pub async fn download_release_binary(
     let checksums_url = format!("{}/SHA256SUMS.txt", base);
 
     let client = build_http_client(proxy)?;
+    let token = github_token.and_then(|t| {
+        let trimmed = t.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
 
     // 下载到临时目录，确保失败时不会污染 exe 所在目录
     let tmp_dir = std::env::temp_dir().join(format!(
@@ -116,8 +130,15 @@ pub async fn download_release_binary(
     })?;
     let archive_path = tmp_dir.join(&archive);
 
-    download_to_file(&client, &archive_url, &archive_path).await?;
-    verify_checksum(&client, &checksums_url, &archive, &archive_path).await?;
+    download_to_file(&client, &archive_url, token.as_deref(), &archive_path).await?;
+    verify_checksum(
+        &client,
+        &checksums_url,
+        token.as_deref(),
+        &archive,
+        &archive_path,
+    )
+    .await?;
 
     let extract_dir = tmp_dir.join("extract");
     fs::create_dir_all(&extract_dir).map_err(|e| {
@@ -158,9 +179,14 @@ fn build_http_client(proxy: Option<&str>) -> Result<reqwest::Client, AdminServic
 async fn download_to_file(
     client: &reqwest::Client,
     url: &str,
+    token: Option<&str>,
     dest: &Path,
 ) -> Result<(), AdminServiceError> {
-    let resp = client.get(url).send().await.map_err(|e| {
+    let mut req = client.get(url);
+    if let Some(t) = token {
+        req = req.header("Authorization", format!("Bearer {}", t));
+    }
+    let resp = req.send().await.map_err(|e| {
         AdminServiceError::InternalError(format!("下载 {} 失败: {}", url, e))
     })?;
     if !resp.status().is_success() {
@@ -197,10 +223,15 @@ async fn download_to_file(
 async fn verify_checksum(
     client: &reqwest::Client,
     checksums_url: &str,
+    token: Option<&str>,
     archive_name: &str,
     archive_path: &Path,
 ) -> Result<(), AdminServiceError> {
-    let resp = client.get(checksums_url).send().await.map_err(|e| {
+    let mut req = client.get(checksums_url);
+    if let Some(t) = token {
+        req = req.header("Authorization", format!("Bearer {}", t));
+    }
+    let resp = req.send().await.map_err(|e| {
         AdminServiceError::InternalError(format!("下载 SHA256SUMS.txt 失败: {}", e))
     })?;
     if !resp.status().is_success() {

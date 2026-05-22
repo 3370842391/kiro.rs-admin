@@ -4,8 +4,10 @@ import {
   Download,
   ExternalLink,
   Info,
+  KeyRound,
   RefreshCw,
   RotateCcw,
+  Save,
   Sparkles,
   UploadCloud,
 } from 'lucide-react'
@@ -56,6 +58,7 @@ export function ImageUpdateDialog({ open, onOpenChange }: ImageUpdateDialogProps
   const [autoApplyTime, setAutoApplyTime] = useState('03:00')
   const [lastOutput, setLastOutput] = useState('')
   const [tipsOpen, setTipsOpen] = useState(false)
+  const [githubToken, setGithubToken] = useState('')
 
   const { data, isLoading } = useQuery({
     queryKey: ['update-config'],
@@ -120,7 +123,21 @@ export function ImageUpdateDialog({ open, onOpenChange }: ImageUpdateDialogProps
   useEffect(() => {
     if (!data) return
     setAutoApplyTime(data.autoApplyTime || '03:00')
+    // 弹窗打开时把 token 输入框清空：后端不回显明文，输入框为空时表示"保持原值"
+    setGithubToken('')
   }, [data])
+
+  const githubTokenMutation = useMutation({
+    mutationFn: (token: string) => setUpdateConfig({ githubToken: token }),
+    onSuccess: (res) => {
+      queryClient.setQueryData(['update-config'], res)
+      // 保存成功后立刻强制重新检查，让用户看到新 token 是否能解锁限流
+      queryClient.invalidateQueries({ queryKey: ['system-update-check'] })
+      setGithubToken('')
+      toast.success(res.githubTokenSet ? 'GitHub Token 已保存' : 'GitHub Token 已清除')
+    },
+    onError: (err) => toast.error(`保存失败: ${extractErrorMessage(err)}`),
+  })
 
   const pullMutation = useMutation({
     mutationFn: pullUpdateImage,
@@ -157,7 +174,8 @@ export function ImageUpdateDialog({ open, onOpenChange }: ImageUpdateDialogProps
     applyMutation.isPending ||
     rollbackMutation.isPending ||
     autoApplyMutation.isPending ||
-    autoApplyTimeMutation.isPending
+    autoApplyTimeMutation.isPending ||
+    githubTokenMutation.isPending
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -352,6 +370,62 @@ export function ImageUpdateDialog({ open, onOpenChange }: ImageUpdateDialogProps
                   className="w-28 font-mono text-sm"
                 />
               </label>
+
+              <div className="space-y-2 border-t pt-3">
+                <div className="flex items-center justify-between gap-3 text-xs">
+                  <div>
+                    <div className="flex items-center gap-1.5 font-medium text-foreground">
+                      <KeyRound className="h-3.5 w-3.5" />
+                      GitHub Token
+                      {data?.githubTokenSet && (
+                        <Badge variant="success" className="ml-1">已配置</Badge>
+                      )}
+                    </div>
+                    <div className="text-muted-foreground">
+                      把 GitHub API 限流从匿名 60/小时 提升到认证 5000/小时；只读权限即可。
+                    </div>
+                  </div>
+                </div>
+                <div className="flex gap-2">
+                  <Input
+                    type="password"
+                    autoComplete="new-password"
+                    placeholder={
+                      data?.githubTokenSet ? '已保存（输入新值会覆盖）' : 'ghp_xxxxxxxxxxxx'
+                    }
+                    value={githubToken}
+                    onChange={(e) => setGithubToken(e.target.value)}
+                    disabled={busy}
+                    className="font-mono text-sm"
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={busy || !githubToken.trim()}
+                    onClick={() => githubTokenMutation.mutate(githubToken.trim())}
+                  >
+                    {githubTokenMutation.isPending ? (
+                      <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Save className="h-3.5 w-3.5" />
+                    )}
+                    <span className="ml-1.5">保存</span>
+                  </Button>
+                  {data?.githubTokenSet && (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      disabled={busy}
+                      onClick={() => githubTokenMutation.mutate('')}
+                      title="清除已保存的 GitHub Token"
+                    >
+                      清除
+                    </Button>
+                  )}
+                </div>
+              </div>
             </div>
           </div>
 

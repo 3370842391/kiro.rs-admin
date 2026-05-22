@@ -172,6 +172,8 @@ export interface UpdateConfigResponse {
   previousVersion?: string
   /** 上一次成功完成在线更新的时间（RFC3339） */
   lastAppliedAt?: string
+  /** 是否已配置 GitHub Token（仅返回布尔，不回明文） */
+  githubTokenSet: boolean
   /** 是否开启无人值守自动更新 */
   autoApply: boolean
   /** 自动更新触发时间（本地时区，HH:MM 24 小时制） */
@@ -179,6 +181,8 @@ export interface UpdateConfigResponse {
 }
 
 export interface SetUpdateConfigRequest {
+  /** GitHub Personal Access Token；空字符串表示清除 */
+  githubToken?: string
   autoApply?: boolean
   autoApplyTime?: string
 }

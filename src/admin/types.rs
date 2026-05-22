@@ -375,6 +375,8 @@ pub struct UpdateConfigResponse {
     /// 上一次成功完成在线更新的时间（RFC3339）；用于前端显示「上次更新于 …」。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_applied_at: Option<String>,
+    /// 是否已配置 GitHub Token（仅返回布尔，不回明文，避免前端泄露）。
+    pub github_token_set: bool,
     /// 是否开启无人值守自动更新
     pub auto_apply: bool,
     /// 自动更新触发时间（本地时区，HH:MM 24 小时制）
@@ -385,6 +387,8 @@ pub struct UpdateConfigResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetUpdateConfigRequest {
+    /// GitHub Personal Access Token；空字符串表示清除，未传则保持原值。
+    pub github_token: Option<String>,
     /// 是否开启无人值守自动更新；不传则保持原值
     pub auto_apply: Option<bool>,
     /// 自动更新触发时间（HH:MM）；不传则保持原值
