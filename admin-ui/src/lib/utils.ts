@@ -237,22 +237,24 @@ function sha256Pure(data: Uint8Array): string {
 /**
  * 生成一个加密强度的随机 API Key
  *
- * 默认 40 字节熵，前缀 "sk-kiro-"，剩余部分使用 Base64URL 编码（字母/数字/-/_）。
- * 优先使用 `crypto.getRandomValues`，缺失时回退到 `Math.random` 并打印告警。
+ * 默认 32 字符随机部分（仅大小写字母 + 数字，~190 bit 熵），加上 `sk-kiro-` 前缀；
+ * 不使用 `-` / `_`，避免与前缀里的连字符相邻产生 `--`。
+ * 强依赖 `crypto.getRandomValues`，缺失时直接抛错，不做任何弱熵 fallback。
  */
-export function generateApiKey(prefix: string = 'sk-kiro-', byteLen: number = 40): string {
-  const bytes = new Uint8Array(byteLen)
-  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
-    crypto.getRandomValues(bytes)
-  } else {
-    // Fallback：弱熵，仅用于极端环境
-    console.warn('[generateApiKey] crypto.getRandomValues 不可用，回退到 Math.random')
-    for (let i = 0; i < byteLen; i++) bytes[i] = Math.floor(Math.random() * 256)
+export function generateApiKey(prefix: string = 'sk-kiro-', randomLen: number = 32): string {
+  if (typeof crypto === 'undefined' || typeof crypto.getRandomValues !== 'function') {
+    throw new Error('crypto.getRandomValues 不可用，无法安全生成 API Key')
   }
-  // Base64 → Base64URL（去除填充与 +、/）
-  let bin = ''
-  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i])
-  const b64 = btoa(bin)
-  const urlSafe = b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
-  return prefix + urlSafe
+  const ALPHABET = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+  // 用拒绝采样把字节均匀映射到 62 字符表，避免取模偏置（248 = 4 * 62）
+  let out = ''
+  const buf = new Uint8Array(randomLen)
+  while (out.length < randomLen) {
+    crypto.getRandomValues(buf)
+    for (let i = 0; i < buf.length && out.length < randomLen; i++) {
+      const b = buf[i]
+      if (b < 248) out += ALPHABET[b % ALPHABET.length]
+    }
+  }
+  return prefix + out
 }
