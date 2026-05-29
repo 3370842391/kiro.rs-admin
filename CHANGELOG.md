@@ -6,11 +6,50 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.5.1] - 2026-05-29
+## [0.5.2] - 2026-05-29
 
-主题：彻底重构 prompt cache 与计费指标——上游 `meteringEvent` 实测只下发 `credit`、不带 token / cache 字段，因此把基础设施收敛到「进程内」：移除 Redis 依赖、按 Anthropic `cache_control` 多断点协议在中转层自建 prompt cache、把 `credit` 作为新维度贯穿后端聚合 → API → 前端。仪表盘同步重做：5 系列图表 + 双 Y 轴 + K/M/B 紧凑数值 + 卡片随时间窗切换。
+主题：在 0.5.1（prompt cache 重构 + Credit 全链路 + 仪表盘改造）基础上加入**账号级风控识别与冷却失败转移**——上游 Kiro/Q-Developer 在风控触发时返回带 `suspicious-activity` body 的 429，与"高负载 429"完全不同；旧版本一刀切当成 transient 重试，导致单账号被反复打到。同时修复 thinking 模式跨轮 replay 的客户端校验失败。前端配套加风控冷却倒计时徽章、单卡刷新余额按钮、整页刷余额按钮提级、趋势图 range 切换动效等若干细节。
 
-> 0.5.0 因 Credit 数值显示问题被作废（`formatCredits` 在 `value ≥ 1` 时直接打印完整浮点）；0.5.1 修复该问题并整合所有内容，请所有用户直接升级到 0.5.1，跳过 0.5.0。
+> 0.5.0 因 Credit 数值显示问题被作废、0.5.1 在小流量场景下仍有单账号被打死风险，**0.5.2 整合三个版本所有内容，请直接升级到 0.5.2，跳过 0.5.0 / 0.5.1**。下方按特性分块罗列从 0.4.x 升上来需要知道的所有变更（标注「0.5.2 新增」的小节是相对 0.5.1 的增量，其余为 0.5.1 内容继承）。
+
+### ✨ 新功能 — 账号级风控识别与冷却失败转移（0.5.2 新增）
+
+- **`is_account_throttled` 端点判别器**：新增 `src/kiro/endpoint/mod.rs::is_account_throttled`，匹配 `429` + body 含 `suspicious-activity`（Kiro/Q-Developer 在账号触发风控时下发的标志）。同步扩展 `is_monthly_request_limit` 也匹配 `OVERAGE_REQUEST_LIMIT_EXCEEDED`，把"超额请求次数耗尽"识别为月度配额耗尽并下线该凭据。
+- **provider 拆分 429 路径**：`src/kiro/provider.rs` 把原本一刀切的 429 处理改成两路——账号风控走"放入冷却 + 失败转移到下一凭据"，high-traffic 429 仍走 transient 重试。冷却中的凭据在 `select_credential` / `available_count` / `snapshot` 全部跳过，调度器不会反复打到同一个被风控的账号。
+- **`TokenEntry::throttled_until` 字段**：`token_manager.rs` 给每条凭据加 `throttled_until: Option<Instant>`，并在 `MultiTokenManager` 暴露 `mark_account_throttled(id, secs)` / `clear_throttle(id)` 两个 API。
+- **`account_throttle_failover` / `accountThrottleCooldownSecs` 配置**：两个原子可在运行时切换，无需重启；持久化到 `config.json`。冷却时长默认 600s（10 分钟），可在面板自定义分钟数。
+- **Admin API 三件套**：
+  - `GET /api/admin/config/account-throttle` 读取当前开关 + 冷却秒数
+  - `PUT /api/admin/config/account-throttle` 修改并落盘
+  - `POST /api/admin/credentials/:id/clear-throttle` 手动解除单条凭据冷却
+- **凭据快照 `throttled_remaining_secs` 字段**：`CredentialStatus` 新增剩余秒数字段，前端按秒递减渲染倒计时。
+- **前端 UI**：
+  - 顶栏「设置」下拉新增"账号风控失败转移"开关 + 冷却预设按钮（5 / 10 / 30 / 60 分钟）+ 自定义分钟输入。
+  - 凭据卡片在风控冷却中：橙红描边 + `mm:ss` 倒计时徽章（`Clock` 图标），到期或手动解除后自动恢复调度。倒计时本地用 `setInterval` 自然递减，避免 30s 拉取间隔之间数字停顿。
+  - 卡片"更多操作"菜单冷却中显示"解除风控冷却（mm:ss）"项。
+
+### 🛠 修复 — Thinking 模式跨轮 replay 兼容（0.5.2 新增）
+
+- **thinking block 必带 `signature`**：Claude Code、Anthropic SDK 等思考模式客户端会拒绝下一轮请求中 `assistant.content[].thinking` 缺 `signature` 的消息，抛 `The content[].thinking in the thinking mode must be passed back to the API`。Kiro 上游不是 Anthropic API、永不下发真签名。修复方案：流式与非流式两路都在思考块结束前注入稳定的占位符 signature，使客户端校验通过；converter 在请求转发时只读 `block.thinking` 文本字段，占位符对上游完全不可见。
+  - 流式：每个 thinking block 的 `content_block_stop` 之前发出一个 `signature_delta` 事件（4 条收尾路径全部覆盖：正常 stop、tool_use、客户端中断、错误）。
+  - 非流式：`assemble_response` 在组装 thinking content block 时直接带上 `signature` 字段。
+  - 测试：新增"signature_delta 必须先于 content_block_stop 且非空"断言（242 通过，+1）。
+
+### ✨ 新功能 — 凭据管理体验改进（0.5.2 新增）
+
+- **每张凭据卡片单独「刷新余额」按钮**：放在「刷新 Token」旁，单 GET `/api/admin/credentials/:id/balance`，loading 时按钮 spin 不阻塞其他卡片。原来只能整页批量"查询当前页信息"才能看到单条凭据的余额。
+- **整页余额刷新按钮提升到工具栏**：之前藏在「更多操作」下拉里，新版作为独立 outline 按钮放到工具栏右侧（"添加凭据"前），并带 `刷新中… N/M` 进度。
+- **「一键开启超额」拆分两态**：之前一个按钮根据可开启数 / 待确定数文案切换，且会对待确定凭据直接调写接口（FREE 订阅 403）。现在拆成两个独立路径：
+  - 有可开启凭据 → 调写接口 `setUserPreference`，文案 `一键开启超额（N）`。
+  - 全部凭据状态待确定 → 改走只读批量查余额，文案 `重试拉取超额状态（N）`，附 `刷新中… N/M` 进度，绝不触发写接口。
+- **趋势图 range 切换动效**：`OverviewPage` 给 `<TimeSeriesChart>` 包一层 `key={range}` 强制重挂，外加 `chart-range-fade` CSS 动画（`opacity + translateY`，`prefers-reduced-motion` 自动禁用）。Recharts 折线动画 `isAnimationActive=true / 550ms ease-out` 同步打开，按下 24h / 7d / 30d 切换器有"刷新"反馈。
+- **字体栈切换到 Plus Jakarta Sans + JetBrains Mono**：`index.html` 通过 Google Fonts `preconnect` 预连 + `display=swap` 异步加载（300/400/500/600/700/800 + Mono 400/500），`tailwind.config.js` 把 `font-sans` 首位换成 `Plus Jakarta Sans`、新增 `font-mono` 栈以 `JetBrains Mono` 为先。中文回落 `PingFang SC / Hiragino Sans GB / 微软雅黑` 不变；移除原本永远不命中的 `SF Pro Display/Text` 与 `Helvetica Neue`。`display=swap` 确保字体未到达时先用回落字体渲染、不阻塞首屏。
+
+## [0.5.1] - 2026-05-29 *(superseded by 0.5.2)*
+
+> **此版本已被 0.5.2 整合并取代**——0.5.1 在小流量场景下仍存在单账号被打死的风险（账号风控 429 当 transient 重试），0.5.2 修复并整合所有功能。请直接升级到 0.5.2，跳过 0.5.1。
+
+下方为 0.5.1 的原始内容，保留以便追溯。
 
 ### 💥 Breaking — 基础设施
 
@@ -82,7 +121,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
 2. **删除过时配置**：编辑 `data/config.json`，删除 `redisUrl` / `cacheDebugLogging` / `cacheMaxReadRatio` 三个字段（保留也只是被忽略，不会报错）。
 3. **下游客户端**：响应里的 `cache_creation_input_tokens` / `cache_read_input_tokens` 字段含义变了——现在反映的是中转层提示词缓存而非上游缓存。如果下游用这两个字段做计费对账，需要重新理解口径（中转层缓存命中并不会减少上游 credit 消耗，是 SDK 体验优化）。
 4. **历史用量**：`usage_log.*.jsonl` 的旧记录会被自动加载（`credits` 字段缺失时默认 0），重启不丢趋势。新的请求开始会带 credit。
-5. **若你已经升级到 0.5.0**：直接升 0.5.1；不需要清理任何状态文件。
+5. **若你已经升级到 0.5.0**：直接升 0.5.2；不需要清理任何状态文件。
+6. **0.5.2 增量项**：升 0.5.2 后，「账号风控失败转移」默认开启、冷却 600s。如不希望自动冷却（例如只用一两个账号、宁愿等冷却也不想被识别为风控），登录管理面板 → 顶栏「设置」→ 关闭"账号风控失败转移"。Thinking 模式 replay 修复无需手动操作。
 
 ## [0.4.0] - 2026-05-22
 
