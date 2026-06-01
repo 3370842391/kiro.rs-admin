@@ -1180,7 +1180,7 @@ mod tests {
         let long_tool_name = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
         assert!(long_tool_name.len() > TOOL_NAME_MAX_LEN);
 
-        let mut schema = std::collections::HashMap::new();
+        let mut schema = std::collections::BTreeMap::new();
         schema.insert("type".to_string(), serde_json::json!("object"));
         schema.insert("properties".to_string(), serde_json::json!({}));
 
@@ -1231,7 +1231,7 @@ mod tests {
 
         let long_tool_name = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
 
-        let mut schema = std::collections::HashMap::new();
+        let mut schema = std::collections::BTreeMap::new();
         schema.insert("type".to_string(), serde_json::json!("object"));
         schema.insert("properties".to_string(), serde_json::json!({}));
 
