@@ -9,11 +9,16 @@
 
 use std::net::TcpListener;
 
+use base64::{Engine as _, engine::general_purpose};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
-use crate::http_client::{ProxyConfig, build_client};
-use crate::kiro::model::token_refresh::{SocialCreateTokenRequest, SocialCreateTokenResponse};
+use crate::http_client::{ProxyConfig, build_client, build_client_no_redirect};
+use crate::kiro::model::credentials::validate_external_idp_endpoint;
+use crate::kiro::model::token_refresh::{
+    ExternalIdpRefreshResponse, SocialCreateTokenRequest, SocialCreateTokenResponse,
+};
 use crate::model::config::Config;
 
 /// Portal 认证 URL（Kiro 网页版入口）
@@ -22,19 +27,52 @@ pub const KIRO_PORTAL_URL: &str = "https://app.kiro.dev";
 /// Kiro auth service 默认端点
 pub const KIRO_AUTH_ENDPOINT: &str = "https://prod.us-east-1.auth.desktop.kiro.dev";
 
+/// Hosted Kiro SSO 企业 IdP 第二段固定回调地址（与 Kiro-Go / Kiro IDE 行为对齐）。
+const EXTERNAL_IDP_REDIRECT_URI: &str = "http://localhost:3128/oauth/callback";
+
 /// 与 IDE 一致的本地回调端口候选列表
 const CALLBACK_PORTS: &[u16] = &[
     3128, 4649, 6588, 8008, 9091, 49153, 50153, 51153, 52153, 53153,
 ];
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OAuthCallbackKind {
+    AuthorizationCode,
+    ExternalIdpDescriptor,
+}
+
 /// OAuth 回调数据
 #[derive(Debug, Clone)]
 pub struct OAuthCallbackData {
+    pub kind: OAuthCallbackKind,
     pub code: String,
     pub login_option: String,
     pub path: String,
     /// OAuth state 参数（用于 CSRF 验证）
     pub state: String,
+    pub issuer_url: Option<String>,
+    pub client_id: Option<String>,
+    pub scopes: Option<String>,
+    pub login_hint: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExternalIdpAuthorization {
+    pub authorization_url: String,
+    pub state: String,
+    pub code_verifier: String,
+    pub token_endpoint: String,
+    pub issuer_url: String,
+    pub client_id: String,
+    pub scopes: String,
+    pub redirect_uri: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExternalIdpToken {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_in: Option<i64>,
 }
 
 /// 回调服务器关闭句柄
@@ -48,7 +86,7 @@ pub struct ServerHandle {
 ///
 /// 关闭句柄 drop 时服务器自动停止。当收到有效的 OAuth 回调时，通过 channel 发送回调数据。
 pub fn start_callback_server(
-    tx: oneshot::Sender<OAuthCallbackData>,
+    tx: mpsc::Sender<OAuthCallbackData>,
 ) -> anyhow::Result<(u16, ServerHandle)> {
     // 直接持有已绑定的 socket，避免 probe-and-bind 的 TOCTOU 竞态
     let (port, std_listener) = bind_available_port()?;
@@ -85,7 +123,7 @@ fn bind_available_port() -> anyhow::Result<(u16, std::net::TcpListener)> {
 
 async fn run_callback_server(
     std_listener: std::net::TcpListener,
-    tx: oneshot::Sender<OAuthCallbackData>,
+    tx: mpsc::Sender<OAuthCallbackData>,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -103,7 +141,6 @@ async fn run_callback_server(
     tracing::info!("Social 回调服务器已启动: http://127.0.0.1:{}", port);
 
     // 只等待一次成功的回调，或关闭信号
-    let mut tx = Some(tx);
     loop {
         let (mut stream, _addr) = tokio::select! {
             result = listener.accept() => match result {
@@ -131,7 +168,12 @@ async fn run_callback_server(
                 .or_else(|| s.strip_suffix(" HTTP/1.0"))
         }) {
             if let Some(callback) = parse_callback(path_and_query) {
-                let body = "<html><head><meta charset='utf-8'><title>登录成功</title></head><body style='font-family:sans-serif;text-align:center;padding:60px'><h2>&#10003; 登录成功</h2><p>Token 已更新，请返回 Kiro Admin UI。</p><p style='color:#888;font-size:13px'>此标签页可以关闭。</p></body></html>";
+                let is_descriptor = callback.kind == OAuthCallbackKind::ExternalIdpDescriptor;
+                let body = if is_descriptor {
+                    "<html><head><meta charset='utf-8'><title>继续登录</title></head><body style='font-family:sans-serif;text-align:center;padding:60px'><h2>&#8635; 继续登录</h2><p>已收到企业 SSO 中间链接，请返回 Kiro Admin UI 打开下一段登录链接。</p><p style='color:#888;font-size:13px'>此标签页可以关闭。</p></body></html>"
+                } else {
+                    "<html><head><meta charset='utf-8'><title>登录成功</title></head><body style='font-family:sans-serif;text-align:center;padding:60px'><h2>&#10003; 登录成功</h2><p>Token 已更新，请返回 Kiro Admin UI。</p><p style='color:#888;font-size:13px'>此标签页可以关闭。</p></body></html>"
+                };
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
@@ -140,10 +182,11 @@ async fn run_callback_server(
                 let _ = stream.write_all(response.as_bytes()).await;
                 let _ = stream.flush().await;
 
-                if let Some(sender) = tx.take() {
-                    let _ = sender.send(callback);
+                let _ = tx.send(callback).await;
+                if !is_descriptor {
+                    break;
                 }
-                break;
+                continue;
             } else if path_and_query.starts_with("/oauth/callback")
                 || path_and_query.starts_with("/signin/callback")
             {
@@ -194,9 +237,29 @@ fn parse_callback(path_and_query: &str) -> Option<OAuthCallbackData> {
 
     let params = parse_query_string(query);
 
-    // 必须有 code 且没有 error
+    // 必须没有 error；企业 SSO 第一段中间链接可以没有 code。
     if params.contains_key("error") {
         return None;
+    }
+
+    let login_option = params.get("login_option").cloned().unwrap_or_default();
+    let issuer_url = params.get("issuer_url").filter(|v| !v.is_empty()).cloned();
+    let client_id = params.get("client_id").filter(|v| !v.is_empty()).cloned();
+    if path != "/oauth/callback"
+        && (login_option.eq_ignore_ascii_case("external_idp") || issuer_url.is_some())
+        && !params.contains_key("code")
+    {
+        return Some(OAuthCallbackData {
+            kind: OAuthCallbackKind::ExternalIdpDescriptor,
+            code: String::new(),
+            login_option,
+            path: path.to_string(),
+            state: params.get("state").cloned().unwrap_or_default(),
+            issuer_url,
+            client_id,
+            scopes: params.get("scopes").filter(|v| !v.is_empty()).cloned(),
+            login_hint: params.get("login_hint").filter(|v| !v.is_empty()).cloned(),
+        });
     }
 
     let code = params.get("code")?.clone();
@@ -204,10 +267,15 @@ fn parse_callback(path_and_query: &str) -> Option<OAuthCallbackData> {
     let state = params.get("state").cloned().unwrap_or_default();
 
     Some(OAuthCallbackData {
+        kind: OAuthCallbackKind::AuthorizationCode,
         code,
         login_option,
         path: path.to_string(),
         state,
+        issuer_url: None,
+        client_id: None,
+        scopes: None,
+        login_hint: None,
     })
 }
 
@@ -284,6 +352,128 @@ pub fn build_portal_url(state: &str, code_challenge: &str, redirect_uri: &str) -
     format!("{}/signin?{}", KIRO_PORTAL_URL, params)
 }
 
+/// 从 Kiro portal 返回的企业 SSO 描述符构造第二段 IdP 授权链接。
+pub async fn build_external_idp_authorization(
+    descriptor: &OAuthCallbackData,
+    _redirect_base_uri: &str,
+    config: &Config,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<ExternalIdpAuthorization> {
+    if descriptor.kind != OAuthCallbackKind::ExternalIdpDescriptor {
+        anyhow::bail!("不是企业 SSO 中间链接");
+    }
+
+    let issuer_url = descriptor
+        .issuer_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("企业 SSO 中间链接缺少 issuer_url"))?;
+    let client_id = descriptor
+        .client_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("企业 SSO 中间链接缺少 client_id"))?;
+    let scopes = descriptor.scopes.as_deref().unwrap_or("").trim();
+
+    let (auth_endpoint, token_endpoint) = oidc_discover(issuer_url, config, proxy).await?;
+    let (code_verifier, code_challenge) = generate_pkce();
+    let state = uuid::Uuid::new_v4().to_string();
+    let redirect_uri = EXTERNAL_IDP_REDIRECT_URI.to_string();
+    let authorization_url = external_idp_authorize_url(
+        &auth_endpoint,
+        client_id,
+        &redirect_uri,
+        scopes,
+        &code_challenge,
+        &state,
+        descriptor.login_hint.as_deref().unwrap_or(""),
+    );
+
+    Ok(ExternalIdpAuthorization {
+        authorization_url,
+        state,
+        code_verifier,
+        token_endpoint,
+        issuer_url: issuer_url.to_string(),
+        client_id: client_id.to_string(),
+        scopes: scopes.to_string(),
+        redirect_uri,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct OidcDiscoveryDocument {
+    authorization_endpoint: String,
+    token_endpoint: String,
+}
+
+async fn oidc_discover(
+    issuer_url: &str,
+    config: &Config,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<(String, String)> {
+    validate_external_idp_endpoint(issuer_url)
+        .map_err(|e| anyhow::anyhow!("企业 SSO issuer 被拒绝: {}", e))?;
+    let doc_url = format!(
+        "{}/.well-known/openid-configuration",
+        issuer_url.trim_end_matches('/')
+    );
+    let client = build_client_no_redirect(proxy, 30, config.tls_backend)?;
+    let response = client
+        .get(&doc_url)
+        .header("Accept", "application/json")
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        anyhow::bail!("OIDC discovery 失败: HTTP {}", status.as_u16());
+    }
+    let doc: OidcDiscoveryDocument = response.json().await?;
+    if doc.authorization_endpoint.trim().is_empty() || doc.token_endpoint.trim().is_empty() {
+        anyhow::bail!("OIDC discovery 缺少 authorization_endpoint 或 token_endpoint");
+    }
+    validate_external_idp_endpoint(&doc.authorization_endpoint)
+        .map_err(|e| anyhow::anyhow!("discovered authorization_endpoint 被拒绝: {}", e))?;
+    validate_external_idp_endpoint(&doc.token_endpoint)
+        .map_err(|e| anyhow::anyhow!("discovered token_endpoint 被拒绝: {}", e))?;
+    Ok((doc.authorization_endpoint, doc.token_endpoint))
+}
+
+fn external_idp_authorize_url(
+    auth_endpoint: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    scopes: &str,
+    challenge: &str,
+    state: &str,
+    login_hint: &str,
+) -> String {
+    let mut query = vec![
+        ("client_id", client_id),
+        ("response_type", "code"),
+        ("redirect_uri", redirect_uri),
+        ("scope", scopes),
+        ("code_challenge", challenge),
+        ("code_challenge_method", "S256"),
+        ("response_mode", "query"),
+        ("state", state),
+    ]
+    .into_iter()
+    .map(|(key, value)| format!("{}={}", key, urlencoding::encode(value)))
+    .collect::<Vec<_>>();
+
+    if !login_hint.trim().is_empty() {
+        query.push(format!(
+            "login_hint={}",
+            urlencoding::encode(login_hint.trim())
+        ));
+    }
+
+    format!("{}?{}", auth_endpoint, query.join("&"))
+}
+
 /// 简易 query string 解析（不依赖 url crate）
 fn parse_query_string(query: &str) -> std::collections::HashMap<String, String> {
     query
@@ -346,4 +536,178 @@ pub async fn exchange_code_for_token(
     resp.json::<SocialCreateTokenResponse>()
         .await
         .map_err(|e| anyhow::anyhow!("解析 Social token 响应失败: {}", e))
+}
+
+/// 用 External IdP authorization code 换取 access_token + refresh_token。
+pub async fn exchange_external_idp_code(
+    token_endpoint: &str,
+    client_id: &str,
+    code: &str,
+    code_verifier: &str,
+    redirect_uri: &str,
+    scopes: &str,
+    config: &Config,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<ExternalIdpToken> {
+    validate_external_idp_endpoint(token_endpoint)
+        .map_err(|e| anyhow::anyhow!("External IdP tokenEndpoint 被拒绝: {}", e))?;
+
+    let mut form = vec![
+        ("client_id", client_id),
+        ("grant_type", "authorization_code"),
+        ("code", code.trim()),
+        ("redirect_uri", redirect_uri),
+        ("code_verifier", code_verifier),
+    ];
+    if !scopes.trim().is_empty() {
+        form.push(("scope", scopes.trim()));
+    }
+
+    let client = build_client(proxy, 30, config.tls_backend)?;
+    let response = client
+        .post(token_endpoint)
+        .header("Accept", "application/json")
+        .form(&form)
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    let data: ExternalIdpRefreshResponse = serde_json::from_str(&body).unwrap_or_default();
+
+    let access_token = data.access_token.filter(|v| !v.trim().is_empty());
+    let refresh_token = data.refresh_token.filter(|v| !v.trim().is_empty());
+    match (status.is_success(), access_token, refresh_token) {
+        (true, Some(access_token), Some(refresh_token)) => Ok(ExternalIdpToken {
+            access_token,
+            refresh_token,
+            expires_in: data.expires_in,
+        }),
+        _ => {
+            if let Some(err) = data.error {
+                anyhow::bail!(
+                    "External IdP token 交换失败 {}: {}: {}",
+                    status,
+                    err,
+                    data.error_description.unwrap_or_default()
+                );
+            }
+            anyhow::bail!("External IdP token 交换失败 {}: {}", status, body);
+        }
+    }
+}
+
+/// 最佳努力从 JWT access token 提取账号邮箱。
+pub fn extract_email_from_jwt(access_token: &str) -> Option<String> {
+    let payload = access_token.split('.').nth(1)?;
+    let decoded = general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| general_purpose::URL_SAFE.decode(payload))
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    for claim in ["email", "preferred_username", "upn"] {
+        if let Some(value) = claims
+            .get(claim)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_callback_accepts_external_idp_descriptor_without_code() {
+        let callback = parse_callback(
+            "/signin/callback?login_option=external_idp&issuer_url=https%3A%2F%2Flogin.microsoftonline.com%2Ftenant%2Fv2.0&client_id=client-123&scopes=api%3A%2F%2Fclient-123%2Fcodewhisperer%3Aconversations+offline_access&login_hint=user%40example.com&state=portal-state",
+        )
+        .expect("descriptor should parse");
+
+        assert_eq!(callback.kind, OAuthCallbackKind::ExternalIdpDescriptor);
+        assert_eq!(callback.code, "");
+        assert_eq!(callback.path, "/signin/callback");
+        assert_eq!(callback.state, "portal-state");
+        assert_eq!(
+            callback.issuer_url.as_deref(),
+            Some("https://login.microsoftonline.com/tenant/v2.0")
+        );
+        assert_eq!(callback.client_id.as_deref(), Some("client-123"));
+        assert_eq!(
+            callback.scopes.as_deref(),
+            Some("api://client-123/codewhisperer:conversations offline_access")
+        );
+        assert_eq!(callback.login_hint.as_deref(), Some("user@example.com"));
+    }
+
+    #[test]
+    fn parse_callback_keeps_oauth_callback_as_final_code() {
+        let callback = parse_callback(
+            "/oauth/callback?code=final-code&state=idp-state&login_option=external_idp",
+        )
+        .expect("final callback should parse");
+
+        assert_eq!(callback.kind, OAuthCallbackKind::AuthorizationCode);
+        assert_eq!(callback.code, "final-code");
+        assert_eq!(callback.path, "/oauth/callback");
+        assert_eq!(callback.state, "idp-state");
+        assert_eq!(callback.login_option, "external_idp");
+        assert!(callback.issuer_url.is_none());
+    }
+
+    #[test]
+    fn external_idp_authorize_url_matches_fixed_kiro_redirect() {
+        let url = external_idp_authorize_url(
+            "https://login.microsoftonline.com/tenant/oauth2/v2.0/authorize",
+            "client-123",
+            EXTERNAL_IDP_REDIRECT_URI,
+            "api://client-123/codewhisperer:conversations offline_access",
+            "challenge",
+            "state-123",
+            "user@example.com",
+        );
+
+        let query = url
+            .split_once('?')
+            .map(|(_, query)| query)
+            .expect("authorize URL query");
+        let params = parse_query_string(query);
+        assert_eq!(
+            params.get("client_id").map(String::as_str),
+            Some("client-123")
+        );
+        assert_eq!(
+            params.get("redirect_uri").map(String::as_str),
+            Some(EXTERNAL_IDP_REDIRECT_URI)
+        );
+        assert_eq!(
+            params.get("response_type").map(String::as_str),
+            Some("code")
+        );
+        assert_eq!(
+            params.get("code_challenge").map(String::as_str),
+            Some("challenge")
+        );
+        assert_eq!(params.get("state").map(String::as_str), Some("state-123"));
+        assert_eq!(
+            params.get("login_hint").map(String::as_str),
+            Some("user@example.com")
+        );
+    }
+
+    #[test]
+    fn extract_email_from_jwt_uses_azure_username_claims() {
+        let payload = general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"preferred_username":"user@example.com"}"#);
+        let token = format!("header.{}.sig", payload);
+
+        assert_eq!(
+            extract_email_from_jwt(&token).as_deref(),
+            Some("user@example.com")
+        );
+    }
 }

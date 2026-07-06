@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { Activity, CheckCircle2, Loader2, RefreshCw, XCircle } from 'lucide-react'
 import {
@@ -89,23 +89,34 @@ export function CredentialResponseTestDialog({
   const [loadingModels, setLoadingModels] = useState(false)
   const [testing, setTesting] = useState(false)
   const [rows, setRows] = useState<Map<number, TestRow>>(new Map())
+  const initializedKeyRef = useRef<string | null>(null)
 
   const enabledCredentials = useMemo(
     () => credentials.filter((c) => !c.disabled),
     [credentials],
   )
+  const enabledCredentialIds = useMemo(
+    () => new Set(enabledCredentials.map((c) => c.id)),
+    [enabledCredentials],
+  )
   const selectedCount = selectedIds.size
   const firstSelectedId = selectedIds.values().next().value as number | undefined
 
   useEffect(() => {
-    if (!open) return
-    const enabled = new Set(credentials.filter((c) => !c.disabled).map((c) => c.id))
-    const next = initialIds.filter((id) => enabled.has(id))
+    if (!open) {
+      initializedKeyRef.current = null
+      return
+    }
+    const initKey = initialIds.join(',')
+    if (initializedKeyRef.current === initKey) return
+
+    const next = initialIds.filter((id) => enabledCredentialIds.has(id))
     setSelectedIds(new Set(next.length > 0 ? next : enabledCredentials.slice(0, 1).map((c) => c.id)))
     setRows(new Map())
     setModels([])
     setModel(DEFAULT_RESPONSE_TEST_MODEL)
-  }, [open, initialIds, credentials, enabledCredentials])
+    initializedKeyRef.current = initKey
+  }, [open, initialIds, enabledCredentialIds, enabledCredentials])
 
   const toggle = (id: number) => {
     setSelectedIds((prev) => {

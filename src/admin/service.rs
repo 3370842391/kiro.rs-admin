@@ -26,12 +26,12 @@ use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
     AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse, AssignProxyRequest,
     AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse, BalanceResponse,
-    BatchAddProxyRequest, BatchImportEvent, CheckRateLimitRequest, CredentialResponseTestResponse,
-    CredentialStatusItem, CredentialsExportResponse, CredentialsStatusResponse,
-    EnableOverageAllResult, ExportedAccount, ExportedCredentials, GitHubRateLimitInfo,
-    ImageUpdateResponse, LoadBalancingModeResponse, LogGovernanceConfigResponse,
-    PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry,
-    ProxyPoolResponse, QuotaExceededResult, SetAccountThrottleConfigRequest,
+    BatchAddProxyRequest, BatchImportEvent, CheckRateLimitRequest, CompleteSocialLoginRequest,
+    CredentialResponseTestResponse, CredentialStatusItem, CredentialsExportResponse,
+    CredentialsStatusResponse, EnableOverageAllResult, ExportedAccount, ExportedCredentials,
+    GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
+    LogGovernanceConfigResponse, PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse,
+    ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult, SetAccountThrottleConfigRequest,
     SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetUpdateConfigRequest,
     StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse,
     UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
@@ -203,13 +203,26 @@ struct SocialAuthSession {
     redirect_uri: String,
     expires_at: DateTime<Utc>,
     /// 收到 OAuth 回调时的数据（code + login_option + path）
-    callback_rx: tokio::sync::Mutex<tokio::sync::oneshot::Receiver<social::OAuthCallbackData>>,
+    callback_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<social::OAuthCallbackData>>,
+    external_idp: Option<ExternalIdpLoginState>,
     cred_template: KiroCredentials,
     proxy: Option<ProxyConfig>,
     /// Drop 时自动关闭回调服务器并释放端口
     _server_handle: social::ServerHandle,
     /// 重新登录时更新此凭据的 Token（非 None 时更新已有凭据而非创建新凭据）
     relogin_target_id: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct ExternalIdpLoginState {
+    state: String,
+    code_verifier: String,
+    token_endpoint: String,
+    issuer_url: String,
+    client_id: String,
+    scopes: String,
+    redirect_uri: String,
+    authorization_url: String,
 }
 
 /// IdC 设备授权会话状态
@@ -2624,7 +2637,7 @@ impl AdminService {
         let (code_verifier, code_challenge) = social::generate_pkce();
         let state = uuid::Uuid::new_v4().to_string();
 
-        let (tx, rx) = tokio::sync::oneshot::channel::<social::OAuthCallbackData>();
+        let (tx, rx) = tokio::sync::mpsc::channel::<social::OAuthCallbackData>(4);
 
         // 启动本地 TCP 回调服务器（本地模式）
         // 远程访问时用户须从浏览器地址栏复制回调 URL，通过 complete_social_login 接口手动完成
@@ -2653,6 +2666,7 @@ impl AdminService {
             redirect_uri,
             expires_at,
             callback_rx: tokio::sync::Mutex::new(rx),
+            external_idp: None,
             cred_template,
             proxy,
             _server_handle: server_handle,
@@ -2675,7 +2689,7 @@ impl AdminService {
         &self,
         session_id: &str,
     ) -> Result<PollIdcLoginResponse, AdminServiceError> {
-        use tokio::sync::oneshot::error::TryRecvError;
+        use tokio::sync::mpsc::error::TryRecvError;
 
         // 一次加锁同时完成：过期检查 + 非阻塞回调接收，消除 TOCTOU
         enum PollOutcome {
@@ -2698,7 +2712,7 @@ impl AdminService {
                     Ok(mut rx) => match rx.try_recv() {
                         Ok(data) => PollOutcome::Received(data),
                         Err(TryRecvError::Empty) => PollOutcome::Pending,
-                        Err(TryRecvError::Closed) => PollOutcome::Closed,
+                        Err(TryRecvError::Disconnected) => PollOutcome::Closed,
                     },
                     Err(_) => PollOutcome::Pending,
                 }
@@ -2731,12 +2745,114 @@ impl AdminService {
         session_id: &str,
         callback: social::OAuthCallbackData,
     ) -> Result<PollIdcLoginResponse, AdminServiceError> {
-        // 先做 CSRF 校验（不移除 session，校验失败时保持 session 可继续轮询）
+        if callback.kind == social::OAuthCallbackKind::ExternalIdpDescriptor {
+            return self
+                .handle_external_idp_descriptor(session_id, callback)
+                .await;
+        }
+
+        let is_external_idp_final = {
+            let sessions = self.social_sessions.lock();
+            let s = sessions
+                .get(session_id)
+                .ok_or(AdminServiceError::NotFound { id: 0 })?;
+            if Utc::now() >= s.expires_at {
+                return Ok(PollIdcLoginResponse::Expired);
+            }
+            s.external_idp.is_some() && callback.path == "/oauth/callback"
+        };
+
+        if is_external_idp_final {
+            self.finish_external_idp_login(session_id, callback).await
+        } else {
+            self.finish_social_code_login(session_id, callback).await
+        }
+    }
+
+    async fn handle_external_idp_descriptor(
+        &self,
+        session_id: &str,
+        callback: social::OAuthCallbackData,
+    ) -> Result<PollIdcLoginResponse, AdminServiceError> {
+        let (redirect_uri, proxy) = {
+            let sessions = self.social_sessions.lock();
+            let s = sessions
+                .get(session_id)
+                .ok_or(AdminServiceError::NotFound { id: 0 })?;
+            if Utc::now() >= s.expires_at {
+                return Ok(PollIdcLoginResponse::Expired);
+            }
+            if !callback.state.is_empty() && callback.state != s.state {
+                tracing::warn!(
+                    "企业 SSO 中间链接 state 不匹配（期望 {}, 收到 {}），已拒绝",
+                    s.state,
+                    callback.state
+                );
+                return Err(AdminServiceError::InternalError(
+                    "OAuth state 不匹配，请重新发起登录".to_string(),
+                ));
+            }
+            if let Some(existing) = &s.external_idp {
+                return Ok(PollIdcLoginResponse::Continue {
+                    next_url: existing.authorization_url.clone(),
+                });
+            }
+            (s.redirect_uri.clone(), s.proxy.clone())
+        };
+
+        let config = self.token_manager.config();
+        let authorization = social::build_external_idp_authorization(
+            &callback,
+            &redirect_uri,
+            config,
+            proxy.as_ref(),
+        )
+        .await
+        .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        let next_url = authorization.authorization_url.clone();
+        let mut sessions = self.social_sessions.lock();
+        let s = sessions
+            .get_mut(session_id)
+            .ok_or(AdminServiceError::NotFound { id: 0 })?;
+        if Utc::now() >= s.expires_at {
+            return Ok(PollIdcLoginResponse::Expired);
+        }
+        if s.external_idp.is_none() {
+            s.external_idp = Some(ExternalIdpLoginState {
+                state: authorization.state,
+                code_verifier: authorization.code_verifier,
+                token_endpoint: authorization.token_endpoint,
+                issuer_url: authorization.issuer_url,
+                client_id: authorization.client_id,
+                scopes: authorization.scopes,
+                redirect_uri: authorization.redirect_uri,
+                authorization_url: next_url.clone(),
+            });
+        }
+
+        Ok(PollIdcLoginResponse::Continue { next_url })
+    }
+
+    async fn finish_social_code_login(
+        &self,
+        session_id: &str,
+        callback: social::OAuthCallbackData,
+    ) -> Result<PollIdcLoginResponse, AdminServiceError> {
+        if callback.code.trim().is_empty() {
+            return Err(AdminServiceError::InternalError(
+                "OAuth 回调缺少 code".to_string(),
+            ));
+        }
+
         {
             let sessions = self.social_sessions.lock();
             let s = sessions
                 .get(session_id)
                 .ok_or(AdminServiceError::NotFound { id: 0 })?;
+            if Utc::now() >= s.expires_at {
+                return Ok(PollIdcLoginResponse::Expired);
+            }
             if callback.state != s.state {
                 tracing::warn!(
                     "Social 登录 state 不匹配（期望 {}, 收到 {}），已拒绝",
@@ -2749,7 +2865,6 @@ impl AdminService {
             }
         }
 
-        // 移除 session（含 code_verifier 等敏感数据）
         let session = self
             .social_sessions
             .lock()
@@ -2823,14 +2938,114 @@ impl AdminService {
         Ok(PollIdcLoginResponse::Success { credential_id })
     }
 
+    async fn finish_external_idp_login(
+        &self,
+        session_id: &str,
+        callback: social::OAuthCallbackData,
+    ) -> Result<PollIdcLoginResponse, AdminServiceError> {
+        if callback.code.trim().is_empty() {
+            return Err(AdminServiceError::InternalError(
+                "External IdP 回调缺少 code".to_string(),
+            ));
+        }
+
+        let (session, external_idp) = {
+            let mut sessions = self.social_sessions.lock();
+            let s = sessions
+                .get(session_id)
+                .ok_or(AdminServiceError::NotFound { id: 0 })?;
+            if Utc::now() >= s.expires_at {
+                return Ok(PollIdcLoginResponse::Expired);
+            }
+            let external_idp = s.external_idp.clone().ok_or_else(|| {
+                AdminServiceError::InternalError(
+                    "尚未收到企业 SSO 中间链接，请先粘贴第一段回调 URL".to_string(),
+                )
+            })?;
+            if callback.state != external_idp.state {
+                tracing::warn!(
+                    "External IdP 登录 state 不匹配（期望 {}, 收到 {}），已拒绝",
+                    external_idp.state,
+                    callback.state
+                );
+                return Err(AdminServiceError::InternalError(
+                    "External IdP state 不匹配，请重新发起登录".to_string(),
+                ));
+            }
+            let session = sessions
+                .remove(session_id)
+                .ok_or(AdminServiceError::NotFound { id: 0 })?;
+            (session, external_idp)
+        };
+
+        let config = self.token_manager.config();
+        let token = social::exchange_external_idp_code(
+            &external_idp.token_endpoint,
+            &external_idp.client_id,
+            &callback.code,
+            &external_idp.code_verifier,
+            &external_idp.redirect_uri,
+            &external_idp.scopes,
+            config,
+            session.proxy.as_ref(),
+        )
+        .await
+        .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        if let Some(target_id) = session.relogin_target_id {
+            self.do_external_idp_relogin_update(target_id, token, external_idp)
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+            tracing::info!(
+                "External IdP 重新登录成功，凭据 #{} Token 与刷新元数据已更新",
+                target_id
+            );
+            return Ok(PollIdcLoginResponse::Success {
+                credential_id: target_id,
+            });
+        }
+
+        let mut new_cred = session.cred_template;
+        new_cred.auth_method = Some("external_idp".to_string());
+        new_cred.provider = Some("AzureAD".to_string());
+        new_cred.client_id = Some(external_idp.client_id);
+        new_cred.client_secret = None;
+        new_cred.token_endpoint = Some(external_idp.token_endpoint);
+        new_cred.issuer_url = Some(external_idp.issuer_url);
+        new_cred.scopes = Some(external_idp.scopes);
+        new_cred.access_token = Some(token.access_token.clone());
+        new_cred.refresh_token = Some(token.refresh_token);
+        new_cred.expires_at = token
+            .expires_in
+            .map(|secs| (Utc::now() + Duration::seconds(secs)).to_rfc3339());
+        if new_cred
+            .email
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            new_cred.email = social::extract_email_from_jwt(&token.access_token);
+        }
+
+        let credential_id = self
+            .token_manager
+            .add_credential(new_cred)
+            .await
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        if let Err(e) = self.get_balance(credential_id).await {
+            tracing::warn!("External IdP 登录后刷新余额失败（不影响登录）: {}", e);
+        }
+
+        tracing::info!("External IdP 登录成功，已添加凭据 #{}", credential_id);
+        Ok(PollIdcLoginResponse::Success { credential_id })
+    }
+
     /// 手动完成 Social 登录：远程访问时从浏览器地址栏粘贴的回调 URL 中提取参数，直接完成 token 兑换
     pub async fn complete_social_login(
         &self,
         session_id: &str,
-        code: String,
-        state: String,
-        login_option: String,
-        path: String,
+        req: CompleteSocialLoginRequest,
     ) -> Result<PollIdcLoginResponse, AdminServiceError> {
         // 过期检查
         {
@@ -2844,10 +3059,22 @@ impl AdminService {
         }
 
         let callback = social::OAuthCallbackData {
-            code,
-            login_option,
-            path,
-            state,
+            kind: if req.code.as_deref().unwrap_or("").trim().is_empty()
+                && (req.issuer_url.is_some()
+                    || req.login_option.eq_ignore_ascii_case("external_idp"))
+            {
+                social::OAuthCallbackKind::ExternalIdpDescriptor
+            } else {
+                social::OAuthCallbackKind::AuthorizationCode
+            },
+            code: req.code.unwrap_or_default(),
+            login_option: req.login_option,
+            path: req.path,
+            state: req.state.unwrap_or_default(),
+            issuer_url: req.issuer_url,
+            client_id: req.client_id,
+            scopes: req.scopes,
+            login_hint: req.login_hint,
         };
         self.do_complete_social_login(session_id, callback).await
     }
@@ -3057,6 +3284,31 @@ impl AdminService {
         Ok(())
     }
 
+    /// 内部：external_idp 重新登录完成后更新已有凭据的 Token 与 IdP 元数据。
+    fn do_external_idp_relogin_update(
+        &self,
+        target_id: u64,
+        token: social::ExternalIdpToken,
+        external_idp: ExternalIdpLoginState,
+    ) -> anyhow::Result<()> {
+        self.token_manager.set_disabled(target_id, true)?;
+        let expires_at = token
+            .expires_in
+            .map(|secs| (Utc::now() + Duration::seconds(secs)).to_rfc3339());
+        self.token_manager.update_external_idp_relogin(
+            target_id,
+            token.refresh_token,
+            Some(token.access_token),
+            expires_at,
+            external_idp.client_id,
+            external_idp.token_endpoint,
+            external_idp.issuer_url,
+            external_idp.scopes,
+        )?;
+        self.token_manager.reset_and_enable(target_id)?;
+        Ok(())
+    }
+
     /// 发起 Social 重新登录（更新已有凭据的 Token 而非创建新凭据）
     pub async fn start_social_relogin(
         &self,
@@ -3085,7 +3337,7 @@ impl AdminService {
         let (code_verifier, code_challenge) = social::generate_pkce();
         let state = uuid::Uuid::new_v4().to_string();
 
-        let (tx, rx) = tokio::sync::oneshot::channel::<social::OAuthCallbackData>();
+        let (tx, rx) = tokio::sync::mpsc::channel::<social::OAuthCallbackData>(4);
 
         let (port, server_handle) = social::start_callback_server(tx)
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
@@ -3103,6 +3355,7 @@ impl AdminService {
             redirect_uri,
             expires_at,
             callback_rx: tokio::sync::Mutex::new(rx),
+            external_idp: None,
             cred_template: KiroCredentials::default(),
             proxy,
             _server_handle: server_handle,

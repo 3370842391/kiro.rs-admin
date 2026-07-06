@@ -41,17 +41,32 @@ const POLL_INTERVAL_MS = 2000
 const isRemoteAccess = () =>
   window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1'
 
-function parseCallbackUrl(rawUrl: string): { code: string; state: string; loginOption: string; path: string } | null {
+function parseCallbackUrl(rawUrl: string): {
+  code?: string
+  state?: string
+  loginOption?: string
+  path: string
+  issuerUrl?: string
+  clientId?: string
+  scopes?: string
+  loginHint?: string
+} | null {
   try {
     const url = new URL(rawUrl.trim())
     const code = url.searchParams.get('code')
     const state = url.searchParams.get('state')
-    if (!code || !state) return null
+    const issuerUrl = url.searchParams.get('issuer_url')
+    const clientId = url.searchParams.get('client_id')
+    if ((!code || !state) && (!issuerUrl || !clientId)) return null
     return {
-      code,
-      state,
+      code: code ?? undefined,
+      state: state ?? undefined,
       loginOption: url.searchParams.get('login_option') ?? '',
       path: url.pathname,
+      issuerUrl: issuerUrl ?? undefined,
+      clientId: clientId ?? undefined,
+      scopes: url.searchParams.get('scopes') ?? undefined,
+      loginHint: url.searchParams.get('login_hint') ?? undefined,
     }
   } catch {
     return null
@@ -109,6 +124,7 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
   const [isStarting, setIsStarting] = useState(false)
   const [isCompleting, setIsCompleting] = useState(false)
   const [callbackUrl, setCallbackUrl] = useState('')
+  const [nextUrl, setNextUrl] = useState('')
   const [socialSession, setSocialSession] = useState<StartSocialLoginResponse | null>(null)
   const [idcSession, setIdcSession] = useState<StartIdcLoginResponse | null>(null)
   // IdC 表单
@@ -127,22 +143,28 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
   const setDisabled = useSetDisabled()
   const resetFailure = useResetFailure()
 
-  useEffect(() => {
-    return () => {
-      if (pollTimerRef.current) clearTimeout(pollTimerRef.current)
+  const clearPollTimer = () => {
+    if (pollTimerRef.current) {
+      clearTimeout(pollTimerRef.current)
+      pollTimerRef.current = null
     }
+  }
+
+  useEffect(() => {
+    return () => clearPollTimer()
   }, [])
 
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ['credentials'] })
 
   const handleClose = () => {
-    if (pollTimerRef.current) clearTimeout(pollTimerRef.current)
+    clearPollTimer()
     setStep('select')
     setSocialSession(null)
     setIdcSession(null)
     setIsStarting(false)
     setIsCompleting(false)
     setCallbackUrl('')
+    setNextUrl('')
     setManualInput('')
     setManualLog([])
     onOpenChange(false)
@@ -174,11 +196,19 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
   }
 
   const scheduleSocialPoll = (sessionId: string) => {
+    clearPollTimer()
     pollTimerRef.current = setTimeout(async () => {
       try {
         const result = await pollSocialRelogin(credential.id, sessionId)
         if (result.status === 'pending') {
           scheduleSocialPoll(sessionId)
+        } else if (result.status === 'continue') {
+          setNextUrl(result.nextUrl)
+          toast.success('已获取二段登录链接')
+          if (!isRemote) {
+            window.open(result.nextUrl, '_blank')
+            scheduleSocialPoll(sessionId)
+          }
         } else if (result.status === 'success') {
           setStep('done')
           invalidate()
@@ -202,6 +232,7 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
       toast.error('URL 格式无效，请复制完整的地址栏 URL')
       return
     }
+    clearPollTimer()
     setIsCompleting(true)
     try {
       const result = await completeSocialRelogin(credential.id, socialSession.sessionId, {
@@ -209,8 +240,18 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
         state: parsed.state,
         loginOption: parsed.loginOption || undefined,
         path: parsed.path,
+        issuerUrl: parsed.issuerUrl,
+        clientId: parsed.clientId,
+        scopes: parsed.scopes,
+        loginHint: parsed.loginHint,
       })
-      if (result.status === 'success') {
+      if (result.status === 'continue') {
+        setNextUrl(result.nextUrl)
+        setCallbackUrl('')
+        toast.success('已获取二段登录链接，请打开后继续授权')
+        window.open(result.nextUrl, '_blank')
+        if (!isRemote) scheduleSocialPoll(socialSession.sessionId)
+      } else if (result.status === 'success') {
         setStep('done')
         invalidate()
         toast.success(`凭据 #${result.credentialId} Token 已更新并启用`)
@@ -404,26 +445,45 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
                 <ExternalLink className="h-3.5 w-3.5" />
               </a>
             </div>
-            {isRemote ? (
-              // 远程访问：OAuth 回调到 localhost 无法被捕获，需手动粘贴回调 URL 完成
-              <div className="space-y-2">
-                <p className="text-sm text-amber-600 dark:text-amber-400">
-                  完成登录后，从地址栏复制完整 URL 粘贴到下方：
-                </p>
-                <textarea
-                  placeholder="http://localhost:3128/oauth/callback?code=...&state=...&login_option=google"
-                  value={callbackUrl}
-                  onChange={(e) => setCallbackUrl(e.target.value)}
-                  disabled={isCompleting}
-                  className="flex min-h-[80px] w-full rounded-md border border-input bg-background px-3 py-2 text-xs font-mono placeholder:text-muted-foreground focus-visible:outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/30 disabled:opacity-50"
-                />
-              </div>
-            ) : (
+            {!isRemote && (
               <div className="flex items-center gap-2 text-sm text-muted-foreground">
                 <Loader2 className="h-4 w-4 animate-spin" />
                 正在等待登录完成…
               </div>
             )}
+            <div className="space-y-2">
+              <p className={isRemote ? 'text-sm text-amber-600 dark:text-amber-400' : 'text-sm text-muted-foreground'}>
+                {nextUrl
+                  ? '打开二段链接完成授权后，把最终回调 URL 粘贴到下方：'
+                  : isRemote
+                    ? '完成登录后，从地址栏复制完整 URL 粘贴到下方。企业 SSO 的第一段中间链接也可以直接粘贴：'
+                    : '如果浏览器停在 localhost 页面，也可以把完整 URL 粘贴到下方。企业 SSO 的第一段中间链接可直接粘贴：'}
+              </p>
+              {nextUrl && (
+                <div className="rounded-lg border bg-muted/50 p-3 space-y-2">
+                  <p className="text-xs font-medium text-muted-foreground">二段登录链接</p>
+                  <textarea
+                    readOnly
+                    value={nextUrl}
+                    onFocus={(e) => e.currentTarget.select()}
+                    className="flex min-h-[72px] w-full resize-none rounded-md border border-input bg-background px-3 py-2 text-xs font-mono text-muted-foreground focus-visible:outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/30"
+                  />
+                  <Button size="sm" variant="outline" onClick={() => navigator.clipboard?.writeText(nextUrl)}>
+                    <Copy className="h-3.5 w-3.5" />
+                    复制二段链接
+                  </Button>
+                </div>
+              )}
+              <textarea
+                placeholder={nextUrl
+                  ? "http://localhost:3128/oauth/callback?code=...&state=..."
+                  : "http://localhost:3128/signin/callback?login_option=external_idp&issuer_url=...&client_id=..."}
+                value={callbackUrl}
+                onChange={(e) => setCallbackUrl(e.target.value)}
+                disabled={isCompleting}
+                className="flex min-h-[80px] w-full rounded-md border border-input bg-background px-3 py-2 text-xs font-mono placeholder:text-muted-foreground focus-visible:outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/30 disabled:opacity-50"
+              />
+            </div>
           </div>
         )}
 
@@ -548,15 +608,13 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
           {step === 'waiting' && method === 'social' && (
             <>
               <Button variant="outline" onClick={handleClose} disabled={isCompleting}>取消</Button>
-              {isRemote && (
-                <Button
-                  onClick={handleCompleteSocialManually}
-                  disabled={isCompleting || !callbackUrl.trim()}
-                >
-                  {isCompleting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-                  完成登录
-                </Button>
-              )}
+              <Button
+                onClick={handleCompleteSocialManually}
+                disabled={isCompleting || !callbackUrl.trim()}
+              >
+                {isCompleting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                完成登录
+              </Button>
             </>
           )}
 

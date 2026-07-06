@@ -636,13 +636,7 @@ pub async fn complete_social_login(
 ) -> impl IntoResponse {
     match state
         .service
-        .complete_social_login(
-            &session_id,
-            payload.code,
-            payload.state,
-            payload.login_option,
-            payload.path,
-        )
+        .complete_social_login(&session_id, payload)
         .await
     {
         Ok(response) => Json(response).into_response(),
@@ -771,13 +765,7 @@ pub async fn complete_social_relogin(
 ) -> impl IntoResponse {
     match state
         .service
-        .complete_social_login(
-            &session_id,
-            payload.code,
-            payload.state,
-            payload.login_option,
-            payload.path,
-        )
+        .complete_social_login(&session_id, payload)
         .await
     {
         Ok(response) => Json(response).into_response(),

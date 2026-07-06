@@ -350,6 +350,7 @@ export interface StartIdcLoginResponse {
 
 export type PollIdcLoginResponse =
   | { status: 'pending' }
+  | { status: 'continue'; nextUrl: string }
   | { status: 'success'; credentialId: number }
   | { status: 'expired' }
 
@@ -363,10 +364,14 @@ export interface StartSocialLoginRequest {
 
 /** 远程访问时手动完成 Social 登录：从浏览器地址栏粘贴的回调 URL 中提取参数 */
 export interface CompleteSocialLoginRequest {
-  code: string
-  state: string
+  code?: string
+  state?: string
   loginOption?: string
   path?: string
+  issuerUrl?: string
+  clientId?: string
+  scopes?: string
+  loginHint?: string
 }
 
 export interface StartSocialLoginResponse {

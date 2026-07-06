@@ -2,7 +2,7 @@
 //!
 //! 提供统一的 HTTP Client 构建功能，支持代理配置
 
-use reqwest::{Client, Proxy};
+use reqwest::{Client, Proxy, redirect::Policy};
 use std::time::Duration;
 
 use crate::model::config::TlsBackend;
@@ -105,7 +105,27 @@ pub fn build_client(
     timeout_secs: u64,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<Client> {
+    build_client_with_redirect_policy(proxy, timeout_secs, tls_backend, None)
+}
+
+pub fn build_client_no_redirect(
+    proxy: Option<&ProxyConfig>,
+    timeout_secs: u64,
+    tls_backend: TlsBackend,
+) -> anyhow::Result<Client> {
+    build_client_with_redirect_policy(proxy, timeout_secs, tls_backend, Some(Policy::none()))
+}
+
+fn build_client_with_redirect_policy(
+    proxy: Option<&ProxyConfig>,
+    timeout_secs: u64,
+    tls_backend: TlsBackend,
+    redirect_policy: Option<Policy>,
+) -> anyhow::Result<Client> {
     let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+    if let Some(policy) = redirect_policy {
+        builder = builder.redirect(policy);
+    }
 
     match tls_backend {
         TlsBackend::Rustls => {

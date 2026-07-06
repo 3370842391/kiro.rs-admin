@@ -898,6 +898,8 @@ pub struct StartIdcLoginResponse {
 pub enum PollIdcLoginResponse {
     #[serde(rename = "pending")]
     Pending,
+    #[serde(rename = "continue")]
+    Continue { next_url: String },
     #[serde(rename = "success")]
     Success { credential_id: u64 },
     #[serde(rename = "expired")]
@@ -941,15 +943,29 @@ pub struct StartSocialLoginResponse {
 #[serde(rename_all = "camelCase")]
 pub struct CompleteSocialLoginRequest {
     /// OAuth 授权码（从回调 URL 的 code 参数提取）
-    pub code: String,
+    #[serde(default)]
+    pub code: Option<String>,
     /// OAuth state（从回调 URL 的 state 参数提取，用于 CSRF 校验）
-    pub state: String,
+    #[serde(default)]
+    pub state: Option<String>,
     /// 登录选项（从回调 URL 的 login_option 参数提取，可为空）
     #[serde(default)]
     pub login_option: String,
     /// 回调 URL 的路径（如 /oauth/callback）
     #[serde(default = "default_oauth_path")]
     pub path: String,
+    /// 企业 SSO 中间链接携带的 issuer_url。
+    #[serde(default)]
+    pub issuer_url: Option<String>,
+    /// 企业 SSO 中间链接携带的 client_id。
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// 企业 SSO 中间链接携带的 scopes。
+    #[serde(default)]
+    pub scopes: Option<String>,
+    /// 企业 SSO 中间链接携带的 login_hint。
+    #[serde(default)]
+    pub login_hint: Option<String>,
 }
 
 fn default_oauth_path() -> String {

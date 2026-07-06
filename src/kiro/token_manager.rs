@@ -3423,6 +3423,79 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 更新 external_idp 重新登录拿到的 token 和刷新元数据。
+    ///
+    /// # 前置条件
+    /// - 凭据必须已禁用（disabled = true），与 [`update_refresh_token`] 保持一致。
+    pub fn update_external_idp_relogin(
+        &self,
+        id: u64,
+        new_refresh_token: String,
+        new_access_token: Option<String>,
+        new_expires_at: Option<String>,
+        client_id: String,
+        token_endpoint: String,
+        issuer_url: String,
+        scopes: String,
+    ) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let idx = entries
+                .iter()
+                .position(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+
+            if !entries[idx].disabled {
+                anyhow::bail!(
+                    "只能为已禁用的凭据更新 external_idp Token（请先禁用凭据 #{}）",
+                    id
+                );
+            }
+
+            let tmp_creds = KiroCredentials {
+                refresh_token: Some(new_refresh_token.clone()),
+                auth_method: Some("external_idp".to_string()),
+                provider: Some("AzureAD".to_string()),
+                client_id: Some(client_id.clone()),
+                client_secret: None,
+                token_endpoint: Some(token_endpoint.clone()),
+                issuer_url: Some(issuer_url.clone()),
+                scopes: Some(scopes.clone()),
+                ..entries[idx].credentials.clone()
+            };
+            validate_refresh_token(&tmp_creds)?;
+
+            let new_hash = sha256_hex(&new_refresh_token);
+            let duplicate = entries.iter().enumerate().any(|(i, e)| {
+                i != idx
+                    && e.credentials
+                        .refresh_token
+                        .as_ref()
+                        .map(|t| sha256_hex(t) == new_hash)
+                        .unwrap_or(false)
+            });
+            if duplicate {
+                anyhow::bail!("refreshToken 与其他凭据重复");
+            }
+
+            let entry = &mut entries[idx];
+            entry.credentials.refresh_token = Some(new_refresh_token);
+            entry.credentials.access_token = new_access_token;
+            entry.credentials.expires_at = new_expires_at;
+            entry.credentials.auth_method = Some("external_idp".to_string());
+            entry.credentials.provider = Some("AzureAD".to_string());
+            entry.credentials.client_id = Some(client_id);
+            entry.credentials.client_secret = None;
+            entry.credentials.token_endpoint = Some(token_endpoint);
+            entry.credentials.issuer_url = Some(issuer_url);
+            entry.credentials.scopes = Some(scopes);
+            entry.refresh_failure_count = 0;
+        }
+        self.persist_credentials()?;
+        tracing::info!("凭据 #{} external_idp Token 已更新", id);
+        Ok(())
+    }
+
     /// 强制刷新指定凭据的 Token（Admin API）
     ///
     /// 无条件调用上游 API 重新获取 access token，不检查是否过期。

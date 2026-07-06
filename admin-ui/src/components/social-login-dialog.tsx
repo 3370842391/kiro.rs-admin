@@ -31,17 +31,32 @@ const isRemoteAccess = () =>
   window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1'
 
 // 从回调 URL 字符串中提取 OAuth 参数
-function parseCallbackUrl(rawUrl: string): { code: string; state: string; loginOption: string; path: string } | null {
+function parseCallbackUrl(rawUrl: string): {
+  code?: string
+  state?: string
+  loginOption?: string
+  path: string
+  issuerUrl?: string
+  clientId?: string
+  scopes?: string
+  loginHint?: string
+} | null {
   try {
     const url = new URL(rawUrl.trim())
     const code = url.searchParams.get('code')
     const state = url.searchParams.get('state')
-    if (!code || !state) return null
+    const issuerUrl = url.searchParams.get('issuer_url')
+    const clientId = url.searchParams.get('client_id')
+    if ((!code || !state) && (!issuerUrl || !clientId)) return null
     return {
-      code,
-      state,
+      code: code ?? undefined,
+      state: state ?? undefined,
       loginOption: url.searchParams.get('login_option') ?? '',
       path: url.pathname,
+      issuerUrl: issuerUrl ?? undefined,
+      clientId: clientId ?? undefined,
+      scopes: url.searchParams.get('scopes') ?? undefined,
+      loginHint: url.searchParams.get('login_hint') ?? undefined,
     }
   } catch {
     return null
@@ -68,25 +83,32 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
   const [session, setSession] = useState<StartSocialLoginResponse | null>(null)
   const [credentialId, setCredentialId] = useState<number | null>(null)
   const [callbackUrl, setCallbackUrl] = useState('')
+  const [nextUrl, setNextUrl] = useState('')
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const loginLinkRef = useRef<HTMLTextAreaElement | null>(null)
   const isRemote = isRemoteAccess()
 
-  useEffect(() => {
-    return () => {
-      if (pollTimerRef.current) clearTimeout(pollTimerRef.current)
+  const clearPollTimer = () => {
+    if (pollTimerRef.current) {
+      clearTimeout(pollTimerRef.current)
+      pollTimerRef.current = null
     }
+  }
+
+  useEffect(() => {
+    return () => clearPollTimer()
   }, [])
 
   const handleOpenChange = (v: boolean) => {
     if (!v) {
-      if (pollTimerRef.current) clearTimeout(pollTimerRef.current)
+      clearPollTimer()
       setStep('form')
       setSession(null)
       setCredentialId(null)
       setIsStarting(false)
       setIsCompleting(false)
       setCallbackUrl('')
+      setNextUrl('')
       setCopyState('idle')
     }
     onOpenChange(v)
@@ -158,11 +180,21 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
   }
 
   const schedulePoll = (sessionId: string) => {
+    clearPollTimer()
     pollTimerRef.current = setTimeout(async () => {
       try {
         const result = await pollSocialLogin(sessionId)
         if (result.status === 'pending') {
           schedulePoll(sessionId)
+        } else if (result.status === 'continue') {
+          setNextUrl(result.nextUrl)
+          toast.success('已获取二段登录链接')
+          if (!isRemote && !incognito) {
+            window.open(result.nextUrl, '_blank')
+          } else if (incognito) {
+            await handleCopyLink(result.nextUrl)
+          }
+          if (!isRemote) schedulePoll(sessionId)
         } else if (result.status === 'success') {
           setCredentialId(result.credentialId)
           setStep('done')
@@ -187,6 +219,7 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
       toast.error('URL 格式无效，请复制完整的地址栏 URL')
       return
     }
+    clearPollTimer()
     setIsCompleting(true)
     try {
       const result = await completeSocialLogin(session.sessionId, {
@@ -194,8 +227,19 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
         state: parsed.state,
         loginOption: parsed.loginOption || undefined,
         path: parsed.path,
+        issuerUrl: parsed.issuerUrl,
+        clientId: parsed.clientId,
+        scopes: parsed.scopes,
+        loginHint: parsed.loginHint,
       })
-      if (result.status === 'success') {
+      if (result.status === 'continue') {
+        setNextUrl(result.nextUrl)
+        setCallbackUrl('')
+        toast.success('已获取二段登录链接，请打开后继续授权')
+        if (incognito) await handleCopyLink(result.nextUrl)
+        else window.open(result.nextUrl, '_blank')
+        if (!isRemote) schedulePoll(session.sessionId)
+      } else if (result.status === 'success') {
         setCredentialId(result.credentialId)
         setStep('done')
         onSuccess()
@@ -216,9 +260,9 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>Kiro 账号登录（Google / GitHub）</DialogTitle>
+          <DialogTitle>Kiro 账号登录（Google / GitHub / 企业 SSO）</DialogTitle>
           <DialogDescription>
-            通过 Kiro 网页端完成 Social 登录，无需手动导出 refreshToken。
+            通过 Kiro 网页端完成账号登录，无需手动导出 refreshToken。
           </DialogDescription>
         </DialogHeader>
 
@@ -256,16 +300,18 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
             {incognito ? (
               <div className="rounded-lg border bg-muted/50 p-4 space-y-3">
                 <p className="text-sm text-muted-foreground">
-                  {copyState === 'copied'
-                    ? '登录链接已复制。'
-                    : '复制登录链接后，'}
+                  {nextUrl
+                    ? '二段登录链接已生成。'
+                    : copyState === 'copied'
+                      ? '登录链接已复制。'
+                      : '复制登录链接后，'}
                   请新开一个<span className="font-medium text-foreground">无痕 / 隐身窗口</span>
                   （Ctrl+Shift+N，Safari 为 ⌘+Shift+N），粘贴打开并完成授权。
                 </p>
                 <textarea
                   ref={loginLinkRef}
                   readOnly
-                  value={session.portalUrl}
+                  value={nextUrl || session.portalUrl}
                   onFocus={(e) => e.currentTarget.select()}
                   className="flex min-h-[72px] w-full resize-none rounded-md border border-input bg-background px-3 py-2 text-xs font-mono text-muted-foreground focus-visible:outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/30"
                 />
@@ -273,14 +319,14 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
                   <Button
                     size="sm"
                     variant="outline"
-                    onClick={() => handleCopyLink(session.portalUrl)}
+                    onClick={() => handleCopyLink(nextUrl || session.portalUrl)}
                   >
                     {copyState === 'copied' ? (
                       <Check className="h-3.5 w-3.5" />
                     ) : (
                       <Copy className="h-3.5 w-3.5" />
                     )}
-                    {copyState === 'copied' ? '已复制' : '复制登录链接'}
+                    {copyState === 'copied' ? '已复制' : nextUrl ? '复制二段链接' : '复制登录链接'}
                   </Button>
                   {copyState === 'manual' && (
                     <span className="text-xs text-muted-foreground">
@@ -306,27 +352,47 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
               </div>
             )}
 
-            {isRemote ? (
-              // 远程访问：OAuth 回调到 localhost 无法被捕获，需用户从地址栏复制完整 URL 手动粘贴完成。
-              <div className="space-y-2">
-                <p className="text-sm text-amber-600 dark:text-amber-400">
-                  完成登录后，浏览器会跳转到 <code>localhost</code> 失败页面，
-                  请从地址栏复制完整 URL 粘贴到下方：
-                </p>
-                <textarea
-                  placeholder="http://localhost:3128/oauth/callback?code=...&state=...&login_option=google"
-                  value={callbackUrl}
-                  onChange={(e) => setCallbackUrl(e.target.value)}
-                  disabled={isCompleting}
-                  className="flex min-h-[80px] w-full rounded-md border border-input bg-background px-3 py-2 text-xs font-mono placeholder:text-muted-foreground focus-visible:outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/30 disabled:opacity-50"
-                />
-              </div>
-            ) : (
+            {!isRemote && (
               <div className="flex items-center gap-2 text-sm text-muted-foreground">
                 <Loader2 className="h-4 w-4 animate-spin" />
                 正在等待登录完成…
               </div>
             )}
+
+            <div className="space-y-2">
+              <p className={isRemote ? 'text-sm text-amber-600 dark:text-amber-400' : 'text-sm text-muted-foreground'}>
+                {nextUrl
+                  ? '打开二段链接完成授权后，把最终回调 URL 粘贴到下方：'
+                  : isRemote
+                    ? '完成登录后，浏览器可能会跳转到 localhost 页面，请从地址栏复制完整 URL 粘贴到下方。企业 SSO 的第一段中间链接也可以直接粘贴：'
+                    : '如果浏览器停在 localhost 页面，也可以把完整 URL 粘贴到下方。企业 SSO 的第一段中间链接可直接粘贴：'}
+              </p>
+              {nextUrl && (
+                <div className="rounded-lg border bg-muted/50 p-3 space-y-2">
+                  <p className="text-xs font-medium text-muted-foreground">二段登录链接</p>
+                  <textarea
+                    ref={loginLinkRef}
+                    readOnly
+                    value={nextUrl}
+                    onFocus={(e) => e.currentTarget.select()}
+                    className="flex min-h-[72px] w-full resize-none rounded-md border border-input bg-background px-3 py-2 text-xs font-mono text-muted-foreground focus-visible:outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/30"
+                  />
+                  <Button size="sm" variant="outline" onClick={() => handleCopyLink(nextUrl)}>
+                    <Copy className="h-3.5 w-3.5" />
+                    复制二段链接
+                  </Button>
+                </div>
+              )}
+              <textarea
+                placeholder={nextUrl
+                  ? "http://localhost:3128/oauth/callback?code=...&state=..."
+                  : "http://localhost:3128/signin/callback?login_option=external_idp&issuer_url=...&client_id=..."}
+                value={callbackUrl}
+                onChange={(e) => setCallbackUrl(e.target.value)}
+                disabled={isCompleting}
+                className="flex min-h-[80px] w-full rounded-md border border-input bg-background px-3 py-2 text-xs font-mono placeholder:text-muted-foreground focus-visible:outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/30 disabled:opacity-50"
+              />
+            </div>
           </div>
         )}
 
@@ -350,15 +416,13 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
               <Button variant="outline" onClick={() => handleOpenChange(false)} disabled={isCompleting}>
                 取消
               </Button>
-              {isRemote && (
-                <Button
-                  onClick={handleCompleteManually}
-                  disabled={isCompleting || !callbackUrl.trim()}
-                >
-                  {isCompleting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-                  完成登录
-                </Button>
-              )}
+              <Button
+                onClick={handleCompleteManually}
+                disabled={isCompleting || !callbackUrl.trim()}
+              >
+                {isCompleting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                完成登录
+              </Button>
             </>
           )}
           {step === 'done' && (
