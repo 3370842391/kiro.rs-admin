@@ -20,7 +20,12 @@ import {
   type BatchImportSummary,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
-import { extractErrorMessage, sha256Hex, normalizeImportAuthMethod } from '@/lib/utils'
+import {
+  completeExternalIdpImportFields,
+  extractErrorMessage,
+  normalizeImportAuthMethod,
+  sha256Hex,
+} from '@/lib/utils'
 
 interface BatchImportDialogProps {
   open: boolean
@@ -29,25 +34,51 @@ interface BatchImportDialogProps {
 
 interface CredentialInput {
   refreshToken?: string
+  refresh_token?: string
+  accessToken?: string
+  access_token?: string
   clientId?: string
+  client_id?: string
   clientSecret?: string
+  client_secret?: string
   region?: string
   authRegion?: string
+  auth_region?: string
   apiRegion?: string
+  api_region?: string
   priority?: number
   rpmLimit?: number
+  rpm_limit?: number
   machineId?: string
+  machine_id?: string
   kiroApiKey?: string
+  kiro_api_key?: string
   authMethod?: string
+  auth_method?: string
   provider?: string
+  idp?: string
   tokenEndpoint?: string
+  token_endpoint?: string
   issuerUrl?: string
+  issuer_url?: string
   scopes?: string
   endpoint?: string
   email?: string
   proxyUrl?: string
+  proxy_url?: string
   proxyUsername?: string
+  proxy_username?: string
   proxyPassword?: string
+  proxy_password?: string
+  profileArn?: string
+  profile_arn?: string
+  expiresAt?: string
+  expires_at?: string
+  expired?: string
+  userId?: string | null
+  user_id?: string | null
+  startUrl?: string
+  start_url?: string
   groups?: string[]
 }
 
@@ -60,6 +91,30 @@ interface VerificationResult {
   credentialId?: number
   rollbackStatus?: 'success' | 'failed' | 'skipped'
   rollbackError?: string
+}
+
+function preferString(obj: Record<string, unknown>, ...keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = obj[key]
+    if (typeof value === 'string') return value
+  }
+  return undefined
+}
+
+function preferNumber(obj: Record<string, unknown>, ...keys: string[]): number | undefined {
+  for (const key of keys) {
+    const value = obj[key]
+    if (typeof value === 'number' && Number.isFinite(value)) return value
+  }
+  return undefined
+}
+
+function preferStringArray(obj: Record<string, unknown>, ...keys: string[]): string[] | undefined {
+  for (const key of keys) {
+    const value = obj[key]
+    if (Array.isArray(value)) return value.filter((item): item is string => typeof item === 'string')
+  }
+  return undefined
 }
 
 /**
@@ -82,9 +137,47 @@ function normalizeImportEntry(raw: unknown): CredentialInput {
   if (merged.provider == null && obj.idp != null) {
     merged.provider = obj.idp
   }
+  const normalized: CredentialInput = {
+    refreshToken: preferString(merged, 'refreshToken', 'refresh_token'),
+    accessToken: preferString(merged, 'accessToken', 'access_token'),
+    profileArn: preferString(merged, 'profileArn', 'profile_arn'),
+    expiresAt: preferString(merged, 'expiresAt', 'expires_at', 'expired'),
+    clientId: preferString(merged, 'clientId', 'client_id'),
+    clientSecret: preferString(merged, 'clientSecret', 'client_secret'),
+    region: preferString(merged, 'region'),
+    authRegion: preferString(merged, 'authRegion', 'auth_region'),
+    apiRegion: preferString(merged, 'apiRegion', 'api_region'),
+    priority: preferNumber(merged, 'priority'),
+    rpmLimit: preferNumber(merged, 'rpmLimit', 'rpm_limit'),
+    machineId: preferString(merged, 'machineId', 'machine_id'),
+    kiroApiKey: preferString(merged, 'kiroApiKey', 'kiro_api_key'),
+    authMethod: preferString(merged, 'authMethod', 'auth_method'),
+    provider: preferString(merged, 'provider'),
+    idp: preferString(merged, 'idp'),
+    tokenEndpoint: preferString(merged, 'tokenEndpoint', 'token_endpoint'),
+    issuerUrl: preferString(merged, 'issuerUrl', 'issuer_url'),
+    scopes: preferString(merged, 'scopes'),
+    startUrl: preferString(merged, 'startUrl', 'start_url'),
+    endpoint: preferString(merged, 'endpoint'),
+    email: preferString(merged, 'email'),
+    proxyUrl: preferString(merged, 'proxyUrl', 'proxy_url'),
+    proxyUsername: preferString(merged, 'proxyUsername', 'proxy_username'),
+    proxyPassword: preferString(merged, 'proxyPassword', 'proxy_password'),
+    groups: preferStringArray(merged, 'groups'),
+    userId:
+      typeof merged.userId === 'string' || merged.userId === null
+        ? merged.userId
+        : typeof merged.user_id === 'string' || merged.user_id === null
+          ? merged.user_id
+          : undefined,
+  }
+  const completed = completeExternalIdpImportFields(normalized)
+  normalized.tokenEndpoint = completed.tokenEndpoint
+  normalized.issuerUrl = completed.issuerUrl
+  normalized.scopes = completed.scopes
   // 仅保留 CredentialInput 关心的字段（其余忽略），避免把 credentials 子对象本身传下去
   delete merged.credentials
-  return merged as CredentialInput
+  return normalized
 }
 
 /**
@@ -261,14 +354,24 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
           const clientId = cred.clientId?.trim() || undefined
           const clientSecret = cred.clientSecret?.trim() || undefined
-          const tokenEndpoint = cred.tokenEndpoint?.trim() || undefined
-          const issuerUrl = cred.issuerUrl?.trim() || undefined
-          const scopes = cred.scopes?.trim() || undefined
+          const completed = completeExternalIdpImportFields({
+            ...cred,
+            clientId,
+          })
+          const tokenEndpoint = completed.tokenEndpoint
+          const issuerUrl = completed.issuerUrl
+          const scopes = completed.scopes
 
           const { authMethod, error: authError } = normalizeImportAuthMethod(cred.authMethod, {
             tokenEndpoint,
+            issuerUrl,
+            scopes,
+            userId: cred.userId,
+            accessToken: cred.accessToken,
             clientId,
             clientSecret,
+            provider: cred.provider,
+            idp: cred.idp,
           })
           if (authError) {
             updateResult(i, { status: 'failed', error: authError })
@@ -280,12 +383,17 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             index: i,
             req: {
               refreshToken: token,
+              accessToken: cred.accessToken?.trim() || undefined,
+              profileArn: cred.profileArn?.trim() || undefined,
+              expiresAt: cred.expiresAt?.trim() || undefined,
               authMethod,
               provider:
                 cred.provider?.trim() ||
+                cred.idp?.trim() ||
                 (isExternalIdp ? 'AzureAD' : undefined),
               authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
               apiRegion: cred.apiRegion?.trim() || undefined,
+              startUrl: cred.startUrl?.trim() || undefined,
               clientId,
               // external_idp 为公共客户端，不携带 clientSecret
               clientSecret: isExternalIdp ? undefined : clientSecret,

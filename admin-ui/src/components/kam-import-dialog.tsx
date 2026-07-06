@@ -20,7 +20,12 @@ import {
   type BatchImportSummary,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
-import { extractErrorMessage, sha256Hex, normalizeImportAuthMethod } from '@/lib/utils'
+import {
+  completeExternalIdpImportFields,
+  extractErrorMessage,
+  normalizeImportAuthMethod,
+  sha256Hex,
+} from '@/lib/utils'
 
 interface KamImportDialogProps {
   open: boolean
@@ -49,9 +54,38 @@ interface KamAccount {
     tokenEndpoint?: string
     issuerUrl?: string
     scopes?: string
+    endpoint?: string
+    priority?: number
+    rpmLimit?: number
+    apiRegion?: string
   }
   machineId?: string
   status?: string
+  groups?: string[]
+}
+
+function readString(obj: Record<string, unknown>, ...keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = obj[key]
+    if (typeof value === 'string') return value
+  }
+  return undefined
+}
+
+function readNumber(obj: Record<string, unknown>, ...keys: string[]): number | undefined {
+  for (const key of keys) {
+    const value = obj[key]
+    if (typeof value === 'number' && Number.isFinite(value)) return value
+  }
+  return undefined
+}
+
+function readStringArray(obj: Record<string, unknown>, ...keys: string[]): string[] | undefined {
+  for (const key of keys) {
+    const value = obj[key]
+    if (Array.isArray(value)) return value.filter((item): item is string => typeof item === 'string')
+  }
+  return undefined
 }
 
 // 把 KAM 的 expiresAt 字段统一规范化为 RFC3339 字符串
@@ -83,65 +117,78 @@ interface VerificationResult {
 
 
 
-// 兼容 KAM 1.8.3 新版平铺格式，统一转换为旧格式（credentials 嵌套结构）
+// 兼容 KAM 平铺格式、旧版嵌套格式，以及 CLIProxyAPI 的 snake_case 单文件格式。
 function normalizeKamAccount(item: unknown): unknown {
   if (typeof item !== 'object' || item === null) return item
   const obj = item as Record<string, unknown>
-  // 新格式：refreshToken 直接在账号对象上，无 credentials 嵌套
-  if (typeof obj.refreshToken === 'string' && typeof obj.credentials === 'undefined') {
-    const email = typeof obj.email === 'string' ? obj.email : undefined
-    const userId =
-      typeof obj.userId === 'string' || obj.userId === null ? (obj.userId as string | null) : undefined
-    const nickname =
-      typeof obj.nickname === 'string'
-        ? obj.nickname
-        : typeof obj.label === 'string'
-          ? (obj.label as string)
-          : undefined
-    const status = typeof obj.status === 'string' ? obj.status : undefined
-    const idp = typeof obj.idp === 'string' ? obj.idp : undefined
-    const machineId = typeof obj.machineId === 'string' ? obj.machineId : undefined
-    const accessToken = typeof obj.accessToken === 'string' ? obj.accessToken : undefined
-    const profileArn = typeof obj.profileArn === 'string' ? obj.profileArn : undefined
-    const expiresAt =
-      typeof obj.expiresAt === 'string' || typeof obj.expiresAt === 'number'
-        ? (obj.expiresAt as string | number)
-        : undefined
-    const clientId = typeof obj.clientId === 'string' ? obj.clientId : undefined
-    const clientSecret = typeof obj.clientSecret === 'string' ? obj.clientSecret : undefined
-    const region = typeof obj.region === 'string' ? obj.region : undefined
-    const authMethod = typeof obj.authMethod === 'string' ? obj.authMethod : undefined
-    const provider = typeof obj.provider === 'string' ? obj.provider : undefined
-    const startUrl = typeof obj.startUrl === 'string' ? obj.startUrl : undefined
-    const tokenEndpoint = typeof obj.tokenEndpoint === 'string' ? obj.tokenEndpoint : undefined
-    const issuerUrl = typeof obj.issuerUrl === 'string' ? obj.issuerUrl : undefined
-    const scopes = typeof obj.scopes === 'string' ? obj.scopes : undefined
+  const nested =
+    obj.credentials && typeof obj.credentials === 'object'
+      ? (obj.credentials as Record<string, unknown>)
+      : {}
+  const merged = { ...obj, ...nested } as Record<string, unknown>
+  const refreshToken = readString(merged, 'refreshToken', 'refresh_token')
+  if (typeof refreshToken !== 'string') return item
 
-    return {
-      email,
-      userId,
-      nickname,
-      idp,
-      status,
-      machineId,
-      credentials: {
-        refreshToken: obj.refreshToken,
-        accessToken,
-        profileArn,
-        expiresAt,
-        clientId,
-        clientSecret,
-        region,
-        authMethod,
-        provider,
-        startUrl,
-        tokenEndpoint,
-        issuerUrl,
-        scopes,
-      },
-    }
+  const email = readString(merged, 'email')
+  const userIdValue = obj.userId ?? obj.user_id
+  const userId = typeof userIdValue === 'string' || userIdValue === null ? (userIdValue as string | null) : undefined
+  const nickname = readString(merged, 'nickname', 'label')
+  const status = readString(merged, 'status')
+  const idp = readString(merged, 'idp')
+  const machineId = readString(merged, 'machineId', 'machine_id')
+  const accessToken = readString(merged, 'accessToken', 'access_token')
+  const profileArn = readString(merged, 'profileArn', 'profile_arn')
+  const expiresAtValue = merged.expiresAt ?? merged.expires_at ?? merged.expired
+  const expiresAt =
+    typeof expiresAtValue === 'string' || typeof expiresAtValue === 'number'
+      ? (expiresAtValue as string | number)
+      : undefined
+  const clientId = readString(merged, 'clientId', 'client_id')
+  const clientSecret = readString(merged, 'clientSecret', 'client_secret')
+  const region = readString(merged, 'region', 'authRegion', 'auth_region')
+  const authMethod = readString(merged, 'authMethod', 'auth_method')
+  const provider = readString(merged, 'provider')
+  const startUrl = readString(merged, 'startUrl', 'start_url')
+  const derivedExternalIdp = completeExternalIdpImportFields({
+    authMethod,
+    provider,
+    idp,
+    tokenEndpoint: readString(merged, 'tokenEndpoint', 'token_endpoint'),
+    issuerUrl: readString(merged, 'issuerUrl', 'issuer_url'),
+    scopes: readString(merged, 'scopes'),
+    userId,
+    accessToken,
+    clientId,
+  })
+
+  return {
+    email,
+    userId,
+    nickname,
+    idp,
+    status,
+    machineId,
+    groups: readStringArray(merged, 'groups'),
+    credentials: {
+      refreshToken,
+      accessToken,
+      profileArn,
+      expiresAt,
+      clientId,
+      clientSecret,
+      region,
+      authMethod,
+      provider,
+      startUrl,
+      tokenEndpoint: derivedExternalIdp.tokenEndpoint,
+      issuerUrl: derivedExternalIdp.issuerUrl,
+      scopes: derivedExternalIdp.scopes,
+      endpoint: readString(merged, 'endpoint'),
+      priority: readNumber(merged, 'priority'),
+      rpmLimit: readNumber(merged, 'rpmLimit', 'rpm_limit'),
+      apiRegion: readString(merged, 'apiRegion', 'api_region'),
+    },
   }
-  return item
 }
 
 // 校验元素是否为有效的 KAM 账号结构
@@ -171,8 +218,8 @@ function parseKamJson(raw: string): KamAccount[] {
   else if (parsed.credentials && typeof parsed.credentials === 'object') {
     rawItems = [parsed]
   }
-  // 单个账号对象（新格式，refreshToken 平铺）
-  else if (typeof parsed.refreshToken === 'string') {
+  // 单个账号对象（新格式 refreshToken 平铺，或 CLIProxyAPI refresh_token）
+  else if (typeof parsed.refreshToken === 'string' || typeof parsed.refresh_token === 'string') {
     rawItems = [parsed]
   }
   else {
@@ -368,15 +415,31 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
 
         const clientId = cred.clientId?.trim() || undefined
         const clientSecret = cred.clientSecret?.trim() || undefined
-        const tokenEndpoint = cred.tokenEndpoint?.trim() || undefined
-        const issuerUrl = cred.issuerUrl?.trim() || undefined
-        const scopes = cred.scopes?.trim() || undefined
-
+        const derivedExternalIdp = completeExternalIdpImportFields({
+          authMethod: cred.authMethod,
+          provider: cred.provider,
+          idp: account.idp,
+          tokenEndpoint: cred.tokenEndpoint,
+          issuerUrl: cred.issuerUrl,
+          scopes: cred.scopes,
+          userId: account.userId,
+          accessToken: cred.accessToken,
+          clientId,
+        })
+        const tokenEndpoint = derivedExternalIdp.tokenEndpoint
+        const issuerUrl = derivedExternalIdp.issuerUrl
+        const scopes = derivedExternalIdp.scopes
 
         const { authMethod, error: authError } = normalizeImportAuthMethod(cred.authMethod, {
           tokenEndpoint,
+          issuerUrl,
+          scopes,
+          userId: account.userId,
+          accessToken: cred.accessToken,
           clientId,
           clientSecret,
+          provider: cred.provider,
+          idp: account.idp,
         })
         if (authError) {
           updateResult(i, { status: 'failed', error: authError })
@@ -404,6 +467,8 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             authMethod,
             provider,
             authRegion: cred.region?.trim() || undefined,
+            apiRegion: cred.apiRegion?.trim() || undefined,
+            endpoint: cred.endpoint?.trim() || undefined,
             startUrl: cred.startUrl?.trim() || undefined,
             clientId,
             // external_idp 为公共客户端，不携带 clientSecret
@@ -411,12 +476,13 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             tokenEndpoint: isExternalIdp ? tokenEndpoint : undefined,
             issuerUrl: isExternalIdp ? issuerUrl : undefined,
             scopes: isExternalIdp ? scopes : undefined,
+            priority: cred.priority || 0,
             machineId: account.machineId?.trim() || undefined,
             email: account.email?.trim() || undefined,
             proxyUrl,
-            // 导入默认不限速（0）
-            rpmLimit: 0,
-            groups: groups.length > 0 ? groups : undefined,
+            // 导入默认不限速（0），JSON 显式带 rpmLimit 时尊重原值
+            rpmLimit: cred.rpmLimit ?? 0,
+            groups: Array.from(new Set([...groups, ...(account.groups ?? [])])).filter(Boolean),
           },
         })
       }

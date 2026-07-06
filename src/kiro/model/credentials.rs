@@ -3,6 +3,7 @@
 //! 支持从 Kiro IDE 的凭证文件加载，使用 Social 认证方式
 //! 支持单凭据和多凭据配置格式
 
+use base64::{Engine, engine::general_purpose};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -247,6 +248,230 @@ pub(crate) fn canonicalize_auth_method_value(value: &str) -> &str {
     } else {
         value
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExternalIdpImportFields<'a> {
+    pub auth_method: Option<&'a str>,
+    pub provider: Option<&'a str>,
+    pub idp: Option<&'a str>,
+    pub token_endpoint: Option<&'a str>,
+    pub issuer_url: Option<&'a str>,
+    pub scopes: Option<&'a str>,
+    pub user_id: Option<&'a str>,
+    pub access_token: Option<&'a str>,
+    pub client_id: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CompletedExternalIdpImportFields {
+    pub token_endpoint: Option<String>,
+    pub issuer_url: Option<String>,
+    pub scopes: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MicrosoftIdpTenant {
+    host: String,
+    tenant: String,
+}
+
+fn clean_import_string(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn is_external_idp_alias(value: Option<&str>) -> bool {
+    value
+        .and_then(|v| clean_import_string(Some(v)))
+        .is_some_and(|v| {
+            EXTERNAL_IDP_ALIASES
+                .iter()
+                .any(|a| v.eq_ignore_ascii_case(a))
+        })
+}
+
+fn extract_microsoft_idp_tenant(raw: Option<&str>) -> Option<MicrosoftIdpTenant> {
+    let value = clean_import_string(raw)?;
+    let url = reqwest::Url::parse(&value).ok()?;
+    if !url.scheme().eq_ignore_ascii_case("https") {
+        return None;
+    }
+
+    let host = url.host_str()?.to_ascii_lowercase();
+    let login_host = if host == "sts.windows.net" {
+        "login.microsoftonline.com".to_string()
+    } else if ALLOWED_EXTERNAL_IDP_SUFFIXES
+        .iter()
+        .any(|suffix| host.ends_with(suffix))
+    {
+        host
+    } else {
+        return None;
+    };
+
+    let tenant = url
+        .path_segments()
+        .and_then(|mut segments| segments.find(|segment| !segment.trim().is_empty()))?;
+    if tenant.eq_ignore_ascii_case("oauth2") || tenant.eq_ignore_ascii_case("v2.0") {
+        return None;
+    }
+
+    Some(MicrosoftIdpTenant {
+        host: login_host,
+        tenant: tenant.to_string(),
+    })
+}
+
+fn default_external_idp_scopes(client_id: Option<&str>) -> Option<String> {
+    let client_id = clean_import_string(client_id)?;
+    Some(
+        [
+            format!("api://{client_id}/codewhisperer:conversations"),
+            format!("api://{client_id}/codewhisperer:completions"),
+            "offline_access".to_string(),
+        ]
+        .join(" "),
+    )
+}
+
+fn normalize_external_idp_scopes(raw_scopes: &str, client_id: Option<&str>) -> Option<String> {
+    let scopes: Vec<&str> = raw_scopes
+        .split_whitespace()
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+        .collect();
+    if scopes.is_empty() {
+        return default_external_idp_scopes(client_id);
+    }
+
+    let client_id = clean_import_string(client_id);
+    let mut normalized: Vec<String> = Vec::new();
+    for scope in scopes {
+        let next = if let Some(client_id) = client_id.as_deref() {
+            if !scope.contains("://") && !scope.eq_ignore_ascii_case("offline_access") {
+                format!("api://{}/{}", client_id, scope.trim_start_matches('/'))
+            } else {
+                scope.to_string()
+            }
+        } else {
+            scope.to_string()
+        };
+
+        if !normalized
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&next))
+        {
+            normalized.push(next);
+        }
+    }
+
+    if client_id.is_some()
+        && !normalized
+            .iter()
+            .any(|scope| scope.eq_ignore_ascii_case("offline_access"))
+    {
+        normalized.push("offline_access".to_string());
+    }
+
+    (!normalized.is_empty()).then(|| normalized.join(" "))
+}
+
+fn decode_jwt_payload(access_token: Option<&str>) -> Option<serde_json::Value> {
+    let token = clean_import_string(access_token)?;
+    let payload = token.split('.').nth(1)?;
+    let decoded = general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| general_purpose::URL_SAFE.decode(payload))
+        .ok()?;
+    serde_json::from_slice(&decoded).ok()
+}
+
+fn derive_jwt_string_claim(access_token: Option<&str>, claim: &str) -> Option<String> {
+    decode_jwt_payload(access_token)?
+        .get(claim)?
+        .as_str()
+        .and_then(|value| clean_import_string(Some(value)))
+}
+
+fn derive_external_idp_scopes_from_access_token(
+    access_token: Option<&str>,
+    client_id: Option<&str>,
+) -> Option<String> {
+    let scp = derive_jwt_string_claim(access_token, "scp")?;
+    normalize_external_idp_scopes(&scp, client_id)
+}
+
+fn is_external_idp_import_like(fields: ExternalIdpImportFields<'_>) -> bool {
+    is_external_idp_alias(fields.auth_method)
+        || is_external_idp_alias(fields.provider)
+        || is_external_idp_alias(fields.idp)
+        || clean_import_string(fields.token_endpoint).is_some()
+        || extract_microsoft_idp_tenant(fields.issuer_url).is_some()
+        || extract_microsoft_idp_tenant(fields.user_id).is_some()
+        || extract_microsoft_idp_tenant(
+            derive_jwt_string_claim(fields.access_token, "iss").as_deref(),
+        )
+        .is_some()
+}
+
+pub(crate) fn complete_external_idp_import_fields(
+    fields: ExternalIdpImportFields<'_>,
+) -> CompletedExternalIdpImportFields {
+    let token_endpoint = clean_import_string(fields.token_endpoint);
+    let issuer_url = clean_import_string(fields.issuer_url);
+    let scopes = clean_import_string(fields.scopes)
+        .and_then(|raw| normalize_external_idp_scopes(&raw, fields.client_id));
+
+    if !is_external_idp_import_like(fields) {
+        return CompletedExternalIdpImportFields {
+            token_endpoint,
+            issuer_url,
+            scopes,
+        };
+    }
+
+    let tenant = extract_microsoft_idp_tenant(token_endpoint.as_deref())
+        .or_else(|| extract_microsoft_idp_tenant(issuer_url.as_deref()))
+        .or_else(|| extract_microsoft_idp_tenant(fields.user_id))
+        .or_else(|| {
+            extract_microsoft_idp_tenant(
+                derive_jwt_string_claim(fields.access_token, "iss").as_deref(),
+            )
+        });
+
+    CompletedExternalIdpImportFields {
+        token_endpoint: token_endpoint.or_else(|| {
+            tenant.as_ref().map(|tenant| {
+                format!(
+                    "https://{}/{}/oauth2/v2.0/token",
+                    tenant.host, tenant.tenant
+                )
+            })
+        }),
+        issuer_url: issuer_url.or_else(|| {
+            tenant
+                .as_ref()
+                .map(|tenant| format!("https://{}/{}/v2.0", tenant.host, tenant.tenant))
+        }),
+        scopes: scopes
+            .or_else(|| {
+                derive_external_idp_scopes_from_access_token(fields.access_token, fields.client_id)
+            })
+            .or_else(|| default_external_idp_scopes(fields.client_id)),
+    }
+}
+
+pub(crate) fn normalize_import_auth_method_from_fields(
+    fields: ExternalIdpImportFields<'_>,
+) -> String {
+    let canonical = canonicalize_auth_method_value(fields.auth_method.unwrap_or("social").trim());
+    if canonical.eq_ignore_ascii_case("external_idp") || is_external_idp_import_like(fields) {
+        return "external_idp".to_string();
+    }
+    canonical.to_string()
 }
 
 /// 导入路径的 auth_method 归一化。
@@ -1365,6 +1590,20 @@ mod tests {
             normalize_import_auth_method("azuread", None),
             "external_idp"
         );
+        assert_eq!(
+            normalize_import_auth_method_from_fields(ExternalIdpImportFields {
+                auth_method: Some("social"),
+                provider: Some("AzureAD"),
+                idp: None,
+                token_endpoint: None,
+                issuer_url: None,
+                scopes: None,
+                user_id: Some("https://login.microsoftonline.com/tenant/v2.0.object-id"),
+                access_token: None,
+                client_id: Some("client-id"),
+            }),
+            "external_idp"
+        );
         // 带 tokenEndpoint 但未声明（默认 social）→ 推断 external_idp
         assert_eq!(
             normalize_import_auth_method(
@@ -1381,6 +1620,86 @@ mod tests {
         assert_eq!(normalize_import_auth_method("social", None), "social");
         // idc 保持
         assert_eq!(normalize_import_auth_method("idc", None), "idc");
+    }
+
+    fn unsigned_jwt(payload_json: &str) -> String {
+        let header = general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
+        let payload = general_purpose::URL_SAFE_NO_PAD.encode(payload_json.as_bytes());
+        format!("{header}.{payload}.")
+    }
+
+    #[test]
+    fn test_complete_external_idp_import_fields_from_old_kam_user_id() {
+        let completed = complete_external_idp_import_fields(ExternalIdpImportFields {
+            auth_method: Some("external_idp"),
+            provider: Some("AzureAD"),
+            idp: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
+            user_id: Some("https://login.microsoftonline.com/tenant-123/v2.0.object-id"),
+            access_token: None,
+            client_id: Some("client-123"),
+        });
+
+        assert_eq!(
+            completed.token_endpoint.as_deref(),
+            Some("https://login.microsoftonline.com/tenant-123/oauth2/v2.0/token")
+        );
+        assert_eq!(
+            completed.issuer_url.as_deref(),
+            Some("https://login.microsoftonline.com/tenant-123/v2.0")
+        );
+        assert_eq!(
+            completed.scopes.as_deref(),
+            Some(
+                "api://client-123/codewhisperer:conversations api://client-123/codewhisperer:completions offline_access"
+            )
+        );
+    }
+
+    #[test]
+    fn test_complete_external_idp_import_fields_from_jwt_claims() {
+        let access_token = unsigned_jwt(
+            r#"{"iss":"https://login.microsoftonline.com/tenant-abc/v2.0","scp":"codewhisperer:conversations codewhisperer:completions"}"#,
+        );
+        let completed = complete_external_idp_import_fields(ExternalIdpImportFields {
+            auth_method: Some("external_idp"),
+            provider: Some("AzureAD"),
+            idp: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
+            user_id: None,
+            access_token: Some(&access_token),
+            client_id: Some("client-abc"),
+        });
+
+        assert_eq!(
+            completed.token_endpoint.as_deref(),
+            Some("https://login.microsoftonline.com/tenant-abc/oauth2/v2.0/token")
+        );
+        assert_eq!(
+            completed.scopes.as_deref(),
+            Some(
+                "api://client-abc/codewhisperer:conversations api://client-abc/codewhisperer:completions offline_access"
+            )
+        );
+    }
+
+    #[test]
+    fn test_normalize_external_idp_scopes_keeps_full_api_scopes() {
+        let scopes = normalize_external_idp_scopes(
+            "api://client-id/codewhisperer:conversations offline_access codewhisperer:completions",
+            Some("client-id"),
+        );
+
+        assert_eq!(
+            scopes.as_deref(),
+            Some(
+                "api://client-id/codewhisperer:conversations offline_access api://client-id/codewhisperer:completions"
+            )
+        );
     }
 
     #[test]

@@ -109,45 +109,64 @@ pub struct SetPriorityRequest {
 #[serde(rename_all = "camelCase")]
 pub struct AddCredentialRequest {
     /// 刷新令牌（OAuth 凭据必填，API Key 凭据不需要）
+    #[serde(alias = "refresh_token")]
     pub refresh_token: Option<String>,
 
     /// 访问令牌（可选，导入/导出时保留）
     #[serde(default)]
+    #[serde(alias = "access_token")]
     pub access_token: Option<String>,
 
     /// Profile ARN（可选，缺失时部分上游接口会拒绝请求）
     #[serde(default)]
+    #[serde(alias = "profile_arn")]
     pub profile_arn: Option<String>,
 
     /// Token 过期时间（可选，RFC3339 格式）
     #[serde(default)]
+    #[serde(alias = "expires_at", alias = "expired")]
     pub expires_at: Option<String>,
 
     /// 认证方式（可选，默认 social）
     #[serde(default = "default_auth_method")]
+    #[serde(alias = "auth_method")]
     pub auth_method: String,
 
     /// 身份提供商
     #[serde(default)]
     pub provider: Option<String>,
 
+    /// 身份提供商别名（KAM 导出常用 idp），仅导入归一化使用。
+    #[serde(default)]
+    pub idp: Option<String>,
+
+    /// 外部 IdP 用户标识（旧 KAM 1.1.x 会放 Microsoft issuer + oid），仅导入归一化使用。
+    #[serde(default)]
+    #[serde(alias = "user_id")]
+    pub user_id: Option<String>,
+
     /// OIDC Client ID（IdC 认证需要）
+    #[serde(alias = "client_id")]
     pub client_id: Option<String>,
 
     /// OIDC Client Secret（IdC 认证需要）
+    #[serde(alias = "client_secret")]
     pub client_secret: Option<String>,
 
     /// SSO Start URL（Enterprise / IAM Identity Center 账号专用）
     #[serde(default)]
+    #[serde(alias = "start_url")]
     pub start_url: Option<String>,
 
     /// 企业 SSO (external_idp，如 Microsoft Entra ID / Azure AD) 的 OAuth2 token 端点。
     /// 刷新 external_idp 凭据时必填。
     #[serde(default)]
+    #[serde(alias = "token_endpoint")]
     pub token_endpoint: Option<String>,
 
     /// 企业 SSO 的 OIDC issuer URL（可选，纯记录）
     #[serde(default)]
+    #[serde(alias = "issuer_url")]
     pub issuer_url: Option<String>,
 
     /// 企业 SSO 授予的 scopes（空格分隔，可选）
@@ -167,30 +186,37 @@ pub struct AddCredentialRequest {
     pub region: Option<String>,
 
     /// 凭据级 Auth Region（用于 Token 刷新）
+    #[serde(alias = "auth_region")]
     pub auth_region: Option<String>,
 
     /// 凭据级 API Region（用于 API 请求）
+    #[serde(alias = "api_region")]
     pub api_region: Option<String>,
 
     /// 凭据级 Machine ID（可选，64 位字符串）
     /// 未配置时回退到 config.json 的 machineId
+    #[serde(alias = "machine_id")]
     pub machine_id: Option<String>,
 
     /// 用户邮箱（可选，用于前端显示）
     pub email: Option<String>,
 
     /// 凭据级代理 URL（可选，特殊值 "direct" 表示不使用代理）
+    #[serde(alias = "proxy_url")]
     pub proxy_url: Option<String>,
 
     /// 凭据级代理认证用户名（可选）
+    #[serde(alias = "proxy_username")]
     pub proxy_username: Option<String>,
 
     /// 凭据级代理认证密码（可选）
+    #[serde(alias = "proxy_password")]
     pub proxy_password: Option<String>,
 
     /// Kiro API Key（API Key 凭据必填，格式: ksk_xxxxxxxx）
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "kiro_api_key")]
     pub kiro_api_key: Option<String>,
 
     /// 端点名称（可选，未配置时使用 config.defaultEndpoint）
@@ -1097,4 +1123,46 @@ pub struct DeleteGroupQuery {
     /// 强制删除：即使仍有引用也删；同时级联清理凭据 / Key 的引用
     #[serde(default)]
     pub force: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_add_credential_request_accepts_clipproxyapi_snake_case() {
+        let json = r#"{
+            "refresh_token": "rt",
+            "access_token": "at",
+            "auth_method": "external_idp",
+            "client_id": "client-id",
+            "expired": "2026-01-02T03:04:05Z",
+            "issuer_url": "https://login.microsoftonline.com/tenant/v2.0",
+            "profile_arn": "arn:aws:codewhisperer:us-east-1:123:profile/test",
+            "scopes": "api://client-id/codewhisperer:conversations offline_access",
+            "token_endpoint": "https://login.microsoftonline.com/tenant/oauth2/v2.0/token",
+            "auth_region": "us-east-1",
+            "api_region": "eu-central-1",
+            "machine_id": "machine",
+            "proxy_url": "direct",
+            "kiro_api_key": "ksk_test"
+        }"#;
+
+        let req: AddCredentialRequest = serde_json::from_str(json).unwrap();
+
+        assert_eq!(req.refresh_token.as_deref(), Some("rt"));
+        assert_eq!(req.access_token.as_deref(), Some("at"));
+        assert_eq!(req.auth_method, "external_idp");
+        assert_eq!(req.client_id.as_deref(), Some("client-id"));
+        assert_eq!(req.expires_at.as_deref(), Some("2026-01-02T03:04:05Z"));
+        assert_eq!(
+            req.token_endpoint.as_deref(),
+            Some("https://login.microsoftonline.com/tenant/oauth2/v2.0/token")
+        );
+        assert_eq!(req.auth_region.as_deref(), Some("us-east-1"));
+        assert_eq!(req.api_region.as_deref(), Some("eu-central-1"));
+        assert_eq!(req.machine_id.as_deref(), Some("machine"));
+        assert_eq!(req.proxy_url.as_deref(), Some("direct"));
+        assert_eq!(req.kiro_api_key.as_deref(), Some("ksk_test"));
+    }
 }

@@ -14,7 +14,8 @@ use crate::kiro::auth::idc::{self, BUILDER_ID_START_URL};
 use crate::kiro::auth::social;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::credentials::{
-    normalize_import_auth_method, validate_external_idp_endpoint,
+    ExternalIdpImportFields, complete_external_idp_import_fields,
+    normalize_import_auth_method_from_fields, validate_external_idp_endpoint,
 };
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::Config;
@@ -997,7 +998,7 @@ impl AdminService {
     ///   订阅信息留待首次请求时按需获取。
     async fn add_credential_inner(
         &self,
-        req: AddCredentialRequest,
+        mut req: AddCredentialRequest,
         fetch_balance: bool,
     ) -> Result<AddCredentialResponse, AdminServiceError> {
         // 校验端点名：未指定则默认合法，指定则必须已注册
@@ -1013,9 +1014,42 @@ impl AdminService {
             }
         }
 
-        // 规范化 auth_method：识别企业 SSO 别名；带 tokenEndpoint 但未声明时推断为 external_idp。
-        let auth_method =
-            normalize_import_auth_method(&req.auth_method, req.token_endpoint.as_deref());
+        let completed_external_idp = complete_external_idp_import_fields(ExternalIdpImportFields {
+            auth_method: Some(req.auth_method.as_str()),
+            provider: req.provider.as_deref(),
+            idp: req.idp.as_deref(),
+            token_endpoint: req.token_endpoint.as_deref(),
+            issuer_url: req.issuer_url.as_deref(),
+            scopes: req.scopes.as_deref(),
+            user_id: req.user_id.as_deref(),
+            access_token: req.access_token.as_deref(),
+            client_id: req.client_id.as_deref(),
+        });
+        req.token_endpoint = completed_external_idp.token_endpoint;
+        req.issuer_url = completed_external_idp.issuer_url;
+        req.scopes = completed_external_idp.scopes;
+        if req
+            .provider
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            req.provider = req.idp.take().filter(|idp| !idp.trim().is_empty());
+        }
+
+        // 规范化 auth_method：识别企业 SSO 别名；带 tokenEndpoint / Microsoft issuer / AzureAD 元数据时推断为 external_idp。
+        let auth_method = normalize_import_auth_method_from_fields(ExternalIdpImportFields {
+            auth_method: Some(req.auth_method.as_str()),
+            provider: req.provider.as_deref(),
+            idp: req.idp.as_deref(),
+            token_endpoint: req.token_endpoint.as_deref(),
+            issuer_url: req.issuer_url.as_deref(),
+            scopes: req.scopes.as_deref(),
+            user_id: req.user_id.as_deref(),
+            access_token: req.access_token.as_deref(),
+            client_id: req.client_id.as_deref(),
+        });
 
         // 企业 SSO 导入校验：刷新需要 refreshToken、clientId、tokenEndpoint；
         // tokenEndpoint / issuerUrl 必须过 Microsoft allow-list。

@@ -168,6 +168,167 @@ export const EXTERNAL_IDP_ALIASES = [
   'external',
 ]
 
+const MICROSOFT_IDP_SUFFIXES = [
+  '.microsoftonline.com',
+  '.microsoftonline.us',
+  '.microsoftonline.cn',
+]
+
+interface MicrosoftIdpTenant {
+  host: string
+  tenant: string
+}
+
+export interface ExternalIdpImportFields {
+  authMethod?: string
+  provider?: string
+  idp?: string
+  tokenEndpoint?: string
+  issuerUrl?: string
+  scopes?: string
+  userId?: string | null
+  accessToken?: string
+  clientId?: string
+}
+
+function cleanString(value: string | null | undefined): string | undefined {
+  const trimmed = value?.trim()
+  return trimmed ? trimmed : undefined
+}
+
+function isExternalIdpAlias(value: string | null | undefined): boolean {
+  const normalized = cleanString(value)?.toLowerCase()
+  return normalized ? EXTERNAL_IDP_ALIASES.includes(normalized) : false
+}
+
+function extractMicrosoftIdpTenant(raw: string | null | undefined): MicrosoftIdpTenant | undefined {
+  const value = cleanString(raw)
+  if (!value) return undefined
+
+  try {
+    const url = new URL(value)
+    if (url.protocol !== 'https:') return undefined
+
+    const host = url.hostname.toLowerCase()
+    const loginHost = host === 'sts.windows.net'
+      ? 'login.microsoftonline.com'
+      : MICROSOFT_IDP_SUFFIXES.some(suffix => host.endsWith(suffix))
+        ? host
+        : undefined
+    if (!loginHost) return undefined
+
+    const tenant = url.pathname.split('/').filter(Boolean)[0]
+    if (!tenant || tenant === 'oauth2' || tenant === 'v2.0') return undefined
+
+    return { host: loginHost, tenant }
+  } catch {
+    return undefined
+  }
+}
+
+function defaultExternalIdpScopes(clientId: string | undefined): string | undefined {
+  const id = cleanString(clientId)
+  if (!id) return undefined
+  return [
+    `api://${id}/codewhisperer:conversations`,
+    `api://${id}/codewhisperer:completions`,
+    'offline_access',
+  ].join(' ')
+}
+
+function normalizeExternalIdpScopes(rawScopes: string, clientId: string | undefined): string | undefined {
+  const scopes = rawScopes.split(/\s+/).map(s => s.trim()).filter(Boolean)
+  if (scopes.length === 0) return defaultExternalIdpScopes(clientId)
+
+  const id = cleanString(clientId)
+  const normalized: string[] = []
+  for (const scope of scopes) {
+    let next = scope
+    if (id && !scope.includes('://') && scope !== 'offline_access') {
+      next = `api://${id}/${scope.replace(/^\/+/, '')}`
+    }
+    if (!normalized.some(existing => existing.toLowerCase() === next.toLowerCase())) {
+      normalized.push(next)
+    }
+  }
+
+  if (id && !normalized.some(scope => scope.toLowerCase() === 'offline_access')) {
+    normalized.push('offline_access')
+  }
+
+  return normalized.length > 0 ? normalized.join(' ') : undefined
+}
+
+function decodeJwtPayload(accessToken: string | undefined): Record<string, unknown> | undefined {
+  const token = cleanString(accessToken)
+  const payload = token?.split('.')[1]
+  if (!payload) return undefined
+
+  try {
+    const base64 = payload.replace(/-/g, '+').replace(/_/g, '/')
+    const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, '=')
+    const binary = atob(padded)
+    const bytes = Uint8Array.from(binary, c => c.charCodeAt(0))
+    const json = new TextDecoder().decode(bytes)
+    const parsed = JSON.parse(json)
+    return parsed && typeof parsed === 'object' ? parsed : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function deriveJwtIssuer(accessToken: string | undefined): string | undefined {
+  const payload = decodeJwtPayload(accessToken)
+  return typeof payload?.iss === 'string' ? payload.iss : undefined
+}
+
+function deriveExternalIdpScopesFromAccessToken(
+  accessToken: string | undefined,
+  clientId: string | undefined,
+): string | undefined {
+  const payload = decodeJwtPayload(accessToken)
+  const scp = typeof payload?.scp === 'string' ? payload.scp : undefined
+  return scp ? normalizeExternalIdpScopes(scp, clientId) : undefined
+}
+
+function isExternalIdpImportLike(fields: ExternalIdpImportFields): boolean {
+  return (
+    isExternalIdpAlias(fields.authMethod) ||
+    isExternalIdpAlias(fields.provider) ||
+    isExternalIdpAlias(fields.idp) ||
+    Boolean(cleanString(fields.tokenEndpoint)) ||
+    Boolean(extractMicrosoftIdpTenant(fields.issuerUrl)) ||
+    Boolean(extractMicrosoftIdpTenant(fields.userId)) ||
+    Boolean(extractMicrosoftIdpTenant(deriveJwtIssuer(fields.accessToken)))
+  )
+}
+
+export function completeExternalIdpImportFields(
+  fields: ExternalIdpImportFields,
+): Pick<ExternalIdpImportFields, 'tokenEndpoint' | 'issuerUrl' | 'scopes'> {
+  const tokenEndpoint = cleanString(fields.tokenEndpoint)
+  const issuerUrl = cleanString(fields.issuerUrl)
+  const scopes = cleanString(fields.scopes)
+    ? normalizeExternalIdpScopes(fields.scopes!, fields.clientId)
+    : undefined
+  if (!isExternalIdpImportLike(fields)) return { tokenEndpoint, issuerUrl, scopes }
+
+  const tenant =
+    extractMicrosoftIdpTenant(tokenEndpoint) ||
+    extractMicrosoftIdpTenant(issuerUrl) ||
+    extractMicrosoftIdpTenant(fields.userId) ||
+    extractMicrosoftIdpTenant(deriveJwtIssuer(fields.accessToken))
+
+  return {
+    tokenEndpoint: tokenEndpoint || (tenant ? `https://${tenant.host}/${tenant.tenant}/oauth2/v2.0/token` : undefined),
+    issuerUrl: issuerUrl || (tenant ? `https://${tenant.host}/${tenant.tenant}/v2.0` : undefined),
+    scopes:
+      scopes ||
+      deriveExternalIdpScopesFromAccessToken(fields.accessToken, fields.clientId) ||
+      defaultExternalIdpScopes(fields.clientId),
+  }
+}
+
 /**
  * 导入路径的 authMethod 归一化，与后端 `normalize_import_auth_method` 对齐：
  * - 命中企业 SSO 别名，或携带 `tokenEndpoint`（social/idc 均无此字段）→ `external_idp`
@@ -179,14 +340,25 @@ export const EXTERNAL_IDP_ALIASES = [
  */
 export function normalizeImportAuthMethod(
   raw: string | undefined,
-  opts: { tokenEndpoint?: string; clientId?: string; clientSecret?: string },
+  opts: {
+    tokenEndpoint?: string
+    issuerUrl?: string
+    scopes?: string
+    userId?: string | null
+    accessToken?: string
+    clientId?: string
+    clientSecret?: string
+    provider?: string
+    idp?: string
+  },
 ): { authMethod: 'social' | 'idc' | 'external_idp'; error?: string } {
   const am = (raw || '').trim().toLowerCase()
   const clientId = opts.clientId?.trim()
   const clientSecret = opts.clientSecret?.trim()
-  const tokenEndpoint = opts.tokenEndpoint?.trim()
+  const completed = completeExternalIdpImportFields({ authMethod: raw, ...opts })
+  const tokenEndpoint = completed.tokenEndpoint?.trim()
 
-  if (EXTERNAL_IDP_ALIASES.includes(am) || tokenEndpoint) {
+  if (EXTERNAL_IDP_ALIASES.includes(am) || isExternalIdpImportLike({ authMethod: raw, ...opts, ...completed })) {
     if (!clientId || !tokenEndpoint) {
       return {
         authMethod: 'external_idp',
@@ -324,4 +496,3 @@ export function generateApiKey(prefix: string = 'sk-kiro-', randomLen: number = 
   }
   return prefix + out
 }
-
