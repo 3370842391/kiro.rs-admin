@@ -370,7 +370,32 @@ fn resolve_usage_input_tokens(
 }
 
 fn available_models() -> Vec<Model> {
-    vec![
+    let model = |id: &str, display_name: &str, owned_by: &str, max_tokens: i32| Model {
+        id: id.to_string(),
+        object: "model".to_string(),
+        created: 1781481600,
+        owned_by: owned_by.to_string(),
+        display_name: display_name.to_string(),
+        model_type: "chat".to_string(),
+        max_tokens,
+    };
+
+    let mut models = vec![
+        model("auto", "Auto", "kiro", 64000),
+        model("claude-sonnet-5", "Claude Sonnet 5", "anthropic", 64000),
+        model("claude-opus-4.8", "Claude Opus 4.8", "anthropic", 64000),
+        model("claude-opus-4.7", "Claude Opus 4.7", "anthropic", 64000),
+        model("claude-opus-4.6", "Claude Opus 4.6", "anthropic", 64000),
+        model("claude-sonnet-4.6", "Claude Sonnet 4.6", "anthropic", 64000),
+        model("claude-opus-4.5", "Claude Opus 4.5", "anthropic", 64000),
+        model("claude-sonnet-4.5", "Claude Sonnet 4.5", "anthropic", 64000),
+        model("claude-sonnet-4", "Claude Sonnet 4", "anthropic", 64000),
+        model("claude-haiku-4.5", "Claude Haiku 4.5", "anthropic", 64000),
+        model("deepseek-3.2", "DeepSeek v3.2", "deepseek", 64000),
+        model("minimax-m2.5", "MiniMax M2.5", "minimax", 64000),
+        model("minimax-m2.1", "MiniMax M2.1", "minimax", 64000),
+        model("glm-5", "GLM 5", "zhipu", 64000),
+        model("qwen3-coder-next", "Qwen3 Coder Next", "qwen", 64000),
         Model {
             id: "claude-fable-5".to_string(),
             object: "model".to_string(),
@@ -551,7 +576,11 @@ fn available_models() -> Vec<Model> {
             model_type: "chat".to_string(),
             max_tokens: 64000,
         },
-    ]
+    ];
+
+    let mut seen = std::collections::HashSet::new();
+    models.retain(|model| seen.insert(model.id.clone()));
+    models
 }
 
 /// GET /v1/models
@@ -1918,6 +1947,35 @@ mod tests {
 
         assert!(ids.contains(&"claude-opus-4-7"));
         assert!(ids.contains(&"claude-opus-4-7-thinking"));
+    }
+
+    #[test]
+    fn available_models_include_native_kiro_models() {
+        let models = available_models();
+        let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+
+        assert!(ids.contains(&"auto"));
+        assert!(ids.contains(&"deepseek-3.2"));
+        assert!(ids.contains(&"minimax-m2.5"));
+        assert!(ids.contains(&"minimax-m2.1"));
+        assert!(ids.contains(&"glm-5"));
+        assert!(ids.contains(&"qwen3-coder-next"));
+        assert!(ids.contains(&"claude-sonnet-4.6"));
+        assert!(ids.contains(&"claude-opus-4.8"));
+    }
+
+    #[test]
+    fn available_models_have_unique_ids() {
+        let models = available_models();
+        let mut seen = std::collections::HashSet::new();
+
+        for model in models {
+            assert!(
+                seen.insert(model.id.clone()),
+                "duplicate model id: {}",
+                model.id
+            );
+        }
     }
 
     #[test]

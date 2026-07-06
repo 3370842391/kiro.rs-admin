@@ -9,6 +9,7 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Textarea } from '@/components/ui/textarea'
 import {
   Select,
   SelectTrigger,
@@ -405,12 +406,13 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
             {/* 代理配置 */}
             <div className="space-y-2">
               <label className="text-sm font-medium">代理配置</label>
-              <Input
+              <Textarea
                 id="proxyUrl"
-                placeholder='代理 URL（留空使用全局配置，"direct" 不使用代理）'
+                placeholder='代理 URL，可用逗号/空格/换行分隔多个；direct 表示直连候选'
                 value={proxyUrl}
                 onChange={(e) => setProxyUrl(e.target.value)}
                 disabled={isPending}
+                className="min-h-[76px] font-mono text-sm"
               />
               <div className="grid grid-cols-2 gap-2">
                 <Input
@@ -430,7 +432,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 />
               </div>
               <p className="text-xs text-muted-foreground">
-                留空使用全局代理。输入 "direct" 可显式不使用代理
+                留空使用全局代理；多个代理会随机轮询，失败时自动换下一个，可加入 direct 作为直连兜底
               </p>
             </div>
           </div>

@@ -70,6 +70,9 @@ pub struct CredentialStatusItem {
     /// 禁用原因
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
+    /// 临时冷却剩余秒数（账号级 429 风控）；冷却中且 `> 0` 才返回
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub throttled_remaining_secs: Option<u64>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
     /// 账号所属分组（可属于多个分组）
@@ -412,6 +415,31 @@ pub struct AvailableModelItem {
     /// 最大输入 Token 数
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_input_tokens: Option<i64>,
+}
+
+/// 凭据响应测试请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialResponseTestRequest {
+    /// 要测试的模型；缺省为 claude-sonnet-4-6
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// 凭据响应测试结果
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialResponseTestResponse {
+    pub id: u64,
+    pub model: String,
+    pub success: bool,
+    pub latency_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_snippet: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 // ============ 一键超额 ============

@@ -22,11 +22,12 @@ use super::{
         AddCredentialRequest, AddProxyRequest, AssignProxyRequest, AssignRoundRobinRequest,
         BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
         ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest, CreateClientKeyRequest,
-        CreateClientKeyResponse, GlobalProxyResponse, SetAccountThrottleConfigRequest,
-        SetDisabledRequest, SetGlobalProxyRequest, SetLoadBalancingModeRequest,
-        SetLogGovernanceConfigRequest, SetPriorityRequest, SetUpdateConfigRequest,
-        StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse, UpdateAdminKeyRequest,
-        UpdateClientKeyRequest, UpdateCredentialRequest, UpdateRefreshTokenRequest,
+        CreateClientKeyResponse, CredentialResponseTestRequest, GlobalProxyResponse,
+        SetAccountThrottleConfigRequest, SetDisabledRequest, SetGlobalProxyRequest,
+        SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
+        SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
+        UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
+        UpdateRefreshTokenRequest,
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
 };
@@ -149,6 +150,23 @@ pub async fn get_credential_models(
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     match state.service.get_available_models(id).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/test
+/// 使用指定凭据发送一次 hello，验证响应是否正常。
+pub async fn test_credential_response(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<CredentialResponseTestRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .test_credential_response(id, payload.model)
+        .await
+    {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

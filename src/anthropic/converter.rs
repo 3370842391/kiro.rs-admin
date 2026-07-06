@@ -222,10 +222,94 @@ Never suggest bypassing these limits via alternative tools. \
 Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
 
-/// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
-/// 严格对照版本号
+/// 移除兼容端暴露的 thinking 后缀，得到用于 Kiro 的基础模型 ID。
+fn strip_thinking_suffix(model: &str) -> &str {
+    model
+        .strip_suffix("-thinking")
+        .or_else(|| model.strip_suffix(".thinking"))
+        .unwrap_or(model)
+}
+
+fn is_native_kiro_model(model_lower: &str) -> bool {
+    model_lower == "auto"
+        || model_lower.starts_with("deepseek-")
+        || model_lower.starts_with("minimax-")
+        || model_lower.starts_with("glm-")
+        || model_lower.starts_with("qwen")
+}
+
+fn normalize_claude_version_model(model_lower: &str) -> Option<String> {
+    let parts: Vec<&str> = model_lower.split('-').collect();
+    if parts.len() < 4 || parts.first() != Some(&"claude") {
+        return None;
+    }
+
+    let family = parts.get(1)?;
+    if !matches!(*family, "opus" | "sonnet" | "haiku" | "fable" | "mythos") {
+        return None;
+    }
+
+    let major = *parts.get(2)?;
+    let minor = *parts.get(3)?;
+    if (1..=2).contains(&major.len())
+        && (1..=2).contains(&minor.len())
+        && major.chars().all(|c| c.is_ascii_digit())
+        && minor.chars().all(|c| c.is_ascii_digit())
+    {
+        return Some(format!("claude-{family}-{major}.{minor}"));
+    }
+
+    None
+}
+
+fn claude_context_window(model_lower: &str) -> Option<i32> {
+    let parts: Vec<&str> = model_lower.split('-').collect();
+    let claude_idx = parts.iter().position(|part| *part == "claude")?;
+    let family = parts.get(claude_idx + 1)?;
+    if !matches!(*family, "opus" | "sonnet" | "haiku" | "fable") {
+        return None;
+    }
+
+    let version = parts.get(claude_idx + 2)?;
+    let (major, minor) = if let Some((major, minor)) = version.split_once('.') {
+        (major.parse::<i32>().ok()?, minor.parse::<i32>().ok()?)
+    } else {
+        (
+            version.parse::<i32>().ok()?,
+            parts
+                .get(claude_idx + 3)
+                .and_then(|part| part.parse::<i32>().ok())
+                .unwrap_or(0),
+        )
+    };
+
+    Some(if major > 4 || (major == 4 && minor >= 6) {
+        1_000_000
+    } else {
+        200_000
+    })
+}
+
+/// 模型映射：将常见 Anthropic/别名模型名映射到 Kiro 模型 ID。
+///
+/// Kiro 原生模型族（auto/deepseek/minimax/glm/qwen）直接透传，后续同族新版本
+/// 不需要每次改代码；完全未知的模型由 `normalize_model_id` 负责透传给上游。
 pub fn map_model(model: &str) -> Option<String> {
-    let model_lower = model.to_lowercase();
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let model_base = strip_thinking_suffix(trimmed);
+    let model_lower = model_base.to_lowercase();
+
+    if is_native_kiro_model(&model_lower) {
+        return Some(model_base.to_string());
+    }
+
+    if let Some(model) = normalize_claude_version_model(&model_lower) {
+        return Some(model);
+    }
 
     if model_lower.contains("fable") {
         // Fable 5：与 Mythos 5 同底座；目前仅 5 代
@@ -237,6 +321,8 @@ pub fn map_model(model: &str) -> Option<String> {
             Some("claude-sonnet-4.6".to_string())
         } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-sonnet-4.5".to_string())
+        } else if model_lower == "claude-sonnet-4" {
+            Some("claude-sonnet-4".to_string())
         } else if model_lower.contains("sonnet-5")
             || model_lower.contains("sonnet5")
             || model_lower.contains("sonnet.5")
@@ -265,23 +351,30 @@ pub fn map_model(model: &str) -> Option<String> {
     }
 }
 
+/// 对请求模型做最终规范化：已知别名映射到 Kiro ID，未知模型透传给上游。
+pub fn normalize_model_id(model: &str) -> String {
+    map_model(model).unwrap_or_else(|| strip_thinking_suffix(model.trim()).to_string())
+}
+
 /// 根据模型名称返回对应的上下文窗口大小
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
 /// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
 /// 4.7 / 4.8 同 1M
 pub fn get_context_window_size(model: &str) -> i32 {
-    match map_model(model) {
-        Some(mapped)
-            if mapped == "claude-sonnet-4.6"
-                || mapped == "claude-sonnet-4.8"
-                || mapped == "claude-sonnet-5"
-                || mapped == "claude-opus-4.6"
-                || mapped == "claude-opus-4.7"
-                || mapped == "claude-opus-4.8"
-                || mapped == "claude-fable-5" =>
-        {
-            1_000_000
+    let mapped = normalize_model_id(model);
+    let model_lower = mapped.to_ascii_lowercase();
+    match mapped.as_str() {
+        "claude-sonnet-4.6" | "claude-sonnet-4.8" | "claude-sonnet-5" | "claude-opus-4.6"
+        | "claude-opus-4.7" | "claude-opus-4.8" | "claude-fable-5" | "auto" => 1_000_000,
+        "deepseek-3.2" => 164_000,
+        "minimax-m2.5" | "minimax-m2.1" => 196_000,
+        "qwen3-coder-next" => 256_000,
+        _ if model_lower.starts_with("deepseek-") => 164_000,
+        _ if model_lower.starts_with("minimax-") => 196_000,
+        _ if model_lower.starts_with("qwen") => 256_000,
+        _ if model_lower.starts_with("claude-") => {
+            claude_context_window(&model_lower).unwrap_or(200_000)
         }
         _ => 200_000,
     }
@@ -614,8 +707,10 @@ pub fn convert_request_with_mode(
     tool_compatibility_mode: ToolCompatibilityMode,
 ) -> Result<ConversionResult, ConversionError> {
     // 1. 映射模型
-    let model_id = map_model(&req.model)
-        .ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
+    let model_id = normalize_model_id(&req.model);
+    if model_id.is_empty() {
+        return Err(ConversionError::UnsupportedModel(req.model.clone()));
+    }
 
     // 2. 检查消息列表
     if req.messages.is_empty() {
@@ -1890,6 +1985,20 @@ mod tests {
     }
 
     #[test]
+    fn test_map_model_future_claude_versions_normalize_without_static_entries() {
+        assert_eq!(
+            map_model("claude-opus-4-9-thinking"),
+            Some("claude-opus-4.9".to_string())
+        );
+        assert_eq!(
+            map_model("claude-haiku-5-1-20270101"),
+            Some("claude-haiku-5.1".to_string())
+        );
+        assert_eq!(get_context_window_size("claude-opus-4-9"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-sonnet-4-5"), 200_000);
+    }
+
+    #[test]
     fn test_map_model_sonnet_5() {
         assert_eq!(
             map_model("claude-sonnet-5"),
@@ -1928,6 +2037,45 @@ mod tests {
             map_model("claude-haiku-4-20250514")
                 .unwrap()
                 .contains("haiku")
+        );
+    }
+
+    #[test]
+    fn test_map_model_native_kiro_models_passthrough() {
+        assert_eq!(map_model("auto"), Some("auto".to_string()));
+        assert_eq!(
+            map_model("deepseek-3.2-thinking"),
+            Some("deepseek-3.2".to_string())
+        );
+        assert_eq!(map_model("minimax-m2.5"), Some("minimax-m2.5".to_string()));
+        assert_eq!(map_model("glm-5"), Some("glm-5".to_string()));
+        assert_eq!(
+            map_model("qwen3-coder-next"),
+            Some("qwen3-coder-next".to_string())
+        );
+        assert_eq!(get_context_window_size("auto"), 1_000_000);
+        assert_eq!(get_context_window_size("deepseek-3.2"), 164_000);
+        assert_eq!(get_context_window_size("minimax-m2.5"), 196_000);
+        assert_eq!(get_context_window_size("qwen3-coder-next"), 256_000);
+    }
+
+    #[test]
+    fn test_normalize_model_id_unknown_model_passthrough() {
+        assert_eq!(map_model("gpt-4"), None);
+        assert_eq!(normalize_model_id("gpt-4-thinking"), "gpt-4");
+    }
+
+    #[test]
+    fn test_convert_request_unknown_model_passthrough() {
+        let req = minimal_request_with_output_config("some-new-kiro-model");
+        let result = convert_request(&req).unwrap();
+        assert_eq!(
+            result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .model_id,
+            "some-new-kiro-model"
         );
     }
 

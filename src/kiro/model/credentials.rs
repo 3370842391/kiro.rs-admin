@@ -479,6 +479,7 @@ pub(crate) fn normalize_import_auth_method_from_fields(
 /// 在别名规范化之外，额外做一步推断：若显式声明的方式不是企业 SSO，但携带了
 /// `tokenEndpoint`（social/idc 均无此字段），则判定为 `external_idp`。这样即便粘贴的
 /// JSON 未写 authMethod，只要带 tokenEndpoint 就能被正确识别。
+#[allow(dead_code)]
 pub(crate) fn normalize_import_auth_method(raw: &str, token_endpoint: Option<&str>) -> String {
     let canonical = canonicalize_auth_method_value(raw.trim());
     if canonical.eq_ignore_ascii_case("external_idp") {
@@ -640,6 +641,46 @@ impl KiroCredentials {
             }
             None => global_proxy.cloned(),
         }
+    }
+
+    /// 获取有效代理候选列表。
+    ///
+    /// `proxy_url` 可为单个 URL，也可用逗号/空白/换行分隔多个 URL；`direct` 会作为直连候选。
+    /// 凭据未配置时继承全局候选；凭据显式配置时不再追加全局候选。
+    pub fn effective_proxy_candidates(
+        &self,
+        global_proxies: &[Option<ProxyConfig>],
+    ) -> Vec<Option<ProxyConfig>> {
+        let own = self
+            .proxy_url
+            .as_deref()
+            .map(ProxyConfig::split_candidates)
+            .unwrap_or_default();
+
+        if own.is_empty() {
+            return if global_proxies.is_empty() {
+                vec![None]
+            } else {
+                global_proxies.to_vec()
+            };
+        }
+
+        let mut out = Vec::new();
+        for candidate in own {
+            if !ProxyConfig::is_supported_entry(&candidate) {
+                continue;
+            }
+            let next = ProxyConfig::from_url_with_auth(
+                candidate,
+                self.proxy_username.as_deref(),
+                self.proxy_password.as_deref(),
+            );
+            if !out.iter().any(|existing| existing == &next) {
+                out.push(next);
+            }
+        }
+
+        if out.is_empty() { vec![None] } else { out }
     }
 
     pub fn canonicalize_auth_method(&mut self) {
@@ -1546,6 +1587,28 @@ mod tests {
 
         let result = creds.effective_proxy(Some(&global));
         assert_eq!(result, Some(ProxyConfig::new("http://global:8080")));
+    }
+
+    #[test]
+    fn test_effective_proxy_candidates_parse_multiple_and_direct() {
+        let mut creds = KiroCredentials::default();
+        creds.proxy_url = Some("socks5://p1:1080, direct http://p2:8080".to_string());
+        let result = creds.effective_proxy_candidates(&[]);
+        assert_eq!(
+            result,
+            vec![
+                Some(ProxyConfig::new("socks5://p1:1080")),
+                None,
+                Some(ProxyConfig::new("http://p2:8080")),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_effective_proxy_candidates_fallback_to_global_candidates() {
+        let creds = KiroCredentials::default();
+        let global = vec![Some(ProxyConfig::new("http://global:8080")), None];
+        assert_eq!(creds.effective_proxy_candidates(&global), global);
     }
 
     #[test]

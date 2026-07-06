@@ -19,6 +19,7 @@ import {
   SelectItem,
 } from '@/components/ui/select'
 import { Input } from '@/components/ui/input'
+import { Textarea } from '@/components/ui/textarea'
 import { useUpdateCredential } from '@/hooks/use-credentials'
 import { useGroupOptions } from '@/hooks/use-groups'
 import { getProxyPool } from '@/api/credentials'
@@ -228,12 +229,12 @@ export function EditCredentialDialog({
 
               {/* 自定义 URL 手动输入框 */}
               {showManualInput && (
-                <Input
-                  placeholder='自定义代理 URL（如 socks5://user:pass@host:port）'
+                <Textarea
+                  placeholder='自定义代理 URL；多个用逗号/空格/换行分隔，可加入 direct'
                   value={proxyUrl}
                   onChange={(e) => setProxyUrl(e.target.value)}
                   disabled={isPending}
-                  className="font-mono text-sm"
+                  className="min-h-[76px] font-mono text-sm"
                 />
               )}
 
@@ -256,7 +257,7 @@ export function EditCredentialDialog({
                 />
               </div>
               <p className="text-xs text-muted-foreground">
-                用户名/密码留空表示不修改；代理 URL 已包含凭据时无需填写
+                用户名/密码留空表示不修改；多个代理会随机轮询，失败时自动换下一个
               </p>
             </div>
           </div>

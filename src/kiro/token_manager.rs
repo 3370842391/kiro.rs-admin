@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1321,6 +1321,15 @@ impl MultiTokenManager {
         model: Option<&str>,
         group: Option<&str>,
     ) -> Option<(u64, KiroCredentials)> {
+        self.select_next_credential_excluding(model, group, &HashSet::new())
+    }
+
+    fn select_next_credential_excluding(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+    ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
         let now = Instant::now();
 
@@ -1328,6 +1337,9 @@ impl MultiTokenManager {
         let available: Vec<_> = entries
             .iter()
             .filter(|e| {
+                if excluded_ids.contains(&e.id) {
+                    return false;
+                }
                 if e.disabled {
                     return false;
                 }
@@ -1382,6 +1394,22 @@ impl MultiTokenManager {
         }
     }
 
+    pub fn has_available_excluding(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+    ) -> bool {
+        let now = Instant::now();
+        self.entries.lock().iter().any(|e| {
+            !excluded_ids.contains(&e.id)
+                && !e.disabled
+                && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                && credential_matches_request(&e.credentials, model, group)
+                && !is_rpm_exceeded(e, now)
+        })
+    }
+
     /// 获取 API 调用上下文
     ///
     /// 返回绑定了 id、credentials 和 token 的调用上下文
@@ -1396,6 +1424,16 @@ impl MultiTokenManager {
         &self,
         model: Option<&str>,
         group: Option<&str>,
+    ) -> anyhow::Result<CallContext> {
+        self.acquire_context_excluding(model, group, &HashSet::new())
+            .await
+    }
+
+    pub async fn acquire_context_excluding(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        excluded_ids: &HashSet<u64>,
     ) -> anyhow::Result<CallContext> {
         let total = self.total_count_in_group(group);
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
@@ -1426,6 +1464,7 @@ impl MultiTokenManager {
                         .iter()
                         .find(|e| {
                             e.id == current_id
+                                && !excluded_ids.contains(&e.id)
                                 && !e.disabled
                                 && !e.throttled_until.map(|t| t > now).unwrap_or(false)
                                 && !is_rpm_exceeded(e, now)
@@ -1438,7 +1477,8 @@ impl MultiTokenManager {
                     hit
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model, group);
+                    let mut best =
+                        self.select_next_credential_excluding(model, group, excluded_ids);
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                     if best.is_none() {
@@ -1457,7 +1497,8 @@ impl MultiTokenManager {
                                 }
                             }
                             drop(entries);
-                            best = self.select_next_credential(model, group);
+                            best =
+                                self.select_next_credential_excluding(model, group, excluded_ids);
                         }
                     }
 
@@ -1507,8 +1548,26 @@ impl MultiTokenManager {
         }
     }
 
+    /// 获取指定凭据的调用上下文，用于 Admin 显式测试等不参与负载均衡的请求。
+    pub async fn acquire_context_for_id(&self, id: u64) -> anyhow::Result<CallContext> {
+        let credentials = {
+            let entries = self.entries.lock();
+            let entry = entries
+                .iter()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            if entry.disabled {
+                anyhow::bail!("凭据 #{} 已禁用", id);
+            }
+            entry.credentials.clone()
+        };
+
+        let ctx = self.try_ensure_token(id, &credentials).await?;
+        self.inc_in_flight(ctx.id);
+        Ok(ctx)
+    }
+
     /// 选择优先级最高的未禁用凭据作为当前凭据（内部方法）
-    ///
     /// 纯粹按优先级选择，不排除当前凭据，用于优先级变更后立即生效
     fn select_highest_priority(&self) {
         let entries = self.entries.lock();
@@ -4978,6 +5037,29 @@ mod tests {
             opus.id, 2,
             "priority current_id must not bypass Opus subscription filtering"
         );
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_excluding_skips_current_priority_credential() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("a", &[]), grouped_cred("b", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let first = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(first.id, 1);
+
+        let excluded = HashSet::from([first.id]);
+        assert!(manager.has_available_excluding(None, None, &excluded));
+        let next = manager
+            .acquire_context_excluding(None, None, &excluded)
+            .await
+            .unwrap();
+        assert_eq!(next.id, 2);
     }
 
     #[test]

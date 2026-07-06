@@ -17,6 +17,7 @@ use crate::kiro::model::credentials::{
     ExternalIdpImportFields, complete_external_idp_import_fields,
     normalize_import_auth_method_from_fields, validate_external_idp_endpoint,
 };
+use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::Config;
 
@@ -25,11 +26,12 @@ use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
     AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse, AssignProxyRequest,
     AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse, BalanceResponse,
-    BatchAddProxyRequest, BatchImportEvent, CheckRateLimitRequest, CredentialStatusItem,
-    CredentialsExportResponse, CredentialsStatusResponse, EnableOverageAllResult, ExportedAccount,
-    ExportedCredentials, GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
-    LogGovernanceConfigResponse, PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse,
-    ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult, SetAccountThrottleConfigRequest,
+    BatchAddProxyRequest, BatchImportEvent, CheckRateLimitRequest, CredentialResponseTestResponse,
+    CredentialStatusItem, CredentialsExportResponse, CredentialsStatusResponse,
+    EnableOverageAllResult, ExportedAccount, ExportedCredentials, GitHubRateLimitInfo,
+    ImageUpdateResponse, LoadBalancingModeResponse, LogGovernanceConfigResponse,
+    PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry,
+    ProxyPoolResponse, QuotaExceededResult, SetAccountThrottleConfigRequest,
     SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetUpdateConfigRequest,
     StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse,
     UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
@@ -43,6 +45,26 @@ const BALANCE_CACHE_TTL_SECS: i64 = 300;
 /// Docker Hub 的 tags 接口对匿名访问有 IP 维度的限流，30 分钟 TTL 既能让用户
 /// 看到红点提醒，又能避免短时间内重复请求被限流。
 const UPDATE_CHECK_TTL_SECS: i64 = 1800;
+
+const DEFAULT_RESPONSE_TEST_MODEL: &str = "claude-sonnet-4-6";
+
+fn normalize_proxy_list(raw: &str) -> Result<Option<String>, AdminServiceError> {
+    let candidates = ProxyConfig::split_candidates(raw);
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    for candidate in &candidates {
+        if !ProxyConfig::is_supported_entry(candidate) {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "代理 URL 格式无效: {}。支持 http://、https://、socks5://、socks4://，多个代理可用逗号/空格/换行分隔，direct 表示直连候选",
+                candidate
+            )));
+        }
+    }
+
+    Ok(Some(candidates.join("\n")))
+}
 
 /// 缓存的余额条目（含时间戳）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,6 +190,8 @@ pub struct AdminService {
     trace_store: Option<crate::admin::trace_db::SharedTraceStore>,
     /// 用量日志记录器（用于日志治理：保留天数运行时可改）
     usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
+    /// 与 Anthropic 路由共享的 KiroProvider，用于 Admin 显式响应测试。
+    kiro_provider: Option<Arc<KiroProvider>>,
 }
 
 /// Social 登录会话状态
@@ -490,6 +514,7 @@ impl AdminService {
             social_sessions: Arc::new(Mutex::new(HashMap::new())),
             trace_store: None,
             usage_recorder: None,
+            kiro_provider: None,
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -523,6 +548,12 @@ impl AdminService {
     ) -> Self {
         self.trace_store = trace_store;
         self.usage_recorder = usage_recorder;
+        self
+    }
+
+    /// 注入与业务 API 共享的 KiroProvider。
+    pub fn with_kiro_provider(mut self, provider: Arc<KiroProvider>) -> Self {
+        self.kiro_provider = Some(provider);
         self
     }
 
@@ -571,6 +602,7 @@ impl AdminService {
                     proxy_url: entry.proxy_url,
                     refresh_failure_count: entry.refresh_failure_count,
                     disabled_reason: entry.disabled_reason,
+                    throttled_remaining_secs: entry.throttled_remaining_secs,
                     endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
                     groups: entry.groups,
                     source_channel: entry.source_channel,
@@ -810,6 +842,35 @@ impl AdminService {
             .collect();
 
         Ok(AvailableModelsResponse { id, models })
+    }
+
+    /// 使用指定凭据发送一次 hello，验证模型响应和耗时。
+    pub async fn test_credential_response(
+        &self,
+        id: u64,
+        model: Option<String>,
+    ) -> Result<CredentialResponseTestResponse, AdminServiceError> {
+        let model = model
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| DEFAULT_RESPONSE_TEST_MODEL.to_string());
+        let provider = self.kiro_provider.as_ref().ok_or_else(|| {
+            AdminServiceError::InternalError("KiroProvider 未初始化，无法测试响应".to_string())
+        })?;
+        let result = provider
+            .test_credential_response(id, &model)
+            .await
+            .map_err(|e| self.classify_balance_error(e, id))?;
+
+        Ok(CredentialResponseTestResponse {
+            id: result.credential_id,
+            model: result.model,
+            success: result.success,
+            latency_ms: result.latency_ms,
+            http_status: result.http_status,
+            response_snippet: result.response_snippet,
+            error: result.error,
+        })
     }
 
     /// 批量刷新所有非禁用凭据的余额（用于后台调度）
@@ -1092,6 +1153,11 @@ impl AdminService {
             }
         }
 
+        req.proxy_url = match req.proxy_url.take() {
+            Some(raw) => normalize_proxy_list(&raw)?,
+            None => None,
+        };
+
         // 构建凭据对象
         let email = req.email.clone();
         let new_cred = KiroCredentials {
@@ -1235,12 +1301,16 @@ impl AdminService {
         id: u64,
         req: UpdateCredentialRequest,
     ) -> Result<(), AdminServiceError> {
+        let proxy_url = match req.proxy_url {
+            Some(raw) => Some(normalize_proxy_list(&raw)?),
+            None => None,
+        };
+
         self.token_manager
             .update_credential(
                 id,
                 req.email.map(|v| if v.is_empty() { None } else { Some(v) }),
-                req.proxy_url
-                    .map(|v| if v.is_empty() { None } else { Some(v) }),
+                proxy_url,
                 req.proxy_username
                     .map(|v| if v.is_empty() { None } else { Some(v) }),
                 req.proxy_password
@@ -1299,24 +1369,15 @@ impl AdminService {
 
     /// 设置全局代理 URL（None 表示清除）并持久化到配置文件
     pub fn set_global_proxy(&self, url: Option<String>) -> Result<(), AdminServiceError> {
-        if let Some(ref u) = url {
-            let valid_prefix = u.starts_with("http://")
-                || u.starts_with("https://")
-                || u.starts_with("socks5://")
-                || u.starts_with("socks4://");
-            if !valid_prefix {
-                return Err(AdminServiceError::InvalidCredential(
-                    "代理 URL 格式无效，需以 http://、https://、socks5:// 或 socks4:// 开头"
-                        .to_string(),
-                ));
-            }
-        }
-
-        let proxy = url.as_deref().map(ProxyConfig::new);
+        let normalized = match url {
+            Some(raw) => normalize_proxy_list(&raw)?,
+            None => None,
+        };
+        let proxy = normalized.as_deref().map(ProxyConfig::new);
         self.token_manager.set_global_proxy(proxy);
 
         // 从磁盘加载最新 config 再写，避免覆盖其他字段的并发修改
-        let url_for_save = url;
+        let url_for_save = normalized;
         self.update_config_file(move |c| c.proxy_url = url_for_save);
         Ok(())
     }

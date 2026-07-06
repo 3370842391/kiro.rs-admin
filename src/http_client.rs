@@ -28,6 +28,62 @@ impl ProxyConfig {
         }
     }
 
+    fn first_proxy_url(&self) -> Option<String> {
+        Self::split_candidates(&self.url)
+            .into_iter()
+            .next()
+            .filter(|candidate| !Self::is_direct(candidate))
+    }
+
+    /// `direct` 表示显式直连。代理列表里也允许把它作为兜底候选。
+    pub fn is_direct(value: &str) -> bool {
+        value.trim().eq_ignore_ascii_case("direct")
+    }
+
+    /// 将逗号/空白/换行分隔的代理字符串拆成候选项，保留 `direct`。
+    pub fn split_candidates(raw: &str) -> Vec<String> {
+        raw.split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .fold(Vec::new(), |mut acc, item| {
+                if !acc
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(item))
+                {
+                    acc.push(item.to_string());
+                }
+                acc
+            })
+    }
+
+    /// 单个配置是否是合法代理 URL 或 direct。
+    pub fn is_supported_entry(value: &str) -> bool {
+        let value = value.trim();
+        Self::is_direct(value)
+            || value.starts_with("http://")
+            || value.starts_with("https://")
+            || value.starts_with("socks5://")
+            || value.starts_with("socks4://")
+    }
+
+    pub fn from_url_with_auth(
+        url: impl Into<String>,
+        username: Option<&str>,
+        password: Option<&str>,
+    ) -> Option<Self> {
+        let url = url.into();
+        if Self::is_direct(&url) {
+            return None;
+        }
+        let mut proxy = Self::new(url);
+        if let (Some(username), Some(password)) = (username, password) {
+            if !username.is_empty() || !password.is_empty() {
+                proxy = proxy.with_auth(username, password);
+            }
+        }
+        Some(proxy)
+    }
+
     /// 设置认证信息
     pub fn with_auth(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
         self.username = Some(username.into());
@@ -68,7 +124,10 @@ pub fn build_client(
     }
 
     if let Some(proxy_config) = proxy {
-        let mut proxy = Proxy::all(&proxy_config.url)?;
+        let Some(proxy_url) = proxy_config.first_proxy_url() else {
+            return Ok(builder.build()?);
+        };
+        let mut proxy = Proxy::all(&proxy_url)?;
 
         // 设置代理认证
         if let (Some(username), Some(password)) = (&proxy_config.username, &proxy_config.password) {
@@ -76,7 +135,7 @@ pub fn build_client(
         }
 
         builder = builder.proxy(proxy);
-        tracing::debug!("HTTP Client 使用代理: {}", proxy_config.url);
+        tracing::debug!("HTTP Client 使用代理: {}", proxy_url);
     }
 
     Ok(builder.build()?)
@@ -113,5 +172,27 @@ mod tests {
         let config = ProxyConfig::new("http://127.0.0.1:7890");
         let client = build_client(Some(&config), 30, TlsBackend::Rustls);
         assert!(client.is_ok());
+    }
+
+    #[test]
+    fn test_build_client_uses_first_non_direct_candidate() {
+        let config = ProxyConfig::new("http://127.0.0.1:7890, direct");
+        let client = build_client(Some(&config), 30, TlsBackend::Rustls);
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn test_split_proxy_candidates() {
+        let candidates = ProxyConfig::split_candidates(
+            "socks5://a:1080, http://b:8080\ndirect  socks5://a:1080",
+        );
+        assert_eq!(
+            candidates,
+            vec![
+                "socks5://a:1080".to_string(),
+                "http://b:8080".to_string(),
+                "direct".to_string(),
+            ]
+        );
     }
 }

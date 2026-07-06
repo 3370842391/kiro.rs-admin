@@ -15,6 +15,7 @@ import {
   ScrollText,
   Boxes,
   Wallet,
+  MessageCircle,
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -71,6 +72,8 @@ interface CredentialCardProps {
   failureStats?: { auth: number; throttle: number; other: number };
   /** 展示形态：卡片（默认）或紧凑列表行 */
   view?: "card" | "list";
+  /** 打开响应测试弹窗 */
+  onTestResponse?: (id: number) => void;
 }
 
 function formatLastUsed(lastUsedAt: string | null): string {
@@ -107,6 +110,14 @@ function formatThrottleCountdown(secs: number): string {
   const s = total % 60;
   const pad = (n: number) => String(n).padStart(2, "0");
   return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
+}
+
+function formatProxyCandidates(raw?: string): string[] {
+  return (raw ?? "")
+    .split(/[,;\s]+/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .map((item) => (item.toLowerCase() === "direct" ? "direct" : maskProxyUrl(item)));
 }
 
 /**
@@ -196,6 +207,7 @@ export function CredentialCard({
   onRefreshBalance,
   failureStats,
   view = "card",
+  onTestResponse,
 }: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false);
   const [priorityValue, setPriorityValue] = useState(
@@ -476,6 +488,14 @@ export function CredentialCard({
         >
           <Boxes />
           查看可用模型
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          onSelect={() => onTestResponse?.(credential.id)}
+          disabled={credential.disabled}
+          title={credential.disabled ? "已禁用凭据无法测试" : undefined}
+        >
+          <MessageCircle />
+          测试响应
         </DropdownMenuItem>
         {throttleRemaining > 0 && (
           <DropdownMenuItem
@@ -999,8 +1019,12 @@ export function CredentialCard({
             {credential.hasProxy && (
               <div className="flex min-w-0 items-center justify-between gap-2 min-[420px]:col-span-2">
                 <dt className="shrink-0 text-muted-foreground">代理</dt>
-                <dd className="min-w-0 truncate text-right font-mono text-xs">
-                  {maskProxyUrl(credential.proxyUrl ?? "")}
+                <dd className="flex min-w-0 flex-wrap justify-end gap-1 text-right font-mono text-xs">
+                  {formatProxyCandidates(credential.proxyUrl).map((proxy, index) => (
+                    <span key={`${proxy}-${index}`} className="max-w-full truncate rounded bg-secondary px-1.5 py-0.5">
+                      {proxy}
+                    </span>
+                  ))}
                 </dd>
               </div>
             )}

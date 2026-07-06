@@ -12,10 +12,15 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 use crate::admin::trace_db::{TraceAttempt, TraceSink, outcome, truncate_snippet};
+use crate::anthropic::converter::normalize_model_id;
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::requests::conversation::{
+    ConversationState, CurrentMessage, UserInputMessage,
+};
+use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
@@ -88,6 +93,26 @@ pub struct KiroCallResult {
     pub credential_id: u64,
 }
 
+/// Admin 手动响应测试结果。
+pub struct CredentialTestResult {
+    pub credential_id: u64,
+    pub model: String,
+    pub success: bool,
+    pub latency_ms: u64,
+    pub http_status: Option<u16>,
+    pub response_snippet: Option<String>,
+    pub error: Option<String>,
+}
+
+struct ProxyAttemptResult {
+    response: reqwest::Response,
+    proxy: Option<ProxyConfig>,
+}
+
+fn should_try_next_proxy(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 407 | 502 | 503 | 504)
+}
+
 /// Kiro API Provider
 ///
 /// 核心组件，负责与 Kiro API 通信
@@ -95,8 +120,6 @@ pub struct KiroCallResult {
 /// 按凭据 `endpoint` 字段选择 [`KiroEndpoint`] 实现
 pub struct KiroProvider {
     token_manager: Arc<MultiTokenManager>,
-    /// 全局代理配置（用于凭据无自定义代理时的回退）
-    global_proxy: Option<ProxyConfig>,
     /// Client 缓存：key = effective proxy config, value = reqwest::Client
     /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client。
     /// 带容量上限淘汰（全局代理 client 常驻），避免代理数量增长导致内存无界增长。
@@ -142,7 +165,6 @@ impl KiroProvider {
 
         Self {
             token_manager,
-            global_proxy: proxy,
             client_cache: Mutex::new(client_cache),
             tls_backend,
             endpoints,
@@ -151,16 +173,65 @@ impl KiroProvider {
         }
     }
 
-    /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
-    fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
-        let effective = credentials.effective_proxy(self.global_proxy.as_ref());
+    fn client_for_proxy(&self, proxy: Option<ProxyConfig>) -> anyhow::Result<Client> {
         let mut cache = self.client_cache.lock();
-        if let Some(client) = cache.get(&effective) {
+        if let Some(client) = cache.get(&proxy) {
             return Ok(client);
         }
-        let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
-        cache.insert(effective, client.clone());
+        let client = build_client(proxy.as_ref(), 720, self.tls_backend)?;
+        cache.insert(proxy, client.clone());
         Ok(client)
+    }
+
+    fn global_proxy_candidates(&self) -> Vec<Option<ProxyConfig>> {
+        let Some(global) = self.token_manager.proxy() else {
+            return vec![None];
+        };
+
+        let candidates = ProxyConfig::split_candidates(&global.url);
+        if candidates.is_empty() {
+            return vec![None];
+        }
+
+        let mut out = Vec::new();
+        for candidate in candidates {
+            if !ProxyConfig::is_supported_entry(&candidate) {
+                tracing::warn!("忽略无效全局代理候选: {}", candidate);
+                continue;
+            }
+            let next = ProxyConfig::from_url_with_auth(
+                candidate,
+                global.username.as_deref(),
+                global.password.as_deref(),
+            );
+            if !out.iter().any(|existing| existing == &next) {
+                out.push(next);
+            }
+        }
+
+        if out.is_empty() { vec![None] } else { out }
+    }
+
+    fn proxy_candidates_for(&self, credentials: &KiroCredentials) -> Vec<Option<ProxyConfig>> {
+        let global = self.global_proxy_candidates();
+        let mut candidates = credentials.effective_proxy_candidates(&global);
+
+        let has_direct = candidates.iter().any(|candidate| candidate.is_none());
+        candidates.retain(|candidate| candidate.is_some());
+
+        if candidates.len() > 1 {
+            let offset = fastrand::usize(..candidates.len());
+            candidates.rotate_left(offset);
+        }
+
+        // 代理候选随机轮询；直连只作为最后兜底，避免有代理可用时主动绕过代理。
+        if has_direct || !candidates.is_empty() {
+            candidates.push(None);
+        }
+        if candidates.is_empty() {
+            candidates.push(None);
+        }
+        candidates
     }
 
     /// 用指定 endpoint 构造并发送一次 API 请求，返回原始响应（不读取 body）。
@@ -175,6 +246,7 @@ impl KiroProvider {
         machine_id: &str,
         config: &crate::model::config::Config,
         request_body: &str,
+        proxy: Option<ProxyConfig>,
     ) -> anyhow::Result<reqwest::Response> {
         let rctx = RequestContext {
             credentials: &ctx.credentials,
@@ -190,7 +262,7 @@ impl KiroProvider {
         tracing::debug!("实际发送请求体: {}", body);
 
         let base = self
-            .client_for(&ctx.credentials)?
+            .client_for_proxy(proxy.clone())?
             .post(&url)
             .body(body)
             .header("content-type", endpoint.content_type())
@@ -206,7 +278,139 @@ impl KiroProvider {
                 tracing::debug!("  header {}: {}", k, v.to_str().unwrap_or("<binary>"));
             }
         }
-        Ok(self.client_for(&ctx.credentials)?.execute(request).await?)
+        Ok(self.client_for_proxy(proxy)?.execute(request).await?)
+    }
+
+    async fn execute_api_request_with_proxy_failover(
+        &self,
+        endpoint: &Arc<dyn KiroEndpoint>,
+        ctx: &crate::kiro::token_manager::CallContext,
+        machine_id: &str,
+        config: &crate::model::config::Config,
+        request_body: &str,
+    ) -> anyhow::Result<ProxyAttemptResult> {
+        let candidates = self.proxy_candidates_for(&ctx.credentials);
+        let candidate_count = candidates.len();
+        let mut last_error: Option<anyhow::Error> = None;
+
+        for (idx, proxy) in candidates.into_iter().enumerate() {
+            if idx > 0 {
+                tracing::info!(
+                    "凭据 #{} 使用下一个代理候选重试: {}",
+                    ctx.id,
+                    proxy.as_ref().map(|p| p.url.as_str()).unwrap_or("direct")
+                );
+            }
+
+            match self
+                .execute_api_request(
+                    endpoint,
+                    ctx,
+                    machine_id,
+                    config,
+                    request_body,
+                    proxy.clone(),
+                )
+                .await
+            {
+                Ok(response) => {
+                    let status = response.status();
+                    if idx + 1 < candidate_count && should_try_next_proxy(status) {
+                        tracing::warn!(
+                            "凭据 #{} 代理候选 {} 返回 HTTP {}，切换下一个候选",
+                            ctx.id,
+                            proxy.as_ref().map(|p| p.url.as_str()).unwrap_or("direct"),
+                            status.as_u16()
+                        );
+                        last_error = Some(anyhow::anyhow!(
+                            "proxy candidate returned HTTP {}",
+                            status.as_u16()
+                        ));
+                        continue;
+                    }
+                    return Ok(ProxyAttemptResult { response, proxy });
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "凭据 #{} 代理候选 {} 请求发送失败: {}",
+                        ctx.id,
+                        proxy.as_ref().map(|p| p.url.as_str()).unwrap_or("direct"),
+                        err
+                    );
+                    last_error = Some(err);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("没有可用代理候选")))
+    }
+
+    async fn execute_mcp_request_with_proxy_failover(
+        &self,
+        endpoint: &Arc<dyn KiroEndpoint>,
+        ctx: &crate::kiro::token_manager::CallContext,
+        machine_id: &str,
+        config: &crate::model::config::Config,
+        request_body: &str,
+    ) -> anyhow::Result<reqwest::Response> {
+        let rctx = RequestContext {
+            credentials: &ctx.credentials,
+            token: &ctx.token,
+            machine_id,
+            config,
+        };
+        let url = endpoint.mcp_url(&rctx);
+        let body = endpoint.transform_mcp_body(request_body, &rctx);
+        let candidates = self.proxy_candidates_for(&ctx.credentials);
+        let candidate_count = candidates.len();
+        let mut last_error: Option<anyhow::Error> = None;
+
+        for (idx, proxy) in candidates.into_iter().enumerate() {
+            if idx > 0 {
+                tracing::info!(
+                    "MCP 凭据 #{} 使用下一个代理候选重试: {}",
+                    ctx.id,
+                    proxy.as_ref().map(|p| p.url.as_str()).unwrap_or("direct")
+                );
+            }
+            let base = self
+                .client_for_proxy(proxy.clone())?
+                .post(&url)
+                .body(body.clone())
+                .header("content-type", endpoint.content_type())
+                .header("Connection", "close");
+            let request = endpoint.decorate_mcp(base, &rctx);
+            match request.send().await {
+                Ok(response) => {
+                    let status = response.status();
+                    if idx + 1 < candidate_count && should_try_next_proxy(status) {
+                        tracing::warn!(
+                            "MCP 凭据 #{} 代理候选 {} 返回 HTTP {}，切换下一个候选",
+                            ctx.id,
+                            proxy.as_ref().map(|p| p.url.as_str()).unwrap_or("direct"),
+                            status.as_u16()
+                        );
+                        last_error = Some(anyhow::anyhow!(
+                            "proxy candidate returned HTTP {}",
+                            status.as_u16()
+                        ));
+                        continue;
+                    }
+                    return Ok(response);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "MCP 凭据 #{} 代理候选 {} 请求发送失败: {}",
+                        ctx.id,
+                        proxy.as_ref().map(|p| p.url.as_str()).unwrap_or("direct"),
+                        err
+                    );
+                    last_error = Some(err.into());
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("没有可用代理候选")))
     }
 
     /// 根据凭据选择 endpoint 实现
@@ -305,6 +509,88 @@ impl KiroProvider {
         self.call_mcp_with_retry(request_body).await
     }
 
+    /// 使用指定凭据发送一次 `hello` 响应测试，不参与凭据故障转移。
+    pub async fn test_credential_response(
+        &self,
+        credential_id: u64,
+        model: &str,
+    ) -> anyhow::Result<CredentialTestResult> {
+        let mapped_model = normalize_model_id(model);
+        let conversation_id = uuid::Uuid::new_v4().to_string();
+        let state = ConversationState::new(conversation_id.clone())
+            .with_agent_continuation_id(conversation_id)
+            .with_agent_task_type("vibe")
+            .with_chat_trigger_type("MANUAL")
+            .with_current_message(CurrentMessage::new(UserInputMessage::new(
+                "hello",
+                mapped_model.clone(),
+            )));
+        let request = KiroRequest {
+            conversation_state: state,
+            profile_arn: None,
+            additional_model_request_fields: None,
+        };
+        let request_body = serde_json::to_string(&request)?;
+
+        let mut ctx = self
+            .token_manager
+            .acquire_context_for_id(credential_id)
+            .await?;
+        let _in_flight = self.token_manager.in_flight_guard(ctx.id);
+        self.token_manager.record_request(ctx.id);
+        self.ensure_profile_arn(&mut ctx).await;
+
+        let config = self.token_manager.config();
+        let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
+        let endpoint = self.endpoint_for(&ctx.credentials)?;
+        let started = Instant::now();
+
+        let response = match self
+            .execute_api_request_with_proxy_failover(
+                &endpoint,
+                &ctx,
+                &machine_id,
+                config,
+                &request_body,
+            )
+            .await
+        {
+            Ok(result) => result.response,
+            Err(e) => {
+                return Ok(CredentialTestResult {
+                    credential_id: ctx.id,
+                    model: mapped_model,
+                    success: false,
+                    latency_ms: started.elapsed().as_millis() as u64,
+                    http_status: None,
+                    response_snippet: None,
+                    error: Some(e.to_string()),
+                });
+            }
+        };
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        let success = status.is_success();
+        if success {
+            self.token_manager.report_success(ctx.id);
+        }
+
+        Ok(CredentialTestResult {
+            credential_id: ctx.id,
+            model: mapped_model,
+            success,
+            latency_ms: started.elapsed().as_millis() as u64,
+            http_status: Some(status.as_u16()),
+            response_snippet: truncate_snippet(&body),
+            error: if success {
+                None
+            } else {
+                Some(format!("HTTP {}", status.as_u16()))
+            },
+        })
+    }
+
     /// 内部方法：带重试逻辑的 MCP API 调用
     async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
         let total_credentials = self.token_manager.total_count();
@@ -344,25 +630,16 @@ impl KiroProvider {
                 }
             };
 
-            let rctx = RequestContext {
-                credentials: &ctx.credentials,
-                token: &ctx.token,
-                machine_id: &machine_id,
-                config,
-            };
-
-            let url = endpoint.mcp_url(&rctx);
-            let body = endpoint.transform_mcp_body(request_body, &rctx);
-
-            let base = self
-                .client_for(&ctx.credentials)?
-                .post(&url)
-                .body(body)
-                .header("content-type", endpoint.content_type())
-                .header("Connection", "close");
-            let request = endpoint.decorate_mcp(base, &rctx);
-
-            let response = match request.send().await {
+            let response = match self
+                .execute_mcp_request_with_proxy_failover(
+                    &endpoint,
+                    &ctx,
+                    &machine_id,
+                    config,
+                    request_body,
+                )
+                .await
+            {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(
@@ -371,7 +648,7 @@ impl KiroProvider {
                         max_retries,
                         e
                     );
-                    last_error = Some(e.into());
+                    last_error = Some(e);
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
                     }
@@ -488,6 +765,7 @@ impl KiroProvider {
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        let mut request_throttled_ids: HashSet<u64> = HashSet::new();
         // 会话级 RPM 记账去重：同一凭据在本会话（含 429 重试）只记 1 次 tick；
         // 故障转移到不同凭据时各记 1 次。
         let mut rpm_recorded: HashSet<u64> = HashSet::new();
@@ -501,7 +779,7 @@ impl KiroProvider {
             // 获取调用上下文（绑定 index、credentials、token）
             let mut ctx = match self
                 .token_manager
-                .acquire_context(model.as_deref(), group)
+                .acquire_context_excluding(model.as_deref(), group, &request_throttled_ids)
                 .await
             {
                 Ok(c) => c,
@@ -555,11 +833,17 @@ impl KiroProvider {
             };
             let endpoint_name = endpoint.name();
 
-            let response = match self
-                .execute_api_request(&endpoint, &ctx, &machine_id, config, request_body)
+            let attempt_result = match self
+                .execute_api_request_with_proxy_failover(
+                    &endpoint,
+                    &ctx,
+                    &machine_id,
+                    config,
+                    request_body,
+                )
                 .await
             {
-                Ok(resp) => resp,
+                Ok(result) => result,
                 Err(e) => {
                     tracing::warn!(
                         "API 请求发送失败（尝试 {}/{}）: {}",
@@ -586,6 +870,8 @@ impl KiroProvider {
                     continue;
                 }
             };
+            let selected_proxy = attempt_result.proxy.clone();
+            let response = attempt_result.response;
 
             let status = response.status();
 
@@ -720,22 +1006,13 @@ impl KiroProvider {
                 continue;
             }
 
-            // 429 端点降级（换桶不换号）：runtime.kiro.dev 与 q.amazonaws.com 限流桶
-            // 相互独立，一个 429 时另一个仍可 200。
-            //
-            // 关键：本块必须在下方「账号级风控」「瞬态重试」两个 429 分支**之前**执行。
-            // 否则含 "suspicious activity" 的账号级 429 会被风控分支先行拦截、冷却当前
-            // 凭据并换号重试——始终停留在同一端点（q），永远轮不到 runtime，表现为
-            // 「q 端点连续重试几次才切 runtime」。前置后：任何 429 都先用同一张凭据在
-            // 备用端点上立刻重发一次（不计 attempt、不退避、不切凭据）。
-            // - 备用端点成功 → 直接返回（trace 记为备用端点 success，可见降级链路）。
-            // - 备用端点也失败 → 落回下方按原始（主端点）响应体分类处理：账号级风控走
-            //   冷却换号，普通 429 走退避重试；下一轮迭代再以主端点起手，形成 q↔runtime 来回。
+            // 429 处理顺序：
+            // - 账号级风控：冷却当前凭据并换号（下方专用分支）。
+            // - 普通限流：先在本次请求内排除当前凭据，若还有其它可用凭据就直接换号。
+            // - 没有其它可用凭据时，再尝试 runtime.kiro.dev / q.amazonaws.com 的备用端点桶。
+            // 这里仍先发射主端点 trace，保证链路顺序与真实调用一致。
             if status.as_u16() == 429 {
-                // 先对主端点 429 分类一次（账号风控 vs 普通限流），并**立即**发射主端点
-                // 这一跳的 trace——必须在备用端点降级之前发射，保证链路里主端点(q)行排在
-                // 备用端点(runtime)行之前，顺序与真实调用一致（先打 q、再降级 runtime）。
-                // 下方「账号级风控」「瞬态重试」两个分支因此不再重复发射本跳，仅保留控制流。
+                // 下方「账号级风控」「瞬态重试」两个分支不再重复发射本跳，仅保留控制流。
                 let account_throttled = self.token_manager.get_account_throttle_failover()
                     && endpoint.is_account_throttled(&body);
                 Self::emit_attempt(
@@ -753,7 +1030,37 @@ impl KiroProvider {
                     attempt_start,
                 );
 
-                if let Some(fb_name) = endpoint.fallback_endpoint() {
+                if !account_throttled {
+                    request_throttled_ids.insert(ctx.id);
+                    if self.token_manager.has_available_excluding(
+                        model.as_deref(),
+                        group,
+                        &request_throttled_ids,
+                    ) {
+                        last_error = Some(anyhow::anyhow!(
+                            "{} API 请求失败（凭据 #{} 429，已切换其它凭据重试）: {} {}",
+                            api_type,
+                            ctx.id,
+                            status,
+                            body
+                        ));
+                        tracing::info!("凭据 #{} 返回普通 429，本次请求优先切换其它凭据", ctx.id);
+                        continue;
+                    }
+                    if !request_throttled_ids.is_empty() {
+                        let keep_excluded = Some(ctx.id);
+                        request_throttled_ids.clear();
+                        if let Some(id) = keep_excluded {
+                            request_throttled_ids.insert(id);
+                        }
+                        tracing::info!(
+                            "本轮可用凭据均返回普通 429，开启下一轮并暂避凭据 #{}。",
+                            ctx.id
+                        );
+                    }
+                }
+
+                if !account_throttled && let Some(fb_name) = endpoint.fallback_endpoint() {
                     if let Some(fb_endpoint) = self.endpoints.get(fb_name).cloned() {
                         tracing::info!(
                             "端点 [{}] 限流 429，凭据 #{} 降级到备用端点 [{}] 重试（换桶不换号）",
@@ -769,6 +1076,7 @@ impl KiroProvider {
                                 &machine_id,
                                 config,
                                 request_body,
+                                selected_proxy.clone(),
                             )
                             .await
                         {

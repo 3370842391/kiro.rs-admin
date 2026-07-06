@@ -82,6 +82,7 @@ import {
   BatchVerifyDialog,
   type VerifyResult,
 } from "@/components/batch-verify-dialog";
+import { CredentialResponseTestDialog } from "@/components/credential-response-test-dialog";
 import { detectTier, type Tier } from "@/components/subscription-badge";
 import { ProxyPoolDialog } from "@/components/proxy-pool-dialog";
 import { ImageUpdateDialog } from "@/components/image-update-dialog";
@@ -193,6 +194,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [verifyResults, setVerifyResults] = useState<Map<number, VerifyResult>>(
     new Map(),
   );
+  const [responseTestOpen, setResponseTestOpen] = useState(false);
+  const [responseTestIds, setResponseTestIds] = useState<number[]>([]);
   const [balanceMap, setBalanceMap] = useState<Map<number, BalanceResponse>>(
     new Map(),
   );
@@ -587,6 +590,11 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     if (f === 0) toast.success(`成功恢复 ${s} 个凭据`);
     else toast.warning(`成功 ${s} 个，失败 ${f} 个`);
     deselectAll();
+  };
+
+  const openResponseTest = (ids: number[]) => {
+    setResponseTestIds(ids);
+    setResponseTestOpen(true);
   };
 
   const handleBatchForceRefresh = async () => {
@@ -1606,6 +1614,13 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                     批量验活
                   </DropdownMenuItem>
                   <DropdownMenuItem
+                    onSelect={() => openResponseTest(Array.from(selectedIds))}
+                    disabled={selectedIds.size === 0}
+                  >
+                    <Activity />
+                    测试响应
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
                     onSelect={(e) => {
                       e.preventDefault();
                       handleBatchForceRefresh();
@@ -1781,6 +1796,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                         handleRefreshBalance(credential.id)
                       }
                       failureStats={failureStatsMap?.[String(credential.id)]}
+                      onTestResponse={(id) => openResponseTest([id])}
                     />
                   ))}
                 </div>
@@ -2034,6 +2050,12 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         onDelete={handleDeleteVerifyResult}
         onDeleteFailed={handleDeleteFailedVerify}
         deleting={verifyDeleting}
+      />
+      <CredentialResponseTestDialog
+        open={responseTestOpen}
+        onOpenChange={setResponseTestOpen}
+        credentials={data?.credentials ?? []}
+        initialIds={responseTestIds}
       />
     </div>
   );

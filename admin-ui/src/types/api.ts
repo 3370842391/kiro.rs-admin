@@ -77,6 +77,22 @@ export interface AvailableModelItem {
   maxInputTokens?: number
 }
 
+// 凭据响应测试请求
+export interface CredentialResponseTestRequest {
+  model?: string
+}
+
+// 凭据响应测试响应
+export interface CredentialResponseTestResponse {
+  id: number
+  model: string
+  success: boolean
+  latencyMs: number
+  httpStatus?: number
+  responseSnippet?: string
+  error?: string
+}
+
 // 成功响应
 export interface SuccessResponse {
   success: boolean

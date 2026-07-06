@@ -21,6 +21,7 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Textarea } from '@/components/ui/textarea'
 import { Badge } from '@/components/ui/badge'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
@@ -45,12 +46,24 @@ interface ProxyPoolDialogProps {
   onSelectProxy?: (url: string) => void
 }
 
+function splitProxyCandidates(raw: string): string[] {
+  return raw
+    .split(/[,;\s]+/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+}
+
+function maskProxyCandidate(candidate: string): string {
+  return candidate.toLowerCase() === 'direct' ? 'direct' : maskProxyUrl(candidate)
+}
+
 
 export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPoolDialogProps) {
   const [newUrl, setNewUrl] = useState('')
   const [newLabel, setNewLabel] = useState('')
   const [batchText, setBatchText] = useState('')
   const [showBatch, setShowBatch] = useState(false)
+  const [globalProxyText, setGlobalProxyText] = useState('')
   const [batchErrors, setBatchErrors] = useState<string[]>([])
   const queryClient = useQueryClient()
 
@@ -69,13 +82,18 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
   const setGlobalProxyMutation = useMutation({
     mutationFn: (url: string | null) => setGlobalProxy({ proxyUrl: url }),
     onSuccess: (_, url) => {
-      toast.success(url ? `已设置全局代理: ${maskProxyUrl(url)}` : '已清除全局代理')
+      const count = url ? splitProxyCandidates(url).length : 0
+      toast.success(url ? `已设置 ${count} 个全局代理候选` : '已清除全局代理')
+      setGlobalProxyText('')
       queryClient.invalidateQueries({ queryKey: ['global-proxy'] })
     },
     onError: (err) => toast.error(`操作失败: ${extractErrorMessage(err)}`),
   })
 
   const currentGlobalProxy = globalProxyData?.proxyUrl ?? null
+  const maskedGlobalProxyCandidates = currentGlobalProxy
+    ? splitProxyCandidates(currentGlobalProxy).map(maskProxyCandidate)
+    : []
 
   const addMutation = useMutation({
     mutationFn: () => addProxy({ url: newUrl.trim(), label: newLabel.trim() || undefined }),
@@ -290,7 +308,34 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
               )}
             </div>
             <div className="text-xs font-mono text-muted-foreground">
-              {currentGlobalProxy ? maskProxyUrl(currentGlobalProxy) : '未配置（直连）'}
+              {maskedGlobalProxyCandidates.length > 0 ? (
+                <div className="flex flex-wrap gap-1.5">
+                  {maskedGlobalProxyCandidates.map((proxy, index) => (
+                    <span key={`${proxy}-${index}`} className="rounded bg-secondary px-2 py-1">
+                      {proxy}
+                    </span>
+                  ))}
+                </div>
+              ) : (
+                '未配置（直连）'
+              )}
+            </div>
+            <div className="grid gap-2 sm:grid-cols-[1fr_auto]">
+              <Textarea
+                value={globalProxyText}
+                onChange={(e) => setGlobalProxyText(e.target.value)}
+                placeholder={'http://user:pass@host1:8080\nsocks5://user:pass@host2:1080\ndirect'}
+                className="min-h-[76px] font-mono text-xs"
+                disabled={setGlobalProxyMutation.isPending}
+              />
+              <Button
+                size="sm"
+                className="self-end"
+                onClick={() => setGlobalProxyMutation.mutate(globalProxyText.trim())}
+                disabled={setGlobalProxyMutation.isPending || !globalProxyText.trim()}
+              >
+                保存
+              </Button>
             </div>
           </div>
 

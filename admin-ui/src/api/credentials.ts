@@ -4,6 +4,8 @@ import type {
   CredentialsStatusResponse,
   BalanceResponse,
   AvailableModelsResponse,
+  CredentialResponseTestRequest,
+  CredentialResponseTestResponse,
   SuccessResponse,
   SetDisabledRequest,
   SetPriorityRequest,
@@ -153,6 +155,15 @@ export async function getCredentialBalance(id: number): Promise<BalanceResponse>
 // 获取凭据当前可用的模型列表（按需实时查询上游）
 export async function getCredentialModels(id: number): Promise<AvailableModelsResponse> {
   const { data } = await api.get<AvailableModelsResponse>(`/credentials/${id}/models`)
+  return data
+}
+
+// 使用指定凭据发送一次 hello 响应测试
+export async function testCredentialResponse(
+  id: number,
+  req: CredentialResponseTestRequest
+): Promise<CredentialResponseTestResponse> {
+  const { data } = await api.post<CredentialResponseTestResponse>(`/credentials/${id}/test`, req)
   return data
 }
 

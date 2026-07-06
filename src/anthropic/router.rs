@@ -1,4 +1,5 @@
 //! Anthropic API 路由配置
+use std::sync::Arc;
 
 use axum::{
     Router,
@@ -32,7 +33,7 @@ pub fn create_router_with_provider(
     tool_compatibility_mode: ToolCompatibilityMode,
 ) -> Router {
     create_router(
-        kiro_provider,
+        kiro_provider.map(Arc::new),
         extract_thinking,
         tool_compatibility_mode,
         None,
@@ -46,7 +47,7 @@ pub fn create_router_with_provider(
 /// 创建 Anthropic API 路由（供 main.rs 使用）
 #[allow(clippy::too_many_arguments)]
 pub fn create_router(
-    kiro_provider: Option<KiroProvider>,
+    kiro_provider: Option<Arc<KiroProvider>>,
     extract_thinking: bool,
     tool_compatibility_mode: ToolCompatibilityMode,
     client_keys: Option<SharedClientKeyManager>,
