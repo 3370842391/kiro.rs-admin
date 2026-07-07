@@ -1370,6 +1370,53 @@ mod tests {
         assert_eq!(messages[1].role, "tool");
     }
 
+    /// Codex 通过 responses 请求体 `reasoning:{effort}` 下发档位（none/minimal/low/
+    /// medium/high/xhigh）。验证：
+    /// - none → 不下发 thinking（关推理），否则后端 parse("none") 失败会 fallback 成 high；
+    /// - minimal → 归一化到后端认得的 low（后端 EffortTier 无 minimal）；
+    /// - xhigh 透传，high/medium 原样；
+    /// - 归一化后的 effort 必须是后端 EffortTier 认得的值。
+    #[test]
+    fn responses_reasoning_effort_is_recognized_and_normalized() {
+        let build = |effort: &str| -> ResponsesRequest {
+            serde_json::from_value(json!({
+                "model": "gpt-5.5",
+                "input": "hi",
+                "reasoning": { "effort": effort }
+            }))
+            .unwrap()
+        };
+
+        // none → 关推理：无 thinking、无 output_config
+        let chat = responses_to_chat_request(&build("none"), Vec::new()).unwrap();
+        let anthropic = chat_to_anthropic(&chat).unwrap().anthropic;
+        assert!(anthropic.thinking.is_none(), "none 不应开启 thinking");
+        assert!(anthropic.output_config.is_none(), "none 不应下发 output_config");
+
+        // minimal → 归一化到 low（后端无 minimal 档）
+        let chat = responses_to_chat_request(&build("minimal"), Vec::new()).unwrap();
+        let anthropic = chat_to_anthropic(&chat).unwrap().anthropic;
+        assert_eq!(anthropic.output_config.as_ref().unwrap().effort, "low");
+        assert!(anthropic.thinking.is_some());
+
+        // 各档位归一化后必须是后端 EffortTier 认得的值
+        for (input, expected) in [
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("xhigh", "xhigh"),
+        ] {
+            let chat = responses_to_chat_request(&build(input), Vec::new()).unwrap();
+            let anthropic = chat_to_anthropic(&chat).unwrap().anthropic;
+            assert_eq!(
+                anthropic.output_config.as_ref().unwrap().effort,
+                expected,
+                "effort={input} 归一化错误"
+            );
+            assert!(anthropic.thinking.is_some(), "effort={input} 应开启 thinking");
+        }
+    }
+
     #[test]
     fn responses_request_expands_previous_messages() {
         let previous = vec![OpenAIMessage {

@@ -718,11 +718,19 @@ fn openai_reasoning_to_anthropic(
         return (None, None);
     };
 
-    let budget = match effort.as_str() {
-        "minimal" | "low" => 4_000,
-        "medium" => 12_000,
-        "high" | "xhigh" | "max" => 20_000,
-        _ => 12_000,
+    // Codex/OpenAI 的 effort 档位（none/minimal/low/medium/high/xhigh）归一化为后端
+    // `EffortTier` 认得的值（low/medium/high/xhigh），并给出对应 thinking 预算：
+    // - "none"：显式关闭推理，不下发 thinking / output_config。若原样透传，后端
+    //   `EffortTier::parse("none")` 会失败并 fallback 到 high，等于把“关推理”变成高强度推理。
+    // - "minimal"：后端无此档，降级到最低的 low（原样透传同样会被 parse 拒绝 → fallback high）。
+    // - 其他未知值：兜底 medium。
+    let (budget, normalized_effort) = match effort.as_str() {
+        "none" => return (None, None),
+        "minimal" | "low" => (4_000, "low"),
+        "medium" => (12_000, "medium"),
+        "high" => (20_000, "high"),
+        "xhigh" | "max" => (20_000, "xhigh"),
+        _ => (12_000, "medium"),
     };
 
     (
@@ -730,7 +738,9 @@ fn openai_reasoning_to_anthropic(
             thinking_type: "enabled".to_string(),
             budget_tokens: budget,
         }),
-        Some(OutputConfig { effort }),
+        Some(OutputConfig {
+            effort: normalized_effort.to_string(),
+        }),
     )
 }
 
