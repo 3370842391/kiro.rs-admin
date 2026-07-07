@@ -1159,9 +1159,10 @@ impl KiroProvider {
             }
 
             // 429 处理顺序：
-            // - 账号级风控：冷却当前凭据并换号（下方专用分支）。
-            // - 普通限流：先在本次请求内排除当前凭据，若还有其它可用凭据就直接换号。
-            // - 没有其它可用凭据时，再尝试 runtime.kiro.dev / q.amazonaws.com 的备用端点桶。
+            // - 任何 429：先用同一张凭据切到 runtime.kiro.dev / q.amazonaws.com 备用端点桶。
+            // - 备用端点成功：直接返回，吃到两套独立限流桶的并发收益。
+            // - 备用端点仍失败：账号级风控才冷却当前凭据；普通限流再按 retry policy
+            //   切换其它凭据或退避。
             // 这里仍先发射主端点 trace，保证链路顺序与真实调用一致。
             if status.as_u16() == 429 {
                 // 下方「账号级风控」「瞬态重试」两个分支不再重复发射本跳，仅保留控制流。
@@ -1182,51 +1183,7 @@ impl KiroProvider {
                     attempt_start,
                 );
 
-                let switch_on_ordinary_429 =
-                    retry_mode == RetryMode::Failover || retry_policy.credential_switch_on_429;
-                if !account_throttled && switch_on_ordinary_429 {
-                    request_throttled_ids.insert(ctx.id);
-                    if self.token_manager.has_available_excluding(
-                        model.as_deref(),
-                        group,
-                        &request_throttled_ids,
-                    ) {
-                        if retry_mode != RetryMode::Failover {
-                            let cooldown = retry_after.unwrap_or_else(|| {
-                                Duration::from_millis(retry_policy.rate_limit_cooldown_ms)
-                            });
-                            self.token_manager.report_rate_limited(ctx.id, cooldown);
-                        }
-                        last_error = Some(anyhow::anyhow!(
-                            "{} API 请求失败（凭据 #{} 429，已切换其它凭据重试）: {} {}",
-                            api_type,
-                            ctx.id,
-                            status,
-                            body
-                        ));
-                        tracing::info!(
-                            "凭据 #{} 返回普通 429，按 {} 策略优先切换其它凭据",
-                            ctx.id,
-                            retry_mode
-                        );
-                        continue;
-                    }
-                    if retry_mode == RetryMode::Failover && !request_throttled_ids.is_empty() {
-                        let keep_excluded = Some(ctx.id);
-                        request_throttled_ids.clear();
-                        if let Some(id) = keep_excluded {
-                            request_throttled_ids.insert(id);
-                        }
-                        tracing::info!(
-                            "本轮可用凭据均返回普通 429，开启下一轮并暂避凭据 #{}。",
-                            ctx.id
-                        );
-                    } else if retry_mode != RetryMode::Failover {
-                        request_throttled_ids.clear();
-                    }
-                }
-
-                if !account_throttled && let Some(fb_name) = endpoint.fallback_endpoint() {
+                if let Some(fb_name) = endpoint.fallback_endpoint() {
                     if let Some(fb_endpoint) = self.endpoints.get(fb_name).cloned() {
                         tracing::info!(
                             "端点 [{}] 限流 429，凭据 #{} 降级到备用端点 [{}] 重试（换桶不换号）",
@@ -1307,6 +1264,50 @@ impl KiroProvider {
                                 );
                             }
                         }
+                    }
+                }
+
+                let switch_on_ordinary_429 =
+                    retry_mode == RetryMode::Failover || retry_policy.credential_switch_on_429;
+                if !account_throttled && switch_on_ordinary_429 {
+                    request_throttled_ids.insert(ctx.id);
+                    if self.token_manager.has_available_excluding(
+                        model.as_deref(),
+                        group,
+                        &request_throttled_ids,
+                    ) {
+                        if retry_mode != RetryMode::Failover {
+                            let cooldown = retry_after.unwrap_or_else(|| {
+                                Duration::from_millis(retry_policy.rate_limit_cooldown_ms)
+                            });
+                            self.token_manager.report_rate_limited(ctx.id, cooldown);
+                        }
+                        last_error = Some(anyhow::anyhow!(
+                            "{} API 请求失败（凭据 #{} 429，备用端点也失败，已切换其它凭据重试）: {} {}",
+                            api_type,
+                            ctx.id,
+                            status,
+                            body
+                        ));
+                        tracing::info!(
+                            "凭据 #{} 主/备用端点均返回普通 429，按 {} 策略切换其它凭据",
+                            ctx.id,
+                            retry_mode
+                        );
+                        continue;
+                    }
+                    if retry_mode == RetryMode::Failover && !request_throttled_ids.is_empty() {
+                        let keep_excluded = Some(ctx.id);
+                        request_throttled_ids.clear();
+                        if let Some(id) = keep_excluded {
+                            request_throttled_ids.insert(id);
+                        }
+                        tracing::info!(
+                            "本轮可用凭据主/备用端点均返回普通 429，开启下一轮并暂避凭据 #{}。",
+                            ctx.id
+                        );
+                    } else if retry_mode != RetryMode::Failover {
+                        request_throttled_ids.clear();
                     }
                 }
             }

@@ -361,7 +361,7 @@ const RETRY_MODE_LABELS: Record<RetryMode, string> = {
 }
 
 const RETRY_MODE_DESCRIPTIONS: Record<RetryMode, string> = {
-  failover: '当前默认：普通 429 先在本次请求内切换其它凭据，保留端点备用桶；不做跨请求冷却，适合多账号池保持吞吐。',
+  failover: '当前默认：普通 429 先用同一凭据切到 q/runtime 备用端点桶，仍失败再切换其它凭据；不做跨请求冷却，适合多账号池保持吞吐。',
   turbo: '最激进：1 秒短冷却、最多 12 次/凭据重试，恢复最快，但更容易持续压到上游限流。',
   fast: '快速恢复：3 秒冷却、9 次/凭据重试，适合短时高峰，仍会快速换凭据。',
   balanced: '折中策略：10 秒冷却、9 次/凭据重试，在吞吐和稳定之间取平衡。',

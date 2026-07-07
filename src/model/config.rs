@@ -32,9 +32,9 @@ pub enum ToolCompatibilityMode {
 
 /// 普通 429 的重试策略模式。
 ///
-/// `Failover` 是本项目默认策略：保留当前行为，普通 429 在本次请求内优先换桶/换凭据，
-/// 不给凭据施加跨请求冷却。其它模式来自 Kiro-RS-Tool，用于按需切换为更激进或更保守的
-/// 普通 429 冷却与重试节奏。
+/// `Failover` 是本项目默认策略：普通 429 先用同一凭据切换 q/runtime 独立限流桶，
+/// 备用端点仍失败时再在本次请求内换凭据，且不给凭据施加跨请求冷却。其它模式来自
+/// Kiro-RS-Tool，用于按需切换为更激进或更保守的普通 429 冷却与重试节奏。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum RetryMode {
