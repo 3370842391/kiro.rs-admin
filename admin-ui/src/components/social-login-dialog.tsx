@@ -43,24 +43,36 @@ function parseCallbackUrl(rawUrl: string): {
 } | null {
   try {
     const url = new URL(rawUrl.trim())
-    const code = url.searchParams.get('code')
-    const state = url.searchParams.get('state')
-    const issuerUrl = url.searchParams.get('issuer_url')
-    const clientId = url.searchParams.get('client_id')
+    const hashParams = new URLSearchParams(url.hash.startsWith('#') ? url.hash.slice(1) : url.hash)
+    const readParam = (...names: string[]) => {
+      for (const name of names) {
+        const value = url.searchParams.get(name) ?? hashParams.get(name)
+        if (value) return value
+      }
+      return null
+    }
+    const code = readParam('code')
+    const state = readParam('state')
+    const issuerUrl = readParam('issuer_url', 'issuerUrl')
+    const clientId = readParam('client_id', 'clientId')
     if ((!code || !state) && (!issuerUrl || !clientId)) return null
     return {
       code: code ?? undefined,
       state: state ?? undefined,
-      loginOption: url.searchParams.get('login_option') ?? '',
+      loginOption: readParam('login_option', 'loginOption') ?? '',
       path: url.pathname,
       issuerUrl: issuerUrl ?? undefined,
       clientId: clientId ?? undefined,
-      scopes: url.searchParams.get('scopes') ?? undefined,
-      loginHint: url.searchParams.get('login_hint') ?? undefined,
+      scopes: readParam('scopes', 'scope') ?? undefined,
+      loginHint: readParam('login_hint', 'loginHint') ?? undefined,
     }
   } catch {
     return null
   }
+}
+
+function getContinueUrl(result: { status: string; nextUrl?: string; next_url?: string }): string {
+  return result.status === 'continue' ? (result.nextUrl || result.next_url || '') : ''
 }
 
 async function getClipboardWritePermission(): Promise<PermissionState | 'unsupported'> {
@@ -176,9 +188,8 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
       } else {
         window.open(resp.portalUrl, '_blank')
       }
-      // 本地访问：本地回调服务器投递，自动轮询完成。
-      // 远程访问：OAuth 回调落到 localhost 失败页，靠下方手动粘贴回调 URL 完成。
-      if (!isRemote) schedulePoll(resp.sessionId)
+      // 回调可能自动投递，也可能需要手动粘贴；始终轮询以便及时展示企业 SSO 二段链接。
+      schedulePoll(resp.sessionId)
     } catch (e) {
       loginWindow?.close()
       toast.error('发起登录失败：' + extractErrorMessage(e))
@@ -195,10 +206,16 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
         if (result.status === 'pending') {
           schedulePoll(sessionId)
         } else if (result.status === 'continue') {
-          setNextUrl(result.nextUrl)
+          const next = getContinueUrl(result)
+          if (!next) {
+            toast.error('后端返回了二段登录状态，但没有返回链接')
+            schedulePoll(sessionId)
+            return
+          }
+          setNextUrl(next)
           setCopyState('idle')
           toast.success('已获取二段登录链接，请点击打开或复制')
-          if (!isRemote) schedulePoll(sessionId)
+          schedulePoll(sessionId)
         } else if (result.status === 'success') {
           setCredentialId(result.credentialId)
           setStep('done')
@@ -237,11 +254,16 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
         loginHint: parsed.loginHint,
       })
       if (result.status === 'continue') {
-        setNextUrl(result.nextUrl)
+        const next = getContinueUrl(result)
+        if (!next) {
+          toast.error('后端返回了二段登录状态，但没有返回链接')
+          return
+        }
+        setNextUrl(next)
         setCopyState('idle')
         setCallbackUrl('')
         toast.success('已获取二段登录链接，请点击打开或复制')
-        if (!isRemote) schedulePoll(session.sessionId)
+        schedulePoll(session.sessionId)
       } else if (result.status === 'success') {
         setCredentialId(result.credentialId)
         setStep('done')
