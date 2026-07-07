@@ -35,9 +35,12 @@ pub struct AdminState {
     pub trace_store: SharedTraceStore,
     /// 账号分组注册表（持久化到 groups.json）
     pub groups: SharedGroupManager,
+    /// 模型映射注册表（持久化到 model_mappings.json，与 anthropic 路由共享）
+    pub model_mappings: super::model_mapping::SharedModelMappingManager,
 }
 
 impl AdminState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         admin_api_key: impl Into<String>,
         service: AdminService,
@@ -45,6 +48,7 @@ impl AdminState {
         usage_aggregator: SharedAggregator,
         trace_store: SharedTraceStore,
         groups: SharedGroupManager,
+        model_mappings: super::model_mapping::SharedModelMappingManager,
     ) -> Self {
         Self {
             admin_api_key: Arc::new(RwLock::new(admin_api_key.into())),
@@ -53,6 +57,7 @@ impl AdminState {
             usage_aggregator,
             trace_store,
             groups,
+            model_mappings,
         }
     }
 }

@@ -50,6 +50,8 @@ pub struct AppState {
     pub cache_meter: Option<SharedCacheMeter>,
     /// 请求链路追踪存储（SQLite，可选）
     pub trace_store: Option<SharedTraceStore>,
+    /// 模型映射（OpenAI 兼容层请求时把源模型名转发到目标模型名）
+    pub model_mappings: Option<crate::admin::SharedModelMappingManager>,
 }
 
 impl AppState {
@@ -68,6 +70,7 @@ impl AppState {
             usage_aggregator: None,
             cache_meter: None,
             trace_store: None,
+            model_mappings: None,
         }
     }
 
@@ -99,6 +102,15 @@ impl AppState {
     /// 注入链路追踪存储
     pub fn with_trace_store(mut self, store: Option<SharedTraceStore>) -> Self {
         self.trace_store = store;
+        self
+    }
+
+    /// 注入模型映射管理器
+    pub fn with_model_mappings(
+        mut self,
+        mappings: Option<crate::admin::SharedModelMappingManager>,
+    ) -> Self {
+        self.model_mappings = mappings;
         self
     }
 }

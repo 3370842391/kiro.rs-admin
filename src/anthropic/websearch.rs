@@ -112,7 +112,14 @@ fn is_native_web_search_tool(t: &crate::anthropic::types::Tool) -> bool {
 /// 检查请求是否为纯 WebSearch 请求
 ///
 /// 条件：tools 有且只有一个，且为 Anthropic 原生 web_search 工具。
+///
+/// `force_web_search_loop`（OpenAI 兼容层置位）时一律返回 false：纯快速路径恒返回 SSE
+/// 且只吐原始 web_search_tool_result 块，OpenAI/Codex 客户端无法消费，须改走 agentic loop
+/// （见 [`has_web_search_among_tools`]）。
 pub fn has_web_search_tool(req: &MessagesRequest) -> bool {
+    if req.force_web_search_loop {
+        return false;
+    }
     req.tools.as_ref().is_some_and(|tools| {
         tools.len() == 1 && tools.first().is_some_and(is_native_web_search_tool)
     })
@@ -124,9 +131,13 @@ pub fn has_web_search_tool(req: &MessagesRequest) -> bool {
 /// the case where native web_search coexists with other tools (exec, etc.) - such a request falls onto the normal chat
 /// path, where the upstream may return a tool_use with name=web_search, requiring the internal agentic loop.
 pub(crate) fn has_web_search_among_tools(req: &MessagesRequest) -> bool {
-    req.tools
-        .as_ref()
-        .is_some_and(|tools| tools.len() > 1 && tools.iter().any(is_native_web_search_tool))
+    req.tools.as_ref().is_some_and(|tools| {
+        let has_native = tools.iter().any(is_native_web_search_tool);
+        // 常规：web_search 与其他工具混用（len>1）走 loop。
+        // force_web_search_loop 时：即便只有一个 web_search 也走 loop（OpenAI/Codex 场景，
+        // 纯快速路径已被 has_web_search_tool 短路），保证内部搜索 + 模型合成答案。
+        has_native && (tools.len() > 1 || req.force_web_search_loop)
+    })
 }
 
 /// 从消息中提取搜索查询
@@ -573,6 +584,7 @@ mod tests {
         use crate::anthropic::types::{Message, Tool};
 
         let req = MessagesRequest {
+            force_web_search_loop: false,
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
             messages: vec![Message {
@@ -603,6 +615,7 @@ mod tests {
         use crate::anthropic::types::{Message, Tool};
 
         let req = MessagesRequest {
+            force_web_search_loop: false,
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
             messages: vec![Message {
@@ -645,6 +658,7 @@ mod tests {
         use crate::anthropic::types::{Message, Tool};
 
         let req = MessagesRequest {
+            force_web_search_loop: false,
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
             messages: vec![Message {
@@ -688,6 +702,7 @@ mod tests {
         use crate::anthropic::types::Message;
 
         let req = MessagesRequest {
+            force_web_search_loop: false,
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
             messages: vec![Message {
@@ -716,6 +731,7 @@ mod tests {
         use crate::anthropic::types::Message;
 
         let req = MessagesRequest {
+            force_web_search_loop: false,
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
             messages: vec![Message {

@@ -1491,6 +1491,61 @@ pub async fn list_groups(State(state): State<AdminState>) -> impl IntoResponse {
     })
 }
 
+/// GET /api/admin/model-mappings
+/// 列出全部模型映射（源模型名 → 目标模型名）。
+pub async fn list_model_mappings(State(state): State<AdminState>) -> impl IntoResponse {
+    let mappings = state.model_mappings.list();
+    Json(super::types::ModelMappingsResponse {
+        total: mappings.len(),
+        mappings,
+    })
+}
+
+/// POST /api/admin/model-mappings
+/// 新增或更新一条映射（按源名去重，大小写不敏感）。
+pub async fn upsert_model_mapping(
+    State(state): State<AdminState>,
+    Json(payload): Json<super::types::UpsertModelMappingRequest>,
+) -> impl IntoResponse {
+    match state
+        .model_mappings
+        .upsert(&payload.source, &payload.target)
+    {
+        Ok(m) => Json(m).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(super::types::AdminErrorResponse::invalid_request(
+                e.to_string(),
+            )),
+        )
+            .into_response(),
+    }
+}
+
+/// PUT /api/admin/model-mappings
+/// 整表替换（前端一次性保存全部映射）。
+pub async fn replace_model_mappings(
+    State(state): State<AdminState>,
+    Json(payload): Json<super::types::ReplaceModelMappingsRequest>,
+) -> impl IntoResponse {
+    state.model_mappings.replace_all(payload.mappings);
+    let mappings = state.model_mappings.list();
+    Json(super::types::ModelMappingsResponse {
+        total: mappings.len(),
+        mappings,
+    })
+}
+
+/// DELETE /api/admin/model-mappings/:source
+/// 删除一条映射（按源名，大小写不敏感）。
+pub async fn delete_model_mapping(
+    State(state): State<AdminState>,
+    Path(source): Path<String>,
+) -> impl IntoResponse {
+    let removed = state.model_mappings.remove(&source);
+    Json(serde_json::json!({ "success": true, "removed": removed }))
+}
+
 /// POST /api/admin/groups
 pub async fn create_group(
     State(state): State<AdminState>,

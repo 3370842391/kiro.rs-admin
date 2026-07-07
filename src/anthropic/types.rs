@@ -128,6 +128,12 @@ pub struct MessagesRequest {
     pub output_config: Option<OutputConfig>,
     /// Claude Code 请求中的 metadata，包含 session 信息
     pub metadata: Option<Metadata>,
+    /// 内部标记：强制 web_search 走 agentic loop（内部搜索 + 模型合成答案），
+    /// 而非纯 web_search 快速路径（返回原始 Anthropic web_search_tool_result 块 + 恒 SSE）。
+    /// OpenAI 兼容层置位——OpenAI/Codex 客户端需要合成后的自然语言答案，
+    /// 且非流式请求无法消费快速路径的 SSE。`skip` 保证客户端 JSON 无法设置它。
+    #[serde(skip)]
+    pub force_web_search_loop: bool,
 }
 
 /// 反序列化 system 字段，支持字符串或数组格式

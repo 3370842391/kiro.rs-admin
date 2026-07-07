@@ -742,6 +742,7 @@ mod tests {
     fn build_request_with_system_breakpoint() -> super::super::types::MessagesRequest {
         use super::super::types::{CacheControl, Message, MessagesRequest, SystemMessage};
         MessagesRequest {
+            force_web_search_loop: false,
             model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 32,
             messages: vec![Message {
@@ -825,6 +826,7 @@ mod tests {
         use super::super::types::{Message, MessagesRequest};
         let cache = CacheMeter::new(None);
         let req = MessagesRequest {
+            force_web_search_loop: false,
             model: "x".to_string(),
             max_tokens: 8,
             messages: vec![Message {
@@ -889,6 +891,7 @@ mod tests {
                 ttl: None,
             });
             MessagesRequest {
+                force_web_search_loop: false,
                 model: "claude-sonnet-4-5-20250929".to_string(),
                 max_tokens: 32,
                 messages: vec![Message {
@@ -942,6 +945,7 @@ mod tests {
     ) -> super::super::types::MessagesRequest {
         use super::super::types::MessagesRequest;
         MessagesRequest {
+            force_web_search_loop: false,
             model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 32,
             messages,
@@ -1098,6 +1102,7 @@ mod tests {
         let body = "implement the feature step by step ".repeat(15);
 
         let make_req = |dyn_header: &str, msgs: Vec<Message>| MessagesRequest {
+            force_web_search_loop: false,
             model: "claude-opus-4-8".to_string(),
             max_tokens: 64,
             messages: msgs,
@@ -1193,6 +1198,7 @@ mod tests {
         use super::super::types::{Message, MessagesRequest, Metadata};
         let body = "conversation prefix that stays stable ".repeat(20);
         let make = |session: &str| MessagesRequest {
+            force_web_search_loop: false,
             model: "claude-opus-4-8".to_string(),
             max_tokens: 64,
             messages: vec![
@@ -1265,6 +1271,7 @@ mod tests {
         let stable_sys = "You are a coding assistant. ".repeat(200);
         let body = "conversation body ".repeat(15);
         let req = MessagesRequest {
+            force_web_search_loop: false,
             model: "claude-opus-4-8".to_string(),
             max_tokens: 64,
             messages: vec![
@@ -1322,6 +1329,7 @@ mod tests {
         // 两条消息：第一条是历史（切段），内容为已知纯文本；最后一条占位（不切段）。
         let history_text = "the quick brown fox jumps over the lazy dog";
         let req = MessagesRequest {
+            force_web_search_loop: false,
             model: "m".to_string(),
             max_tokens: 8,
             messages: vec![
@@ -1366,6 +1374,7 @@ mod tests {
         );
 
         let make = |trailing: &str| MessagesRequest {
+            force_web_search_loop: false,
             model: "m".to_string(),
             max_tokens: 8,
             messages: vec![

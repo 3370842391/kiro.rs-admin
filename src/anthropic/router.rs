@@ -41,6 +41,7 @@ pub fn create_router_with_provider(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -55,6 +56,7 @@ pub fn create_router(
     usage_aggregator: Option<SharedAggregator>,
     cache_meter: Option<SharedCacheMeter>,
     trace_store: Option<SharedTraceStore>,
+    model_mappings: Option<crate::admin::SharedModelMappingManager>,
 ) -> Router {
     let mut state = AppState::new(extract_thinking, tool_compatibility_mode);
     if let Some(provider) = kiro_provider {
@@ -63,12 +65,23 @@ pub fn create_router(
     state = state.with_usage(client_keys, usage_recorder, usage_aggregator);
     state = state.with_cache_meter(cache_meter);
     state = state.with_trace_store(trace_store);
+    state = state.with_model_mappings(model_mappings);
 
     // 需要认证的 /v1 路由
     let v1_routes = Router::new()
         .route("/models", get(get_models))
         .route("/messages", post(post_messages))
         .route("/messages/count_tokens", post(count_tokens))
+        .route(
+            "/chat/completions",
+            post(crate::openai::handlers::post_chat_completions),
+        )
+        .route("/responses", post(crate::openai::handlers::post_responses))
+        .route(
+            "/responses/{id}",
+            get(crate::openai::handlers::get_response)
+                .delete(crate::openai::handlers::delete_response),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,

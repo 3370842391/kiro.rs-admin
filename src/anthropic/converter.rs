@@ -2171,6 +2171,7 @@ mod tests {
         use super::super::types::{Message as AnthropicMessage, OutputConfig};
 
         MessagesRequest {
+            force_web_search_loop: false,
             model: model.to_string(),
             max_tokens: 1024,
             messages: vec![AnthropicMessage {
@@ -2525,6 +2526,7 @@ mod tests {
     fn test_determine_chat_trigger_type() {
         // 无工具时返回 MANUAL
         let req = MessagesRequest {
+            force_web_search_loop: false,
             model: "claude-sonnet-4.5".to_string(),
             max_tokens: 1024,
             messages: vec![],
@@ -2816,6 +2818,7 @@ mod tests {
     fn cc_convert_request_default_maps_builtin_names() {
         use super::super::types::Message as AnthropicMessage;
         let req = MessagesRequest {
+            force_web_search_loop: false,
             model: "claude-sonnet-4.5".to_string(),
             max_tokens: 1024,
             messages: vec![AnthropicMessage {
@@ -2855,6 +2858,7 @@ mod tests {
         schema.insert("properties".to_string(), serde_json::json!({}));
 
         let req = MessagesRequest {
+            force_web_search_loop: false,
             model: "claude-sonnet-4.5".to_string(),
             max_tokens: 1024,
             messages: vec![AnthropicMessage {
@@ -2909,6 +2913,7 @@ mod tests {
         schema.insert("properties".to_string(), serde_json::json!({}));
 
         let req = MessagesRequest {
+            force_web_search_loop: false,
             model: "claude-sonnet-4.5".to_string(),
             max_tokens: 1024,
             messages: vec![
@@ -2973,6 +2978,7 @@ mod tests {
 
         // 创建一个请求，历史中有工具使用，但 tools 列表为空
         let req = MessagesRequest {
+            force_web_search_loop: false,
             model: "claude-sonnet-4.5".to_string(),
             max_tokens: 1024,
             messages: vec![
@@ -3072,6 +3078,7 @@ mod tests {
 
         // 测试带有 metadata 的请求，应该使用 session UUID 作为 conversationId
         let req = MessagesRequest {
+            force_web_search_loop: false,
             model: "claude-sonnet-4.5".to_string(),
             max_tokens: 1024,
             messages: vec![AnthropicMessage {
@@ -3104,6 +3111,7 @@ mod tests {
 
         // 测试没有 metadata 的请求，应该生成新的 UUID
         let req = MessagesRequest {
+            force_web_search_loop: false,
             model: "claude-sonnet-4.5".to_string(),
             max_tokens: 1024,
             messages: vec![AnthropicMessage {
@@ -3523,6 +3531,7 @@ mod tests {
         use super::super::types::Message as AnthropicMessage;
 
         let req = MessagesRequest {
+            force_web_search_loop: false,
             model: "claude-sonnet-4.5".to_string(),
             max_tokens: 1024,
             messages: vec![
@@ -3592,6 +3601,7 @@ mod tests {
 
         // user question -> assistant tool_use -> user tool_result (with image + text)
         let req = MessagesRequest {
+            force_web_search_loop: false,
             model: "claude-sonnet-4.5".to_string(),
             max_tokens: 1024,
             messages: vec![
@@ -3652,6 +3662,7 @@ mod tests {
 
         // text-only tool_result: regression unchanged, should produce no top-level image
         let req = MessagesRequest {
+            force_web_search_loop: false,
             model: "claude-sonnet-4.5".to_string(),
             max_tokens: 1024,
             messages: vec![

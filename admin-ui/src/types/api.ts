@@ -601,6 +601,25 @@ export interface GroupsResponse {
   groups: GroupItem[]
 }
 
+// ============ 模型映射（请求时模型名转发） ============
+
+export interface ModelMapping {
+  /** 源模型名（客户端请求里出现的名字，如 gpt-5.5） */
+  source: string
+  /** 目标模型名（转发到后端实际使用的名字，如 claude-opus-4.8） */
+  target: string
+}
+
+export interface ModelMappingsResponse {
+  total: number
+  mappings: ModelMapping[]
+}
+
+export interface UpsertModelMappingRequest {
+  source: string
+  target: string
+}
+
 export interface CreateGroupRequest {
   name: string
   description?: string

@@ -32,3 +32,6 @@
 .codegraph/
 .claude/
 test/
+
+# oh-my-claudecode 运行时状态（不提交）
+.omc/

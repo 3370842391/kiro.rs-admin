@@ -6,6 +6,7 @@ mod http_client;
 mod image_resize;
 mod kiro;
 mod model;
+mod openai;
 pub mod token;
 
 use std::collections::HashMap;
@@ -272,6 +273,20 @@ async fn main() {
     )));
     cache_meter.clone().spawn_background();
 
+    // 模型映射：请求时把源模型名（如 gpt-5.5）转发到目标模型名（如 claude-opus-4.8）。
+    // 首次启动写入内置默认映射；源名不会出现在 /v1/models 列表里。
+    let model_mappings_path = admin::model_mapping::default_path_in(&cache_dir);
+    let model_mapping_manager = std::sync::Arc::new(
+        admin::ModelMappingManager::load(&model_mappings_path).unwrap_or_else(|e| {
+            tracing::warn!(
+                "加载模型映射失败 ({}): {}",
+                model_mappings_path.display(),
+                e
+            );
+            admin::ModelMappingManager::new()
+        }),
+    );
+
     let anthropic_app = anthropic::create_router(
         Some(kiro_provider.clone()),
         config.extract_thinking,
@@ -281,6 +296,7 @@ async fn main() {
         Some(usage_aggregator.clone()),
         Some(cache_meter.clone()),
         trace_store.clone(),
+        Some(model_mapping_manager.clone()),
     );
 
     // 构建 Admin API 路由（配置了非空 adminApiKey 时启用）
@@ -313,6 +329,7 @@ async fn main() {
                 usage_aggregator.clone(),
                 admin_trace_store,
                 group_manager.clone(),
+                model_mapping_manager.clone(),
             );
 
             // 启动余额后台刷新调度器（每 5 分钟一次，与缓存 TTL 对齐）
@@ -351,6 +368,8 @@ async fn main() {
     tracing::info!("  GET  /v1/models");
     tracing::info!("  POST /v1/messages");
     tracing::info!("  POST /v1/messages/count_tokens");
+    tracing::info!("  POST /v1/chat/completions");
+    tracing::info!("  POST /v1/responses");
     tracing::info!("Admin API:");
     tracing::info!("  GET  /api/admin/credentials");
     tracing::info!("  POST /api/admin/credentials/:index/disabled");

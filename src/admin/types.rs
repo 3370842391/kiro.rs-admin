@@ -950,8 +950,14 @@ pub struct StartIdcLoginResponse {
 }
 
 /// 轮询 IdC 登录状态响应
+///
+/// `rename_all_fields = "camelCase"` 不可省略：enum 上的 `rename_all` 只重命名变体名，
+/// 不会级联到 struct variant 内部字段。缺了它，`Success`/`Continue` 会序列化成
+/// snake_case（`credential_id`/`next_url`），而前端读 `credentialId`/`nextUrl` →
+/// 得到 `undefined`（Kiro Hosted 登录成功 toast 显示"已添加凭据 #undefined"，
+/// 二段登录 `nextUrl` 链接也拿不到）。
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase", tag = "status")]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "status")]
 pub enum PollIdcLoginResponse {
     #[serde(rename = "pending")]
     Pending,
@@ -1226,9 +1232,55 @@ pub struct DeleteGroupQuery {
     pub force: bool,
 }
 
+// ============ 模型映射（请求时模型名转发） ============
+
+/// 模型映射列表响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelMappingsResponse {
+    pub total: usize,
+    pub mappings: Vec<super::model_mapping::ModelMapping>,
+}
+
+/// 新增 / 更新单条映射
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpsertModelMappingRequest {
+    pub source: String,
+    pub target: String,
+}
+
+/// 整表替换（前端一次性保存全部映射）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplaceModelMappingsRequest {
+    #[serde(default)]
+    pub mappings: Vec<super::model_mapping::ModelMapping>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 回归：Kiro Hosted / IdC 登录成功后前端读 `credentialId`/`nextUrl`（camelCase）。
+    /// enum 上仅 `rename_all` 不会重命名 struct variant 内部字段——必须叠加
+    /// `rename_all_fields`，否则前端拿到 undefined（toast 显示"已添加凭据 #undefined"）。
+    #[test]
+    fn poll_login_response_serializes_fields_as_camel_case() {
+        let success = serde_json::to_value(PollIdcLoginResponse::Success { credential_id: 7 })
+            .unwrap();
+        assert_eq!(success["status"], "success");
+        assert_eq!(success["credentialId"], 7);
+        assert!(success.get("credential_id").is_none());
+
+        let cont = serde_json::to_value(PollIdcLoginResponse::Continue {
+            next_url: "https://example.com/next".to_string(),
+        })
+        .unwrap();
+        assert_eq!(cont["status"], "continue");
+        assert_eq!(cont["nextUrl"], "https://example.com/next");
+        assert!(cont.get("next_url").is_none());
+    }
 
     #[test]
     fn test_add_credential_request_accepts_clipproxyapi_snake_case() {

@@ -1,7 +1,7 @@
 import { forwardRef, useEffect, useState, type ComponentPropsWithoutRef } from 'react'
 import {
   Activity, RefreshCw, UploadCloud, Settings, Key, Wand2, Eye, EyeOff, Copy,
-  MoreHorizontal, ShieldAlert, ShieldCheck, Gauge,
+  MoreHorizontal, ShieldAlert, ShieldCheck, Gauge, Shuffle,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -28,6 +28,7 @@ import {
 } from '@/api/credentials'
 import { extractErrorMessage, generateApiKey } from '@/lib/utils'
 import { ImageUpdateDialog } from '@/components/image-update-dialog'
+import { ModelMappingsDialog } from '@/components/model-mappings-dialog'
 
 /**
  * 顶栏右侧通用工具栏：负载均衡切换、刷新、在线更新、设置（Key 管理）。
@@ -50,6 +51,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
   const { data: updateCheck } = useUpdateCheck()
 
   const [imageUpdateOpen, setImageUpdateOpen] = useState(false)
+  const [modelMappingsOpen, setModelMappingsOpen] = useState(false)
   const [keyDialogOpen, setKeyDialogOpen] = useState(false)
   const [newKey, setNewKey] = useState('')
   const [showPlain, setShowPlain] = useState(false)
@@ -119,6 +121,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     isSettingThrottle,
     loadBalancingMode: loadBalancingData?.mode,
     openImageUpdate: () => setImageUpdateOpen(true),
+    openModelMappings: () => setModelMappingsOpen(true),
     openKeyDialog,
     retryPolicy,
     setRetryPolicy: (mode: RetryMode, customPolicy?: RetryPolicy | null) =>
@@ -143,6 +146,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     <>
       {compact ? <CompactTools controls={controls} /> : <FullTools controls={controls} />}
       <ImageUpdateDialog open={imageUpdateOpen} onOpenChange={setImageUpdateOpen} />
+      <ModelMappingsDialog open={modelMappingsOpen} onOpenChange={setModelMappingsOpen} />
 
       <Dialog
         open={keyDialogOpen}
@@ -250,6 +254,7 @@ interface ToolControls {
   isSettingThrottle: boolean
   loadBalancingMode?: LoadBalancingMode
   openImageUpdate: () => void
+  openModelMappings: () => void
   openKeyDialog: () => void
   retryPolicy?: RetryPolicyConfig
   setRetryPolicy: (mode: RetryMode, customPolicy?: RetryPolicy | null) => void
@@ -272,7 +277,10 @@ function FullTools({ controls }: { controls: ToolControls }) {
       />
       <RefreshButton onRefresh={controls.handleRefresh} />
       <ImageUpdateButton controls={controls} />
-      <KeySettingsMenu onOpenKeyDialog={controls.openKeyDialog} />
+      <KeySettingsMenu
+        onOpenKeyDialog={controls.openKeyDialog}
+        onOpenModelMappings={controls.openModelMappings}
+      />
     </>
   )
 }
@@ -312,6 +320,10 @@ function CompactTools({ controls }: { controls: ToolControls }) {
         </DropdownMenuItem>
         <RetryCompactItems controls={controls} />
         <ThrottleCompactItems {...throttleProps} />
+        <DropdownMenuLabel>模型</DropdownMenuLabel>
+        <DropdownMenuItem onSelect={controls.openModelMappings}>
+          <Shuffle />模型映射（请求时模型名转发）
+        </DropdownMenuItem>
         <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
         <DropdownMenuItem onSelect={controls.openKeyDialog}>
           <Key />修改登录API密钥（管理面板登录）
@@ -638,7 +650,13 @@ function ImageUpdateButton({ controls }: { controls: ToolControls }) {
   )
 }
 
-function KeySettingsMenu({ onOpenKeyDialog }: { onOpenKeyDialog: () => void }) {
+function KeySettingsMenu({
+  onOpenKeyDialog,
+  onOpenModelMappings,
+}: {
+  onOpenKeyDialog: () => void
+  onOpenModelMappings: () => void
+}) {
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -647,6 +665,10 @@ function KeySettingsMenu({ onOpenKeyDialog }: { onOpenKeyDialog: () => void }) {
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end">
+        <DropdownMenuLabel>模型</DropdownMenuLabel>
+        <DropdownMenuItem onSelect={onOpenModelMappings}>
+          <Shuffle />模型映射（请求时模型名转发）
+        </DropdownMenuItem>
         <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
         <DropdownMenuItem onSelect={onOpenKeyDialog}>
           <Key />修改登录API密钥（管理面板登录）

@@ -15,8 +15,9 @@ use super::{
         enable_overage_all, export_credentials, force_refresh_token, get_account_throttle_config,
         get_all_credentials, get_credential_balance, get_credential_models, get_global_proxy,
         get_load_balancing_mode, get_log_governance_config, get_proxy_balancing_mode,
-        get_proxy_pool, get_retry_policy, get_update_config, list_client_keys, list_groups,
-        list_traces, poll_idc_login, poll_idc_relogin, poll_social_login, poll_social_relogin,
+        delete_model_mapping, get_proxy_pool, get_retry_policy, get_update_config, list_client_keys,
+        list_groups, list_model_mappings, list_traces, poll_idc_login, poll_idc_relogin,
+        poll_social_login, poll_social_relogin, replace_model_mappings, upsert_model_mapping,
         pull_update_image, reset_all_success_count, reset_client_key_stats, reset_failure_count,
         reset_success_count, rollback_image_update, rotate_client_key, set_account_throttle_config,
         set_client_key_disabled, set_credential_disabled, set_credential_overage,
@@ -169,6 +170,13 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/client-keys/{id}/rotate", post(rotate_client_key))
         .route("/groups", get(list_groups).post(create_group))
         .route("/groups/{name}", delete(delete_group).patch(update_group))
+        .route(
+            "/model-mappings",
+            get(list_model_mappings)
+                .post(upsert_model_mapping)
+                .put(replace_model_mappings),
+        )
+        .route("/model-mappings/{source}", delete(delete_model_mapping))
         .route("/stats/overview", get(stats_overview))
         .route("/stats/timeseries", get(stats_timeseries))
         .route("/stats/by-model", get(stats_by_model))
