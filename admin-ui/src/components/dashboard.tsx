@@ -7,7 +7,6 @@ import {
   Server,
   Plus,
   Upload,
-  FileUp,
   FileDown,
   Trash2,
   RotateCcw,
@@ -77,7 +76,6 @@ import { BatchImportDialog } from "@/components/batch-import-dialog";
 import { BatchEditCredentialDialog } from "@/components/batch-edit-credential-dialog";
 import { IdcLoginDialog } from "@/components/idc-login-dialog";
 import { SocialLoginDialog } from "@/components/social-login-dialog";
-import { KamImportDialog } from "@/components/kam-import-dialog";
 import {
   BatchVerifyDialog,
   type VerifyResult,
@@ -176,7 +174,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [enterpriseLoginDialogOpen, setEnterpriseLoginDialogOpen] =
     useState(false);
   const [socialLoginDialogOpen, setSocialLoginDialogOpen] = useState(false);
-  const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false);
   const [proxyPoolDialogOpen, setProxyPoolDialogOpen] = useState(false);
   const [imageUpdateDialogOpen, setImageUpdateDialogOpen] = useState(false);
   const [adminKeyDialogOpen, setAdminKeyDialogOpen] = useState(false);
@@ -1579,13 +1576,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                     onSelect={() => setBatchImportDialogOpen(true)}
                   >
                     <Upload />
-                    批量导入
-                  </DropdownMenuItem>
-                  <DropdownMenuItem
-                    onSelect={() => setKamImportDialogOpen(true)}
-                  >
-                    <FileUp />
-                    Kiro Account Manager 导入
+                    导入凭据 / Kiro Account Manager
                   </DropdownMenuItem>
                   <DropdownMenuItem
                     onSelect={handleExportKam}
@@ -1914,10 +1905,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         onSuccess={() =>
           queryClient.invalidateQueries({ queryKey: ["credentials"] })
         }
-      />
-      <KamImportDialog
-        open={kamImportDialogOpen}
-        onOpenChange={setKamImportDialogOpen}
       />
       <ProxyPoolDialog
         open={proxyPoolDialogOpen}

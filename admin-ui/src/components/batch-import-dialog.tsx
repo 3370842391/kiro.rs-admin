@@ -1,7 +1,7 @@
-import { useRef, useState } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { CheckCircle2, XCircle, AlertCircle, Loader2 } from 'lucide-react'
+import { CheckCircle2, XCircle, AlertCircle, Loader2, Upload } from 'lucide-react'
 import {
   Dialog,
   DialogContent,
@@ -79,12 +79,13 @@ interface CredentialInput {
   user_id?: string | null
   startUrl?: string
   start_url?: string
+  status?: string
   groups?: string[]
 }
 
 interface VerificationResult {
   index: number
-  status: 'pending' | 'checking' | 'verifying' | 'verified' | 'imported' | 'duplicate' | 'failed'
+  status: 'pending' | 'checking' | 'verifying' | 'verified' | 'imported' | 'duplicate' | 'failed' | 'skipped'
   error?: string
   usage?: string
   email?: string
@@ -117,6 +118,37 @@ function preferStringArray(obj: Record<string, unknown>, ...keys: string[]): str
   return undefined
 }
 
+function normalizeExpiresAt(value: unknown): string | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    const date = new Date(value)
+    return Number.isNaN(date.getTime()) ? undefined : date.toISOString()
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    return trimmed.length > 0 ? trimmed : undefined
+  }
+  return undefined
+}
+
+function parseImportEntries(parsed: unknown): unknown[] {
+  if (Array.isArray(parsed)) return parsed
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('无法识别的 JSON 格式')
+  }
+  const obj = parsed as Record<string, unknown>
+  if (Array.isArray(obj.accounts)) return obj.accounts
+  if (
+    (obj.credentials && typeof obj.credentials === 'object') ||
+    typeof obj.refreshToken === 'string' ||
+    typeof obj.refresh_token === 'string' ||
+    typeof obj.kiroApiKey === 'string' ||
+    typeof obj.kiro_api_key === 'string'
+  ) {
+    return [obj]
+  }
+  throw new Error('无法识别的导入格式：请粘贴凭据对象、数组，或 Kiro Account Manager 导出的 accounts JSON')
+}
+
 /**
  * 归一化单条导入条目，兼容两种格式：
  * 1. 扁平 `credentials.json` 格式（字段直接位于顶层）；
@@ -141,7 +173,7 @@ function normalizeImportEntry(raw: unknown): CredentialInput {
     refreshToken: preferString(merged, 'refreshToken', 'refresh_token'),
     accessToken: preferString(merged, 'accessToken', 'access_token'),
     profileArn: preferString(merged, 'profileArn', 'profile_arn'),
-    expiresAt: preferString(merged, 'expiresAt', 'expires_at', 'expired'),
+    expiresAt: normalizeExpiresAt(merged.expiresAt ?? merged.expires_at ?? merged.expired),
     clientId: preferString(merged, 'clientId', 'client_id'),
     clientSecret: preferString(merged, 'clientSecret', 'client_secret'),
     region: preferString(merged, 'region'),
@@ -160,6 +192,7 @@ function normalizeImportEntry(raw: unknown): CredentialInput {
     startUrl: preferString(merged, 'startUrl', 'start_url'),
     endpoint: preferString(merged, 'endpoint'),
     email: preferString(merged, 'email'),
+    status: preferString(merged, 'status'),
     proxyUrl: preferString(merged, 'proxyUrl', 'proxy_url'),
     proxyUsername: preferString(merged, 'proxyUsername', 'proxy_username'),
     proxyPassword: preferString(merged, 'proxyPassword', 'proxy_password'),
@@ -198,17 +231,21 @@ function mergeGroups(
   return Array.from(new Set(all))
 }
 
-
+function isErrorStatus(status: string | undefined): boolean {
+  return status?.trim().toLowerCase() === 'error'
+}
 
 export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps) {
   const [jsonInput, setJsonInput] = useState('')
   const [importing, setImporting] = useState(false)
+  const [skipErrorAccounts, setSkipErrorAccounts] = useState(true)
   const [progress, setProgress] = useState({ current: 0, total: 0 })
   const [currentProcessing, setCurrentProcessing] = useState<string>('')
   const [results, setResults] = useState<VerificationResult[]>([])
   // 导入时统一为所有账号设置的分组（与 JSON 内 groups 取并集）。
   const [groups, setGroups] = useState<string[]>([])
   const groupOptions = useGroupOptions()
+  const fileInputRef = useRef<HTMLInputElement>(null)
   // 进行中的 AbortController，用于"停止导入"：abort 会让 fetch 流中断，
   // 服务端在下次写回事件时检测到接收端关闭即停止处理剩余凭据。
   const abortRef = useRef<AbortController | null>(null)
@@ -223,10 +260,12 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
   const resetForm = () => {
     setJsonInput('')
+    setSkipErrorAccounts(true)
     setProgress({ current: 0, total: 0 })
     setCurrentProcessing('')
     setResults([])
     setGroups([])
+    if (fileInputRef.current) fileInputRef.current.value = ''
   }
 
   // 按原始下标局部更新单行结果（避免每条全量拷贝之外的额外复杂度）
@@ -238,13 +277,50 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     })
   }
 
+  const handleFileSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files ?? [])
+    if (files.length === 0) return
+
+    try {
+      const fileTexts = await Promise.all(
+        files.map(async (file) => ({ name: file.name, text: await file.text() }))
+      )
+      const merged: unknown[] = []
+      const failed: { name: string; reason: string }[] = []
+
+      for (const { name, text } of fileTexts) {
+        try {
+          merged.push(...parseImportEntries(JSON.parse(text)))
+        } catch (error) {
+          failed.push({ name, reason: extractErrorMessage(error) })
+        }
+      }
+
+      if (merged.length === 0) {
+        toast.error(`所有文件均解析失败：${failed.map((f) => `${f.name}（${f.reason}）`).join('；')}`)
+        return
+      }
+
+      setJsonInput(JSON.stringify({ version: 'merged', accounts: merged }, null, 2))
+      setResults([])
+      const summary = files.length === 1 ? files[0].name : `${files.length} 个文件`
+      if (failed.length > 0) {
+        toast.warning(`已加载 ${summary}，合并 ${merged.length} 条记录；${failed.length} 个文件解析失败`)
+      } else {
+        toast.success(`已加载 ${summary}，合并 ${merged.length} 条记录`)
+      }
+    } catch (error) {
+      toast.error('读取文件失败: ' + extractErrorMessage(error))
+    } finally {
+      event.target.value = ''
+    }
+  }
+
   const handleBatchImport = async (verify: boolean) => {
     // 先单独解析 JSON，给出精准的错误提示
     let credentials: CredentialInput[]
     try {
-      const parsed = JSON.parse(jsonInput)
-      const arr = Array.isArray(parsed) ? parsed : [parsed]
-      credentials = arr.map(normalizeImportEntry)
+      credentials = parseImportEntries(JSON.parse(jsonInput)).map(normalizeImportEntry)
     } catch (error) {
       toast.error('JSON 格式错误: ' + extractErrorMessage(error))
       return
@@ -260,9 +336,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       setProgress({ current: 0, total: credentials.length })
 
       // 初始化结果
-      const initialResults: VerificationResult[] = credentials.map((_, i) => ({
+      const initialResults: VerificationResult[] = credentials.map((cred, i) => ({
         index: i + 1,
-        status: 'pending'
+        status: skipErrorAccounts && isErrorStatus(cred.status) ? 'skipped' : 'pending',
+        email: cred.email,
       }))
       setResults(initialResults)
 
@@ -288,6 +365,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
       for (let i = 0; i < credentials.length; i++) {
         const cred = credentials[i]
+
+        if (skipErrorAccounts && isErrorStatus(cred.status)) {
+          continue
+        }
 
         // 若凭据未指定代理且代理池有可用代理，随机分配一个
         if (!cred.proxyUrl?.trim() && enabledProxies.length > 0) {
@@ -421,7 +502,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       }
 
       if (toImport.length === 0) {
-        setCurrentProcessing('没有需要上传的凭据（全部重复或校验失败）')
+        setCurrentProcessing('没有需要上传的凭据（全部跳过、重复或校验失败）')
       } else {
         setCurrentProcessing(
           `${verify ? '批量验活' : '直接导入'}中（${toImport.length} 个）…`,
@@ -516,6 +597,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
         return <CheckCircle2 className="w-5 h-5 text-sky-500" />
       case 'duplicate':
         return <AlertCircle className="w-5 h-5 text-yellow-500" />
+      case 'skipped':
+        return <AlertCircle className="w-5 h-5 text-gray-400" />
       case 'failed':
         return <XCircle className="w-5 h-5 text-red-500" />
     }
@@ -535,6 +618,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
         return '已导入（未验活）'
       case 'duplicate':
         return '重复凭据'
+      case 'skipped':
+        return '已跳过（error 状态）'
       case 'failed':
         if (result.rollbackStatus === 'success') return '验活失败（已排除）'
         if (result.rollbackStatus === 'failed') return '验活失败（未排除）'
@@ -549,8 +634,22 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       r.status === 'verified' ||
       r.status === 'imported' ||
       r.status === 'duplicate' ||
-      r.status === 'failed'
+      r.status === 'failed' ||
+      r.status === 'skipped'
   ).length
+
+  const { previewCredentials, parseError } = useMemo(() => {
+    if (!jsonInput.trim()) return { previewCredentials: [] as CredentialInput[], parseError: '' }
+    try {
+      return {
+        previewCredentials: parseImportEntries(JSON.parse(jsonInput)).map(normalizeImportEntry),
+        parseError: '',
+      }
+    } catch (error) {
+      return { previewCredentials: [] as CredentialInput[], parseError: extractErrorMessage(error) }
+    }
+  }, [jsonInput])
+  const errorAccountCount = previewCredentials.filter((cred) => isErrorStatus(cred.status)).length
 
   return (
     <Dialog
@@ -569,16 +668,38 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     >
       <DialogContent className="sm:max-w-2xl max-h-[80vh] flex flex-col">
         <DialogHeader>
-          <DialogTitle>批量导入凭据</DialogTitle>
+          <DialogTitle>导入凭据</DialogTitle>
         </DialogHeader>
 
         <div className="flex-1 overflow-y-auto space-y-4 py-4">
           <div className="space-y-2">
-            <label className="text-sm font-medium">
-              JSON 格式凭据
-            </label>
+            <div className="flex items-center justify-between gap-2">
+              <label className="text-sm font-medium">
+                JSON 凭据 / Kiro Account Manager 导出
+              </label>
+              <div>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="application/json,.json"
+                  multiple
+                  className="hidden"
+                  onChange={handleFileSelect}
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={importing}
+                >
+                  <Upload className="w-4 h-4 mr-1.5" />
+                  选择文件
+                </Button>
+              </div>
+            </div>
             <textarea
-              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n企业 SSO: [{"authMethod":"external_idp","refreshToken":"...","clientId":"...","tokenEndpoint":"https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token","scopes":"...","region":"eu-central-1"}]\n\n支持 region 字段自动映射为 authRegion'}
+              placeholder={'粘贴 JSON（支持单个对象、数组，或 Kiro Account Manager 导出的 { "version": "...", "accounts": [...] }）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n企业 SSO: [{"authMethod":"external_idp","refreshToken":"...","clientId":"...","tokenEndpoint":"https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token","scopes":"...","region":"eu-central-1"}]\nKAM: {"version":"1.8.3","accounts":[{"email":"...","credentials":{"refreshToken":"...","clientId":"..."}}]}\n\n支持 region 自动映射为 authRegion，也支持多个 JSON 文件合并导入'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}
@@ -588,6 +709,29 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               💡 "开始导入并验活"会校验余额、失败自动排除；"直接导入"只落库不验活（更快）。两种模式均支持中途"停止"。
             </p>
           </div>
+
+          {parseError && (
+            <div className="text-sm text-red-600 dark:text-red-400">解析失败: {parseError}</div>
+          )}
+          {previewCredentials.length > 0 && !importing && results.length === 0 && (
+            <div className="space-y-2 rounded-md border bg-muted/30 p-3">
+              <div className="text-sm text-muted-foreground">
+                识别到 {previewCredentials.length} 条记录
+                {errorAccountCount > 0 && `（其中 ${errorAccountCount} 条为 error 状态）`}
+              </div>
+              {errorAccountCount > 0 && (
+                <label className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={skipErrorAccounts}
+                    onChange={(e) => setSkipErrorAccounts(e.target.checked)}
+                    className="rounded border-gray-300"
+                  />
+                  跳过 error 状态的账号
+                </label>
+              )}
+            </div>
+          )}
 
           {/* 导入分组：选中的分组会统一应用到本次导入的所有账号
               （与 JSON 内自带的 groups 取并集），免去导入后逐个改分组。 */}
@@ -638,6 +782,9 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
                 </span>
                 <span className="text-red-600 dark:text-red-400">
                   ✗ 失败: {results.filter(r => r.status === 'failed').length}
+                </span>
+                <span className="text-muted-foreground">
+                  跳过: {results.filter(r => r.status === 'skipped').length}
                 </span>
               </div>
 
