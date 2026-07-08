@@ -400,8 +400,22 @@ fn split_chat_messages(
 ) -> Result<(Option<Vec<SystemMessage>>, Vec<Message>), OpenAIConversionError> {
     let mut system = Vec::new();
     let mut out = Vec::new();
+    // 缓冲连续的 OpenAI `tool` 消息：Anthropic 要求同一 assistant 轮次的所有
+    // tool_result 必须**合并进一条 user 消息**（且紧跟在发起 tool_use 的 assistant
+    // 之后）。OpenAI 的并行工具调用会发多条独立 tool 消息，若逐条转成单独的 user
+    // 消息会产生连续 user 消息、破坏 tool_use/tool_result 配对，上游报
+    // 400 "tool_use and tool_result blocks must be correctly paired and ordered"。
+    let mut pending_tool_results: Vec<Value> = Vec::new();
 
     for msg in messages {
+        // 遇到任何非 tool 消息前，先把缓冲的 tool_result 作为一条 user 消息落盘。
+        if msg.role != "tool" && !pending_tool_results.is_empty() {
+            out.push(Message {
+                role: "user".to_string(),
+                content: Value::Array(std::mem::take(&mut pending_tool_results)),
+            });
+        }
+
         match msg.role.as_str() {
             "system" | "developer" => {
                 let text = content_to_text(msg.content.as_ref().unwrap_or(&Value::Null));
@@ -420,18 +434,23 @@ fn split_chat_messages(
                 role: "assistant".to_string(),
                 content: assistant_content_to_anthropic(msg)?,
             }),
-            "tool" => out.push(Message {
-                role: "user".to_string(),
-                content: Value::Array(vec![json!({
-                    "type": "tool_result",
-                    "tool_use_id": msg.tool_call_id.clone().unwrap_or_default(),
-                    "content": tool_result_content(msg.content.as_ref())?
-                })]),
-            }),
+            "tool" => pending_tool_results.push(json!({
+                "type": "tool_result",
+                "tool_use_id": msg.tool_call_id.clone().unwrap_or_default(),
+                "content": tool_result_content(msg.content.as_ref())?
+            })),
             other => {
                 tracing::debug!("忽略不支持的 OpenAI message role: {}", other);
             }
         }
+    }
+
+    // 收尾：flush 末尾残留的 tool_result（对话以工具结果结束是常见的续跑场景）。
+    if !pending_tool_results.is_empty() {
+        out.push(Message {
+            role: "user".to_string(),
+            content: Value::Array(pending_tool_results),
+        });
     }
 
     Ok(((!system.is_empty()).then_some(system), out))

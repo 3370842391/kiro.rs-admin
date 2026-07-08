@@ -1355,6 +1355,50 @@ mod tests {
         assert!(tools.iter().any(|t| t.name == "get_weather" && t.tool_type.is_none()));
     }
 
+    /// 回归：OpenAI 并行工具调用（一条 assistant 带多个 tool_calls + 多条独立 tool
+    /// 消息）必须合并成 assistant[tool_use...] + 单条 user[tool_result...]，否则连续
+    /// user 消息会破坏配对，上游报 400 "tool_use and tool_result blocks must be
+    /// correctly paired and ordered"。
+    #[test]
+    fn chat_request_batches_parallel_tool_results_into_one_user_message() {
+        let req: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [
+                {"role": "user", "content": "查北京和上海的天气"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_a", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":\"北京\"}"}},
+                    {"id": "call_b", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":\"上海\"}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_a", "content": "北京晴"},
+                {"role": "tool", "tool_call_id": "call_b", "content": "上海雨"},
+                {"role": "user", "content": "总结"}
+            ]
+        }))
+        .unwrap();
+
+        let converted = chat_to_anthropic(&req).unwrap();
+        let msgs = &converted.anthropic.messages;
+        // user / assistant(2×tool_use) / user(2×tool_result 合并) / user(总结)
+        assert_eq!(msgs.len(), 4);
+
+        // assistant 轮次带两个 tool_use
+        assert_eq!(msgs[1].role, "assistant");
+        let assistant_blocks = msgs[1].content.as_array().unwrap();
+        let tool_uses = assistant_blocks.iter().filter(|b| b["type"] == "tool_use").count();
+        assert_eq!(tool_uses, 2);
+
+        // 两个 tool_result 必须在同一条 user 消息里（关键：不能拆成两条）
+        assert_eq!(msgs[2].role, "user");
+        let results = msgs[2].content.as_array().unwrap();
+        assert_eq!(results.len(), 2, "两个 tool_result 必须合并进一条 user 消息");
+        assert!(results.iter().all(|r| r["type"] == "tool_result"));
+        assert_eq!(results[0]["tool_use_id"], "call_a");
+        assert_eq!(results[1]["tool_use_id"], "call_b");
+
+        // 不应出现连续两条 user 消息承载 tool_result
+        assert_eq!(msgs[3].role, "user"); // 这是"总结"，与上一条 tool_result user 相邻是允许的
+    }
+
     #[test]
     fn responses_input_merges_parallel_function_calls() {
         let messages = responses_input_to_messages(Some(&json!([
