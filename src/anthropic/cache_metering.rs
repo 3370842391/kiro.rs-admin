@@ -72,17 +72,44 @@ pub struct CacheUsage {
     pub cache_covered_est: i32,
     /// 整个 prompt 的 estimate token 总量（比例分摊的分母）。
     pub prompt_total_est: i32,
+    /// 命中率整形下界（百分比 0..=100）。由 handler 从运行时配置注入；
+    /// `min==0 && max==0` = 不整形。见 [`shape_hit_rate`]。
+    pub hit_rate_min_pct: u32,
+    /// 命中率整形上界（百分比 0..=100）。见 [`Self::hit_rate_min_pct`]。
+    pub hit_rate_max_pct: u32,
 }
 
 impl CacheUsage {
+    /// 注入命中率整形区间（百分比 0..=100），返回带 bounds 的副本。
+    /// 由 handler 在 `compute_cache_usage` 产出后、随 cache_usage 流入流/非流路径前调用；
+    /// `(0, 0)` = 不整形。bounds 随 [`CacheUsage`] 一路带到 [`Self::split_against_total`]。
+    pub fn with_hit_rate_bounds(mut self, min_pct: u32, max_pct: u32) -> Self {
+        self.hit_rate_min_pct = min_pct.min(100);
+        self.hit_rate_max_pct = max_pct.min(100);
+        self
+    }
+
     /// 按真实 total 口径做互斥分摊，返回 `(input_tokens, cache_creation, cache_read)`。
     ///
     /// `total_real` 是最终上报口径的全量 prompt token（contextUsage 真值优先，
     /// 否则 `count_tokens` 估算）。三者满足 `input + creation + read == total_real`。
     ///
-    /// 无缓存覆盖（`cache_covered_est == 0`）或基准缺失时，直接返回
-    /// `(total_real, 0, 0)`——全部计入 input，不凭空造缓存计数。
+    /// 无缓存覆盖（`cache_covered_est == 0`）或基准缺失时，先得到 `(total_real, 0, 0)`；
+    /// 随后按 `hit_rate_*_pct` 做命中率整形（区间为 `(0,0)` 时原样返回）。
     pub fn split_against_total(&self, total_real: i32) -> (i32, i32, i32) {
+        let (input, creation, read) = self.split_raw(total_real);
+        // 整形：固定 creation 与 total 不变，只在 input↔read 之间挪，把命中率钳进 [min,max]。
+        shape_hit_rate(
+            input,
+            creation,
+            read,
+            self.hit_rate_min_pct,
+            self.hit_rate_max_pct,
+        )
+    }
+
+    /// 未整形的原始互斥分摊。整形逻辑集中在 [`Self::split_against_total`] 末尾。
+    fn split_raw(&self, total_real: i32) -> (i32, i32, i32) {
         let total = total_real.max(0);
         if self.cache_covered_est <= 0 || self.prompt_total_est <= 0 {
             return (total, 0, 0);
@@ -103,6 +130,50 @@ impl CacheUsage {
         let input = total - cache_total;
         (input, creation, read)
     }
+}
+
+/// 命中率整形：把 `(input, creation, read)` 的命中率 `read/(input+read)` **钳制**进
+/// `[min_pct, max_pct]`（百分比）。固定 `creation` 与 total（三者之和）不变，只在
+/// `input↔read` 之间重分配——**计费总量一分不漂**，只改 input 与 cache_read 的配比。
+///
+/// 语义：
+/// - `min_pct == 0 && max_pct == 0` → 关闭整形，原样返回（默认，零行为变化）。
+/// - `max_pct == 0`（min>0）→ 只设下界，上界视为 100%（把低命中率提到 min）。
+/// - `min_pct == 0`（max>0）→ 只设上界，下界视为 0%（把高命中率压到 max）。
+/// - 命中率已在区间内 → 保留真实模拟值。
+///
+/// `pool = input + read <= 0` 时无可分配，原样返回（不凭空造 read）。
+fn shape_hit_rate(
+    input: i32,
+    creation: i32,
+    read: i32,
+    min_pct: u32,
+    max_pct: u32,
+) -> (i32, i32, i32) {
+    if min_pct == 0 && max_pct == 0 {
+        return (input, creation, read);
+    }
+    let pool = input + read;
+    if pool <= 0 {
+        return (input, creation, read);
+    }
+    let lo = (min_pct.min(100) as f64) / 100.0;
+    let hi = if max_pct == 0 {
+        1.0
+    } else {
+        (max_pct.min(100) as f64) / 100.0
+    };
+    // 防御：区间非法（lo > hi，来自手改/损坏的 config——构造路径不强制 min<=max）时
+    // 不整形原样返回，绝不让 `f64::clamp(lo, hi)` 在 lo>hi 时 panic 打挂请求热路径。
+    if lo > hi {
+        return (input, creation, read);
+    }
+    let cur = read as f64 / pool as f64;
+    let target = cur.clamp(lo, hi);
+    let new_read = ((pool as f64) * target).round() as i32;
+    let new_read = new_read.clamp(0, pool);
+    let new_input = pool - new_read;
+    (new_input, creation, new_read)
 }
 
 /// 进程内提示词缓存
@@ -371,6 +442,7 @@ pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u6
         cache_read: cache_read as i32,
         cache_covered_est: covered as i32,
         prompt_total_est: prompt_total_est as i32,
+        ..Default::default()
     }
 }
 
@@ -799,6 +871,7 @@ mod tests {
             cache_read: 30,
             cache_covered_est: 80, // creation 部分 = 50
             prompt_total_est: 100,
+            ..Default::default()
         };
         // covered 占 prompt 的 80% → 真实 total=1000 时缓存覆盖 800。
         let (input, creation, read) = u.split_against_total(1000);
@@ -815,8 +888,113 @@ mod tests {
             cache_read: 0,
             cache_covered_est: 0,
             prompt_total_est: 100,
+            ..Default::default()
         };
         assert_eq!(u.split_against_total(500), (500, 0, 0));
+    }
+
+    #[test]
+    fn shape_hit_rate_invalid_range_does_not_panic() {
+        // 构造路径不强制 min<=max：手改/损坏 config 可能出现 min>max。
+        // 此时 f64::clamp(lo,hi) 会 panic，shape_hit_rate 必须防御性原样返回而非打挂请求。
+        let (input, creation, read) = shape_hit_rate(500, 10, 500, 99, 90);
+        assert_eq!(
+            (input, creation, read),
+            (500, 10, 500),
+            "非法区间(min>max)应原样返回，绝不 panic"
+        );
+        // 边界：min=100,max=1 也不能 panic。
+        let _ = shape_hit_rate(1000, 0, 0, 100, 1);
+    }
+
+    #[test]
+    fn shape_hit_rate_disabled_is_passthrough() {
+        // (0,0) = 关闭整形，原样返回。
+        assert_eq!(shape_hit_rate(100, 20, 900, 0, 0), (100, 20, 900));
+        assert_eq!(shape_hit_rate(1000, 0, 0, 0, 0), (1000, 0, 0));
+    }
+
+    #[test]
+    fn shape_hit_rate_lifts_cold_start_to_min() {
+        // 冷启动：read=0（命中率 0%），下界 90% → 把 pool 的 90% 挪进 read。
+        let (input, creation, read) = shape_hit_rate(1000, 0, 0, 90, 99);
+        assert_eq!(input + read, 1000, "creation 外的 pool 守恒");
+        assert_eq!(creation, 0, "creation 不动");
+        assert_eq!(read, 900);
+        assert_eq!(input, 100);
+    }
+
+    #[test]
+    fn shape_hit_rate_caps_high_to_max() {
+        // 命中率 99.9%（999/1000），上界 95% → 压到 95%。
+        let (input, creation, read) = shape_hit_rate(1, 50, 999, 90, 95);
+        assert_eq!(input + read, 1000);
+        assert_eq!(creation, 50, "creation 不动");
+        assert_eq!(read, 950);
+        assert_eq!(input, 50);
+    }
+
+    #[test]
+    fn shape_hit_rate_in_range_preserved() {
+        // 命中率 93%（930/1000）已在 [90,99] 内 → 原样。
+        let (input, creation, read) = shape_hit_rate(70, 10, 930, 90, 99);
+        assert_eq!((input, creation, read), (70, 10, 930));
+    }
+
+    #[test]
+    fn shape_hit_rate_total_conserved() {
+        // 任意整形都必须保持 input+creation+read 恒定（计费总量不漂）。
+        for (i, c, r) in [(1000, 0, 0), (0, 100, 900), (500, 200, 300), (1, 1, 998)] {
+            let total = i + c + r;
+            let (ni, nc, nr) = shape_hit_rate(i, c, r, 90, 99);
+            assert_eq!(ni + nc + nr, total, "整形前后总量必须守恒");
+            assert_eq!(nc, c, "creation 恒不变");
+        }
+    }
+
+    #[test]
+    fn shape_hit_rate_empty_pool_passthrough() {
+        // pool = input+read = 0（纯 creation 或全空）→ 无可分配，原样返回。
+        assert_eq!(shape_hit_rate(0, 500, 0, 90, 99), (0, 500, 0));
+        assert_eq!(shape_hit_rate(0, 0, 0, 90, 99), (0, 0, 0));
+    }
+
+    #[test]
+    fn shape_hit_rate_only_max_floor_zero() {
+        // min=0、max=95：只压上界，下界视为 0；命中率 0% 时不提升。
+        assert_eq!(shape_hit_rate(1000, 0, 0, 0, 95), (1000, 0, 0));
+        // 命中率 99% 压到 95%。
+        let (input, _c, read) = shape_hit_rate(10, 0, 990, 0, 95);
+        assert_eq!(read, 950);
+        assert_eq!(input, 50);
+    }
+
+    #[test]
+    fn shape_hit_rate_only_min_ceiling_hundred() {
+        // min=90、max=0：只设下界，上界视为 100%；命中率 99% 不被压低。
+        let (input, _c, read) = shape_hit_rate(10, 0, 990, 90, 0);
+        assert_eq!((input, read), (10, 990), "已高于下界，不动");
+        // 命中率 50% 提到 90%。
+        let (input2, _c2, read2) = shape_hit_rate(500, 0, 500, 90, 0);
+        assert_eq!(read2, 900);
+        assert_eq!(input2, 100);
+    }
+
+    #[test]
+    fn split_against_total_shaped_via_bounds() {
+        // 端到端：带 bounds 的 CacheUsage 走 split_against_total 应被整形。
+        // covered=0 → split_raw 得 (total,0,0)（命中率 0%），下界 90% → read 提到 90%。
+        let u = CacheUsage {
+            cache_read: 0,
+            cache_covered_est: 0,
+            prompt_total_est: 100,
+            ..Default::default()
+        }
+        .with_hit_rate_bounds(90, 99);
+        let (input, creation, read) = u.split_against_total(1000);
+        assert_eq!(input + creation + read, 1000);
+        assert_eq!(creation, 0);
+        assert_eq!(read, 900);
     }
 
     #[test]

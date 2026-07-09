@@ -515,6 +515,62 @@ export async function setRetryPolicy(
   return data
 }
 
+// 429 降级桶链配置
+export interface EndpointBucketOption {
+  name: string
+  protocol: string
+}
+
+export interface EndpointChainsConfig {
+  chains: Record<string, string[]>
+  overridden: boolean
+  defaults: Record<string, string[]>
+  availableBuckets: Record<string, EndpointBucketOption[]>
+  maxBucketAttemptsPerRequest: number
+  streamIdleTimeoutSecs: number
+}
+
+export interface SetEndpointChainsRequest {
+  chains?: Record<string, string[]> | null
+  maxBucketAttemptsPerRequest?: number
+  streamIdleTimeoutSecs?: number
+}
+
+export async function getEndpointChains(): Promise<EndpointChainsConfig> {
+  const { data } = await api.get<EndpointChainsConfig>('/config/endpoint-chains')
+  return data
+}
+
+export async function setEndpointChains(
+  req: SetEndpointChainsRequest,
+): Promise<EndpointChainsConfig> {
+  const { data } = await api.put<EndpointChainsConfig>('/config/endpoint-chains', req)
+  return data
+}
+
+export interface CacheHitRateConfig {
+  minPct: number
+  maxPct: number
+  enabled: boolean
+}
+
+export interface SetCacheHitRateRequest {
+  minPct: number
+  maxPct: number
+}
+
+export async function getCacheHitRate(): Promise<CacheHitRateConfig> {
+  const { data } = await api.get<CacheHitRateConfig>('/config/cache-hit-rate')
+  return data
+}
+
+export async function setCacheHitRate(
+  req: SetCacheHitRateRequest,
+): Promise<CacheHitRateConfig> {
+  const { data } = await api.put<CacheHitRateConfig>('/config/cache-hit-rate', req)
+  return data
+}
+
 export interface AccountThrottleConfig {
   failover: boolean
   cooldownSecs: number

@@ -37,3 +37,7 @@ demo/
 
 # oh-my-claudecode 运行时状态（不提交）
 .omc/
+# 模型映射运行时产物（无隐私但不入库，由管理面板生成）
+/model_mappings.json
+# 内部任务分析文档（含生产服务器 IP 等私密信息，不公开）
+/docs/

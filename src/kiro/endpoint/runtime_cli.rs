@@ -64,6 +64,10 @@ impl KiroEndpoint for RuntimeCliEndpoint {
         RUNTIME_CLI_ENDPOINT_NAME
     }
 
+    fn protocol(&self) -> &'static str {
+        "cli"
+    }
+
     /// runtime_cli 走 `runtime.kiro.dev`（CLI 协议）；429 时回切 q 桶的同协议端点 cli。
     fn fallback_chain(&self) -> &'static [&'static str] {
         use crate::kiro::endpoint::cli::CLI_ENDPOINT_NAME;

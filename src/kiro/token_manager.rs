@@ -13,7 +13,7 @@ use tokio::sync::Mutex as TokioMutex;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -456,6 +456,26 @@ fn rest_api_region_candidates(sso_region: &str) -> [&'static str; 2] {
     }
 }
 
+/// 计算 REST 用量/模型/profile 接口的候选区域顺序。
+///
+/// 优先级：**真实 profileArn 的区域** > SSO 区域推断。原因：这些接口用
+/// `getUsageLimits` / `ListAvailableModels` 会把 profileArn 带进请求，若端点区域与
+/// profileArn 区域不一致，上游返回 `400 Improperly formed request`——而 400 不像
+/// 403 那样触发候选回退，会直接失败。因此当凭据已解析出真实 ARN 时，把 ARN 的区域
+/// 放在首位，确保端点区域与 profileArn 对齐；ARN 缺失/为占位符时退回 SSO 区域推断。
+fn rest_api_region_candidates_for(
+    credentials: &KiroCredentials,
+    config: &Config,
+) -> [&'static str; 2] {
+    let arn_region = credentials
+        .effective_profile_arn()
+        .and_then(crate::kiro::model::credentials::region_from_profile_arn);
+    let preferred = arn_region
+        .as_deref()
+        .unwrap_or_else(|| credentials.effective_auth_region(config));
+    rest_api_region_candidates(preferred)
+}
+
 /// 获取使用额度信息
 pub(crate) async fn get_usage_limits(
     credentials: &KiroCredentials,
@@ -465,10 +485,10 @@ pub(crate) async fn get_usage_limits(
 ) -> anyhow::Result<UsageLimitsResponse> {
     tracing::debug!("正在获取使用额度信息...");
 
-    // getUsageLimits 仅在 us-east-1 / eu-central-1 提供服务，
-    // 依据凭据 SSO 区域选择主端点，403 时回退到另一个端点。
-    let sso_region = credentials.effective_auth_region(config);
-    let candidates = rest_api_region_candidates(sso_region);
+    // getUsageLimits 仅在 us-east-1 / eu-central-1 提供服务。
+    // 候选区域优先用真实 profileArn 的区域（见 rest_api_region_candidates_for），
+    // 避免端点区域与 profileArn 不一致导致 400；403 时再回退到另一个端点。
+    let candidates = rest_api_region_candidates_for(credentials, config);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     // 用量类接口固定用 USAGE_API_KIRO_VERSION：新版 IDE 会强制要求 profileArn，
     // 对 Enterprise/IdC 账号失败；该版本无需 profileArn。
@@ -523,11 +543,13 @@ pub(crate) async fn get_usage_limits(
 
         let body_text = response.text().await.unwrap_or_default();
 
-        // 403 且仍有备用端点时，尝试下一个区域端点（Enterprise/IdC 跨区兼容）
-        if status.as_u16() == 403 && idx + 1 < candidates.len() {
+        // 403（跨区 token 兼容）或 400（端点区域与 profileArn 不一致 →
+        // Improperly formed request）且仍有备用端点时，尝试下一个区域端点。
+        if matches!(status.as_u16(), 400 | 403) && idx + 1 < candidates.len() {
             tracing::debug!(
-                "getUsageLimits 在 {} 返回 403，尝试备用端点 {}",
+                "getUsageLimits 在 {} 返回 {}，尝试备用端点 {}",
                 region,
+                status.as_u16(),
                 candidates[idx + 1]
             );
             last_error = Some(format!("{} {}", status, body_text));
@@ -564,10 +586,10 @@ pub(crate) async fn get_available_models(
 ) -> anyhow::Result<ListAvailableModelsResponse> {
     tracing::debug!("正在获取可用模型列表...");
 
-    // ListAvailableModels 仅在 us-east-1 / eu-central-1 提供服务，
-    // 依据凭据 SSO 区域选择主端点，403 时回退到另一个端点。
-    let sso_region = credentials.effective_auth_region(config);
-    let candidates = rest_api_region_candidates(sso_region);
+    // ListAvailableModels 仅在 us-east-1 / eu-central-1 提供服务。
+    // 候选区域优先用真实 profileArn 的区域（见 rest_api_region_candidates_for），
+    // 避免端点区域与 profileArn 不一致导致 400；403/400 时再回退到另一个端点。
+    let candidates = rest_api_region_candidates_for(credentials, config);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     let kiro_version = USAGE_API_KIRO_VERSION;
     let os_name = &config.system_version;
@@ -620,11 +642,14 @@ pub(crate) async fn get_available_models(
 
         let body_text = response.text().await.unwrap_or_default();
 
-        // 403 且仍有备用端点时，尝试下一个区域端点（Enterprise/IdC 跨区兼容）
-        if status.as_u16() == 403 && idx + 1 < candidates.len() {
+        // 403/400 且仍有备用端点时，尝试下一个区域端点。
+        // 403：Enterprise/IdC 跨区兼容；400：profileArn 区域与端点不一致（Improperly
+        // formed request），换到另一个区域端点即可对齐。
+        if (status.as_u16() == 403 || status.as_u16() == 400) && idx + 1 < candidates.len() {
             tracing::debug!(
-                "ListAvailableModels 在 {} 返回 403，尝试备用端点 {}",
+                "ListAvailableModels 在 {} 返回 {}，尝试备用端点 {}",
                 region,
+                status.as_u16(),
                 candidates[idx + 1]
             );
             last_error = Some(format!("{} {}", status, body_text));
@@ -632,6 +657,7 @@ pub(crate) async fn get_available_models(
         }
 
         let error_msg = match status.as_u16() {
+            400 => "请求格式错误（profileArn 区域可能与端点不一致）",
             401 => "认证失败，Token 无效或已过期",
             403 => "权限不足，无法获取可用模型",
             429 => "请求过于频繁，已被限流",
@@ -1026,6 +1052,16 @@ pub struct MultiTokenManager {
     retry_mode: Mutex<RetryMode>,
     /// 普通 429 自定义策略（运行时可修改）
     retry_policy: Mutex<Option<RetryPolicy>>,
+    /// 429 降级桶链运行时覆盖（运行时可修改）。None = 回退各 endpoint 静态 fallback_chain()。
+    endpoint_chains: Mutex<Option<HashMap<String, Vec<String>>>>,
+    /// 单请求备用桶尝试总数硬上限（运行时可修改，0 = 不限）。
+    max_bucket_attempts_per_request: AtomicUsize,
+    /// 流式空闲超时秒数（运行时可修改，0 = 关闭 idle watchdog）。
+    stream_idle_timeout_secs: AtomicU64,
+    /// 缓存命中率整形下界（百分比 0..=100，运行时可修改）。min==0 && max==0 = 关闭整形。
+    cache_hit_rate_min_pct: AtomicU32,
+    /// 缓存命中率整形上界（百分比 0..=100，运行时可修改）。见 cache_hit_rate_min_pct。
+    cache_hit_rate_max_pct: AtomicU32,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -1242,6 +1278,23 @@ impl MultiTokenManager {
         let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
         let retry_mode = config.retry_mode;
         let retry_policy = config.retry_policy.clone();
+        let endpoint_chains = config.endpoint_chains.clone();
+        let max_bucket_attempts = config.max_bucket_attempts_per_request;
+        let stream_idle_timeout_secs = config.stream_idle_timeout_secs;
+        let cache_hit_rate_min_pct = config.cache_hit_rate_min_pct.min(100);
+        let cache_hit_rate_max_pct = config.cache_hit_rate_max_pct.min(100);
+        // 构造路径不强制 min<=max（仅 admin setter 校验）。非法区间不 panic（shape_hit_rate 有防御），
+        // 但会静默不整形——这里启动时告警一声，便于运营发现「填了却不生效」的误配。
+        if cache_hit_rate_min_pct > 0
+            && cache_hit_rate_max_pct > 0
+            && cache_hit_rate_min_pct > cache_hit_rate_max_pct
+        {
+            tracing::warn!(
+                "缓存命中率整形区间非法(min={} > max={})，将不生效；请在管理面板重设",
+                cache_hit_rate_min_pct,
+                cache_hit_rate_max_pct
+            );
+        }
         let manager = Self {
             config,
             proxy: Mutex::new(proxy),
@@ -1258,6 +1311,11 @@ impl MultiTokenManager {
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
             retry_mode: Mutex::new(retry_mode),
             retry_policy: Mutex::new(retry_policy),
+            endpoint_chains: Mutex::new(endpoint_chains),
+            max_bucket_attempts_per_request: AtomicUsize::new(max_bucket_attempts),
+            stream_idle_timeout_secs: AtomicU64::new(stream_idle_timeout_secs),
+            cache_hit_rate_min_pct: AtomicU32::new(cache_hit_rate_min_pct),
+            cache_hit_rate_max_pct: AtomicU32::new(cache_hit_rate_max_pct),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
         };
@@ -2696,9 +2754,23 @@ impl MultiTokenManager {
             return Ok(None);
         }
 
-        // 已有真实 ARN（含 Social 共享 ARN）→ 直接用，无需查询
+        // 已有真实 ARN（含 Social 共享 ARN）→ 直接用，无需查询。
+        // 但仍要确保 api_region 与 ARN 区域一致：早期版本只回填了 ARN 未回填区域，
+        // 导致请求发到 config 默认区域（us-east-1）却带着 eu-central-1 的 profileArn，
+        // 上游返回 400 Improperly formed request。此处对已有 ARN 做一次区域自愈。
         if let Some(arn) = credentials.profile_arn.as_deref() {
             if !is_placeholder_profile_arn(arn) {
+                let (region, changed) = self.backfill_api_region_from_arn(id, arn);
+                if changed {
+                    if let Err(e) = self.persist_credentials() {
+                        tracing::warn!("api_region 区域自愈后持久化失败（不影响本次请求）: {}", e);
+                    }
+                    tracing::info!(
+                        "凭据 #{} api_region 已自愈为 {}（与 profileArn 区域对齐）",
+                        id,
+                        region.as_deref().unwrap_or("<unknown>")
+                    );
+                }
                 return Ok(Some(arn.to_string()));
             }
         }
@@ -2714,19 +2786,77 @@ impl MultiTokenManager {
             return Ok(None);
         };
 
-        // 写回真实 ARN 并持久化
+        // 写回真实 ARN，并从 ARN 解析区域一并回填 api_region。
+        // profileArn 与请求端点区域必须一致，否则上游返回 400 Improperly formed request。
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                 entry.credentials.profile_arn = Some(arn.clone());
             }
         }
+        let (region, _changed) = self.backfill_api_region_from_arn(id, &arn);
         if let Err(e) = self.persist_credentials() {
             tracing::warn!("profileArn 回填后持久化失败（不影响本次请求）: {}", e);
         }
-        tracing::info!("凭据 #{} 已解析并回填真实 profileArn: {}", id, arn);
+        match region {
+            Some(region) => tracing::info!(
+                "凭据 #{} 已解析并回填真实 profileArn: {}（区域 {}）",
+                id,
+                arn,
+                region
+            ),
+            None => tracing::info!("凭据 #{} 已解析并回填真实 profileArn: {}", id, arn),
+        }
 
         Ok(Some(arn))
+    }
+
+    /// 从真实 profileArn 解析区域并回填到凭据 `api_region`（幂等）。
+    ///
+    /// profileArn 与请求端点区域必须一致，否则上游返回 400 Improperly formed
+    /// request。早期版本只回填 ARN 未回填区域，导致请求发到 config 默认区域
+    /// （us-east-1）却带着其它区域（如 eu-central-1）的 profileArn。此方法在
+    /// ARN 回填成功后调用，把 ARN 里的区域段同步到 `api_region`。
+    ///
+    /// 返回 `(解析出的区域, 是否发生了变更)`。`changed` 为 `true` 表示本次实际写入了
+    /// 新的 `api_region`，调用方应据此决定是否 `persist_credentials`。ARN 不含可解析
+    /// 区域时返回 `(None, false)`。**本方法不负责持久化。**
+    fn backfill_api_region_from_arn(&self, id: u64, arn: &str) -> (Option<String>, bool) {
+        let Some(region) = crate::kiro::model::credentials::region_from_profile_arn(arn) else {
+            return (None, false);
+        };
+        let mut changed = false;
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            if entry.credentials.api_region.as_deref() != Some(region.as_str()) {
+                entry.credentials.api_region = Some(region.clone());
+                changed = true;
+            }
+        }
+        (Some(region), changed)
+    }
+
+    /// 对已有真实 profileArn 的凭据做一次 `api_region` 区域对齐（含持久化）。
+    ///
+    /// 供 `ensure_profile_arn` 早返回路径调用：当凭据已带真实 ARN 时不会再走
+    /// `resolve_profile_arn_for`，但早期版本回填的 ARN 没有同步区域，导致请求发到
+    /// config 默认区域却带着其它区域的 profileArn（上游 400 Improperly formed
+    /// request）。此方法幂等，仅在实际变更时持久化，返回解析出的区域。
+    pub fn align_api_region_with_arn(&self, id: u64, arn: &str) -> Option<String> {
+        let (region, changed) = self.backfill_api_region_from_arn(id, arn);
+        if changed {
+            if let Err(e) = self.persist_credentials() {
+                tracing::warn!("api_region 区域对齐后持久化失败（不影响本次请求）: {}", e);
+            }
+            if let Some(ref region) = region {
+                tracing::info!(
+                    "凭据 #{} api_region 已对齐为 {}（与 profileArn 区域一致）",
+                    id,
+                    region
+                );
+            }
+        }
+        region
     }
 
     /// 获取指定凭据的使用额度（Admin API）
@@ -3710,6 +3840,107 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 读取某主端点的运行时降级桶链覆盖。返回 `Some(vec)` 表示运营已配置（含空 vec =
+    /// 显式不降级）；`None` 表示未配置，调用方回退各 endpoint 的静态 `fallback_chain()`。
+    pub fn endpoint_chain_for(&self, primary: &str) -> Option<Vec<String>> {
+        self.endpoint_chains
+            .lock()
+            .as_ref()
+            .and_then(|m| m.get(primary).cloned())
+    }
+
+    /// 当前全部降级桶链覆盖（供 admin 展示）。`None` = 未配置（全走静态默认）。
+    pub fn get_endpoint_chains(&self) -> Option<HashMap<String, Vec<String>>> {
+        self.endpoint_chains.lock().clone()
+    }
+
+    /// 设置降级桶链覆盖（已由上层校验桶名合法 + 协议一致）。`None` 清除覆盖回退静态默认。
+    /// 持久化失败时回滚内存态。
+    pub fn set_endpoint_chains(
+        &self,
+        chains: Option<HashMap<String, Vec<String>>>,
+    ) -> anyhow::Result<()> {
+        let previous = self.endpoint_chains.lock().clone();
+        *self.endpoint_chains.lock() = chains.clone();
+
+        if let Err(err) = self.persist_endpoint_chains(chains.as_ref()) {
+            tracing::error!("持久化降级桶链失败，回滚内存态: {}", err);
+            *self.endpoint_chains.lock() = previous;
+            return Err(err);
+        }
+
+        tracing::info!("429 降级桶链覆盖已更新");
+        Ok(())
+    }
+
+    fn persist_endpoint_chains(
+        &self,
+        chains: Option<&HashMap<String, Vec<String>>>,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，降级桶链仅在当前进程生效");
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.endpoint_chains = chains.cloned();
+        config
+            .save()
+            .with_context(|| format!("持久化降级桶链失败: {}", config_path.display()))?;
+
+        Ok(())
+    }
+
+    /// 单请求内备用桶尝试总数硬上限（跨 attempt 累计）。`0` = 不限。
+    pub fn max_bucket_attempts_per_request(&self) -> usize {
+        self.max_bucket_attempts_per_request
+            .load(Ordering::Relaxed)
+    }
+
+    /// 运行时设置桶尝试上限并持久化。持久化失败时回滚内存态。
+    pub fn set_max_bucket_attempts_per_request(&self, value: usize) -> anyhow::Result<()> {
+        let previous = self
+            .max_bucket_attempts_per_request
+            .swap(value, Ordering::Relaxed);
+
+        if let Err(err) = self.persist_max_bucket_attempts(value) {
+            tracing::error!("持久化桶尝试上限失败，回滚内存态: {}", err);
+            self.max_bucket_attempts_per_request
+                .store(previous, Ordering::Relaxed);
+            return Err(err);
+        }
+
+        tracing::info!("单请求桶尝试上限已设置为: {}", value);
+        Ok(())
+    }
+
+    fn persist_max_bucket_attempts(&self, value: usize) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，桶尝试上限仅在当前进程生效");
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.max_bucket_attempts_per_request = value;
+        config
+            .save()
+            .with_context(|| format!("持久化桶尝试上限失败: {}", config_path.display()))?;
+
+        Ok(())
+    }
+
     fn persist_load_balancing_mode(&self, mode: &str) -> anyhow::Result<()> {
         use anyhow::Context;
 
@@ -3879,6 +4110,112 @@ impl MultiTokenManager {
         config
             .save()
             .with_context(|| format!("持久化账号级风控配置失败: {}", config_path.display()))?;
+
+        Ok(())
+    }
+
+    /// 流式空闲超时秒数（运行时读取，供 provider/流层动态生效）。`0` = 关闭。
+    pub fn get_stream_idle_timeout_secs(&self) -> u64 {
+        self.stream_idle_timeout_secs.load(Ordering::Relaxed)
+    }
+
+    /// 设置流式空闲超时（秒，`0` = 关闭）。持久化失败时回滚内存态。
+    /// 上限 3600 秒，防误配成极大值让 idle watchdog 形同虚设。
+    pub fn set_stream_idle_timeout_secs(&self, secs: u64) -> anyhow::Result<()> {
+        if secs > 3_600 {
+            anyhow::bail!("流式空闲超时必须在 0..=3600 秒内: {}", secs);
+        }
+        let previous = self.stream_idle_timeout_secs.swap(secs, Ordering::Relaxed);
+        if previous == secs {
+            return Ok(());
+        }
+        if let Err(err) = self.persist_stream_idle_timeout(secs) {
+            tracing::error!("持久化流式空闲超时失败，回滚内存态: {}", err);
+            self.stream_idle_timeout_secs
+                .store(previous, Ordering::Relaxed);
+            return Err(err);
+        }
+        tracing::info!("流式空闲超时已设置为: {}s", secs);
+        Ok(())
+    }
+
+    fn persist_stream_idle_timeout(&self, secs: u64) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，流式空闲超时仅在当前进程生效");
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.stream_idle_timeout_secs = secs;
+        config
+            .save()
+            .with_context(|| format!("持久化流式空闲超时失败: {}", config_path.display()))?;
+
+        Ok(())
+    }
+
+    /// 缓存命中率整形区间（运行时读取）。返回 `(min_pct, max_pct)`，均为百分比 0..=100。
+    /// `(0, 0)` = 关闭整形。供 provider 转发给缓存计量层做互斥分摊后的命中率钳制。
+    pub fn get_cache_hit_rate_bounds(&self) -> (u32, u32) {
+        (
+            self.cache_hit_rate_min_pct.load(Ordering::Relaxed),
+            self.cache_hit_rate_max_pct.load(Ordering::Relaxed),
+        )
+    }
+
+    /// 设置缓存命中率整形区间（百分比）。校验：各值 0..=100；同时非零时 min<=max。
+    /// `(0, 0)` = 关闭。持久化失败时回滚内存态（两个字段一起回滚，保持一致）。
+    pub fn set_cache_hit_rate_bounds(&self, min_pct: u32, max_pct: u32) -> anyhow::Result<()> {
+        if min_pct > 100 || max_pct > 100 {
+            anyhow::bail!(
+                "缓存命中率必须在 0..=100 内: min={} max={}",
+                min_pct,
+                max_pct
+            );
+        }
+        // 两值都非零时才约束 min<=max；max==0 视为关闭上界、min==0 视为下界为 0（仅设上限）。
+        if min_pct > 0 && max_pct > 0 && min_pct > max_pct {
+            anyhow::bail!("缓存命中率下界不能大于上界: min={} max={}", min_pct, max_pct);
+        }
+        let prev_min = self.cache_hit_rate_min_pct.swap(min_pct, Ordering::Relaxed);
+        let prev_max = self.cache_hit_rate_max_pct.swap(max_pct, Ordering::Relaxed);
+        if prev_min == min_pct && prev_max == max_pct {
+            return Ok(());
+        }
+        if let Err(err) = self.persist_cache_hit_rate_bounds(min_pct, max_pct) {
+            tracing::error!("持久化缓存命中率区间失败，回滚内存态: {}", err);
+            self.cache_hit_rate_min_pct.store(prev_min, Ordering::Relaxed);
+            self.cache_hit_rate_max_pct.store(prev_max, Ordering::Relaxed);
+            return Err(err);
+        }
+        tracing::info!("缓存命中率整形区间已设置为: [{}%, {}%]", min_pct, max_pct);
+        Ok(())
+    }
+
+    fn persist_cache_hit_rate_bounds(&self, min_pct: u32, max_pct: u32) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，缓存命中率区间仅在当前进程生效");
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.cache_hit_rate_min_pct = min_pct;
+        config.cache_hit_rate_max_pct = max_pct;
+        config
+            .save()
+            .with_context(|| format!("持久化缓存命中率区间失败: {}", config_path.display()))?;
 
         Ok(())
     }
@@ -4913,6 +5250,41 @@ mod tests {
     }
 
     #[test]
+    fn test_rest_api_region_candidates_for_prefers_profile_arn_region() {
+        // config 默认 us-east-1；凭据无 SSO region，但已解析出 eu-central-1 的真实
+        // profileArn。候选区域必须优先 profileArn 区域，否则带 eu 的 ARN 打 us 端点会
+        // 收到 400 Improperly formed request（且 400 不触发 403 那样的回退）。
+        let config = Config::default();
+
+        let mut eu_arn_cred = KiroCredentials::default();
+        eu_arn_cred.profile_arn = Some(
+            "arn:aws:codewhisperer:eu-central-1:257752232114:profile/HDQDPR39YRV9".to_string(),
+        );
+        assert_eq!(
+            rest_api_region_candidates_for(&eu_arn_cred, &config),
+            ["eu-central-1", "us-east-1"],
+            "有 eu profileArn 时应优先 eu-central-1"
+        );
+
+        // 占位符 ARN 不含可解析真实区域 → 退回 SSO 区域推断（此处 config 默认 us）。
+        let mut placeholder_cred = KiroCredentials::default();
+        placeholder_cred.profile_arn =
+            Some(crate::kiro::model::credentials::BUILDER_ID_PROFILE_ARN.to_string());
+        assert_eq!(
+            rest_api_region_candidates_for(&placeholder_cred, &config),
+            ["us-east-1", "eu-central-1"],
+            "占位符 ARN 应退回 SSO 区域推断"
+        );
+
+        // 无 ARN 的普通凭据同样退回 SSO 区域推断。
+        let plain_cred = KiroCredentials::default();
+        assert_eq!(
+            rest_api_region_candidates_for(&plain_cred, &config),
+            ["us-east-1", "eu-central-1"]
+        );
+    }
+
+    #[test]
     fn test_credential_region_empty_string_treated_as_set() {
         // 空字符串 auth_region 被视为已设置（虽然不推荐，但行为应一致）
         let mut config = Config::default();
@@ -5365,6 +5737,114 @@ mod tests {
         assert_eq!(persisted.retry_policy, Some(custom));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_set_endpoint_chains_persists_and_reads_back() {
+        let path = tmp_creds_path("endpoint_chains_config");
+        let config = Config::load(&path).unwrap();
+        config.save().unwrap();
+
+        let manager = MultiTokenManager::new(config, Vec::new(), None, None, false).unwrap();
+        // 未配置时 get 返回 None，endpoint_chain_for 也返回 None（回退静态默认）
+        assert!(manager.get_endpoint_chains().is_none());
+        assert!(manager.endpoint_chain_for("ide").is_none());
+
+        let mut chains = HashMap::new();
+        chains.insert("ide".to_string(), vec!["runtime".to_string()]);
+        manager.set_endpoint_chains(Some(chains.clone())).unwrap();
+
+        // 内存态生效
+        assert_eq!(
+            manager.endpoint_chain_for("ide"),
+            Some(vec!["runtime".to_string()])
+        );
+        // 持久化到 config.json
+        let persisted = Config::load(&path).unwrap();
+        assert_eq!(persisted.endpoint_chains, Some(chains));
+
+        // 清除覆盖回退静态默认
+        manager.set_endpoint_chains(None).unwrap();
+        assert!(manager.get_endpoint_chains().is_none());
+        let persisted = Config::load(&path).unwrap();
+        assert!(persisted.endpoint_chains.is_none());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_endpoint_chain_empty_vec_means_no_fallback() {
+        let path = tmp_creds_path("endpoint_chains_empty");
+        let config = Config::load(&path).unwrap();
+        config.save().unwrap();
+
+        let manager = MultiTokenManager::new(config, Vec::new(), None, None, false).unwrap();
+        let mut chains = HashMap::new();
+        chains.insert("ide".to_string(), Vec::<String>::new());
+        manager.set_endpoint_chains(Some(chains)).unwrap();
+
+        // 空数组 = 显式配置了「不降级」，与「未配置(None)」区分：返回 Some(空 vec)
+        assert_eq!(manager.endpoint_chain_for("ide"), Some(Vec::new()));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_set_max_bucket_attempts_persists() {
+        let path = tmp_creds_path("max_bucket_attempts_config");
+        let config = Config::load(&path).unwrap();
+        config.save().unwrap();
+
+        let manager = MultiTokenManager::new(config, Vec::new(), None, None, false).unwrap();
+        // 默认值
+        assert_eq!(manager.max_bucket_attempts_per_request(), 6);
+
+        manager.set_max_bucket_attempts_per_request(3).unwrap();
+        assert_eq!(manager.max_bucket_attempts_per_request(), 3);
+        let persisted = Config::load(&path).unwrap();
+        assert_eq!(persisted.max_bucket_attempts_per_request, 3);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_set_cache_hit_rate_bounds_persists() {
+        let path = tmp_creds_path("cache_hit_rate_config");
+        let config = Config::load(&path).unwrap();
+        config.save().unwrap();
+
+        let manager = MultiTokenManager::new(config, Vec::new(), None, None, false).unwrap();
+        // 默认关闭：(0, 0)
+        assert_eq!(manager.get_cache_hit_rate_bounds(), (0, 0));
+
+        manager.set_cache_hit_rate_bounds(90, 99).unwrap();
+        assert_eq!(manager.get_cache_hit_rate_bounds(), (90, 99));
+        let persisted = Config::load(&path).unwrap();
+        assert_eq!(persisted.cache_hit_rate_min_pct, 90);
+        assert_eq!(persisted.cache_hit_rate_max_pct, 99);
+
+        // 归零关闭
+        manager.set_cache_hit_rate_bounds(0, 0).unwrap();
+        assert_eq!(manager.get_cache_hit_rate_bounds(), (0, 0));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_set_cache_hit_rate_bounds_rejects_invalid() {
+        let manager =
+            MultiTokenManager::new(Config::default(), Vec::new(), None, None, false).unwrap();
+        // 超过 100 拒绝
+        assert!(manager.set_cache_hit_rate_bounds(0, 101).is_err());
+        assert!(manager.set_cache_hit_rate_bounds(150, 0).is_err());
+        // 两值非零但 min>max 拒绝
+        assert!(manager.set_cache_hit_rate_bounds(99, 90).is_err());
+        // 仅设上界（min=0）允许
+        assert!(manager.set_cache_hit_rate_bounds(0, 95).is_ok());
+        assert_eq!(manager.get_cache_hit_rate_bounds(), (0, 95));
+        // 拒绝后内存态不变
+        assert!(manager.set_cache_hit_rate_bounds(99, 90).is_err());
+        assert_eq!(manager.get_cache_hit_rate_bounds(), (0, 95));
     }
 
     // ===== 账号分组隔离回归测试 =====

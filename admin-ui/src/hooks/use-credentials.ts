@@ -18,6 +18,10 @@ import {
   setAccountThrottleConfig,
   getRetryPolicy,
   setRetryPolicy,
+  getEndpointChains,
+  setEndpointChains,
+  getCacheHitRate,
+  setCacheHitRate,
   getLogGovernanceConfig,
   setLogGovernanceConfig,
   resetSuccessCount,
@@ -233,6 +237,44 @@ export function useSetRetryPolicy() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['retryPolicy'] })
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 获取 429 降级桶链配置
+export function useEndpointChains() {
+  return useQuery({
+    queryKey: ['endpointChains'],
+    queryFn: getEndpointChains,
+  })
+}
+
+// 设置 429 降级桶链配置
+export function useSetEndpointChains() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setEndpointChains,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['endpointChains'] })
+    },
+  })
+}
+
+// 获取缓存命中率整形区间
+export function useCacheHitRate() {
+  return useQuery({
+    queryKey: ['cacheHitRate'],
+    queryFn: getCacheHitRate,
+  })
+}
+
+// 设置缓存命中率整形区间
+export function useSetCacheHitRate() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setCacheHitRate,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['cacheHitRate'] })
     },
   })
 }

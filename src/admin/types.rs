@@ -566,6 +566,72 @@ pub struct SetRetryPolicyRequest {
     pub custom_policy: Option<RetryPolicy>,
 }
 
+/// 一个可选备用桶（供前端多选框展示）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EndpointBucketOption {
+    /// 桶名（endpoint 名，如 "runtime" / "codewhisperer"）
+    pub name: String,
+    /// 协议族（"ide" / "cli"）——同族才可互换
+    pub protocol: String,
+}
+
+/// 429 降级桶链配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EndpointChainsResponse {
+    /// 当前生效的运行时覆盖（键=主端点，值=有序备用桶）。空 map = 未配置（全走静态默认）。
+    pub chains: std::collections::HashMap<String, Vec<String>>,
+    /// 是否已配置运行时覆盖（false = chains 为静态默认的只读展示）。
+    pub overridden: bool,
+    /// 各主端点的静态默认链（前端「恢复默认」用）。
+    pub defaults: std::collections::HashMap<String, Vec<String>>,
+    /// 每个可作为主端点的端点 → 该协议下可选的备用桶清单（前端多选数据源）。
+    pub available_buckets: std::collections::HashMap<String, Vec<EndpointBucketOption>>,
+    /// 单请求桶尝试总数硬上限（0 = 不限）。
+    pub max_bucket_attempts_per_request: usize,
+    /// 流式空闲超时（秒，0 = 关闭）。上游返回 200 后连续该秒数无字节即主动收尾。
+    pub stream_idle_timeout_secs: u64,
+}
+
+/// 更新 429 降级桶链配置
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetEndpointChainsRequest {
+    /// 运行时覆盖。传 null / 省略 = 清除覆盖回退静态默认；传空 map 也等价清除。
+    /// 键 = 主端点名，值 = 有序备用桶名（空数组 = 该主端点不降级）。
+    #[serde(default)]
+    pub chains: Option<std::collections::HashMap<String, Vec<String>>>,
+    /// 单请求桶尝试总数硬上限（0 = 不限）；省略则不改。
+    #[serde(default)]
+    pub max_bucket_attempts_per_request: Option<usize>,
+    /// 流式空闲超时（秒，0 = 关闭）；省略则不改。
+    #[serde(default)]
+    pub stream_idle_timeout_secs: Option<u64>,
+}
+
+/// 缓存命中率整形区间配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheHitRateResponse {
+    /// 下界（百分比 0..=100）。0 且 max 为 0 = 关闭整形。
+    pub min_pct: u32,
+    /// 上界（百分比 0..=100）。
+    pub max_pct: u32,
+    /// 是否启用整形（min>0 || max>0）。
+    pub enabled: bool,
+}
+
+/// 更新缓存命中率整形区间。`min_pct == 0 && max_pct == 0` = 关闭整形。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCacheHitRateRequest {
+    /// 下界（百分比 0..=100）。
+    pub min_pct: u32,
+    /// 上界（百分比 0..=100）。
+    pub max_pct: u32,
+}
+
 /// 日志治理配置响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

@@ -338,6 +338,42 @@ pub struct Config {
     #[serde(default = "default_usage_log_retention_days")]
     pub usage_log_retention_days: u32,
 
+    /// 流式空闲超时（秒，默认 120）。
+    ///
+    /// 上游返回 200 后，若连续 `stream_idle_timeout_secs` 秒没有收到任何字节
+    /// （首字节前挂死或中途停流），中转层主动收尾结束该流，避免空烧到绝对超时。
+    /// 复现 Kiro-Go 的 idle watchdog（120s）。`0` = 关闭空闲超时（仅靠绝对超时兜底）。
+    /// 运行时可在管理面板调整。
+    #[serde(default = "default_stream_idle_timeout_secs")]
+    pub stream_idle_timeout_secs: u64,
+
+    /// 429 降级桶链运行时覆盖。键 = 主端点名（`ide` / `cli`），值 = 该主端点 429 时
+    /// 依次尝试的备用桶名（有序）。缺省（None）时回退各 endpoint 的静态 `fallback_chain()`，
+    /// 保证老部署零行为变化。空数组 = 该主端点不降级。运行时可在管理面板编辑。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_chains: Option<HashMap<String, Vec<String>>>,
+
+    /// 单个客户端请求内「备用桶尝试」的总次数硬上限（跨 attempt 累计）。
+    /// 防止「链长 × attempt 数」把单请求放大成上百次上游调用。默认 6；`0` = 不限。
+    /// 运行时可在管理面板调整。
+    #[serde(default = "default_max_bucket_attempts_per_request")]
+    pub max_bucket_attempts_per_request: usize,
+
+    /// 缓存命中率整形——下界（百分比 0..=100）。
+    ///
+    /// 上游不下发真实缓存 token，中转层自行模拟；本旋钮把最终呈现（newapi 计费用量）的
+    /// 命中率 `cache_read/(input+cache_read)` **钳制**进 `[min, max]` 区间：低于 min 提到
+    /// min，高于 max 压到 max，区间内保留真实模拟值。整形只在 `input↔cache_read` 之间挪，
+    /// **保持 `input+creation+read` 总量不变**（计费总额不漂），creation 不动。
+    /// `min == 0 && max == 0` = 关闭整形（默认，零行为变化）。运行时可在管理面板调整。
+    #[serde(default)]
+    pub cache_hit_rate_min_pct: u32,
+
+    /// 缓存命中率整形——上界（百分比 0..=100）。见 [`Self::cache_hit_rate_min_pct`]。
+    /// `min == 0 && max == 0` = 关闭。仅 max>0 时也生效（下界视为 0）。
+    #[serde(default)]
+    pub cache_hit_rate_max_pct: u32,
+
     /// 端点特定的配置
     ///
     /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
@@ -427,6 +463,14 @@ fn default_trace_retention_days() -> u32 {
     7
 }
 
+fn default_stream_idle_timeout_secs() -> u64 {
+    120
+}
+
+fn default_max_bucket_attempts_per_request() -> usize {
+    6
+}
+
 fn default_usage_log_retention_days() -> u32 {
     31
 }
@@ -469,6 +513,11 @@ impl Default for Config {
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
+            stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
+            endpoint_chains: None,
+            max_bucket_attempts_per_request: default_max_bucket_attempts_per_request(),
+            cache_hit_rate_min_pct: 0,
+            cache_hit_rate_max_pct: 0,
             endpoints: HashMap::new(),
             config_path: None,
         }

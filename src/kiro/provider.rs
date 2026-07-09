@@ -14,7 +14,7 @@ use tokio::time::sleep;
 use crate::admin::proxy_pool::{ProxyInFlightGuard, ProxyPoolManager};
 use crate::admin::trace_db::{TraceAttempt, TraceSink, outcome, truncate_snippet};
 use crate::anthropic::converter::normalize_model_id;
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{ProxyConfig, build_client_with_read_timeout};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
@@ -169,6 +169,10 @@ pub struct KiroProvider {
     client_cache: Mutex<ClientCache>,
     /// TLS 后端配置
     tls_backend: TlsBackend,
+    /// 流式/请求 Client 的读空闲超时（秒，None = 不设置，保持旧行为）。
+    /// 来自 `config.stream_idle_timeout_secs`，让底层在上游首字节前/中途挂死时尽早报错，
+    /// 配合流层 idle watchdog 收尾，避免空烧到 720s 绝对超时。
+    read_timeout_secs: Option<u64>,
     /// 端点实现注册表（key: endpoint 名称）
     endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
     /// 默认端点名称（凭据未指定 endpoint 时使用）
@@ -204,15 +208,23 @@ impl KiroProvider {
             default_endpoint
         );
         let tls_backend = token_manager.config().tls_backend;
+        // 读空闲超时：来自 config.stream_idle_timeout_secs（0 = 不设 read timeout，保持旧行为）。
+        // 让上游首字节前挂死 / 中途停流时底层读取尽早报错，配合流层 idle watchdog 收尾。
+        let read_timeout_secs = match token_manager.config().stream_idle_timeout_secs {
+            0 => None,
+            secs => Some(secs),
+        };
         // 预热：构建全局代理对应的 Client（作为受保护的常驻条目）
         let initial_client =
-            build_client(proxy.as_ref(), 720, tls_backend).expect("创建 HTTP 客户端失败");
+            build_client_with_read_timeout(proxy.as_ref(), 720, read_timeout_secs, tls_backend)
+                .expect("创建 HTTP 客户端失败");
         let client_cache = ClientCache::new(proxy.clone(), initial_client, CLIENT_CACHE_CAP);
 
         Self {
             token_manager,
             client_cache: Mutex::new(client_cache),
             tls_backend,
+            read_timeout_secs,
             endpoints,
             default_endpoint,
             proxy_pool,
@@ -225,9 +237,59 @@ impl KiroProvider {
         if let Some(client) = cache.get(&proxy) {
             return Ok(client);
         }
-        let client = build_client(proxy.as_ref(), 720, self.tls_backend)?;
+        let client = build_client_with_read_timeout(
+            proxy.as_ref(),
+            720,
+            self.read_timeout_secs,
+            self.tls_backend,
+        )?;
         cache.insert(proxy, client.clone());
         Ok(client)
+    }
+
+    /// 流式空闲超时（秒）。`0` = 关闭。
+    ///
+    /// 供 SSE 流层做显式 idle watchdog：`select!` 每 25s ping 会重建
+    /// `body_stream.next()` future，可能重置底层 read_timeout，故不能只靠 HTTP
+    /// client 的 read_timeout，需在流层维护一个跨迭代的空闲截止时间。
+    ///
+    /// 读**运行时**值（token_manager 原子态），使管理面板对 `stream_idle_timeout_secs`
+    /// 的修改立即作用于流层 watchdog。注意：HTTP client 的 `.read_timeout()` 在构造时
+    /// 已固定（连接池复用），运行时改值只影响流层 watchdog；两者协同兜底，够用。
+    pub fn stream_idle_timeout_secs(&self) -> u64 {
+        self.token_manager.get_stream_idle_timeout_secs()
+    }
+
+    /// 缓存命中率整形区间（运行时读取 token_manager 原子态），返回 `(min_pct, max_pct)`。
+    /// 供 anthropic handler 在 `compute_cache_usage` 产出后注入 [`CacheUsage`]，
+    /// 使管理面板对区间的修改立即作用于后续请求的命中率呈现。`(0,0)` = 不整形。
+    pub fn cache_hit_rate_bounds(&self) -> (u32, u32) {
+        self.token_manager.get_cache_hit_rate_bounds()
+    }
+
+    /// 全部已注册端点的「桶名 → 协议族」映射。供 admin 校验运营配置的降级桶链
+    /// （桶名必须存在 + 链内桶与主端点同协议）。
+    pub fn endpoint_protocols(&self) -> std::collections::HashMap<String, String> {
+        self.endpoints
+            .iter()
+            .map(|(name, ep)| (name.clone(), ep.protocol().to_string()))
+            .collect()
+    }
+
+    /// 各主端点（凭据默认可路由的端点）的静态默认降级链。键 = 主端点名，
+    /// 值 = 其 `fallback_chain()`。供 admin 展示「恢复默认」与当前生效链。
+    pub fn default_endpoint_chains(&self) -> std::collections::HashMap<String, Vec<String>> {
+        self.endpoints
+            .iter()
+            .map(|(name, ep)| {
+                let chain = ep
+                    .fallback_chain()
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>();
+                (name.clone(), chain)
+            })
+            .collect()
     }
 
     fn global_proxy_candidates(&self) -> Vec<Option<ProxyConfig>> {
@@ -545,6 +607,15 @@ impl KiroProvider {
             Some(arn) => is_placeholder_profile_arn(arn),
         };
         if !needs {
+            // 已有真实 ARN：不再解析，但要确保 api_region 与 ARN 区域一致。
+            // 早期版本回填 ARN 时未回填区域，会导致请求发到 config 默认区域
+            // （us-east-1）却带着其它区域的 profileArn，上游返回 400。
+            if let Some(arn) = ctx.credentials.profile_arn.clone() {
+                if let Some(region) = self.token_manager.align_api_region_with_arn(ctx.id, &arn) {
+                    // 同步到本次请求的 ctx，使当前请求立即使用正确区域
+                    ctx.credentials.api_region = Some(region);
+                }
+            }
             return;
         }
         // 进程内去重：仅在「拿到上游确定结果」后才标记已尝试，避免一次网络抖动
@@ -922,6 +993,11 @@ impl KiroProvider {
         let mut rpm_recorded: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
 
+        // 单请求内「备用桶尝试」总次数（跨 attempt 累计），受 max_bucket_attempts_per_request 限制，
+        // 防止「链长 × attempt 数」把单请求放大成上百次上游调用。
+        let max_bucket_attempts = self.token_manager.max_bucket_attempts_per_request();
+        let mut bucket_attempts: usize = 0;
+
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
 
@@ -1229,10 +1305,34 @@ impl KiroProvider {
 
                 // 沿降级链依次尝试每个备用桶（换桶不换号），命中第一个 2xx 即返回；
                 // 整条链都失败才落回下方的账号风控/瞬态重试逻辑。参考 demo 的多端点重试。
-                for fb_name in endpoint.fallback_chain() {
-                    let Some(fb_endpoint) = self.endpoints.get(*fb_name).cloned() else {
+                //
+                // 降级链来源：运行时覆盖（config.endpointChains，管理面板可改）优先，
+                // 未配置该主端点时回退各 endpoint 的静态 fallback_chain()（零行为变化）。
+                let fallback_chain: Vec<String> = self
+                    .token_manager
+                    .endpoint_chain_for(endpoint.name())
+                    .unwrap_or_else(|| {
+                        endpoint
+                            .fallback_chain()
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect()
+                    });
+                for fb_name in &fallback_chain {
+                    // 单请求桶尝试总数硬上限（跨 attempt 累计）：防止「链长 × attempt 数」
+                    // 把单请求放大成上百次上游调用。0 = 不限。
+                    if max_bucket_attempts > 0 && bucket_attempts >= max_bucket_attempts {
+                        tracing::warn!(
+                            "凭据 #{} 已达单请求桶尝试上限 {}，停止降级链",
+                            ctx.id,
+                            max_bucket_attempts
+                        );
+                        break;
+                    }
+                    let Some(fb_endpoint) = self.endpoints.get(fb_name.as_str()).cloned() else {
                         continue;
                     };
+                    bucket_attempts += 1;
                     tracing::info!(
                         "端点 [{}] 返回 {}（瞬态），凭据 #{} 降级到备用端点 [{}] 重试（换桶不换号）",
                         endpoint_name,

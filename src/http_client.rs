@@ -105,7 +105,7 @@ pub fn build_client(
     timeout_secs: u64,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<Client> {
-    build_client_with_redirect_policy(proxy, timeout_secs, tls_backend, None)
+    build_client_with_redirect_policy(proxy, timeout_secs, None, tls_backend, None)
 }
 
 pub fn build_client_no_redirect(
@@ -113,16 +113,43 @@ pub fn build_client_no_redirect(
     timeout_secs: u64,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<Client> {
-    build_client_with_redirect_policy(proxy, timeout_secs, tls_backend, Some(Policy::none()))
+    build_client_with_redirect_policy(proxy, timeout_secs, None, tls_backend, Some(Policy::none()))
+}
+
+/// 构建带 read timeout（读空闲超时）的 HTTP Client。
+///
+/// `.timeout()` 是整个请求的**绝对**上限；`.read_timeout()` 是相邻两次成功读取
+/// 之间的**空闲**上限。Kiro/Bedrock 上游对大 payload 常在返回 200 后首字节前挂死
+/// 不吐字节，绝对超时要等满 `timeout_secs`（如 720s）才断，期间只有 ping 保活在
+/// 空烧。设置 read timeout 后，空闲超过阈值即让底层读取报错，配合流层 idle
+/// watchdog 尽早收尾，避免长时间挂死。
+///
+/// `read_timeout_secs` 为 `None` 或 `Some(0)` 时不设置（保持旧行为）。
+pub fn build_client_with_read_timeout(
+    proxy: Option<&ProxyConfig>,
+    timeout_secs: u64,
+    read_timeout_secs: Option<u64>,
+    tls_backend: TlsBackend,
+) -> anyhow::Result<Client> {
+    build_client_with_redirect_policy(proxy, timeout_secs, read_timeout_secs, tls_backend, None)
 }
 
 fn build_client_with_redirect_policy(
     proxy: Option<&ProxyConfig>,
     timeout_secs: u64,
+    read_timeout_secs: Option<u64>,
     tls_backend: TlsBackend,
     redirect_policy: Option<Policy>,
 ) -> anyhow::Result<Client> {
     let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+
+    // read timeout 仅在显式给出且 > 0 时设置；否则保持旧行为（仅绝对超时）。
+    if let Some(secs) = read_timeout_secs {
+        if secs > 0 {
+            builder = builder.read_timeout(Duration::from_secs(secs));
+        }
+    }
+
     if let Some(policy) = redirect_policy {
         builder = builder.redirect(policy);
     }

@@ -1018,23 +1018,58 @@ impl ToolJsonAccumulator {
         )))
     }
 
-    /// 流结束时收尾：若仍有从未收到 `stop=true` 的缓冲，说明上游在工具参数
-    /// 写到一半时截断，返回 `IncompleteJson`（取字节数最多的那个作代表）。
-    pub fn finish(&mut self) -> Result<(), ToolJsonAccumulatorError> {
-        if let Some((tool_use_id, (name, input))) = self
-            .buffers
-            .iter()
-            .max_by_key(|(_, (_, input))| input.len())
-            .map(|(id, (name, input))| (id.clone(), (name.clone(), input.clone())))
-        {
-            self.buffers.remove(&tool_use_id);
-            return Err(ToolJsonAccumulatorError::IncompleteJson {
-                tool_use_id,
-                name,
-                bytes: input.len(),
-            });
+    /// 流结束时收尾。对每个从未收到 `stop=true` 的残留缓冲分两种情况处理：
+    ///
+    /// - **空入参**（0 字节 / 纯空白）：上游把 tool_use 块开出来、但没写任何参数就断流，
+    ///   等价于无参工具调用（如 `EnterPlanMode`）。按 `{}` **打捞**成完整工具调用返回，
+    ///   与 base 版（首片即发 `content_block_start{input:{}}`、收尾补 `content_block_stop`）
+    ///   行为一致——避免把合法的无参调用整个丢弃、连累整轮失败。
+    /// - **半截 JSON**（有字节但从未 stop）：上游在参数写到一半时截断，转发会让客户端
+    ///   拿到无法解析 / 语义残缺的参数，故**不打捞**，记为 `IncompleteJson`
+    ///   （多个残留时取字节数最多的那个作代表错误）。
+    ///
+    /// 返回 `(已打捞的完整工具调用, 半截错误)`；两者可同时非空（部分空参可救、部分半截报错）。
+    /// 调用后缓冲被清空，重复调用返回 `(空, None)`。
+    pub fn finish(
+        &mut self,
+        tool_name_map: &HashMap<String, String>,
+    ) -> (Vec<CompletedToolUse>, Option<ToolJsonAccumulatorError>) {
+        let mut salvaged = Vec::new();
+        let mut incomplete: Option<ToolJsonAccumulatorError> = None;
+
+        // 稳定顺序：按 tool_use_id 排序，保证多缓冲时输出与错误代表选取的确定性。
+        let mut entries: Vec<(String, (String, String))> = self.buffers.drain().collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (tool_use_id, (kiro_name, input_json)) in entries {
+            if input_json.trim().is_empty() {
+                // 无参工具：打捞为 {}，经统一入口还原客户端工具名。
+                salvaged.push(CompletedToolUse::from_kiro(
+                    tool_use_id,
+                    &kiro_name,
+                    serde_json::json!({}),
+                    tool_name_map,
+                ));
+            } else {
+                // 半截 JSON：取字节数最多的作代表错误，不打捞。
+                let bytes = input_json.len();
+                let larger = match &incomplete {
+                    Some(ToolJsonAccumulatorError::IncompleteJson { bytes: prev, .. }) => {
+                        bytes > *prev
+                    }
+                    _ => true,
+                };
+                if larger {
+                    incomplete = Some(ToolJsonAccumulatorError::IncompleteJson {
+                        tool_use_id,
+                        name: kiro_name,
+                        bytes,
+                    });
+                }
+            }
         }
-        Ok(())
+
+        (salvaged, incomplete)
     }
 }
 
@@ -1142,6 +1177,12 @@ impl SseStateManager {
     /// 记录工具调用
     pub fn set_has_tool_use(&mut self, has: bool) {
         self.has_tool_use = has;
+    }
+
+    /// 本轮是否出现过 tool_use（含仅缓冲、尚未发出块的分片）。
+    /// process_tool_use 收到任一 toolUseEvent 即置真，故可用于"是否纯思考轮"的判定。
+    pub fn has_tool_use(&self) -> bool {
+        self.has_tool_use
     }
 
     /// 设置 stop_reason
@@ -2434,10 +2475,16 @@ impl StreamContext {
 
         // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，
         // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
-        // 并补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块
+        // 并补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块。
+        //
+        // 护栏：`has_tool_use()` 覆盖"仅缓冲、尚未发出块"的 tool_use（如无参工具在
+        // stop=true 前断流）——此时 active_blocks 里只有 thinking 块，has_non_thinking_blocks()
+        // 仍为 false，若不看 has_tool_use 会误判为纯思考轮，把随后打捞的 tool_use 的
+        // stop_reason 盖成 max_tokens 并多吐一个空格。
         if self.thinking_enabled
             && self.thinking_block_index.is_some()
             && !self.state_manager.has_non_thinking_blocks()
+            && !self.state_manager.has_tool_use()
         {
             self.state_manager.set_stop_reason("max_tokens");
             events.extend(self.create_text_delta_events(" "));
@@ -2449,14 +2496,32 @@ impl StreamContext {
             events.extend(self.drain_invoke_sniff_buffer(true));
         }
 
-        // 收尾检查工具调用累积器：若仍有 tool_use 从未收到 stop=true（上游在参数
-        // 写到一半时截断），记为错误。process_tool_use 中已置位的错误保持不变。
-        if self.tool_json_error.is_none()
-            && let Err(e) = self.tool_json_accumulator.finish()
-        {
-            tracing::error!("{}", e);
-            self.tool_json_error = Some(e);
-            self.state_manager.set_stop_reason("error");
+        // 收尾检查工具调用累积器：对残留缓冲区分处理——
+        //   · 空入参（无参工具，如 EnterPlanMode）→ 打捞成完整 tool_use 发出；
+        //   · 半截 JSON（上游写参数途中截断）→ 记为错误，补 error 事件。
+        // process_tool_use 中已置位的错误保持不变。
+        if self.tool_json_error.is_none() {
+            let map = self.tool_name_map.clone();
+            let (salvaged, incomplete) = self.tool_json_accumulator.finish(&map);
+            if !salvaged.is_empty() {
+                // 兜底：若 thinking 块此刻仍开着（罕见：in_thinking_block 为 true 且缓冲为空、
+                // 上面各分支都没关它），先把它关掉，避免 tool_use 块发出后才补 thinking 的
+                // content_block_stop 导致块顺序错乱。close_open_thinking_block 幂等，已关则 no-op。
+                events.extend(self.close_open_thinking_block());
+            }
+            for completed in salvaged {
+                tracing::warn!(
+                    "上游在无参工具 {} ({}) 未发 stop=true 即断流，按 {{}} 打捞发出",
+                    completed.name,
+                    completed.id
+                );
+                events.extend(self.emit_completed_tool_use(completed));
+            }
+            if let Some(e) = incomplete {
+                tracing::error!("{}", e);
+                self.tool_json_error = Some(e);
+                self.state_manager.set_stop_reason("error");
+            }
         }
 
         // 互斥口径：total 真值（contextUsage 优先）− 缓存覆盖 = 未缓存的 input。
@@ -2703,7 +2768,7 @@ mod tests {
     #[test]
     fn tool_json_accumulator_incomplete_on_missing_stop() {
         let mut acc = ToolJsonAccumulator::new();
-        // 只来了半截、从未 stop → finish() 报 IncompleteJson。
+        // 有字节但从未 stop → finish() 报 IncompleteJson（不打捞半截 JSON）。
         assert!(
             acc.push(
                 &tool_evt("t1", "read_file", "{\"path\":\"/a", false),
@@ -2712,13 +2777,54 @@ mod tests {
             .unwrap()
             .is_none()
         );
-        let err = acc.finish().unwrap_err();
+        let (salvaged, err) = acc.finish(&HashMap::new());
+        assert!(salvaged.is_empty(), "半截 JSON 不应被打捞");
+        let err = err.expect("半截 JSON 应报 IncompleteJson");
         assert!(matches!(
             err,
             ToolJsonAccumulatorError::IncompleteJson { .. }
         ));
-        // 已取出残留后再 finish() 应成功。
-        assert!(acc.finish().is_ok());
+        // 已取出残留后再 finish() 应无错误、无打捞。
+        let (salvaged, err) = acc.finish(&HashMap::new());
+        assert!(salvaged.is_empty() && err.is_none());
+    }
+
+    #[test]
+    fn tool_json_accumulator_salvages_empty_input_on_missing_stop() {
+        // 回归：无参工具（如 EnterPlanMode）上游开了 tool_use 块但未发 stop=true 即断流，
+        // 残留缓冲为 0 字节 → 应按 {} 打捞成完整工具调用，而非丢弃报错。
+        let mut acc = ToolJsonAccumulator::new();
+        assert!(
+            acc.push(&tool_evt("t1", "EnterPlanMode", "", false), &HashMap::new())
+                .unwrap()
+                .is_none()
+        );
+        let (salvaged, err) = acc.finish(&HashMap::new());
+        assert!(err.is_none(), "空入参不应报错");
+        assert_eq!(salvaged.len(), 1);
+        assert_eq!(salvaged[0].id, "t1");
+        assert_eq!(salvaged[0].name, "EnterPlanMode");
+        assert_eq!(salvaged[0].input, serde_json::json!({}));
+    }
+
+    #[test]
+    fn tool_json_accumulator_finish_mixes_salvage_and_error() {
+        // 多残留：空参可救 + 半截报错，二者并存互不影响。
+        let mut acc = ToolJsonAccumulator::new();
+        acc.push(&tool_evt("empty1", "EnterPlanMode", "", false), &HashMap::new())
+            .unwrap();
+        acc.push(
+            &tool_evt("half1", "read_file", "{\"path\":\"/a", false),
+            &HashMap::new(),
+        )
+        .unwrap();
+        let (salvaged, err) = acc.finish(&HashMap::new());
+        assert_eq!(salvaged.len(), 1, "空参应被打捞");
+        assert_eq!(salvaged[0].id, "empty1");
+        assert!(
+            matches!(err, Some(ToolJsonAccumulatorError::IncompleteJson { .. })),
+            "半截 JSON 仍应报错"
+        );
     }
 
     #[test]
@@ -3201,6 +3307,127 @@ mod tests {
         assert!(estimate_tokens("Hello") > 0);
         assert!(estimate_tokens("你好") > 0);
         assert!(estimate_tokens("Hello 你好") > 0);
+    }
+
+    #[test]
+    fn generate_final_events_salvaged_tool_after_thinking_is_tool_use_not_max_tokens() {
+        // 回归 Bug 1：thinking 模式下"纯思考 → 无参工具(EnterPlanMode)缓冲 → 上游未发 stop=true 即断流"。
+        // 收尾时 max_tokens 启发式不得抢在打捞前把 stop_reason 盖成 max_tokens、也不得多吐空格 text 块；
+        // 打捞出的 tool_use 应正常发出，stop_reason 应为 tool_use。
+        use crate::kiro::model::events::{ReasoningContentEvent, ToolUseEvent};
+
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true, // thinking enabled
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        // 1) 原生 thinking：开出并写入 thinking 块（随后被 tool_use 分片关闭）。
+        let _ = ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+            text: Some("let me think about the plan".to_string()),
+            signature: Some("sig".to_string()),
+            redacted_content: None,
+        }));
+
+        // 2) 无参工具 EnterPlanMode，stop=false → 仅缓冲、不发 tool_use 块，但 has_tool_use 置真。
+        let mid = ctx.process_kiro_event(&Event::ToolUse(ToolUseEvent {
+            name: "EnterPlanMode".to_string(),
+            tool_use_id: "toolu_plan".to_string(),
+            input: String::new(),
+            stop: false,
+        }));
+        assert!(
+            mid.iter().all(|e| {
+                e.event != "content_block_start"
+                    || e.data["content_block"]["type"] != "tool_use"
+            }),
+            "stop=false 分片不应发出 tool_use 块（仅缓冲）"
+        );
+
+        // 3) 收尾。
+        let final_events = ctx.generate_final_events();
+
+        // tool_use 块应被打捞发出，name=EnterPlanMode。
+        let tool_start = final_events.iter().find(|e| {
+            e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
+        });
+        assert!(
+            tool_start.is_some(),
+            "应打捞发出 EnterPlanMode 的 tool_use 块"
+        );
+        assert_eq!(
+            tool_start.unwrap().data["content_block"]["name"],
+            "EnterPlanMode"
+        );
+
+        // stop_reason 必须是 tool_use，而不是 max_tokens。
+        let delta = final_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("应有 message_delta");
+        assert_eq!(
+            delta.data["delta"]["stop_reason"], "tool_use",
+            "有 tool_use 时 stop_reason 应为 tool_use，不得被 max_tokens 启发式抢跑"
+        );
+
+        // 不得为"纯思考轮"补发空格 text 块。
+        let has_space_text = final_events.iter().any(|e| {
+            e.event == "content_block_delta"
+                && e.data["delta"]["type"] == "text_delta"
+                && e.data["delta"]["text"] == " "
+        });
+        assert!(!has_space_text, "不应补发空格 text 块");
+
+        // 顺序健壮性：若存在 thinking 的 content_block_stop，应在 tool_use 的 content_block_start 之前。
+        let pos_tool_start = final_events.iter().position(|e| {
+            e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
+        });
+        if let (Some(tool_pos), Some(think_idx)) = (pos_tool_start, ctx.thinking_block_index) {
+            if let Some(think_stop_pos) = final_events.iter().position(|e| {
+                e.event == "content_block_stop"
+                    && e.data["index"].as_i64() == Some(think_idx as i64)
+            }) {
+                assert!(
+                    think_stop_pos < tool_pos,
+                    "thinking 块应在 tool_use 块之前关闭"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generate_final_events_thinking_only_still_reports_max_tokens() {
+        // 反向回归：真·纯思考轮（无任何 tool_use）仍应触发 max_tokens 补空格逻辑，
+        // 确保 Bug 1 的护栏没有误伤原有行为。
+        use crate::kiro::model::events::ReasoningContentEvent;
+
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let _ = ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+            text: Some("thinking only, no tools".to_string()),
+            signature: Some("sig".to_string()),
+            redacted_content: None,
+        }));
+
+        let final_events = ctx.generate_final_events();
+        let delta = final_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("应有 message_delta");
+        assert_eq!(
+            delta.data["delta"]["stop_reason"], "max_tokens",
+            "纯思考轮 stop_reason 仍应为 max_tokens"
+        );
     }
 
     #[test]

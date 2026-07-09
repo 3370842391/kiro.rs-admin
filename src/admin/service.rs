@@ -28,12 +28,14 @@ use super::types::{
     AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse, BalanceResponse,
     BatchAddProxyRequest, BatchImportEvent, CheckRateLimitRequest, CompleteSocialLoginRequest,
     CredentialResponseTestResponse, CredentialStatusItem, CredentialsExportResponse,
-    CredentialsStatusResponse, EnableOverageAllResult, ExportedAccount, ExportedCredentials,
+    CredentialsStatusResponse, EnableOverageAllResult, EndpointBucketOption, EndpointChainsResponse,
+    CacheHitRateResponse, SetCacheHitRateRequest,
+    ExportedAccount, ExportedCredentials,
     GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
     LogGovernanceConfigResponse, PollIdcLoginResponse, ProxyBalancingModeResponse,
     ProxyCheckAllResponse, ProxyCheckResponse, ProxyCheckUrlRequest, ProxyPoolEntry,
     ProxyPoolResponse, QuotaExceededResult, RetryPolicyResponse, SetAccountThrottleConfigRequest,
-    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetProxyBalancingModeRequest,
+    SetEndpointChainsRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetProxyBalancingModeRequest,
     SetRetryPolicyRequest, SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse,
     StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse,
     UpdateCredentialRequest, UpdateRefreshTokenRequest,
@@ -2054,6 +2056,157 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
 
         self.get_retry_policy()
+    }
+
+    /// 读取 429 降级桶链配置（当前覆盖 + 静态默认 + 各协议可选桶清单 + 桶尝试上限）。
+    pub fn get_endpoint_chains(&self) -> Result<EndpointChainsResponse, AdminServiceError> {
+        let provider = self.kiro_provider.as_ref().ok_or_else(|| {
+            AdminServiceError::InternalError("Kiro provider 未初始化".to_string())
+        })?;
+
+        let protocols = provider.endpoint_protocols();
+        let defaults = provider.default_endpoint_chains();
+
+        // 每个「有静态降级链的主端点」作为可配置主端点；其可选桶 = 同协议的其它端点。
+        let mut available_buckets: std::collections::HashMap<String, Vec<EndpointBucketOption>> =
+            std::collections::HashMap::new();
+        for primary in defaults.keys() {
+            let Some(primary_proto) = protocols.get(primary) else {
+                continue;
+            };
+            let mut options: Vec<EndpointBucketOption> = protocols
+                .iter()
+                .filter(|(name, proto)| name.as_str() != primary && *proto == primary_proto)
+                .map(|(name, proto)| EndpointBucketOption {
+                    name: name.clone(),
+                    protocol: proto.clone(),
+                })
+                .collect();
+            options.sort_by(|a, b| a.name.cmp(&b.name));
+            available_buckets.insert(primary.clone(), options);
+        }
+
+        let override_chains = self.token_manager.get_endpoint_chains();
+        let overridden = override_chains.is_some();
+        let chains = override_chains.unwrap_or_else(|| defaults.clone());
+
+        Ok(EndpointChainsResponse {
+            chains,
+            overridden,
+            defaults,
+            available_buckets,
+            max_bucket_attempts_per_request: self
+                .token_manager
+                .max_bucket_attempts_per_request(),
+            stream_idle_timeout_secs: self
+                .token_manager
+                .get_stream_idle_timeout_secs(),
+        })
+    }
+
+    /// 更新 429 降级桶链配置。校验：主端点合法、桶名存在、链内桶与主端点同协议。
+    pub fn set_endpoint_chains(
+        &self,
+        req: SetEndpointChainsRequest,
+    ) -> Result<EndpointChainsResponse, AdminServiceError> {
+        let provider = self.kiro_provider.as_ref().ok_or_else(|| {
+            AdminServiceError::InternalError("Kiro provider 未初始化".to_string())
+        })?;
+        let protocols = provider.endpoint_protocols();
+        let defaults = provider.default_endpoint_chains();
+
+        if let Some(chains) = req.chains.as_ref() {
+            for (primary, buckets) in chains.iter() {
+                // 主端点必须是「有静态降级链」的合法主端点
+                let Some(primary_proto) = protocols.get(primary) else {
+                    return Err(AdminServiceError::InvalidCredential(format!(
+                        "未知主端点: {}",
+                        primary
+                    )));
+                };
+                if !defaults.contains_key(primary) {
+                    return Err(AdminServiceError::InvalidCredential(format!(
+                        "端点 {} 不是可配置降级链的主端点",
+                        primary
+                    )));
+                }
+                let mut seen = std::collections::HashSet::new();
+                for bucket in buckets {
+                    // 桶名必须存在
+                    let Some(bucket_proto) = protocols.get(bucket) else {
+                        return Err(AdminServiceError::InvalidCredential(format!(
+                            "未知备用桶: {}",
+                            bucket
+                        )));
+                    };
+                    // 协议一致：链内桶必须与主端点同协议，否则降级会悄悄换掉请求体加工/凭据身份
+                    if bucket_proto != primary_proto {
+                        return Err(AdminServiceError::InvalidCredential(format!(
+                            "备用桶 {} 协议({})与主端点 {} 协议({})不一致",
+                            bucket, bucket_proto, primary, primary_proto
+                        )));
+                    }
+                    // 备用桶不能是主端点自身
+                    if bucket == primary {
+                        return Err(AdminServiceError::InvalidCredential(format!(
+                            "备用桶不能是主端点自身: {}",
+                            bucket
+                        )));
+                    }
+                    // 链内去重
+                    if !seen.insert(bucket.clone()) {
+                        return Err(AdminServiceError::InvalidCredential(format!(
+                            "备用桶 {} 在 {} 链中重复",
+                            bucket, primary
+                        )));
+                    }
+                }
+            }
+        }
+
+        // 空 map 等价清除覆盖（回退静态默认）
+        let normalized = req
+            .chains
+            .filter(|m| !m.is_empty());
+        self.token_manager
+            .set_endpoint_chains(normalized)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        if let Some(cap) = req.max_bucket_attempts_per_request {
+            self.token_manager
+                .set_max_bucket_attempts_per_request(cap)
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        }
+
+        if let Some(secs) = req.stream_idle_timeout_secs {
+            self.token_manager
+                .set_stream_idle_timeout_secs(secs)
+                .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+        }
+
+        self.get_endpoint_chains()
+    }
+
+    /// 读取缓存命中率整形区间配置。
+    pub fn get_cache_hit_rate(&self) -> CacheHitRateResponse {
+        let (min_pct, max_pct) = self.token_manager.get_cache_hit_rate_bounds();
+        CacheHitRateResponse {
+            min_pct,
+            max_pct,
+            enabled: min_pct > 0 || max_pct > 0,
+        }
+    }
+
+    /// 设置缓存命中率整形区间（百分比 0..=100）。`(0,0)` = 关闭整形。
+    /// 校验（各值上限、min<=max）在 token_manager 层，失败映射为 400。
+    pub fn set_cache_hit_rate(
+        &self,
+        req: SetCacheHitRateRequest,
+    ) -> Result<CacheHitRateResponse, AdminServiceError> {
+        self.token_manager
+            .set_cache_hit_rate_bounds(req.min_pct, req.max_pct)
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+        Ok(self.get_cache_hit_rate())
     }
 
     /// 读取日志治理配置（trace 开关 / trace 保留天数 / usage 保留天数）

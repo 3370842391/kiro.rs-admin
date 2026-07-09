@@ -829,6 +829,32 @@ pub fn is_placeholder_profile_arn(arn: &str) -> bool {
     arn == BUILDER_ID_PROFILE_ARN
 }
 
+/// 从 profileArn 中解析出区域段。
+///
+/// ARN 格式：`arn:aws:codewhisperer:{region}:{account}:profile/{id}`，第 4 段即区域。
+/// 用于把 `ListAvailableProfiles` 命中的真实 profile 区域回填到凭据 `api_region`，
+/// 避免流式/用量请求发到与 profileArn 不一致的区域（上游会返回
+/// `400 Improperly formed request`）。占位符 ARN 或格式不符时返回 `None`。
+pub fn region_from_profile_arn(arn: &str) -> Option<String> {
+    if is_placeholder_profile_arn(arn) {
+        return None;
+    }
+    let mut parts = arn.split(':');
+    // arn : aws : codewhisperer : {region} : ...
+    if parts.next()? != "arn" {
+        return None;
+    }
+    parts.next()?; // partition (aws)
+    if parts.next()? != "codewhisperer" {
+        return None;
+    }
+    let region = parts.next()?;
+    if region.is_empty() {
+        return None;
+    }
+    Some(region.to_string())
+}
+
 #[cfg(test)]
 impl KiroCredentials {
     fn from_json(json_string: &str) -> Result<Self, serde_json::Error> {
@@ -844,6 +870,31 @@ impl KiroCredentials {
 mod tests {
     use super::*;
     use crate::model::config::Config;
+
+    #[test]
+    fn test_region_from_profile_arn() {
+        // 标准 ARN：第 4 段是区域
+        assert_eq!(
+            region_from_profile_arn(
+                "arn:aws:codewhisperer:eu-central-1:257752232114:profile/HDQDPR39YRV9"
+            )
+            .as_deref(),
+            Some("eu-central-1")
+        );
+        assert_eq!(
+            region_from_profile_arn(
+                "arn:aws:codewhisperer:us-east-1:123456789012:profile/ABC"
+            )
+            .as_deref(),
+            Some("us-east-1")
+        );
+        // BuilderID 占位符 → None
+        assert_eq!(region_from_profile_arn(BUILDER_ID_PROFILE_ARN), None);
+        // 服务名不符 / 格式不符 → None
+        assert_eq!(region_from_profile_arn("arn:aws:s3:us-east-1:x:bucket"), None);
+        assert_eq!(region_from_profile_arn("not-an-arn"), None);
+        assert_eq!(region_from_profile_arn("arn:aws:codewhisperer::x:profile/y"), None);
+    }
 
     #[test]
     fn test_from_json() {

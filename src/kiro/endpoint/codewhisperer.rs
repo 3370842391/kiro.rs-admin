@@ -69,6 +69,10 @@ impl KiroEndpoint for CodeWhispererEndpoint {
         CODEWHISPERER_ENDPOINT_NAME
     }
 
+    fn protocol(&self) -> &'static str {
+        "ide"
+    }
+
     /// codewhisperer 走独立 host；429 时沿 IDE 协议链回切 q 家族与 runtime 桶。
     fn fallback_chain(&self) -> &'static [&'static str] {
         use crate::kiro::endpoint::{

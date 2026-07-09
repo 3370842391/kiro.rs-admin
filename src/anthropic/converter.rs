@@ -2301,6 +2301,51 @@ mod tests {
     }
 
     #[test]
+    fn test_output_config_emits_effort_for_dash_form_opus_4_8() {
+        // 复现线上日志里的模型名：客户端发 dash 形式 `claude-opus-4-8`。
+        // 归一化后应变 `claude-opus-4.8`（dot）过 reasoning 支持闸门，effort 正常下发。
+        // 这是「effort 徽章为何不显示」排查的回归钉子：模型闸门是过的，
+        // 徽章空是因为客户端没带 thinking/output_config，而非 opus-4-8 不支持。
+        let req = minimal_request_with_effort("claude-opus-4-8", "xhigh");
+        let result = convert_request(&req).unwrap();
+        let fields = result
+            .additional_model_request_fields
+            .expect("dash-form claude-opus-4-8 应归一化为 opus-4.8 并下发 effort");
+        assert_eq!(
+            fields.output_config.unwrap().effort,
+            "xhigh",
+            "opus-4.8 支持 xhigh，dash 形式也应原样保留"
+        );
+    }
+
+    #[test]
+    fn test_no_output_config_no_thinking_emits_no_effort() {
+        // 佐证客诉观察：裸请求（无 thinking、无 output_config）→ 不下发 effort → 无徽章。
+        use super::super::types::Message as AnthropicMessage;
+        let req = MessagesRequest {
+            force_web_search_loop: false,
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+            }],
+            stream: true,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        let result = convert_request(&req).unwrap();
+        assert!(
+            result.additional_model_request_fields.is_none(),
+            "无 thinking/output_config 时不应下发 effort（徽章空是正确行为）"
+        );
+    }
+
+    #[test]
     fn test_output_config_downgrades_xhigh_for_known_older_models() {
         for model in [
             "claude-opus-4.6",

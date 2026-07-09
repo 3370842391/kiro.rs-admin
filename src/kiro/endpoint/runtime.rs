@@ -69,6 +69,10 @@ impl KiroEndpoint for RuntimeEndpoint {
         RUNTIME_ENDPOINT_NAME
     }
 
+    fn protocol(&self) -> &'static str {
+        "ide"
+    }
+
     /// runtime 走 `runtime.kiro.dev`（IDE 协议）。429 时沿链回切到 q 家族的独立限流桶：
     /// ide（q host）→ codewhisperer（独立 host）→ amazonq（同 q host 不同服务）。链内全部 IDE 协议。
     fn fallback_chain(&self) -> &'static [&'static str] {

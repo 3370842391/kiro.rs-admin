@@ -56,6 +56,10 @@ impl KiroEndpoint for CliEndpoint {
         CLI_ENDPOINT_NAME
     }
 
+    fn protocol(&self) -> &'static str {
+        "cli"
+    }
+
     /// cli 走 `q.amazonaws.com`（CLI 协议：KIRO_CLI origin + aws-sdk-rust UA +
     /// x-amz-json-1.0）。429 时降级到独立限流桶 `runtime.kiro.dev` 上的**同协议**端点
     /// runtime_cli——绝不能降级到 IDE 协议的 runtime，否则会把 CLI 凭据的身份悄悄改成 IDE。

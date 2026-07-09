@@ -4,7 +4,7 @@ use axum::{
     Json as JsonExtractor,
     body::{Body, to_bytes},
     extract::{Extension, Path, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
 use bytes::Bytes;
@@ -44,6 +44,7 @@ fn responses_store() -> &'static RwLock<HashMap<String, StoredResponse>> {
 pub async fn post_chat_completions(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
+    headers: HeaderMap,
     JsonExtractor(mut req): JsonExtractor<ChatCompletionRequest>,
 ) -> Response {
     apply_model_mapping(&state, &mut req.model);
@@ -61,6 +62,7 @@ pub async fn post_chat_completions(
     let anthropic_response = post_messages(
         State(state),
         Extension(key_ctx),
+        headers,
         JsonExtractor(converted.anthropic),
     )
     .await;
@@ -76,6 +78,7 @@ pub async fn post_chat_completions(
 pub async fn post_responses(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
+    headers: HeaderMap,
     JsonExtractor(mut req): JsonExtractor<ResponsesRequest>,
 ) -> Response {
     if let Some(model) = req.model.as_mut() {
@@ -104,6 +107,7 @@ pub async fn post_responses(
     let anthropic_response = post_messages(
         State(state),
         Extension(key_ctx),
+        headers,
         JsonExtractor(converted.anthropic),
     )
     .await;

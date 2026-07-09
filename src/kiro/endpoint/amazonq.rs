@@ -68,6 +68,10 @@ impl KiroEndpoint for AmazonQEndpoint {
         AMAZONQ_ENDPOINT_NAME
     }
 
+    fn protocol(&self) -> &'static str {
+        "ide"
+    }
+
     /// amazonq 走 q host 的 AmazonQ 服务；429 时沿 IDE 协议链切到其它独立桶。
     fn fallback_chain(&self) -> &'static [&'static str] {
         use crate::kiro::endpoint::{

@@ -32,6 +32,12 @@ pub trait KiroEndpoint: Send + Sync {
     /// 端点名称（对应 credentials.endpoint / config.defaultEndpoint 的取值）
     fn name(&self) -> &'static str;
 
+    /// 协议族标识：同一协议族的端点共享 origin / UA / 请求体加工，可在 429 降级链里
+    /// 互换而不改变凭据身份。IDE 协议族：`ide` / `runtime` / `codewhisperer` / `amazonq`；
+    /// CLI 协议族：`cli` / `runtime_cli`。运营配置降级链时用它校验「链内桶与主端点同协议」，
+    /// 挡住「把 CLI 桶配进 IDE 链」这种会悄悄换掉请求体加工的错误配置。
+    fn protocol(&self) -> &'static str;
+
     /// 429 限流时按顺序降级的备用端点链（每个都是一个**独立的限流桶**）。
     ///
     /// 参考 demo（kiro-go）的多端点重试：单张凭据在主端点 429 时，会沿本链

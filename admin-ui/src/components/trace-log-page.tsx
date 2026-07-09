@@ -175,7 +175,85 @@ function AttemptRow({ a }: { a: TraceAttempt }) {
   )
 }
 
-/** 可展开的链路行 */
+/** 1M 上下文判定阈值：标准 Claude 窗口 200K，prompt 超过即说明扩展窗口在生效 */
+const CONTEXT_1M_INPUT_THRESHOLD = 200_000
+
+/**
+ * 思考徽章（对齐 Kiro-Go 的 `effort || schema` 兜底）：
+ * - 有具体档位 → 显 high/xhigh/max（high 淡色、xhigh 橙、max 红，高成本档更醒目）
+ * - 请求了推理但没解析出档位（如非 opus 模型）→ 显淡色「思考」
+ * - 没请求推理 → 不渲染（裸流量不误标）
+ */
+function EffortBadge({ effort, thinking }: { effort?: string | null; thinking?: boolean }) {
+  const e = (effort ?? '').trim().toLowerCase()
+  if (e) {
+    const variant: 'secondary' | 'warning' | 'destructive' =
+      e === 'max' ? 'destructive' : e === 'xhigh' ? 'warning' : 'secondary'
+    return (
+      <Badge variant={variant} className="ml-1.5" title={`思考档位：${e}`}>
+        {e}
+      </Badge>
+    )
+  }
+  if (thinking) {
+    return (
+      <Badge variant="secondary" className="ml-1.5" title="客户端请求了推理，但未解析出具体档位">
+        思考
+      </Badge>
+    )
+  }
+  return null
+}
+
+/**
+ * 1M 扩展上下文徽章：客户端声明 beta 头，或 prompt 实测 > 200K（扩展窗口已生效）时显示。
+ *
+ * 注意用 **prompt 总量** = input + cacheCreation + cacheRead 判定，而非 input 单值：
+ * 缓存模拟 / 命中率整形会把 token 从 input 挪进 cache_read，input 单值会被压到 200K 以下，
+ * 但这三者之和（真实 prompt 规模）恒定，故用它判定才不受缓存整形影响。
+ */
+function Context1mBadge({ rec }: { rec: TraceRecord }) {
+  const declared = rec.context1m === true
+  const promptTotal =
+    (rec.inputTokens ?? 0) + (rec.cacheCreationTokens ?? 0) + (rec.cacheReadTokens ?? 0)
+  const overStd = promptTotal > CONTEXT_1M_INPUT_THRESHOLD
+  if (!declared && !overStd) return null
+  const title = declared
+    ? '客户端声明 1M 扩展上下文（anthropic-beta: context-1m）'
+    : `prompt 超过 200K（标准窗口上限），扩展上下文已生效`
+  return (
+    <Badge variant="success" className="ml-1.5" title={title}>
+      1M{!declared && overStd ? '?' : ''}
+    </Badge>
+  )
+}
+
+/**
+ * 缓存命中率徽章：`缓存读/(输入+缓存读)`，与概览图表 calcHitRate 同口径（不含缓存写）。
+ * cacheRead=0（冷启动/无缓存）时不渲染，避免满屏 0%。纯展示，用行内已有的 token 数现算。
+ */
+function CacheHitRateBadge({ rec }: { rec: TraceRecord }) {
+  const input = rec.inputTokens ?? 0
+  const cacheRead = rec.cacheReadTokens ?? 0
+  const denom = input + cacheRead
+  if (cacheRead <= 0 || denom <= 0) return null
+  const pct = Math.round((cacheRead / denom) * 100)
+  return (
+    <Badge
+      variant="outline"
+      className="ml-1.5"
+      style={{
+        borderColor: 'transparent',
+        backgroundColor: 'rgba(6,182,212,0.12)',
+        color: '#0891b2',
+      }}
+      title={`缓存命中率 = 缓存读/(输入+缓存读) = ${pct}%（与概览同口径，不含缓存写）`}
+    >
+      缓存 {pct}%
+    </Badge>
+  )
+}
+
 /** Token 用量单元格：紧凑展示总量，hover 显示分项明细 */
 function TokenCell({ rec }: { rec: TraceRecord }) {
   const input = rec.inputTokens ?? 0
@@ -252,6 +330,9 @@ function TraceRow({ rec }: { rec: TraceRecord }) {
         <td className="py-2.5 pr-3 text-[13px]">
           <span className="inline-block max-w-[220px] truncate align-middle">{rec.model}</span>
           {rec.isStream && <Badge variant="outline" className="ml-1.5">流式</Badge>}
+          <EffortBadge effort={rec.reasoningEffort} thinking={rec.thinking} />
+          <Context1mBadge rec={rec} />
+          <CacheHitRateBadge rec={rec} />
         </td>
         <td className="py-2.5 pr-3 text-[13px]">
           <Badge variant="outline">{keyLabel(rec.keyId, rec.keyName)}</Badge>

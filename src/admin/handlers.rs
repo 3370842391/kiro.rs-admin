@@ -24,7 +24,8 @@ use super::{
         ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest, CreateClientKeyRequest,
         CreateClientKeyResponse, CredentialResponseTestRequest, GlobalProxyResponse,
         ProxyCheckUrlRequest, SetAccountThrottleConfigRequest, SetDisabledRequest,
-        SetGlobalProxyRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
+        SetCacheHitRateRequest, SetEndpointChainsRequest, SetGlobalProxyRequest, SetLoadBalancingModeRequest,
+        SetLogGovernanceConfigRequest,
         SetPriorityRequest, SetProxyBalancingModeRequest, SetRetryPolicyRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
@@ -621,6 +622,45 @@ pub async fn set_retry_policy(
     Json(payload): Json<SetRetryPolicyRequest>,
 ) -> impl IntoResponse {
     match state.service.set_retry_policy(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/endpoint-chains
+/// 获取 429 降级桶链配置（当前覆盖 + 静态默认 + 可选桶清单 + 桶尝试上限）
+pub async fn get_endpoint_chains(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.get_endpoint_chains() {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// PUT /api/admin/config/endpoint-chains
+/// 更新 429 降级桶链配置（运行时生效 + 持久化 config.json）
+pub async fn set_endpoint_chains(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetEndpointChainsRequest>,
+) -> impl IntoResponse {
+    match state.service.set_endpoint_chains(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/cache-hit-rate
+/// 获取缓存命中率整形区间（min/max 百分比 + 是否启用）
+pub async fn get_cache_hit_rate(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_cache_hit_rate())
+}
+
+/// PUT /api/admin/config/cache-hit-rate
+/// 更新缓存命中率整形区间（运行时生效 + 持久化 config.json）。(0,0) = 关闭。
+pub async fn set_cache_hit_rate(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetCacheHitRateRequest>,
+) -> impl IntoResponse {
+    match state.service.set_cache_hit_rate(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
@@ -1430,6 +1470,9 @@ pub async fn list_traces(
                 "totalTokens": r.input_tokens + r.output_tokens + r.cache_creation_tokens + r.cache_read_tokens,
                 "credits": r.credits,
                 "firstTokenMs": r.first_token_ms,
+                "reasoningEffort": r.reasoning_effort,
+                "context1m": r.context_1m,
+                "thinking": r.thinking,
                 "attempts": attempts,
             })
         })
