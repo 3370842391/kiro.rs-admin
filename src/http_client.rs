@@ -141,7 +141,14 @@ fn build_client_with_redirect_policy(
     tls_backend: TlsBackend,
     redirect_policy: Option<Policy>,
 ) -> anyhow::Result<Client> {
-    let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+    // 连接池：显式对齐 kirogo（IdleConnTimeout=120s / MaxIdleConnsPerHost=128）。
+    // 请求头改用 Connection: keep-alive 后，同一代理的 TLS 连接可复用，省掉每轮
+    // 对话到美国上游 1-3s 的 TCP+TLS 握手（首字延迟的主要来源）。空闲连接在
+    // pool_idle_timeout 后自动回收，陈旧连接被 reqwest 复用前会剔除，安全。
+    let mut builder = Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .pool_idle_timeout(Duration::from_secs(120))
+        .pool_max_idle_per_host(128);
 
     // read timeout 仅在显式给出且 > 0 时设置；否则保持旧行为（仅绝对超时）。
     if let Some(secs) = read_timeout_secs {

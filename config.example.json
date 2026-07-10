@@ -10,5 +10,6 @@
   "updateAutoApplyTime": "03:00",
   "traceEnabled": true,
   "traceRetentionDays": 7,
-  "usageLogRetentionDays": 31
+  "usageLogRetentionDays": 31,
+  "earlyStreamHandshake": false
 }

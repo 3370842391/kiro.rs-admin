@@ -347,6 +347,11 @@ pub struct Config {
     #[serde(default = "default_stream_idle_timeout_secs")]
     pub stream_idle_timeout_secs: u64,
 
+    /// 流式请求是否在 Kiro 上游响应前立即提交 SSE，并用注释心跳保活。
+    /// false 保留真实上游 HTTP 状态；true 时提交后的上游错误改走 SSE error。
+    #[serde(default)]
+    pub early_stream_handshake: bool,
+
     /// 429 降级桶链运行时覆盖。键 = 主端点名（`ide` / `cli`），值 = 该主端点 429 时
     /// 依次尝试的备用桶名（有序）。缺省（None）时回退各 endpoint 的静态 `fallback_chain()`，
     /// 保证老部署零行为变化。空数组 = 该主端点不降级。运行时可在管理面板编辑。
@@ -514,6 +519,7 @@ impl Default for Config {
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
             stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
+            early_stream_handshake: false,
             endpoint_chains: None,
             max_bucket_attempts_per_request: default_max_bucket_attempts_per_request(),
             cache_hit_rate_min_pct: 0,
@@ -582,5 +588,22 @@ impl Config {
         fs::write(path, content)
             .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn early_stream_handshake_defaults_off() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(!config.early_stream_handshake);
+    }
+
+    #[test]
+    fn early_stream_handshake_accepts_camel_case_json() {
+        let config: Config = serde_json::from_str(r#"{"earlyStreamHandshake":true}"#).unwrap();
+        assert!(config.early_stream_handshake);
     }
 }

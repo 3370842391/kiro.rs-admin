@@ -125,6 +125,9 @@ pub struct TraceRecord {
     /// 首 Token 延迟（毫秒，仅流式有值；非流式为 None）
     #[serde(default)]
     pub first_token_ms: Option<u64>,
+    /// Kiro 上游首个原始 body chunk 延迟（毫秒，仅流式有值）。
+    #[serde(default)]
+    pub upstream_first_byte_ms: Option<u64>,
     /// 本次请求实际下发的思考档位（low/medium/high/xhigh/max）；未启用/不支持时为 None。
     #[serde(default)]
     pub reasoning_effort: Option<String>,
@@ -264,13 +267,14 @@ impl TraceStore {
         // (列名, 定义) —— 与 SCHEMA 中新增列保持一致
         // 注意 key_source 不带 NOT NULL：老库已有行需先以 NULL 添加再回填（SQLite ALTER ADD COLUMN
         // NOT NULL 不带常量 DEFAULT 时无法对已有行赋值）。新插入永远写入合法值。
-        let columns: [(&str, &str); 10] = [
+        let columns: [(&str, &str); 11] = [
             ("input_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("output_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("cache_read_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("credits", "REAL NOT NULL DEFAULT 0"),
             ("first_token_ms", "INTEGER"),
+            ("upstream_first_byte_ms", "INTEGER"),
             ("key_source", "TEXT"),
             ("reasoning_effort", "TEXT"),
             ("context_1m", "INTEGER NOT NULL DEFAULT 0"),
@@ -336,8 +340,8 @@ impl TraceStore {
                  is_stream, final_status, final_credential_id, error_type, error_message, \
                  total_attempts, duration_ms, interrupted_after_bytes, \
                  input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, \
-                 credits, first_token_ms, reasoning_effort, context_1m, thinking) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
+                 credits, first_token_ms, upstream_first_byte_ms, reasoning_effort, context_1m, thinking) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
                 rusqlite::params![
                     rec.trace_id,
                     rec.ts,
@@ -359,6 +363,7 @@ impl TraceStore {
                     rec.cache_read_tokens as i64,
                     rec.credits,
                     rec.first_token_ms.map(|v| v as i64),
+                    rec.upstream_first_byte_ms.map(|v| v as i64),
                     rec.reasoning_effort,
                     rec.context_1m as i64,
                     rec.thinking as i64,
@@ -499,7 +504,7 @@ impl TraceStore {
             "SELECT trace_id, ts, key_id, key_source, model, is_stream, final_status, final_credential_id, \
              error_type, error_message, total_attempts, duration_ms, interrupted_after_bytes, \
              input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits, first_token_ms, \
-             reasoning_effort, context_1m, thinking \
+             upstream_first_byte_ms, reasoning_effort, context_1m, thinking \
              FROM traces {} ORDER BY ts_epoch DESC LIMIT {} OFFSET {}",
             where_sql, limit, q.offset
         );
@@ -526,9 +531,10 @@ impl TraceStore {
                 cache_read_tokens: row.get::<_, i64>(16)? as u64,
                 credits: row.get::<_, f64>(17)?,
                 first_token_ms: row.get::<_, Option<i64>>(18)?.map(|v| v as u64),
-                reasoning_effort: row.get::<_, Option<String>>(19)?,
-                context_1m: row.get::<_, i64>(20)? != 0,
-                thinking: row.get::<_, i64>(21)? != 0,
+                upstream_first_byte_ms: row.get::<_, Option<i64>>(19)?.map(|v| v as u64),
+                reasoning_effort: row.get::<_, Option<String>>(20)?,
+                context_1m: row.get::<_, i64>(21)? != 0,
+                thinking: row.get::<_, i64>(22)? != 0,
                 attempts: Vec::new(),
             })
         })?;
@@ -742,6 +748,7 @@ CREATE TABLE IF NOT EXISTS traces (
     cache_read_tokens INTEGER NOT NULL DEFAULT 0,
     credits           REAL NOT NULL DEFAULT 0,
     first_token_ms    INTEGER,
+    upstream_first_byte_ms INTEGER,
     reasoning_effort  TEXT,
     context_1m        INTEGER NOT NULL DEFAULT 0,
     thinking          INTEGER NOT NULL DEFAULT 0
@@ -803,7 +810,8 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 101760,
             credits: 0.0,
-            first_token_ms: None,
+            first_token_ms: Some(3200),
+            upstream_first_byte_ms: Some(2800),
             reasoning_effort: None,
             context_1m: false,
             thinking: false,
@@ -867,6 +875,8 @@ mod tests {
         assert_eq!(out[0].output_tokens, 779);
         assert_eq!(out[0].cache_read_tokens, 101760);
         assert_eq!(out[0].cache_creation_tokens, 0);
+        assert_eq!(out[0].first_token_ms, Some(3200));
+        assert_eq!(out[0].upstream_first_byte_ms, Some(2800));
     }
 
     #[test]

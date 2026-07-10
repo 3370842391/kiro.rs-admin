@@ -23,7 +23,9 @@ use crate::admin::error::AdminServiceError;
 const MAX_DOWNLOAD_BYTES: u64 = 200 * 1024 * 1024;
 
 /// GitHub Releases 仓库 owner/repo。
-const GITHUB_REPO: &str = "ZyphrZero/kiro.rs";
+/// 指向本 fork：在线更新下载的二进制来自这里的 Release，确保拉到的是
+/// 带 admin 魔改（桶链/idle 防护/缓存整形）的版本，而非上游原版。
+const GITHUB_REPO: &str = "3370842391/kiro.rs-admin";
 
 /// release 包内（解压后）二进制文件名。Linux/macOS 是 `kiro-rs`，
 /// Windows 是 `kiro-rs.exe`。

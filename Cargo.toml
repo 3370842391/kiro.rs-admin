@@ -1,6 +1,6 @@
-[package]
+﻿[package]
 name = "kiro-rs"
-version = "0.6.9"
+version = "0.7.0"
 edition = "2024"
 
 [features]
@@ -29,21 +29,21 @@ uuid = { version = "1.10", features = ["v1", "v4", "fast-rng"] }
 fastrand = "2"
 sha2 = "0.10"
 hex = "0.4"
-crc = "3"           # CRC32C 计算
-bytes = "1"         # 高效的字节缓冲区
+crc = "3"           # CRC32C 璁＄畻
+bytes = "1"         # 楂樻晥鐨勫瓧鑺傜紦鍐插尯
 tower-http = { version = "0.6", features = ["cors"] }
 clap = { version = "4.5", features = ["derive"] }
 urlencoding = "2"
-parking_lot = "0.12"  # 高性能同步原语
+parking_lot = "0.12"  # 楂樻€ц兘鍚屾鍘熻
 # Image resize for inbound user/MCP images so AWS Q stays within request size
-# limit. Pure-Rust, no C deps. PNG/JPEG/WebP/GIF only — keeps build slim.
+# limit. Pure-Rust, no C deps. PNG/JPEG/WebP/GIF only 鈥?keeps build slim.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 base64 = "0.22"
 thiserror = "1"
-subtle = "2.6"        # 常量时间比较（防止时序攻击）
-rust-embed = "8"      # 嵌入静态文件
-mime_guess = "2"      # MIME 类型推断
-flate2 = "1"        # tar.gz 解压（在线更新）
-tar = "0.4"         # tar 解析（在线更新）
-zip = { version = "2", default-features = false, features = ["deflate"] }  # zip 解压（Windows 在线更新）
-rusqlite = { version = "0.32", features = ["bundled"] }  # 请求链路追踪持久化（自带 SQLite 源码）
+subtle = "2.6"        # 甯搁噺鏃堕棿姣旇緝锛堥槻姝㈡椂搴忔敾鍑伙級
+rust-embed = "8"      # 宓屽叆闈欐€佹枃浠?
+mime_guess = "2"      # MIME 绫诲瀷鎺ㄦ柇
+flate2 = "1"        # tar.gz 瑙ｅ帇锛堝湪绾挎洿鏂帮級
+tar = "0.4"         # tar 瑙ｆ瀽锛堝湪绾挎洿鏂帮級
+zip = { version = "2", default-features = false, features = ["deflate"] }  # zip 瑙ｅ帇锛圵indows 鍦ㄧ嚎鏇存柊锛?
+rusqlite = { version = "0.32", features = ["bundled"] }  # 璇锋眰閾捐矾杩借釜鎸佷箙鍖栵紙鑷甫 SQLite 婧愮爜锛?

@@ -1,6 +1,8 @@
 //! Anthropic API Handler 函数
 
 use std::convert::Infallible;
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Instant;
 
 use crate::admin::client_keys::SharedClientKeyManager;
@@ -136,8 +138,10 @@ pub(crate) struct RequestTracer {
     /// 客户端是否请求了推理（thinking 启用 或 显式 effort）；与档位独立。
     thinking: bool,
     started_at: Instant,
-    /// 首个上游 chunk 到达时刻（仅流式标记；取第一次）
+    /// 首个客户端可见内容事件产出时刻（仅流式标记；取第一次）
     first_token_at: parking_lot::Mutex<Option<Instant>>,
+    /// 首个 Kiro 原始 body chunk 到达时刻（仅流式标记；取第一次）
+    upstream_first_byte_at: parking_lot::Mutex<Option<Instant>>,
     attempts: parking_lot::Mutex<Vec<TraceAttempt>>,
 }
 
@@ -185,16 +189,29 @@ impl RequestTracer {
             thinking: options.thinking,
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
+            upstream_first_byte_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
-    /// 标记首个上游 chunk 到达（幂等，仅记录第一次）
+    /// 标记首个客户端可见内容事件产出（幂等，仅记录第一次）
     pub fn mark_first_token(&self) {
         let mut slot = self.first_token_at.lock();
         if slot.is_none() {
             *slot = Some(Instant::now());
         }
+    }
+
+    /// 标记首个 Kiro 原始 body chunk 到达（幂等，仅记录第一次）
+    pub fn mark_upstream_first_byte(&self) {
+        let mut slot = self.upstream_first_byte_at.lock();
+        if slot.is_none() {
+            *slot = Some(Instant::now());
+        }
+    }
+
+    fn last_http_status(&self) -> Option<u16> {
+        self.attempts.lock().last().and_then(|a| a.http_status)
     }
 
     /// 组装并落库一条完整链路。store 为 None 时不做任何事。
@@ -212,6 +229,10 @@ impl RequestTracer {
         let final_credential_id = attempts.last().map(|a| a.credential_id).unwrap_or(0);
         let first_token_ms = self
             .first_token_at
+            .lock()
+            .map(|t| t.duration_since(self.started_at).as_millis() as u64);
+        let upstream_first_byte_ms = self
+            .upstream_first_byte_at
             .lock()
             .map(|t| t.duration_since(self.started_at).as_millis() as u64);
         let rec = TraceRecord {
@@ -234,6 +255,7 @@ impl RequestTracer {
             cache_read_tokens: usage.cache_read_tokens,
             credits: usage.credits,
             first_token_ms,
+            upstream_first_byte_ms,
             reasoning_effort: self.reasoning_effort.clone(),
             context_1m: self.context_1m,
             thinking: self.thinking,
@@ -315,68 +337,72 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
     }
 }
 
-/// 将 KiroProvider 错误映射为 HTTP 响应
+struct ClassifiedProviderError {
+    http_status: StatusCode,
+    error_type: &'static str,
+    public_message: &'static str,
+}
+
+fn classify_provider_error(err: &Error) -> ClassifiedProviderError {
+    let text = err.to_string();
+    if text.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
+        return ClassifiedProviderError {
+            http_status: StatusCode::BAD_REQUEST,
+            error_type: "invalid_request_error",
+            public_message: "Context window is full. Reduce conversation history, system prompt, or tools.",
+        };
+    }
+    if text.contains("Input is too long") {
+        return ClassifiedProviderError {
+            http_status: StatusCode::BAD_REQUEST,
+            error_type: "invalid_request_error",
+            public_message: "Input is too long. Reduce the size of your messages.",
+        };
+    }
+    if crate::kiro::endpoint::default_is_client_validation_error(&text) {
+        return ClassifiedProviderError {
+            http_status: StatusCode::BAD_REQUEST,
+            error_type: "invalid_request_error",
+            public_message: "Invalid message sequence: tool_use and tool_result blocks must be correctly paired and ordered.",
+        };
+    }
+    ClassifiedProviderError {
+        http_status: StatusCode::BAD_GATEWAY,
+        error_type: "api_error",
+        public_message: "Upstream API request failed.",
+    }
+}
+
+/// 将 KiroProvider 错误映射为 HTTP 响应。
 pub(super) fn map_provider_error(err: Error) -> Response {
-    let err_str = err.to_string();
-
-    // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
-    if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
-        tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Context window is full. Reduce conversation history, system prompt, or tools.",
-            )),
-        )
-            .into_response();
+    let classified = classify_provider_error(&err);
+    if classified.http_status.is_client_error() {
+        tracing::warn!(error = %err, "上游拒绝了客户端请求");
+    } else {
+        tracing::error!(error = %err, "Kiro API 调用失败");
     }
-
-    // 单次输入太长（请求体本身超出上游限制）
-    if err_str.contains("Input is too long") {
-        tracing::warn!(error = %err, "上游拒绝请求：输入过长（不应重试）");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Input is too long. Reduce the size of your messages.",
-            )),
-        )
-            .into_response();
-    }
-
-    // Bedrock client-side validation errors (tool_use <-> tool_result mismatch, invalid message sequence, etc.)
-    // The root cause is the client's own messages array, not an upstream failure, so it must not map to 5xx
-    // otherwise it triggers an upstream cooldown that amplifies one client error into a 30+ burst of 503s.
-    // Detection is centralized in the endpoint layer (single source of truth for the markers); the provider
-    // already bails out without retry on these, and this mapping is the client-facing safety net.
-    if crate::kiro::endpoint::default_is_client_validation_error(&err_str) {
-        tracing::warn!(
-            error = %err,
-            "client messages array violates the protocol (Bedrock validation; mapped to 400 to avoid a false cooldown)"
-        );
-        // Return a stable, client-facing message and avoid echoing the raw upstream
-        // error string (which can carry request IDs or internal validation details).
-        // The full error is already logged above for diagnostics.
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Invalid message sequence: tool_use and tool_result blocks must be correctly paired and ordered.".to_string(),
-            )),
-        )
-            .into_response();
-    }
-
-    tracing::error!("Kiro API 调用失败: {}", err);
     (
-        StatusCode::BAD_GATEWAY,
+        classified.http_status,
         Json(ErrorResponse::new(
-            "api_error",
-            format!("上游 API 调用失败: {}", err),
+            classified.error_type,
+            classified.public_message,
         )),
     )
         .into_response()
+}
+
+fn provider_error_sse(err: Error, upstream_status: Option<u16>) -> Bytes {
+    let classified = classify_provider_error(&err);
+    let mut error = json!({
+        "type": classified.error_type,
+        "message": classified.public_message,
+    });
+    if let Some(status) = upstream_status {
+        error["upstream_status"] = json!(status);
+    }
+    SseEvent::new("error", json!({"type": "error", "error": error}))
+        .to_sse_string()
+        .into()
 }
 
 /// 计算 Anthropic usage 口径的 input_tokens
@@ -904,6 +930,31 @@ async fn handle_stream_request(
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
 ) -> Response {
+    if provider.early_stream_handshake() {
+        let idle_timeout_secs = provider.stream_idle_timeout_secs();
+        let stream = create_early_sse_stream(
+            provider,
+            request_body.to_owned(),
+            model.to_owned(),
+            input_tokens,
+            thinking_enabled,
+            tool_name_map,
+            known_tool_names,
+            hook,
+            cache_usage,
+            tracer,
+            group,
+            idle_timeout_secs,
+        );
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header(header::CONNECTION, "keep-alive")
+            .body(Body::from_stream(stream))
+            .unwrap();
+    }
+
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
         .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
@@ -961,12 +1012,265 @@ async fn handle_stream_request(
         .unwrap()
 }
 
+struct EarlyStreamSetup {
+    model: String,
+    input_tokens: i32,
+    thinking_enabled: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
+    known_tool_names: std::collections::HashSet<String>,
+    hook: UsageRecordHook,
+    cache_usage: super::cache_metering::CacheUsage,
+    tracer: std::sync::Arc<RequestTracer>,
+    idle_timeout_secs: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_early_sse_stream(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    request_body: String,
+    model: String,
+    input_tokens: i32,
+    thinking_enabled: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
+    known_tool_names: std::collections::HashSet<String>,
+    hook: UsageRecordHook,
+    cache_usage: super::cache_metering::CacheUsage,
+    tracer: std::sync::Arc<RequestTracer>,
+    group: Option<String>,
+    idle_timeout_secs: u64,
+) -> impl Stream<Item = Result<Bytes, Infallible>> {
+    let tracer_for_call = tracer.clone();
+    let call = async move {
+        provider
+            .call_api_stream(
+                &request_body,
+                Some(tracer_for_call.as_ref()),
+                group.as_deref(),
+            )
+            .await
+    };
+    let mut setup = Some(EarlyStreamSetup {
+        model,
+        input_tokens,
+        thinking_enabled,
+        tool_name_map,
+        known_tool_names,
+        hook,
+        cache_usage,
+        tracer,
+        idle_timeout_secs,
+    });
+
+    flatten_pending_call(call, move |result| {
+        let setup = setup.take().expect("early stream setup consumed once");
+        match result {
+            Ok(call_result) => {
+                let mut ctx = StreamContext::new_with_thinking(
+                    setup.model,
+                    setup.input_tokens,
+                    setup.thinking_enabled,
+                    setup.tool_name_map,
+                    setup.known_tool_names,
+                );
+                ctx.cache_usage = setup.cache_usage;
+                let initial_events = ctx.generate_initial_events();
+                Box::pin(create_sse_stream(
+                    call_result.response,
+                    ctx,
+                    initial_events,
+                    setup.hook,
+                    call_result.credential_id,
+                    setup.tracer,
+                    setup.idle_timeout_secs,
+                ))
+            }
+            Err(err) => {
+                setup
+                    .hook
+                    .record(0, setup.input_tokens, 0, 0, 0, 0.0, "error");
+                let upstream_status = setup.tracer.last_http_status();
+                let error_type = last_attempt_outcome(&setup.tracer);
+                let error_text = err.to_string();
+                setup.tracer.finalize(
+                    "error",
+                    error_type,
+                    Some(&error_text),
+                    None,
+                    TraceUsage::zero(),
+                );
+                Box::pin(stream::once(async move {
+                    Ok(provider_error_sse(err, upstream_status))
+                }))
+            }
+        }
+    })
+}
+
 /// Ping 事件间隔（25秒）
 const PING_INTERVAL_SECS: u64 = 25;
+
+const EARLY_CONNECTED_SSE: &[u8] = b": connected\n\n";
+const EARLY_PING_SSE: &[u8] = b": ping\n\n";
+const EARLY_PING_INTERVAL: Duration = Duration::from_secs(1);
+
+type BoxByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, Infallible>> + Send>>;
+
+enum PendingCallEvent<T> {
+    Comment(Bytes),
+    Complete(anyhow::Result<T>),
+}
+
+impl<T> PendingCallEvent<T> {
+    #[cfg(test)]
+    fn comment_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Comment(bytes) => Some(bytes.as_ref()),
+            Self::Complete(_) => None,
+        }
+    }
+}
+
+fn pending_call_stream<F, T>(future: F) -> impl Stream<Item = PendingCallEvent<T>>
+where
+    F: Future<Output = anyhow::Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    struct State<F> {
+        future: Pin<Box<F>>,
+        heartbeat: tokio::time::Interval,
+        connected_sent: bool,
+        completed: bool,
+    }
+
+    let heartbeat = tokio::time::interval_at(
+        TokioInstant::now() + EARLY_PING_INTERVAL,
+        EARLY_PING_INTERVAL,
+    );
+    stream::unfold(
+        State {
+            future: Box::pin(future),
+            heartbeat,
+            connected_sent: false,
+            completed: false,
+        },
+        |mut state| async move {
+            if state.completed {
+                return None;
+            }
+            if !state.connected_sent {
+                state.connected_sent = true;
+                return Some((
+                    PendingCallEvent::Comment(Bytes::from_static(EARLY_CONNECTED_SSE)),
+                    state,
+                ));
+            }
+            tokio::select! {
+                result = &mut state.future => {
+                    state.completed = true;
+                    Some((PendingCallEvent::Complete(result), state))
+                }
+                _ = state.heartbeat.tick() => Some((
+                    PendingCallEvent::Comment(Bytes::from_static(EARLY_PING_SSE)),
+                    state,
+                )),
+            }
+        },
+    )
+}
+
+fn flatten_pending_call<F, T, M>(
+    future: F,
+    mut on_complete: M,
+) -> impl Stream<Item = Result<Bytes, Infallible>>
+where
+    F: Future<Output = anyhow::Result<T>> + Send + 'static,
+    T: Send + 'static,
+    M: FnMut(anyhow::Result<T>) -> BoxByteStream + Send + 'static,
+{
+    pending_call_stream(future)
+        .map(move |event| -> BoxByteStream {
+            match event {
+                PendingCallEvent::Comment(bytes) => {
+                    Box::pin(stream::once(async move { Ok(bytes) }))
+                }
+                PendingCallEvent::Complete(result) => on_complete(result),
+            }
+        })
+        .flatten()
+}
+
+#[cfg(test)]
+fn flatten_pending_call_for_test(
+    result: anyhow::Result<BoxByteStream>,
+) -> impl Stream<Item = Result<Bytes, Infallible>> {
+    flatten_pending_call(async move { result }, |result| match result {
+        Ok(stream) => stream,
+        Err(err) => Box::pin(stream::once(
+            async move { Ok(provider_error_sse(err, None)) },
+        )),
+    })
+}
+
+#[cfg(test)]
+fn early_error_test_stream(
+    err: Error,
+    upstream_status: Option<u16>,
+) -> impl Stream<Item = Result<Bytes, Infallible>> {
+    flatten_pending_call(
+        async move { Err::<BoxByteStream, _>(err) },
+        move |result| match result {
+            Ok(stream) => stream,
+            Err(err) => Box::pin(stream::once(async move {
+                Ok(provider_error_sse(err, upstream_status))
+            })),
+        },
+    )
+}
 
 /// 创建 ping 事件的 SSE 字符串
 fn create_ping_sse() -> Bytes {
     Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n")
+}
+
+fn is_client_visible_content(event: &SseEvent) -> bool {
+    if event.event == "content_block_start" {
+        return event
+            .data
+            .pointer("/content_block/type")
+            .and_then(serde_json::Value::as_str)
+            == Some("tool_use");
+    }
+    if event.event != "content_block_delta" {
+        return false;
+    }
+    match event
+        .data
+        .pointer("/delta/type")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("text_delta") => event
+            .data
+            .pointer("/delta/text")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| !s.is_empty()),
+        Some("thinking_delta") => event
+            .data
+            .pointer("/delta/thinking")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| !s.is_empty()),
+        Some("input_json_delta") => event
+            .data
+            .pointer("/delta/partial_json")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| !s.is_empty()),
+        _ => false,
+    }
+}
+
+fn mark_first_token_if_visible(tracer: &RequestTracer, events: &[SseEvent]) {
+    if events.iter().any(is_client_visible_content) {
+        tracer.mark_first_token();
+    }
 }
 
 /// 创建 SSE 事件流
@@ -1015,7 +1319,7 @@ fn create_sse_stream(
                 chunk_result = body_stream.next() => {
                     match chunk_result {
                         Some(Ok(chunk)) => {
-                            tracer.mark_first_token();
+                            tracer.mark_upstream_first_byte();
                             sent_bytes += chunk.len() as u64;
                             // 收到真实字节：顺延 idle 截止时间
                             idle_deadline = TokioInstant::now() + Duration::from_secs(idle_timeout_secs.max(1));
@@ -1038,6 +1342,7 @@ fn create_sse_stream(
                                     }
                                 }
                             }
+                            mark_first_token_if_visible(&tracer, &events);
 
                             // 转换为 SSE 字节流
                             let bytes: Vec<Result<Bytes, Infallible>> = events
@@ -1051,6 +1356,7 @@ fn create_sse_stream(
                             tracing::error!("读取响应流失败: {}", e);
                             // 发送最终事件并结束（记为 error）
                             let final_events = ctx.generate_final_events();
+                            mark_first_token_if_visible(&tracer, &final_events);
                             record_stream_usage(&hook, &ctx, credential_id, "error");
                             // 已开始返回内容后上游断流：标记为 interrupted，带已发送字节数
                             tracer.finalize(
@@ -1070,6 +1376,7 @@ fn create_sse_stream(
                             // 流结束，发送最终事件（generate_final_events 内部会 finish()
                             // 累积器，据此判定是否有半截 / 非法工具调用 JSON）。
                             let final_events = ctx.generate_final_events();
+                            mark_first_token_if_visible(&tracer, &final_events);
                             if let Some(message) = ctx.tool_json_error_message() {
                                 // 工具调用 JSON 半截 / 非法：实时流已回 200，无法改状态码，
                                 // 只能记 error 并让 generate_final_events 补发的 `error` 事件透传给客户端。
@@ -1115,6 +1422,7 @@ fn create_sse_stream(
                         sent_bytes
                     );
                     let final_events = ctx.generate_final_events();
+                    mark_first_token_if_visible(&tracer, &final_events);
                     record_stream_usage(&hook, &ctx, credential_id, "error");
                     tracer.finalize(
                         "interrupted",
@@ -1927,6 +2235,7 @@ fn create_buffered_sse_stream(
                             sent_bytes
                         );
                         let all_events = ctx.finish_and_get_all_events();
+                        mark_first_token_if_visible(&tracer, &all_events);
                         let (i, o, cc, cr, credits) = ctx.final_usage();
                         hook.record(credential_id, i, o, cc, cr, credits, "error");
                         tracer.finalize(
@@ -1953,7 +2262,7 @@ fn create_buffered_sse_stream(
                     chunk_result = body_stream.next() => {
                         match chunk_result {
                             Some(Ok(chunk)) => {
-                                tracer.mark_first_token();
+                                tracer.mark_upstream_first_byte();
                                 sent_bytes += chunk.len() as u64;
                                 // 收到真实字节：顺延 idle 截止时间
                                 idle_deadline = TokioInstant::now() + Duration::from_secs(idle_timeout_secs.max(1));
@@ -1981,6 +2290,7 @@ fn create_buffered_sse_stream(
                                 tracing::error!("读取响应流失败: {}", e);
                                 // 发生错误，完成处理并返回所有事件
                                 let all_events = ctx.finish_and_get_all_events();
+                                mark_first_token_if_visible(&tracer, &all_events);
                                 let (i, o, cc, cr, credits) = ctx.final_usage();
                                 hook.record(credential_id, i, o, cc, cr, credits, "error");
                                 // 缓冲模式 chunk 读取失败：上游中途断流
@@ -2008,6 +2318,7 @@ fn create_buffered_sse_stream(
                                 // finish_and_get_all_events 内部会 finish() 累积器；若有半截 /
                                 // 非法工具调用 JSON，error 事件已随缓冲发出，这里据此记 error。
                                 let all_events = ctx.finish_and_get_all_events();
+                                mark_first_token_if_visible(&tracer, &all_events);
                                 let (i, o, cc, cr, credits) = ctx.final_usage();
                                 let trace_usage = TraceUsage {
                                     input_tokens: i.max(0) as u64,
@@ -2046,7 +2357,158 @@ fn create_buffered_sse_stream(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use futures::{StreamExt, future};
+
     use super::*;
+
+    #[tokio::test]
+    async fn pending_call_stream_emits_connected_then_ping() {
+        let stream = pending_call_stream(future::pending::<Result<(), anyhow::Error>>());
+        futures::pin_mut!(stream);
+
+        assert_eq!(
+            stream.next().await.unwrap().comment_bytes(),
+            Some(&b": connected\n\n"[..])
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), stream.next())
+                .await
+                .is_err(),
+            "ping 不应紧跟 connected 立即发出"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(1200), stream.next())
+                .await
+                .expect("1 秒后应产生 ping")
+                .unwrap()
+                .comment_bytes(),
+            Some(&b": ping\n\n"[..])
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_call_stream_completes_after_connected() {
+        let stream = pending_call_stream(async { Ok::<_, anyhow::Error>(7u8) });
+        futures::pin_mut!(stream);
+
+        assert!(matches!(
+            stream.next().await,
+            Some(PendingCallEvent::Comment(_))
+        ));
+        assert!(matches!(
+            stream.next().await,
+            Some(PendingCallEvent::Complete(Ok(7)))
+        ));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_pending_call_stream_drops_the_provider_future() {
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        {
+            let guard = DropFlag(dropped.clone());
+            let stream = pending_call_stream(async move {
+                let _guard = guard;
+                future::pending::<Result<(), anyhow::Error>>().await
+            });
+            futures::pin_mut!(stream);
+            assert!(matches!(
+                stream.next().await,
+                Some(PendingCallEvent::Comment(_))
+            ));
+        }
+        tokio::task::yield_now().await;
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn provider_error_sse_is_sanitized_and_carries_upstream_status() {
+        let bytes = provider_error_sse(
+            anyhow::anyhow!("Bearer secret-token connection reset"),
+            Some(429),
+        );
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.starts_with("event: error\ndata: "));
+        assert!(text.contains("\"upstream_status\":429"));
+        assert!(!text.contains("secret-token"));
+    }
+
+    #[test]
+    fn provider_validation_error_keeps_invalid_request_classification() {
+        let classified = classify_provider_error(&anyhow::anyhow!(
+            "Expected toolResult blocks but found none"
+        ));
+        assert_eq!(classified.http_status, StatusCode::BAD_REQUEST);
+        assert_eq!(classified.error_type, "invalid_request_error");
+    }
+
+    #[tokio::test]
+    async fn early_error_stream_sends_comment_then_error_without_message_start() {
+        let stream = early_error_test_stream(anyhow::anyhow!("connection reset"), Some(502));
+        futures::pin_mut!(stream);
+        let first = stream.next().await.unwrap().unwrap();
+        let second = stream.next().await.unwrap().unwrap();
+        assert_eq!(first, Bytes::from_static(EARLY_CONNECTED_SSE));
+        assert!(String::from_utf8_lossy(&second).starts_with("event: error\n"));
+        assert!(!String::from_utf8_lossy(&second).contains("message_start"));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn flatten_pending_call_preserves_success_stream_order() {
+        let inner: BoxByteStream = Box::pin(stream::iter(vec![
+            Ok(Bytes::from_static(b"event: message_start\ndata: {}\n\n")),
+            Ok(Bytes::from_static(
+                b"event: content_block_delta\ndata: {}\n\n",
+            )),
+        ]));
+        let stream = flatten_pending_call_for_test(Ok(inner));
+        futures::pin_mut!(stream);
+        assert_eq!(
+            stream.next().await.unwrap().unwrap(),
+            Bytes::from_static(EARLY_CONNECTED_SSE)
+        );
+        assert!(
+            String::from_utf8_lossy(&stream.next().await.unwrap().unwrap())
+                .contains("message_start")
+        );
+        assert!(
+            String::from_utf8_lossy(&stream.next().await.unwrap().unwrap())
+                .contains("content_block_delta")
+        );
+    }
+
+    #[test]
+    fn only_non_empty_content_events_are_client_visible_first_tokens() {
+        assert!(!is_client_visible_content(&SseEvent::new(
+            "message_start",
+            json!({})
+        )));
+        assert!(!is_client_visible_content(&SseEvent::new(
+            "content_block_delta",
+            json!({"delta":{"type":"text_delta","text":""}}),
+        )));
+        assert!(is_client_visible_content(&SseEvent::new(
+            "content_block_delta",
+            json!({"delta":{"type":"text_delta","text":"hi"}}),
+        )));
+        assert!(is_client_visible_content(&SseEvent::new(
+            "content_block_start",
+            json!({"content_block":{"type":"tool_use","name":"Bash"}}),
+        )));
+    }
 
     #[test]
     fn bedrock_client_validation_errors_map_to_400() {

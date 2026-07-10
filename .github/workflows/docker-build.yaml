@@ -56,9 +56,6 @@ jobs:
           - platform: linux/amd64
             runner: ubuntu-latest
             arch: amd64
-          - platform: linux/arm64
-            runner: ubuntu-22.04-arm
-            arch: arm64
 
     steps:
       - name: Checkout
@@ -134,7 +131,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Create and push multi-arch manifest
+      - name: Create and push manifest (amd64 only)
         env:
           IMAGE: ${{ steps.meta.outputs.image }}
           VERSION: ${{ steps.meta.outputs.version }}
@@ -143,18 +140,15 @@ jobs:
           set -euo pipefail
 
           docker manifest create "${IMAGE}:${VERSION}" \
-            "${IMAGE}:${VERSION}-amd64" \
-            "${IMAGE}:${VERSION}-arm64"
+            "${IMAGE}:${VERSION}-amd64"
           docker manifest push "${IMAGE}:${VERSION}"
 
           if [ "${IS_BETA}" != "true" ]; then
             docker manifest create "${IMAGE}:latest" \
-              "${IMAGE}:${VERSION}-amd64" \
-              "${IMAGE}:${VERSION}-arm64"
+              "${IMAGE}:${VERSION}-amd64"
             docker manifest push "${IMAGE}:latest"
           else
             docker manifest create "${IMAGE}:beta" \
-              "${IMAGE}:${VERSION}-amd64" \
-              "${IMAGE}:${VERSION}-arm64"
+              "${IMAGE}:${VERSION}-amd64"
             docker manifest push "${IMAGE}:beta"
           fi

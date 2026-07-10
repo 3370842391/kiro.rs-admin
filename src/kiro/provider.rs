@@ -260,6 +260,11 @@ impl KiroProvider {
         self.token_manager.get_stream_idle_timeout_secs()
     }
 
+    /// 是否在等待 Kiro 上游响应时提前提交 SSE 连接注释。
+    pub fn early_stream_handshake(&self) -> bool {
+        self.token_manager.config().early_stream_handshake
+    }
+
     /// 缓存命中率整形区间（运行时读取 token_manager 原子态），返回 `(min_pct, max_pct)`。
     /// 供 anthropic handler 在 `compute_cache_usage` 产出后注入 [`CacheUsage`]，
     /// 使管理面板对区间的修改立即作用于后续请求的命中率呈现。`(0,0)` = 不整形。
@@ -403,12 +408,16 @@ impl KiroProvider {
         tracing::debug!("使用端点 [{}] POST {}", endpoint.name(), url);
         tracing::debug!("实际发送请求体: {}", body);
 
+        // 复用连接池的热 TLS 连接：从中转到 us-east-1 的 TLS 握手 1-3s，每请求
+        // Connection:close 等于废掉 client_for_proxy 的连接池，把整个握手 RTT 计入
+        // 首字节。改为 keep-alive 后同代理连接复用，是最大的 TFB 收益。空闲连接
+        // 竞态（发请求瞬间上游关闭）由 call_api_with_retry 的网络错误重试兜底。
         let base = self
             .client_for_proxy(proxy.clone())?
             .post(&url)
             .body(body)
             .header("content-type", endpoint.content_type())
-            .header("Connection", "close");
+            .header("Connection", "keep-alive");
         let request = endpoint.decorate_api(base, &rctx);
 
         // 打印实际发送的请求头（RUST_LOG=debug 时输出，便于排查问题）
@@ -531,7 +540,7 @@ impl KiroProvider {
                 .post(&url)
                 .body(body.clone())
                 .header("content-type", endpoint.content_type())
-                .header("Connection", "close");
+                .header("Connection", "keep-alive");
             let request = endpoint.decorate_mcp(base, &rctx);
             match request.send().await {
                 Ok(response) => {

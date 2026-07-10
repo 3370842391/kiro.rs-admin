@@ -548,6 +548,8 @@ export interface TraceRecord {
   credits?: number
   /** 首 Token 延迟（毫秒，仅流式有值） */
   firstTokenMs?: number | null
+  /** Kiro 上游首个原始 body chunk 延迟（毫秒，仅流式有值） */
+  upstreamFirstByteMs?: number | null
   /** 实际下发的思考档位（low/medium/high/xhigh/max）；未启用/不支持为 null */
   reasoningEffort?: string | null
   /** 是否声明 1M 扩展上下文（客户端带 anthropic-beta: context-1m-... 头） */

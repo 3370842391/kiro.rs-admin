@@ -511,7 +511,8 @@ fn subscription_type_from_title(title: Option<&str>) -> &'static str {
 
 /// GitHub Release 仓库名（owner/repo）。
 /// 在线更新所需的版本号、changelog、二进制资产都从这里取。
-const GITHUB_RELEASES_REPO: &str = "ZyphrZero/kiro.rs";
+/// 指向本 fork，与 binary_update.rs 的 GITHUB_REPO 保持一致。
+const GITHUB_RELEASES_REPO: &str = "3370842391/kiro.rs-admin";
 
 impl AdminService {
     pub fn new(

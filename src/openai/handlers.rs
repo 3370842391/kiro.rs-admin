@@ -1276,6 +1276,26 @@ mod tests {
     }
 
     #[test]
+    fn openai_stream_parsers_ignore_anthropic_sse_comments() {
+        let input = concat!(
+            ": connected\n\n",
+            ": ping\n\n",
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{}}\n\n",
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"failed\",\"upstream_status\":502}}\n\n",
+        );
+        let chat = run_chat_translator(input, false);
+        assert_eq!(chat.iter().filter(|v| v.get("error").is_some()).count(), 1);
+        let responses = run_responses_translator(input);
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|(name, _)| name == "response.failed")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn chat_request_converts_tools_and_tool_results() {
         let req: ChatCompletionRequest = serde_json::from_value(json!({
             "model": "gpt-4o",
