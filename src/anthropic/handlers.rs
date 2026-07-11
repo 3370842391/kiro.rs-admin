@@ -405,12 +405,17 @@ fn provider_error_sse(err: Error, upstream_status: Option<u16>) -> Bytes {
         .into()
 }
 
-/// 计算 Anthropic usage 口径的 input_tokens
-fn resolve_usage_input_tokens(
-    fallback_total_input_tokens: i32,
-    context_total_input_tokens: Option<i32>,
-) -> i32 {
-    context_total_input_tokens.unwrap_or(fallback_total_input_tokens)
+/// 按客户端可见输入生成 Anthropic usage；上游上下文只保留用于护栏与日志。
+fn split_non_stream_usage(
+    client_visible_tokens: i32,
+    upstream_context_tokens: Option<i32>,
+    cache_usage: &super::cache_metering::CacheUsage,
+) -> (i32, i32, i32) {
+    let mut usage = super::usage::InputTokenUsage::new(client_visible_tokens);
+    if let Some(tokens) = upstream_context_tokens {
+        usage.observe_upstream_context(tokens);
+    }
+    usage.split_api(cache_usage)
 }
 
 fn available_models() -> Vec<Model> {
@@ -1579,8 +1584,8 @@ async fn handle_non_stream_request(
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut upstream_signalled_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
-    // 从 contextUsageEvent 计算的实际输入 tokens
-    let mut context_input_tokens: Option<i32> = None;
+    // Kiro 整体上下文占用（包含客户端不可见的 foundational prompt）。
+    let mut upstream_context_tokens: Option<i32> = None;
     // meteringEvent 上报的 credit 计费量（上游真实下发）；
     // input/cache_* 的互斥分摊在拿到 total 真值后由 cache_usage 完成。
     let mut credits: f64 = 0.0;
@@ -1634,15 +1639,16 @@ async fn handle_non_stream_request(
                             let actual_input_tokens =
                                 (context_usage.context_usage_percentage * (window_size as f64)
                                     / 100.0) as i32;
-                            context_input_tokens = Some(actual_input_tokens);
+                            upstream_context_tokens = Some(actual_input_tokens);
                             // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                             if context_usage.context_usage_percentage >= 100.0 {
                                 stop_reason = "model_context_window_exceeded".to_string();
                             }
                             tracing::debug!(
-                                "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
-                                context_usage.context_usage_percentage,
-                                actual_input_tokens
+                                client_visible_tokens = input_tokens,
+                                upstream_context_tokens = actual_input_tokens,
+                                context_usage_percentage = context_usage.context_usage_percentage,
+                                "received upstream context usage"
                             );
                         }
                         Event::Metering(metering) => {
@@ -1747,11 +1753,9 @@ async fn handle_non_stream_request(
     // 估算输出 tokens（上游不下发 token，全部走估算）
     let output_tokens = token::estimate_output_tokens(&content);
 
-    // 输入 tokens：contextUsage 真实值优先，否则用客户端估算
-    let total_input_tokens = resolve_usage_input_tokens(input_tokens, context_input_tokens);
-    // 互斥分摊：input + cache_creation + cache_read == total
+    // API 只上报客户端可见输入；上游上下文占用不覆盖该口径。
     let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
-        cache_usage.split_against_total(total_input_tokens);
+        split_non_stream_usage(input_tokens, upstream_context_tokens, &cache_usage);
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -1941,8 +1945,8 @@ pub async fn count_tokens(
 /// POST /cc/v1/messages
 ///
 /// Claude Code 兼容端点，与 /v1/messages 的区别在于：
-/// - 流式响应会等待 kiro 端返回 contextUsageEvent 后再发送 message_start
-/// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
+/// - 流式响应会缓冲到 Kiro 流结束后再统一发送
+/// - message_start 中的 input_tokens 使用客户端可见输入与缓存拆分口径
 pub async fn post_messages_cc(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
@@ -2168,7 +2172,7 @@ pub async fn post_messages_cc(
 /// 处理流式请求（缓冲版本）
 ///
 /// 与 `handle_stream_request` 不同，此函数会缓冲所有事件直到流结束，
-/// 然后用从 contextUsageEvent 计算的正确 input_tokens 生成 message_start 事件。
+/// 然后用客户端可见 input_tokens 与缓存拆分生成 message_start 事件。
 async fn handle_stream_request_buffered(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -2429,6 +2433,15 @@ mod tests {
     use futures::{StreamExt, future};
 
     use super::*;
+
+    #[test]
+    fn non_stream_usage_ignores_upstream_context_for_api_total() {
+        let cache = crate::anthropic::cache_metering::CacheUsage::default();
+        assert_eq!(
+            split_non_stream_usage(72, Some(5_417), &cache),
+            (72, 0, 0)
+        );
+    }
 
     #[tokio::test]
     async fn document_input_error_maps_to_anthropic_400() {

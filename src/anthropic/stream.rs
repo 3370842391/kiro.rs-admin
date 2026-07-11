@@ -1415,10 +1415,8 @@ pub struct StreamContext {
     pub model: String,
     /// 消息 ID
     pub message_id: String,
-    /// 输入 tokens（估算值）
-    pub input_tokens: i32,
-    /// 从 contextUsageEvent 计算的实际输入 tokens
-    pub context_input_tokens: Option<i32>,
+    /// 客户端可见输入与 Kiro 整体上下文占用的双轨计量。
+    input_usage: super::usage::InputTokenUsage,
     /// 输出 tokens 累计
     pub output_tokens: i32,
     /// 工具块索引映射 (tool_id -> block_index)
@@ -1454,7 +1452,7 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
-    /// 中转层 CacheMeter 的缓存覆盖情况（estimate 口径）。最终上报时按真实 total
+    /// 中转层 CacheMeter 的缓存覆盖情况（estimate 口径）。最终上报时按客户端可见 total
     /// 做互斥分摊：`input + cache_creation + cache_read == total`，避免把被缓存
     /// 覆盖的前缀重复计进 input_tokens。
     pub cache_usage: super::cache_metering::CacheUsage,
@@ -1481,11 +1479,14 @@ pub struct StreamContext {
 impl StreamContext {
     /// 解析最终上报口径的 `(input_tokens, cache_creation, cache_read)`。
     ///
-    /// total 真值优先取 contextUsage（上游真实百分比×窗口），否则用客户端估算的
-    /// `input_tokens`；再由 [`CacheUsage::split_against_total`] 做互斥分摊。
+    /// Anthropic API 始终使用客户端可见输入，再由缓存计量做互斥分摊。
     pub fn resolved_usage(&self) -> (i32, i32, i32) {
-        let total_real = self.context_input_tokens.unwrap_or(self.input_tokens);
-        self.cache_usage.split_against_total(total_real)
+        self.input_usage.split_api(&self.cache_usage)
+    }
+
+    /// Kiro 上报的整体上下文占用，只用于日志和上下文护栏。
+    pub fn upstream_context_tokens(&self) -> Option<i32> {
+        self.input_usage.upstream_context_tokens()
     }
 
     /// 工具调用 JSON 错误信息（非法 / 半截）。上层据此把本次请求记为 error、
@@ -1506,8 +1507,7 @@ impl StreamContext {
             state_manager: SseStateManager::new(),
             model: model.into(),
             message_id: format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
-            input_tokens,
-            context_input_tokens: None,
+            input_usage: super::usage::InputTokenUsage::new(input_tokens),
             output_tokens: 0,
             tool_block_indices: HashMap::new(),
             tool_name_map,
@@ -1547,7 +1547,7 @@ impl StreamContext {
                 "stop_reason": null,
                 "stop_sequence": null,
                 "usage": {
-                    "input_tokens": self.input_tokens,
+                    "input_tokens": self.input_usage.client_visible_tokens(),
                     "output_tokens": 1,
                     "cache_creation_input_tokens": 0,
                     "cache_read_input_tokens": 0
@@ -1606,16 +1606,18 @@ impl StreamContext {
                 let window_size = get_context_window_size(&self.model);
                 let actual_input_tokens =
                     (context_usage.context_usage_percentage * (window_size as f64) / 100.0) as i32;
-                self.context_input_tokens = Some(actual_input_tokens);
+                self.input_usage
+                    .observe_upstream_context(actual_input_tokens);
                 // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                 if context_usage.context_usage_percentage >= 100.0 {
                     self.state_manager
                         .set_stop_reason("model_context_window_exceeded");
                 }
                 tracing::debug!(
-                    "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
-                    context_usage.context_usage_percentage,
-                    actual_input_tokens
+                    client_visible_tokens = self.input_usage.client_visible_tokens(),
+                    upstream_context_tokens = actual_input_tokens,
+                    context_usage_percentage = context_usage.context_usage_percentage,
+                    "received upstream context usage"
                 );
                 Vec::new()
             }
@@ -2564,7 +2566,7 @@ impl StreamContext {
             }
         }
 
-        // 互斥口径：total 真值（contextUsage 优先）− 缓存覆盖 = 未缓存的 input。
+        // 客户端可见 total − 缓存覆盖 = 未缓存 input。
         let (final_input_tokens, cache_creation, cache_read) = self.resolved_usage();
 
         // 生成最终事件（message_delta + message_stop）
@@ -2597,7 +2599,7 @@ impl StreamContext {
 /// 缓冲流处理上下文 - 用于 /cc/v1/messages 流式请求
 ///
 /// 与 `StreamContext` 不同，此上下文会缓冲所有事件直到流结束，
-/// 然后用从 `contextUsageEvent` 计算的正确 `input_tokens` 更正 `message_start` 事件。
+/// 然后用客户端可见 `input_tokens` 与缓存拆分更正 `message_start` 事件。
 ///
 /// 工作流程：
 /// 1. 使用 `StreamContext` 正常处理所有 Kiro 事件
@@ -2661,7 +2663,7 @@ impl BufferedStreamContext {
     ///
     /// 此方法会：
     /// 1. 生成最终事件（message_delta, message_stop）
-    /// 2. 用正确的 input_tokens 更正 message_start 事件
+    /// 2. 用客户端可见 input_tokens 更正 message_start 事件
     /// 3. 返回所有缓冲的事件
     pub fn finish_and_get_all_events(&mut self) -> Vec<SseEvent> {
         // 如果从未处理过事件，也要生成初始事件
@@ -2671,7 +2673,7 @@ impl BufferedStreamContext {
             self.initial_events_generated = true;
         }
 
-        // 互斥口径分摊：total 真值 − 缓存覆盖 = 未缓存 input（与 inner 收尾一致）。
+        // 客户端可见 total 的互斥缓存分摊（与 inner 收尾一致）。
         let (final_input_tokens, cache_creation, cache_read) = self.inner.resolved_usage();
 
         // 生成最终事件（StreamContext 内部会用同样的优先级与分摊）
@@ -2740,6 +2742,67 @@ pub fn estimate_tokens(text: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_usage_does_not_override_stream_api_usage() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4.8",
+            72,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        ctx.process_kiro_event(&Event::ContextUsage(
+            crate::kiro::model::events::ContextUsageEvent {
+                context_usage_percentage: 0.5417,
+            },
+        ));
+
+        assert_eq!(ctx.resolved_usage(), (72, 0, 0));
+        assert_eq!(ctx.upstream_context_tokens(), Some(5_417));
+    }
+
+    #[test]
+    fn buffered_cc_stream_rewrites_message_start_with_client_visible_usage() {
+        let mut ctx = BufferedStreamContext::new(
+            "claude-opus-4.8",
+            72,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        ctx.process_and_buffer(&Event::ContextUsage(
+            crate::kiro::model::events::ContextUsageEvent {
+                context_usage_percentage: 0.5417,
+            },
+        ));
+        let events = ctx.finish_and_get_all_events();
+        let start = events
+            .iter()
+            .find(|event| event.event == "message_start")
+            .unwrap();
+        assert_eq!(start.data["message"]["usage"]["input_tokens"], 72);
+    }
+
+    #[test]
+    fn full_upstream_context_still_sets_overflow_stop_reason() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4.8",
+            72,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        ctx.process_kiro_event(&Event::ContextUsage(
+            crate::kiro::model::events::ContextUsageEvent {
+                context_usage_percentage: 100.0,
+            },
+        ));
+        assert_eq!(
+            ctx.state_manager.get_stop_reason(),
+            "model_context_window_exceeded"
+        );
+    }
 
     // ---- ToolJsonAccumulator: 流式半截 / 非法工具调用 JSON ----
 

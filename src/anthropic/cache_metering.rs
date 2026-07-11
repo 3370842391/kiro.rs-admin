@@ -55,13 +55,12 @@ pub struct SegmentResult {
 /// `compute_cache_usage` 的结果：缓存计费量 + 比例分摊所需的 estimate 口径基准。
 ///
 /// `cache_creation` / `cache_read` 是按 `estimate_tokens` 口径算出的「被缓存覆盖
-/// 前缀」的拆分；但最终上报要换算到**真实 total 口径**（contextUsage 真值或
-/// `count_tokens` 估算），两个估算器尺度不同，所以这里额外带出两个 estimate 口径
+/// 前缀」的拆分；最终上报要换算到**客户端可见 total 口径**，所以这里额外带出两个 estimate 口径
 /// 的基准量，供调用方做**无量纲比例分摊**：
 ///   - `cache_covered_est` = 被缓存覆盖前缀的 estimate token（= creation + read）
 ///   - `prompt_total_est`  = 整个 prompt（含最深断点之后未缓存尾部）的 estimate token
 ///
-/// 调用方据此算 `prefix_ratio = cache_covered_est / prompt_total_est`，再乘到真实
+/// 调用方据此算 `prefix_ratio = cache_covered_est / prompt_total_est`，再乘到客户端可见
 /// total 上得到缓存覆盖部分，剩余即未缓存的 `input_tokens`，三者互斥相加 == total。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CacheUsage {
@@ -89,10 +88,10 @@ impl CacheUsage {
         self
     }
 
-    /// 按真实 total 口径做互斥分摊，返回 `(input_tokens, cache_creation, cache_read)`。
+    /// 按调用方指定的 total 口径做互斥分摊，返回 `(input_tokens, cache_creation, cache_read)`。
     ///
-    /// `total_real` 是最终上报口径的全量 prompt token（contextUsage 真值优先，
-    /// 否则 `count_tokens` 估算）。三者满足 `input + creation + read == total_real`。
+    /// `total_real` 是最终上报口径的全量 prompt token。Anthropic API 调用方应传入
+    /// 客户端可见估算值。三者满足 `input + creation + read == total_real`。
     ///
     /// 无缓存覆盖（`cache_covered_est == 0`）或基准缺失时，先得到 `(total_real, 0, 0)`；
     /// 随后按 `hit_rate_*_pct` 做命中率整形（区间为 `(0,0)` 时原样返回）。
@@ -372,7 +371,7 @@ struct Segment {
 }
 
 /// 调用 CacheMeter 计算本次请求的缓存覆盖情况，并把所有断点（含命中段）记录回
-/// cache、刷新 TTL。返回 [`CacheUsage`]，由调用方在拿到真实 total 后做互斥分摊。
+/// cache、刷新 TTL。返回 [`CacheUsage`]，由调用方按客户端可见 total 做互斥分摊。
 ///
 /// **完全按 Anthropic 协议**：取最深命中的段索引 i*，那么（estimate 口径）
 /// - `cache_read = segments[i*].cumulative_tokens`

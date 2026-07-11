@@ -42,8 +42,8 @@ struct RoundOutcome {
     text: String,
     /// The complete tool_use for this round (name already restored via tool_name_map)
     tool_uses: Vec<CompletedToolUse>,
-    /// Actual input tokens computed from contextUsageEvent
-    context_input_tokens: Option<i32>,
+    /// Kiro 整体上下文占用（包含客户端不可见的 foundational prompt）。
+    upstream_context_tokens: Option<i32>,
     /// Cumulative credits from meteringEvent
     credits: f64,
     /// stop_reason override (max_tokens / model_context_window_exceeded)
@@ -95,7 +95,7 @@ async fn decode_round(
         std::collections::HashMap::new();
     let mut order: Vec<String> = Vec::new();
     let mut tool_uses: Vec<CompletedToolUse> = Vec::new();
-    let mut context_input_tokens: Option<i32> = None;
+    let mut upstream_context_tokens: Option<i32> = None;
     let mut credits = 0.0;
     let mut stop_reason_override: Option<String> = None;
     let mut stream_error = false;
@@ -139,7 +139,7 @@ async fn decode_round(
                 Event::ContextUsage(cu) => {
                     let window = get_context_window_size(model);
                     let actual = (cu.context_usage_percentage * (window as f64) / 100.0) as i32;
-                    context_input_tokens = Some(actual);
+                    upstream_context_tokens = Some(actual);
                     if cu.context_usage_percentage >= 100.0 {
                         stop_reason_override = Some("model_context_window_exceeded".to_string());
                     }
@@ -177,7 +177,7 @@ async fn decode_round(
     RoundOutcome {
         text,
         tool_uses,
-        context_input_tokens,
+        upstream_context_tokens,
         credits,
         stop_reason_override,
         stream_error,
@@ -519,6 +519,20 @@ fn build_flush_content(
     content
 }
 
+fn resolve_websearch_api_input(
+    client_visible_tokens: i32,
+    upstream_context_tokens: Option<i32>,
+) -> i32 {
+    if let Some(upstream_context_tokens) = upstream_context_tokens {
+        tracing::debug!(
+            client_visible_tokens,
+            upstream_context_tokens,
+            "web search loop keeps client-visible API usage"
+        );
+    }
+    client_visible_tokens.max(0)
+}
+
 /// web_search loop entry point
 ///
 /// `stream_client`: whether the client wants SSE (true) or a single JSON response (false).
@@ -539,7 +553,7 @@ pub(super) async fn run_web_search_loop(
 
     let mut presentation: Vec<Value> = Vec::new();
     let mut last_credential_id: u64 = 0;
-    let mut last_context_input: Option<i32> = None;
+    let mut last_upstream_context: Option<i32> = None;
     let mut total_credits = 0.0;
 
     for round_idx in 0..=MAX_WEB_SEARCH_ROUNDS {
@@ -557,7 +571,7 @@ pub(super) async fn run_web_search_loop(
             Err(resp) => return resp,
         };
         last_credential_id = credential_id;
-        last_context_input = round.context_input_tokens.or(last_context_input);
+        last_upstream_context = round.upstream_context_tokens.or(last_upstream_context);
         total_credits += round.credits;
 
         if should_search_round(round_idx, &round.tool_uses) {
@@ -593,7 +607,7 @@ pub(super) async fn run_web_search_loop(
         // web_search must end as "end_turn", not "tool_use" (otherwise the host would
         // wait for a client tool call that is never emitted).
         let (_web_uses, client_uses) = partition_tool_uses(&round.tool_uses);
-        let final_input = last_context_input.unwrap_or(fallback_input_tokens);
+        let final_input = resolve_websearch_api_input(fallback_input_tokens, last_upstream_context);
         // INVARIANT: web_search is ALWAYS executed internally and is NEVER flushed
         // as a raw tool_use (the Codex host has no executor for it and rejects it
         // with "unsupported call: web_search"). This covers the mixed-round case
@@ -869,6 +883,11 @@ fn build_sse_events(
 mod tests {
     use super::*;
     use crate::anthropic::websearch::{WebSearchResult, WebSearchResults};
+
+    #[test]
+    fn websearch_api_usage_ignores_upstream_context() {
+        assert_eq!(resolve_websearch_api_input(72, Some(5_417)), 72);
+    }
 
     fn tu(name: &str) -> CompletedToolUse {
         CompletedToolUse {
