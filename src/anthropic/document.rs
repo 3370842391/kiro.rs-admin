@@ -10,6 +10,8 @@ pub(crate) const MAX_PDF_CHARS: usize = 200_000;
 
 #[derive(Debug, Error)]
 pub(crate) enum DocumentError {
+    #[error("{location}: invalid document source: {message}")]
+    InvalidSource { location: String, message: String },
     #[error("{location}: invalid base64 PDF data")]
     InvalidBase64 { location: String },
     #[error("{location}: PDF exceeds 10 MiB")]
@@ -28,6 +30,93 @@ pub(crate) enum DocumentError {
     InvalidPdf { location: String, message: String },
     #[error("PDF parser task failed: {0}")]
     TaskFailed(String),
+}
+
+pub(crate) async fn expand_pdf_documents(
+    request: &mut crate::anthropic::types::MessagesRequest,
+) -> Result<(), DocumentError> {
+    let mut jobs = Vec::new();
+    for (message_index, message) in request.messages.iter().enumerate() {
+        let Some(blocks) = message.content.as_array() else {
+            continue;
+        };
+        for (block_index, block) in blocks.iter().enumerate() {
+            if block.get("type").and_then(serde_json::Value::as_str) != Some("document") {
+                continue;
+            }
+
+            let location = format!("messages[{message_index}].content[{block_index}]");
+            let source = block
+                .get("source")
+                .ok_or_else(|| DocumentError::InvalidSource {
+                    location: location.clone(),
+                    message: "missing source".to_string(),
+                })?;
+            if source.get("type").and_then(serde_json::Value::as_str) != Some("base64") {
+                return Err(DocumentError::InvalidSource {
+                    location,
+                    message: "source.type must be base64".to_string(),
+                });
+            }
+            if source
+                .get("media_type")
+                .and_then(serde_json::Value::as_str)
+                != Some("application/pdf")
+            {
+                return Err(DocumentError::InvalidSource {
+                    location,
+                    message: "media_type must be application/pdf".to_string(),
+                });
+            }
+            let data = source
+                .get("data")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| DocumentError::InvalidSource {
+                    location: location.clone(),
+                    message: "source.data must be a base64 string".to_string(),
+                })?
+                .to_string();
+            jobs.push((message_index, block_index, location, data));
+        }
+    }
+
+    let tasks: Vec<_> = jobs
+        .iter()
+        .map(|(_, _, location, data)| {
+            let location = location.clone();
+            let data = data.clone();
+            tokio::task::spawn_blocking(move || {
+                use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+                let bytes = STANDARD.decode(data).map_err(|_| DocumentError::InvalidBase64 {
+                    location: location.clone(),
+                })?;
+                extract_pdf_text(&bytes, &location)
+            })
+        })
+        .collect();
+
+    let mut extracted = Vec::with_capacity(tasks.len());
+    for result in futures::future::join_all(tasks).await {
+        extracted.push(result.map_err(|error| DocumentError::TaskFailed(error.to_string()))??);
+    }
+
+    for ((message_index, block_index, _, _), text) in jobs.into_iter().zip(extracted) {
+        let envelope = serde_json::to_string(&serde_json::json!({
+            "type": "untrusted_document",
+            "message_index": message_index,
+            "block_index": block_index,
+            "text": text,
+        }))
+        .expect("serializing a JSON value cannot fail");
+        request.messages[message_index]
+            .content
+            .as_array_mut()
+            .expect("document jobs only come from array content")[block_index] =
+            serde_json::json!({"type": "text", "text": envelope});
+    }
+
+    Ok(())
 }
 
 fn extract_pdf_text(bytes: &[u8], location: &str) -> Result<String, DocumentError> {
@@ -91,12 +180,97 @@ mod tests {
     use super::*;
 
     const TEXT_PDF_B64: &str = "JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCA2MTIgNzkyXSAvUmVzb3VyY2VzIDw8IC9Gb250IDw8IC9GMSA0IDAgUiA+PiA+PiAvQ29udGVudHMgNSAwIFIgPj4KZW5kb2JqCjQgMCBvYmoKPDwgL1R5cGUgL0ZvbnQgL1N1YnR5cGUgL1R5cGUxIC9CYXNlRm9udCAvSGVsdmV0aWNhID4+CmVuZG9iago1IDAgb2JqCjw8IC9MZW5ndGggNTQgPj4Kc3RyZWFtCkJUIC9GMSAxMiBUZiA3MiA3MjAgVGQgKFBERi1DT01QQVRJQklMSVRZLVRPS0VOKSBUaiBFVAplbmRzdHJlYW0KZW5kb2JqCnhyZWYKMCA2CjAwMDAwMDAwMDAgNjU1MzUgZiAKMDAwMDAwMDAwOSAwMDAwMCBuIAowMDAwMDAwMDU4IDAwMDAwIG4gCjAwMDAwMDAxMTUgMDAwMDAgbiAKMDAwMDAwMDI0MSAwMDAwMCBuIAowMDAwMDAwMzExIDAwMDAwIG4gCnRyYWlsZXIKPDwgL1NpemUgNiAvUm9vdCAxIDAgUiA+PgpzdGFydHhyZWYKNDE1CiUlRU9GCg==";
+    const EMPTY_PDF_B64: &str = "JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCA2MTIgNzkyXSAvQ29udGVudHMgNCAwIFIgPj4KZW5kb2JqCjQgMCBvYmoKPDwgL0xlbmd0aCAwID4+CnN0cmVhbQoKZW5kc3RyZWFtCmVuZG9iagp4cmVmCjAgNQowMDAwMDAwMDAwIDY1NTM1IGYgCjAwMDAwMDAwMDkgMDAwMDAgbiAKMDAwMDAwMDA1OCAwMDAwMCBuIAowMDAwMDAwMTE1IDAwMDAwIG4gCjAwMDAwMDAyMDIgMDAwMDAgbiAKdHJhaWxlcgo8PCAvU2l6ZSA1IC9Sb290IDEgMCBSID4+CnN0YXJ0eHJlZgoyNTEKJSVFT0YK";
+
+    fn request_with_document(
+        media_type: &str,
+        data: &str,
+    ) -> crate::anthropic::types::MessagesRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "claude-opus-4-6",
+            "max_tokens": 128,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "before"},
+                    {"type": "document", "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": data
+                    }}
+                ]
+            }]
+        }))
+        .unwrap()
+    }
 
     #[test]
     fn extracts_text_from_valid_pdf() {
         let bytes = STANDARD.decode(TEXT_PDF_B64).unwrap();
         let text = extract_pdf_text(&bytes, "messages[0].content[0]").unwrap();
         assert!(text.contains("PDF-COMPATIBILITY-TOKEN"));
+    }
+
+    #[tokio::test]
+    async fn expands_base64_document_in_place_and_preserves_order() {
+        let mut request: crate::anthropic::types::MessagesRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "claude-opus-4-6",
+                "max_tokens": 128,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "before"},
+                        {"type": "document", "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": TEXT_PDF_B64
+                        }},
+                        {"type": "text", "text": "after"}
+                    ]
+                }]
+            }))
+            .unwrap();
+
+        expand_pdf_documents(&mut request).await.unwrap();
+        let blocks = request.messages[0].content.as_array().unwrap();
+        assert_eq!(blocks[0]["text"], "before");
+        assert_eq!(blocks[2]["text"], "after");
+        let envelope: serde_json::Value =
+            serde_json::from_str(blocks[1]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(envelope["type"], "untrusted_document");
+        assert!(
+            envelope["text"]
+                .as_str()
+                .unwrap()
+                .contains("PDF-COMPATIBILITY-TOKEN")
+        );
+        assert!(blocks[1].get("source").is_none());
+    }
+
+    #[tokio::test]
+    async fn rejects_non_pdf_media_type_with_block_location() {
+        let mut request = request_with_document("text/plain", TEXT_PDF_B64);
+        let error = expand_pdf_documents(&mut request).await.unwrap_err();
+        assert!(matches!(error, DocumentError::InvalidSource { .. }));
+        assert!(error.to_string().contains("messages[0].content[1]"));
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_base64_with_block_location() {
+        let mut request = request_with_document("application/pdf", "%%%invalid%%%");
+        let error = expand_pdf_documents(&mut request).await.unwrap_err();
+        assert!(matches!(error, DocumentError::InvalidBase64 { .. }));
+        assert!(error.to_string().contains("messages[0].content[1]"));
+    }
+
+    #[tokio::test]
+    async fn rejects_textless_pdf_as_unsupported_scanned_document() {
+        let mut request = request_with_document("application/pdf", EMPTY_PDF_B64);
+        assert!(matches!(
+            expand_pdf_documents(&mut request).await,
+            Err(DocumentError::NoText { .. })
+        ));
     }
 
     #[test]
