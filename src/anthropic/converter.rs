@@ -706,8 +706,7 @@ pub fn convert_request_with_mode(
         .map_or(0, |index| index + 1);
     let history_messages = &messages[..current_start];
     let current_messages = &messages[current_start..];
-    let (text_content, images, tool_results) =
-        process_current_user_messages(current_messages)?;
+    let (text_content, images, tool_results) = process_current_user_messages(current_messages)?;
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射；ClaudeCode 模式做内置工具适配）
     let mut tool_name_map = HashMap::new();
@@ -1677,16 +1676,14 @@ fn build_history(
                 system_content
             };
 
-            // 系统消息作为 user + assistant 配对
+            // Kiro 没有独立 system 字段，因此使用 user 历史消息承载原文。
             let user_msg = HistoryUserMessage::new(final_content, model_id);
             history.push(Message::User(user_msg));
-
         }
     } else if let Some(ref prefix) = thinking_prefix {
         // 没有系统消息但有thinking配置，插入新的系统消息
         let user_msg = HistoryUserMessage::new(prefix.clone(), model_id);
         history.push(Message::User(user_msg));
-
     }
 
     // 2. 处理调用方已经与 currentMessage 分离的常规消息历史
