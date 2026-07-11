@@ -30,6 +30,7 @@ pub(crate) mod middleware;
 mod router;
 pub mod stream;
 pub mod types;
+pub(crate) mod usage;
 mod websearch;
 mod websearch_loop;
 
