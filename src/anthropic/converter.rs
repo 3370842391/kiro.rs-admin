@@ -1644,11 +1644,7 @@ fn has_thinking_tags(content: &str) -> bool {
     content.contains("<thinking_mode>") || content.contains("<max_thinking_length>")
 }
 
-fn push_system_history(
-    history: &mut Vec<Message>,
-    req: &MessagesRequest,
-    model_id: &str,
-) {
+fn push_system_history(history: &mut Vec<Message>, req: &MessagesRequest, model_id: &str) {
     let thinking_prefix = thinking_prefix_for_history(req, model_id);
     if let Some(system) = &req.system {
         let system_content = system
@@ -1667,10 +1663,14 @@ fn push_system_history(
             } else {
                 system_content
             };
-            history.push(Message::User(HistoryUserMessage::new(content, model_id)));
+            history.push(Message::User(HistoryUserMessage {
+                user_input_message: UserMessage::new(content, model_id),
+            }));
         }
     } else if let Some(prefix) = thinking_prefix {
-        history.push(Message::User(HistoryUserMessage::new(prefix, model_id)));
+        history.push(Message::User(HistoryUserMessage {
+            user_input_message: UserMessage::new(prefix, model_id),
+        }));
     }
 }
 

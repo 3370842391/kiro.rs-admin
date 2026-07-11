@@ -1645,9 +1645,12 @@ impl StreamContext {
                     self.state_manager
                         .set_stop_reason("model_context_window_exceeded");
                 }
+                let upstream_context_tokens = self
+                    .upstream_context_tokens()
+                    .unwrap_or(actual_input_tokens);
                 tracing::debug!(
                     client_visible_tokens = self.input_usage.client_visible_tokens(),
-                    upstream_context_tokens = actual_input_tokens,
+                    upstream_context_tokens,
                     context_usage_percentage = context_usage.context_usage_percentage,
                     "received upstream context usage"
                 );
