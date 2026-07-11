@@ -1631,6 +1631,14 @@ fn generate_thinking_prefix(req: &MessagesRequest, model_id: &str) -> Option<Str
     None
 }
 
+/// 原生 reasoning 字段可表达请求时，不再向消息正文注入 XML。
+fn thinking_prefix_for_history(req: &MessagesRequest, model_id: &str) -> Option<String> {
+    if model_supports_native_reasoning(model_id) && native_reasoning_requested(req, model_id) {
+        return None;
+    }
+    generate_thinking_prefix(req, model_id)
+}
+
 /// 检查内容是否已包含thinking标签
 fn has_thinking_tags(content: &str) -> bool {
     content.contains("<thinking_mode>") || content.contains("<max_thinking_length>")
@@ -1641,7 +1649,7 @@ fn push_system_history(
     req: &MessagesRequest,
     model_id: &str,
 ) {
-    let thinking_prefix = generate_thinking_prefix(req, model_id);
+    let thinking_prefix = thinking_prefix_for_history(req, model_id);
     if let Some(system) = &req.system {
         let system_content = system
             .iter()
@@ -3159,6 +3167,72 @@ mod tests {
         assert!(content.starts_with("<thinking_mode>enabled</thinking_mode>"));
         assert!(content.ends_with("Keep the answer exact."));
         assert_eq!(content.matches("<thinking_mode>").count(), 1);
+    }
+
+    #[test]
+    fn opus_4_8_uses_native_reasoning_without_thinking_xml() {
+        use super::super::types::{SystemMessage, Thinking};
+
+        let mut req = minimal_request_with_output_config("claude-opus-4.8");
+        req.thinking = Some(Thinking {
+            thinking_type: "enabled".into(),
+            budget_tokens: 20_000,
+        });
+        req.system = Some(vec![SystemMessage {
+            text: "Keep the answer exact.".into(),
+            cache_control: None,
+        }]);
+
+        let result = convert_request(&req).unwrap();
+        let wire = serde_json::to_string(&result.conversation_state).unwrap();
+        assert!(!wire.contains("<thinking_mode>"));
+        assert!(!wire.contains("<max_thinking_length>"));
+        assert_eq!(
+            result
+                .additional_model_request_fields
+                .unwrap()
+                .output_config
+                .unwrap()
+                .effort,
+            "high"
+        );
+    }
+
+    #[test]
+    fn legacy_model_keeps_text_reasoning_fallback() {
+        use super::super::types::Thinking;
+
+        let mut req = minimal_request_with_output_config("claude-sonnet-4.5");
+        req.output_config = None;
+        req.thinking = Some(Thinking {
+            thinking_type: "enabled".into(),
+            budget_tokens: 2_048,
+        });
+        let result = convert_request(&req).unwrap();
+        assert!(
+            serde_json::to_string(&result.conversation_state)
+                .unwrap()
+                .contains("<thinking_mode>enabled</thinking_mode>")
+        );
+    }
+
+    #[test]
+    fn opus_4_6_enabled_keeps_text_fallback_when_native_fields_are_rejected() {
+        use super::super::types::Thinking;
+
+        let mut req = minimal_request_with_output_config("claude-opus-4.6");
+        req.output_config = None;
+        req.thinking = Some(Thinking {
+            thinking_type: "enabled".into(),
+            budget_tokens: 2_048,
+        });
+        let result = convert_request(&req).unwrap();
+        assert!(result.additional_model_request_fields.is_none());
+        assert!(
+            serde_json::to_string(&result.conversation_state)
+                .unwrap()
+                .contains("<thinking_mode>enabled</thinking_mode>")
+        );
     }
 
     #[test]
