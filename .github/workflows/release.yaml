@@ -261,6 +261,9 @@ jobs:
           set -euo pipefail
           (
             cd release-assets
+            # nullglob：匹配不到的通配符展开为空，避免单平台（无 .zip）时
+            # 字面量 *.zip 被传给 sha256sum 导致 "No such file" 退出 1。
+            shopt -s nullglob
             sha256sum *.tar.gz *.zip > SHA256SUMS.txt
           )
 
