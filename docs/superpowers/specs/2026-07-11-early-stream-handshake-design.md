@@ -10,7 +10,7 @@
 - 非流式请求保持现有行为。
 - 本地鉴权、请求 JSON、模型映射和参数校验继续在提交响应前完成，仍返回真实 HTTP 4xx。
 - Kiro 上游请求开始后的错误在提前握手模式下通过标准 SSE `error` 事件返回。
-- OpenAI 兼容层必须忽略新增的 SSE 注释，不把它转换成客户端事件。
+- OpenAI 兼容层必须忽略立即握手注释，并安全忽略协议级 `ping`，不把心跳转换成正文事件。
 
 不在本次范围内：账号选择策略、代理配置、TLS 实现、重试策略以及缓存计费逻辑。
 
@@ -36,7 +36,7 @@
 
 1. 立即产出 `: connected\n\n`。
 2. 在 body stream 内等待 `provider.call_api_stream(...)`。
-3. 等待期间每秒产出 `: ping\n\n`，直到上游调用成功或失败。
+3. 等待期间每秒产出合法 Anthropic 心跳 `event: ping\ndata: {"type":"ping"}\n\n`，直到上游调用成功或失败。第一个心跳约在一秒时产生，使仅识别 `data:` 的 New API 能记录并转发连接活性。
 4. 上游成功后才创建并产出既有 `message_start`、`content_block_start` 等初始事件。
 5. 后续复用现有 Kiro EventStream 解码和 Anthropic SSE 转换逻辑。
 6. 上游失败时产出一个标准 Anthropic `event: error`，然后结束流；不得产出 `message_start` 或伪造正常收尾。
@@ -87,13 +87,13 @@ data: {"type":"error","error":{"type":"api_error","message":"...","upstream_stat
 - 新增 `upstream_first_byte_ms`：首次收到 Kiro 原始 body chunk 时记录。
 - `duration_ms`、attempt duration 和最终状态保持现有定义。
 
-心跳不能计为 token，也不能影响 output byte/token 统计。
+心跳不能计为 Rust 自身的 token，也不能影响 output byte/token 统计。New API 的 `FirstResponseTime` 会把第一个合法心跳记作首响应，这是其“首 Token”列的既有口径，不改变 Rust 管理面板的真实内容首字口径。
 
 ## Compatibility
 
-- SSE 注释以冒号开头，符合 SSE 标准，Anthropic 客户端应忽略。
-- Rust OpenAI SSE parser 必须显式验证忽略无 `data:` 的注释 frame。
-- 禁止用 `event: ping` 作为首个握手事件，避免部分 SDK 将未知事件暴露给调用方。
+- 立即握手仍使用冒号开头的 SSE 注释，符合 SSE 标准，Anthropic 客户端应忽略。
+- 一秒心跳使用 Anthropic 协议已定义的 `ping` 事件；New API 会识别其 `data:` 行、记录首响应并在 Claude relay 下转发。
+- Rust OpenAI SSE parser 必须显式验证注释和 Anthropic `ping` 都不会转换成正文或错误事件。
 - `Cache-Control: no-cache` 和 `Connection: keep-alive` 保持不变。
 
 ## Testing
@@ -102,13 +102,14 @@ data: {"type":"error","error":{"type":"api_error","message":"...","upstream_stat
 
 1. 开关关闭时，pending 上游 future 不应提前产出 body 项。
 2. 开关开启时，pending 上游 future 的首个 body 项立即为 `: connected\n\n`。
-3. 上游持续 pending 时按一秒间隔产生 `: ping\n\n`，且不会产生消息事件。
+3. 上游持续 pending 时按一秒间隔产生 `event: ping` 与 `data: {"type":"ping"}`，且不会产生消息事件或触发 Rust `first_token_ms`。
 4. 上游成功时，注释之后的首个协议事件仍为 `message_start`，随后进入现有事件顺序。
 5. 上游 401、429、5xx/网络错误时产生一个脱敏 `event: error`，trace/usage 状态为 error，不产生 `message_start`。
 6. 丢弃 body stream 会丢弃 provider future，验证取消哨兵被触发。
-7. OpenAI SSE parser 忽略 `: connected` 与 `: ping` 注释。
+7. OpenAI SSE parser 忽略 `: connected` 注释与 Anthropic `ping` 事件；Chat Completions 和 Responses 均不得产生客户端正文事件。
 8. `first_token_ms` 不被原始 chunk、注释或初始事件触发，只被首个实际内容触发。
 9. `upstream_first_byte_ms` 在首个原始 chunk 触发且只记录一次。
+10. 用 New API 的扫描规则验证：注释不触发首响应，合法 `ping` 的 `data:` 行会在约一秒触发首响应且可被 Claude relay 转发。
 
 完成单元测试后运行完整 `cargo test`，再用本地两个服务发送相同的小型流式请求，记录响应头、首个非空行和首个 `content_block_delta` 时间。
 
