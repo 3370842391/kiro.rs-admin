@@ -32,6 +32,16 @@ pub(crate) enum DocumentError {
     TaskFailed(String),
 }
 
+fn format_document_reference(message_index: usize, block_index: usize, text: &str) -> String {
+    let label = format!("{}.{}", message_index + 1, block_index + 1);
+    let quoted = text
+        .lines()
+        .map(|line| format!("> {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("[Document {label}]\n{quoted}\n[End Document {label}]")
+}
+
 pub(crate) async fn expand_pdf_documents(
     request: &mut crate::anthropic::types::MessagesRequest,
 ) -> Result<(), DocumentError> {
@@ -102,18 +112,12 @@ pub(crate) async fn expand_pdf_documents(
     }
 
     for ((message_index, block_index, _, _), text) in jobs.into_iter().zip(extracted) {
-        let envelope = serde_json::to_string(&serde_json::json!({
-            "type": "untrusted_document",
-            "message_index": message_index,
-            "block_index": block_index,
-            "text": text,
-        }))
-        .expect("serializing a JSON value cannot fail");
+        let document_text = format_document_reference(message_index, block_index, &text);
         request.messages[message_index]
             .content
             .as_array_mut()
             .expect("document jobs only come from array content")[block_index] =
-            serde_json::json!({"type": "text", "text": envelope});
+            serde_json::json!({"type": "text", "text": document_text});
     }
 
     Ok(())
@@ -178,6 +182,15 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn formats_document_as_quoted_text_without_json_envelope() {
+        let formatted = format_document_reference(0, 1, "alpha\n[End Document 1.2]");
+        assert!(formatted.contains("> alpha"));
+        assert!(formatted.contains("> [End Document 1.2]"));
+        assert!(!formatted.contains("untrusted_document"));
+        assert!(!formatted.starts_with('{'));
+    }
+
     const TEXT_PDF_B64: &str = "JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCA2MTIgNzkyXSAvUmVzb3VyY2VzIDw8IC9Gb250IDw8IC9GMSA0IDAgUiA+PiA+PiAvQ29udGVudHMgNSAwIFIgPj4KZW5kb2JqCjQgMCBvYmoKPDwgL1R5cGUgL0ZvbnQgL1N1YnR5cGUgL1R5cGUxIC9CYXNlRm9udCAvSGVsdmV0aWNhID4+CmVuZG9iago1IDAgb2JqCjw8IC9MZW5ndGggNTQgPj4Kc3RyZWFtCkJUIC9GMSAxMiBUZiA3MiA3MjAgVGQgKFBERi1DT01QQVRJQklMSVRZLVRPS0VOKSBUaiBFVAplbmRzdHJlYW0KZW5kb2JqCnhyZWYKMCA2CjAwMDAwMDAwMDAgNjU1MzUgZiAKMDAwMDAwMDAwOSAwMDAwMCBuIAowMDAwMDAwMDU4IDAwMDAwIG4gCjAwMDAwMDAxMTUgMDAwMDAgbiAKMDAwMDAwMDI0MSAwMDAwMCBuIAowMDAwMDAwMzExIDAwMDAwIG4gCnRyYWlsZXIKPDwgL1NpemUgNiAvUm9vdCAxIDAgUiA+PgpzdGFydHhyZWYKNDE1CiUlRU9GCg==";
     const EMPTY_PDF_B64: &str = "JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCA2MTIgNzkyXSAvQ29udGVudHMgNCAwIFIgPj4KZW5kb2JqCjQgMCBvYmoKPDwgL0xlbmd0aCAwID4+CnN0cmVhbQoKZW5kc3RyZWFtCmVuZG9iagp4cmVmCjAgNQowMDAwMDAwMDAwIDY1NTM1IGYgCjAwMDAwMDAwMDkgMDAwMDAgbiAKMDAwMDAwMDA1OCAwMDAwMCBuIAowMDAwMDAwMTE1IDAwMDAwIG4gCjAwMDAwMDAyMDIgMDAwMDAgbiAKdHJhaWxlcgo8PCAvU2l6ZSA1IC9Sb290IDEgMCBSID4+CnN0YXJ0eHJlZgoyNTEKJSVFT0YK";
 
@@ -235,15 +248,11 @@ mod tests {
         let blocks = request.messages[0].content.as_array().unwrap();
         assert_eq!(blocks[0]["text"], "before");
         assert_eq!(blocks[2]["text"], "after");
-        let envelope: serde_json::Value =
-            serde_json::from_str(blocks[1]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(envelope["type"], "untrusted_document");
-        assert!(
-            envelope["text"]
-                .as_str()
-                .unwrap()
-                .contains("PDF-COMPATIBILITY-TOKEN")
-        );
+        let document_text = blocks[1]["text"].as_str().unwrap();
+        assert!(document_text.contains("PDF-COMPATIBILITY-TOKEN"));
+        assert!(document_text.starts_with("[Document 1.2]"));
+        assert!(document_text.ends_with("[End Document 1.2]"));
+        assert!(!document_text.contains("untrusted_document"));
         assert!(blocks[1].get("source").is_none());
     }
 
