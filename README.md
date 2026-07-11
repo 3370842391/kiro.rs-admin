@@ -1,5 +1,7 @@
 # kiro-rs
 
+AIP中转:https://apiv2.52codeflow.top/
+
 **该项目基于 [hank9999/kiro.rs](https://github.com/hank9999/kiro.rs) 进行的二次开发**
 
 `kiro-rs` 是一个用 Rust 编写的 Anthropic Messages API 兼容代理。它把
