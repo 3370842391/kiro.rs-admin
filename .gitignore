@@ -1,4 +1,5 @@
 /target
+/.worktrees/
 /CLAUDE.md
 /AGENTS.md
 /config.json
