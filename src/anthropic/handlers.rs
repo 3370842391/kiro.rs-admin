@@ -1406,7 +1406,7 @@ fn create_sse_stream(
                             // 累积器，据此判定是否有半截 / 非法工具调用 JSON）。
                             let final_events = ctx.generate_final_events();
                             mark_first_token_if_visible(&tracer, &final_events);
-                            if let Some(message) = ctx.tool_json_error_message() {
+                            if let Some(message) = ctx.terminal_error_message() {
                                 // 工具调用 JSON 半截 / 非法：实时流已回 200，无法改状态码，
                                 // 只能记 error 并让 generate_final_events 补发的 `error` 事件透传给客户端。
                                 record_stream_usage(&hook, &ctx, credential_id, "error");
@@ -1749,6 +1749,21 @@ async fn handle_non_stream_request(
         )
             .into_response();
     }
+    if let Err(message) = validate_non_stream_content(&content) {
+        hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
+        tracer.finalize(
+            "error",
+            Some(outcome::BAD_REQUEST),
+            Some(message),
+            None,
+            TraceUsage::zero(),
+        );
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse::new("upstream_empty_response", message)),
+        )
+            .into_response();
+    }
 
     // 估算输出 tokens（上游不下发 token，全部走估算）
     let output_tokens = token::estimate_output_tokens(&content);
@@ -1815,6 +1830,14 @@ fn apply_tool_stop_reason(
         *stop_reason = "tool_use".to_string();
     }
     Ok(())
+}
+
+fn validate_non_stream_content(content: &[serde_json::Value]) -> Result<(), &'static str> {
+    if content.is_empty() {
+        Err("upstream returned no assistant content")
+    } else {
+        Ok(())
+    }
 }
 
 fn build_non_stream_content(
@@ -2395,7 +2418,7 @@ fn create_buffered_sse_stream(
                                     cache_read_tokens: cr.max(0) as u64,
                                     credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
                                 };
-                                if let Some(message) = ctx.tool_json_error_message() {
+                                if let Some(message) = ctx.terminal_error_message() {
                                     hook.record(credential_id, i, o, cc, cr, credits, "error");
                                     tracer.finalize(
                                         "error",
@@ -2441,6 +2464,12 @@ mod tests {
             split_non_stream_usage(72, Some(5_417), &cache),
             (72, 0, 0)
         );
+    }
+
+    #[test]
+    fn empty_upstream_content_is_not_a_successful_non_stream_response() {
+        let content: Vec<serde_json::Value> = Vec::new();
+        assert!(validate_non_stream_content(&content).is_err());
     }
 
     #[tokio::test]

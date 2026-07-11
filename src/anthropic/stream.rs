@@ -1219,8 +1219,7 @@ impl SseStateManager {
         self.has_tool_use = has;
     }
 
-    /// 本轮是否出现过 tool_use（含仅缓冲、尚未发出块的分片）。
-    /// process_tool_use 收到任一 toolUseEvent 即置真，故可用于"是否纯思考轮"的判定。
+    /// 本轮是否实际发出过 tool_use content block。
     pub fn has_tool_use(&self) -> bool {
         self.has_tool_use
     }
@@ -1474,6 +1473,34 @@ pub struct StreamContext {
     tool_json_error: Option<ToolJsonAccumulatorError>,
     /// 跨 chunk 过滤混入 assistant 文本的字面 `<tool_use>` XML 泄漏。
     tool_use_xml_filter: ToolUseXmlLeakFilter,
+    /// 是否收到过上游 toolUseEvent；与实际发出工具块分开记录。
+    saw_upstream_tool_use: bool,
+    /// 是否实际向客户端发出过非空文本、thinking、redacted thinking 或工具块。
+    has_visible_output: bool,
+    /// 非工具 JSON 类的终止协议错误。
+    terminal_protocol_error: Option<String>,
+}
+
+fn events_have_visible_output(events: &[SseEvent]) -> bool {
+    events.iter().any(|event| {
+        if event.event == "content_block_start" {
+            return matches!(
+                event.data["content_block"]["type"].as_str(),
+                Some("tool_use" | "redacted_thinking")
+            );
+        }
+        if event.event != "content_block_delta" {
+            return false;
+        }
+        let delta = &event.data["delta"];
+        delta["text"].as_str().is_some_and(|text| !text.is_empty())
+            || delta["thinking"]
+                .as_str()
+                .is_some_and(|thinking| !thinking.is_empty())
+            || delta["partial_json"]
+                .as_str()
+                .is_some_and(|json| !json.is_empty())
+    })
 }
 
 impl StreamContext {
@@ -1491,8 +1518,10 @@ impl StreamContext {
 
     /// 工具调用 JSON 错误信息（非法 / 半截）。上层据此把本次请求记为 error、
     /// 或在非流式路径返回 502。无错误时返回 `None`。
-    pub fn tool_json_error_message(&self) -> Option<String> {
-        self.tool_json_error.as_ref().map(|err| err.message())
+    pub fn terminal_error_message(&self) -> Option<String> {
+        self.terminal_protocol_error
+            .clone()
+            .or_else(|| self.tool_json_error.as_ref().map(|err| err.message()))
     }
 
     /// 创建 StreamContext
@@ -1531,6 +1560,9 @@ impl StreamContext {
             tool_json_accumulator: ToolJsonAccumulator::new(),
             tool_json_error: None,
             tool_use_xml_filter: ToolUseXmlLeakFilter::default(),
+            saw_upstream_tool_use: false,
+            has_visible_output: false,
+            terminal_protocol_error: None,
         }
     }
 
@@ -1597,7 +1629,7 @@ impl StreamContext {
 
     /// 处理 Kiro 事件并转换为 Anthropic SSE 事件
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
-        match event {
+        let events = match event {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ReasoningContent(reasoning) => self.process_reasoning_content(reasoning),
@@ -1646,7 +1678,11 @@ impl StreamContext {
                 Vec::new()
             }
             _ => Vec::new(),
+        };
+        if events_have_visible_output(&events) {
+            self.has_visible_output = true;
         }
+        events
     }
 
     /// 处理助手响应事件
@@ -2047,6 +2083,7 @@ impl StreamContext {
             return events;
         }
         let text: &str = &kept;
+        self.has_visible_output = true;
 
         // 🅱 维护跨流的代码围栏奇偶状态：所有真正作为「文本」吐出的内容都过这里，
         // 在此累进围栏状态，使后续 <invoke> 能判断自己是否落在代码块内。
@@ -2222,6 +2259,7 @@ impl StreamContext {
     }
 
     fn create_redacted_thinking_events(&mut self, data: &str) -> Vec<SseEvent> {
+        self.has_visible_output = true;
         let mut events = self.close_open_thinking_block();
         events.extend(self.close_open_text_block());
 
@@ -2294,6 +2332,7 @@ impl StreamContext {
     fn emit_completed_tool_use(&mut self, completed: CompletedToolUse) -> Vec<SseEvent> {
         let mut events = Vec::new();
         self.state_manager.set_has_tool_use(true);
+        self.has_visible_output = true;
 
         let block_index = if let Some(&idx) = self.tool_block_indices.get(&completed.id) {
             idx
@@ -2348,7 +2387,7 @@ impl StreamContext {
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
-        self.state_manager.set_has_tool_use(true);
+        self.saw_upstream_tool_use = true;
 
         if self.is_thinking_block_open() && !self.in_thinking_block {
             events.extend(self.close_open_thinking_block());
@@ -2519,14 +2558,14 @@ impl StreamContext {
         // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
         // 并补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块。
         //
-        // 护栏：`has_tool_use()` 覆盖"仅缓冲、尚未发出块"的 tool_use（如无参工具在
+        // 护栏：`saw_upstream_tool_use` 覆盖"仅缓冲、尚未发出块"的 tool_use（如无参工具在
         // stop=true 前断流）——此时 active_blocks 里只有 thinking 块，has_non_thinking_blocks()
         // 仍为 false，若不看 has_tool_use 会误判为纯思考轮，把随后打捞的 tool_use 的
         // stop_reason 盖成 max_tokens 并多吐一个空格。
         if self.thinking_enabled
             && self.thinking_block_index.is_some()
             && !self.state_manager.has_non_thinking_blocks()
-            && !self.state_manager.has_tool_use()
+            && !self.saw_upstream_tool_use
         {
             self.state_manager.set_stop_reason("max_tokens");
             events.extend(self.create_text_delta_events(" "));
@@ -2540,7 +2579,7 @@ impl StreamContext {
 
         // 收尾检查工具调用累积器：对残留缓冲区分处理——
         //   · 空入参（无参工具，如 EnterPlanMode）→ 打捞成完整 tool_use 发出；
-        //   · 半截 JSON（上游写参数途中截断）→ 记为错误，补 error 事件。
+        //   · 半截 JSON（上游写参数途中截断）→ 记为错误，以 error 事件终止。
         // process_tool_use 中已置位的错误保持不变。
         if self.tool_json_error.is_none() {
             let map = self.tool_name_map.clone();
@@ -2566,6 +2605,45 @@ impl StreamContext {
             }
         }
 
+        if events_have_visible_output(&events) {
+            self.has_visible_output = true;
+        }
+        if self.saw_upstream_tool_use
+            && !self.state_manager.has_tool_use()
+            && self.tool_json_error.is_none()
+        {
+            self.terminal_protocol_error = Some(
+                "upstream ended with tool_use but produced no valid tool_use content block"
+                    .to_string(),
+            );
+        }
+        if !self.has_visible_output
+            && self.tool_json_error.is_none()
+            && self.terminal_protocol_error.is_none()
+        {
+            self.terminal_protocol_error =
+                Some("upstream returned no assistant content".to_string());
+        }
+
+        if let Some(message) = self.terminal_error_message() {
+            let error_type = self
+                .tool_json_error
+                .as_ref()
+                .map(ToolJsonAccumulatorError::error_type)
+                .unwrap_or("upstream_protocol_error");
+            events.push(SseEvent::new(
+                "error",
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": error_type,
+                        "message": message
+                    }
+                }),
+            ));
+            return events;
+        }
+
         // 客户端可见 total − 缓存覆盖 = 未缓存 input。
         let (final_input_tokens, cache_creation, cache_read) = self.resolved_usage();
 
@@ -2576,21 +2654,6 @@ impl StreamContext {
             cache_creation,
             cache_read,
         ));
-
-        // 工具调用 JSON 错误：在最终事件之后补一个 Anthropic `error` 事件，明确告知
-        // 客户端本次工具调用因上游半截 / 非法 JSON 未被转发（实时流已返回 200，无法再改状态码）。
-        if let Some(err) = &self.tool_json_error {
-            events.push(SseEvent::new(
-                "error",
-                json!({
-                    "type": "error",
-                    "error": {
-                        "type": err.error_type(),
-                        "message": err.message()
-                    }
-                }),
-            ));
-        }
 
         events
     }
@@ -2662,7 +2725,7 @@ impl BufferedStreamContext {
     /// 完成流处理并返回所有事件
     ///
     /// 此方法会：
-    /// 1. 生成最终事件（message_delta, message_stop）
+    /// 1. 成功时生成 message_delta/message_stop；协议错误时生成 error
     /// 2. 用客户端可见 input_tokens 更正 message_start 事件
     /// 3. 返回所有缓冲的事件
     pub fn finish_and_get_all_events(&mut self) -> Vec<SseEvent> {
@@ -2711,8 +2774,8 @@ impl BufferedStreamContext {
     }
 
     /// 工具调用 JSON 错误信息（转发内部 StreamContext）。缓冲流据此记 error。
-    pub fn tool_json_error_message(&self) -> Option<String> {
-        self.inner.tool_json_error_message()
+    pub fn terminal_error_message(&self) -> Option<String> {
+        self.inner.terminal_error_message()
     }
 }
 
@@ -2802,6 +2865,49 @@ mod tests {
             ctx.state_manager.get_stop_reason(),
             "model_context_window_exceeded"
         );
+    }
+
+    #[test]
+    fn empty_upstream_stream_emits_error_without_success_terminal_events() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4.8",
+            10,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let events = ctx.generate_final_events();
+
+        assert!(events.iter().any(|event| event.event == "error"));
+        assert!(!events.iter().any(|event| event.event == "message_delta"));
+        assert!(!events.iter().any(|event| event.event == "message_stop"));
+        assert_eq!(
+            ctx.terminal_error_message().as_deref(),
+            Some("upstream returned no assistant content")
+        );
+    }
+
+    #[test]
+    fn incomplete_tool_signal_emits_error_without_success_terminal_events() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4.8",
+            10,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_tool_use(&tool_evt("tool_1", "test_tool", "{\"half\":", false));
+        let events = ctx.generate_final_events();
+
+        assert!(events.iter().any(|event| event.event == "error"));
+        assert!(!events.iter().any(|event| event.event == "message_delta"));
+        assert!(!events.iter().any(|event| event.event == "message_stop"));
+        assert!(!events.iter().any(|event| {
+            event.event == "content_block_start"
+                && event.data["content_block"]["type"] == "tool_use"
+        }));
     }
 
     // ---- ToolJsonAccumulator: 流式半截 / 非法工具调用 JSON ----
@@ -3482,7 +3588,7 @@ mod tests {
             redacted_content: None,
         }));
 
-        // 2) 无参工具 EnterPlanMode，stop=false → 仅缓冲、不发 tool_use 块，但 has_tool_use 置真。
+        // 2) 无参工具 EnterPlanMode，stop=false → 仅缓冲、不发 tool_use 块，但记录上游工具信号。
         let mid = ctx.process_kiro_event(&Event::ToolUse(ToolUseEvent {
             name: "EnterPlanMode".to_string(),
             tool_use_id: "toolu_plan".to_string(),
