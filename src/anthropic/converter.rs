@@ -215,13 +215,6 @@ const EDIT_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the `new_string` con
 /// 追加到 Bash 工具 description 末尾的内容（上游可能在超大命令处截断）
 const BASH_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: Do not send very large commands, inline scripts, or heredocs. If a command would exceed 100 lines or ~8000 characters, first create/modify a script file with chunked Write/Edit calls, then run a short command that executes it. Do not retry the same oversized command after a failure; split it smaller.";
 
-/// 追加到系统提示词的分块写入策略
-const SYSTEM_CHUNKED_POLICY: &str = "\
-When the Write or Edit tool has content size limits, always comply silently. \
-Never suggest bypassing these limits via alternative tools. \
-Never ask the user whether to switch approaches. \
-Complete all chunked operations without commentary.";
-
 /// 移除兼容端暴露的 thinking 后缀，得到用于 Kiro 的基础模型 ID。
 fn strip_thinking_suffix(model: &str) -> &str {
     model
@@ -623,41 +616,6 @@ impl std::fmt::Display for ConversionError {
 
 impl std::error::Error for ConversionError {}
 
-/// 从 metadata.user_id 中提取 session UUID
-///
-/// 支持两种格式:
-/// 1. 字符串格式: user_xxx_account__session_0b4445e1-f5be-49e1-87ce-62bbc28ad705
-/// 2. JSON 格式: {"device_id":"...","account_uuid":"...","session_id":"UUID"}
-///
-/// 提取 session UUID 作为 conversationId
-fn extract_session_id(user_id: &str) -> Option<String> {
-    // 先尝试 JSON 解析
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(user_id) {
-        if let Some(session_id) = json.get("session_id").and_then(|v| v.as_str()) {
-            if is_valid_uuid(session_id) {
-                return Some(session_id.to_string());
-            }
-        }
-    }
-
-    // 回退到字符串格式: 查找 "session_" 后面的内容
-    if let Some(pos) = user_id.find("session_") {
-        let session_part = &user_id[pos + 8..]; // "session_" 长度为 8
-        if session_part.len() >= 36 {
-            let uuid_str = &session_part[..36];
-            if is_valid_uuid(uuid_str) {
-                return Some(uuid_str.to_string());
-            }
-        }
-    }
-    None
-}
-
-/// 简单验证 UUID 格式（36 字符，包含 4 个连字符）
-fn is_valid_uuid(s: &str) -> bool {
-    s.len() == 36 && s.chars().filter(|c| *c == '-').count() == 4
-}
-
 /// 收集历史消息中使用的所有工具名称
 fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
     let mut tool_names = Vec::new();
@@ -732,21 +690,23 @@ pub fn convert_request_with_mode(
     };
 
     // 3. 生成会话 ID 和代理 ID
-    // 优先从 metadata.user_id 中提取 session UUID 作为 conversationId
-    let conversation_id = req
-        .metadata
-        .as_ref()
-        .and_then(|m| m.user_id.as_ref())
-        .and_then(|user_id| extract_session_id(user_id))
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    // Anthropic/OpenAI 兼容请求携带完整历史。复用 metadata.user_id 会让并发请求
+    // 在 Kiro 上游竞争同一会话状态，因此每次转换都使用独立会话 ID。
+    let conversation_id = Uuid::new_v4().to_string();
     let agent_continuation_id = Uuid::new_v4().to_string();
 
     // 4. 确定触发类型
     let chat_trigger_type = determine_chat_trigger_type(req);
 
-    // 5. 处理最后一条消息作为 current_message（经过 prefill 预处理，末尾必为 user）
-    let last_message = messages.last().unwrap();
-    let (text_content, images, tool_results) = process_message_content(&last_message.content)?;
+    // 5. 将最后一个 assistant 之后的连续 user 消息合并为 current_message。
+    // 兼容 API 的请求携带完整历史，不需要伪造 assistant 回复来强制交替。
+    let current_start = messages
+        .iter()
+        .rposition(|message| message.role == "assistant")
+        .map_or(0, |index| index + 1);
+    let history_messages = &messages[..current_start];
+    let current_messages = &messages[current_start..];
+    let (text_content, images, tool_results) = process_current_user_messages(current_messages)?;
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射；ClaudeCode 模式做内置工具适配）
     let mut tool_name_map = HashMap::new();
@@ -767,7 +727,7 @@ pub fn convert_request_with_mode(
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
     let mut history = build_history(
         req,
-        messages,
+        history_messages,
         &model_id,
         &mut tool_name_map,
         tool_compatibility_mode,
@@ -925,6 +885,26 @@ fn process_message_content_dedup(
     }
 
     Ok((text_parts.join("\n"), images, tool_results))
+}
+
+fn process_current_user_messages(
+    messages: &[super::types::Message],
+) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
+    let mut content_parts = Vec::new();
+    let mut images = Vec::new();
+    let mut tool_results = Vec::new();
+
+    for message in messages {
+        let (text, message_images, message_tool_results) =
+            process_message_content(&message.content)?;
+        if !text.is_empty() {
+            content_parts.push(text);
+        }
+        images.extend(message_images);
+        tool_results.extend(message_tool_results);
+    }
+
+    Ok((content_parts.join("\n"), images, tool_results))
 }
 
 /// 从 media_type 获取图片格式
@@ -1685,9 +1665,6 @@ fn build_history(
             .join("\n");
 
         if !system_content.is_empty() {
-            // 追加分块写入策略到系统消息
-            let system_content = format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY);
-
             // 注入thinking标签到系统消息最前面（如果需要且不存在）
             let final_content = if let Some(ref prefix) = thinking_prefix {
                 if !has_thinking_tags(&system_content) {
@@ -1699,36 +1676,23 @@ fn build_history(
                 system_content
             };
 
-            // 系统消息作为 user + assistant 配对
+            // Kiro 没有独立 system 字段，因此使用 user 历史消息承载原文。
             let user_msg = HistoryUserMessage::new(final_content, model_id);
             history.push(Message::User(user_msg));
-
-            let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
-            history.push(Message::Assistant(assistant_msg));
         }
     } else if let Some(ref prefix) = thinking_prefix {
         // 没有系统消息但有thinking配置，插入新的系统消息
         let user_msg = HistoryUserMessage::new(prefix.clone(), model_id);
         history.push(Message::User(user_msg));
-
-        let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
-        history.push(Message::Assistant(assistant_msg));
     }
 
-    // 2. 处理常规消息历史
-    // 最后一条消息作为 currentMessage，不加入历史
-    // 经过 prefill 预处理后，messages 末尾必定是 user，故直接截掉最后一条即可
-    let history_end_index = messages.len().saturating_sub(1);
-
-    // 收集并配对消息
+    // 2. 处理调用方已经与 currentMessage 分离的常规消息历史
     let mut user_buffer: Vec<&super::types::Message> = Vec::new();
     let mut assistant_buffer: Vec<&super::types::Message> = Vec::new();
     // SHA256 dedup set for images spanning the whole history; a repeated image is kept only on first sight
     let mut image_dedup: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for i in 0..history_end_index {
-        let msg = &messages[i];
-
+    for msg in messages {
         if msg.role == "user" {
             // 先处理累积的 assistant 消息
             if !assistant_buffer.is_empty() {
@@ -1755,14 +1719,10 @@ fn build_history(
         history.push(Message::Assistant(merged));
     }
 
-    // 处理结尾的孤立 user 消息
+    // 刷新末尾累积的 user 消息，不生成客户端未提交的 assistant 内容。
     if !user_buffer.is_empty() {
         let merged_user = merge_user_messages(&user_buffer, model_id, &mut image_dedup)?;
         history.push(Message::User(merged_user));
-
-        // 自动配对一个 "OK" 的 assistant 响应
-        let auto_assistant = HistoryAssistantMessage::new("OK");
-        history.push(Message::Assistant(auto_assistant));
     }
 
     Ok(history)
@@ -3072,56 +3032,134 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_session_id_valid() {
-        // 测试有效的 user_id 格式
-        let user_id = "user_0dede55c6dcc4a11a30bbb5e7f22e6fdf86cdeba3820019cc27612af4e1243cd_account__session_8bb5523b-ec7c-4540-a9ca-beb6d79f1552";
-        let session_id = extract_session_id(user_id);
+    fn test_consecutive_trailing_users_merge_into_current_message() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let mut req = minimal_request_with_output_config("claude-sonnet-4.5");
+        req.output_config = None;
+        req.messages = vec![
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("first"),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("second"),
+            },
+        ];
+
+        let result = convert_request(&req).unwrap();
+        assert!(result.conversation_state.history.is_empty());
         assert_eq!(
-            session_id,
-            Some("8bb5523b-ec7c-4540-a9ca-beb6d79f1552".to_string())
+            result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content,
+            "first\nsecond"
         );
     }
 
     #[test]
-    fn test_extract_session_id_json_format() {
-        // 测试 JSON 格式的 user_id
-        let user_id = r#"{"device_id":"0dede55c6dcc4a11a30bbb5e7f22e6fdf86cdeba3820019cc27612af4e1243cd","account_uuid":"","session_id":"8bb5523b-ec7c-4540-a9ca-beb6d79f1552"}"#;
-        let session_id = extract_session_id(user_id);
+    fn test_multiturn_history_contains_no_synthetic_ok() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let mut req = minimal_request_with_output_config("claude-sonnet-4.5");
+        req.output_config = None;
+        req.messages = vec![
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("question"),
+            },
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!("answer"),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("follow up A"),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("follow up B"),
+            },
+        ];
+
+        let result = convert_request(&req).unwrap();
+        assert_eq!(result.conversation_state.history.len(), 2);
         assert_eq!(
-            session_id,
-            Some("8bb5523b-ec7c-4540-a9ca-beb6d79f1552".to_string())
+            result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content,
+            "follow up A\nfollow up B"
+        );
+        assert!(!result.conversation_state.history.iter().any(|message| {
+            matches!(
+                message,
+                Message::Assistant(assistant)
+                    if assistant.assistant_response_message.content == "OK"
+            )
+        }));
+    }
+
+    #[test]
+    fn test_system_content_is_preserved_without_internal_policy() {
+        use super::super::types::SystemMessage;
+
+        let mut req = minimal_request_with_output_config("claude-sonnet-4.5");
+        req.output_config = None;
+        req.system = Some(vec![SystemMessage {
+            text: "Reply with nonce-7 only.".to_string(),
+            cache_control: None,
+        }]);
+
+        let result = convert_request(&req).unwrap();
+        assert_eq!(result.conversation_state.history.len(), 1);
+
+        let Message::User(system) = &result.conversation_state.history[0] else {
+            panic!("system content must be represented as Kiro user history");
+        };
+        assert_eq!(
+            system.user_input_message.content,
+            "Reply with nonce-7 only."
         );
     }
 
     #[test]
-    fn test_extract_session_id_json_invalid_session() {
-        // 测试 JSON 格式但 session_id 不是有效 UUID
-        let user_id = r#"{"device_id":"abc","session_id":"not-a-uuid"}"#;
-        let session_id = extract_session_id(user_id);
-        assert_eq!(session_id, None);
+    fn test_thinking_prefix_appears_once_before_system() {
+        use super::super::types::{SystemMessage, Thinking};
+
+        let mut req = minimal_request_with_output_config("claude-sonnet-4.5");
+        req.output_config = None;
+        req.thinking = Some(Thinking {
+            thinking_type: "enabled".to_string(),
+            budget_tokens: 2048,
+        });
+        req.system = Some(vec![SystemMessage {
+            text: "Keep the answer exact.".to_string(),
+            cache_control: None,
+        }]);
+
+        let result = convert_request(&req).unwrap();
+        let Message::User(system) = &result.conversation_state.history[0] else {
+            panic!("expected system history");
+        };
+        let content = &system.user_input_message.content;
+
+        assert!(content.starts_with(
+            "<thinking_mode>enabled</thinking_mode><max_thinking_length>2048</max_thinking_length>\n"
+        ));
+        assert_eq!(content.matches("<thinking_mode>").count(), 1);
+        assert!(content.ends_with("Keep the answer exact."));
     }
 
     #[test]
-    fn test_extract_session_id_no_session() {
-        // 测试没有 session 的 user_id
-        let user_id = "user_0dede55c6dcc4a11a30bbb5e7f22e6fdf86cdeba3820019cc27612af4e1243cd";
-        let session_id = extract_session_id(user_id);
-        assert_eq!(session_id, None);
-    }
-
-    #[test]
-    fn test_extract_session_id_invalid_uuid() {
-        // 测试无效的 UUID 格式
-        let user_id = "user_xxx_session_invalid-uuid";
-        let session_id = extract_session_id(user_id);
-        assert_eq!(session_id, None);
-    }
-
-    #[test]
-    fn test_convert_request_with_session_metadata() {
+    fn test_same_metadata_gets_distinct_conversation_ids() {
         use super::super::types::{Message as AnthropicMessage, Metadata};
 
-        // 测试带有 metadata 的请求，应该使用 session UUID 作为 conversationId
+        // metadata 仅用于兼容和审计，不得复用为 Kiro 上游会话 ID。
         let req = MessagesRequest {
             force_web_search_loop: false,
             model: "claude-sonnet-4.5".to_string(),
@@ -3143,11 +3181,15 @@ mod tests {
             }),
         };
 
-        let result = convert_request(&req).unwrap();
-        assert_eq!(
-            result.conversation_state.conversation_id,
-            "a0662283-7fd3-4399-a7eb-52b9a717ae88"
-        );
+        let first = convert_request(&req).unwrap();
+        let second = convert_request(&req).unwrap();
+        let first_id = &first.conversation_state.conversation_id;
+        let second_id = &second.conversation_state.conversation_id;
+
+        assert_ne!(first_id, second_id);
+        assert_ne!(first_id, "a0662283-7fd3-4399-a7eb-52b9a717ae88");
+        assert!(Uuid::parse_str(first_id).is_ok());
+        assert!(Uuid::parse_str(second_id).is_ok());
     }
 
     #[test]
