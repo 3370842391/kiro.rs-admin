@@ -124,39 +124,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-latest
-            target: aarch64-apple-darwin
-            name: macOS-arm64
-            archive: tar
-            binary: kiro-rs
-          - platform: macos-latest
-            target: x86_64-apple-darwin
-            name: macOS-x64
-            archive: tar
-            binary: kiro-rs
-          - platform: windows-latest
-            target: x86_64-pc-windows-msvc
-            name: Windows-x64
-            archive: zip
-            binary: kiro-rs.exe
-          - platform: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            name: Linux-x64
-            archive: tar
-            binary: kiro-rs
-          - platform: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
-            name: Linux-arm64
-            archive: tar
-            binary: kiro-rs
+          # 只发布服务器运行平台：容器是 Alpine/musl x86_64，
+          # 面板 platform_suffix() 对 linux/x86_64 取的正是 Linux-musl-x64。
           - platform: ubuntu-22.04
             target: x86_64-unknown-linux-musl
             name: Linux-musl-x64
-            archive: tar
-            binary: kiro-rs
-          - platform: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-musl
-            name: Linux-musl-arm64
             archive: tar
             binary: kiro-rs
 
