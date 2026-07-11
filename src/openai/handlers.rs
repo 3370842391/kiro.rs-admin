@@ -1276,15 +1276,20 @@ mod tests {
     }
 
     #[test]
-    fn openai_stream_parsers_ignore_anthropic_sse_comments() {
+    fn openai_stream_parsers_ignore_anthropic_handshake_and_ping() {
         let input = concat!(
             ": connected\n\n",
-            ": ping\n\n",
+            "event: ping\ndata: {\"type\":\"ping\"}\n\n",
             "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{}}\n\n",
             "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"failed\",\"upstream_status\":502}}\n\n",
         );
         let chat = run_chat_translator(input, false);
         assert_eq!(chat.iter().filter(|v| v.get("error").is_some()).count(), 1);
+        assert!(chat.iter().all(|value| {
+            !serde_json::to_string(value)
+                .expect("chat event should serialize")
+                .contains("\"type\":\"ping\"")
+        }));
         let responses = run_responses_translator(input);
         assert_eq!(
             responses
@@ -1293,6 +1298,11 @@ mod tests {
                 .count(),
             1
         );
+        assert!(responses.iter().all(|(_, value)| {
+            !serde_json::to_string(value)
+                .expect("responses event should serialize")
+                .contains("\"type\":\"ping\"")
+        }));
     }
 
     #[test]

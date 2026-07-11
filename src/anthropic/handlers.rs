@@ -1110,7 +1110,7 @@ fn create_early_sse_stream(
 const PING_INTERVAL_SECS: u64 = 25;
 
 const EARLY_CONNECTED_SSE: &[u8] = b": connected\n\n";
-const EARLY_PING_SSE: &[u8] = b": ping\n\n";
+const EARLY_PING_SSE: &[u8] = b"event: ping\ndata: {\"type\":\"ping\"}\n\n";
 const EARLY_PING_INTERVAL: Duration = Duration::from_secs(1);
 
 type BoxByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, Infallible>> + Send>>;
@@ -2371,9 +2371,14 @@ mod tests {
         let stream = pending_call_stream(future::pending::<Result<(), anyhow::Error>>());
         futures::pin_mut!(stream);
 
-        assert_eq!(
-            stream.next().await.unwrap().comment_bytes(),
-            Some(&b": connected\n\n"[..])
+        let connected = stream.next().await.unwrap();
+        let connected_bytes = connected.comment_bytes().unwrap();
+        assert_eq!(connected_bytes, b": connected\n\n");
+        assert!(
+            !connected_bytes
+                .split(|byte| *byte == b'\n')
+                .any(|line| line.starts_with(b"data:")),
+            "connected 必须保持为 New API 忽略的 SSE 注释"
         );
         assert!(
             tokio::time::timeout(Duration::from_millis(100), stream.next())
@@ -2381,13 +2386,20 @@ mod tests {
                 .is_err(),
             "ping 不应紧跟 connected 立即发出"
         );
+        let ping = tokio::time::timeout(Duration::from_millis(1200), stream.next())
+            .await
+            .expect("1 秒后应产生 ping")
+            .unwrap();
+        let ping_bytes = ping.comment_bytes().unwrap();
         assert_eq!(
-            tokio::time::timeout(Duration::from_millis(1200), stream.next())
-                .await
-                .expect("1 秒后应产生 ping")
-                .unwrap()
-                .comment_bytes(),
-            Some(&b": ping\n\n"[..])
+            ping_bytes,
+            b"event: ping\ndata: {\"type\":\"ping\"}\n\n"
+        );
+        assert!(
+            ping_bytes
+                .split(|byte| *byte == b'\n')
+                .any(|line| line.starts_with(b"data:")),
+            "ping 必须包含 New API 可识别的 data 行"
         );
     }
 
