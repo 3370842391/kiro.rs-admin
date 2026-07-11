@@ -58,9 +58,7 @@ pub(crate) async fn expand_pdf_documents(
                     message: "source.type must be base64".to_string(),
                 });
             }
-            if source
-                .get("media_type")
-                .and_then(serde_json::Value::as_str)
+            if source.get("media_type").and_then(serde_json::Value::as_str)
                 != Some("application/pdf")
             {
                 return Err(DocumentError::InvalidSource {
@@ -88,9 +86,11 @@ pub(crate) async fn expand_pdf_documents(
             tokio::task::spawn_blocking(move || {
                 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
-                let bytes = STANDARD.decode(data).map_err(|_| DocumentError::InvalidBase64 {
-                    location: location.clone(),
-                })?;
+                let bytes = STANDARD
+                    .decode(data)
+                    .map_err(|_| DocumentError::InvalidBase64 {
+                        location: location.clone(),
+                    })?;
                 extract_pdf_text(&bytes, &location)
             })
         })
@@ -137,13 +137,12 @@ fn extract_pdf_text(bytes: &[u8], location: &str) -> Result<String, DocumentErro
     }
     validate_page_count(location, document.get_pages().len())?;
 
-    let page_text =
-        pdf_extract::extract_text_from_mem_by_pages(bytes).map_err(|error| {
-            DocumentError::InvalidPdf {
-                location: location.to_string(),
-                message: error.to_string(),
-            }
-        })?;
+    let page_text = pdf_extract::extract_text_from_mem_by_pages(bytes).map_err(|error| {
+        DocumentError::InvalidPdf {
+            location: location.to_string(),
+            message: error.to_string(),
+        }
+    })?;
     let text = page_text.join("\n\n");
     validate_extracted_text(location, &text)?;
     Ok(text)

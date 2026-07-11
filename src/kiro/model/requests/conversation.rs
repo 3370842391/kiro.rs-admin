@@ -258,6 +258,7 @@ pub struct HistoryUserMessage {
 
 impl HistoryUserMessage {
     /// 创建新的历史用户消息
+    #[cfg(test)]
     pub fn new(content: impl Into<String>, model_id: impl Into<String>) -> Self {
         Self {
             user_input_message: UserMessage::new(content, model_id),

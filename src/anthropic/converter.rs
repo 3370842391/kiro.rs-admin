@@ -1645,9 +1645,7 @@ fn build_current_message_content(
         .system
         .as_ref()
         .is_some_and(|system| system.iter().any(|block| has_thinking_tags(&block.text)));
-    if !client_system_has_thinking
-        && let Some(prefix) = generate_thinking_prefix(req, model_id)
-    {
+    if !client_system_has_thinking && let Some(prefix) = generate_thinking_prefix(req, model_id) {
         system_blocks.push(prefix);
     }
     if let Some(system) = &req.system {

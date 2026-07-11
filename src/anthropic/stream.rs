@@ -890,9 +890,7 @@ pub(crate) fn normalize_non_stream_content_blocks(
             blocks.push(block);
         }
     }
-    blocks.retain(|block| {
-        tool_semantic_key(block).is_none_or(|key| !native_keys.contains(&key))
-    });
+    blocks.retain(|block| tool_semantic_key(block).is_none_or(|key| !native_keys.contains(&key)));
     blocks.extend(native_tool_uses);
     blocks
 }
@@ -3128,8 +3126,7 @@ mod tests {
             "type": "text",
             "text": "call\n<invoke name=\"get_weather\">\n<parameter name=\"location\">Paris</parameter>\n</invoke>"
         })];
-        let blocks =
-            normalize_non_stream_content_blocks(base, native, &known, &HashMap::new());
+        let blocks = normalize_non_stream_content_blocks(base, native, &known, &HashMap::new());
         let tools: Vec<_> = blocks
             .iter()
             .filter(|block| block["type"] == "tool_use")
@@ -3156,9 +3153,11 @@ mod tests {
             &known,
             &HashMap::new(),
         );
-        assert!(blocks.iter().any(|block| {
-            block["type"] == "tool_use" && block["name"] == "get_weather"
-        }));
+        assert!(
+            blocks
+                .iter()
+                .any(|block| { block["type"] == "tool_use" && block["name"] == "get_weather" })
+        );
     }
 
     #[test]
@@ -4091,6 +4090,50 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&tools[0].1).expect("input 应为合法 JSON");
         assert_eq!(parsed["cmd"], "ls");
+    }
+
+    #[test]
+    fn stream_recovers_fragmented_get_weather_invoke_as_tool_use() {
+        let known = ["get_weather".to_string()].into_iter().collect();
+        let mut context = StreamContext::new_with_thinking(
+            "claude-opus-4-6",
+            1,
+            false,
+            HashMap::new(),
+            known,
+        );
+        let mut events = context.generate_initial_events();
+        events.extend(context.process_assistant_response("call\n<invoke name=\"get_"));
+        events.extend(context.process_assistant_response(
+            "weather\"><parameter name=\"location\">Paris</parameter></invoke>",
+        ));
+        events.extend(context.generate_final_events());
+
+        assert!(events.iter().any(|event| {
+            event.event == "content_block_start"
+                && event.data["content_block"]["type"] == "tool_use"
+                && event.data["content_block"]["name"] == "get_weather"
+        }));
+        let delta_index = events
+            .iter()
+            .position(|event| event.event == "message_delta")
+            .unwrap();
+        let delta = &events[delta_index];
+        assert_eq!(delta.data["delta"]["stop_reason"], "tool_use");
+
+        let tool_start_index = events
+            .iter()
+            .position(|event| {
+                event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "tool_use"
+            })
+            .unwrap();
+        let tool_stop_index = events
+            .iter()
+            .rposition(|event| event.event == "content_block_stop")
+            .unwrap();
+        assert!(tool_start_index < tool_stop_index);
+        assert!(tool_stop_index < delta_index);
     }
 
     #[test]

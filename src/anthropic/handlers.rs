@@ -1721,9 +1721,9 @@ async fn handle_non_stream_request(
         &known_tool_names,
         &tool_name_map,
     );
-    let has_output_tool_use = content.iter().any(|block| {
-        block.get("type").and_then(serde_json::Value::as_str) == Some("tool_use")
-    });
+    let has_output_tool_use = content
+        .iter()
+        .any(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("tool_use"));
     if let Err(message) = apply_tool_stop_reason(
         &mut stop_reason,
         upstream_signalled_tool_use,
@@ -1739,10 +1739,7 @@ async fn handle_non_stream_request(
         );
         return (
             StatusCode::BAD_GATEWAY,
-            Json(ErrorResponse::new(
-                "upstream_tool_protocol_error",
-                message,
-            )),
+            Json(ErrorResponse::new("upstream_tool_protocol_error", message)),
         )
             .into_response();
     }
@@ -2435,22 +2432,19 @@ mod tests {
 
     #[tokio::test]
     async fn document_input_error_maps_to_anthropic_400() {
-        let response = map_document_error(
-            crate::anthropic::document::DocumentError::InvalidSource {
+        let response =
+            map_document_error(crate::anthropic::document::DocumentError::InvalidSource {
                 location: "messages[0].content[1]".to_string(),
                 message: "media_type must be application/pdf".to_string(),
-            },
-        );
+            });
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
     async fn document_task_failure_maps_to_500() {
-        let response = map_document_error(
-            crate::anthropic::document::DocumentError::TaskFailed(
-                "worker panicked".to_string(),
-            ),
-        );
+        let response = map_document_error(crate::anthropic::document::DocumentError::TaskFailed(
+            "worker panicked".to_string(),
+        ));
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
