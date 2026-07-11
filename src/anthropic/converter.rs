@@ -623,41 +623,6 @@ impl std::fmt::Display for ConversionError {
 
 impl std::error::Error for ConversionError {}
 
-/// 从 metadata.user_id 中提取 session UUID
-///
-/// 支持两种格式:
-/// 1. 字符串格式: user_xxx_account__session_0b4445e1-f5be-49e1-87ce-62bbc28ad705
-/// 2. JSON 格式: {"device_id":"...","account_uuid":"...","session_id":"UUID"}
-///
-/// 提取 session UUID 作为 conversationId
-fn extract_session_id(user_id: &str) -> Option<String> {
-    // 先尝试 JSON 解析
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(user_id) {
-        if let Some(session_id) = json.get("session_id").and_then(|v| v.as_str()) {
-            if is_valid_uuid(session_id) {
-                return Some(session_id.to_string());
-            }
-        }
-    }
-
-    // 回退到字符串格式: 查找 "session_" 后面的内容
-    if let Some(pos) = user_id.find("session_") {
-        let session_part = &user_id[pos + 8..]; // "session_" 长度为 8
-        if session_part.len() >= 36 {
-            let uuid_str = &session_part[..36];
-            if is_valid_uuid(uuid_str) {
-                return Some(uuid_str.to_string());
-            }
-        }
-    }
-    None
-}
-
-/// 简单验证 UUID 格式（36 字符，包含 4 个连字符）
-fn is_valid_uuid(s: &str) -> bool {
-    s.len() == 36 && s.chars().filter(|c| *c == '-').count() == 4
-}
-
 /// 收集历史消息中使用的所有工具名称
 fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
     let mut tool_names = Vec::new();
@@ -732,13 +697,9 @@ pub fn convert_request_with_mode(
     };
 
     // 3. 生成会话 ID 和代理 ID
-    // 优先从 metadata.user_id 中提取 session UUID 作为 conversationId
-    let conversation_id = req
-        .metadata
-        .as_ref()
-        .and_then(|m| m.user_id.as_ref())
-        .and_then(|user_id| extract_session_id(user_id))
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    // Anthropic/OpenAI 兼容请求携带完整历史。复用 metadata.user_id 会让并发请求
+    // 在 Kiro 上游竞争同一会话状态，因此每次转换都使用独立会话 ID。
+    let conversation_id = Uuid::new_v4().to_string();
     let agent_continuation_id = Uuid::new_v4().to_string();
 
     // 4. 确定触发类型
@@ -3072,56 +3033,10 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_session_id_valid() {
-        // 测试有效的 user_id 格式
-        let user_id = "user_0dede55c6dcc4a11a30bbb5e7f22e6fdf86cdeba3820019cc27612af4e1243cd_account__session_8bb5523b-ec7c-4540-a9ca-beb6d79f1552";
-        let session_id = extract_session_id(user_id);
-        assert_eq!(
-            session_id,
-            Some("8bb5523b-ec7c-4540-a9ca-beb6d79f1552".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_session_id_json_format() {
-        // 测试 JSON 格式的 user_id
-        let user_id = r#"{"device_id":"0dede55c6dcc4a11a30bbb5e7f22e6fdf86cdeba3820019cc27612af4e1243cd","account_uuid":"","session_id":"8bb5523b-ec7c-4540-a9ca-beb6d79f1552"}"#;
-        let session_id = extract_session_id(user_id);
-        assert_eq!(
-            session_id,
-            Some("8bb5523b-ec7c-4540-a9ca-beb6d79f1552".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_session_id_json_invalid_session() {
-        // 测试 JSON 格式但 session_id 不是有效 UUID
-        let user_id = r#"{"device_id":"abc","session_id":"not-a-uuid"}"#;
-        let session_id = extract_session_id(user_id);
-        assert_eq!(session_id, None);
-    }
-
-    #[test]
-    fn test_extract_session_id_no_session() {
-        // 测试没有 session 的 user_id
-        let user_id = "user_0dede55c6dcc4a11a30bbb5e7f22e6fdf86cdeba3820019cc27612af4e1243cd";
-        let session_id = extract_session_id(user_id);
-        assert_eq!(session_id, None);
-    }
-
-    #[test]
-    fn test_extract_session_id_invalid_uuid() {
-        // 测试无效的 UUID 格式
-        let user_id = "user_xxx_session_invalid-uuid";
-        let session_id = extract_session_id(user_id);
-        assert_eq!(session_id, None);
-    }
-
-    #[test]
-    fn test_convert_request_with_session_metadata() {
+    fn test_same_metadata_gets_distinct_conversation_ids() {
         use super::super::types::{Message as AnthropicMessage, Metadata};
 
-        // 测试带有 metadata 的请求，应该使用 session UUID 作为 conversationId
+        // metadata 仅用于兼容和审计，不得复用为 Kiro 上游会话 ID。
         let req = MessagesRequest {
             force_web_search_loop: false,
             model: "claude-sonnet-4.5".to_string(),
@@ -3143,11 +3058,15 @@ mod tests {
             }),
         };
 
-        let result = convert_request(&req).unwrap();
-        assert_eq!(
-            result.conversation_state.conversation_id,
-            "a0662283-7fd3-4399-a7eb-52b9a717ae88"
-        );
+        let first = convert_request(&req).unwrap();
+        let second = convert_request(&req).unwrap();
+        let first_id = &first.conversation_state.conversation_id;
+        let second_id = &second.conversation_state.conversation_id;
+
+        assert_ne!(first_id, second_id);
+        assert_ne!(first_id, "a0662283-7fd3-4399-a7eb-52b9a717ae88");
+        assert!(Uuid::parse_str(first_id).is_ok());
+        assert!(Uuid::parse_str(second_id).is_ok());
     }
 
     #[test]
