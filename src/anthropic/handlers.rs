@@ -684,6 +684,24 @@ fn reasoning_requested(payload: &MessagesRequest) -> bool {
             .is_some_and(|oc| !oc.effort.trim().is_empty())
 }
 
+fn map_document_error(error: super::document::DocumentError) -> Response {
+    let status = if matches!(&error, super::document::DocumentError::TaskFailed(_)) {
+        StatusCode::INTERNAL_SERVER_ERROR
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    let error_type = if status == StatusCode::BAD_REQUEST {
+        "invalid_request_error"
+    } else {
+        "api_error"
+    };
+    (
+        status,
+        Json(ErrorResponse::new(error_type, error.to_string())),
+    )
+        .into_response()
+}
+
 /// POST /v1/messages
 ///
 /// 创建消息（对话）
@@ -732,6 +750,12 @@ pub async fn post_messages(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+
+    if let Err(error) = super::document::expand_pdf_documents(&mut payload).await {
+        tracing::warn!(error = %error, "Anthropic document preprocessing failed");
+        hook.record(0, 0, 0, 0, 0, 0.0, "error");
+        return map_document_error(error);
+    }
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
@@ -1920,6 +1944,12 @@ pub async fn post_messages_cc(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
+    if let Err(error) = super::document::expand_pdf_documents(&mut payload).await {
+        tracing::warn!(error = %error, "Anthropic document preprocessing failed");
+        hook.record(0, 0, 0, 0, 0, 0.0, "error");
+        return map_document_error(error);
+    }
+
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
@@ -2365,6 +2395,27 @@ mod tests {
     use futures::{StreamExt, future};
 
     use super::*;
+
+    #[tokio::test]
+    async fn document_input_error_maps_to_anthropic_400() {
+        let response = map_document_error(
+            crate::anthropic::document::DocumentError::InvalidSource {
+                location: "messages[0].content[1]".to_string(),
+                message: "media_type must be application/pdf".to_string(),
+            },
+        );
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn document_task_failure_maps_to_500() {
+        let response = map_document_error(
+            crate::anthropic::document::DocumentError::TaskFailed(
+                "worker panicked".to_string(),
+            ),
+        );
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
     #[tokio::test]
     async fn pending_call_stream_emits_connected_then_ping() {
