@@ -24,6 +24,7 @@
 
 pub mod cache_metering;
 pub(crate) mod converter;
+mod document;
 pub(crate) mod handlers;
 pub(crate) mod middleware;
 mod router;

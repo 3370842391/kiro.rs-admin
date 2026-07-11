@@ -39,6 +39,7 @@ parking_lot = "0.12"  # 楂樻€ц兘鍚屾鍘熻
 # limit. Pure-Rust, no C deps. PNG/JPEG/WebP/GIF only 鈥?keeps build slim.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 base64 = "0.22"
+pdf-extract = "0.12"
 thiserror = "1"
 subtle = "2.6"        # 甯搁噺鏃堕棿姣旇緝锛堥槻姝㈡椂搴忔敾鍑伙級
 rust-embed = "8"      # 宓屽叆闈欐€佹枃浠?
