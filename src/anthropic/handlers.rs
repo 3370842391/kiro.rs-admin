@@ -1515,9 +1515,7 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
-    // 非流式路径直接处理结构化 Event::ToolUse，不经过 <invoke> 文本嗅探，
-    // 因此这里不需要工具表校验；保留参数以对齐调用方签名。
-    _known_tool_names: std::collections::HashSet<String>,
+    known_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
@@ -1579,7 +1577,7 @@ async fn handle_non_stream_request(
     let mut native_thinking_signature: Option<String> = None;
     let mut native_redacted_thinking: Vec<String> = Vec::new();
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
-    let mut has_tool_use = false;
+    let mut upstream_signalled_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
@@ -1618,7 +1616,7 @@ async fn handle_non_stream_request(
                             }
                         }
                         Event::ToolUse(tool_use) => {
-                            has_tool_use = true;
+                            upstream_signalled_tool_use = true;
                             match tool_accumulator.push(&tool_use, &tool_name_map) {
                                 Ok(Some(completed)) => {
                                     tool_uses.push(completed.to_anthropic_block());
@@ -1706,23 +1704,48 @@ async fn handle_non_stream_request(
             .into_response();
     }
 
-    // 确定 stop_reason
-    if has_tool_use && stop_reason == "end_turn" {
-        stop_reason = "tool_use".to_string();
-    }
-
     // 剥离混入文本的字面 <tool_use> XML 泄漏（非流式：整段文本已就绪，一次性剥离）。
     let text_content = crate::kiro::model::events::strip_tool_use_xml_leaks(&text_content);
 
-    // 构建响应内容
-    let mut content = build_non_stream_content(
+    // 先保留原有 thinking 解析，再把可恢复的 <invoke> 和原生工具事件归一化。
+    let base_content = build_non_stream_content(
         thinking_enabled,
         text_content,
         native_thinking,
         native_thinking_signature,
         native_redacted_thinking,
     );
-    content.extend(tool_uses);
+    let content = super::stream::normalize_non_stream_content_blocks(
+        base_content,
+        tool_uses,
+        &known_tool_names,
+        &tool_name_map,
+    );
+    let has_output_tool_use = content.iter().any(|block| {
+        block.get("type").and_then(serde_json::Value::as_str) == Some("tool_use")
+    });
+    if let Err(message) = apply_tool_stop_reason(
+        &mut stop_reason,
+        upstream_signalled_tool_use,
+        has_output_tool_use,
+    ) {
+        hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
+        tracer.finalize(
+            "error",
+            Some(outcome::BAD_REQUEST),
+            Some(message),
+            None,
+            TraceUsage::zero(),
+        );
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse::new(
+                "upstream_tool_protocol_error",
+                message,
+            )),
+        )
+            .into_response();
+    }
 
     // 估算输出 tokens（上游不下发 token，全部走估算）
     let output_tokens = token::estimate_output_tokens(&content);
@@ -1777,6 +1800,20 @@ async fn handle_non_stream_request(
         },
     );
     (StatusCode::OK, Json(response_body)).into_response()
+}
+
+fn apply_tool_stop_reason(
+    stop_reason: &mut String,
+    upstream_signalled_tool_use: bool,
+    has_output_tool_use: bool,
+) -> Result<(), &'static str> {
+    if upstream_signalled_tool_use && !has_output_tool_use {
+        return Err("upstream ended with tool_use but produced no valid tool_use content block");
+    }
+    if has_output_tool_use {
+        *stop_reason = "tool_use".to_string();
+    }
+    Ok(())
 }
 
 fn build_non_stream_content(
@@ -2415,6 +2452,31 @@ mod tests {
             ),
         );
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn tool_stop_reason_matches_final_content() {
+        let mut plain = "end_turn".to_string();
+        assert_eq!(apply_tool_stop_reason(&mut plain, false, false), Ok(()));
+        assert_eq!(plain, "end_turn");
+
+        let mut recovered = "end_turn".to_string();
+        assert_eq!(apply_tool_stop_reason(&mut recovered, false, true), Ok(()));
+        assert_eq!(recovered, "tool_use");
+
+        let mut native = "end_turn".to_string();
+        assert_eq!(apply_tool_stop_reason(&mut native, true, true), Ok(()));
+        assert_eq!(native, "tool_use");
+
+        let mut recovered_after_max_tokens_hint = "max_tokens".to_string();
+        assert_eq!(
+            apply_tool_stop_reason(&mut recovered_after_max_tokens_hint, false, true),
+            Ok(())
+        );
+        assert_eq!(recovered_after_max_tokens_hint, "tool_use");
+
+        let mut broken = "end_turn".to_string();
+        assert!(apply_tool_stop_reason(&mut broken, true, false).is_err());
     }
 
     #[tokio::test]

@@ -855,6 +855,48 @@ pub(crate) fn extract_invoke_content_blocks(
     blocks
 }
 
+fn tool_semantic_key(block: &serde_json::Value) -> Option<String> {
+    if block.get("type")?.as_str()? != "tool_use" {
+        return None;
+    }
+    let name = block.get("name")?.as_str()?;
+    let input = serde_json::to_string(block.get("input")?).ok()?;
+    Some(format!("{name}\0{input}"))
+}
+
+pub(crate) fn normalize_non_stream_content_blocks(
+    base_content: Vec<serde_json::Value>,
+    native_tool_uses: Vec<serde_json::Value>,
+    known_tool_names: &std::collections::HashSet<String>,
+    tool_name_map: &HashMap<String, String>,
+) -> Vec<serde_json::Value> {
+    let native_keys: std::collections::HashSet<String> = native_tool_uses
+        .iter()
+        .filter_map(tool_semantic_key)
+        .collect();
+    let mut blocks = Vec::new();
+    for block in base_content {
+        if block.get("type").and_then(serde_json::Value::as_str) == Some("text") {
+            let text = block
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            blocks.extend(extract_invoke_content_blocks(
+                text,
+                known_tool_names,
+                tool_name_map,
+            ));
+        } else {
+            blocks.push(block);
+        }
+    }
+    blocks.retain(|block| {
+        tool_semantic_key(block).is_none_or(|key| !native_keys.contains(&key))
+    });
+    blocks.extend(native_tool_uses);
+    blocks
+}
+
 /// 累积完成的工具调用（`ToolUseEvent` 的所有分片拼接、解析成功后的结果）。
 #[derive(Debug, Clone)]
 pub struct CompletedToolUse {
@@ -3071,6 +3113,52 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0]["type"], "text");
         assert_eq!(blocks[0]["text"], "just a normal answer with no tool calls");
+    }
+
+    #[test]
+    fn normalize_non_stream_content_recovers_get_weather_and_deduplicates_native_call() {
+        let known = ["get_weather".to_string()].into_iter().collect();
+        let native = vec![serde_json::json!({
+            "type": "tool_use",
+            "id": "toolu_native",
+            "name": "get_weather",
+            "input": {"location": "Paris"}
+        })];
+        let base = vec![serde_json::json!({
+            "type": "text",
+            "text": "call\n<invoke name=\"get_weather\">\n<parameter name=\"location\">Paris</parameter>\n</invoke>"
+        })];
+        let blocks =
+            normalize_non_stream_content_blocks(base, native, &known, &HashMap::new());
+        let tools: Vec<_> = blocks
+            .iter()
+            .filter(|block| block["type"] == "tool_use")
+            .collect();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["id"], "toolu_native");
+        assert!(!blocks.iter().any(|block| {
+            block["type"] == "text"
+                && block["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("<invoke"))
+        }));
+    }
+
+    #[test]
+    fn normalize_non_stream_content_recovers_text_only_tool_call() {
+        let known = ["get_weather".to_string()].into_iter().collect();
+        let blocks = normalize_non_stream_content_blocks(
+            vec![serde_json::json!({
+                "type": "text",
+                "text": "call\n<invoke name=\"get_weather\"><parameter name=\"location\">Paris</parameter></invoke>"
+            })],
+            Vec::new(),
+            &known,
+            &HashMap::new(),
+        );
+        assert!(blocks.iter().any(|block| {
+            block["type"] == "tool_use" && block["name"] == "get_weather"
+        }));
     }
 
     #[test]
