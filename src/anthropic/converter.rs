@@ -215,13 +215,6 @@ const EDIT_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the `new_string` con
 /// 追加到 Bash 工具 description 末尾的内容（上游可能在超大命令处截断）
 const BASH_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: Do not send very large commands, inline scripts, or heredocs. If a command would exceed 100 lines or ~8000 characters, first create/modify a script file with chunked Write/Edit calls, then run a short command that executes it. Do not retry the same oversized command after a failure; split it smaller.";
 
-/// 追加到系统提示词的分块写入策略
-const SYSTEM_CHUNKED_POLICY: &str = "\
-When the Write or Edit tool has content size limits, always comply silently. \
-Never suggest bypassing these limits via alternative tools. \
-Never ask the user whether to switch approaches. \
-Complete all chunked operations without commentary.";
-
 /// 移除兼容端暴露的 thinking 后缀，得到用于 Kiro 的基础模型 ID。
 fn strip_thinking_suffix(model: &str) -> &str {
     model
@@ -1646,9 +1639,6 @@ fn build_history(
             .join("\n");
 
         if !system_content.is_empty() {
-            // 追加分块写入策略到系统消息
-            let system_content = format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY);
-
             // 注入thinking标签到系统消息最前面（如果需要且不存在）
             let final_content = if let Some(ref prefix) = thinking_prefix {
                 if !has_thinking_tags(&system_content) {
@@ -1664,16 +1654,12 @@ fn build_history(
             let user_msg = HistoryUserMessage::new(final_content, model_id);
             history.push(Message::User(user_msg));
 
-            let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
-            history.push(Message::Assistant(assistant_msg));
         }
     } else if let Some(ref prefix) = thinking_prefix {
         // 没有系统消息但有thinking配置，插入新的系统消息
         let user_msg = HistoryUserMessage::new(prefix.clone(), model_id);
         history.push(Message::User(user_msg));
 
-        let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
-        history.push(Message::Assistant(assistant_msg));
     }
 
     // 2. 处理常规消息历史
@@ -3030,6 +3016,57 @@ mod tests {
             tools.iter().any(|t| t.tool_specification.name == "read"),
             "tools 列表应包含 'read' 工具的占位符定义"
         );
+    }
+
+    #[test]
+    fn test_system_content_is_preserved_without_internal_policy() {
+        use super::super::types::SystemMessage;
+
+        let mut req = minimal_request_with_output_config("claude-sonnet-4.5");
+        req.output_config = None;
+        req.system = Some(vec![SystemMessage {
+            text: "Reply with nonce-7 only.".to_string(),
+            cache_control: None,
+        }]);
+
+        let result = convert_request(&req).unwrap();
+        assert_eq!(result.conversation_state.history.len(), 1);
+
+        let Message::User(system) = &result.conversation_state.history[0] else {
+            panic!("system content must be represented as Kiro user history");
+        };
+        assert_eq!(
+            system.user_input_message.content,
+            "Reply with nonce-7 only."
+        );
+    }
+
+    #[test]
+    fn test_thinking_prefix_appears_once_before_system() {
+        use super::super::types::{SystemMessage, Thinking};
+
+        let mut req = minimal_request_with_output_config("claude-sonnet-4.5");
+        req.output_config = None;
+        req.thinking = Some(Thinking {
+            thinking_type: "enabled".to_string(),
+            budget_tokens: 2048,
+        });
+        req.system = Some(vec![SystemMessage {
+            text: "Keep the answer exact.".to_string(),
+            cache_control: None,
+        }]);
+
+        let result = convert_request(&req).unwrap();
+        let Message::User(system) = &result.conversation_state.history[0] else {
+            panic!("expected system history");
+        };
+        let content = &system.user_input_message.content;
+
+        assert!(content.starts_with(
+            "<thinking_mode>enabled</thinking_mode><max_thinking_length>2048</max_thinking_length>\n"
+        ));
+        assert_eq!(content.matches("<thinking_mode>").count(), 1);
+        assert!(content.ends_with("Keep the answer exact."));
     }
 
     #[test]
