@@ -698,9 +698,16 @@ pub fn convert_request_with_mode(
     // 4. 确定触发类型
     let chat_trigger_type = determine_chat_trigger_type(req);
 
-    // 5. 处理最后一条消息作为 current_message（经过 prefill 预处理，末尾必为 user）
-    let last_message = messages.last().unwrap();
-    let (text_content, images, tool_results) = process_message_content(&last_message.content)?;
+    // 5. 将最后一个 assistant 之后的连续 user 消息合并为 current_message。
+    // 兼容 API 的请求携带完整历史，不需要伪造 assistant 回复来强制交替。
+    let current_start = messages
+        .iter()
+        .rposition(|message| message.role == "assistant")
+        .map_or(0, |index| index + 1);
+    let history_messages = &messages[..current_start];
+    let current_messages = &messages[current_start..];
+    let (text_content, images, tool_results) =
+        process_current_user_messages(current_messages)?;
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射；ClaudeCode 模式做内置工具适配）
     let mut tool_name_map = HashMap::new();
@@ -721,7 +728,7 @@ pub fn convert_request_with_mode(
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
     let mut history = build_history(
         req,
-        messages,
+        history_messages,
         &model_id,
         &mut tool_name_map,
         tool_compatibility_mode,
@@ -879,6 +886,26 @@ fn process_message_content_dedup(
     }
 
     Ok((text_parts.join("\n"), images, tool_results))
+}
+
+fn process_current_user_messages(
+    messages: &[super::types::Message],
+) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
+    let mut content_parts = Vec::new();
+    let mut images = Vec::new();
+    let mut tool_results = Vec::new();
+
+    for message in messages {
+        let (text, message_images, message_tool_results) =
+            process_message_content(&message.content)?;
+        if !text.is_empty() {
+            content_parts.push(text);
+        }
+        images.extend(message_images);
+        tool_results.extend(message_tool_results);
+    }
+
+    Ok((content_parts.join("\n"), images, tool_results))
 }
 
 /// 从 media_type 获取图片格式
@@ -1662,20 +1689,13 @@ fn build_history(
 
     }
 
-    // 2. 处理常规消息历史
-    // 最后一条消息作为 currentMessage，不加入历史
-    // 经过 prefill 预处理后，messages 末尾必定是 user，故直接截掉最后一条即可
-    let history_end_index = messages.len().saturating_sub(1);
-
-    // 收集并配对消息
+    // 2. 处理调用方已经与 currentMessage 分离的常规消息历史
     let mut user_buffer: Vec<&super::types::Message> = Vec::new();
     let mut assistant_buffer: Vec<&super::types::Message> = Vec::new();
     // SHA256 dedup set for images spanning the whole history; a repeated image is kept only on first sight
     let mut image_dedup: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for i in 0..history_end_index {
-        let msg = &messages[i];
-
+    for msg in messages {
         if msg.role == "user" {
             // 先处理累积的 assistant 消息
             if !assistant_buffer.is_empty() {
@@ -1702,14 +1722,10 @@ fn build_history(
         history.push(Message::Assistant(merged));
     }
 
-    // 处理结尾的孤立 user 消息
+    // 刷新末尾累积的 user 消息，不生成客户端未提交的 assistant 内容。
     if !user_buffer.is_empty() {
         let merged_user = merge_user_messages(&user_buffer, model_id, &mut image_dedup)?;
         history.push(Message::User(merged_user));
-
-        // 自动配对一个 "OK" 的 assistant 响应
-        let auto_assistant = HistoryAssistantMessage::new("OK");
-        history.push(Message::Assistant(auto_assistant));
     }
 
     Ok(history)
@@ -3016,6 +3032,79 @@ mod tests {
             tools.iter().any(|t| t.tool_specification.name == "read"),
             "tools 列表应包含 'read' 工具的占位符定义"
         );
+    }
+
+    #[test]
+    fn test_consecutive_trailing_users_merge_into_current_message() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let mut req = minimal_request_with_output_config("claude-sonnet-4.5");
+        req.output_config = None;
+        req.messages = vec![
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("first"),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("second"),
+            },
+        ];
+
+        let result = convert_request(&req).unwrap();
+        assert!(result.conversation_state.history.is_empty());
+        assert_eq!(
+            result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content,
+            "first\nsecond"
+        );
+    }
+
+    #[test]
+    fn test_multiturn_history_contains_no_synthetic_ok() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let mut req = minimal_request_with_output_config("claude-sonnet-4.5");
+        req.output_config = None;
+        req.messages = vec![
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("question"),
+            },
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!("answer"),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("follow up A"),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("follow up B"),
+            },
+        ];
+
+        let result = convert_request(&req).unwrap();
+        assert_eq!(result.conversation_state.history.len(), 2);
+        assert_eq!(
+            result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content,
+            "follow up A\nfollow up B"
+        );
+        assert!(!result.conversation_state.history.iter().any(|message| {
+            matches!(
+                message,
+                Message::Assistant(assistant)
+                    if assistant.assistant_response_message.content == "OK"
+            )
+        }));
     }
 
     #[test]
