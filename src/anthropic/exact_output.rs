@@ -1,4 +1,4 @@
-use super::types::MessagesRequest;
+use super::types::{MessagesRequest, ToolChoice};
 
 const MAX_LITERAL_BYTES: usize = 128;
 const MAX_JSON_BYTES: usize = 8192;
@@ -18,13 +18,7 @@ impl ExactOutput {
 }
 
 pub(crate) fn exact_system_output(req: &MessagesRequest) -> Option<ExactOutput> {
-    if req.tools.as_ref().is_some_and(|tools| !tools.is_empty())
-        || req.tool_choice.is_some()
-        || req
-            .thinking
-            .as_ref()
-            .is_some_and(|thinking| thinking.is_enabled())
-    {
+    if !exact_system_tool_policy_is_safe(req) {
         return None;
     }
 
@@ -53,6 +47,35 @@ pub(crate) fn exact_system_output(req: &MessagesRequest) -> Option<ExactOutput> 
         [value] => Some(ExactOutput::Text(value.clone())),
         _ => None,
     }
+}
+
+fn exact_system_tool_policy_is_safe(req: &MessagesRequest) -> bool {
+    if req
+        .thinking
+        .as_ref()
+        .is_some_and(|thinking| thinking.is_enabled())
+        || conversation_has_tool_blocks(req)
+    {
+        return false;
+    }
+
+    matches!(
+        req.tool_choice.as_ref(),
+        None | Some(ToolChoice::Auto { .. }) | Some(ToolChoice::None { .. })
+    )
+}
+
+fn conversation_has_tool_blocks(req: &MessagesRequest) -> bool {
+    req.messages.iter().any(|message| {
+        message.content.as_array().is_some_and(|blocks| {
+            blocks.iter().any(|block| {
+                matches!(
+                    block.get("type").and_then(serde_json::Value::as_str),
+                    Some("tool_use" | "tool_result")
+                )
+            })
+        })
+    })
 }
 
 pub(crate) fn strict_json_requested(req: &MessagesRequest) -> bool {
@@ -487,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_system_shortcut_with_tools_or_thinking() {
+    fn rejects_system_shortcut_with_required_tools_or_thinking() {
         let mut with_tool = request(
             Some("Return exactly the single word 'alpha' and nothing else."),
             "hello",
@@ -500,6 +523,8 @@ mod tests {
             }))
             .unwrap(),
         ]);
+        with_tool.tool_choice =
+            Some(serde_json::from_value(json!({"type": "tool", "name": "echo"})).unwrap());
         assert_eq!(exact_system_output(&with_tool), None);
 
         let mut with_thinking = request(
@@ -511,6 +536,82 @@ mod tests {
             budget_tokens: 1024,
         });
         assert_eq!(exact_system_output(&with_thinking), None);
+    }
+
+    #[test]
+    fn passive_tools_allow_static_exact_system_output() {
+        let mut req = request(
+            Some("Respond with exactly the single word 'alpha_42' and nothing else."),
+            "hello",
+        );
+        req.tools = Some(vec![
+            serde_json::from_value(json!({
+                "name": "noop",
+                "description": "A passive tool that is not required",
+                "input_schema": {"type": "object"}
+            }))
+            .unwrap(),
+        ]);
+
+        assert_eq!(
+            exact_system_output(&req),
+            Some(ExactOutput::Text("alpha_42".into()))
+        );
+    }
+
+    #[test]
+    fn passive_tools_allow_auto_and_none_tool_choice() {
+        for tool_choice in ["auto", "none"] {
+            let mut req = request(
+                Some("Respond with exactly the single word 'alpha_42' and nothing else."),
+                "hello",
+            );
+            req.tools = Some(vec![
+                serde_json::from_value(json!({
+                    "name": "noop",
+                    "description": "A passive tool that is not required",
+                    "input_schema": {"type": "object"}
+                }))
+                .unwrap(),
+            ]);
+            req.tool_choice = Some(serde_json::from_value(json!({"type": tool_choice})).unwrap());
+
+            assert_eq!(
+                exact_system_output(&req),
+                Some(ExactOutput::Text("alpha_42".into())),
+                "tool_choice={tool_choice} should remain passive"
+            );
+        }
+    }
+
+    #[test]
+    fn passive_tools_reject_required_choices_and_tool_history() {
+        for tool_choice in [
+            json!({"type": "any"}),
+            json!({"type": "tool", "name": "noop"}),
+        ] {
+            let mut req = request(
+                Some("Respond with exactly the single word 'alpha_42' and nothing else."),
+                "hello",
+            );
+            req.tool_choice = Some(serde_json::from_value(tool_choice).unwrap());
+            assert_eq!(exact_system_output(&req), None);
+        }
+
+        for block in [
+            json!({"type": "tool_use", "id": "toolu_1", "name": "noop", "input": {}}),
+            json!({"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}),
+        ] {
+            let mut req = request(
+                Some("Respond with exactly the single word 'alpha_42' and nothing else."),
+                "hello",
+            );
+            req.messages.insert(
+                0,
+                serde_json::from_value(json!({"role": "assistant", "content": [block]})).unwrap(),
+            );
+            assert_eq!(exact_system_output(&req), None);
+        }
     }
 
     #[test]
