@@ -227,6 +227,22 @@ curl http://127.0.0.1:8990/v1/messages/count_tokens \
 | `POST` | `/cc/v1/messages` | Claude Code 兼容入口，流式事件顺序针对 Claude Code 调整 |
 | `POST` | `/cc/v1/messages/count_tokens` | Claude Code 兼容 count_tokens |
 
+#### 本地 Anthropic 兼容性探针
+
+服务启动后，可用临时客户端 Key 从调用方视角检查 thinking、强制工具调用、文本型 PDF、并发 system Canary 和 SSE 事件顺序：
+
+```powershell
+$env:ANTHROPIC_API_KEY = "临时客户端Key"
+cargo run --bin anthropic_probe -- `
+  --base-url http://127.0.0.1:8990 `
+  --model claude-opus-4-8 `
+  --pdf D:\path\to\text-based.pdf `
+  --parallel 16
+Remove-Item Env:ANTHROPIC_API_KEY
+```
+
+也兼容从 `ANTHROPIC_AUTH_TOKEN` 读取 Key。未提供 `--pdf` 时 PDF 项显示为 `Skip`；扫描版 PDF 暂不支持。探针只验证本服务的协议兼容行为，不证明服务是 Anthropic 官方直连，也不保证第三方检测平台的固定分数。
+
 ### OpenAI 兼容
 
 在 Anthropic 管线之上提供的 OpenAI 兼容层，方便接入 Codex 及通用 OpenAI SDK 客户端。鉴权与 `/v1/messages` 一致（`Authorization: Bearer <客户端 Key>` 或 `x-api-key`）。
