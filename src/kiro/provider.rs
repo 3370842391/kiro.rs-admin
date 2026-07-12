@@ -311,6 +311,11 @@ impl KiroProvider {
         self.token_manager.config().early_stream_handshake
     }
 
+    /// 是否在客户端请求 thinking 但上游未返回 reasoning 时强制报协议错误。
+    pub fn strict_thinking_validation(&self) -> bool {
+        self.token_manager.config().strict_thinking_validation
+    }
+
     /// 是否对助手输出做身份归一化（Kiro/AWS → Claude/Anthropic）。见 anthropic::identity。
     pub fn identity_normalization(&self) -> bool {
         self.token_manager.config().identity_normalization

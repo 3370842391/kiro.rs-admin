@@ -11,5 +11,6 @@
   "traceEnabled": true,
   "traceRetentionDays": 7,
   "usageLogRetentionDays": 31,
-  "earlyStreamHandshake": false
+  "earlyStreamHandshake": false,
+  "strictThinkingValidation": false
 }

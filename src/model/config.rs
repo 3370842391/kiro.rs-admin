@@ -314,6 +314,11 @@ pub struct Config {
     #[serde(default = "default_extract_thinking")]
     pub extract_thinking: bool,
 
+    /// 客户端请求 thinking 但 Kiro 未返回 reasoning 时，是否按严格协议返回错误。
+    /// 默认 false：保留上游已经产生的正文或工具调用，不伪造 thinking。
+    #[serde(default)]
+    pub strict_thinking_validation: bool,
+
     /// 工具兼容模式。默认 `claude-code`：把 Claude Code 内置工具名/入参双向适配为
     /// Kiro 内置工具；`raw` 保留旧行为、直接透传客户端工具 schema，用于排障。
     #[serde(default = "default_tool_compatibility_mode")]
@@ -523,6 +528,7 @@ impl Default for Config {
             retry_mode: default_retry_mode(),
             retry_policy: None,
             extract_thinking: default_extract_thinking(),
+            strict_thinking_validation: false,
             tool_compatibility_mode: default_tool_compatibility_mode(),
             default_endpoint: default_endpoint(),
             trace_enabled: default_trace_enabled(),
@@ -616,5 +622,18 @@ mod tests {
     fn early_stream_handshake_accepts_camel_case_json() {
         let config: Config = serde_json::from_str(r#"{"earlyStreamHandshake":true}"#).unwrap();
         assert!(config.early_stream_handshake);
+    }
+
+    #[test]
+    fn strict_thinking_validation_defaults_to_false() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(!config.strict_thinking_validation);
+    }
+
+    #[test]
+    fn strict_thinking_validation_can_be_enabled() {
+        let config: Config =
+            serde_json::from_str(r#"{"strictThinkingValidation":true}"#).unwrap();
+        assert!(config.strict_thinking_validation);
     }
 }
