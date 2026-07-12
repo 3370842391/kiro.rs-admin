@@ -705,8 +705,7 @@ mod tests {
 
     #[test]
     fn strict_thinking_validation_can_be_enabled() {
-        let config: Config =
-            serde_json::from_str(r#"{"strictThinkingValidation":true}"#).unwrap();
+        let config: Config = serde_json::from_str(r#"{"strictThinkingValidation":true}"#).unwrap();
         assert!(config.strict_thinking_validation);
     }
 }

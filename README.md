@@ -271,6 +271,8 @@ Remove-Item Env:ANTHROPIC_API_KEY
 | `/api/admin/traces` | 请求链路追踪查询 |
 | `/api/admin/proxy-pool` | 代理池 |
 | `/api/admin/config/*` | 运行时配置 |
+| `/api/admin/config/cache-policy` | 查询或更新缓存策略、容量、落盘周期和命中率整形 |
+| `/api/admin/config/cache-policy/clear` | 清空内存及落盘的模拟缓存条目 |
 | `/api/admin/auth/*` | Social / IdC 登录流程 |
 | `/api/admin/system/update/*` | 在线更新、回退、版本检查 |
 
@@ -324,6 +326,13 @@ Admin API 鉴权同样支持：
 | `traceEnabled` | `true` | 是否写入 `traces.db` |
 | `traceRetentionDays` | `7` | trace 保留天数 |
 | `usageLogRetentionDays` | `31` | `usage_log.*.jsonl` 保留天数 |
+| `cacheMeteringEnabled` | `true` | 是否启用 rs 模拟 prompt cache 计量 |
+| `cacheDefaultTtlSecs` | `1800` | 未显式指定 TTL 时的默认窗口；只允许 `300`、`1800`、`3600` |
+| `cacheAutoWithoutControl` | `true` | 无 `cache_control` 时是否自动模拟稳定前缀缓存 |
+| `cacheCapacity` | `4096` | 最大前缀缓存条目数，范围 `256..=65536` |
+| `cacheFlushIntervalSecs` | `60` | 过期清理及落盘周期，范围 `10..=600` 秒 |
+| `cacheHitRateMinPct` | `0` | 命中率整形下界；与上界同时为 0 时关闭整形 |
+| `cacheHitRateMaxPct` | `0` | 命中率整形上界；冷启动 `cache_read=0` 不会被抬高 |
 | `countTokensApiUrl` | 无 | 外部 count_tokens API 地址 |
 | `countTokensApiKey` | 无 | 外部 count_tokens API Key |
 | `countTokensAuthType` | `x-api-key` | `x-api-key` 或 `bearer` |
@@ -675,6 +684,22 @@ data/
 - `cache_creation_input_tokens`
 - `cache_read_input_tokens`
 - `output_tokens`
+
+缓存策略默认启用，默认 TTL 为 30 分钟，可在 Admin UI 的“缓存策略”弹窗中切换 5 分钟、30 分钟或 1 小时，并实时调整容量、落盘周期、自动缓存和命中率整形。对应 API：
+
+- `GET /api/admin/config/cache-policy`
+- `PUT /api/admin/config/cache-policy`
+- `POST /api/admin/config/cache-policy/clear`
+
+TTL 规则：
+
+- 客户端显式 `cache_control.ttl` 优先于管理端默认值。
+- 支持 `5m`、`30m`、`1h`；其中 `30m` 是 rs 的模拟计量扩展。
+- 同一请求出现多个受支持的显式 TTL 时取最大值。
+- 未提供受支持的显式 TTL 时使用 `cacheDefaultTtlSecs`，默认 `1800` 秒。
+- 修改默认 TTL 只影响之后写入或续期的条目，不重写已有条目的过期时间。
+
+计费边界：这套缓存是 **rs 的用量拆分模拟**，不会减少 Kiro 上游实际 token、费用或延迟。命中率整形只在 `input_tokens` 与 `cache_read_input_tokens` 之间移动份额，保持输入总量不变；首次请求或真实未命中时 `cache_read_input_tokens` 保持为 0。清空缓存不会删除用量历史，只会让后续稳定前缀重新产生 `cache_creation_input_tokens`。
 
 <a id="admin-ui"></a>
 ## 🖥️ Admin UI

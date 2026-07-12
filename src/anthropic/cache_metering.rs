@@ -246,6 +246,7 @@ pub struct CacheStats {
 
 impl CacheMeter {
     /// 创建一个空 cache。`persist_path` 为 `Some` 时会自动从该文件加载历史。
+    #[allow(dead_code)]
     pub fn new(persist_path: Option<PathBuf>) -> Self {
         Self::with_policy(persist_path, CachePolicy::default())
     }
@@ -476,6 +477,7 @@ fn evict_lru_locked(inner: &mut Inner, capacity: usize) {
 }
 
 /// 兼容旧调用：无显式值或值无效时使用新的 30 分钟默认值。
+#[cfg(test)]
 pub fn parse_ttl(ttl: Option<&str>) -> i64 {
     ttl.and_then(parse_explicit_ttl)
         .unwrap_or(CachePolicy::default().default_ttl_secs) as i64
