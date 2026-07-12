@@ -22,6 +22,9 @@ import {
   setEndpointChains,
   getCacheHitRate,
   setCacheHitRate,
+  getCachePolicy,
+  setCachePolicy,
+  clearCachePolicyEntries,
   getLogGovernanceConfig,
   setLogGovernanceConfig,
   resetSuccessCount,
@@ -275,6 +278,36 @@ export function useSetCacheHitRate() {
     mutationFn: setCacheHitRate,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['cacheHitRate'] })
+    },
+  })
+}
+
+// 获取完整缓存策略和运行时状态
+export function useCachePolicy() {
+  return useQuery({
+    queryKey: ['cachePolicy'],
+    queryFn: getCachePolicy,
+  })
+}
+
+// 更新缓存策略；同步刷新旧命中率查询以保持兼容页面一致
+export function useSetCachePolicy() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setCachePolicy,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['cachePolicy'] })
+      queryClient.invalidateQueries({ queryKey: ['cacheHitRate'] })
+    },
+  })
+}
+
+export function useClearCachePolicyEntries() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: clearCachePolicyEntries,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['cachePolicy'] })
     },
   })
 }

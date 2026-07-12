@@ -571,6 +571,52 @@ export async function setCacheHitRate(
   return data
 }
 
+export interface CachePolicyConfig {
+  enabled: boolean
+  defaultTtlSecs: 300 | 1800 | 3600
+  allowedTtlSecs: number[]
+  autoWithoutCacheControl: boolean
+  capacity: number
+  flushIntervalSecs: number
+  minPct: number
+  maxPct: number
+  activeEntries: number
+  usagePct: number
+  dirty: boolean
+  lastFlushAt?: string | null
+  persistEnabled: boolean
+}
+
+export type SetCachePolicyRequest = Partial<
+  Pick<
+    CachePolicyConfig,
+    | 'enabled'
+    | 'defaultTtlSecs'
+    | 'autoWithoutCacheControl'
+    | 'capacity'
+    | 'flushIntervalSecs'
+    | 'minPct'
+    | 'maxPct'
+  >
+>
+
+export async function getCachePolicy(): Promise<CachePolicyConfig> {
+  const { data } = await api.get<CachePolicyConfig>('/config/cache-policy')
+  return data
+}
+
+export async function setCachePolicy(
+  req: SetCachePolicyRequest,
+): Promise<CachePolicyConfig> {
+  const { data } = await api.put<CachePolicyConfig>('/config/cache-policy', req)
+  return data
+}
+
+export async function clearCachePolicyEntries(): Promise<{ clearedEntries: number }> {
+  const { data } = await api.post<{ clearedEntries: number }>('/config/cache-policy/clear')
+  return data
+}
+
 export interface AccountThrottleConfig {
   failover: boolean
   cooldownSecs: number
