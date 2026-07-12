@@ -265,6 +265,11 @@ impl KiroProvider {
         self.token_manager.config().early_stream_handshake
     }
 
+    /// 是否对助手输出做身份归一化（Kiro/AWS → Claude/Anthropic）。见 anthropic::identity。
+    pub fn identity_normalization(&self) -> bool {
+        self.token_manager.config().identity_normalization
+    }
+
     /// 缓存命中率整形区间（运行时读取 token_manager 原子态），返回 `(min_pct, max_pct)`。
     /// 供 anthropic handler 在 `compute_cache_usage` 产出后注入 [`CacheUsage`]，
     /// 使管理面板对区间的修改立即作用于后续请求的命中率呈现。`(0,0)` = 不整形。

@@ -352,6 +352,12 @@ pub struct Config {
     #[serde(default)]
     pub early_stream_handshake: bool,
 
+    /// 身份归一化：把 Kiro 网关注入的品牌自述（"I'm Kiro" / "made by AWS"）改写回
+    /// Claude / Anthropic。默认 true（开启）——底层本就是真实 Claude 模型，用户已授权
+    /// 还原对外身份一致性以通过验真检测。设 false 保留上游原始品牌措辞。见 anthropic::identity。
+    #[serde(default = "default_true")]
+    pub identity_normalization: bool,
+
     /// 429 降级桶链运行时覆盖。键 = 主端点名（`ide` / `cli`），值 = 该主端点 429 时
     /// 依次尝试的备用桶名（有序）。缺省（None）时回退各 endpoint 的静态 `fallback_chain()`，
     /// 保证老部署零行为变化。空数组 = 该主端点不降级。运行时可在管理面板编辑。
@@ -452,6 +458,10 @@ fn default_extract_thinking() -> bool {
     true
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_tool_compatibility_mode() -> ToolCompatibilityMode {
     ToolCompatibilityMode::ClaudeCode
 }
@@ -520,6 +530,7 @@ impl Default for Config {
             usage_log_retention_days: default_usage_log_retention_days(),
             stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
             early_stream_handshake: false,
+            identity_normalization: true,
             endpoint_chains: None,
             max_bucket_attempts_per_request: default_max_bucket_attempts_per_request(),
             cache_hit_rate_min_pct: 0,

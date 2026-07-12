@@ -1015,6 +1015,9 @@ async fn handle_stream_request(
         known_tool_names,
     );
     ctx.cache_usage = cache_usage;
+    if provider.identity_normalization() {
+        ctx.enable_identity_filter();
+    }
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -1051,6 +1054,7 @@ struct EarlyStreamSetup {
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     idle_timeout_secs: u64,
+    identity_normalization: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1069,6 +1073,8 @@ fn create_early_sse_stream(
     idle_timeout_secs: u64,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let tracer_for_call = tracer.clone();
+    // 在 provider 被 move 进 call 之前捕获身份归一化开关。
+    let identity_normalization = provider.identity_normalization();
     let call = async move {
         provider
             .call_api_stream(
@@ -1088,6 +1094,7 @@ fn create_early_sse_stream(
         cache_usage,
         tracer,
         idle_timeout_secs,
+        identity_normalization,
     });
 
     flatten_pending_call(call, move |result| {
@@ -1102,6 +1109,9 @@ fn create_early_sse_stream(
                     setup.known_tool_names,
                 );
                 ctx.cache_usage = setup.cache_usage;
+                if setup.identity_normalization {
+                    ctx.enable_identity_filter();
+                }
                 let initial_events = ctx.generate_initial_events();
                 Box::pin(create_sse_stream(
                     call_result.response,
@@ -1713,6 +1723,13 @@ async fn handle_non_stream_request(
     // 剥离混入文本的字面 <tool_use> XML 泄漏（非流式：整段文本已就绪，一次性剥离）。
     let text_content = crate::kiro::model::events::strip_tool_use_xml_leaks(&text_content);
 
+    // 身份归一化：把 Kiro 网关注入的品牌自述改写回 Claude（底层就是真实 Claude 模型）。
+    let text_content = if provider.identity_normalization() {
+        super::identity::normalize_identity_text(&text_content)
+    } else {
+        text_content
+    };
+
     // 先保留原有 thinking 解析，再把可恢复的 <invoke> 和原生工具事件归一化。
     let base_content = build_non_stream_content(
         thinking_enabled,
@@ -2239,6 +2256,9 @@ async fn handle_stream_request_buffered(
         known_tool_names,
     );
     ctx.set_cache_usage(cache_usage);
+    if provider.identity_normalization() {
+        ctx.enable_identity_filter();
+    }
 
     // 创建缓冲 SSE 流
     let idle_timeout_secs = provider.stream_idle_timeout_secs();

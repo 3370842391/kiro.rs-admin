@@ -156,6 +156,15 @@ fn shape_hit_rate(
     if pool <= 0 {
         return (input, creation, read);
     }
+    // 冷启动护栏：split_raw 给出的原始 `read == 0` 表示本请求没有命中任何真实缓存前缀
+    // （首轮 / 无 cache_control / 全 miss）。真实 Anthropic 在这种请求上 `cache_read = 0`，
+    // 若在这里把命中率抬到 min%，等于凭空把未缓存 input 记成 cache_read，会造成两个可被
+    // 验真探针抓到的破绽：①全新单轮请求就上报 90% 命中（真直连首轮必为 0）；②message_start
+    // 的 input_tokens 与 message_delta 不一致（input 被挪进 read）。因此冷启动一律原样返回，
+    // 只对确有真实命中（read > 0）的多轮请求做区间整形。
+    if read == 0 {
+        return (input, creation, read);
+    }
     let lo = (min_pct.min(100) as f64) / 100.0;
     let hi = if max_pct == 0 {
         1.0
@@ -914,13 +923,14 @@ mod tests {
     }
 
     #[test]
-    fn shape_hit_rate_lifts_cold_start_to_min() {
-        // 冷启动：read=0（命中率 0%），下界 90% → 把 pool 的 90% 挪进 read。
+    fn shape_hit_rate_cold_start_stays_zero() {
+        // 冷启动护栏：原始 read=0（无真实命中）时一律原样返回，绝不把 input 挪进 cache_read。
+        // 真实 Anthropic 首轮 / 全 miss 请求 cache_read=0；抬升会造成验真探针可抓的破绽
+        // （单轮请求即 90% 命中 + message_start/delta input_tokens 不一致）。
         let (input, creation, read) = shape_hit_rate(1000, 0, 0, 90, 99);
-        assert_eq!(input + read, 1000, "creation 外的 pool 守恒");
+        assert_eq!(read, 0, "冷启动 cache_read 保持 0");
+        assert_eq!(input, 1000, "input 不被挪进 read");
         assert_eq!(creation, 0, "creation 不动");
-        assert_eq!(read, 900);
-        assert_eq!(input, 100);
     }
 
     #[test]
@@ -980,9 +990,10 @@ mod tests {
     }
 
     #[test]
-    fn split_against_total_shaped_via_bounds() {
-        // 端到端：带 bounds 的 CacheUsage 走 split_against_total 应被整形。
-        // covered=0 → split_raw 得 (total,0,0)（命中率 0%），下界 90% → read 提到 90%。
+    fn split_against_total_cold_start_not_shaped() {
+        // 端到端冷启动护栏：covered=0 → split_raw 得 (total,0,0)（无真实命中）。
+        // 即使配了 bounds(90,99)，冷启动也**不**抬升 read——真实 Anthropic 首轮 cache_read=0，
+        // 抬升会造成验真探针可抓的破绽（见 shape_hit_rate 冷启动护栏）。
         let u = CacheUsage {
             cache_read: 0,
             cache_covered_est: 0,
@@ -993,7 +1004,24 @@ mod tests {
         let (input, creation, read) = u.split_against_total(1000);
         assert_eq!(input + creation + read, 1000);
         assert_eq!(creation, 0);
-        assert_eq!(read, 900);
+        assert_eq!(read, 0, "冷启动 cache_read 保持 0，不被 bounds 抬升");
+        assert_eq!(input, 1000);
+    }
+
+    #[test]
+    fn split_against_total_warm_hit_is_shaped() {
+        // 有真实命中（cache_read>0）时 bounds 整形仍生效：把偏低的命中率抬进区间。
+        let u = CacheUsage {
+            cache_read: 20,
+            cache_covered_est: 20,
+            prompt_total_est: 100,
+            ..Default::default()
+        }
+        .with_hit_rate_bounds(90, 99);
+        let (input, creation, read) = u.split_against_total(1000);
+        assert_eq!(input + creation + read, 1000);
+        assert_eq!(creation, 0);
+        assert!(read >= 900, "有真实命中时命中率被抬到下界 90%: read={read}");
     }
 
     #[test]

@@ -1473,6 +1473,8 @@ pub struct StreamContext {
     tool_json_error: Option<ToolJsonAccumulatorError>,
     /// 跨 chunk 过滤混入 assistant 文本的字面 `<tool_use>` XML 泄漏。
     tool_use_xml_filter: ToolUseXmlLeakFilter,
+    /// 身份归一化流式过滤器（跨 chunk 把整词 Kiro→Claude）。仅在 config 开启时生效。
+    identity_filter: Option<super::identity::IdentityStreamFilter>,
     /// 是否收到过上游 toolUseEvent；与实际发出工具块分开记录。
     saw_upstream_tool_use: bool,
     /// 是否实际向客户端发出过非空文本、thinking、redacted thinking 或工具块。
@@ -1560,6 +1562,7 @@ impl StreamContext {
             tool_json_accumulator: ToolJsonAccumulator::new(),
             tool_json_error: None,
             tool_use_xml_filter: ToolUseXmlLeakFilter::default(),
+            identity_filter: None,
             saw_upstream_tool_use: false,
             has_visible_output: false,
             terminal_protocol_error: None,
@@ -1689,6 +1692,11 @@ impl StreamContext {
     }
 
     /// 处理助手响应事件
+    /// 开启流式身份归一化（Kiro→Claude 跨 chunk 改写）。由 handler 依据 config 调用。
+    pub fn enable_identity_filter(&mut self) {
+        self.identity_filter = Some(super::identity::IdentityStreamFilter::default());
+    }
+
     fn process_assistant_response(&mut self, content: &str) -> Vec<SseEvent> {
         // 先过滤字面 <tool_use> XML 泄漏（跨 chunk）。过滤后为空可能是过滤器在缓冲
         // 半个标签，直接返回；后续 token 估算与文本处理都用过滤后内容
@@ -1697,7 +1705,19 @@ impl StreamContext {
         if content.is_empty() {
             return Vec::new();
         }
-        let content = content.as_str();
+        // 身份归一化（流式，跨 chunk 整词 Kiro→Claude）。仅 config 开启时生效；
+        // 过滤器可能缓冲末尾疑似 "kiro" 前缀（≤3 字符），此时本轮可能产出空串。
+        let identity_out = self
+            .identity_filter
+            .as_mut()
+            .map(|f| f.push(&content));
+        let content = match &identity_out {
+            Some(s) => s.as_str(),
+            None => content.as_str(),
+        };
+        if content.is_empty() {
+            return Vec::new();
+        }
 
         let mut events = Vec::new();
         if self.is_thinking_block_open() && !self.in_thinking_block {
@@ -2480,10 +2500,28 @@ impl StreamContext {
         // 走同一文本路径，交由后续 thinking / invoke 缓冲一并 flush。
         let leftover = self.tool_use_xml_filter.finish();
         if !leftover.is_empty() {
-            if self.thinking_enabled {
-                events.extend(self.process_content_with_thinking(&leftover));
-            } else {
-                events.extend(self.create_text_delta_events(&leftover));
+            // XML 残留也要过身份过滤器（保持与正常 chunk 同口径）。
+            let leftover = self
+                .identity_filter
+                .as_mut()
+                .map(|f| f.push(&leftover))
+                .unwrap_or(leftover);
+            if !leftover.is_empty() {
+                if self.thinking_enabled {
+                    events.extend(self.process_content_with_thinking(&leftover));
+                } else {
+                    events.extend(self.create_text_delta_events(&leftover));
+                }
+            }
+        }
+        // flush 身份过滤器缓冲的末尾残留（疑似 kiro 前缀但流已结束，原样输出）。
+        if let Some(tail) = self.identity_filter.as_mut().map(|f| f.finish()) {
+            if !tail.is_empty() {
+                if self.thinking_enabled {
+                    events.extend(self.process_content_with_thinking(&tail));
+                } else {
+                    events.extend(self.create_text_delta_events(&tail));
+                }
             }
         }
 
@@ -2707,6 +2745,11 @@ impl BufferedStreamContext {
     /// 注入由 CacheMeter 计算的缓存覆盖情况（estimate 口径），最终上报时分摊。
     pub fn set_cache_usage(&mut self, cache_usage: super::cache_metering::CacheUsage) {
         self.inner.cache_usage = cache_usage;
+    }
+
+    /// 开启流式身份归一化（委托给 inner StreamContext）。
+    pub fn enable_identity_filter(&mut self) {
+        self.inner.enable_identity_filter();
     }
 
     /// 处理 Kiro 事件并缓冲结果

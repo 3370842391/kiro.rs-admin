@@ -591,6 +591,52 @@ pub struct ConversionResult {
     /// Additional model request fields (including `output_config.effort`), translated from the
     /// `output_config` field of the client's Anthropic request. Not sent when empty.
     pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
+    /// 解析后的工具选择策略。Kiro 上游无 tool_choice 字段，本代理据此在下发前调整工具集
+    /// 与描述 nudge（见 [`ToolChoicePolicy`]），使 `tool_choice` 不再被静默忽略。
+    pub tool_choice_policy: ToolChoicePolicy,
+}
+
+/// 工具选择策略（由客户端 `tool_choice` 解析而来）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolChoicePolicy {
+    /// 模型自行决定（缺省）——不干预。
+    Auto,
+    /// 必须调用某个工具——给所有工具描述追加 nudge。
+    RequiredAny,
+    /// 必须调用指定工具——只下发该工具 + 追加强 nudge。
+    RequiredSpecific(String),
+    /// 禁止调用工具——清空工具集。
+    Disabled,
+}
+
+const REQUIRED_TOOL_NUDGE: &str = " (Client requirement: you MUST call this tool before answering.)";
+const REQUIRED_ANY_NUDGE: &str =
+    " (Client requirement: you MUST call at least one of the provided tools before answering.)";
+
+/// 由 `tool_choice` + 已声明工具解析策略。指定工具不存在时回落 Auto（不报错，最大兼容）。
+pub fn resolve_tool_choice_policy(
+    choice: Option<&super::types::ToolChoice>,
+    client_tool_names: &[String],
+) -> ToolChoicePolicy {
+    use super::types::ToolChoice;
+    match choice {
+        None | Some(ToolChoice::Auto) => ToolChoicePolicy::Auto,
+        Some(ToolChoice::None) => ToolChoicePolicy::Disabled,
+        Some(ToolChoice::Any) => {
+            if client_tool_names.is_empty() {
+                ToolChoicePolicy::Auto
+            } else {
+                ToolChoicePolicy::RequiredAny
+            }
+        }
+        Some(ToolChoice::Tool { name }) => {
+            if client_tool_names.iter().any(|n| n == name) {
+                ToolChoicePolicy::RequiredSpecific(name.clone())
+            } else {
+                ToolChoicePolicy::Auto
+            }
+        }
+    }
 }
 
 /// 转换错误
@@ -724,6 +770,37 @@ pub fn convert_request_with_mode(
         known_tool_names.insert(short.clone());
     }
 
+    // tool_choice 策略：Kiro 上游无 tool_choice 字段，据此调整下发工具集 + 描述 nudge，
+    // 使客户端的强制/禁用工具意图不再被静默忽略。用原始 client 工具名解析。
+    let client_tool_names: Vec<String> = req
+        .tools
+        .as_ref()
+        .map(|ts| ts.iter().map(|t| t.name.clone()).collect())
+        .unwrap_or_default();
+    let tool_choice_policy = resolve_tool_choice_policy(req.tool_choice.as_ref(), &client_tool_names);
+    match &tool_choice_policy {
+        ToolChoicePolicy::Disabled => tools.clear(),
+        ToolChoicePolicy::RequiredAny => {
+            for t in &mut tools {
+                t.tool_specification.description.push_str(REQUIRED_ANY_NUDGE);
+            }
+        }
+        ToolChoicePolicy::RequiredSpecific(client_name) => {
+            // 只保留目标工具（按原名或映射短名匹配），并追加强 nudge。
+            tools.retain(|t| {
+                let up = &t.tool_specification.name;
+                up == client_name
+                    || tool_name_map
+                        .get(up)
+                        .is_some_and(|orig| orig == client_name)
+            });
+            for t in &mut tools {
+                t.tool_specification.description.push_str(REQUIRED_TOOL_NUDGE);
+            }
+        }
+        ToolChoicePolicy::Auto => {}
+    }
+
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
     let mut history = build_history(
         req,
@@ -805,6 +882,7 @@ pub fn convert_request_with_mode(
         tool_name_map,
         known_tool_names,
         additional_model_request_fields,
+        tool_choice_policy,
     })
 }
 
@@ -1889,6 +1967,54 @@ fn merge_assistant_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_choice_policy_resolves_variants() {
+        use super::super::types::ToolChoice;
+        let names = vec!["get_weather".to_string(), "read_cal".to_string()];
+        assert_eq!(resolve_tool_choice_policy(None, &names), ToolChoicePolicy::Auto);
+        assert_eq!(
+            resolve_tool_choice_policy(Some(&ToolChoice::Auto), &names),
+            ToolChoicePolicy::Auto
+        );
+        assert_eq!(
+            resolve_tool_choice_policy(Some(&ToolChoice::None), &names),
+            ToolChoicePolicy::Disabled
+        );
+        assert_eq!(
+            resolve_tool_choice_policy(Some(&ToolChoice::Any), &names),
+            ToolChoicePolicy::RequiredAny
+        );
+        assert_eq!(
+            resolve_tool_choice_policy(
+                Some(&ToolChoice::Tool { name: "get_weather".into() }),
+                &names
+            ),
+            ToolChoicePolicy::RequiredSpecific("get_weather".into())
+        );
+    }
+
+    #[test]
+    fn tool_choice_any_without_tools_falls_back_auto() {
+        use super::super::types::ToolChoice;
+        assert_eq!(
+            resolve_tool_choice_policy(Some(&ToolChoice::Any), &[]),
+            ToolChoicePolicy::Auto
+        );
+    }
+
+    #[test]
+    fn tool_choice_unknown_specific_falls_back_auto() {
+        use super::super::types::ToolChoice;
+        let names = vec!["get_weather".to_string()];
+        assert_eq!(
+            resolve_tool_choice_policy(
+                Some(&ToolChoice::Tool { name: "missing".into() }),
+                &names
+            ),
+            ToolChoicePolicy::Auto
+        );
+    }
 
     #[test]
     fn test_map_model_sonnet() {

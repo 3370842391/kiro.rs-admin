@@ -123,7 +123,8 @@ pub struct MessagesRequest {
     #[serde(default, deserialize_with = "deserialize_system")]
     pub system: Option<Vec<SystemMessage>>,
     pub tools: Option<Vec<Tool>>,
-    pub tool_choice: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "deserialize_tool_choice")]
+    pub tool_choice: Option<ToolChoice>,
     pub thinking: Option<Thinking>,
     pub output_config: Option<OutputConfig>,
     /// Claude Code 请求中的 metadata，包含 session 信息
@@ -219,6 +220,40 @@ pub struct CacheControl {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ttl: Option<String>,
+}
+
+/// 工具定义
+///
+/// 支持两种格式：
+/// 1. 普通工具：{ name, description, input_schema }
+/// 2. WebSearch 工具：{ type: "web_search_20250305", name: "web_search", max_uses: 8 }
+/// Anthropic `tool_choice`：`auto` / `any` / `{type:"tool",name}` / `none`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolChoice {
+    Auto,
+    Any,
+    Tool { name: String },
+    None,
+}
+
+/// 宽松反序列化 `tool_choice`：容错未知/畸形结构（回落 None=不干预），
+/// 忽略 `disable_parallel_tool_use` 等附加字段。真 Anthropic 只认 type 字段。
+fn deserialize_tool_choice<'de, D>(deserializer: D) -> Result<Option<ToolChoice>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let val: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    let Some(v) = val else { return Ok(None) };
+    let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("auto");
+    Ok(Some(match ty {
+        "any" => ToolChoice::Any,
+        "none" => ToolChoice::None,
+        "tool" => match v.get("name").and_then(|n| n.as_str()) {
+            Some(name) if !name.is_empty() => ToolChoice::Tool { name: name.to_string() },
+            _ => ToolChoice::Auto, // tool 但缺 name：回落 auto，不报错
+        },
+        _ => ToolChoice::Auto,
+    }))
 }
 
 /// 工具定义

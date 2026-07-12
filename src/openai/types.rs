@@ -698,14 +698,15 @@ fn schema_to_btree(schema: Option<Value>) -> BTreeMap<String, Value> {
     }
 }
 
-fn convert_tool_choice(choice: Option<&Value>) -> Option<Value> {
+/// OpenAI `tool_choice`（"none"/"auto"/"required" 或 {function:{name}}）→ 类型化 Anthropic ToolChoice。
+fn convert_tool_choice(choice: Option<&Value>) -> Option<crate::anthropic::types::ToolChoice> {
+    use crate::anthropic::types::ToolChoice;
     let choice = choice?;
     if let Some(s) = choice.as_str() {
         return Some(match s {
-            "none" => json!({"type": "none"}),
-            "auto" => json!({"type": "auto"}),
-            "required" => json!({"type": "any"}),
-            _ => choice.clone(),
+            "none" => ToolChoice::None,
+            "required" => ToolChoice::Any,
+            _ => ToolChoice::Auto, // "auto" 及未知
         });
     }
     let function_name = choice
@@ -713,9 +714,11 @@ fn convert_tool_choice(choice: Option<&Value>) -> Option<Value> {
         .and_then(|f| f.get("name"))
         .and_then(Value::as_str);
     if let Some(name) = function_name {
-        return Some(json!({"type": "tool", "name": name}));
+        if !name.is_empty() {
+            return Some(ToolChoice::Tool { name: name.to_string() });
+        }
     }
-    Some(choice.clone())
+    Some(ToolChoice::Auto)
 }
 
 fn openai_reasoning_to_anthropic(
