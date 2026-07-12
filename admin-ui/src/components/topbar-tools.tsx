@@ -30,7 +30,7 @@ import { extractErrorMessage, generateApiKey } from '@/lib/utils'
 import { ImageUpdateDialog } from '@/components/image-update-dialog'
 import { ModelMappingsDialog } from '@/components/model-mappings-dialog'
 import { EndpointChainsDialog } from '@/components/endpoint-chains-dialog'
-import { CacheHitRateDialog } from '@/components/cache-hit-rate-dialog'
+import { CachePolicyDialog } from '@/components/cache-policy-dialog'
 
 /**
  * 顶栏右侧通用工具栏：负载均衡切换、刷新、在线更新、设置（Key 管理）。
@@ -55,7 +55,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
   const [imageUpdateOpen, setImageUpdateOpen] = useState(false)
   const [modelMappingsOpen, setModelMappingsOpen] = useState(false)
   const [endpointChainsOpen, setEndpointChainsOpen] = useState(false)
-  const [cacheHitRateOpen, setCacheHitRateOpen] = useState(false)
+  const [cachePolicyOpen, setCachePolicyOpen] = useState(false)
   const [keyDialogOpen, setKeyDialogOpen] = useState(false)
   const [newKey, setNewKey] = useState('')
   const [showPlain, setShowPlain] = useState(false)
@@ -127,7 +127,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     openImageUpdate: () => setImageUpdateOpen(true),
     openModelMappings: () => setModelMappingsOpen(true),
     openEndpointChains: () => setEndpointChainsOpen(true),
-    openCacheHitRate: () => setCacheHitRateOpen(true),
+    openCachePolicy: () => setCachePolicyOpen(true),
     openKeyDialog,
     retryPolicy,
     setRetryPolicy: (mode: RetryMode, customPolicy?: RetryPolicy | null) =>
@@ -154,7 +154,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
       <ImageUpdateDialog open={imageUpdateOpen} onOpenChange={setImageUpdateOpen} />
       <ModelMappingsDialog open={modelMappingsOpen} onOpenChange={setModelMappingsOpen} />
       <EndpointChainsDialog open={endpointChainsOpen} onOpenChange={setEndpointChainsOpen} />
-      <CacheHitRateDialog open={cacheHitRateOpen} onOpenChange={setCacheHitRateOpen} />
+      <CachePolicyDialog open={cachePolicyOpen} onOpenChange={setCachePolicyOpen} />
 
       <Dialog
         open={keyDialogOpen}
@@ -264,7 +264,7 @@ interface ToolControls {
   openImageUpdate: () => void
   openModelMappings: () => void
   openEndpointChains: () => void
-  openCacheHitRate: () => void
+  openCachePolicy: () => void
   openKeyDialog: () => void
   retryPolicy?: RetryPolicyConfig
   setRetryPolicy: (mode: RetryMode, customPolicy?: RetryPolicy | null) => void
@@ -291,7 +291,7 @@ function FullTools({ controls }: { controls: ToolControls }) {
         onOpenKeyDialog={controls.openKeyDialog}
         onOpenModelMappings={controls.openModelMappings}
         onOpenEndpointChains={controls.openEndpointChains}
-        onOpenCacheHitRate={controls.openCacheHitRate}
+        onOpenCachePolicy={controls.openCachePolicy}
       />
     </>
   )
@@ -339,8 +339,8 @@ function CompactTools({ controls }: { controls: ToolControls }) {
         <DropdownMenuItem onSelect={controls.openEndpointChains}>
           <Shuffle />429 降级桶链（端点降级配置）
         </DropdownMenuItem>
-        <DropdownMenuItem onSelect={controls.openCacheHitRate}>
-          <Gauge />缓存命中率整形（min/max 区间）
+        <DropdownMenuItem onSelect={controls.openCachePolicy}>
+          <Gauge />缓存策略（TTL / 容量 / 命中率）
         </DropdownMenuItem>
         <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
         <DropdownMenuItem onSelect={controls.openKeyDialog}>
@@ -672,12 +672,12 @@ function KeySettingsMenu({
   onOpenKeyDialog,
   onOpenModelMappings,
   onOpenEndpointChains,
-  onOpenCacheHitRate,
+  onOpenCachePolicy,
 }: {
   onOpenKeyDialog: () => void
   onOpenModelMappings: () => void
   onOpenEndpointChains: () => void
-  onOpenCacheHitRate: () => void
+  onOpenCachePolicy: () => void
 }) {
   return (
     <DropdownMenu>
@@ -694,8 +694,8 @@ function KeySettingsMenu({
         <DropdownMenuItem onSelect={onOpenEndpointChains}>
           <Shuffle />429 降级桶链（端点降级配置）
         </DropdownMenuItem>
-        <DropdownMenuItem onSelect={onOpenCacheHitRate}>
-          <Gauge />缓存命中率整形（min/max 区间）
+        <DropdownMenuItem onSelect={onOpenCachePolicy}>
+          <Gauge />缓存策略（TTL / 容量 / 命中率）
         </DropdownMenuItem>
         <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
         <DropdownMenuItem onSelect={onOpenKeyDialog}>
