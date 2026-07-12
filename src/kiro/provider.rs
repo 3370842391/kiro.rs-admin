@@ -23,6 +23,7 @@ use crate::kiro::model::requests::conversation::{
     ConversationState, CurrentMessage, UserInputMessage,
 };
 use crate::kiro::model::requests::kiro::KiroRequest;
+use crate::kiro::model_capabilities::{ModelAvailability, ModelAvailabilityCache};
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::{RetryMode, RetryPolicy, TlsBackend};
@@ -185,6 +186,7 @@ pub struct KiroProvider {
     /// `ListAvailableProfiles`。命中真实 ARN 的账号会把 ARN 持久化进凭据，之后
     /// 通过 `streaming_profile_arn()` 直接命中，不再进入解析路径。
     profile_resolution_attempted: Mutex<HashSet<u64>>,
+    model_availability: Mutex<ModelAvailabilityCache>,
 }
 
 impl KiroProvider {
@@ -229,6 +231,50 @@ impl KiroProvider {
             default_endpoint,
             proxy_pool,
             profile_resolution_attempted: Mutex::new(HashSet::new()),
+            model_availability: Mutex::new(ModelAvailabilityCache::new(Duration::from_secs(300))),
+        }
+    }
+
+    async fn model_availability_for(&self, credential_id: u64, model: &str) -> ModelAvailability {
+        let now = Instant::now();
+        let cached = self
+            .model_availability
+            .lock()
+            .availability(credential_id, model, now);
+        if cached != ModelAvailability::Unknown {
+            return cached;
+        }
+
+        match self
+            .token_manager
+            .get_available_models_for(credential_id)
+            .await
+        {
+            Ok(response) => {
+                let ids: Vec<String> = response
+                    .models
+                    .into_iter()
+                    .map(|entry| entry.model_id)
+                    .collect();
+                let available = ids.iter().any(|id| id == model);
+                self.model_availability
+                    .lock()
+                    .insert(credential_id, ids, now);
+                if available {
+                    ModelAvailability::Available
+                } else {
+                    ModelAvailability::Missing
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    credential_id,
+                    model,
+                    error = %error,
+                    "模型列表查询失败，按未知能力继续当前请求"
+                );
+                ModelAvailability::Unknown
+            }
         }
     }
 
@@ -1002,6 +1048,7 @@ impl KiroProvider {
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let mut request_throttled_ids: HashSet<u64> = HashSet::new();
+        let mut model_incompatible_ids: HashSet<u64> = HashSet::new();
         // 会话级 RPM 记账去重：同一凭据在本会话（含 429 重试）只记 1 次 tick；
         // 故障转移到不同凭据时各记 1 次。
         let mut rpm_recorded: HashSet<u64> = HashSet::new();
@@ -1017,10 +1064,12 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
+            let mut excluded_ids = request_throttled_ids.clone();
+            excluded_ids.extend(model_incompatible_ids.iter().copied());
             // 获取调用上下文（绑定 index、credentials、token）
             let mut ctx = match self
                 .token_manager
-                .acquire_context_excluding(model.as_deref(), group, &request_throttled_ids)
+                .acquire_context_excluding(model.as_deref(), group, &excluded_ids)
                 .await
             {
                 Ok(c) => c,
@@ -1050,6 +1099,28 @@ impl KiroProvider {
 
             // 确保 Enterprise / IdC 账号的真实 profileArn 已解析（流式端点强制要求）
             self.ensure_profile_arn(&mut ctx).await;
+
+            if let Some(model) = model.as_deref()
+                && self.model_availability_for(ctx.id, model).await == ModelAvailability::Missing
+            {
+                tracing::warn!(
+                    credential_id = ctx.id,
+                    model,
+                    "当前凭据不提供目标模型，切换凭据"
+                );
+                model_incompatible_ids.insert(ctx.id);
+                last_error = Some(anyhow::anyhow!(
+                    "MODEL_NOT_AVAILABLE: credential #{} does not provide {}",
+                    ctx.id,
+                    model
+                ));
+                if model_incompatible_ids.len() >= total_credentials {
+                    anyhow::bail!(
+                        "MODEL_NOT_AVAILABLE: requested model is unavailable for configured credentials"
+                    );
+                }
+                continue;
+            }
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
@@ -1266,8 +1337,14 @@ impl KiroProvider {
                     body
                 );
                 Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
-                    outcome::BAD_REQUEST, Some(&body), attempt_start,
+                    sink,
+                    attempt,
+                    ctx.id,
+                    endpoint_name,
+                    Some(status.as_u16()),
+                    outcome::BAD_REQUEST,
+                    Some(&body),
+                    attempt_start,
                 );
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
@@ -1276,14 +1353,16 @@ impl KiroProvider {
             // 放大客户端等待时间和 Claude 端 Retrying 轮数；快速返回，让客户端下一次调用重新建连。
             // 同样必须在多端点降级链之前拦截。
             if status.as_u16() == 524 || endpoint.is_gateway_timeout(&body) {
-                tracing::warn!(
-                    "API 请求失败（上游网关超时，不重试）: {} {}",
-                    status,
-                    body
-                );
+                tracing::warn!("API 请求失败（上游网关超时，不重试）: {} {}", status, body);
                 Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
-                    outcome::TRANSIENT, Some(&body), attempt_start,
+                    sink,
+                    attempt,
+                    ctx.id,
+                    endpoint_name,
+                    Some(status.as_u16()),
+                    outcome::TRANSIENT,
+                    Some(&body),
+                    attempt_start,
                 );
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
@@ -1307,7 +1386,11 @@ impl KiroProvider {
                     && self.token_manager.get_account_throttle_failover()
                     && endpoint.is_account_throttled(&body);
                 Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
+                    sink,
+                    attempt,
+                    ctx.id,
+                    endpoint_name,
+                    Some(status.as_u16()),
                     if account_throttled {
                         outcome::ACCOUNT_THROTTLED
                     } else {
@@ -1369,8 +1452,14 @@ impl KiroProvider {
                         Ok(fb_resp) if fb_resp.status().is_success() => {
                             let fb_status = fb_resp.status();
                             Self::emit_attempt(
-                                sink, attempt, ctx.id, fb_name, Some(fb_status.as_u16()),
-                                outcome::SUCCESS, None, fb_start,
+                                sink,
+                                attempt,
+                                ctx.id,
+                                fb_name,
+                                Some(fb_status.as_u16()),
+                                outcome::SUCCESS,
+                                None,
+                                fb_start,
                             );
                             self.token_manager.report_success(ctx.id);
                             tracing::info!(
@@ -1388,8 +1477,14 @@ impl KiroProvider {
                             let fb_status = fb_resp.status();
                             let fb_body = fb_resp.text().await.unwrap_or_default();
                             Self::emit_attempt(
-                                sink, attempt, ctx.id, fb_name, Some(fb_status.as_u16()),
-                                outcome::TRANSIENT, Some(&fb_body), fb_start,
+                                sink,
+                                attempt,
+                                ctx.id,
+                                fb_name,
+                                Some(fb_status.as_u16()),
+                                outcome::TRANSIENT,
+                                Some(&fb_body),
+                                fb_start,
                             );
                             tracing::warn!(
                                 "备用端点 [{}] 也失败（{}），尝试链中下一个桶",
@@ -1399,8 +1494,14 @@ impl KiroProvider {
                         }
                         Err(e) => {
                             Self::emit_attempt(
-                                sink, attempt, ctx.id, fb_name, None,
-                                outcome::NETWORK_ERROR, Some(&e.to_string()), fb_start,
+                                sink,
+                                attempt,
+                                ctx.id,
+                                fb_name,
+                                None,
+                                outcome::NETWORK_ERROR,
+                                Some(&e.to_string()),
+                                fb_start,
                             );
                             tracing::warn!(
                                 "备用端点 [{}] 请求发送失败（{}），尝试链中下一个桶",

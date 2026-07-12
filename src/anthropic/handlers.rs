@@ -345,6 +345,13 @@ struct ClassifiedProviderError {
 
 fn classify_provider_error(err: &Error) -> ClassifiedProviderError {
     let text = err.to_string();
+    if text.contains("MODEL_NOT_AVAILABLE") {
+        return ClassifiedProviderError {
+            http_status: StatusCode::BAD_REQUEST,
+            error_type: "invalid_request_error",
+            public_message: "The requested model is not available for the configured upstream account.",
+        };
+    }
     if text.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
         return ClassifiedProviderError {
             http_status: StatusCode::BAD_REQUEST,
@@ -2649,6 +2656,15 @@ mod tests {
     fn enabled_thinking_rejects_plain_text_without_reasoning_block() {
         let content = vec![serde_json::json!({"type": "text", "text": "plain"})];
         assert!(validate_required_thinking(true, &content).is_err());
+    }
+
+    #[test]
+    fn unavailable_model_maps_to_anthropic_400() {
+        let classified = classify_provider_error(&anyhow::anyhow!(
+            "MODEL_NOT_AVAILABLE: requested model is unavailable"
+        ));
+        assert_eq!(classified.http_status, StatusCode::BAD_REQUEST);
+        assert_eq!(classified.error_type, "invalid_request_error");
     }
 
     #[test]
