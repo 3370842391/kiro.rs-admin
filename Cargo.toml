@@ -1,6 +1,6 @@
 ﻿[package]
 name = "kiro-rs"
-version = "0.8.4"
+version = "0.8.5"
 edition = "2024"
 
 [features]
@@ -48,3 +48,4 @@ flate2 = "1"        # tar.gz 瑙ｅ帇锛堝湪绾挎洿鏂帮級
 tar = "0.4"         # tar 瑙ｆ瀽锛堝湪绾挎洿鏂帮級
 zip = { version = "2", default-features = false, features = ["deflate"] }  # zip 瑙ｅ帇锛圵indows 鍦ㄧ嚎鏇存柊锛?
 rusqlite = { version = "0.32", features = ["bundled"] }  # 璇锋眰閾捐矾杩借釜鎸佷箙鍖栵紙鑷甫 SQLite 婧愮爜锛?
+ 
