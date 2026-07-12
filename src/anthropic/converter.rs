@@ -600,16 +600,20 @@ pub struct ConversionResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolChoicePolicy {
     /// 模型自行决定（缺省）——不干预。
-    Auto,
+    Auto { disable_parallel_tool_use: bool },
     /// 必须调用某个工具——给所有工具描述追加 nudge。
-    RequiredAny,
+    RequiredAny { disable_parallel_tool_use: bool },
     /// 必须调用指定工具——只下发该工具 + 追加强 nudge。
-    RequiredSpecific(String),
+    RequiredSpecific {
+        name: String,
+        disable_parallel_tool_use: bool,
+    },
     /// 禁止调用工具——清空工具集。
     Disabled,
 }
 
-const REQUIRED_TOOL_NUDGE: &str = " (Client requirement: you MUST call this tool before answering.)";
+const REQUIRED_TOOL_NUDGE: &str =
+    " (Client requirement: you MUST call this tool before answering.)";
 const REQUIRED_ANY_NUDGE: &str =
     " (Client requirement: you MUST call at least one of the provided tools before answering.)";
 
@@ -617,23 +621,44 @@ const REQUIRED_ANY_NUDGE: &str =
 pub fn resolve_tool_choice_policy(
     choice: Option<&super::types::ToolChoice>,
     client_tool_names: &[String],
-) -> ToolChoicePolicy {
+) -> Result<ToolChoicePolicy, ConversionError> {
     use super::types::ToolChoice;
     match choice {
-        None | Some(ToolChoice::Auto) => ToolChoicePolicy::Auto,
-        Some(ToolChoice::None) => ToolChoicePolicy::Disabled,
-        Some(ToolChoice::Any) => {
+        None => Ok(ToolChoicePolicy::Auto {
+            disable_parallel_tool_use: false,
+        }),
+        Some(ToolChoice::Auto {
+            disable_parallel_tool_use,
+        }) => Ok(ToolChoicePolicy::Auto {
+            disable_parallel_tool_use: *disable_parallel_tool_use,
+        }),
+        Some(ToolChoice::None { .. }) => Ok(ToolChoicePolicy::Disabled),
+        Some(ToolChoice::Any {
+            disable_parallel_tool_use,
+        }) => {
             if client_tool_names.is_empty() {
-                ToolChoicePolicy::Auto
+                Err(ConversionError::InvalidToolChoice(
+                    "tool_choice any requires at least one tool".into(),
+                ))
             } else {
-                ToolChoicePolicy::RequiredAny
+                Ok(ToolChoicePolicy::RequiredAny {
+                    disable_parallel_tool_use: *disable_parallel_tool_use,
+                })
             }
         }
-        Some(ToolChoice::Tool { name }) => {
+        Some(ToolChoice::Tool {
+            name,
+            disable_parallel_tool_use,
+        }) => {
             if client_tool_names.iter().any(|n| n == name) {
-                ToolChoicePolicy::RequiredSpecific(name.clone())
+                Ok(ToolChoicePolicy::RequiredSpecific {
+                    name: name.clone(),
+                    disable_parallel_tool_use: *disable_parallel_tool_use,
+                })
             } else {
-                ToolChoicePolicy::Auto
+                Err(ConversionError::InvalidToolChoice(format!(
+                    "tool_choice references undeclared tool: {name}"
+                )))
             }
         }
     }
@@ -646,6 +671,7 @@ pub enum ConversionError {
     EmptyMessages,
     /// Claude Code 工具无法映射到 Kiro 内置工具（如 Read.pages 无对应、内置缺 schema）。
     UnsupportedToolMapping(String),
+    InvalidToolChoice(String),
 }
 
 impl std::fmt::Display for ConversionError {
@@ -655,6 +681,9 @@ impl std::fmt::Display for ConversionError {
             ConversionError::EmptyMessages => write!(f, "消息列表为空"),
             ConversionError::UnsupportedToolMapping(reason) => {
                 write!(f, "工具映射不支持: {}", reason)
+            }
+            ConversionError::InvalidToolChoice(reason) => {
+                write!(f, "工具选择无效: {}", reason)
             }
         }
     }
@@ -777,15 +806,20 @@ pub fn convert_request_with_mode(
         .as_ref()
         .map(|ts| ts.iter().map(|t| t.name.clone()).collect())
         .unwrap_or_default();
-    let tool_choice_policy = resolve_tool_choice_policy(req.tool_choice.as_ref(), &client_tool_names);
+    let tool_choice_policy =
+        resolve_tool_choice_policy(req.tool_choice.as_ref(), &client_tool_names)?;
     match &tool_choice_policy {
         ToolChoicePolicy::Disabled => tools.clear(),
-        ToolChoicePolicy::RequiredAny => {
+        ToolChoicePolicy::RequiredAny { .. } => {
             for t in &mut tools {
-                t.tool_specification.description.push_str(REQUIRED_ANY_NUDGE);
+                t.tool_specification
+                    .description
+                    .push_str(REQUIRED_ANY_NUDGE);
             }
         }
-        ToolChoicePolicy::RequiredSpecific(client_name) => {
+        ToolChoicePolicy::RequiredSpecific {
+            name: client_name, ..
+        } => {
             // 只保留目标工具（按原名或映射短名匹配），并追加强 nudge。
             tools.retain(|t| {
                 let up = &t.tool_specification.name;
@@ -795,10 +829,12 @@ pub fn convert_request_with_mode(
                         .is_some_and(|orig| orig == client_name)
             });
             for t in &mut tools {
-                t.tool_specification.description.push_str(REQUIRED_TOOL_NUDGE);
+                t.tool_specification
+                    .description
+                    .push_str(REQUIRED_TOOL_NUDGE);
             }
         }
-        ToolChoicePolicy::Auto => {}
+        ToolChoicePolicy::Auto { .. } => {}
     }
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
@@ -1972,48 +2008,92 @@ mod tests {
     fn tool_choice_policy_resolves_variants() {
         use super::super::types::ToolChoice;
         let names = vec!["get_weather".to_string(), "read_cal".to_string()];
-        assert_eq!(resolve_tool_choice_policy(None, &names), ToolChoicePolicy::Auto);
         assert_eq!(
-            resolve_tool_choice_policy(Some(&ToolChoice::Auto), &names),
-            ToolChoicePolicy::Auto
+            resolve_tool_choice_policy(None, &names).unwrap(),
+            ToolChoicePolicy::Auto {
+                disable_parallel_tool_use: false,
+            }
         );
         assert_eq!(
-            resolve_tool_choice_policy(Some(&ToolChoice::None), &names),
+            resolve_tool_choice_policy(
+                Some(&ToolChoice::Auto {
+                    disable_parallel_tool_use: true,
+                }),
+                &names
+            )
+            .unwrap(),
+            ToolChoicePolicy::Auto {
+                disable_parallel_tool_use: true,
+            }
+        );
+        assert_eq!(
+            resolve_tool_choice_policy(
+                Some(&ToolChoice::None {
+                    disable_parallel_tool_use: false,
+                }),
+                &names
+            )
+            .unwrap(),
             ToolChoicePolicy::Disabled
         );
         assert_eq!(
-            resolve_tool_choice_policy(Some(&ToolChoice::Any), &names),
-            ToolChoicePolicy::RequiredAny
+            resolve_tool_choice_policy(
+                Some(&ToolChoice::Any {
+                    disable_parallel_tool_use: true,
+                }),
+                &names
+            )
+            .unwrap(),
+            ToolChoicePolicy::RequiredAny {
+                disable_parallel_tool_use: true,
+            }
         );
         assert_eq!(
             resolve_tool_choice_policy(
-                Some(&ToolChoice::Tool { name: "get_weather".into() }),
+                Some(&ToolChoice::Tool {
+                    name: "get_weather".into(),
+                    disable_parallel_tool_use: true,
+                }),
                 &names
-            ),
-            ToolChoicePolicy::RequiredSpecific("get_weather".into())
+            )
+            .unwrap(),
+            ToolChoicePolicy::RequiredSpecific {
+                name: "get_weather".into(),
+                disable_parallel_tool_use: true,
+            }
         );
     }
 
     #[test]
-    fn tool_choice_any_without_tools_falls_back_auto() {
+    fn tool_choice_any_without_tools_is_rejected() {
         use super::super::types::ToolChoice;
-        assert_eq!(
-            resolve_tool_choice_policy(Some(&ToolChoice::Any), &[]),
-            ToolChoicePolicy::Auto
-        );
+        assert!(matches!(
+            resolve_tool_choice_policy(
+                Some(&ToolChoice::Any {
+                    disable_parallel_tool_use: false,
+                }),
+                &[]
+            ),
+            Err(ConversionError::InvalidToolChoice(message))
+                if message.contains("at least one tool")
+        ));
     }
 
     #[test]
-    fn tool_choice_unknown_specific_falls_back_auto() {
+    fn tool_choice_unknown_specific_is_rejected() {
         use super::super::types::ToolChoice;
         let names = vec!["get_weather".to_string()];
-        assert_eq!(
+        assert!(matches!(
             resolve_tool_choice_policy(
-                Some(&ToolChoice::Tool { name: "missing".into() }),
+                Some(&ToolChoice::Tool {
+                    name: "missing".into(),
+                    disable_parallel_tool_use: false,
+                }),
                 &names
             ),
-            ToolChoicePolicy::Auto
-        );
+            Err(ConversionError::InvalidToolChoice(message))
+                if message.contains("missing")
+        ));
     }
 
     #[test]

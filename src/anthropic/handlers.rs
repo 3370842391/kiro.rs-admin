@@ -819,6 +819,9 @@ pub async fn post_messages(
                     "invalid_request_error",
                     format!("工具映射不支持: {}", reason),
                 ),
+                ConversionError::InvalidToolChoice(reason) => {
+                    ("invalid_request_error", format!("工具选择无效: {}", reason))
+                }
             };
             tracing::warn!("请求转换失败: {}", e);
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
@@ -873,6 +876,7 @@ pub async fn post_messages(
 
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
+    let tool_choice_policy = conversion_result.tool_choice_policy;
 
     // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存。
     // 返回 estimate 口径的覆盖量；真实 input/cache 互斥分摊在拿到 total 真值时进行。
@@ -908,6 +912,7 @@ pub async fn post_messages(
             thinking_enabled,
             tool_name_map,
             known_tool_names,
+            tool_choice_policy,
             hook,
             cache_usage,
             tracer,
@@ -936,6 +941,7 @@ pub async fn post_messages(
             extract_thinking,
             tool_name_map,
             known_tool_names,
+            tool_choice_policy,
             hook,
             cache_usage,
             tracer,
@@ -954,6 +960,7 @@ async fn handle_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
+    tool_choice_policy: super::converter::ToolChoicePolicy,
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
@@ -969,6 +976,7 @@ async fn handle_stream_request(
             thinking_enabled,
             tool_name_map,
             known_tool_names,
+            tool_choice_policy,
             hook,
             cache_usage,
             tracer,
@@ -1007,12 +1015,13 @@ async fn handle_stream_request(
     let credential_id = call_result.credential_id;
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(
+    let mut ctx = StreamContext::new_with_constraints(
         model,
         input_tokens,
         thinking_enabled,
         tool_name_map,
         known_tool_names,
+        tool_choice_policy,
     );
     ctx.cache_usage = cache_usage;
     if provider.identity_normalization() {
@@ -1050,6 +1059,7 @@ struct EarlyStreamSetup {
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
+    tool_choice_policy: super::converter::ToolChoicePolicy,
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
@@ -1066,6 +1076,7 @@ fn create_early_sse_stream(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
+    tool_choice_policy: super::converter::ToolChoicePolicy,
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
@@ -1090,6 +1101,7 @@ fn create_early_sse_stream(
         thinking_enabled,
         tool_name_map,
         known_tool_names,
+        tool_choice_policy,
         hook,
         cache_usage,
         tracer,
@@ -1101,12 +1113,13 @@ fn create_early_sse_stream(
         let setup = setup.take().expect("early stream setup consumed once");
         match result {
             Ok(call_result) => {
-                let mut ctx = StreamContext::new_with_thinking(
+                let mut ctx = StreamContext::new_with_constraints(
                     setup.model,
                     setup.input_tokens,
                     setup.thinking_enabled,
                     setup.tool_name_map,
                     setup.known_tool_names,
+                    setup.tool_choice_policy,
                 );
                 ctx.cache_usage = setup.cache_usage;
                 if setup.identity_normalization {
@@ -1531,6 +1544,7 @@ async fn handle_non_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
+    tool_choice_policy: super::converter::ToolChoicePolicy,
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
@@ -1744,6 +1758,21 @@ async fn handle_non_stream_request(
         &known_tool_names,
         &tool_name_map,
     );
+    if let Err(message) = validate_tool_choice_content(&tool_choice_policy, &content) {
+        hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
+        tracer.finalize(
+            "error",
+            Some(outcome::BAD_REQUEST),
+            Some(&message),
+            None,
+            TraceUsage::zero(),
+        );
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse::new("upstream_tool_choice_error", message)),
+        )
+            .into_response();
+    }
     let has_output_tool_use = content
         .iter()
         .any(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("tool_use"));
@@ -1854,6 +1883,58 @@ fn validate_non_stream_content(content: &[serde_json::Value]) -> Result<(), &'st
         Err("upstream returned no assistant content")
     } else {
         Ok(())
+    }
+}
+
+fn validate_tool_choice_content(
+    policy: &super::converter::ToolChoicePolicy,
+    content: &[serde_json::Value],
+) -> Result<(), String> {
+    use super::converter::ToolChoicePolicy;
+
+    let tool_names: Vec<&str> = content
+        .iter()
+        .filter(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("tool_use"))
+        .filter_map(|block| block.get("name").and_then(serde_json::Value::as_str))
+        .collect();
+
+    let disable_parallel = match policy {
+        ToolChoicePolicy::Auto {
+            disable_parallel_tool_use,
+        }
+        | ToolChoicePolicy::RequiredAny {
+            disable_parallel_tool_use,
+        }
+        | ToolChoicePolicy::RequiredSpecific {
+            disable_parallel_tool_use,
+            ..
+        } => *disable_parallel_tool_use,
+        ToolChoicePolicy::Disabled => false,
+    };
+    if disable_parallel && tool_names.len() > 1 {
+        return Err(
+            "client disabled parallel tool use but upstream produced multiple tool calls".into(),
+        );
+    }
+
+    match policy {
+        ToolChoicePolicy::Auto { .. } => Ok(()),
+        ToolChoicePolicy::Disabled if tool_names.is_empty() => Ok(()),
+        ToolChoicePolicy::Disabled => {
+            Err("client disabled tool calls but upstream produced one".into())
+        }
+        ToolChoicePolicy::RequiredAny { .. } if tool_names.is_empty() => {
+            Err("client required a tool call but upstream produced none".into())
+        }
+        ToolChoicePolicy::RequiredAny { .. } => Ok(()),
+        ToolChoicePolicy::RequiredSpecific { name, .. }
+            if tool_names.iter().any(|actual| *actual == name) =>
+        {
+            Ok(())
+        }
+        ToolChoicePolicy::RequiredSpecific { name, .. } => Err(format!(
+            "client required tool {name} but upstream did not produce it"
+        )),
     }
 }
 
@@ -2084,6 +2165,9 @@ pub async fn post_messages_cc(
                     "invalid_request_error",
                     format!("工具映射不支持: {}", reason),
                 ),
+                ConversionError::InvalidToolChoice(reason) => {
+                    ("invalid_request_error", format!("工具选择无效: {}", reason))
+                }
             };
             tracing::warn!("请求转换失败: {}", e);
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
@@ -2138,6 +2222,7 @@ pub async fn post_messages_cc(
 
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
+    let tool_choice_policy = conversion_result.tool_choice_policy;
 
     // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存（estimate 口径）。
     let cache_usage = state
@@ -2171,6 +2256,7 @@ pub async fn post_messages_cc(
             thinking_enabled,
             tool_name_map,
             known_tool_names,
+            tool_choice_policy,
             hook,
             total_input_tokens,
             cache_usage,
@@ -2200,6 +2286,7 @@ pub async fn post_messages_cc(
             extract_thinking,
             tool_name_map,
             known_tool_names,
+            tool_choice_policy,
             hook,
             cache_usage,
             tracer,
@@ -2220,6 +2307,7 @@ async fn handle_stream_request_buffered(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
+    tool_choice_policy: super::converter::ToolChoicePolicy,
     hook: UsageRecordHook,
     fallback_input_tokens: i32,
     cache_usage: super::cache_metering::CacheUsage,
@@ -2248,12 +2336,13 @@ async fn handle_stream_request_buffered(
     let credential_id = call_result.credential_id;
 
     // 创建缓冲流处理上下文
-    let mut ctx = BufferedStreamContext::new(
+    let mut ctx = BufferedStreamContext::new_with_constraints(
         model,
         fallback_input_tokens,
         thinking_enabled,
         tool_name_map,
         known_tool_names,
+        tool_choice_policy,
     );
     ctx.set_cache_usage(cache_usage);
     if provider.identity_normalization() {
@@ -2262,7 +2351,14 @@ async fn handle_stream_request_buffered(
 
     // 创建缓冲 SSE 流
     let idle_timeout_secs = provider.stream_idle_timeout_secs();
-    let stream = create_buffered_sse_stream(response, ctx, hook, credential_id, tracer, idle_timeout_secs);
+    let stream = create_buffered_sse_stream(
+        response,
+        ctx,
+        hook,
+        credential_id,
+        tracer,
+        idle_timeout_secs,
+    );
 
     // 返回 SSE 响应
     Response::builder()
@@ -2478,6 +2574,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn required_any_rejects_non_stream_text_only_content() {
+        let content = vec![serde_json::json!({"type": "text", "text": "plain"})];
+        assert!(
+            validate_tool_choice_content(
+                &crate::anthropic::converter::ToolChoicePolicy::RequiredAny {
+                    disable_parallel_tool_use: false,
+                },
+                &content,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn disable_parallel_rejects_multiple_non_stream_tool_calls() {
+        let content = vec![
+            serde_json::json!({"type": "tool_use", "name": "first_tool", "input": {}}),
+            serde_json::json!({"type": "tool_use", "name": "second_tool", "input": {}}),
+        ];
+        assert!(
+            validate_tool_choice_content(
+                &crate::anthropic::converter::ToolChoicePolicy::RequiredAny {
+                    disable_parallel_tool_use: true,
+                },
+                &content,
+            )
+            .unwrap_err()
+            .contains("parallel")
+        );
+    }
+
+    #[test]
     fn non_stream_usage_ignores_upstream_context_for_api_total() {
         let cache = crate::anthropic::cache_metering::CacheUsage::default();
         assert_eq!(split_non_stream_usage(72, Some(5_417), &cache), (72, 0, 0));
@@ -2557,10 +2685,7 @@ mod tests {
             .expect("1 秒后应产生 ping")
             .unwrap();
         let ping_bytes = ping.comment_bytes().unwrap();
-        assert_eq!(
-            ping_bytes,
-            b"event: ping\ndata: {\"type\":\"ping\"}\n\n"
-        );
+        assert_eq!(ping_bytes, b"event: ping\ndata: {\"type\":\"ping\"}\n\n");
         assert!(
             ping_bytes
                 .split(|byte| *byte == b'\n')

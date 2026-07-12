@@ -1481,6 +1481,12 @@ pub struct StreamContext {
     has_visible_output: bool,
     /// 非工具 JSON 类的终止协议错误。
     terminal_protocol_error: Option<String>,
+    /// 工具选择策略，用于在流结束时验证上游输出。
+    tool_choice_policy: super::converter::ToolChoicePolicy,
+    /// 已实际发送给客户端的工具名。
+    emitted_tool_names: Vec<String>,
+    /// 终止协议错误的 Anthropic 错误类型。
+    terminal_protocol_error_type: Option<&'static str>,
 }
 
 fn events_have_visible_output(events: &[SseEvent]) -> bool {
@@ -1534,6 +1540,26 @@ impl StreamContext {
         tool_name_map: HashMap<String, String>,
         known_tool_names: std::collections::HashSet<String>,
     ) -> Self {
+        Self::new_with_constraints(
+            model,
+            input_tokens,
+            thinking_enabled,
+            tool_name_map,
+            known_tool_names,
+            super::converter::ToolChoicePolicy::Auto {
+                disable_parallel_tool_use: false,
+            },
+        )
+    }
+
+    pub fn new_with_constraints(
+        model: impl Into<String>,
+        input_tokens: i32,
+        thinking_enabled: bool,
+        tool_name_map: HashMap<String, String>,
+        known_tool_names: std::collections::HashSet<String>,
+        tool_choice_policy: super::converter::ToolChoicePolicy,
+    ) -> Self {
         Self {
             state_manager: SseStateManager::new(),
             model: model.into(),
@@ -1566,6 +1592,9 @@ impl StreamContext {
             saw_upstream_tool_use: false,
             has_visible_output: false,
             terminal_protocol_error: None,
+            tool_choice_policy,
+            emitted_tool_names: Vec::new(),
+            terminal_protocol_error_type: None,
         }
     }
 
@@ -1707,10 +1736,7 @@ impl StreamContext {
         }
         // 身份归一化（流式，跨 chunk 整词 Kiro→Claude）。仅 config 开启时生效；
         // 过滤器可能缓冲末尾疑似 "kiro" 前缀（≤3 字符），此时本轮可能产出空串。
-        let identity_out = self
-            .identity_filter
-            .as_mut()
-            .map(|f| f.push(&content));
+        let identity_out = self.identity_filter.as_mut().map(|f| f.push(&content));
         let content = match &identity_out {
             Some(s) => s.as_str(),
             None => content.as_str(),
@@ -2356,6 +2382,7 @@ impl StreamContext {
         let mut events = Vec::new();
         self.state_manager.set_has_tool_use(true);
         self.has_visible_output = true;
+        self.emitted_tool_names.push(completed.name.clone());
 
         let block_index = if let Some(&idx) = self.tool_block_indices.get(&completed.id) {
             idx
@@ -2658,6 +2685,45 @@ impl StreamContext {
                     .to_string(),
             );
         }
+        if self.terminal_protocol_error.is_none() && self.tool_json_error.is_none() {
+            let tool_choice_error = match &self.tool_choice_policy {
+                super::converter::ToolChoicePolicy::Auto {
+                    disable_parallel_tool_use: true,
+                }
+                | super::converter::ToolChoicePolicy::RequiredAny {
+                    disable_parallel_tool_use: true,
+                }
+                | super::converter::ToolChoicePolicy::RequiredSpecific {
+                    disable_parallel_tool_use: true,
+                    ..
+                } if self.emitted_tool_names.len() > 1 => Some(
+                    "client disabled parallel tool use but upstream produced multiple tool calls"
+                        .to_string(),
+                ),
+                super::converter::ToolChoicePolicy::RequiredAny { .. }
+                    if self.emitted_tool_names.is_empty() =>
+                {
+                    Some("client required a tool call but upstream produced none".to_string())
+                }
+                super::converter::ToolChoicePolicy::RequiredSpecific { name, .. }
+                    if !self.emitted_tool_names.iter().any(|actual| actual == name) =>
+                {
+                    Some(format!(
+                        "client required tool {name} but upstream did not produce it"
+                    ))
+                }
+                super::converter::ToolChoicePolicy::Disabled
+                    if !self.emitted_tool_names.is_empty() =>
+                {
+                    Some("client disabled tool calls but upstream produced one".to_string())
+                }
+                _ => None,
+            };
+            if let Some(message) = tool_choice_error {
+                self.terminal_protocol_error = Some(message);
+                self.terminal_protocol_error_type = Some("upstream_tool_choice_error");
+            }
+        }
         if !self.has_visible_output
             && self.tool_json_error.is_none()
             && self.terminal_protocol_error.is_none()
@@ -2671,6 +2737,7 @@ impl StreamContext {
                 .tool_json_error
                 .as_ref()
                 .map(ToolJsonAccumulatorError::error_type)
+                .or(self.terminal_protocol_error_type)
                 .unwrap_or("upstream_protocol_error");
             events.push(SseEvent::new(
                 "error",
@@ -2728,12 +2795,33 @@ impl BufferedStreamContext {
         tool_name_map: HashMap<String, String>,
         known_tool_names: std::collections::HashSet<String>,
     ) -> Self {
-        let inner = StreamContext::new_with_thinking(
+        Self::new_with_constraints(
             model,
             estimated_input_tokens,
             thinking_enabled,
             tool_name_map,
             known_tool_names,
+            super::converter::ToolChoicePolicy::Auto {
+                disable_parallel_tool_use: false,
+            },
+        )
+    }
+
+    pub fn new_with_constraints(
+        model: impl Into<String>,
+        estimated_input_tokens: i32,
+        thinking_enabled: bool,
+        tool_name_map: HashMap<String, String>,
+        known_tool_names: std::collections::HashSet<String>,
+        tool_choice_policy: super::converter::ToolChoicePolicy,
+    ) -> Self {
+        let inner = StreamContext::new_with_constraints(
+            model,
+            estimated_input_tokens,
+            thinking_enabled,
+            tool_name_map,
+            known_tool_names,
+            tool_choice_policy,
         );
         Self {
             inner,
@@ -2851,6 +2939,28 @@ pub fn estimate_tokens(text: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn required_any_stream_ends_with_error_without_tool_use() {
+        let mut ctx = StreamContext::new_with_constraints(
+            "claude-opus-4-8",
+            10,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+            super::super::converter::ToolChoicePolicy::RequiredAny {
+                disable_parallel_tool_use: false,
+            },
+        );
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_assistant_response("plain text"));
+        events.extend(ctx.generate_final_events());
+
+        assert!(events.iter().any(|event| {
+            event.event == "error" && event.data["error"]["type"] == "upstream_tool_choice_error"
+        }));
+        assert!(!events.iter().any(|event| event.event == "message_stop"));
+    }
 
     #[test]
     fn context_usage_does_not_override_stream_api_usage() {
@@ -3066,8 +3176,11 @@ mod tests {
     fn tool_json_accumulator_finish_mixes_salvage_and_error() {
         // 多残留：空参可救 + 半截报错，二者并存互不影响。
         let mut acc = ToolJsonAccumulator::new();
-        acc.push(&tool_evt("empty1", "EnterPlanMode", "", false), &HashMap::new())
-            .unwrap();
+        acc.push(
+            &tool_evt("empty1", "EnterPlanMode", "", false),
+            &HashMap::new(),
+        )
+        .unwrap();
         acc.push(
             &tool_evt("half1", "read_file", "{\"path\":\"/a", false),
             &HashMap::new(),
@@ -3643,8 +3756,7 @@ mod tests {
         }));
         assert!(
             mid.iter().all(|e| {
-                e.event != "content_block_start"
-                    || e.data["content_block"]["type"] != "tool_use"
+                e.event != "content_block_start" || e.data["content_block"]["type"] != "tool_use"
             }),
             "stop=false 分片不应发出 tool_use 块（仅缓冲）"
         );
@@ -4310,13 +4422,8 @@ mod tests {
     #[test]
     fn stream_recovers_fragmented_get_weather_invoke_as_tool_use() {
         let known = ["get_weather".to_string()].into_iter().collect();
-        let mut context = StreamContext::new_with_thinking(
-            "claude-opus-4-6",
-            1,
-            false,
-            HashMap::new(),
-            known,
-        );
+        let mut context =
+            StreamContext::new_with_thinking("claude-opus-4-6", 1, false, HashMap::new(), known);
         let mut events = context.generate_initial_events();
         events.extend(context.process_assistant_response("call\n<invoke name=\"get_"));
         events.extend(context.process_assistant_response(

@@ -159,10 +159,8 @@ pub fn chat_to_anthropic(
         return Err(err("messages must contain at least one non-system message"));
     }
 
-    let (thinking, output_config) = openai_reasoning_to_anthropic(
-        req.reasoning_effort.as_deref(),
-        req.reasoning.as_ref(),
-    );
+    let (thinking, output_config) =
+        openai_reasoning_to_anthropic(req.reasoning_effort.as_deref(), req.reasoning.as_ref());
 
     let tools = convert_openai_tools(&req.tools);
     // OpenAI/Codex 客户端带 web_search 时强制走 agentic loop：纯快速路径恒返回 SSE 且
@@ -330,7 +328,10 @@ fn response_input_item_to_messages(
         }
         "function_call_output" | "tool_result" => Ok(vec![OpenAIMessage {
             role: "tool".to_string(),
-            content: obj.get("output").cloned().or_else(|| obj.get("content").cloned()),
+            content: obj
+                .get("output")
+                .cloned()
+                .or_else(|| obj.get("content").cloned()),
             tool_calls: Vec::new(),
             tool_call_id: first_string(obj, &["call_id", "tool_call_id"]),
             name: None,
@@ -370,20 +371,18 @@ pub fn append_openai_messages(
     messages: Vec<OpenAIMessage>,
 ) -> Vec<OpenAIMessage> {
     for msg in messages {
-        let merge_tool_calls = out
-            .last()
-            .is_some_and(|last| {
-                last.role == "assistant"
-                    && !last.tool_calls.is_empty()
-                    && msg.role == "assistant"
-                    && !msg.tool_calls.is_empty()
-                    && content_to_text(last.content.as_ref().unwrap_or(&Value::Null))
-                        .trim()
-                        .is_empty()
-                    && content_to_text(msg.content.as_ref().unwrap_or(&Value::Null))
-                        .trim()
-                        .is_empty()
-            });
+        let merge_tool_calls = out.last().is_some_and(|last| {
+            last.role == "assistant"
+                && !last.tool_calls.is_empty()
+                && msg.role == "assistant"
+                && !msg.tool_calls.is_empty()
+                && content_to_text(last.content.as_ref().unwrap_or(&Value::Null))
+                    .trim()
+                    .is_empty()
+                && content_to_text(msg.content.as_ref().unwrap_or(&Value::Null))
+                    .trim()
+                    .is_empty()
+        });
         if merge_tool_calls {
             if let Some(last) = out.last_mut() {
                 last.tool_calls.extend(msg.tool_calls);
@@ -704,9 +703,15 @@ fn convert_tool_choice(choice: Option<&Value>) -> Option<crate::anthropic::types
     let choice = choice?;
     if let Some(s) = choice.as_str() {
         return Some(match s {
-            "none" => ToolChoice::None,
-            "required" => ToolChoice::Any,
-            _ => ToolChoice::Auto, // "auto" 及未知
+            "none" => ToolChoice::None {
+                disable_parallel_tool_use: false,
+            },
+            "required" => ToolChoice::Any {
+                disable_parallel_tool_use: false,
+            },
+            _ => ToolChoice::Auto {
+                disable_parallel_tool_use: false,
+            }, // "auto" 及未知
         });
     }
     let function_name = choice
@@ -715,10 +720,15 @@ fn convert_tool_choice(choice: Option<&Value>) -> Option<crate::anthropic::types
         .and_then(Value::as_str);
     if let Some(name) = function_name {
         if !name.is_empty() {
-            return Some(ToolChoice::Tool { name: name.to_string() });
+            return Some(ToolChoice::Tool {
+                name: name.to_string(),
+                disable_parallel_tool_use: false,
+            });
         }
     }
-    Some(ToolChoice::Auto)
+    Some(ToolChoice::Auto {
+        disable_parallel_tool_use: false,
+    })
 }
 
 fn openai_reasoning_to_anthropic(
@@ -778,7 +788,11 @@ pub fn content_to_text(content: &Value) -> String {
         Value::Null => String::new(),
         Value::String(s) => s.clone(),
         Value::Number(_) | Value::Bool(_) => content.to_string(),
-        Value::Array(items) => items.iter().map(content_to_text).collect::<Vec<_>>().join(""),
+        Value::Array(items) => items
+            .iter()
+            .map(content_to_text)
+            .collect::<Vec<_>>()
+            .join(""),
         Value::Object(obj) => {
             if let Some(text) = obj.get("text").and_then(Value::as_str) {
                 return text.to_string();

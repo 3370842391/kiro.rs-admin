@@ -213,6 +213,10 @@ async fn run_round(
                     "invalid_request_error",
                     format!("unsupported tool mapping: {}", reason),
                 ),
+                ConversionError::InvalidToolChoice(reason) => (
+                    "invalid_request_error",
+                    format!("invalid tool choice: {}", reason),
+                ),
             };
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
             return Err(
