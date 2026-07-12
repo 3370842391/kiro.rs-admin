@@ -1489,6 +1489,8 @@ pub struct StreamContext {
     terminal_protocol_error_type: Option<&'static str>,
     /// 是否观察到真实 thinking 或 redacted_thinking 输出。
     saw_reasoning_output: bool,
+    /// 缺少真实 reasoning 时是否按严格协议终止流。
+    strict_thinking_validation: bool,
 }
 
 fn events_have_visible_output(events: &[SseEvent]) -> bool {
@@ -1547,6 +1549,7 @@ impl StreamContext {
             model,
             input_tokens,
             thinking_enabled,
+            false,
             tool_name_map,
             known_tool_names,
             super::converter::ToolChoicePolicy::Auto {
@@ -1559,6 +1562,7 @@ impl StreamContext {
         model: impl Into<String>,
         input_tokens: i32,
         thinking_enabled: bool,
+        strict_thinking_validation: bool,
         tool_name_map: HashMap<String, String>,
         known_tool_names: std::collections::HashSet<String>,
         tool_choice_policy: super::converter::ToolChoicePolicy,
@@ -1599,6 +1603,7 @@ impl StreamContext {
             emitted_tool_names: Vec::new(),
             terminal_protocol_error_type: None,
             saw_reasoning_output: false,
+            strict_thinking_validation,
         }
     }
 
@@ -2732,6 +2737,19 @@ impl StreamContext {
             }
         }
         if self.thinking_enabled
+            && !self.strict_thinking_validation
+            && !self.saw_reasoning_output
+            && self.has_visible_output
+            && self.tool_json_error.is_none()
+            && self.terminal_protocol_error.is_none()
+        {
+            tracing::warn!(
+                model = %self.model,
+                "客户端请求了 thinking，但 Kiro 未返回 reasoning；流式保留有效正文或工具调用"
+            );
+        }
+        if self.thinking_enabled
+            && self.strict_thinking_validation
             && !self.saw_reasoning_output
             && self.tool_json_error.is_none()
             && self.terminal_protocol_error.is_none()
@@ -2817,6 +2835,7 @@ impl BufferedStreamContext {
             model,
             estimated_input_tokens,
             thinking_enabled,
+            false,
             tool_name_map,
             known_tool_names,
             super::converter::ToolChoicePolicy::Auto {
@@ -2829,6 +2848,7 @@ impl BufferedStreamContext {
         model: impl Into<String>,
         estimated_input_tokens: i32,
         thinking_enabled: bool,
+        strict_thinking_validation: bool,
         tool_name_map: HashMap<String, String>,
         known_tool_names: std::collections::HashSet<String>,
         tool_choice_policy: super::converter::ToolChoicePolicy,
@@ -2837,6 +2857,7 @@ impl BufferedStreamContext {
             model,
             estimated_input_tokens,
             thinking_enabled,
+            strict_thinking_validation,
             tool_name_map,
             known_tool_names,
             tool_choice_policy,
@@ -2964,6 +2985,7 @@ mod tests {
             "claude-opus-4-8",
             10,
             false,
+            false,
             HashMap::new(),
             std::collections::HashSet::new(),
             super::super::converter::ToolChoicePolicy::RequiredAny {
@@ -2981,13 +3003,38 @@ mod tests {
     }
 
     #[test]
-    fn enabled_thinking_stream_ends_with_error_when_only_plain_text_arrives() {
-        let mut ctx = StreamContext::new_with_thinking(
+    fn compatible_thinking_stream_finishes_when_plain_text_arrives() {
+        let mut ctx = StreamContext::new_with_constraints(
             "claude-opus-4-8",
             10,
             true,
+            false,
             HashMap::new(),
             std::collections::HashSet::new(),
+            super::super::converter::ToolChoicePolicy::Auto {
+                disable_parallel_tool_use: false,
+            },
+        );
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_assistant_response("正常中文回复"));
+        events.extend(ctx.generate_final_events());
+
+        assert!(events.iter().any(|event| event.event == "message_stop"));
+        assert!(!events.iter().any(|event| event.event == "error"));
+    }
+
+    #[test]
+    fn strict_thinking_stream_errors_when_plain_text_arrives() {
+        let mut ctx = StreamContext::new_with_constraints(
+            "claude-opus-4-8",
+            10,
+            true,
+            true,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+            super::super::converter::ToolChoicePolicy::Auto {
+                disable_parallel_tool_use: false,
+            },
         );
         let mut events = ctx.generate_initial_events();
         events.extend(ctx.process_assistant_response("plain text"));

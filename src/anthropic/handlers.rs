@@ -1048,6 +1048,7 @@ async fn handle_stream_request(
         model,
         input_tokens,
         thinking_enabled,
+        provider.strict_thinking_validation(),
         tool_name_map,
         known_tool_names,
         tool_choice_policy,
@@ -1094,6 +1095,7 @@ struct EarlyStreamSetup {
     tracer: std::sync::Arc<RequestTracer>,
     idle_timeout_secs: u64,
     identity_normalization: bool,
+    strict_thinking_validation: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1115,6 +1117,7 @@ fn create_early_sse_stream(
     let tracer_for_call = tracer.clone();
     // 在 provider 被 move 进 call 之前捕获身份归一化开关。
     let identity_normalization = provider.identity_normalization();
+    let strict_thinking_validation = provider.strict_thinking_validation();
     let call = async move {
         provider
             .call_api_stream(
@@ -1136,6 +1139,7 @@ fn create_early_sse_stream(
         tracer,
         idle_timeout_secs,
         identity_normalization,
+        strict_thinking_validation,
     });
 
     flatten_pending_call(call, move |result| {
@@ -1146,6 +1150,7 @@ fn create_early_sse_stream(
                     setup.model,
                     setup.input_tokens,
                     setup.thinking_enabled,
+                    setup.strict_thinking_validation,
                     setup.tool_name_map,
                     setup.known_tool_names,
                     setup.tool_choice_policy,
@@ -2433,6 +2438,7 @@ async fn handle_stream_request_buffered(
         model,
         fallback_input_tokens,
         thinking_enabled,
+        provider.strict_thinking_validation(),
         tool_name_map,
         known_tool_names,
         tool_choice_policy,
