@@ -375,6 +375,26 @@ pub struct Config {
     #[serde(default = "default_max_bucket_attempts_per_request")]
     pub max_bucket_attempts_per_request: usize,
 
+    /// 是否启用 rs 的模拟 prompt cache 计量。
+    #[serde(default = "default_cache_metering_enabled")]
+    pub cache_metering_enabled: bool,
+
+    /// 未显式提供 cache_control TTL 时使用的默认缓存窗口（秒）。
+    #[serde(default = "default_cache_default_ttl_secs")]
+    pub cache_default_ttl_secs: u64,
+
+    /// 请求没有 cache_control 时，是否自动对稳定前缀进行模拟缓存。
+    #[serde(default = "default_cache_auto_without_control")]
+    pub cache_auto_without_control: bool,
+
+    /// 模拟缓存最多保留的前缀条目数。
+    #[serde(default = "default_cache_capacity")]
+    pub cache_capacity: usize,
+
+    /// 过期清理和缓存状态落盘周期（秒）。
+    #[serde(default = "default_cache_flush_interval_secs")]
+    pub cache_flush_interval_secs: u64,
+
     /// 缓存命中率整形——下界（百分比 0..=100）。
     ///
     /// 上游不下发真实缓存 token，中转层自行模拟；本旋钮把最终呈现（newapi 计费用量）的
@@ -491,6 +511,26 @@ fn default_max_bucket_attempts_per_request() -> usize {
     6
 }
 
+fn default_cache_metering_enabled() -> bool {
+    true
+}
+
+fn default_cache_default_ttl_secs() -> u64 {
+    30 * 60
+}
+
+fn default_cache_auto_without_control() -> bool {
+    true
+}
+
+fn default_cache_capacity() -> usize {
+    4096
+}
+
+fn default_cache_flush_interval_secs() -> u64 {
+    60
+}
+
 fn default_usage_log_retention_days() -> u32 {
     31
 }
@@ -539,6 +579,11 @@ impl Default for Config {
             identity_normalization: true,
             endpoint_chains: None,
             max_bucket_attempts_per_request: default_max_bucket_attempts_per_request(),
+            cache_metering_enabled: default_cache_metering_enabled(),
+            cache_default_ttl_secs: default_cache_default_ttl_secs(),
+            cache_auto_without_control: default_cache_auto_without_control(),
+            cache_capacity: default_cache_capacity(),
+            cache_flush_interval_secs: default_cache_flush_interval_secs(),
             cache_hit_rate_min_pct: 0,
             cache_hit_rate_max_pct: 0,
             endpoints: HashMap::new(),
@@ -611,6 +656,34 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_policy_defaults_to_thirty_minutes() {
+        let config: Config = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(config.cache_metering_enabled);
+        assert_eq!(config.cache_default_ttl_secs, 1800);
+        assert!(config.cache_auto_without_control);
+        assert_eq!(config.cache_capacity, 4096);
+        assert_eq!(config.cache_flush_interval_secs, 60);
+    }
+
+    #[test]
+    fn cache_policy_fields_round_trip_in_camel_case() {
+        let value = serde_json::json!({
+            "cacheMeteringEnabled": false,
+            "cacheDefaultTtlSecs": 300,
+            "cacheAutoWithoutControl": false,
+            "cacheCapacity": 8192,
+            "cacheFlushIntervalSecs": 30
+        });
+        let config: Config = serde_json::from_value(value).unwrap();
+        let encoded = serde_json::to_value(config).unwrap();
+        assert_eq!(encoded["cacheMeteringEnabled"], false);
+        assert_eq!(encoded["cacheDefaultTtlSecs"], 300);
+        assert_eq!(encoded["cacheAutoWithoutControl"], false);
+        assert_eq!(encoded["cacheCapacity"], 8192);
+        assert_eq!(encoded["cacheFlushIntervalSecs"], 30);
+    }
 
     #[test]
     fn early_stream_handshake_defaults_off() {
