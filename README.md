@@ -323,6 +323,7 @@ Admin API 鉴权同样支持：
 | `retryPolicy` | 无 | `retryMode=custom` 时使用的普通 429 自定义策略 |
 | `toolCompatibilityMode` | `claude-code` | `claude-code` 启用内置工具双向映射；`raw` 保留旧的 schema 透传行为 |
 | `extractThinking` | `true` | 非流式响应是否把旧 `<thinking>` 文本提取成 thinking block |
+| `localPingResponse` | `true` | 单轮纯文本 `ping` 健康检查是否由 rs 本地稳定返回 `pong` |
 | `traceEnabled` | `true` | 是否写入 `traces.db` |
 | `traceRetentionDays` | `7` | trace 保留天数 |
 | `usageLogRetentionDays` | `31` | `usage_log.*.jsonl` 保留天数 |
@@ -339,6 +340,8 @@ Admin API 鉴权同样支持：
 | `githubToken` | 无 | 在线更新访问 GitHub API 时使用，降低 rate limit 风险 |
 | `updateAutoApply` | `false` | 是否每天自动检查并应用新版本 |
 | `updateAutoApplyTime` | `03:00` | 自动更新时间，本地时区 `HH:MM` |
+
+`localPingResponse` 只匹配没有 system、tools、tool_choice、thinking、历史消息、output_config、WebSearch 或多模态内容的单轮纯文本 `ping`（忽略 ASCII 大小写和首尾空白），并返回标准 Anthropic message/SSE 与正常 usage。任何附加上下文都会继续走上游。若客户业务需要模型自由解释 `ping`，可设为 `false` 恢复完全上游行为。
 
 <a id="credentials"></a>
 ## 🔐 凭据

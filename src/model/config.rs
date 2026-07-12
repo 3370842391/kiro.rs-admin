@@ -319,6 +319,11 @@ pub struct Config {
     #[serde(default)]
     pub strict_thinking_validation: bool,
 
+    /// 是否把无 system/tools/thinking/历史/多模态的单轮 `ping` 作为本地健康检查，
+    /// 直接返回 `pong`。默认开启，可关闭以恢复完全上游行为。
+    #[serde(default = "default_true")]
+    pub local_ping_response: bool,
+
     /// 工具兼容模式。默认 `claude-code`：把 Claude Code 内置工具名/入参双向适配为
     /// Kiro 内置工具；`raw` 保留旧行为、直接透传客户端工具 schema，用于排障。
     #[serde(default = "default_tool_compatibility_mode")]
@@ -569,6 +574,7 @@ impl Default for Config {
             retry_policy: None,
             extract_thinking: default_extract_thinking(),
             strict_thinking_validation: false,
+            local_ping_response: default_true(),
             tool_compatibility_mode: default_tool_compatibility_mode(),
             default_endpoint: default_endpoint(),
             trace_enabled: default_trace_enabled(),
@@ -656,6 +662,20 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_ping_response_defaults_on_and_round_trips_in_camel_case() {
+        let defaulted: Config = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(defaulted.local_ping_response);
+
+        let disabled: Config = serde_json::from_value(serde_json::json!({
+            "localPingResponse": false
+        }))
+        .unwrap();
+        assert!(!disabled.local_ping_response);
+        let encoded = serde_json::to_value(disabled).unwrap();
+        assert_eq!(encoded["localPingResponse"], false);
+    }
 
     #[test]
     fn cache_policy_defaults_to_thirty_minutes() {

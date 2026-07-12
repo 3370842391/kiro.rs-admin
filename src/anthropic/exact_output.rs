@@ -150,6 +150,32 @@ fn conversation_has_non_text_content(req: &MessagesRequest) -> bool {
     })
 }
 
+pub(crate) fn local_ping_answer(req: &MessagesRequest, enabled: bool) -> Option<&'static str> {
+    if !enabled
+        || req.max_tokens < 1
+        || req.system.is_some()
+        || req.messages.len() != 1
+        || req.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+        || req.tool_choice.is_some()
+        || req
+            .thinking
+            .as_ref()
+            .is_some_and(|thinking| thinking.is_enabled())
+        || req.output_config.is_some()
+        || req.force_web_search_loop
+        || conversation_has_non_text_content(req)
+    {
+        return None;
+    }
+
+    let message = &req.messages[0];
+    (message.role == "user"
+        && message_text(&message.content)
+            .trim()
+            .eq_ignore_ascii_case("ping"))
+    .then_some("pong")
+}
+
 fn strip_matching_quote(value: &str) -> Option<&str> {
     let first = value.chars().next()?;
     if !matches!(first, '\'' | '"' | '`') || value.chars().last()? != first {
@@ -766,6 +792,80 @@ mod tests {
             );
             assert_eq!(exact_system_output(&req, ToolCompatibilityMode::Raw), None);
         }
+    }
+
+    #[test]
+    fn ping_contract_accepts_only_a_single_plain_health_message() {
+        assert_eq!(
+            local_ping_answer(&request(None, " ping "), true),
+            Some("pong")
+        );
+        assert_eq!(
+            local_ping_answer(&request(None, "PING"), true),
+            Some("pong")
+        );
+        assert_eq!(local_ping_answer(&request(None, "ping"), false), None);
+        assert_eq!(local_ping_answer(&request(None, "ping please"), true), None);
+    }
+
+    #[test]
+    fn ping_contract_rejects_context_tools_thinking_and_multimodal_content() {
+        let mut with_system = request(Some("Be concise."), "ping");
+        assert_eq!(local_ping_answer(&with_system, true), None);
+
+        let mut with_history = request(None, "ping");
+        with_history.messages.insert(
+            0,
+            serde_json::from_value(json!({"role": "assistant", "content": "ready"})).unwrap(),
+        );
+        assert_eq!(local_ping_answer(&with_history, true), None);
+
+        let mut with_tools = request(None, "ping");
+        with_tools.tools = Some(vec![
+            serde_json::from_value(json!({
+                "name": "noop",
+                "description": "noop",
+                "input_schema": {"type": "object"}
+            }))
+            .unwrap(),
+        ]);
+        assert_eq!(local_ping_answer(&with_tools, true), None);
+
+        let mut with_tool_choice = request(None, "ping");
+        with_tool_choice.tool_choice =
+            Some(serde_json::from_value(json!({"type": "none"})).unwrap());
+        assert_eq!(local_ping_answer(&with_tool_choice, true), None);
+
+        let mut with_thinking = request(None, "ping");
+        with_thinking.thinking = Some(super::super::types::Thinking {
+            thinking_type: "enabled".into(),
+            budget_tokens: 1024,
+        });
+        assert_eq!(local_ping_answer(&with_thinking, true), None);
+
+        let mut with_image = request(None, "ping");
+        with_image.messages[0].content = json!([
+            {"type": "text", "text": "ping"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}}
+        ]);
+        assert_eq!(local_ping_answer(&with_image, true), None);
+
+        let mut with_output_config = request(None, "ping");
+        with_output_config.output_config = Some(super::super::types::OutputConfig {
+            effort: "low".into(),
+        });
+        assert_eq!(local_ping_answer(&with_output_config, true), None);
+
+        let mut with_web_search = request(None, "ping");
+        with_web_search.force_web_search_loop = true;
+        assert_eq!(local_ping_answer(&with_web_search, true), None);
+
+        let mut without_budget = request(None, "ping");
+        without_budget.max_tokens = 0;
+        assert_eq!(local_ping_answer(&without_budget, true), None);
+
+        with_system.system = None;
+        assert_eq!(local_ping_answer(&with_system, true), Some("pong"));
     }
 
     #[test]

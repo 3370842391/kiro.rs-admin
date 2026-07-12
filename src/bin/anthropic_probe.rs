@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Instant;
 
 use base64::Engine as _;
 use futures::{StreamExt, future::join_all};
@@ -214,6 +215,25 @@ fn classify_strict_json_stream_capture(capture: &StreamCapture) -> ProbeResult {
         );
     }
     ProbeResult::Pass
+}
+
+fn coefficient_of_variation(samples: &[f64]) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+    if mean <= f64::EPSILON {
+        return 0.0;
+    }
+    let variance = samples
+        .iter()
+        .map(|sample| {
+            let delta = sample - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / samples.len() as f64;
+    variance.sqrt() / mean
 }
 
 fn passive_tools_system_request(model: &str, expected: &str) -> Value {
@@ -500,6 +520,44 @@ async fn strict_json_stream_probe(client: &reqwest::Client, args: &Args, key: &s
     }
 }
 
+async fn ping_health_probe(client: &reqwest::Client, args: &Args, key: &str) -> ProbeResult {
+    let mut latencies_ms = Vec::with_capacity(20);
+    for _ in 0..20 {
+        let started_at = Instant::now();
+        let response = post_message(
+            client,
+            args,
+            key,
+            json!({
+                "model": args.model,
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "ping"}]
+            }),
+        )
+        .await;
+        latencies_ms.push(started_at.elapsed().as_secs_f64() * 1000.0);
+        match response {
+            Ok(value) if classify_exact_text(&value, "pong") == ProbeResult::Pass => {}
+            Ok(value) => {
+                return ProbeResult::Fail(format!(
+                    "ping health response was not exactly pong: {value}"
+                ));
+            }
+            Err(error) => return ProbeResult::Fail(error),
+        }
+    }
+
+    let mean_ms = latencies_ms.iter().sum::<f64>() / latencies_ms.len() as f64;
+    let cv = coefficient_of_variation(&latencies_ms);
+    if cv > 0.25 {
+        ProbeResult::Fail(format!(
+            "ping health latency was unstable: mean_ms={mean_ms:.3} cv={cv:.3}"
+        ))
+    } else {
+        ProbeResult::Pass
+    }
+}
+
 async fn pdf_probe(client: &reqwest::Client, args: &Args, key: &str) -> ProbeResult {
     let bytes = match &args.pdf {
         Some(path) => match tokio::fs::read(path).await {
@@ -648,6 +706,10 @@ async fn main() {
         (
             "strict_json_stream",
             strict_json_stream_probe(&client, &args, &api_key).await,
+        ),
+        (
+            "ping_health",
+            ping_health_probe(&client, &args, &api_key).await,
         ),
         ("pdf", pdf_probe(&client, &args, &api_key).await),
         (
@@ -835,6 +897,13 @@ mod tests {
             classify_strict_json(&markdown),
             ProbeResult::Fail(_)
         ));
+    }
+
+    #[test]
+    fn latency_cv_is_zero_for_stable_samples() {
+        assert_eq!(coefficient_of_variation(&[10.0, 10.0, 10.0]), 0.0);
+        let cv = coefficient_of_variation(&[10.0, 11.0, 9.0]);
+        assert!(cv > 0.0 && cv < 0.1);
     }
 
     #[test]

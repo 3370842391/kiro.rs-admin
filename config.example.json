@@ -12,5 +12,6 @@
   "traceRetentionDays": 7,
   "usageLogRetentionDays": 31,
   "earlyStreamHandshake": false,
-  "strictThinkingValidation": false
+  "strictThinkingValidation": false,
+  "localPingResponse": true
 }

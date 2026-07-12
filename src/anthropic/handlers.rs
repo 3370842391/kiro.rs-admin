@@ -1094,6 +1094,71 @@ fn try_local_exact_user_response(
     }
 }
 
+fn try_local_ping_response(
+    state: &AppState,
+    provider: &crate::kiro::provider::KiroProvider,
+    payload: &MessagesRequest,
+    hook: &UsageRecordHook,
+) -> Option<Response> {
+    let answer = super::exact_output::local_ping_answer(payload, provider.local_ping_response())?;
+    let output_tokens = token::count_tokens(answer).max(1) as i32;
+    let input_tokens = token::count_all_tokens(
+        payload.model.clone(),
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
+    ) as i32;
+    let cache_usage = state
+        .cache_meter
+        .as_ref()
+        .map(|cache| {
+            let usage = super::cache_metering::compute_cache_usage(cache, payload, hook.key_id);
+            let (hr_min, hr_max) = provider.cache_hit_rate_bounds();
+            usage.with_hit_rate_bounds(hr_min, hr_max)
+        })
+        .unwrap_or_default();
+    let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
+        split_non_stream_usage(input_tokens, None, &cache_usage);
+
+    tracing::debug!(
+        input_tokens = final_input_tokens,
+        output_tokens,
+        stream = payload.stream,
+        "served bounded ping health response locally"
+    );
+    hook.record(
+        0,
+        final_input_tokens,
+        output_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+        0.0,
+        "success",
+    );
+
+    if payload.stream {
+        Some(local_text_stream_response(build_local_text_stream_events(
+            &payload.model,
+            answer,
+            input_tokens,
+            cache_usage,
+        )))
+    } else {
+        Some(
+            (
+                StatusCode::OK,
+                Json(build_local_text_message(
+                    &payload.model,
+                    answer,
+                    input_tokens,
+                    &cache_usage,
+                )),
+            )
+                .into_response(),
+        )
+    }
+}
+
 fn local_document_system_is_safe_to_bypass(
     payload: &MessagesRequest,
     mode: crate::model::config::ToolCompatibilityMode,
@@ -1564,6 +1629,10 @@ pub async fn post_messages(
         &hook,
         state.tool_compatibility_mode,
     ) {
+        return response;
+    }
+
+    if let Some(response) = try_local_ping_response(&state, provider.as_ref(), &payload, &hook) {
         return response;
     }
 
@@ -3077,6 +3146,10 @@ pub async fn post_messages_cc(
         &hook,
         state.tool_compatibility_mode,
     ) {
+        return response;
+    }
+
+    if let Some(response) = try_local_ping_response(&state, provider.as_ref(), &payload, &hook) {
         return response;
     }
 
