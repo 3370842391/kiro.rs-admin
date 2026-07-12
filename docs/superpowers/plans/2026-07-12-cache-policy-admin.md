@@ -300,12 +300,14 @@ compute_cache_usage 首先读取 policy：disabled 直接返回零覆盖；auto 
 #[test]
 fn lowering_capacity_evicts_lru_immediately() {
     let cache = CacheMeter::new(None);
-    cache.record(&[1, 2, 3], &[10, 20, 30], 1800);
+    let hashes: Vec<u64> = (0..257).collect();
+    let tokens = vec![10; hashes.len()];
+    cache.record(&hashes, &tokens, 1800);
     cache.update_policy(CachePolicy {
-        capacity: 2,
+        capacity: 256,
         ..CachePolicy::default()
     }).unwrap();
-    assert_eq!(cache.stats().active_entries, 2);
+    assert_eq!(cache.stats().active_entries, 256);
 }
 
 #[test]

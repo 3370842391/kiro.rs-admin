@@ -18,18 +18,52 @@
 //! 内存 + JSON 落盘：每分钟一次写到 `cache_dir/cache_metering.json`，启动时读
 //! 回过期记录会被丢掉。**不依赖 Redis 或任何外部 KV**。
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// 默认条目上限（防止内存无限增长）
-const DEFAULT_CAPACITY: usize = 4096;
 /// 最长 TTL（1h，与 Anthropic ttl="1h" 对齐）
 const MAX_TTL_SECS: i64 = 3600;
-/// 默认 TTL（5min，ephemeral 默认值）
-const DEFAULT_TTL_SECS: i64 = 5 * 60;
+
+pub const ALLOWED_TTL_SECS: [u64; 3] = [300, 1800, 3600];
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CachePolicy {
+    pub enabled: bool,
+    pub default_ttl_secs: u64,
+    pub auto_without_cache_control: bool,
+    pub capacity: usize,
+    pub flush_interval_secs: u64,
+}
+
+impl Default for CachePolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            default_ttl_secs: 1800,
+            auto_without_cache_control: true,
+            capacity: 4096,
+            flush_interval_secs: 60,
+        }
+    }
+}
+
+impl CachePolicy {
+    pub fn validate(self) -> anyhow::Result<Self> {
+        if !ALLOWED_TTL_SECS.contains(&self.default_ttl_secs) {
+            anyhow::bail!("cacheDefaultTtlSecs 只能是 300、1800 或 3600");
+        }
+        if !(256..=65_536).contains(&self.capacity) {
+            anyhow::bail!("cacheCapacity 必须在 256..=65536 内");
+        }
+        if !(10..=600).contains(&self.flush_interval_secs) {
+            anyhow::bail!("cacheFlushIntervalSecs 必须在 10..=600 内");
+        }
+        Ok(self)
+    }
+}
 
 /// 单个缓存条目
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,6 +221,8 @@ fn shape_hit_rate(
 /// 进程内提示词缓存
 pub struct CacheMeter {
     inner: Mutex<Inner>,
+    policy: RwLock<CachePolicy>,
+    policy_changed: tokio::sync::Notify,
     persist_path: Option<PathBuf>,
 }
 
@@ -195,11 +231,26 @@ struct Inner {
     entries: HashMap<u64, CacheEntry>,
     /// 自上次落盘后是否有变化
     dirty: bool,
+    generation: u64,
+    last_flush_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct CacheStats {
+    pub active_entries: usize,
+    pub capacity: usize,
+    pub dirty: bool,
+    pub last_flush_at: Option<i64>,
+    pub persist_enabled: bool,
 }
 
 impl CacheMeter {
     /// 创建一个空 cache。`persist_path` 为 `Some` 时会自动从该文件加载历史。
     pub fn new(persist_path: Option<PathBuf>) -> Self {
+        Self::with_policy(persist_path, CachePolicy::default())
+    }
+
+    pub fn with_policy(persist_path: Option<PathBuf>, policy: CachePolicy) -> Self {
         let mut inner = Inner::default();
         if let Some(path) = persist_path.as_ref() {
             if let Ok(bytes) = std::fs::read(path) {
@@ -218,9 +269,47 @@ impl CacheMeter {
                 }
             }
         }
+        evict_lru_locked(&mut inner, policy.capacity);
         Self {
             inner: Mutex::new(inner),
+            policy: RwLock::new(policy),
+            policy_changed: tokio::sync::Notify::new(),
             persist_path,
+        }
+    }
+
+    pub fn policy(&self) -> CachePolicy {
+        *self.policy.read()
+    }
+
+    pub fn update_policy(&self, policy: CachePolicy) -> anyhow::Result<CachePolicy> {
+        let policy = policy.validate()?;
+        {
+            let mut current = self.policy.write();
+            *current = policy;
+        }
+        {
+            let mut inner = self.inner.lock();
+            let before = inner.entries.len();
+            evict_lru_locked(&mut inner, policy.capacity);
+            if inner.entries.len() != before {
+                inner.generation = inner.generation.wrapping_add(1);
+                inner.dirty = self.persist_path.is_some();
+            }
+        }
+        self.policy_changed.notify_one();
+        Ok(policy)
+    }
+
+    pub fn stats(&self) -> CacheStats {
+        let policy = self.policy();
+        let inner = self.inner.lock();
+        CacheStats {
+            active_entries: inner.entries.len(),
+            capacity: policy.capacity,
+            dirty: inner.dirty,
+            last_flush_at: inner.last_flush_at,
+            persist_enabled: self.persist_path.is_some(),
         }
     }
 
@@ -250,6 +339,7 @@ impl CacheMeter {
     pub fn record(&self, segment_hashes: &[u64], segment_tokens: &[u32], ttl_secs: i64) {
         debug_assert_eq!(segment_hashes.len(), segment_tokens.len());
         let ttl = ttl_secs.clamp(60, MAX_TTL_SECS);
+        let capacity = self.policy().capacity;
         let now = now_secs();
         let expires_at = now + ttl;
         let mut inner = self.inner.lock();
@@ -263,61 +353,67 @@ impl CacheMeter {
                 },
             );
         }
-        inner.dirty = true;
+        inner.generation = inner.generation.wrapping_add(1);
+        inner.dirty = self.persist_path.is_some();
         // 容量超限：按 last_hit_at 淘汰最旧的若干条
-        if inner.entries.len() > DEFAULT_CAPACITY {
-            let drop_n = inner.entries.len() - DEFAULT_CAPACITY;
-            let mut victims: Vec<(u64, i64)> = inner
-                .entries
-                .iter()
-                .map(|(k, v)| (*k, v.last_hit_at))
-                .collect();
-            victims.sort_by_key(|x| x.1);
-            for (k, _) in victims.into_iter().take(drop_n) {
-                inner.entries.remove(&k);
-            }
-        }
+        evict_lru_locked(&mut inner, capacity);
     }
 
     /// 把当前快照写到 persist_path（仅在 dirty 时实际落盘）
-    pub fn flush_to_disk(&self) {
+    pub fn flush_to_disk(&self) -> anyhow::Result<()> {
         let path = match self.persist_path.clone() {
             Some(p) => p,
-            None => return,
+            None => return Ok(()),
         };
-        let snapshot = {
-            let mut inner = self.inner.lock();
+        let (snapshot, generation) = {
+            let inner = self.inner.lock();
             if !inner.dirty {
-                return;
+                return Ok(());
             }
-            inner.dirty = false;
-            inner.entries.clone()
+            (inner.entries.clone(), inner.generation)
         };
-        let json = match serde_json::to_vec(&snapshot) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!("CacheMeter 序列化失败: {}", e);
-                return;
-            }
-        };
+        let json = serde_json::to_vec(&snapshot)?;
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent)?;
         }
-        if let Err(e) = std::fs::write(&path, json) {
-            tracing::warn!("CacheMeter 落盘失败 {}: {}", path.display(), e);
+        std::fs::write(&path, json)?;
+        let mut inner = self.inner.lock();
+        inner.last_flush_at = Some(now_secs());
+        if inner.generation == generation {
+            inner.dirty = false;
         }
+        Ok(())
+    }
+
+    pub fn clear(&self) -> anyhow::Result<usize> {
+        let cleared = {
+            let mut inner = self.inner.lock();
+            let cleared = inner.entries.len();
+            inner.entries.clear();
+            inner.generation = inner.generation.wrapping_add(1);
+            inner.dirty = self.persist_path.is_some();
+            cleared
+        };
+        self.flush_to_disk()?;
+        Ok(cleared)
     }
 
     /// 启动后台周期任务：定期 flush + 清理过期条目
     pub fn spawn_background(self: Arc<Self>) {
         let weak = Arc::downgrade(&self);
         tokio::spawn(async move {
-            let interval = std::time::Duration::from_secs(60);
             loop {
-                tokio::time::sleep(interval).await;
                 let Some(cache) = weak.upgrade() else { return };
-                cache.evict_expired();
-                cache.flush_to_disk();
+                let delay = std::time::Duration::from_secs(cache.policy().flush_interval_secs);
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {
+                        cache.evict_expired();
+                        if let Err(error) = cache.flush_to_disk() {
+                            tracing::warn!(%error, "CacheMeter 后台落盘失败");
+                        }
+                    }
+                    _ = cache.policy_changed.notified() => continue,
+                }
             }
         });
     }
@@ -330,7 +426,8 @@ impl CacheMeter {
         let before = inner.entries.len();
         inner.entries.retain(|_, v| v.expires_at > now);
         if inner.entries.len() != before {
-            inner.dirty = true;
+            inner.generation = inner.generation.wrapping_add(1);
+            inner.dirty = self.persist_path.is_some();
         }
     }
 
@@ -348,13 +445,40 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// 解析 cache_control 的 ttl 字符串（"5m" / "1h"）→ 秒
-pub fn parse_ttl(ttl: Option<&str>) -> i64 {
-    match ttl {
-        Some(s) if s.eq_ignore_ascii_case("1h") => 3600,
-        Some(s) if s.eq_ignore_ascii_case("5m") => 300,
-        _ => DEFAULT_TTL_SECS,
+/// 解析受支持的显式 cache_control TTL。
+pub fn parse_explicit_ttl(value: &str) -> Option<u64> {
+    if value.eq_ignore_ascii_case("5m") {
+        return Some(300);
     }
+    if value.eq_ignore_ascii_case("30m") {
+        return Some(1800);
+    }
+    if value.eq_ignore_ascii_case("1h") {
+        return Some(3600);
+    }
+    None
+}
+
+fn evict_lru_locked(inner: &mut Inner, capacity: usize) {
+    if inner.entries.len() <= capacity {
+        return;
+    }
+    let drop_n = inner.entries.len() - capacity;
+    let mut victims: Vec<(u64, i64)> = inner
+        .entries
+        .iter()
+        .map(|(key, value)| (*key, value.last_hit_at))
+        .collect();
+    victims.sort_by_key(|(_, last_hit_at)| *last_hit_at);
+    for (key, _) in victims.into_iter().take(drop_n) {
+        inner.entries.remove(&key);
+    }
+}
+
+/// 兼容旧调用：无显式值或值无效时使用新的 30 分钟默认值。
+pub fn parse_ttl(ttl: Option<&str>) -> i64 {
+    ttl.and_then(parse_explicit_ttl)
+        .unwrap_or(CachePolicy::default().default_ttl_secs) as i64
 }
 
 /// `Arc<CacheMeter>` 别名
@@ -399,7 +523,12 @@ struct Segment {
 /// 请求 metadata 里的 session，否则退回 key_id），使不同会话 / 不同客户端 Key 的
 /// 缓存互不命中——同一前缀只在同一会话内复用。
 pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u64) -> CacheUsage {
-    let (segments, prompt_total_est) = extract_segments(req, key_id);
+    let policy = cache.policy();
+    if !policy.enabled || (!policy.auto_without_cache_control && !request_has_cache_control(req)) {
+        return CacheUsage::default();
+    }
+
+    let (segments, prompt_total_est) = extract_segments(req, key_id, policy);
     if segments.is_empty() {
         // 无断点：仍带出 prompt_total_est 以便调用方将来扩展，但 covered=0 → 全入 input。
         return CacheUsage {
@@ -465,7 +594,11 @@ pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u6
 ///
 /// `key_id` 用于会话隔离：哈希以一个隔离种子起头（优先用 metadata session，否则
 /// key_id），种子不计入 token，只让不同会话的同前缀产生不同 hash → 互不命中。
-fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
+fn extract_segments(
+    req: &MessagesRequest,
+    key_id: u64,
+    policy: CachePolicy,
+) -> (Vec<Segment>, u32) {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     let mut cum_tokens: u32 = 0;
@@ -521,8 +654,8 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
     // tool_result 也是 role=user，锚点每轮指向不同物理消息，前缀永不对齐，
     // 导致 cache_read 恒为 0、全部记成 creation。
 
-    // 统一 ttl：探测整个请求里出现过的最大 cache_control.ttl，否则默认 5m。
-    let ttl = detect_max_ttl(req);
+    // 统一 ttl：客户端显式值优先，否则使用当前默认策略。
+    let ttl = effective_ttl(req, policy) as i64;
 
     // 1. tools（全部喂入，作为前缀基础的一部分；工具定义跨轮稳定）。
     if let Some(tools) = req.tools.as_ref() {
@@ -659,39 +792,63 @@ fn extract_session_id(user_id: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// 探测请求里出现过的最大 cache_control.ttl（"1h" 优先于 "5m"）；
-/// 无任何 cache_control 时返回默认 5m。决定写入缓存段的存活时长。
-fn detect_max_ttl(req: &MessagesRequest) -> i64 {
-    let mut ttl = DEFAULT_TTL_SECS;
-    let mut bump = |cc: Option<&CacheControl>| {
-        if let Some(cc) = cc {
-            ttl = ttl.max(parse_ttl(cc.ttl.as_deref()));
+fn request_has_cache_control(req: &MessagesRequest) -> bool {
+    req.tools
+        .as_ref()
+        .is_some_and(|tools| tools.iter().any(|tool| tool.cache_control.is_some()))
+        || req
+            .system
+            .as_ref()
+            .is_some_and(|systems| systems.iter().any(|system| system.cache_control.is_some()))
+        || req.messages.iter().any(|message| {
+            message.content.as_array().is_some_and(|blocks| {
+                blocks
+                    .iter()
+                    .any(|block| block.get("cache_control").is_some())
+            })
+        })
+}
+
+/// 客户端显式 TTL 优先；多个显式 TTL 延续现有语义，取最大值。
+/// 没有受支持的显式 TTL 时使用管理策略默认值。
+pub fn effective_ttl(req: &MessagesRequest, policy: CachePolicy) -> u64 {
+    let mut explicit = Vec::new();
+    let mut collect = |cc: Option<&CacheControl>| {
+        if let Some(ttl) = cc
+            .and_then(|control| control.ttl.as_deref())
+            .and_then(parse_explicit_ttl)
+        {
+            explicit.push(ttl);
         }
     };
     if let Some(tools) = req.tools.as_ref() {
-        for t in tools {
-            bump(t.cache_control.as_ref());
+        for tool in tools {
+            collect(tool.cache_control.as_ref());
         }
     }
     if let Some(systems) = req.system.as_ref() {
-        for sys in systems {
-            bump(sys.cache_control.as_ref());
+        for system in systems {
+            collect(system.cache_control.as_ref());
         }
     }
-    for msg in &req.messages {
-        if let serde_json::Value::Array(arr) = &msg.content {
-            for v in arr {
-                if let Some(t) = v
+    for message in &req.messages {
+        if let serde_json::Value::Array(blocks) = &message.content {
+            for block in blocks {
+                if let Some(ttl) = block
                     .get("cache_control")
                     .and_then(|cc| cc.get("ttl"))
-                    .and_then(|t| t.as_str())
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(parse_explicit_ttl)
                 {
-                    ttl = ttl.max(parse_ttl(Some(t)));
+                    explicit.push(ttl);
                 }
             }
         }
     }
-    ttl
+    explicit
+        .into_iter()
+        .max()
+        .unwrap_or(policy.default_ttl_secs)
 }
 
 fn tool_signature(t: &Tool) -> String {
@@ -800,9 +957,10 @@ mod tests {
     #[test]
     fn parse_ttl_handles_known_values() {
         assert_eq!(parse_ttl(Some("1h")), 3600);
+        assert_eq!(parse_ttl(Some("30m")), 1800);
         assert_eq!(parse_ttl(Some("5m")), 300);
-        assert_eq!(parse_ttl(None), 300);
-        assert_eq!(parse_ttl(Some("garbage")), 300);
+        assert_eq!(parse_ttl(None), 1800);
+        assert_eq!(parse_ttl(Some("garbage")), 1800);
     }
 
     #[test]
@@ -810,7 +968,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("kiro-pc-{}.json", now_secs()));
         let cache = CacheMeter::new(Some(tmp.clone()));
         cache.record(&[7], &[42], 600);
-        cache.flush_to_disk();
+        cache.flush_to_disk().unwrap();
 
         let cache2 = CacheMeter::new(Some(tmp.clone()));
         let r = cache2.lookup(&[7], &[42]);
@@ -843,6 +1001,61 @@ mod tests {
             output_config: None,
             metadata: None,
         }
+    }
+
+    fn request_with_ttl(ttl: Option<&str>) -> super::super::types::MessagesRequest {
+        let mut request = build_request_with_system_breakpoint();
+        request.system.as_mut().unwrap()[0].cache_control = Some(CacheControl {
+            cache_type: "ephemeral".to_string(),
+            ttl: ttl.map(str::to_string),
+        });
+        request
+    }
+
+    fn request_with_system_ttls(ttls: &[&str]) -> super::super::types::MessagesRequest {
+        let mut request = build_request_with_system_breakpoint();
+        request.system = Some(
+            ttls.iter()
+                .map(|ttl| SystemMessage {
+                    text: format!("stable system block {ttl} ").repeat(40),
+                    cache_control: Some(CacheControl {
+                        cache_type: "ephemeral".to_string(),
+                        ttl: Some((*ttl).to_string()),
+                    }),
+                })
+                .collect(),
+        );
+        request
+    }
+
+    #[test]
+    fn cache_policy_supports_five_thirty_and_sixty_minutes() {
+        assert_eq!(parse_explicit_ttl("5m"), Some(300));
+        assert_eq!(parse_explicit_ttl("30m"), Some(1800));
+        assert_eq!(parse_explicit_ttl("1h"), Some(3600));
+        assert_eq!(parse_explicit_ttl("garbage"), None);
+    }
+
+    #[test]
+    fn explicit_five_minutes_overrides_default_thirty_minutes() {
+        assert_eq!(
+            effective_ttl(&request_with_ttl(Some("5m")), CachePolicy::default()),
+            300
+        );
+    }
+
+    #[test]
+    fn missing_ttl_uses_default_thirty_minutes() {
+        assert_eq!(
+            effective_ttl(&request_with_ttl(None), CachePolicy::default()),
+            1800
+        );
+    }
+
+    #[test]
+    fn multiple_explicit_ttls_use_largest_explicit_value() {
+        let request = request_with_system_ttls(&["5m", "1h"]);
+        assert_eq!(effective_ttl(&request, CachePolicy::default()), 3600);
     }
 
     #[test]
@@ -1162,6 +1375,70 @@ mod tests {
             output_config: None,
             metadata: None,
         }
+    }
+
+    #[test]
+    fn disabled_policy_does_not_read_or_write_cache() {
+        let cache = CacheMeter::with_policy(
+            None,
+            CachePolicy {
+                enabled: false,
+                ..CachePolicy::default()
+            },
+        );
+        let request = build_request_with_system_breakpoint();
+        let first = compute_cache_usage(&cache, &request, 1);
+        let second = compute_cache_usage(&cache, &request, 1);
+        assert_eq!(first.cache_covered_est, 0);
+        assert_eq!(second.cache_read, 0);
+        assert_eq!(cache.stats().active_entries, 0);
+    }
+
+    #[test]
+    fn auto_without_control_can_be_disabled() {
+        let cache = CacheMeter::with_policy(
+            None,
+            CachePolicy {
+                auto_without_cache_control: false,
+                ..CachePolicy::default()
+            },
+        );
+        let request = req_with_messages(vec![
+            msg_with_cc("user", "first", false),
+            msg_with_cc("assistant", "second", false),
+            msg_with_cc("user", "third", false),
+        ]);
+        assert_eq!(
+            compute_cache_usage(&cache, &request, 1).cache_covered_est,
+            0
+        );
+    }
+
+    #[test]
+    fn lowering_capacity_evicts_lru_immediately() {
+        let cache = CacheMeter::new(None);
+        let hashes: Vec<u64> = (0..257).collect();
+        let tokens = vec![10; hashes.len()];
+        cache.record(&hashes, &tokens, 1800);
+        cache
+            .update_policy(CachePolicy {
+                capacity: 256,
+                ..CachePolicy::default()
+            })
+            .unwrap();
+        assert_eq!(cache.stats().active_entries, 256);
+    }
+
+    #[test]
+    fn clear_removes_memory_and_persisted_entries() {
+        let path =
+            std::env::temp_dir().join(format!("kiro-cache-clear-{}.json", uuid::Uuid::new_v4()));
+        let cache = CacheMeter::new(Some(path.clone()));
+        cache.record(&[7], &[42], 1800);
+        assert_eq!(cache.clear().unwrap(), 1);
+        assert_eq!(cache.stats().active_entries, 0);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
+        let _ = std::fs::remove_file(path);
     }
 
     /// 模拟 Claude Code 真实工具调用序列：tool_use(assistant) / tool_result(user)
