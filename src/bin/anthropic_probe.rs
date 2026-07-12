@@ -196,6 +196,26 @@ fn classify_strict_json_sse(events: &[Value]) -> ProbeResult {
     classify_strict_json(&json!({"content": [{"type": "text", "text": text}]}))
 }
 
+#[derive(Debug)]
+struct StreamCapture {
+    events: Vec<Value>,
+    transport_yields: usize,
+}
+
+fn classify_strict_json_stream_capture(capture: &StreamCapture) -> ProbeResult {
+    let classified = classify_strict_json_sse(&capture.events);
+    if !matches!(classified, ProbeResult::Pass) {
+        return classified;
+    }
+    if capture.transport_yields < 2 {
+        return ProbeResult::Fail(
+            "strict JSON SSE arrived in one transport yield; intermediary buffering is suspected"
+                .into(),
+        );
+    }
+    ProbeResult::Pass
+}
+
 fn passive_tools_system_request(model: &str, expected: &str) -> Value {
     json!({
         "model": model,
@@ -261,7 +281,7 @@ async fn post_stream_events(
     args: &Args,
     api_key: &str,
     body: Value,
-) -> Result<Vec<Value>, String> {
+) -> Result<StreamCapture, String> {
     let response = client
         .post(format!(
             "{}/v1/messages",
@@ -281,8 +301,10 @@ async fn post_stream_events(
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
     let mut events = Vec::new();
+    let mut transport_yields = 0usize;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| error.to_string())?;
+        transport_yields += 1;
         buffer.push_str(&String::from_utf8_lossy(&chunk));
         while let Some(pos) = buffer.find("\n\n") {
             let frame = buffer[..pos].to_string();
@@ -299,7 +321,10 @@ async fn post_stream_events(
     if !buffer.trim().is_empty() {
         return Err("SSE response ended with an incomplete frame".into());
     }
-    Ok(events)
+    Ok(StreamCapture {
+        events,
+        transport_yields,
+    })
 }
 
 async fn thinking_probe(client: &reqwest::Client, args: &Args, key: &str) -> ProbeResult {
@@ -470,7 +495,7 @@ async fn strict_json_stream_probe(client: &reqwest::Client, args: &Args, key: &s
     )
     .await
     {
-        Ok(events) => classify_strict_json_sse(&events),
+        Ok(capture) => classify_strict_json_stream_capture(&capture),
         Err(error) => ProbeResult::Fail(error),
     }
 }
@@ -572,7 +597,7 @@ async fn stream_probe(client: &reqwest::Client, args: &Args, key: &str) -> Probe
     )
     .await
     {
-        Ok(events) => classify_sse(&events),
+        Ok(capture) => classify_sse(&capture.events),
         Err(error) => ProbeResult::Fail(error),
     }
 }
@@ -767,6 +792,32 @@ mod tests {
         assert_eq!(classify_strict_json_sse(&events), ProbeResult::Pass);
         assert!(matches!(
             classify_strict_json_sse(&events[..5]),
+            ProbeResult::Fail(_)
+        ));
+    }
+
+    #[test]
+    fn strict_json_stream_capture_requires_multiple_transport_yields() {
+        let events = vec![
+            json!({"type": "message_start"}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "{\"a\":\"ztset\",\"b\":37,\"c\":\"PROBE-JSON\"}"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}}),
+            json!({"type": "message_stop"}),
+        ];
+        assert_eq!(
+            classify_strict_json_stream_capture(&StreamCapture {
+                events: events.clone(),
+                transport_yields: 2,
+            }),
+            ProbeResult::Pass
+        );
+        assert!(matches!(
+            classify_strict_json_stream_capture(&StreamCapture {
+                events,
+                transport_yields: 1,
+            }),
             ProbeResult::Fail(_)
         ));
     }

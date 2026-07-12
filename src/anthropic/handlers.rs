@@ -528,16 +528,24 @@ fn local_text_stream_chunks(events: Vec<SseEvent>) -> Vec<Bytes> {
         .collect()
 }
 
+const LOCAL_SSE_EVENT_DELAY: Duration = Duration::from_millis(2);
+
 fn local_text_stream_response(events: Vec<SseEvent>) -> Response {
-    let body_stream = stream::iter(
-        local_text_stream_chunks(events)
-            .into_iter()
-            .map(Ok::<_, Infallible>),
+    let body_stream = stream::unfold(
+        (local_text_stream_chunks(events).into_iter(), true),
+        |(mut chunks, first)| async move {
+            let chunk = chunks.next()?;
+            if !first {
+                tokio::time::sleep(LOCAL_SSE_EVENT_DELAY).await;
+            }
+            Some((Ok::<_, Infallible>(chunk), (chunks, false)))
+        },
     );
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::CACHE_CONTROL, "no-cache, no-transform")
+        .header("x-accel-buffering", "no")
         .header(header::CONNECTION, "keep-alive")
         .body(Body::from_stream(body_stream))
         .unwrap()
@@ -3825,6 +3833,41 @@ mod tests {
             .await;
         assert_eq!(body_chunks.len(), 6);
         assert!(body_chunks.into_iter().all(|chunk| chunk.is_ok()));
+    }
+
+    #[test]
+    fn local_text_stream_sets_anti_buffering_headers() {
+        let response = local_text_stream_response(build_local_text_stream_events(
+            "claude-opus-4-8",
+            "PACE-42",
+            42,
+            crate::anthropic::cache_metering::CacheUsage::default(),
+        ));
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "no-cache, no-transform"
+        );
+        assert_eq!(response.headers()["x-accel-buffering"], "no");
+        assert!(response.headers().get(header::CONTENT_LENGTH).is_none());
+    }
+
+    #[tokio::test]
+    async fn local_text_stream_inserts_a_pending_boundary_between_events() {
+        use futures::FutureExt;
+
+        let response = local_text_stream_response(build_local_text_stream_events(
+            "claude-opus-4-8",
+            "PACE-42",
+            42,
+            crate::anthropic::cache_metering::CacheUsage::default(),
+        ));
+        let mut chunks = response.into_body().into_data_stream();
+        assert!(chunks.next().await.unwrap().is_ok());
+        assert!(
+            chunks.next().now_or_never().is_none(),
+            "第二个本地 SSE 事件必须先产生调度边界"
+        );
+        assert!(chunks.next().await.unwrap().is_ok());
     }
 
     #[test]
