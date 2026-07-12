@@ -74,15 +74,61 @@ fn classify_thinking(response: &Value) -> ProbeResult {
 }
 
 fn classify_required_tool(response: &Value, name: &str) -> ProbeResult {
-    let has = response["content"].as_array().is_some_and(|blocks| {
-        blocks
-            .iter()
-            .any(|block| block["type"] == "tool_use" && block["name"].as_str() == Some(name))
+    let first_non_thinking = response["content"].as_array().and_then(|blocks| {
+        blocks.iter().find(|block| {
+            !matches!(
+                block["type"].as_str(),
+                Some("thinking" | "redacted_thinking")
+            )
+        })
     });
-    if has && response["stop_reason"] == "tool_use" {
+    let first_is_required_tool = first_non_thinking
+        .is_some_and(|block| block["type"] == "tool_use" && block["name"].as_str() == Some(name));
+    if first_is_required_tool && response["stop_reason"] == "tool_use" {
         ProbeResult::Pass
     } else {
-        ProbeResult::Fail(format!("response did not call required tool {name}"))
+        ProbeResult::Fail(format!(
+            "required tool {name} was not the first non-thinking content block"
+        ))
+    }
+}
+
+fn classify_exact_text(response: &Value, expected: &str) -> ProbeResult {
+    let Some(blocks) = response["content"].as_array() else {
+        return ProbeResult::Fail("response content is not an array".into());
+    };
+    if blocks.len() == 1
+        && blocks[0]["type"] == "text"
+        && blocks[0]["text"].as_str() == Some(expected)
+    {
+        ProbeResult::Pass
+    } else {
+        ProbeResult::Fail(format!("response was not exactly {expected:?}"))
+    }
+}
+
+fn classify_strict_json(response: &Value) -> ProbeResult {
+    let Some(text) = response["content"]
+        .as_array()
+        .filter(|blocks| blocks.len() == 1)
+        .and_then(|blocks| blocks[0]["text"].as_str())
+    else {
+        return ProbeResult::Fail("strict JSON response was not one text block".into());
+    };
+    if text.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return ProbeResult::Fail("strict JSON response was not minified".into());
+    }
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return ProbeResult::Fail("strict JSON response was not valid JSON".into());
+    };
+    if value["a"] == "ztset"
+        && value["b"] == 37
+        && value["c"] == "PROBE-JSON"
+        && value.as_object().is_some_and(|object| object.len() == 3)
+    {
+        ProbeResult::Pass
+    } else {
+        ProbeResult::Fail("strict JSON response did not satisfy expected fields".into())
     }
 }
 
@@ -175,6 +221,49 @@ async fn tool_probe(client: &reqwest::Client, args: &Args, key: &str) -> ProbeRe
     .await
     {
         Ok(value) => classify_required_tool(&value, name),
+        Err(error) => ProbeResult::Fail(error),
+    }
+}
+
+async fn exact_system_probe(client: &reqwest::Client, args: &Args, key: &str) -> ProbeResult {
+    let expected = "SYSTEM_EXACT_42";
+    match post_message(
+        client,
+        args,
+        key,
+        json!({
+            "model": args.model,
+            "max_tokens": 64,
+            "system": format!(
+                "Respond to every user message with exactly the single word '{expected}' and nothing else. No explanation or markdown."
+            ),
+            "messages": [{"role": "user", "content": "hello"}]
+        }),
+    )
+    .await
+    {
+        Ok(value) => classify_exact_text(&value, expected),
+        Err(error) => ProbeResult::Fail(error),
+    }
+}
+
+async fn strict_json_probe(client: &reqwest::Client, args: &Args, key: &str) -> ProbeResult {
+    match post_message(
+        client,
+        args,
+        key,
+        json!({
+            "model": args.model,
+            "max_tokens": 128,
+            "messages": [{
+                "role": "user",
+                "content": "You must reply with exactly one minified JSON object and no markdown, no explanation. Schema: {\"a\": string, \"b\": number, \"c\": string}. Set a to the reverse of 'testz'. Set b to 29 + 8. Set c to 'PROBE-JSON'."
+            }]
+        }),
+    )
+    .await
+    {
+        Ok(value) => classify_strict_json(&value),
         Err(error) => ProbeResult::Fail(error),
     }
 }
@@ -332,6 +421,14 @@ async fn main() {
     let results = [
         ("thinking", thinking_probe(&client, &args, &api_key).await),
         ("tool_choice", tool_probe(&client, &args, &api_key).await),
+        (
+            "system_exact",
+            exact_system_probe(&client, &args, &api_key).await,
+        ),
+        (
+            "strict_json",
+            strict_json_probe(&client, &args, &api_key).await,
+        ),
         ("pdf", pdf_probe(&client, &args, &api_key).await),
         (
             "parallel_canary",
@@ -389,6 +486,47 @@ mod tests {
             classify_required_tool(&response, "probe_echo"),
             ProbeResult::Pass
         );
+
+        let text_first = json!({
+            "content": [
+                {"type": "text", "text": "I will call it."},
+                {"type": "tool_use", "name": "probe_echo", "input": {"value": "x"}}
+            ],
+            "stop_reason": "tool_use"
+        });
+        assert!(matches!(
+            classify_required_tool(&text_first, "probe_echo"),
+            ProbeResult::Fail(_)
+        ));
+    }
+
+    #[test]
+    fn exact_system_classifier_requires_only_the_expected_text() {
+        let correct = json!({"content": [{"type":"text","text":"SYSTEM_EXACT_42"}]});
+        let explanatory = json!({"content": [{"type":"text","text":"Answer: SYSTEM_EXACT_42"}]});
+        assert_eq!(
+            classify_exact_text(&correct, "SYSTEM_EXACT_42"),
+            ProbeResult::Pass
+        );
+        assert!(matches!(
+            classify_exact_text(&explanatory, "SYSTEM_EXACT_42"),
+            ProbeResult::Fail(_)
+        ));
+    }
+
+    #[test]
+    fn strict_json_classifier_checks_minified_schema_values() {
+        let correct = json!({
+            "content": [{"type":"text","text":"{\"a\":\"ztset\",\"b\":37,\"c\":\"PROBE-JSON\"}"}]
+        });
+        let markdown = json!({
+            "content": [{"type":"text","text":"```json\n{\"a\":\"ztset\",\"b\":37,\"c\":\"PROBE-JSON\"}\n```"}]
+        });
+        assert_eq!(classify_strict_json(&correct), ProbeResult::Pass);
+        assert!(matches!(
+            classify_strict_json(&markdown),
+            ProbeResult::Fail(_)
+        ));
     }
 
     #[test]
