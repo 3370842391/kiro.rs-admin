@@ -1788,7 +1788,22 @@ async fn handle_non_stream_request(
         &known_tool_names,
         &tool_name_map,
     );
-    if let Err(message) = validate_required_thinking(require_thinking, &content) {
+    let strict_thinking_validation = provider.strict_thinking_validation();
+    if require_thinking
+        && !strict_thinking_validation
+        && !content_has_reasoning(&content)
+    {
+        tracing::warn!(
+            model,
+            credential_id,
+            "客户端请求了 thinking，但 Kiro 未返回 reasoning；保留有效正文或工具调用"
+        );
+    }
+    if let Err(message) = validate_required_thinking(
+        require_thinking,
+        strict_thinking_validation,
+        &content,
+    ) {
         hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
         tracer.finalize(
             "error",
@@ -1936,21 +1951,26 @@ fn validate_non_stream_content(content: &[serde_json::Value]) -> Result<(), &'st
 
 fn validate_required_thinking(
     thinking_enabled: bool,
+    strict_validation: bool,
     content: &[serde_json::Value],
 ) -> Result<(), &'static str> {
-    if !thinking_enabled {
+    if !thinking_enabled || !strict_validation {
         return Ok(());
     }
-    if content.iter().any(|block| {
-        matches!(
-            block.get("type").and_then(serde_json::Value::as_str),
-            Some("thinking" | "redacted_thinking")
-        )
-    }) {
+    if content_has_reasoning(content) {
         Ok(())
     } else {
         Err("client requested thinking but upstream produced no thinking content")
     }
+}
+
+fn content_has_reasoning(content: &[serde_json::Value]) -> bool {
+    content.iter().any(|block| {
+        matches!(
+            block.get("type").and_then(serde_json::Value::as_str),
+            Some("thinking" | "redacted_thinking")
+        )
+    })
 }
 
 fn validate_tool_choice_content(
@@ -2742,9 +2762,15 @@ mod tests {
     }
 
     #[test]
-    fn enabled_thinking_rejects_plain_text_without_reasoning_block() {
+    fn compatible_thinking_accepts_plain_text_without_reasoning_block() {
         let content = vec![serde_json::json!({"type": "text", "text": "plain"})];
-        assert!(validate_required_thinking(true, &content).is_err());
+        assert!(validate_required_thinking(true, false, &content).is_ok());
+    }
+
+    #[test]
+    fn strict_thinking_rejects_plain_text_without_reasoning_block() {
+        let content = vec![serde_json::json!({"type": "text", "text": "plain"})];
+        assert!(validate_required_thinking(true, true, &content).is_err());
     }
 
     #[test]
@@ -2762,7 +2788,7 @@ mod tests {
             "type": "redacted_thinking",
             "data": "encrypted"
         })];
-        assert!(validate_required_thinking(true, &content).is_ok());
+        assert!(validate_required_thinking(true, true, &content).is_ok());
     }
 
     #[test]
