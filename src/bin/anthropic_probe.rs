@@ -236,6 +236,14 @@ fn coefficient_of_variation(samples: &[f64]) -> f64 {
     variance.sqrt() / mean
 }
 
+fn ping_latency_is_acceptable(samples: &[f64]) -> bool {
+    if samples.is_empty() {
+        return false;
+    }
+    let mean_ms = samples.iter().sum::<f64>() / samples.len() as f64;
+    mean_ms < 50.0 || coefficient_of_variation(samples) <= 0.25
+}
+
 fn passive_tools_system_request(model: &str, expected: &str) -> Value {
     json!({
         "model": model,
@@ -549,7 +557,7 @@ async fn ping_health_probe(client: &reqwest::Client, args: &Args, key: &str) -> 
 
     let mean_ms = latencies_ms.iter().sum::<f64>() / latencies_ms.len() as f64;
     let cv = coefficient_of_variation(&latencies_ms);
-    if cv > 0.25 {
+    if !ping_latency_is_acceptable(&latencies_ms) {
         ProbeResult::Fail(format!(
             "ping health latency was unstable: mean_ms={mean_ms:.3} cv={cv:.3}"
         ))
@@ -904,6 +912,13 @@ mod tests {
         assert_eq!(coefficient_of_variation(&[10.0, 10.0, 10.0]), 0.0);
         let cv = coefficient_of_variation(&[10.0, 11.0, 9.0]);
         assert!(cv > 0.0 && cv < 0.1);
+    }
+
+    #[test]
+    fn ping_latency_accepts_fast_samples_and_rejects_slow_unstable_samples() {
+        assert!(ping_latency_is_acceptable(&[1.0, 3.0, 8.0, 2.0]));
+        assert!(ping_latency_is_acceptable(&[60.0, 61.0, 59.0]));
+        assert!(!ping_latency_is_acceptable(&[50.0, 100.0, 200.0]));
     }
 
     #[test]

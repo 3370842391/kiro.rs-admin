@@ -303,7 +303,7 @@ pub(crate) fn local_ping_answer(req: &MessagesRequest, enabled: bool) -> Option<
 
 - [ ] **Step 6: Extend probe and docs**
 
-probe 增加 `ping_health`：连续 20 次发送单条 `ping`，每次必须精确得到 `pong`；记录毫秒延迟并计算 CV，CV > 0.25 时失败并报告 mean/CV。README 和 config.example.json 说明默认开启、只匹配无 system/tools/thinking/历史/多模态的单轮 ping，设 `localPingResponse=false` 可关闭。
+probe 增加 `ping_health`：连续 20 次发送单条 `ping`，每次必须精确得到 `pong`；记录毫秒延迟并计算 CV。均值低于 50ms 时按绝对快速通过，避免本地亚 10ms 调度抖动放大相对 CV；均值达到 50ms 后要求 CV <= 0.25，否则失败并报告 mean/CV。README 和 config.example.json 说明默认开启、只匹配无 system/tools/thinking/历史/多模态的单轮 ping，设 `localPingResponse=false` 可关闭。
 
 - [ ] **Step 7: Run GREEN and commit**
 
