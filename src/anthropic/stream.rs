@@ -1535,6 +1535,7 @@ impl StreamContext {
     }
 
     /// 创建 StreamContext
+    #[cfg(test)]
     pub fn new_with_thinking(
         model: impl Into<String>,
         input_tokens: i32,
@@ -2804,6 +2805,7 @@ pub struct BufferedStreamContext {
 
 impl BufferedStreamContext {
     /// 创建缓冲流上下文
+    #[cfg(test)]
     pub fn new(
         model: impl Into<String>,
         estimated_input_tokens: i32,
