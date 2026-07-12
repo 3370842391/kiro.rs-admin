@@ -425,7 +425,7 @@ fn split_non_stream_usage(
     usage.split_api(cache_usage)
 }
 
-fn build_local_document_message(
+fn build_local_text_message(
     model: &str,
     answer: &str,
     input_tokens: i32,
@@ -451,7 +451,7 @@ fn build_local_document_message(
     })
 }
 
-fn build_local_document_stream_events(
+fn build_local_text_stream_events(
     model: &str,
     answer: &str,
     input_tokens: i32,
@@ -519,6 +519,99 @@ fn build_local_document_stream_events(
         ),
         SseEvent::new("message_stop", json!({"type": "message_stop"})),
     ]
+}
+
+fn local_exact_system_output(
+    payload: &MessagesRequest,
+) -> Option<super::exact_output::ExactOutput> {
+    let output = super::exact_output::exact_system_output(payload)?;
+    let output_tokens = token::count_tokens(output.as_str()).max(1) as i32;
+    (output_tokens <= payload.max_tokens.max(0)).then_some(output)
+}
+
+#[cfg(test)]
+fn local_exact_system_answer(payload: &MessagesRequest) -> Option<String> {
+    local_exact_system_output(payload).map(|output| output.as_str().to_owned())
+}
+
+fn try_local_exact_system_response(
+    state: &AppState,
+    provider: &crate::kiro::provider::KiroProvider,
+    payload: &MessagesRequest,
+    hook: &UsageRecordHook,
+) -> Option<Response> {
+    let output = local_exact_system_output(payload)?;
+    let answer = output.as_str();
+    let output_tokens = token::count_tokens(answer).max(1) as i32;
+    let input_tokens = token::count_all_tokens(
+        payload.model.clone(),
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
+    ) as i32;
+    let cache_usage = state
+        .cache_meter
+        .as_ref()
+        .map(|cache| {
+            let usage = super::cache_metering::compute_cache_usage(cache, payload, hook.key_id);
+            let (hr_min, hr_max) = provider.cache_hit_rate_bounds();
+            usage.with_hit_rate_bounds(hr_min, hr_max)
+        })
+        .unwrap_or_default();
+    let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
+        split_non_stream_usage(input_tokens, None, &cache_usage);
+    let output_kind = match &output {
+        super::exact_output::ExactOutput::Text(_) => "text",
+        super::exact_output::ExactOutput::Json(_) => "json",
+    };
+
+    tracing::debug!(
+        output_kind,
+        output_bytes = answer.len(),
+        input_tokens = final_input_tokens,
+        output_tokens,
+        stream = payload.stream,
+        "served static exact system output locally"
+    );
+    hook.record(
+        0,
+        final_input_tokens,
+        output_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+        0.0,
+        "success",
+    );
+
+    if payload.stream {
+        let body =
+            build_local_text_stream_events(&payload.model, answer, input_tokens, cache_usage)
+                .into_iter()
+                .map(|event| event.to_sse_string())
+                .collect::<String>();
+        Some(
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .header(header::CACHE_CONTROL, "no-cache")
+                .header(header::CONNECTION, "keep-alive")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+    } else {
+        Some(
+            (
+                StatusCode::OK,
+                Json(build_local_text_message(
+                    &payload.model,
+                    answer,
+                    input_tokens,
+                    &cache_usage,
+                )),
+            )
+                .into_response(),
+        )
+    }
 }
 
 fn local_document_system_is_safe_to_bypass(
@@ -599,7 +692,7 @@ fn try_local_document_identifier_response(
 
     if payload.stream {
         let body =
-            build_local_document_stream_events(&payload.model, &answer, input_tokens, cache_usage)
+            build_local_text_stream_events(&payload.model, &answer, input_tokens, cache_usage)
                 .into_iter()
                 .map(|event| event.to_sse_string())
                 .collect::<String>();
@@ -616,7 +709,7 @@ fn try_local_document_identifier_response(
         Some(
             (
                 StatusCode::OK,
-                Json(build_local_document_message(
+                Json(build_local_text_message(
                     &payload.model,
                     &answer,
                     input_tokens,
@@ -981,6 +1074,12 @@ pub async fn post_messages(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+
+    if let Some(response) =
+        try_local_exact_system_response(&state, provider.as_ref(), &payload, &hook)
+    {
+        return response;
+    }
 
     let document_expansion = match super::document::expand_pdf_documents(&mut payload).await {
         Ok(expansion) => expansion,
@@ -2430,6 +2529,12 @@ pub async fn post_messages_cc(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
+    if let Some(response) =
+        try_local_exact_system_response(&state, provider.as_ref(), &payload, &hook)
+    {
+        return response;
+    }
+
     let document_expansion = match super::document::expand_pdf_documents(&mut payload).await {
         Ok(expansion) => expansion,
         Err(error) => {
@@ -3077,7 +3182,7 @@ mod tests {
 
     #[test]
     fn local_document_non_stream_body_is_standard_anthropic_message() {
-        let body = build_local_document_message(
+        let body = build_local_text_message(
             "claude-opus-4-8",
             "ORDER-ID-4f8a2c1d",
             42,
@@ -3095,7 +3200,7 @@ mod tests {
 
     #[test]
     fn local_document_stream_events_have_complete_standard_sequence() {
-        let events = build_local_document_stream_events(
+        let events = build_local_text_stream_events(
             "claude-opus-4-8",
             "ORDER-ID-4f8a2c1d",
             42,
@@ -3120,6 +3225,62 @@ mod tests {
         assert_eq!(events[2].data["delta"]["text"], "ORDER-ID-4f8a2c1d");
         assert_eq!(events[4].data["delta"]["stop_reason"], "end_turn");
         assert_eq!(events[4].data["usage"]["input_tokens"], 42);
+    }
+
+    #[test]
+    fn exact_system_non_stream_body_uses_generic_local_text_builder() {
+        let body = build_local_text_message(
+            "claude-opus-4-8",
+            "alpha_42",
+            20,
+            &crate::anthropic::cache_metering::CacheUsage::default(),
+        );
+        assert_eq!(body["content"][0]["text"], "alpha_42");
+        assert_eq!(body["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn exact_system_stream_uses_generic_local_text_builder() {
+        let events = build_local_text_stream_events(
+            "claude-opus-4-8",
+            "{\"a\":330}",
+            20,
+            crate::anthropic::cache_metering::CacheUsage::default(),
+        );
+        assert_eq!(events[2].data["delta"]["text"], "{\"a\":330}");
+        assert_eq!(events.last().unwrap().event, "message_stop");
+    }
+
+    #[test]
+    fn exact_system_answer_accepts_static_contract_and_rejects_unsafe_or_too_small_output() {
+        let request = |system: &str, max_tokens: i32| -> MessagesRequest {
+            serde_json::from_value(serde_json::json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": max_tokens,
+                "messages": [{"role": "user", "content": "hello"}],
+                "system": system
+            }))
+            .unwrap()
+        };
+
+        assert_eq!(
+            local_exact_system_answer(&request(
+                "Return exactly the single word 'alpha_42' and nothing else. No explanation.",
+                64,
+            )),
+            Some("alpha_42".to_string())
+        );
+        assert_eq!(
+            local_exact_system_answer(&request("You are CodeAssist v2.", 64)),
+            None
+        );
+        assert_eq!(
+            local_exact_system_answer(&request(
+                "Return exactly the single word 'alpha_42' and nothing else. No explanation.",
+                0,
+            )),
+            None
+        );
     }
 
     #[test]
