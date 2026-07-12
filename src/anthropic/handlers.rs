@@ -714,6 +714,22 @@ fn map_document_error(error: super::document::DocumentError) -> Response {
         .into_response()
 }
 
+#[derive(Debug)]
+enum PrepareRequestError {
+    Document(super::document::DocumentError),
+    Conversion(super::converter::ConversionError),
+}
+
+async fn prepare_request(
+    payload: &mut MessagesRequest,
+    mode: crate::model::config::ToolCompatibilityMode,
+) -> Result<super::converter::ConversionResult, PrepareRequestError> {
+    super::document::expand_pdf_documents(payload)
+        .await
+        .map_err(PrepareRequestError::Document)?;
+    convert_request_with_mode(payload, mode).map_err(PrepareRequestError::Conversion)
+}
+
 /// POST /v1/messages
 ///
 /// 创建消息（对话）
@@ -811,10 +827,15 @@ pub async fn post_messages(
     }
 
     // 转换请求
-    let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode)
+    let conversion_result = match prepare_request(&mut payload, state.tool_compatibility_mode).await
     {
         Ok(result) => result,
-        Err(e) => {
+        Err(PrepareRequestError::Document(error)) => {
+            tracing::warn!(error = %error, "Anthropic document preprocessing failed");
+            hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            return map_document_error(error);
+        }
+        Err(PrepareRequestError::Conversion(e)) => {
             let (error_type, message) = match &e {
                 ConversionError::UnsupportedModel(model) => {
                     ("invalid_request_error", format!("模型不支持: {}", model))
@@ -2196,10 +2217,15 @@ pub async fn post_messages_cc(
     }
 
     // 转换请求
-    let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode)
+    let conversion_result = match prepare_request(&mut payload, state.tool_compatibility_mode).await
     {
         Ok(result) => result,
-        Err(e) => {
+        Err(PrepareRequestError::Document(error)) => {
+            tracing::warn!(error = %error, "Anthropic document preprocessing failed");
+            hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            return map_document_error(error);
+        }
+        Err(PrepareRequestError::Conversion(e)) => {
             let (error_type, message) = match &e {
                 ConversionError::UnsupportedModel(model) => {
                     ("invalid_request_error", format!("模型不支持: {}", model))
@@ -2619,6 +2645,69 @@ mod tests {
     use futures::{StreamExt, future};
 
     use super::*;
+
+    const PDF_CANARY_B64: &str = "JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCA2MTIgNzkyXSAvUmVzb3VyY2VzIDw8IC9Gb250IDw8IC9GMSA0IDAgUiA+PiA+PiAvQ29udGVudHMgNSAwIFIgPj4KZW5kb2JqCjQgMCBvYmoKPDwgL1R5cGUgL0ZvbnQgL1N1YnR5cGUgL1R5cGUxIC9CYXNlRm9udCAvSGVsdmV0aWNhID4+CmVuZG9iago1IDAgb2JqCjw8IC9MZW5ndGggNTQgPj4Kc3RyZWFtCkJUIC9GMSAxMiBUZiA3MiA3MjAgVGQgKFBERi1DT01QQVRJQklMSVRZLVRPS0VOKSBUaiBFVAplbmRzdHJlYW0KZW5kb2JqCnhyZWYKMCA2CjAwMDAwMDAwMDAgNjU1MzUgZiAKMDAwMDAwMDAwOSAwMDAwMCBuIAowMDAwMDAwMDU4IDAwMDAwIG4gCjAwMDAwMDAxMTUgMDAwMDAgbiAKMDAwMDAwMDI0MSAwMDAwMCBuIAowMDAwMDAwMzExIDAwMDAwIG4gCnRyYWlsZXIKPDwgL1NpemUgNiAvUm9vdCAxIDAgUiA+PgpzdGFydHhyZWYKNDE1CiUlRU9GCg==";
+
+    #[tokio::test]
+    async fn prepare_request_carries_pdf_canary_into_kiro_wire_in_order() {
+        let mut request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 128,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "before"},
+                    {"type": "document", "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": PDF_CANARY_B64
+                    }},
+                    {"type": "text", "text": "after"}
+                ]
+            }]
+        }))
+        .unwrap();
+
+        let converted = prepare_request(
+            &mut request,
+            crate::model::config::ToolCompatibilityMode::ClaudeCode,
+        )
+        .await
+        .unwrap();
+        let content = &converted
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content;
+        assert!(content.find("before").unwrap() < content.find("PDF-COMPATIBILITY-TOKEN").unwrap());
+        assert!(content.find("PDF-COMPATIBILITY-TOKEN").unwrap() < content.find("after").unwrap());
+    }
+
+    #[tokio::test]
+    async fn prepare_request_rejects_invalid_pdf_before_conversion() {
+        let mut request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 128,
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "document", "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": "not-base64"
+                }}]
+            }]
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            prepare_request(
+                &mut request,
+                crate::model::config::ToolCompatibilityMode::ClaudeCode,
+            )
+            .await,
+            Err(PrepareRequestError::Document(_))
+        ));
+    }
 
     #[test]
     fn required_any_rejects_non_stream_text_only_content() {
