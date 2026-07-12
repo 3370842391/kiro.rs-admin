@@ -9,6 +9,9 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::anthropic::cache_metering::{
+    ALLOWED_TTL_SECS, CachePolicy, CacheStats, SharedCacheMeter,
+};
 use crate::http_client::ProxyConfig;
 use crate::kiro::auth::idc::{self, BUILDER_ID_START_URL};
 use crate::kiro::auth::social;
@@ -26,19 +29,20 @@ use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
     AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse, AssignProxyRequest,
     AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse, BalanceResponse,
-    BatchAddProxyRequest, BatchImportEvent, CheckRateLimitRequest, CompleteSocialLoginRequest,
+    BatchAddProxyRequest, BatchImportEvent, CacheHitRateResponse, CachePolicyResponse,
+    CheckRateLimitRequest, ClearCacheResponse, CompleteSocialLoginRequest,
     CredentialResponseTestResponse, CredentialStatusItem, CredentialsExportResponse,
-    CredentialsStatusResponse, EnableOverageAllResult, EndpointBucketOption, EndpointChainsResponse,
-    CacheHitRateResponse, SetCacheHitRateRequest,
-    ExportedAccount, ExportedCredentials,
-    GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
-    LogGovernanceConfigResponse, PollIdcLoginResponse, ProxyBalancingModeResponse,
-    ProxyCheckAllResponse, ProxyCheckResponse, ProxyCheckUrlRequest, ProxyPoolEntry,
-    ProxyPoolResponse, QuotaExceededResult, RetryPolicyResponse, SetAccountThrottleConfigRequest,
-    SetEndpointChainsRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetProxyBalancingModeRequest,
-    SetRetryPolicyRequest, SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse,
-    StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse,
-    UpdateCredentialRequest, UpdateRefreshTokenRequest,
+    CredentialsStatusResponse, EnableOverageAllResult, EndpointBucketOption,
+    EndpointChainsResponse, ExportedAccount, ExportedCredentials, GitHubRateLimitInfo,
+    ImageUpdateResponse, LoadBalancingModeResponse, LogGovernanceConfigResponse,
+    PollIdcLoginResponse, ProxyBalancingModeResponse, ProxyCheckAllResponse, ProxyCheckResponse,
+    ProxyCheckUrlRequest, ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult,
+    RetryPolicyResponse, SetAccountThrottleConfigRequest, SetCacheHitRateRequest,
+    SetCachePolicyRequest, SetEndpointChainsRequest, SetLoadBalancingModeRequest,
+    SetLogGovernanceConfigRequest, SetProxyBalancingModeRequest, SetRetryPolicyRequest,
+    SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
+    StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest,
+    UpdateRefreshTokenRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -51,6 +55,36 @@ const BALANCE_CACHE_TTL_SECS: i64 = 300;
 const UPDATE_CHECK_TTL_SECS: i64 = 1800;
 
 const DEFAULT_RESPONSE_TEST_MODEL: &str = "claude-sonnet-4-6";
+
+fn build_cache_policy_response(
+    policy: CachePolicy,
+    stats: CacheStats,
+    bounds: (u32, u32),
+) -> CachePolicyResponse {
+    let usage_pct = if stats.capacity == 0 {
+        0.0
+    } else {
+        stats.active_entries as f64 * 100.0 / stats.capacity as f64
+    };
+    CachePolicyResponse {
+        enabled: policy.enabled,
+        default_ttl_secs: policy.default_ttl_secs,
+        allowed_ttl_secs: ALLOWED_TTL_SECS,
+        auto_without_cache_control: policy.auto_without_cache_control,
+        capacity: policy.capacity,
+        flush_interval_secs: policy.flush_interval_secs,
+        min_pct: bounds.0,
+        max_pct: bounds.1,
+        active_entries: stats.active_entries,
+        usage_pct,
+        dirty: stats.dirty,
+        last_flush_at: stats
+            .last_flush_at
+            .and_then(|timestamp| DateTime::<Utc>::from_timestamp(timestamp, 0))
+            .map(|value| value.to_rfc3339()),
+        persist_enabled: stats.persist_enabled,
+    }
+}
 
 fn normalize_import_email(raw_email: Option<String>, access_token: Option<&str>) -> Option<String> {
     raw_email
@@ -205,6 +239,8 @@ pub struct AdminService {
     usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
     /// 与 Anthropic 路由共享的 KiroProvider，用于 Admin 显式响应测试。
     kiro_provider: Option<Arc<KiroProvider>>,
+    /// 与 Anthropic 路由共享的缓存计量器，用于运行时策略控制。
+    cache_meter: Option<SharedCacheMeter>,
 }
 
 /// Social 登录会话状态
@@ -540,6 +576,7 @@ impl AdminService {
             trace_store: None,
             usage_recorder: None,
             kiro_provider: None,
+            cache_meter: None,
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -579,6 +616,11 @@ impl AdminService {
     /// 注入与业务 API 共享的 KiroProvider。
     pub fn with_kiro_provider(mut self, provider: Arc<KiroProvider>) -> Self {
         self.kiro_provider = Some(provider);
+        self
+    }
+
+    pub fn with_cache_meter(mut self, cache_meter: SharedCacheMeter) -> Self {
+        self.cache_meter = Some(cache_meter);
         self
     }
 
@@ -2096,12 +2138,8 @@ impl AdminService {
             overridden,
             defaults,
             available_buckets,
-            max_bucket_attempts_per_request: self
-                .token_manager
-                .max_bucket_attempts_per_request(),
-            stream_idle_timeout_secs: self
-                .token_manager
-                .get_stream_idle_timeout_secs(),
+            max_bucket_attempts_per_request: self.token_manager.max_bucket_attempts_per_request(),
+            stream_idle_timeout_secs: self.token_manager.get_stream_idle_timeout_secs(),
         })
     }
 
@@ -2166,9 +2204,7 @@ impl AdminService {
         }
 
         // 空 map 等价清除覆盖（回退静态默认）
-        let normalized = req
-            .chains
-            .filter(|m| !m.is_empty());
+        let normalized = req.chains.filter(|m| !m.is_empty());
         self.token_manager
             .set_endpoint_chains(normalized)
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
@@ -2208,6 +2244,79 @@ impl AdminService {
             .set_cache_hit_rate_bounds(req.min_pct, req.max_pct)
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
         Ok(self.get_cache_hit_rate())
+    }
+
+    pub fn get_cache_policy(&self) -> Result<CachePolicyResponse, AdminServiceError> {
+        let cache_meter = self.cache_meter.as_ref().ok_or_else(|| {
+            AdminServiceError::InternalError("缓存计量器未注入 AdminService".to_string())
+        })?;
+        Ok(build_cache_policy_response(
+            cache_meter.policy(),
+            cache_meter.stats(),
+            self.token_manager.get_cache_hit_rate_bounds(),
+        ))
+    }
+
+    pub fn set_cache_policy(
+        &self,
+        req: SetCachePolicyRequest,
+    ) -> Result<CachePolicyResponse, AdminServiceError> {
+        let cache_meter = self.cache_meter.as_ref().ok_or_else(|| {
+            AdminServiceError::InternalError("缓存计量器未注入 AdminService".to_string())
+        })?;
+        let current = cache_meter.policy();
+        let current_bounds = self.token_manager.get_cache_hit_rate_bounds();
+        let policy = CachePolicy {
+            enabled: req.enabled.unwrap_or(current.enabled),
+            default_ttl_secs: req.default_ttl_secs.unwrap_or(current.default_ttl_secs),
+            auto_without_cache_control: req
+                .auto_without_cache_control
+                .unwrap_or(current.auto_without_cache_control),
+            capacity: req.capacity.unwrap_or(current.capacity),
+            flush_interval_secs: req
+                .flush_interval_secs
+                .unwrap_or(current.flush_interval_secs),
+        }
+        .validate()
+        .map_err(|error| AdminServiceError::InvalidCredential(error.to_string()))?;
+        let min_pct = req.min_pct.unwrap_or(current_bounds.0);
+        let max_pct = req.max_pct.unwrap_or(current_bounds.1);
+        MultiTokenManager::validate_cache_hit_rate_bounds(min_pct, max_pct)
+            .map_err(|error| AdminServiceError::InvalidCredential(error.to_string()))?;
+
+        if let Some(config_path) = self.token_manager.config().config_path() {
+            let mut config = Config::load(config_path)
+                .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+            config.cache_metering_enabled = policy.enabled;
+            config.cache_default_ttl_secs = policy.default_ttl_secs;
+            config.cache_auto_without_control = policy.auto_without_cache_control;
+            config.cache_capacity = policy.capacity;
+            config.cache_flush_interval_secs = policy.flush_interval_secs;
+            config.cache_hit_rate_min_pct = min_pct;
+            config.cache_hit_rate_max_pct = max_pct;
+            config
+                .save()
+                .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+        } else {
+            tracing::warn!("配置文件路径未知，缓存策略仅在当前进程生效");
+        }
+
+        cache_meter
+            .update_policy(policy)
+            .map_err(|error| AdminServiceError::InvalidCredential(error.to_string()))?;
+        self.token_manager
+            .apply_cache_hit_rate_bounds_runtime(min_pct, max_pct);
+        self.get_cache_policy()
+    }
+
+    pub fn clear_cache(&self) -> Result<ClearCacheResponse, AdminServiceError> {
+        let cache_meter = self.cache_meter.as_ref().ok_or_else(|| {
+            AdminServiceError::InternalError("缓存计量器未注入 AdminService".to_string())
+        })?;
+        let cleared_entries = cache_meter
+            .clear()
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+        Ok(ClearCacheResponse { cleared_entries })
     }
 
     /// 读取日志治理配置（trace 开关 / trace 保留天数 / usage 保留天数）
@@ -3685,6 +3794,24 @@ impl AdminService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_policy_response_calculates_capacity_usage() {
+        let response = build_cache_policy_response(
+            CachePolicy::default(),
+            CacheStats {
+                active_entries: 1024,
+                capacity: 4096,
+                dirty: false,
+                last_flush_at: None,
+                persist_enabled: true,
+            },
+            (0, 95),
+        );
+        assert_eq!(response.default_ttl_secs, 1800);
+        assert_eq!(response.usage_pct, 25.0);
+        assert_eq!(response.max_pct, 95);
+    }
 
     #[test]
     fn semver_compares_correctly() {

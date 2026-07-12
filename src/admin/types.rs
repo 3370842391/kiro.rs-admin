@@ -632,6 +632,49 @@ pub struct SetCacheHitRateRequest {
     pub max_pct: u32,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachePolicyResponse {
+    pub enabled: bool,
+    pub default_ttl_secs: u64,
+    pub allowed_ttl_secs: [u64; 3],
+    pub auto_without_cache_control: bool,
+    pub capacity: usize,
+    pub flush_interval_secs: u64,
+    pub min_pct: u32,
+    pub max_pct: u32,
+    pub active_entries: usize,
+    pub usage_pct: f64,
+    pub dirty: bool,
+    pub last_flush_at: Option<String>,
+    pub persist_enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCachePolicyRequest {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub default_ttl_secs: Option<u64>,
+    #[serde(default)]
+    pub auto_without_cache_control: Option<bool>,
+    #[serde(default)]
+    pub capacity: Option<usize>,
+    #[serde(default)]
+    pub flush_interval_secs: Option<u64>,
+    #[serde(default)]
+    pub min_pct: Option<u32>,
+    #[serde(default)]
+    pub max_pct: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClearCacheResponse {
+    pub cleared_entries: usize,
+}
+
 /// 日志治理配置响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1023,7 +1066,11 @@ pub struct StartIdcLoginResponse {
 /// 得到 `undefined`（Kiro Hosted 登录成功 toast 显示"已添加凭据 #undefined"，
 /// 二段登录 `nextUrl` 链接也拿不到）。
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "status")]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "status"
+)]
 pub enum PollIdcLoginResponse {
     #[serde(rename = "pending")]
     Pending,
@@ -1328,13 +1375,25 @@ pub struct ReplaceModelMappingsRequest {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cache_policy_patch_is_partial_and_camel_case() {
+        let patch: SetCachePolicyRequest = serde_json::from_value(serde_json::json!({
+            "defaultTtlSecs": 300,
+            "capacity": 8192
+        }))
+        .unwrap();
+        assert_eq!(patch.default_ttl_secs, Some(300));
+        assert_eq!(patch.capacity, Some(8192));
+        assert_eq!(patch.enabled, None);
+    }
+
     /// 回归：Kiro Hosted / IdC 登录成功后前端读 `credentialId`/`nextUrl`（camelCase）。
     /// enum 上仅 `rename_all` 不会重命名 struct variant 内部字段——必须叠加
     /// `rename_all_fields`，否则前端拿到 undefined（toast 显示"已添加凭据 #undefined"）。
     #[test]
     fn poll_login_response_serializes_fields_as_camel_case() {
-        let success = serde_json::to_value(PollIdcLoginResponse::Success { credential_id: 7 })
-            .unwrap();
+        let success =
+            serde_json::to_value(PollIdcLoginResponse::Success { credential_id: 7 }).unwrap();
         assert_eq!(success["status"], "success");
         assert_eq!(success["credentialId"], 7);
         assert!(success.get("credential_id").is_none());

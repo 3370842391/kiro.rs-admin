@@ -23,13 +23,12 @@ use super::{
         BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
         ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest, CreateClientKeyRequest,
         CreateClientKeyResponse, CredentialResponseTestRequest, GlobalProxyResponse,
-        ProxyCheckUrlRequest, SetAccountThrottleConfigRequest, SetDisabledRequest,
-        SetCacheHitRateRequest, SetEndpointChainsRequest, SetGlobalProxyRequest, SetLoadBalancingModeRequest,
-        SetLogGovernanceConfigRequest,
-        SetPriorityRequest, SetProxyBalancingModeRequest, SetRetryPolicyRequest,
-        SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
-        UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
-        UpdateRefreshTokenRequest,
+        ProxyCheckUrlRequest, SetAccountThrottleConfigRequest, SetCacheHitRateRequest,
+        SetCachePolicyRequest, SetDisabledRequest, SetEndpointChainsRequest, SetGlobalProxyRequest,
+        SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
+        SetProxyBalancingModeRequest, SetRetryPolicyRequest, SetUpdateConfigRequest,
+        StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse, UpdateAdminKeyRequest,
+        UpdateClientKeyRequest, UpdateCredentialRequest, UpdateRefreshTokenRequest,
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
 };
@@ -663,6 +662,33 @@ pub async fn set_cache_hit_rate(
     match state.service.set_cache_hit_rate(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/cache-policy
+pub async fn get_cache_policy(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.get_cache_policy() {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
+
+/// PUT /api/admin/config/cache-policy
+pub async fn set_cache_policy(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetCachePolicyRequest>,
+) -> impl IntoResponse {
+    match state.service.set_cache_policy(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/config/cache-policy/clear
+pub async fn clear_cache_policy_entries(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.clear_cache() {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
     }
 }
 

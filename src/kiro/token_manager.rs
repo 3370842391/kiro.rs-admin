@@ -3899,8 +3899,7 @@ impl MultiTokenManager {
 
     /// 单请求内备用桶尝试总数硬上限（跨 attempt 累计）。`0` = 不限。
     pub fn max_bucket_attempts_per_request(&self) -> usize {
-        self.max_bucket_attempts_per_request
-            .load(Ordering::Relaxed)
+        self.max_bucket_attempts_per_request.load(Ordering::Relaxed)
     }
 
     /// 运行时设置桶尝试上限并持久化。持久化失败时回滚内存态。
@@ -4169,9 +4168,7 @@ impl MultiTokenManager {
         )
     }
 
-    /// 设置缓存命中率整形区间（百分比）。校验：各值 0..=100；同时非零时 min<=max。
-    /// `(0, 0)` = 关闭。持久化失败时回滚内存态（两个字段一起回滚，保持一致）。
-    pub fn set_cache_hit_rate_bounds(&self, min_pct: u32, max_pct: u32) -> anyhow::Result<()> {
+    pub fn validate_cache_hit_rate_bounds(min_pct: u32, max_pct: u32) -> anyhow::Result<()> {
         if min_pct > 100 || max_pct > 100 {
             anyhow::bail!(
                 "缓存命中率必须在 0..=100 内: min={} max={}",
@@ -4179,21 +4176,33 @@ impl MultiTokenManager {
                 max_pct
             );
         }
-        // 两值都非零时才约束 min<=max；max==0 视为关闭上界、min==0 视为下界为 0（仅设上限）。
         if min_pct > 0 && max_pct > 0 && min_pct > max_pct {
-            anyhow::bail!("缓存命中率下界不能大于上界: min={} max={}", min_pct, max_pct);
+            anyhow::bail!(
+                "缓存命中率下界不能大于上界: min={} max={}",
+                min_pct,
+                max_pct
+            );
         }
-        let prev_min = self.cache_hit_rate_min_pct.swap(min_pct, Ordering::Relaxed);
-        let prev_max = self.cache_hit_rate_max_pct.swap(max_pct, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub fn apply_cache_hit_rate_bounds_runtime(&self, min_pct: u32, max_pct: u32) {
+        self.cache_hit_rate_min_pct
+            .store(min_pct, Ordering::Relaxed);
+        self.cache_hit_rate_max_pct
+            .store(max_pct, Ordering::Relaxed);
+    }
+
+    /// 设置缓存命中率整形区间（百分比）。校验：各值 0..=100；同时非零时 min<=max。
+    /// `(0, 0)` = 关闭。先持久化再应用运行时值，写盘失败时内存态保持不变。
+    pub fn set_cache_hit_rate_bounds(&self, min_pct: u32, max_pct: u32) -> anyhow::Result<()> {
+        Self::validate_cache_hit_rate_bounds(min_pct, max_pct)?;
+        let (prev_min, prev_max) = self.get_cache_hit_rate_bounds();
         if prev_min == min_pct && prev_max == max_pct {
             return Ok(());
         }
-        if let Err(err) = self.persist_cache_hit_rate_bounds(min_pct, max_pct) {
-            tracing::error!("持久化缓存命中率区间失败，回滚内存态: {}", err);
-            self.cache_hit_rate_min_pct.store(prev_min, Ordering::Relaxed);
-            self.cache_hit_rate_max_pct.store(prev_max, Ordering::Relaxed);
-            return Err(err);
-        }
+        self.persist_cache_hit_rate_bounds(min_pct, max_pct)?;
+        self.apply_cache_hit_rate_bounds_runtime(min_pct, max_pct);
         tracing::info!("缓存命中率整形区间已设置为: [{}%, {}%]", min_pct, max_pct);
         Ok(())
     }
@@ -5845,6 +5854,12 @@ mod tests {
         // 拒绝后内存态不变
         assert!(manager.set_cache_hit_rate_bounds(99, 90).is_err());
         assert_eq!(manager.get_cache_hit_rate_bounds(), (0, 95));
+    }
+
+    #[test]
+    fn cache_hit_rate_validation_is_reusable_without_mutation() {
+        assert!(MultiTokenManager::validate_cache_hit_rate_bounds(0, 95).is_ok());
+        assert!(MultiTokenManager::validate_cache_hit_rate_bounds(99, 90).is_err());
     }
 
     // ===== 账号分组隔离回归测试 =====

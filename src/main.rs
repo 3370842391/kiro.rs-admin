@@ -15,7 +15,7 @@ use std::sync::Arc;
 use clap::Parser;
 use kiro::endpoint::{
     AmazonQEndpoint, CliEndpoint, CodeWhispererEndpoint, IdeEndpoint, KiroEndpoint,
-    RuntimeEndpoint, RuntimeCliEndpoint,
+    RuntimeCliEndpoint, RuntimeEndpoint,
 };
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
@@ -180,7 +180,9 @@ async fn main() {
             config.account_throttle_cooldown_secs
         );
     } else {
-        tracing::info!("账号级风控转移: 关闭（suspicious activity 429 按普通瞬态错误退避重试，不冷却/不换号）");
+        tracing::info!(
+            "账号级风控转移: 关闭（suspicious activity 429 按普通瞬态错误退避重试，不冷却/不换号）"
+        );
     }
 
     // 创建 MultiTokenManager 和 KiroProvider
@@ -300,9 +302,22 @@ async fn main() {
 
     // CacheMeter：模拟 Anthropic 缓存、计量 cache_read/creation token 的进程内组件。
     // 持久化到 cache_dir/cache_metering.json，启动时自动加载未过期条目。
-    let cache_meter = std::sync::Arc::new(anthropic::cache_metering::CacheMeter::new(Some(
-        cache_dir.join("cache_metering.json"),
-    )));
+    let cache_policy = anthropic::cache_metering::CachePolicy {
+        enabled: config.cache_metering_enabled,
+        default_ttl_secs: config.cache_default_ttl_secs,
+        auto_without_cache_control: config.cache_auto_without_control,
+        capacity: config.cache_capacity,
+        flush_interval_secs: config.cache_flush_interval_secs,
+    }
+    .validate()
+    .unwrap_or_else(|error| {
+        tracing::warn!(%error, "缓存策略配置无效，回退默认值");
+        anthropic::cache_metering::CachePolicy::default()
+    });
+    let cache_meter = std::sync::Arc::new(anthropic::cache_metering::CacheMeter::with_policy(
+        Some(cache_dir.join("cache_metering.json")),
+        cache_policy,
+    ));
     cache_meter.clone().spawn_background();
 
     // 模型映射：请求时把源模型名（如 gpt-5.5）转发到目标模型名（如 claude-opus-4.8）。
@@ -350,6 +365,7 @@ async fn main() {
                 proxy_pool.clone(),
             )
             .with_kiro_provider(kiro_provider.clone())
+            .with_cache_meter(cache_meter.clone())
             .with_log_governance(
                 Some(admin_trace_store.clone()),
                 Some(usage_recorder.clone()),
