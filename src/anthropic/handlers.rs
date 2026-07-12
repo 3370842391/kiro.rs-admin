@@ -2121,6 +2121,7 @@ async fn handle_non_stream_request(
         &known_tool_names,
         &tool_name_map,
     );
+    let content = normalize_required_tool_content(content, &tool_choice_policy);
     let strict_thinking_validation = provider.strict_thinking_validation();
     if require_thinking && !strict_thinking_validation && !content_has_reasoning(&content) {
         tracing::warn!(
@@ -2285,6 +2286,23 @@ fn validate_non_stream_content(content: &[serde_json::Value]) -> Result<(), &'st
         Err("upstream returned no assistant content")
     } else {
         Ok(())
+    }
+}
+
+fn normalize_required_tool_content(
+    content: Vec<serde_json::Value>,
+    policy: &super::converter::ToolChoicePolicy,
+) -> Vec<serde_json::Value> {
+    let has_tool = content
+        .iter()
+        .any(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("tool_use"));
+    if policy.is_required() && has_tool {
+        content
+            .into_iter()
+            .filter(|block| block.get("type").and_then(serde_json::Value::as_str) != Some("text"))
+            .collect()
+    } else {
+        content
     }
 }
 
@@ -3339,6 +3357,36 @@ mod tests {
 
         let mut broken = "end_turn".to_string();
         assert!(apply_tool_stop_reason(&mut broken, true, false).is_err());
+    }
+
+    #[test]
+    fn normalize_required_tool_content_strips_narration_only_when_tool_exists() {
+        let content = vec![
+            serde_json::json!({"type":"text","text":"I will call it."}),
+            serde_json::json!({
+                "type":"tool_use",
+                "id":"toolu_1",
+                "name":"get_weather",
+                "input":{}
+            }),
+        ];
+        let required = super::super::converter::ToolChoicePolicy::RequiredAny {
+            disable_parallel_tool_use: false,
+        };
+        let filtered = normalize_required_tool_content(content.clone(), &required);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0]["type"], "tool_use");
+
+        let auto = super::super::converter::ToolChoicePolicy::Auto {
+            disable_parallel_tool_use: false,
+        };
+        assert_eq!(normalize_required_tool_content(content, &auto).len(), 2);
+
+        let text_only = vec![serde_json::json!({"type":"text","text":"no tool"})];
+        assert_eq!(
+            normalize_required_tool_content(text_only, &required)[0]["type"],
+            "text"
+        );
     }
 
     #[tokio::test]
