@@ -521,6 +521,28 @@ fn build_local_text_stream_events(
     ]
 }
 
+fn local_text_stream_chunks(events: Vec<SseEvent>) -> Vec<Bytes> {
+    events
+        .into_iter()
+        .map(|event| Bytes::from(event.to_sse_string()))
+        .collect()
+}
+
+fn local_text_stream_response(events: Vec<SseEvent>) -> Response {
+    let body_stream = stream::iter(
+        local_text_stream_chunks(events)
+            .into_iter()
+            .map(Ok::<_, Infallible>),
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::CONNECTION, "keep-alive")
+        .body(Body::from_stream(body_stream))
+        .unwrap()
+}
+
 #[derive(Debug)]
 struct BufferedAttempt {
     events: Vec<SseEvent>,
@@ -795,22 +817,12 @@ async fn handle_strict_json_request(
             tracer.finalize("success", None, None, None, trace_usage);
 
             if payload.stream {
-                let body = build_local_text_stream_events(
+                local_text_stream_response(build_local_text_stream_events(
                     &payload.model,
                     &recovered.json,
                     input_tokens,
                     cache_usage,
-                )
-                .into_iter()
-                .map(|event| event.to_sse_string())
-                .collect::<String>();
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "text/event-stream")
-                    .header(header::CACHE_CONTROL, "no-cache")
-                    .header(header::CONNECTION, "keep-alive")
-                    .body(Body::from(body))
-                    .unwrap()
+                ))
             } else {
                 (
                     StatusCode::OK,
@@ -968,20 +980,12 @@ fn try_local_exact_system_response(
     );
 
     if payload.stream {
-        let body =
-            build_local_text_stream_events(&payload.model, answer, input_tokens, cache_usage)
-                .into_iter()
-                .map(|event| event.to_sse_string())
-                .collect::<String>();
-        Some(
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "text/event-stream")
-                .header(header::CACHE_CONTROL, "no-cache")
-                .header(header::CONNECTION, "keep-alive")
-                .body(Body::from(body))
-                .unwrap(),
-        )
+        Some(local_text_stream_response(build_local_text_stream_events(
+            &payload.model,
+            answer,
+            input_tokens,
+            cache_usage,
+        )))
     } else {
         Some(
             (
@@ -1055,20 +1059,12 @@ fn try_local_exact_user_response(
     );
 
     if payload.stream {
-        let body =
-            build_local_text_stream_events(&payload.model, &answer, input_tokens, cache_usage)
-                .into_iter()
-                .map(|event| event.to_sse_string())
-                .collect::<String>();
-        Some(
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "text/event-stream")
-                .header(header::CACHE_CONTROL, "no-cache")
-                .header(header::CONNECTION, "keep-alive")
-                .body(Body::from(body))
-                .unwrap(),
-        )
+        Some(local_text_stream_response(build_local_text_stream_events(
+            &payload.model,
+            &answer,
+            input_tokens,
+            cache_usage,
+        )))
     } else {
         Some(
             (
@@ -1162,20 +1158,12 @@ fn try_local_document_identifier_response(
     );
 
     if payload.stream {
-        let body =
-            build_local_text_stream_events(&payload.model, &answer, input_tokens, cache_usage)
-                .into_iter()
-                .map(|event| event.to_sse_string())
-                .collect::<String>();
-        Some(
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "text/event-stream")
-                .header(header::CACHE_CONTROL, "no-cache")
-                .header(header::CONNECTION, "keep-alive")
-                .body(Body::from(body))
-                .unwrap(),
-        )
+        Some(local_text_stream_response(build_local_text_stream_events(
+            &payload.model,
+            &answer,
+            input_tokens,
+            cache_usage,
+        )))
     } else {
         Some(
             (
@@ -3788,6 +3776,42 @@ mod tests {
         assert_eq!(events[2].data["delta"]["text"], "ORDER-ID-4f8a2c1d");
         assert_eq!(events[4].data["delta"]["stop_reason"], "end_turn");
         assert_eq!(events[4].data["usage"]["input_tokens"], 42);
+    }
+
+    #[tokio::test]
+    async fn local_text_stream_chunks_keep_one_complete_event_per_body_chunk() {
+        let events = build_local_text_stream_events(
+            "claude-opus-4-8",
+            "CHUNK-42",
+            42,
+            crate::anthropic::cache_metering::CacheUsage::default(),
+        );
+        let chunks = local_text_stream_chunks(events.clone());
+
+        assert_eq!(chunks.len(), 6);
+        for chunk in &chunks {
+            let frame = std::str::from_utf8(chunk).unwrap();
+            assert_eq!(frame.matches("event:").count(), 1);
+            assert!(frame.ends_with("\n\n"));
+        }
+        let joined = chunks
+            .iter()
+            .flat_map(|chunk| chunk.iter().copied())
+            .collect::<Vec<_>>();
+        let joined = String::from_utf8(joined).unwrap();
+        assert!(joined.contains("event: message_start"));
+        assert!(joined.contains("event: content_block_delta"));
+        assert!(joined.contains("CHUNK-42"));
+        assert!(joined.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
+
+        let response = local_text_stream_response(events);
+        let body_chunks = response
+            .into_body()
+            .into_data_stream()
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(body_chunks.len(), 6);
+        assert!(body_chunks.into_iter().all(|chunk| chunk.is_ok()));
     }
 
     #[test]
