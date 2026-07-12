@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - master
+    tags:
+      - 'v*'
     paths-ignore:
       - '**.md'
       - 'docs/**'
@@ -25,28 +27,7 @@ permissions:
   packages: write
 
 jobs:
-  pre-check:
-    runs-on: ubuntu-latest
-    outputs:
-      should_build: ${{ steps.check.outputs.should_build }}
-    steps:
-      - uses: actions/checkout@v4
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
-        with:
-          fetch-depth: 0
-      - name: Skip build when commit already has release tag
-        id: check
-        run: |
-          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == refs/heads/* ]] && git tag --points-at HEAD | grep -q '^v'; then
-            echo "should_build=false" >> $GITHUB_OUTPUT
-            echo "::notice::Skipping beta build: commit already has a release tag"
-          else
-            echo "should_build=true" >> $GITHUB_OUTPUT
-          fi
-
   build:
-    needs: pre-check
-    if: needs.pre-check.outputs.should_build == 'true'
     runs-on: ${{ matrix.runner }}
 
     strategy:
@@ -69,16 +50,29 @@ jobs:
 
       - name: Determine version
         id: version
+        shell: bash
         run: |
+          set -euo pipefail
+          SHORT_SHA="$(echo "${{ github.sha }}" | cut -c1-6)"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=sha-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             RAW_VERSION="${{ github.event.inputs.version }}"
-            echo "version=${RAW_VERSION#v}" >> $GITHUB_OUTPUT
-            echo "is_beta=false" >> $GITHUB_OUTPUT
+            echo "version=${RAW_VERSION#v}" >> "$GITHUB_OUTPUT"
+            echo "is_beta=false" >> "$GITHUB_OUTPUT"
+          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+            echo "is_beta=false" >> "$GITHUB_OUTPUT"
           else
-            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-6)
-            echo "version=beta-${SHORT_SHA}" >> $GITHUB_OUTPUT
-            echo "is_beta=true" >> $GITHUB_OUTPUT
+            echo "version=beta-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+            echo "is_beta=true" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Resolve build timestamp
+        id: build_meta
+        shell: bash
+        run: echo "created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -99,10 +93,15 @@ jobs:
           cache-to: type=gha,mode=max
           push: true
           provenance: false
-          tags: ${{ steps.repo.outputs.image }}:${{ steps.version.outputs.version }}-${{ matrix.arch }}
+          tags: |
+            ${{ steps.repo.outputs.image }}:${{ steps.version.outputs.version }}-${{ matrix.arch }}
+            ${{ steps.repo.outputs.image }}:${{ steps.version.outputs.sha_tag }}-${{ matrix.arch }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.description=Kiro.rs Docker Image
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.created=${{ steps.build_meta.outputs.created }}
 
   manifest:
     needs: build
@@ -110,16 +109,22 @@ jobs:
     steps:
       - name: Resolve image and version
         id: meta
+        shell: bash
         run: |
           set -euo pipefail
           OWNER="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          SHORT_SHA="$(echo "${{ github.sha }}" | cut -c1-6)"
           echo "image=ghcr.io/${OWNER}/kiro-rs" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=sha-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             RAW_VERSION="${{ github.event.inputs.version }}"
             echo "version=${RAW_VERSION#v}" >> "$GITHUB_OUTPUT"
             echo "is_beta=false" >> "$GITHUB_OUTPUT"
+          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+            echo "is_beta=false" >> "$GITHUB_OUTPUT"
           else
-            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-6)
             echo "version=beta-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
             echo "is_beta=true" >> "$GITHUB_OUTPUT"
           fi
@@ -131,10 +136,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Create and push manifest (amd64 only)
+      - name: Create and push manifests
         env:
           IMAGE: ${{ steps.meta.outputs.image }}
           VERSION: ${{ steps.meta.outputs.version }}
+          SHA_TAG: ${{ steps.meta.outputs.sha_tag }}
           IS_BETA: ${{ steps.meta.outputs.is_beta }}
         run: |
           set -euo pipefail
@@ -143,12 +149,16 @@ jobs:
             "${IMAGE}:${VERSION}-amd64"
           docker manifest push "${IMAGE}:${VERSION}"
 
-          if [ "${IS_BETA}" != "true" ]; then
-            docker manifest create "${IMAGE}:latest" \
-              "${IMAGE}:${VERSION}-amd64"
-            docker manifest push "${IMAGE}:latest"
-          else
+          docker manifest create "${IMAGE}:${SHA_TAG}" \
+            "${IMAGE}:${SHA_TAG}-amd64"
+          docker manifest push "${IMAGE}:${SHA_TAG}"
+
+          if [ "${IS_BETA}" = "true" ]; then
             docker manifest create "${IMAGE}:beta" \
               "${IMAGE}:${VERSION}-amd64"
             docker manifest push "${IMAGE}:beta"
+          else
+            docker manifest create "${IMAGE}:latest" \
+              "${IMAGE}:${VERSION}-amd64"
+            docker manifest push "${IMAGE}:latest"
           fi
