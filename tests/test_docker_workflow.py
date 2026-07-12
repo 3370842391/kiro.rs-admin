@@ -21,6 +21,10 @@ class DockerWorkflowContractTest(unittest.TestCase):
     def test_images_have_revision_and_immutable_sha_tag(self):
         self.assertIn("org.opencontainers.image.revision=${{ github.sha }}", self.text)
         self.assertIn("sha-${SHORT_SHA}", self.text)
+        self.assertIn('docker manifest inspect "${IMAGE}:${SHA_TAG}"', self.text)
+        self.assertNotIn(
+            "${{ steps.version.outputs.sha_tag }}-${{ matrix.arch }}", self.text
+        )
 
 
 if __name__ == "__main__":

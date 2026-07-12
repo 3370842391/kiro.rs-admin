@@ -95,7 +95,6 @@ jobs:
           provenance: false
           tags: |
             ${{ steps.repo.outputs.image }}:${{ steps.version.outputs.version }}-${{ matrix.arch }}
-            ${{ steps.repo.outputs.image }}:${{ steps.version.outputs.sha_tag }}-${{ matrix.arch }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.description=Kiro.rs Docker Image
@@ -149,9 +148,13 @@ jobs:
             "${IMAGE}:${VERSION}-amd64"
           docker manifest push "${IMAGE}:${VERSION}"
 
-          docker manifest create "${IMAGE}:${SHA_TAG}" \
-            "${IMAGE}:${SHA_TAG}-amd64"
-          docker manifest push "${IMAGE}:${SHA_TAG}"
+          if docker manifest inspect "${IMAGE}:${SHA_TAG}" >/dev/null 2>&1; then
+            echo "Immutable commit manifest ${IMAGE}:${SHA_TAG} already exists; keeping it unchanged"
+          else
+            docker manifest create "${IMAGE}:${SHA_TAG}" \
+              "${IMAGE}:${VERSION}-amd64"
+            docker manifest push "${IMAGE}:${SHA_TAG}"
+          fi
 
           if [ "${IS_BETA}" = "true" ]; then
             docker manifest create "${IMAGE}:beta" \
