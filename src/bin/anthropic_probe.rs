@@ -212,6 +212,23 @@ fn passive_tools_system_request(model: &str, expected: &str) -> Value {
     })
 }
 
+fn identity_passive_tools_system_request(model: &str, expected: &str) -> Value {
+    let mut request = passive_tools_system_request(model, expected);
+    request["system"] = json!([
+        {
+            "type": "text",
+            "text": "You are Claude Code, Anthropic's official CLI for Claude."
+        },
+        {
+            "type": "text",
+            "text": format!(
+                "Respond to every user message with exactly the single word '{expected}' and nothing else. No explanation or markdown."
+            )
+        }
+    ]);
+    request
+}
+
 async fn post_message(
     client: &reqwest::Client,
     args: &Args,
@@ -366,6 +383,25 @@ async fn passive_tools_system_probe(
         args,
         key,
         passive_tools_system_request(&args.model, &expected),
+    )
+    .await
+    {
+        Ok(value) => classify_exact_text(&value, &expected),
+        Err(error) => ProbeResult::Fail(error),
+    }
+}
+
+async fn identity_passive_tools_system_probe(
+    client: &reqwest::Client,
+    args: &Args,
+    key: &str,
+) -> ProbeResult {
+    let expected = format!("IDENTITY_{}", Uuid::new_v4().simple());
+    match post_message(
+        client,
+        args,
+        key,
+        identity_passive_tools_system_request(&args.model, &expected),
     )
     .await
     {
@@ -573,6 +609,10 @@ async fn main() {
             passive_tools_system_probe(&client, &args, &api_key).await,
         ),
         (
+            "system_identity_passive_tools",
+            identity_passive_tools_system_probe(&client, &args, &api_key).await,
+        ),
+        (
             "echo_token",
             echo_token_probe(&client, &args, &api_key).await,
         ),
@@ -677,6 +717,20 @@ mod tests {
             true
         );
         assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+        assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn identity_passive_tools_request_keeps_identity_and_exact_contract_separate() {
+        let body = identity_passive_tools_system_request("claude-opus-4-8", "IDENTITY_42");
+        let system = body["system"].as_array().unwrap();
+        assert_eq!(system.len(), 2);
+        assert_eq!(
+            system[0]["text"],
+            "You are Claude Code, Anthropic's official CLI for Claude."
+        );
+        assert!(system[1]["text"].as_str().unwrap().contains("IDENTITY_42"));
+        assert!(body["tools"].is_array());
         assert!(body.get("tool_choice").is_none());
     }
 

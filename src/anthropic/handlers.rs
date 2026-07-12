@@ -919,15 +919,19 @@ async fn handle_strict_json_request(
 
 fn local_exact_system_output(
     payload: &MessagesRequest,
+    mode: crate::model::config::ToolCompatibilityMode,
 ) -> Option<super::exact_output::ExactOutput> {
-    let output = super::exact_output::exact_system_output(payload)?;
+    let output = super::exact_output::exact_system_output(payload, mode)?;
     let output_tokens = token::count_tokens(output.as_str()).max(1) as i32;
     (output_tokens <= payload.max_tokens.max(0)).then_some(output)
 }
 
 #[cfg(test)]
-fn local_exact_system_answer(payload: &MessagesRequest) -> Option<String> {
-    local_exact_system_output(payload).map(|output| output.as_str().to_owned())
+fn local_exact_system_answer(
+    payload: &MessagesRequest,
+    mode: crate::model::config::ToolCompatibilityMode,
+) -> Option<String> {
+    local_exact_system_output(payload, mode).map(|output| output.as_str().to_owned())
 }
 
 fn try_local_exact_system_response(
@@ -935,8 +939,9 @@ fn try_local_exact_system_response(
     provider: &crate::kiro::provider::KiroProvider,
     payload: &MessagesRequest,
     hook: &UsageRecordHook,
+    mode: crate::model::config::ToolCompatibilityMode,
 ) -> Option<Response> {
-    let output = local_exact_system_output(payload)?;
+    let output = local_exact_system_output(payload, mode)?;
     let answer = output.as_str();
     let output_tokens = token::count_tokens(answer).max(1) as i32;
     let input_tokens = token::count_all_tokens(
@@ -1534,9 +1539,13 @@ pub async fn post_messages(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
-    if let Some(response) =
-        try_local_exact_system_response(&state, provider.as_ref(), &payload, &hook)
-    {
+    if let Some(response) = try_local_exact_system_response(
+        &state,
+        provider.as_ref(),
+        &payload,
+        &hook,
+        state.tool_compatibility_mode,
+    ) {
         return response;
     }
 
@@ -3043,9 +3052,13 @@ pub async fn post_messages_cc(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
-    if let Some(response) =
-        try_local_exact_system_response(&state, provider.as_ref(), &payload, &hook)
-    {
+    if let Some(response) = try_local_exact_system_response(
+        &state,
+        provider.as_ref(),
+        &payload,
+        &hook,
+        state.tool_compatibility_mode,
+    ) {
         return response;
     }
 
@@ -3851,21 +3864,30 @@ mod tests {
         };
 
         assert_eq!(
-            local_exact_system_answer(&request(
-                "Return exactly the single word 'alpha_42' and nothing else. No explanation.",
-                64,
-            )),
+            local_exact_system_answer(
+                &request(
+                    "Return exactly the single word 'alpha_42' and nothing else. No explanation.",
+                    64,
+                ),
+                crate::model::config::ToolCompatibilityMode::Raw,
+            ),
             Some("alpha_42".to_string())
         );
         assert_eq!(
-            local_exact_system_answer(&request("You are CodeAssist v2.", 64)),
+            local_exact_system_answer(
+                &request("You are CodeAssist v2.", 64),
+                crate::model::config::ToolCompatibilityMode::ClaudeCode,
+            ),
             None
         );
         assert_eq!(
-            local_exact_system_answer(&request(
-                "Return exactly the single word 'alpha_42' and nothing else. No explanation.",
-                0,
-            )),
+            local_exact_system_answer(
+                &request(
+                    "Return exactly the single word 'alpha_42' and nothing else. No explanation.",
+                    0,
+                ),
+                crate::model::config::ToolCompatibilityMode::Raw,
+            ),
             None
         );
     }

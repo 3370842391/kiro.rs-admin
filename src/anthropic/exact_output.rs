@@ -1,4 +1,5 @@
 use super::types::{MessagesRequest, ToolChoice};
+use crate::model::config::ToolCompatibilityMode;
 
 const MAX_LITERAL_BYTES: usize = 128;
 const MAX_JSON_BYTES: usize = 8192;
@@ -17,7 +18,10 @@ impl ExactOutput {
     }
 }
 
-pub(crate) fn exact_system_output(req: &MessagesRequest) -> Option<ExactOutput> {
+pub(crate) fn exact_system_output(
+    req: &MessagesRequest,
+    mode: ToolCompatibilityMode,
+) -> Option<ExactOutput> {
     if !exact_system_tool_policy_is_safe(req) {
         return None;
     }
@@ -26,7 +30,7 @@ pub(crate) fn exact_system_output(req: &MessagesRequest) -> Option<ExactOutput> 
         .system
         .as_ref()?
         .iter()
-        .map(|message| message.text.as_str())
+        .filter_map(|message| super::converter::sanitize_system_for_kiro(&message.text, mode))
         .collect::<Vec<_>>()
         .join("\n");
     let normalized = system.to_lowercase();
@@ -522,6 +526,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::model::config::ToolCompatibilityMode;
 
     fn request(system: Option<&str>, user: &str) -> MessagesRequest {
         let mut value = json!({
@@ -535,6 +540,64 @@ mod tests {
         serde_json::from_value(value).unwrap()
     }
 
+    fn identity_and_exact_request(separate_blocks: bool) -> MessagesRequest {
+        let exact =
+            "Respond with exactly the single word 'alpha_42' and nothing else. No explanation.";
+        let system = if separate_blocks {
+            json!([
+                {"type": "text", "text": super::super::converter::CLAUDE_CODE_IDENTITY_ANCHOR},
+                {"type": "text", "text": exact}
+            ])
+        } else {
+            json!([{
+                "type": "text",
+                "text": format!(
+                    "{}\n{}",
+                    super::super::converter::CLAUDE_CODE_IDENTITY_ANCHOR,
+                    exact
+                )
+            }])
+        };
+        serde_json::from_value(json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 128,
+            "system": system,
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{
+                "name": "noop",
+                "description": "An optional passive tool",
+                "input_schema": {"type": "object", "properties": {}}
+            }]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn claude_code_identity_anchor_allows_exact_contract_only_in_claude_code_mode() {
+        for separate_blocks in [true, false] {
+            let req = identity_and_exact_request(separate_blocks);
+            assert_eq!(
+                exact_system_output(&req, ToolCompatibilityMode::ClaudeCode),
+                Some(ExactOutput::Text("alpha_42".into()))
+            );
+            assert_eq!(exact_system_output(&req, ToolCompatibilityMode::Raw), None);
+        }
+    }
+
+    #[test]
+    fn arbitrary_identity_still_blocks_exact_contract() {
+        let req = request(
+            Some(
+                "You are CodeAssist v2.\nReturn exactly the single word 'alpha_42' and nothing else. No explanation.",
+            ),
+            "hello",
+        );
+        assert_eq!(
+            exact_system_output(&req, ToolCompatibilityMode::ClaudeCode),
+            None
+        );
+    }
+
     #[test]
     fn parses_static_ascii_literal_from_strict_system() {
         let req = request(
@@ -544,7 +607,7 @@ mod tests {
             "hello",
         );
         assert_eq!(
-            exact_system_output(&req),
+            exact_system_output(&req, ToolCompatibilityMode::Raw),
             Some(ExactOutput::Text("alpha_42".into()))
         );
     }
@@ -558,7 +621,7 @@ mod tests {
             "hello",
         );
         assert_eq!(
-            exact_system_output(&req),
+            exact_system_output(&req, ToolCompatibilityMode::Raw),
             Some(ExactOutput::Json("{\"a\":330,\"b\":360}".into()))
         );
     }
@@ -566,21 +629,30 @@ mod tests {
     #[test]
     fn rejects_identity_dynamic_and_ambiguous_system_contracts() {
         assert_eq!(
-            exact_system_output(&request(Some("You are CodeAssist v2."), "hello")),
+            exact_system_output(
+                &request(Some("You are CodeAssist v2."), "hello"),
+                ToolCompatibilityMode::Raw,
+            ),
             None
         );
         assert_eq!(
-            exact_system_output(&request(
-                Some("Return exactly the current date and nothing else."),
-                "hello"
-            )),
+            exact_system_output(
+                &request(
+                    Some("Return exactly the current date and nothing else."),
+                    "hello",
+                ),
+                ToolCompatibilityMode::Raw,
+            ),
             None
         );
         assert_eq!(
-            exact_system_output(&request(
-                Some("Return exactly 'alpha' or 'beta' and nothing else."),
-                "hello"
-            )),
+            exact_system_output(
+                &request(
+                    Some("Return exactly 'alpha' or 'beta' and nothing else."),
+                    "hello",
+                ),
+                ToolCompatibilityMode::Raw,
+            ),
             None
         );
     }
@@ -601,7 +673,10 @@ mod tests {
         ]);
         with_tool.tool_choice =
             Some(serde_json::from_value(json!({"type": "tool", "name": "echo"})).unwrap());
-        assert_eq!(exact_system_output(&with_tool), None);
+        assert_eq!(
+            exact_system_output(&with_tool, ToolCompatibilityMode::Raw),
+            None
+        );
 
         let mut with_thinking = request(
             Some("Return exactly the single word 'alpha' and nothing else."),
@@ -611,7 +686,10 @@ mod tests {
             thinking_type: "enabled".into(),
             budget_tokens: 1024,
         });
-        assert_eq!(exact_system_output(&with_thinking), None);
+        assert_eq!(
+            exact_system_output(&with_thinking, ToolCompatibilityMode::Raw),
+            None
+        );
     }
 
     #[test]
@@ -630,7 +708,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            exact_system_output(&req),
+            exact_system_output(&req, ToolCompatibilityMode::Raw),
             Some(ExactOutput::Text("alpha_42".into()))
         );
     }
@@ -653,7 +731,7 @@ mod tests {
             req.tool_choice = Some(serde_json::from_value(json!({"type": tool_choice})).unwrap());
 
             assert_eq!(
-                exact_system_output(&req),
+                exact_system_output(&req, ToolCompatibilityMode::Raw),
                 Some(ExactOutput::Text("alpha_42".into())),
                 "tool_choice={tool_choice} should remain passive"
             );
@@ -671,7 +749,7 @@ mod tests {
                 "hello",
             );
             req.tool_choice = Some(serde_json::from_value(tool_choice).unwrap());
-            assert_eq!(exact_system_output(&req), None);
+            assert_eq!(exact_system_output(&req, ToolCompatibilityMode::Raw), None);
         }
 
         for block in [
@@ -686,7 +764,7 @@ mod tests {
                 0,
                 serde_json::from_value(json!({"role": "assistant", "content": [block]})).unwrap(),
             );
-            assert_eq!(exact_system_output(&req), None);
+            assert_eq!(exact_system_output(&req, ToolCompatibilityMode::Raw), None);
         }
     }
 

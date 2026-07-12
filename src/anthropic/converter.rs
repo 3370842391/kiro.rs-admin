@@ -1763,10 +1763,10 @@ fn has_thinking_tags(content: &str) -> bool {
     content.contains("<thinking_mode>") || content.contains("<max_thinking_length>")
 }
 
-const CLAUDE_CODE_IDENTITY_ANCHOR: &str =
+pub(crate) const CLAUDE_CODE_IDENTITY_ANCHOR: &str =
     "You are Claude Code, Anthropic's official CLI for Claude.";
 
-fn sanitize_system_for_kiro(text: &str, mode: ToolCompatibilityMode) -> Option<String> {
+pub(crate) fn sanitize_system_for_kiro(text: &str, mode: ToolCompatibilityMode) -> Option<String> {
     if mode != ToolCompatibilityMode::ClaudeCode {
         return (!text.is_empty()).then(|| text.to_string());
     }
