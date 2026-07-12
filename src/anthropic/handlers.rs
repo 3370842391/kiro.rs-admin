@@ -557,12 +557,25 @@ fn strict_json_from_events(events: &[SseEvent]) -> Option<String> {
     super::exact_output::extract_single_json(&text)
 }
 
+#[cfg(test)]
 async fn recover_strict_json_attempts<F, Fut>(
-    mut collect: F,
+    collect: F,
 ) -> Result<StrictJsonRecovery, StrictJsonRecoveryFailure>
 where
     F: FnMut(usize) -> Fut,
     Fut: Future<Output = anyhow::Result<BufferedAttempt>>,
+{
+    recover_strict_json_attempts_with_validator(collect, |_| true).await
+}
+
+async fn recover_strict_json_attempts_with_validator<F, Fut, V>(
+    mut collect: F,
+    mut validate: V,
+) -> Result<StrictJsonRecovery, StrictJsonRecoveryFailure>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: Future<Output = anyhow::Result<BufferedAttempt>>,
+    V: FnMut(&str) -> bool,
 {
     let mut attempts = Vec::with_capacity(2);
     for attempt_index in 0..2 {
@@ -581,7 +594,7 @@ where
             .then(|| strict_json_from_events(&attempt.events))
             .flatten();
         attempts.push(attempt);
-        if let Some(json) = json {
+        if let Some(json) = json.filter(|json| validate(json)) {
             return Ok(StrictJsonRecovery { json, attempts });
         }
     }
@@ -712,25 +725,28 @@ async fn handle_strict_json_request(
     };
     let bodies = [request_body.to_owned(), retry_body];
     let model = payload.model.clone();
-    let recovery = recover_strict_json_attempts(|attempt_index| {
-        let provider = provider.clone();
-        let body = bodies[attempt_index].clone();
-        let model = model.clone();
-        let tracer = tracer.clone();
-        let group = group.clone();
-        async move {
-            collect_buffered_attempt(
-                provider,
-                body,
-                model,
-                input_tokens,
-                cache_usage,
-                tracer,
-                group,
-            )
-            .await
-        }
-    })
+    let recovery = recover_strict_json_attempts_with_validator(
+        |attempt_index| {
+            let provider = provider.clone();
+            let body = bodies[attempt_index].clone();
+            let model = model.clone();
+            let tracer = tracer.clone();
+            let group = group.clone();
+            async move {
+                collect_buffered_attempt(
+                    provider,
+                    body,
+                    model,
+                    input_tokens,
+                    cache_usage,
+                    tracer,
+                    group,
+                )
+                .await
+            }
+        },
+        |json| super::exact_output::json_satisfies_explicit_constraints(payload, json),
+    )
     .await;
 
     let (final_input, cache_creation, cache_read) =
@@ -3769,6 +3785,48 @@ mod tests {
         assert_eq!(calls, 2);
         assert_eq!(recovered.json, "{\"a\":1}");
         assert_eq!(recovered.attempts.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn strict_json_recovery_retries_syntactically_valid_constraint_violation() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 128,
+            "messages": [{
+                "role": "user",
+                "content": "Reply with exactly one minified JSON object and no explanation. Set alpha to the reverse of 'testz'. Set total to 29 + 8."
+            }]
+        }))
+        .unwrap();
+        let attempt = |text: &str| BufferedAttempt {
+            events: build_local_text_stream_events(
+                "claude-opus-4-8",
+                text,
+                20,
+                crate::anthropic::cache_metering::CacheUsage::default(),
+            ),
+            credential_id: 1,
+            usage: TraceUsage::zero(),
+            credits: 0.0,
+            terminal_error: None,
+        };
+        let mut attempts = std::collections::VecDeque::from([
+            attempt("{\"alpha\":\" ztset\",\"total\":37}"),
+            attempt("{\"alpha\":\"ztset\",\"total\":37}"),
+        ]);
+        let mut calls = 0;
+        let recovered = recover_strict_json_attempts_with_validator(
+            |_| {
+                calls += 1;
+                futures::future::ready(Ok(attempts.pop_front().unwrap()))
+            },
+            |json| super::super::exact_output::json_satisfies_explicit_constraints(&request, json),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(calls, 2);
+        assert_eq!(recovered.json, "{\"alpha\":\"ztset\",\"total\":37}");
     }
 
     #[tokio::test]

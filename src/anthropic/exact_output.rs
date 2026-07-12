@@ -152,6 +152,162 @@ pub(crate) fn append_strict_json_retry_instruction(request_body: &str) -> Option
     serde_json::to_string(&value).ok()
 }
 
+pub(crate) fn json_satisfies_explicit_constraints(req: &MessagesRequest, json: &str) -> bool {
+    let latest_user_text = req
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(|message| message_text(&message.content))
+        .unwrap_or_default();
+    let constraints = parse_explicit_json_constraints(&latest_user_text);
+    if constraints.is_empty() {
+        return true;
+    }
+    let Ok(serde_json::Value::Object(object)) = serde_json::from_str::<serde_json::Value>(json)
+    else {
+        return false;
+    };
+    constraints
+        .iter()
+        .all(|(key, expected)| object.get(key) == Some(expected))
+}
+
+fn parse_explicit_json_constraints(text: &str) -> Vec<(String, serde_json::Value)> {
+    let lower = text.to_ascii_lowercase();
+    let bytes = text.as_bytes();
+    let mut constraints = Vec::new();
+    let mut cursor = 0;
+    while let Some(relative) = lower[cursor..].find("set ") {
+        let start = cursor + relative;
+        cursor = start + "set ".len();
+        if start > 0 {
+            let previous = bytes[start - 1];
+            if previous.is_ascii_alphanumeric() || previous == b'_' {
+                continue;
+            }
+        }
+
+        let mut position = skip_ascii_whitespace(bytes, cursor);
+        let key_start = position;
+        while position < bytes.len()
+            && (bytes[position].is_ascii_alphanumeric() || matches!(bytes[position], b'_' | b'-'))
+        {
+            position += 1;
+        }
+        if position == key_start {
+            continue;
+        }
+        let key = text[key_start..position].to_owned();
+        position = skip_ascii_whitespace(bytes, position);
+        if !lower[position..].starts_with("to") {
+            continue;
+        }
+        position += 2;
+        if position < bytes.len()
+            && (bytes[position].is_ascii_alphanumeric() || bytes[position] == b'_')
+        {
+            continue;
+        }
+        position = skip_ascii_whitespace(bytes, position);
+
+        let rhs_lower = &lower[position..];
+        let reverse_prefix = if rhs_lower.starts_with("the reverse of") {
+            Some("the reverse of".len())
+        } else if rhs_lower.starts_with("reverse of") {
+            Some("reverse of".len())
+        } else {
+            None
+        };
+        let expected = if let Some(prefix_len) = reverse_prefix {
+            let quoted_start = skip_ascii_whitespace(bytes, position + prefix_len);
+            parse_quoted_string(text, quoted_start).map(|(value, _)| {
+                serde_json::Value::String(value.chars().rev().collect::<String>())
+            })
+        } else if let Some((value, _)) = parse_quoted_string(text, position) {
+            Some(serde_json::Value::String(value))
+        } else if let Some((left, after_left)) = parse_integer(text, position) {
+            let operator_position = skip_ascii_whitespace(bytes, after_left);
+            let operator = bytes.get(operator_position).copied();
+            let right_position = skip_ascii_whitespace(bytes, operator_position + 1);
+            parse_integer(text, right_position).and_then(|(right, _)| {
+                let value = match operator {
+                    Some(b'+') => left.checked_add(right),
+                    Some(b'-') => left.checked_sub(right),
+                    _ => None,
+                }?;
+                Some(serde_json::Value::Number(value.into()))
+            })
+        } else {
+            None
+        };
+        if let Some(expected) = expected {
+            constraints.push((key, expected));
+        }
+    }
+    constraints
+}
+
+fn skip_ascii_whitespace(bytes: &[u8], mut position: usize) -> usize {
+    while position < bytes.len() && bytes[position].is_ascii_whitespace() {
+        position += 1;
+    }
+    position
+}
+
+fn parse_quoted_string(text: &str, start: usize) -> Option<(String, usize)> {
+    let bytes = text.as_bytes();
+    let quote = *bytes.get(start)?;
+    if !matches!(quote, b'\'' | b'"') {
+        return None;
+    }
+    let mut escaped = false;
+    let mut end = start + 1;
+    while end < bytes.len() {
+        let byte = bytes[end];
+        if escaped {
+            escaped = false;
+        } else if byte == b'\\' {
+            escaped = true;
+        } else if byte == quote {
+            let raw = &text[start + 1..end];
+            let value = if quote == b'"' {
+                serde_json::from_str::<String>(&text[start..=end]).ok()?
+            } else {
+                let mut value = String::with_capacity(raw.len());
+                let mut chars = raw.chars();
+                while let Some(character) = chars.next() {
+                    if character == '\\' {
+                        value.push(chars.next().unwrap_or('\\'));
+                    } else {
+                        value.push(character);
+                    }
+                }
+                value
+            };
+            return Some((value, end + 1));
+        }
+        end += 1;
+    }
+    None
+}
+
+fn parse_integer(text: &str, start: usize) -> Option<(i64, usize)> {
+    let bytes = text.as_bytes();
+    let mut end = start;
+    if matches!(bytes.get(end), Some(b'+' | b'-')) {
+        end += 1;
+    }
+    let digits_start = end;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    if end == digits_start {
+        return None;
+    }
+    Some((text[start..end].parse().ok()?, end))
+}
+
 fn has_exact_cue(text: &str) -> bool {
     [
         "exactly",
@@ -408,5 +564,38 @@ mod tests {
             .unwrap();
         assert!(current.starts_with("current"));
         assert!(current.contains("complete JSON"));
+    }
+
+    #[test]
+    fn validates_generic_explicit_json_constraints() {
+        let req = request(
+            None,
+            "Reply with exactly one minified JSON object and no explanation. Set alpha to the reverse of 'testz'. Set total to 29 + 8. Set marker to \"VALUE-42\".",
+        );
+        assert!(json_satisfies_explicit_constraints(
+            &req,
+            r#"{"alpha":"ztset","total":37,"marker":"VALUE-42"}"#
+        ));
+        assert!(!json_satisfies_explicit_constraints(
+            &req,
+            r#"{"alpha":" ztset","total":37,"marker":"VALUE-42"}"#
+        ));
+        assert!(!json_satisfies_explicit_constraints(
+            &req,
+            r#"{"alpha":"zteset","total":37,"marker":"VALUE-42"}"#
+        ));
+        assert!(!json_satisfies_explicit_constraints(
+            &req,
+            r#"{"alpha":"ztset","total":36,"marker":"VALUE-42"}"#
+        ));
+    }
+
+    #[test]
+    fn accepts_valid_json_when_no_supported_explicit_constraint_exists() {
+        let req = request(
+            None,
+            "Reply with exactly one minified JSON object and no explanation. Use suitable values.",
+        );
+        assert!(json_satisfies_explicit_constraints(&req, r#"{"a":1}"#));
     }
 }
