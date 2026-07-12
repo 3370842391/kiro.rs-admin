@@ -29,7 +29,10 @@ const IDENTITY_BRAND_PHRASES: &[(&str, &str)] = &[
 const IDENTITY_DESC_PHRASES: &[(&str, &str)] = &[
     ("an AI-powered development environment", "an AI assistant"),
     ("AI-powered development environment", "AI assistant"),
-    ("an AI assistant for software development", "an AI assistant"),
+    (
+        "an AI assistant for software development",
+        "an AI assistant",
+    ),
 ];
 
 /// 大小写不敏感的子串替换：在 `haystack` 中把所有 `from`（忽略大小写）替换为 `to`。
@@ -37,17 +40,23 @@ fn replace_ci(haystack: &str, from: &str, to: &str) -> String {
     if from.is_empty() || haystack.len() < from.len() {
         return haystack.to_string();
     }
-    let hay_lower = haystack.to_lowercase();
-    let from_lower = from.to_lowercase();
     let mut out = String::with_capacity(haystack.len());
     let mut last = 0usize;
-    let mut search_from = 0usize;
-    while let Some(rel) = hay_lower[search_from..].find(&from_lower) {
-        let start = search_from + rel;
-        out.push_str(&haystack[last..start]);
-        out.push_str(to);
-        last = start + from.len();
-        search_from = last;
+    let mut i = 0usize;
+    while i + from.len() <= haystack.len() {
+        let end = i + from.len();
+        if haystack.is_char_boundary(end) && haystack[i..end].eq_ignore_ascii_case(from) {
+            out.push_str(&haystack[last..i]);
+            out.push_str(to);
+            last = end;
+            i = end;
+            continue;
+        }
+        i += haystack[i..]
+            .chars()
+            .next()
+            .map(char::len_utf8)
+            .unwrap_or(1);
     }
     out.push_str(&haystack[last..]);
     out
@@ -56,18 +65,20 @@ fn replace_ci(haystack: &str, from: &str, to: &str) -> String {
 /// 整词 "Kiro" → "Claude"（大小写不敏感匹配，统一替换为 "Claude"）。
 /// 词边界：前后字符都不是 ASCII 字母/数字，避免命中 "Kiron" 之类。
 fn replace_word_kiro(text: &str) -> String {
-    let lower = text.to_lowercase();
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
     let mut i = 0usize;
     while i < text.len() {
-        if lower[i..].starts_with("kiro") {
+        let after_idx = i + 4;
+        if after_idx <= text.len()
+            && text.is_char_boundary(after_idx)
+            && text[i..after_idx].eq_ignore_ascii_case("kiro")
+        {
             let before_ok = i == 0
                 || !bytes
                     .get(i - 1)
                     .map(|b| b.is_ascii_alphanumeric())
                     .unwrap_or(false);
-            let after_idx = i + 4;
             let after_ok = after_idx >= text.len()
                 || !bytes
                     .get(after_idx)
@@ -140,18 +151,21 @@ impl IdentityStreamFilter {
 /// 只在该前缀之前是词边界时才认（否则不可能构成整词 Kiro，无需缓冲）。
 fn trailing_kiro_prefix_len(s: &str) -> usize {
     const TARGET: &str = "kiro";
-    let lower = s.to_lowercase();
     // 前缀长度从长到短试：3,2,1（长度 4 = 完整词，交给 replace_word_kiro 处理，不缓冲）。
     for len in (1..=3).rev() {
-        if lower.len() < len {
+        if s.len() < len {
             continue;
         }
-        let suffix = &lower[lower.len() - len..];
-        if TARGET.starts_with(suffix) {
+        let before_idx = s.len() - len;
+        // `len` 是 ASCII 目标的字节数；UTF-8 文本末尾可能是多字节字符，不能从字符内部切片。
+        if !s.is_char_boundary(before_idx) {
+            continue;
+        }
+        let suffix = &s[before_idx..];
+        if TARGET[..len].eq_ignore_ascii_case(suffix) {
             // 词边界检查：该前缀前一个字符不能是字母数字。
-            let before_idx = s.len() - len;
-            let before_ok = before_idx == 0
-                || !s.as_bytes()[before_idx - 1].is_ascii_alphanumeric();
+            let before_ok =
+                before_idx == 0 || !s.as_bytes()[before_idx - 1].is_ascii_alphanumeric();
             if before_ok {
                 return len;
             }
@@ -183,7 +197,10 @@ mod tests {
     #[test]
     fn does_not_touch_kiro_inside_other_words() {
         // 词边界保护：不误伤 "Kiron" / "kiroshi" 之类。
-        assert_eq!(normalize_identity_text("Kiron and akiro"), "Kiron and akiro");
+        assert_eq!(
+            normalize_identity_text("Kiron and akiro"),
+            "Kiron and akiro"
+        );
     }
 
     #[test]
@@ -224,5 +241,18 @@ mod tests {
         let out = format!("{}{}", f.push("I am Kiro here"), f.finish());
         assert_eq!(out, "I am Claude here");
     }
-}
 
+    #[test]
+    fn stream_filter_handles_utf8_chunks_without_panicking() {
+        let mut f = IdentityStreamFilter::default();
+        let out = format!("{}{}", f.push("我是"), f.finish());
+        assert_eq!(out, "我是");
+    }
+
+    #[test]
+    fn stream_filter_handles_unicode_case_expansion_before_kiro() {
+        let mut f = IdentityStreamFilter::default();
+        let out = format!("{}{}", f.push("İ Kiro"), f.finish());
+        assert_eq!(out, "İ Claude");
+    }
+}
