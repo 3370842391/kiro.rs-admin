@@ -1754,17 +1754,45 @@ fn has_thinking_tags(content: &str) -> bool {
     content.contains("<thinking_mode>") || content.contains("<max_thinking_length>")
 }
 
-fn push_system_history(history: &mut Vec<Message>, req: &MessagesRequest, model_id: &str) {
+const CLAUDE_CODE_IDENTITY_ANCHOR: &str =
+    "You are Claude Code, Anthropic's official CLI for Claude.";
+
+fn sanitize_system_for_kiro(text: &str, mode: ToolCompatibilityMode) -> Option<String> {
+    if mode != ToolCompatibilityMode::ClaudeCode {
+        return (!text.is_empty()).then(|| text.to_string());
+    }
+
+    let contains_anchor = text
+        .lines()
+        .any(|line| line.trim() == CLAUDE_CODE_IDENTITY_ANCHOR);
+    if !contains_anchor {
+        return (!text.is_empty()).then(|| text.to_string());
+    }
+
+    let sanitized = text
+        .lines()
+        .filter(|line| line.trim() != CLAUDE_CODE_IDENTITY_ANCHOR)
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!sanitized.is_empty()).then_some(sanitized)
+}
+
+fn push_system_history(
+    history: &mut Vec<Message>,
+    req: &MessagesRequest,
+    model_id: &str,
+    mode: ToolCompatibilityMode,
+) {
     let thinking_prefix = thinking_prefix_for_history(req, model_id);
     if let Some(system) = &req.system {
         let system_content = system
             .iter()
-            .map(|block| block.text.as_str())
-            .filter(|text| !text.is_empty())
+            .filter_map(|block| sanitize_system_for_kiro(&block.text, mode))
             .collect::<Vec<_>>()
             .join("\n");
         if !system_content.is_empty() {
-            let content = if let Some(prefix) = thinking_prefix {
+            let content = if let Some(prefix) = thinking_prefix.as_deref() {
                 if has_thinking_tags(&system_content) {
                     system_content
                 } else {
@@ -1775,6 +1803,10 @@ fn push_system_history(history: &mut Vec<Message>, req: &MessagesRequest, model_
             };
             history.push(Message::User(HistoryUserMessage {
                 user_input_message: UserMessage::new(content, model_id),
+            }));
+        } else if let Some(prefix) = thinking_prefix {
+            history.push(Message::User(HistoryUserMessage {
+                user_input_message: UserMessage::new(prefix, model_id),
             }));
         }
     } else if let Some(prefix) = thinking_prefix {
@@ -1798,7 +1830,7 @@ fn build_history(
     mode: ToolCompatibilityMode,
 ) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
-    push_system_history(&mut history, req, model_id);
+    push_system_history(&mut history, req, model_id, mode);
 
     // 处理调用方已经与 currentMessage 分离的常规消息历史。
     let mut user_buffer: Vec<&super::types::Message> = Vec::new();
@@ -3344,6 +3376,88 @@ mod tests {
         let wire = serde_json::to_string(&result.conversation_state).unwrap();
         assert!(!wire.contains("client_system_instructions"));
         assert!(!wire.contains("user_content"));
+    }
+
+    #[test]
+    fn claude_code_mode_removes_conflicting_identity_only_system() {
+        use super::super::types::SystemMessage;
+
+        let mut req = minimal_request_with_output_config("claude-sonnet-4.5");
+        req.output_config = None;
+        req.system = Some(vec![SystemMessage {
+            text: "You are Claude Code, Anthropic's official CLI for Claude.".into(),
+            cache_control: None,
+        }]);
+
+        let result = convert_request_with_mode(&req, ToolCompatibilityMode::ClaudeCode).unwrap();
+        assert!(result.conversation_state.history.is_empty());
+    }
+
+    #[test]
+    fn claude_code_mode_keeps_rules_beside_conflicting_identity() {
+        use super::super::types::SystemMessage;
+
+        let mut req = minimal_request_with_output_config("claude-sonnet-4.5");
+        req.output_config = None;
+        req.system = Some(vec![SystemMessage {
+            text:
+                "You are Claude Code, Anthropic's official CLI for Claude.\nReturn {\"ok\":true}."
+                    .into(),
+            cache_control: None,
+        }]);
+
+        let result = convert_request_with_mode(&req, ToolCompatibilityMode::ClaudeCode).unwrap();
+        let Message::User(system) = &result.conversation_state.history[0] else {
+            panic!("expected remaining system rule as history");
+        };
+        assert_eq!(system.user_input_message.content, "Return {\"ok\":true}.");
+    }
+
+    #[test]
+    fn raw_mode_preserves_claude_code_identity_system() {
+        use super::super::types::SystemMessage;
+
+        let identity = "You are Claude Code, Anthropic's official CLI for Claude.";
+        let mut req = minimal_request_with_output_config("claude-sonnet-4.5");
+        req.output_config = None;
+        req.system = Some(vec![SystemMessage {
+            text: identity.into(),
+            cache_control: None,
+        }]);
+
+        let result = convert_request_with_mode(&req, ToolCompatibilityMode::Raw).unwrap();
+        let Message::User(system) = &result.conversation_state.history[0] else {
+            panic!("expected raw system history");
+        };
+        assert_eq!(system.user_input_message.content, identity);
+    }
+
+    #[test]
+    fn thinking_prefix_precedes_rules_after_identity_removal() {
+        use super::super::types::{SystemMessage, Thinking};
+
+        let mut req = minimal_request_with_output_config("claude-sonnet-4.5");
+        req.output_config = None;
+        req.thinking = Some(Thinking {
+            thinking_type: "enabled".to_string(),
+            budget_tokens: 2048,
+        });
+        req.system = Some(vec![SystemMessage {
+            text:
+                "You are Claude Code, Anthropic's official CLI for Claude.\nKeep the answer exact."
+                    .into(),
+            cache_control: None,
+        }]);
+
+        let result = convert_request_with_mode(&req, ToolCompatibilityMode::ClaudeCode).unwrap();
+        let Message::User(system) = &result.conversation_state.history[0] else {
+            panic!("expected system history");
+        };
+        let content = &system.user_input_message.content;
+        assert!(content.starts_with("<thinking_mode>enabled</thinking_mode>"));
+        assert!(content.ends_with("Keep the answer exact."));
+        assert_eq!(content.matches("<thinking_mode>").count(), 1);
+        assert!(!content.contains("Claude Code"));
     }
 
     #[test]

@@ -5,6 +5,8 @@ use futures::{StreamExt, future::join_all};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+const BUILTIN_TEXT_PDF_B64: &str = "JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCA2MTIgNzkyXSAvUmVzb3VyY2VzIDw8IC9Gb250IDw8IC9GMSA0IDAgUiA+PiA+PiAvQ29udGVudHMgNSAwIFIgPj4KZW5kb2JqCjQgMCBvYmoKPDwgL1R5cGUgL0ZvbnQgL1N1YnR5cGUgL1R5cGUxIC9CYXNlRm9udCAvSGVsdmV0aWNhID4+CmVuZG9iago1IDAgb2JqCjw8IC9MZW5ndGggNTQgPj4Kc3RyZWFtCkJUIC9GMSAxMiBUZiA3MiA3MjAgVGQgKFBERi1DT01QQVRJQklMSVRZLVRPS0VOKSBUaiBFVAplbmRzdHJlYW0KZW5kb2JqCnhyZWYKMCA2CjAwMDAwMDAwMDAgNjU1MzUgZiAKMDAwMDAwMDAwOSAwMDAwMCBuIAowMDAwMDAwMDU4IDAwMDAwIG4gCjAwMDAwMDAxMTUgMDAwMDAgbiAKMDAwMDAwMDI0MSAwMDAwMCBuIAowMDAwMDAwMzExIDAwMDAwIG4gCnRyYWlsZXIKPDwgL1NpemUgNiAvUm9vdCAxIDAgUiA+PgpzdGFydHhyZWYKNDE1CiUlRU9GCg==";
+
 #[derive(Debug)]
 struct Args {
     base_url: String,
@@ -17,7 +19,6 @@ struct Args {
 enum ProbeResult {
     Pass,
     Fail(String),
-    Skip(String),
 }
 
 fn parse_args_from<I, S>(args: I) -> Result<Args, String>
@@ -179,12 +180,15 @@ async fn tool_probe(client: &reqwest::Client, args: &Args, key: &str) -> ProbeRe
 }
 
 async fn pdf_probe(client: &reqwest::Client, args: &Args, key: &str) -> ProbeResult {
-    let Some(path) = &args.pdf else {
-        return ProbeResult::Skip("--pdf was not provided".into());
-    };
-    let bytes = match tokio::fs::read(path).await {
-        Ok(bytes) => bytes,
-        Err(error) => return ProbeResult::Fail(error.to_string()),
+    let bytes = match &args.pdf {
+        Some(path) => match tokio::fs::read(path).await {
+            Ok(bytes) => bytes,
+            Err(error) => return ProbeResult::Fail(error.to_string()),
+        },
+        None => match base64::engine::general_purpose::STANDARD.decode(BUILTIN_TEXT_PDF_B64) {
+            Ok(bytes) => bytes,
+            Err(error) => return ProbeResult::Fail(error.to_string()),
+        },
     };
     let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
     match post_message(
@@ -198,16 +202,13 @@ async fn pdf_probe(client: &reqwest::Client, args: &Args, key: &str) -> ProbeRes
                 {"type": "document", "source": {
                     "type": "base64", "media_type": "application/pdf", "data": encoded
                 }},
-                {"type": "text", "text": "Return the exact verification token printed in the document."}
+                {"type": "text", "text": "Extract the identifier formatted like 'PDF-COMPATIBILITY-xxxxx' and reply with ONLY the identifier, no explanation."}
             ]}]
         }),
     )
     .await
     {
-        Ok(value) if value["content"].as_array().is_some_and(|blocks| !blocks.is_empty()) => {
-            ProbeResult::Pass
-        }
-        Ok(_) => ProbeResult::Fail("PDF request returned empty content".into()),
+        Ok(value) => classify_pdf(&value),
         Err(error) => ProbeResult::Fail(error),
     }
 }
@@ -401,5 +402,34 @@ mod tests {
         ];
         assert_eq!(classify_sse(&events), ProbeResult::Pass);
         assert!(matches!(classify_sse(&events[..4]), ProbeResult::Fail(_)));
+    }
+
+    #[test]
+    fn pdf_probe_requires_the_exact_document_identifier() {
+        let correct = json!({
+            "content": [{"type": "text", "text": "PDF-COMPATIBILITY-TOKEN"}]
+        });
+        let explanatory = json!({
+            "content": [{"type": "text", "text": "The token is PDF-COMPATIBILITY-TOKEN."}]
+        });
+
+        assert_eq!(classify_pdf(&correct), ProbeResult::Pass);
+        assert!(matches!(classify_pdf(&explanatory), ProbeResult::Fail(_)));
+    }
+}
+
+fn classify_pdf(response: &Value) -> ProbeResult {
+    let text = response["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|block| block["text"].as_str())
+        .collect::<String>();
+    if text.trim() == "PDF-COMPATIBILITY-TOKEN" {
+        ProbeResult::Pass
+    } else {
+        ProbeResult::Fail(format!(
+            "PDF identifier mismatch: expected PDF-COMPATIBILITY-TOKEN, got {text:?}"
+        ))
     }
 }

@@ -2395,6 +2395,8 @@ impl StreamContext {
         self.state_manager.set_has_tool_use(true);
         self.has_visible_output = true;
         self.emitted_tool_names.push(completed.name.clone());
+        let input_json =
+            serde_json::to_string(&completed.input).unwrap_or_else(|_| "{}".to_string());
 
         let block_index = if let Some(&idx) = self.tool_block_indices.get(&completed.id) {
             idx
@@ -2403,6 +2405,13 @@ impl StreamContext {
             self.tool_block_indices.insert(completed.id.clone(), idx);
             idx
         };
+        tracing::debug!(
+            tool_id = %completed.id,
+            tool_name = %completed.name,
+            block_index,
+            input_bytes = input_json.len(),
+            "emitting completed Anthropic tool_use block"
+        );
 
         events.extend(self.state_manager.handle_content_block_start(
             block_index,
@@ -2420,7 +2429,7 @@ impl StreamContext {
         ));
 
         // 一次性发出完整参数 JSON（来源已保证是合法 JSON）。
-        self.output_tokens += estimate_tokens(&completed.input.to_string());
+        self.output_tokens += estimate_tokens(&input_json);
         if let Some(delta_event) = self.state_manager.handle_content_block_delta(
             block_index,
             json!({
@@ -2428,7 +2437,7 @@ impl StreamContext {
                 "index": block_index,
                 "delta": {
                     "type": "input_json_delta",
-                    "partial_json": serde_json::to_string(&completed.input).unwrap_or_else(|_| "{}".to_string())
+                    "partial_json": input_json
                 }
             }),
         ) {
@@ -2450,6 +2459,13 @@ impl StreamContext {
         let mut events = Vec::new();
 
         self.saw_upstream_tool_use = true;
+        tracing::debug!(
+            tool_id = %tool_use.tool_use_id,
+            tool_name = %tool_use.name,
+            stop = tool_use.stop,
+            input_bytes = tool_use.input.len(),
+            "received upstream tool_use fragment"
+        );
 
         if self.is_thinking_block_open() && !self.in_thinking_block {
             events.extend(self.close_open_thinking_block());
@@ -2767,7 +2783,14 @@ impl StreamContext {
                 Some("upstream returned no assistant content".to_string());
         }
 
-        if let Some(message) = self.terminal_error_message() {
+        let terminal_error = self.terminal_error_message();
+        tracing::debug!(
+            emitted_tool_names = ?self.emitted_tool_names,
+            stop_reason = %self.state_manager.get_stop_reason(),
+            terminal_error = terminal_error.as_deref().unwrap_or(""),
+            "finalized Anthropic tool event state"
+        );
+        if let Some(message) = terminal_error {
             let error_type = self
                 .tool_json_error
                 .as_ref()

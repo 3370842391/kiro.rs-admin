@@ -113,65 +113,77 @@ pub(crate) fn normalize_identity_text(text: &str) -> String {
     replace_word_kiro(&s)
 }
 
-/// 流式身份过滤器：跨 chunk 把整词 "Kiro" → "Claude"。
+/// 流式身份过滤器：跨 chunk 归一化已知身份短语。
 ///
-/// 流式下 "Kiro" 可能被切在两个 chunk 之间（如 "...I'm Ki" | "ro..."），故用小缓冲：
-/// 每个 chunk 处理后，若末尾是 "kiro" 的**前缀**（且该前缀前是词边界），就把它留到
-/// 下个 chunk 再判定；否则全部输出。只处理整词 Kiro（最主要、最安全的身份泄漏关键词）；
-/// "made by AWS" 等多词短语走非流式完整归一化（身份探针均为非流式）。
+/// 每个 chunk 处理后，若末尾是任一已知源短语的严格前缀，就把该后缀留到下个 chunk；
+/// 其余部分复用非流式归一化。缓冲长度至多为最长身份短语减一，不会固定延迟普通文本。
 #[derive(Default)]
 pub(crate) struct IdentityStreamFilter {
-    /// 上一 chunk 末尾疑似 "kiro" 前缀的残留（含其前的词边界判定信息）。
+    /// 上一 chunk 末尾疑似身份短语前缀的残留。
     pending: String,
 }
 
 impl IdentityStreamFilter {
-    /// 送入一个文本 chunk，返回可安全输出的部分（已完成 Kiro→Claude 替换）。
+    /// 送入一个文本 chunk，返回可安全输出的已归一化部分。
     pub(crate) fn push(&mut self, chunk: &str) -> String {
         if chunk.is_empty() {
             return String::new();
         }
         let mut combined = std::mem::take(&mut self.pending);
         combined.push_str(chunk);
-        // 找出末尾最长的、可能是 "kiro" 前缀的后缀（1..=3 个字符，"kiro" 本身会被整词替换）。
-        let keep = trailing_kiro_prefix_len(&combined);
+        let keep = trailing_identity_prefix_len(&combined);
         let (emit_part, hold_part) = combined.split_at(combined.len() - keep);
         self.pending = hold_part.to_string();
-        replace_word_kiro(emit_part)
+        normalize_identity_text(emit_part)
     }
 
-    /// 流结束时 flush 残留（末尾疑似前缀若不是完整 "kiro"，原样输出）。
+    /// 流结束时 flush 残留。
     pub(crate) fn finish(&mut self) -> String {
         let rest = std::mem::take(&mut self.pending);
-        replace_word_kiro(&rest)
+        normalize_identity_text(&rest)
     }
 }
 
-/// 返回 `s` 末尾属于 "kiro"（忽略大小写）严格前缀的字符数（1..=3）；无则 0。
-/// 只在该前缀之前是词边界时才认（否则不可能构成整词 Kiro，无需缓冲）。
-fn trailing_kiro_prefix_len(s: &str) -> usize {
-    const TARGET: &str = "kiro";
-    // 前缀长度从长到短试：3,2,1（长度 4 = 完整词，交给 replace_word_kiro 处理，不缓冲）。
-    for len in (1..=3).rev() {
-        if s.len() < len {
+fn identity_source_phrases() -> impl Iterator<Item = &'static str> {
+    std::iter::once("kiro")
+        .chain(IDENTITY_BRAND_PHRASES.iter().map(|(from, _)| *from))
+        .chain(IDENTITY_DESC_PHRASES.iter().map(|(from, _)| *from))
+}
+
+/// 返回 `s` 末尾属于任一已知源短语（忽略 ASCII 大小写）严格前缀的最大字节数。
+fn trailing_identity_prefix_len(s: &str) -> usize {
+    let max_target_len = identity_source_phrases().map(str::len).max().unwrap_or(0);
+    let min_start = s.len().saturating_sub(max_target_len.saturating_sub(1));
+    let mut best = 0usize;
+
+    for start in s
+        .char_indices()
+        .map(|(index, _)| index)
+        .filter(|index| *index >= min_start)
+    {
+        let suffix = &s[start..];
+        if suffix.is_empty() {
             continue;
         }
-        let before_idx = s.len() - len;
-        // `len` 是 ASCII 目标的字节数；UTF-8 文本末尾可能是多字节字符，不能从字符内部切片。
-        if !s.is_char_boundary(before_idx) {
-            continue;
-        }
-        let suffix = &s[before_idx..];
-        if TARGET[..len].eq_ignore_ascii_case(suffix) {
-            // 词边界检查：该前缀前一个字符不能是字母数字。
-            let before_ok =
-                before_idx == 0 || !s.as_bytes()[before_idx - 1].is_ascii_alphanumeric();
-            if before_ok {
-                return len;
+        let before_is_word = s[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
+
+        for target in identity_source_phrases() {
+            if suffix.len() >= target.len() || !target.is_char_boundary(suffix.len()) {
+                continue;
+            }
+            if before_is_word && target.as_bytes()[0].is_ascii_alphanumeric() {
+                continue;
+            }
+            if target[..suffix.len()].eq_ignore_ascii_case(suffix) {
+                best = best.max(suffix.len());
             }
         }
     }
-    0
+
+    best
 }
 
 #[cfg(test)]
@@ -254,5 +266,63 @@ mod tests {
         let mut f = IdentityStreamFilter::default();
         let out = format!("{}{}", f.push("İ Kiro"), f.finish());
         assert_eq!(out, "İ Claude");
+    }
+
+    #[test]
+    fn stream_filter_normalizes_complete_identity_across_multiple_chunks() {
+        let mut f = IdentityStreamFilter::default();
+        let mut out = String::new();
+        out.push_str(&f.push("I'm Kiro, an AI-pow"));
+        out.push_str(&f.push("ered development environment made by AW"));
+        out.push_str(&f.push("S."));
+        out.push_str(&f.finish());
+
+        assert_eq!(out, "I'm Claude, an AI assistant made by Anthropic.");
+    }
+
+    #[test]
+    fn stream_filter_handles_every_split_of_identity_phrase() {
+        let source = "I'm Kiro, an AI-powered development environment made by AWS.";
+        let expected = "I'm Claude, an AI assistant made by Anthropic.";
+
+        for split in source
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain([source.len()])
+        {
+            let mut f = IdentityStreamFilter::default();
+            let out = format!(
+                "{}{}{}",
+                f.push(&source[..split]),
+                f.push(&source[split..]),
+                f.finish()
+            );
+            assert_eq!(out, expected, "split at byte {split}");
+        }
+    }
+
+    #[test]
+    fn stream_filter_preserves_unicode_around_identity_phrase() {
+        let mut f = IdentityStreamFilter::default();
+        let out = format!(
+            "{}{}{}{}",
+            f.push("前缀🙂 I'm Kiro, an AI-pow"),
+            f.push("ered development environment"),
+            f.push(" 后缀🚀"),
+            f.finish()
+        );
+        assert_eq!(out, "前缀🙂 I'm Claude, an AI assistant 后缀🚀");
+    }
+
+    #[test]
+    fn stream_filter_leaves_legit_aws_text_untouched() {
+        let mut f = IdentityStreamFilter::default();
+        let out = format!(
+            "{}{}{}",
+            f.push("Use the AWS SDK to call Ama"),
+            f.push("zon S3."),
+            f.finish()
+        );
+        assert_eq!(out, "Use the AWS SDK to call Amazon S3.");
     }
 }

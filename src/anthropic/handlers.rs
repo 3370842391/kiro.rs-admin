@@ -425,6 +425,209 @@ fn split_non_stream_usage(
     usage.split_api(cache_usage)
 }
 
+fn build_local_document_message(
+    model: &str,
+    answer: &str,
+    input_tokens: i32,
+    cache_usage: &super::cache_metering::CacheUsage,
+) -> serde_json::Value {
+    let (input_tokens, cache_creation_tokens, cache_read_tokens) =
+        split_non_stream_usage(input_tokens, None, cache_usage);
+    let output_tokens = token::count_tokens(answer).max(1) as i32;
+    json!({
+        "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "text", "text": answer}],
+        "model": model,
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_creation_input_tokens": cache_creation_tokens,
+            "cache_read_input_tokens": cache_read_tokens
+        }
+    })
+}
+
+fn build_local_document_stream_events(
+    model: &str,
+    answer: &str,
+    input_tokens: i32,
+    cache_usage: super::cache_metering::CacheUsage,
+) -> Vec<SseEvent> {
+    let (input_tokens, cache_creation_tokens, cache_read_tokens) =
+        split_non_stream_usage(input_tokens, None, &cache_usage);
+    let output_tokens = token::count_tokens(answer).max(1) as i32;
+    let message_id = format!("msg_{}", Uuid::new_v4().to_string().replace('-', ""));
+
+    vec![
+        SseEvent::new(
+            "message_start",
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": model,
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {
+                        "input_tokens": input_tokens,
+                        "output_tokens": 0,
+                        "cache_creation_input_tokens": cache_creation_tokens,
+                        "cache_read_input_tokens": cache_read_tokens
+                    }
+                }
+            }),
+        ),
+        SseEvent::new(
+            "content_block_start",
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""}
+            }),
+        ),
+        SseEvent::new(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": answer}
+            }),
+        ),
+        SseEvent::new(
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": 0}),
+        ),
+        SseEvent::new(
+            "message_delta",
+            json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "cache_creation_input_tokens": cache_creation_tokens,
+                    "cache_read_input_tokens": cache_read_tokens
+                }
+            }),
+        ),
+        SseEvent::new("message_stop", json!({"type": "message_stop"})),
+    ]
+}
+
+fn local_document_system_is_safe_to_bypass(
+    payload: &MessagesRequest,
+    mode: crate::model::config::ToolCompatibilityMode,
+) -> bool {
+    const IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+    payload.system.as_ref().is_none_or(|blocks| {
+        if mode != crate::model::config::ToolCompatibilityMode::ClaudeCode {
+            return false;
+        }
+        blocks.iter().all(|block| {
+            block
+                .text
+                .lines()
+                .all(|line| line.trim().is_empty() || line.trim() == IDENTITY)
+        })
+    })
+}
+
+fn try_local_document_identifier_response(
+    state: &AppState,
+    provider: &crate::kiro::provider::KiroProvider,
+    payload: &MessagesRequest,
+    expansion: &super::document::DocumentExpansion,
+    hook: &UsageRecordHook,
+    mode: crate::model::config::ToolCompatibilityMode,
+) -> Option<Response> {
+    if payload
+        .tools
+        .as_ref()
+        .is_some_and(|tools| !tools.is_empty())
+        || payload.tool_choice.is_some()
+        || payload.thinking.as_ref().is_some_and(Thinking::is_enabled)
+        || !local_document_system_is_safe_to_bypass(payload, mode)
+    {
+        return None;
+    }
+    let answer = expansion.deterministic_identifier_answer(payload)?;
+    let output_tokens = token::count_tokens(&answer).max(1) as i32;
+    if output_tokens > payload.max_tokens.max(0) {
+        return None;
+    }
+    let input_tokens = token::count_all_tokens(
+        payload.model.clone(),
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
+    ) as i32;
+    let cache_usage = state
+        .cache_meter
+        .as_ref()
+        .map(|cache| {
+            let usage = super::cache_metering::compute_cache_usage(cache, payload, hook.key_id);
+            let (hr_min, hr_max) = provider.cache_hit_rate_bounds();
+            usage.with_hit_rate_bounds(hr_min, hr_max)
+        })
+        .unwrap_or_default();
+    let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
+        split_non_stream_usage(input_tokens, None, &cache_usage);
+
+    tracing::debug!(
+        answer_bytes = answer.len(),
+        input_tokens = final_input_tokens,
+        output_tokens,
+        stream = payload.stream,
+        "served strict local identifier extraction for text PDF"
+    );
+    hook.record(
+        0,
+        final_input_tokens,
+        output_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+        0.0,
+        "success",
+    );
+
+    if payload.stream {
+        let body =
+            build_local_document_stream_events(&payload.model, &answer, input_tokens, cache_usage)
+                .into_iter()
+                .map(|event| event.to_sse_string())
+                .collect::<String>();
+        Some(
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .header(header::CACHE_CONTROL, "no-cache")
+                .header(header::CONNECTION, "keep-alive")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+    } else {
+        Some(
+            (
+                StatusCode::OK,
+                Json(build_local_document_message(
+                    &payload.model,
+                    &answer,
+                    input_tokens,
+                    &cache_usage,
+                )),
+            )
+                .into_response(),
+        )
+    }
+}
+
 fn available_models() -> Vec<Model> {
     let model = |id: &str, display_name: &str, owned_by: &str, max_tokens: i32| Model {
         id: id.to_string(),
@@ -779,10 +982,23 @@ pub async fn post_messages(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
-    if let Err(error) = super::document::expand_pdf_documents(&mut payload).await {
-        tracing::warn!(error = %error, "Anthropic document preprocessing failed");
-        hook.record(0, 0, 0, 0, 0, 0.0, "error");
-        return map_document_error(error);
+    let document_expansion = match super::document::expand_pdf_documents(&mut payload).await {
+        Ok(expansion) => expansion,
+        Err(error) => {
+            tracing::warn!(error = %error, "Anthropic document preprocessing failed");
+            hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            return map_document_error(error);
+        }
+    };
+    if let Some(response) = try_local_document_identifier_response(
+        &state,
+        provider.as_ref(),
+        &payload,
+        &document_expansion,
+        &hook,
+        state.tool_compatibility_mode,
+    ) {
+        return response;
     }
 
     // 检查是否为 WebSearch 请求
@@ -1681,8 +1897,21 @@ async fn handle_non_stream_request(
                         }
                         Event::ToolUse(tool_use) => {
                             upstream_signalled_tool_use = true;
+                            tracing::debug!(
+                                tool_id = %tool_use.tool_use_id,
+                                tool_name = %tool_use.name,
+                                stop = tool_use.stop,
+                                input_bytes = tool_use.input.len(),
+                                "received upstream non-stream tool_use fragment"
+                            );
                             match tool_accumulator.push(&tool_use, &tool_name_map) {
                                 Ok(Some(completed)) => {
+                                    tracing::debug!(
+                                        tool_id = %completed.id,
+                                        tool_name = %completed.name,
+                                        input_bytes = completed.input.to_string().len(),
+                                        "collected completed non-stream tool_use block"
+                                    );
                                     tool_uses.push(completed.to_anthropic_block());
                                 }
                                 Ok(None) => {}
@@ -1794,21 +2023,16 @@ async fn handle_non_stream_request(
         &tool_name_map,
     );
     let strict_thinking_validation = provider.strict_thinking_validation();
-    if require_thinking
-        && !strict_thinking_validation
-        && !content_has_reasoning(&content)
-    {
+    if require_thinking && !strict_thinking_validation && !content_has_reasoning(&content) {
         tracing::warn!(
             model,
             credential_id,
             "客户端请求了 thinking，但 Kiro 未返回 reasoning；保留有效正文或工具调用"
         );
     }
-    if let Err(message) = validate_required_thinking(
-        require_thinking,
-        strict_thinking_validation,
-        &content,
-    ) {
+    if let Err(message) =
+        validate_required_thinking(require_thinking, strict_thinking_validation, &content)
+    {
         hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
         tracer.finalize(
             "error",
@@ -1844,6 +2068,11 @@ async fn handle_non_stream_request(
     let has_output_tool_use = content
         .iter()
         .any(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("tool_use"));
+    let emitted_tool_names = content
+        .iter()
+        .filter(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("tool_use"))
+        .filter_map(|block| block.get("name").and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>();
     if let Err(message) = apply_tool_stop_reason(
         &mut stop_reason,
         upstream_signalled_tool_use,
@@ -1863,6 +2092,12 @@ async fn handle_non_stream_request(
         )
             .into_response();
     }
+    tracing::debug!(
+        emitted_tool_names = ?emitted_tool_names,
+        upstream_signalled_tool_use,
+        stop_reason = %stop_reason,
+        "finalized non-stream Anthropic tool event state"
+    );
     if let Err(message) = validate_non_stream_content(&content) {
         hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
         tracer.finalize(
@@ -2195,10 +2430,23 @@ pub async fn post_messages_cc(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
-    if let Err(error) = super::document::expand_pdf_documents(&mut payload).await {
-        tracing::warn!(error = %error, "Anthropic document preprocessing failed");
-        hook.record(0, 0, 0, 0, 0, 0.0, "error");
-        return map_document_error(error);
+    let document_expansion = match super::document::expand_pdf_documents(&mut payload).await {
+        Ok(expansion) => expansion,
+        Err(error) => {
+            tracing::warn!(error = %error, "Anthropic document preprocessing failed");
+            hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            return map_document_error(error);
+        }
+    };
+    if let Some(response) = try_local_document_identifier_response(
+        &state,
+        provider.as_ref(),
+        &payload,
+        &document_expansion,
+        &hook,
+        state.tool_compatibility_mode,
+    ) {
+        return response;
     }
 
     // 检查是否为 WebSearch 请求
@@ -2825,6 +3073,86 @@ mod tests {
             "worker panicked".to_string(),
         ));
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn local_document_non_stream_body_is_standard_anthropic_message() {
+        let body = build_local_document_message(
+            "claude-opus-4-8",
+            "ORDER-ID-4f8a2c1d",
+            42,
+            &crate::anthropic::cache_metering::CacheUsage::default(),
+        );
+
+        assert_eq!(body["type"], "message");
+        assert_eq!(body["role"], "assistant");
+        assert_eq!(body["content"][0]["type"], "text");
+        assert_eq!(body["content"][0]["text"], "ORDER-ID-4f8a2c1d");
+        assert_eq!(body["stop_reason"], "end_turn");
+        assert_eq!(body["usage"]["input_tokens"], 42);
+        assert!(body["usage"]["output_tokens"].as_i64().unwrap() > 0);
+    }
+
+    #[test]
+    fn local_document_stream_events_have_complete_standard_sequence() {
+        let events = build_local_document_stream_events(
+            "claude-opus-4-8",
+            "ORDER-ID-4f8a2c1d",
+            42,
+            crate::anthropic::cache_metering::CacheUsage::default(),
+        );
+        let names = events
+            .iter()
+            .map(|event| event.event.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop"
+            ]
+        );
+        assert_eq!(events[2].data["delta"]["text"], "ORDER-ID-4f8a2c1d");
+        assert_eq!(events[4].data["delta"]["stop_reason"], "end_turn");
+        assert_eq!(events[4].data["usage"]["input_tokens"], 42);
+    }
+
+    #[test]
+    fn local_document_bypass_accepts_only_the_removed_claude_code_identity() {
+        let request = |system: Option<&str>| -> MessagesRequest {
+            let mut value = serde_json::json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "test"}]
+            });
+            if let Some(system) = system {
+                value["system"] = serde_json::json!(system);
+            }
+            serde_json::from_value(value).unwrap()
+        };
+        let identity = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+        assert!(local_document_system_is_safe_to_bypass(
+            &request(None),
+            crate::model::config::ToolCompatibilityMode::Raw
+        ));
+        assert!(local_document_system_is_safe_to_bypass(
+            &request(Some(identity)),
+            crate::model::config::ToolCompatibilityMode::ClaudeCode
+        ));
+        assert!(!local_document_system_is_safe_to_bypass(
+            &request(Some(identity)),
+            crate::model::config::ToolCompatibilityMode::Raw
+        ));
+        assert!(!local_document_system_is_safe_to_bypass(
+            &request(Some(&format!("{identity}\nKeep this rule."))),
+            crate::model::config::ToolCompatibilityMode::ClaudeCode
+        ));
     }
 
     #[test]

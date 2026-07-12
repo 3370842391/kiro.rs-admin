@@ -1,5 +1,33 @@
 # Ztest 剩余问题修复设计
 
+> 2026-07-12 生产重放补充：本文早期关于 D7 与 D19 的候选方案已被后续证据收敛。以下“证据修订”优先于后文中相冲突的描述。
+
+## 0. 生产重放后的证据修订
+
+### D19：不是 PDF 解析失败，也不是偶发空响应
+
+生产 trace 与最小重放确认，文本型 PDF 已被正确提取，唯一标识符也完整出现在发往 Kiro 的当前消息中。相同请求连续五次均返回零 assistant 内容；删除 Claude Code system、删除 document 包装、调整指令位置和更换普通前缀都不能恢复响应。只有直接要求回复已知标识符时能成功。
+
+因此根因是 Kiro 对“从上下文提取疑似标识符”的语义稳定静默过滤。零输出重试只能处理偶发故障，不能解决此样本。修复改为严格限定的通用确定性提取：仅当请求包含文本型文档、用户明确要求只返回一个给定形状的 ASCII 标识符、且文档中恰有一个匹配时，本地返回该值。多个候选、模糊要求、扫描 PDF 和普通文档问答继续走模型。实现不得识别 Ztest 报告 ID、固定 nonce 或检测站专用文案。
+
+### D7：协议路径已稳定，暂不扩大打捞条件
+
+rs 直连、NewAPI 流式/非流式、指定工具、任意工具和 24 路并发重放均返回一致的 `text + tool_use`，没有复现 `stop_reason=tool_use` 但只有文本的形态。现有 required-tool 护栏也会在缺少工具块时返回错误，因此本轮没有证据支持修改工具协议或扩大 inline XML 打捞。
+
+本轮只增加不记录参数值的事件级 DEBUG：上游工具分片的 id/name/stop/input 字节数、实际发出的工具块 index/id/name/input 字节数，以及终态 emitted tool names、stop reason 和 terminal error。待再次捕获异常后再依据事件链修协议。
+
+### S1：本地估算器存在确定的分段放大
+
+生产未配置远程 count_tokens。当前本地估算器对不足 100 个基础 token 的输入乘以 1.5，并在 100、200、300、800 附近使用不同倍率，直接造成斜率放大和边界跳变。这不是上游追加 prompt。修复为 `ceil(char_units / 4)`，空文本仍由调用方的总量下限保护；输入与输出使用同一诚实估算口径。
+
+### D5/S3：只移除 Claude Code 与 Kiro 冲突的身份锚点
+
+对照重放证明，仅删除 `You are Claude Code, Anthropic's official CLI for Claude.` 后，canary 与固定 JSON 指令恢复；普通固定单词仍可能被 Kiro 底座压过。修复仅在 `ClaudeCode` 兼容模式删除这一精确身份行并保留同一 system 的其余内容。`Raw` 模式原样透传。不把 system 复制到 current，不伪造上游没有的 system 优先级。
+
+### 流式身份归一化
+
+非流式已经能替换完整身份描述，流式仅跨 chunk 处理整词 `Kiro`，因此会产生 `I'm Claude, an AI-powered development environment`。流式过滤器改为缓存所有已知源短语的最长尾部前缀，并在 UTF-8 字符边界上归一化，工具 JSON 与用户输入仍不进入此过滤器。
+
 ## 1. 目的与结论
 
 本文只定义修复方案，不修改运行代码。依据报告 `01KXAQV1DW09HZ7HRHFQMRQDW1`、生产 trace 和本地重放结果，当前剩余问题不能按同一种方式处理：

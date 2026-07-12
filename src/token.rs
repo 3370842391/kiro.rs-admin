@@ -5,7 +5,7 @@
 //! # 计算规则
 //! - 非西文字符：每个计 4.5 个字符单位
 //! - 西文字符：每个计 1 个字符单位
-//! - 4 个字符单位 = 1 token（四舍五入）
+//! - 4 个字符单位 = 1 token（向上取整）
 
 use crate::anthropic::types::{
     CountTokensRequest, CountTokensResponse, Message, SystemMessage, Tool,
@@ -74,32 +74,15 @@ fn is_non_western_char(c: char) -> bool {
 /// # 计算规则
 /// - 非西文字符：每个计 4.5 个字符单位
 /// - 西文字符：每个计 1 个字符单位
-/// - 4 个字符单位 = 1 token（四舍五入）
+/// - 4 个字符单位 = 1 token（向上取整）
 /// ```
 pub fn count_tokens(text: &str) -> u64 {
-    // println!("text: {}", text);
-
-    let char_units: f64 = text
+    let char_units: u64 = text
         .chars()
-        .map(|c| if is_non_western_char(c) { 4.0 } else { 1.0 })
+        .map(|c| if is_non_western_char(c) { 4 } else { 1 })
         .sum();
 
-    let tokens = char_units / 4.0;
-
-    let acc_token = if tokens < 100.0 {
-        tokens * 1.5
-    } else if tokens < 200.0 {
-        tokens * 1.3
-    } else if tokens < 300.0 {
-        tokens * 1.25
-    } else if tokens < 800.0 {
-        tokens * 1.2
-    } else {
-        tokens * 1.0
-    } as u64;
-
-    // println!("tokens: {}, acc_tokens: {}", tokens, acc_token);
-    acc_token
+    char_units.div_ceil(4)
 }
 
 /// 估算请求的输入 tokens
@@ -254,6 +237,37 @@ pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn local_estimator_does_not_inflate_short_ascii_text() {
+        assert_eq!(count_tokens("abcdefgh"), 2);
+    }
+
+    #[test]
+    fn local_estimator_has_no_tier_jump_at_one_hundred_tokens() {
+        assert_eq!(count_tokens(&"a".repeat(396)), 99);
+        assert_eq!(count_tokens(&"a".repeat(400)), 100);
+    }
+
+    #[test]
+    fn local_estimator_scales_linearly_with_text_length() {
+        let short = count_tokens(&"a".repeat(80));
+        let long = count_tokens(&"a".repeat(160));
+
+        assert_eq!(long, short * 2);
+    }
+
+    #[test]
+    fn local_estimator_is_non_zero_and_monotonic_for_unicode() {
+        let one = count_tokens("中");
+        let two = count_tokens("中文");
+        let mixed = count_tokens("中文ab");
+
+        assert!(one > 0);
+        assert!(one <= two);
+        assert!(two <= mixed);
+        assert_eq!(two, 2);
+    }
 
     #[test]
     fn estimate_output_tokens_counts_thinking_blocks() {
