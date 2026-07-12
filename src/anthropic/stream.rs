@@ -1483,6 +1483,10 @@ pub struct StreamContext {
     terminal_protocol_error: Option<String>,
     /// 工具选择策略，用于在流结束时验证上游输出。
     tool_choice_policy: super::converter::ToolChoicePolicy,
+    /// required tool 模式下暂存工具前的模型旁白，避免先创建 text block。
+    required_tool_preamble: String,
+    /// 暂存旁白是否已经释放或丢弃。
+    required_tool_preamble_released: bool,
     /// 已实际发送给客户端的工具名。
     emitted_tool_names: Vec<String>,
     /// 终止协议错误的 Anthropic 错误类型。
@@ -1600,6 +1604,8 @@ impl StreamContext {
             has_visible_output: false,
             terminal_protocol_error: None,
             tool_choice_policy,
+            required_tool_preamble: String::new(),
+            required_tool_preamble_released: false,
             emitted_tool_names: Vec::new(),
             terminal_protocol_error_type: None,
             saw_reasoning_output: false,
@@ -1644,7 +1650,7 @@ impl StreamContext {
 
         // 如果启用了 thinking，不在这里创建文本块
         // thinking 块和文本块会在 process_content_with_thinking 中按正确顺序创建
-        if self.thinking_enabled {
+        if self.thinking_enabled || self.tool_choice_policy.is_required() {
             return events;
         }
 
@@ -1751,6 +1757,14 @@ impl StreamContext {
             None => content.as_str(),
         };
         if content.is_empty() {
+            return Vec::new();
+        }
+
+        if self.tool_choice_policy.is_required()
+            && !self.saw_upstream_tool_use
+            && !self.required_tool_preamble_released
+        {
+            self.required_tool_preamble.push_str(content);
             return Vec::new();
         }
 
@@ -2458,6 +2472,15 @@ impl StreamContext {
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
+        if self.tool_choice_policy.is_required() && !self.required_tool_preamble_released {
+            let discarded_bytes = self.required_tool_preamble.len();
+            self.required_tool_preamble.clear();
+            self.required_tool_preamble_released = true;
+            tracing::debug!(
+                discarded_bytes,
+                "discarded required-tool narration before native tool_use"
+            );
+        }
         self.saw_upstream_tool_use = true;
         tracing::debug!(
             tool_id = %tool_use.tool_use_id,
@@ -2577,6 +2600,17 @@ impl StreamContext {
                 } else {
                     events.extend(self.create_text_delta_events(&tail));
                 }
+            }
+        }
+
+        if self.tool_choice_policy.is_required()
+            && !self.saw_upstream_tool_use
+            && !self.required_tool_preamble_released
+        {
+            self.required_tool_preamble_released = true;
+            let buffered = std::mem::take(&mut self.required_tool_preamble);
+            if !buffered.is_empty() {
+                events.extend(self.create_text_delta_events(&buffered));
             }
         }
 
@@ -3023,6 +3057,100 @@ mod tests {
             event.event == "error" && event.data["error"]["type"] == "upstream_tool_choice_error"
         }));
         assert!(!events.iter().any(|event| event.event == "message_stop"));
+    }
+
+    #[test]
+    fn required_native_tool_is_first_content_block_and_discards_narration() {
+        let known = ["get_weather".to_string()].into_iter().collect();
+        let mut ctx = StreamContext::new_with_constraints(
+            "claude-opus-4-8",
+            10,
+            false,
+            false,
+            HashMap::new(),
+            known,
+            super::super::converter::ToolChoicePolicy::RequiredSpecific {
+                name: "get_weather".into(),
+                disable_parallel_tool_use: false,
+            },
+        );
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_assistant_response("I will call the weather tool."));
+        events.extend(ctx.process_tool_use(&tool_evt(
+            "tool_1",
+            "get_weather",
+            "{\"location\":\"Paris\"}",
+            true,
+        )));
+        events.extend(ctx.generate_final_events());
+
+        assert_eq!(events[0].event, "message_start");
+        let first_content = events
+            .iter()
+            .find(|event| event.event == "content_block_start")
+            .expect("required tool response must contain a content block");
+        assert_eq!(first_content.data["content_block"]["type"], "tool_use");
+        assert_eq!(first_content.data["index"], 0);
+        assert!(!events.iter().any(|event| {
+            event.event == "content_block_start" && event.data["content_block"]["type"] == "text"
+        }));
+    }
+
+    #[test]
+    fn auto_policy_keeps_text_before_native_tool() {
+        let known = ["get_weather".to_string()].into_iter().collect();
+        let mut ctx = StreamContext::new_with_constraints(
+            "claude-opus-4-8",
+            10,
+            false,
+            false,
+            HashMap::new(),
+            known,
+            super::super::converter::ToolChoicePolicy::Auto {
+                disable_parallel_tool_use: false,
+            },
+        );
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_assistant_response("I will call it."));
+        events.extend(ctx.process_tool_use(&tool_evt("tool_1", "get_weather", "{}", true)));
+        events.extend(ctx.generate_final_events());
+
+        let content_types = events
+            .iter()
+            .filter(|event| event.event == "content_block_start")
+            .filter_map(|event| event.data["content_block"]["type"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(content_types, vec!["text", "tool_use"]);
+    }
+
+    #[test]
+    fn required_textual_invoke_is_recovered_as_first_tool_block() {
+        let known = ["get_weather".to_string()].into_iter().collect();
+        let mut ctx = StreamContext::new_with_constraints(
+            "claude-opus-4-8",
+            10,
+            false,
+            false,
+            HashMap::new(),
+            known,
+            super::super::converter::ToolChoicePolicy::RequiredSpecific {
+                name: "get_weather".into(),
+                disable_parallel_tool_use: false,
+            },
+        );
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_assistant_response(
+            "call\n<invoke name=\"get_weather\"><parameter name=\"location\">Paris</parameter></invoke>",
+        ));
+        events.extend(ctx.generate_final_events());
+
+        let first_content = events
+            .iter()
+            .find(|event| event.event == "content_block_start")
+            .expect("textual invoke must become a content block");
+        assert_eq!(first_content.data["content_block"]["type"], "tool_use");
+        assert_eq!(first_content.data["index"], 0);
+        assert!(!events.iter().any(|event| event.event == "error"));
     }
 
     #[test]

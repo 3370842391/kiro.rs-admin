@@ -612,6 +612,15 @@ pub enum ToolChoicePolicy {
     Disabled,
 }
 
+impl ToolChoicePolicy {
+    pub(crate) fn is_required(&self) -> bool {
+        matches!(
+            self,
+            Self::RequiredAny { .. } | Self::RequiredSpecific { .. }
+        )
+    }
+}
+
 const REQUIRED_TOOL_NUDGE: &str =
     " (Client requirement: you MUST call this tool before answering.)";
 const REQUIRED_ANY_NUDGE: &str =
