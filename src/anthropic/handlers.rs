@@ -146,7 +146,7 @@ pub(crate) struct RequestTracer {
 }
 
 /// 本次请求的用量快照（落入 trace 行，与 usage_log 同源）
-#[derive(Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct TraceUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -519,6 +519,374 @@ fn build_local_text_stream_events(
         ),
         SseEvent::new("message_stop", json!({"type": "message_stop"})),
     ]
+}
+
+#[derive(Debug)]
+struct BufferedAttempt {
+    events: Vec<SseEvent>,
+    credential_id: u64,
+    usage: TraceUsage,
+    credits: f64,
+    terminal_error: Option<String>,
+}
+
+#[derive(Debug)]
+struct StrictJsonRecovery {
+    json: String,
+    attempts: Vec<BufferedAttempt>,
+}
+
+#[derive(Debug)]
+struct StrictJsonRecoveryFailure {
+    attempts: Vec<BufferedAttempt>,
+    source: Option<anyhow::Error>,
+}
+
+fn strict_json_from_events(events: &[SseEvent]) -> Option<String> {
+    if events.iter().any(|event| {
+        event.event == "content_block_start" && event.data["content_block"]["type"] == "tool_use"
+    }) {
+        return None;
+    }
+    let text = events
+        .iter()
+        .filter(|event| event.event == "content_block_delta")
+        .filter(|event| event.data["delta"]["type"] == "text_delta")
+        .filter_map(|event| event.data["delta"]["text"].as_str())
+        .collect::<String>();
+    super::exact_output::extract_single_json(&text)
+}
+
+async fn recover_strict_json_attempts<F, Fut>(
+    mut collect: F,
+) -> Result<StrictJsonRecovery, StrictJsonRecoveryFailure>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: Future<Output = anyhow::Result<BufferedAttempt>>,
+{
+    let mut attempts = Vec::with_capacity(2);
+    for attempt_index in 0..2 {
+        let attempt = match collect(attempt_index).await {
+            Ok(attempt) => attempt,
+            Err(source) => {
+                return Err(StrictJsonRecoveryFailure {
+                    attempts,
+                    source: Some(source),
+                });
+            }
+        };
+        let json = attempt
+            .terminal_error
+            .is_none()
+            .then(|| strict_json_from_events(&attempt.events))
+            .flatten();
+        attempts.push(attempt);
+        if let Some(json) = json {
+            return Ok(StrictJsonRecovery { json, attempts });
+        }
+    }
+    Err(StrictJsonRecoveryFailure {
+        attempts,
+        source: None,
+    })
+}
+
+async fn collect_buffered_attempt(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    request_body: String,
+    model: String,
+    input_tokens: i32,
+    cache_usage: super::cache_metering::CacheUsage,
+    tracer: std::sync::Arc<RequestTracer>,
+    group: Option<String>,
+) -> anyhow::Result<BufferedAttempt> {
+    let call_result = provider
+        .call_api(&request_body, Some(tracer.as_ref()), group.as_deref())
+        .await?;
+    let credential_id = call_result.credential_id;
+    let body = call_result.response.bytes().await?;
+    tracer.mark_upstream_first_byte();
+
+    let mut decoder = EventStreamDecoder::new();
+    if let Err(error) = decoder.feed(&body) {
+        tracing::warn!(error = %error, "strict JSON attempt decoder buffer overflow");
+    }
+    let mut context = BufferedStreamContext::new_with_constraints(
+        model,
+        input_tokens,
+        false,
+        false,
+        std::collections::HashMap::new(),
+        std::collections::HashSet::new(),
+        super::converter::ToolChoicePolicy::Auto {
+            disable_parallel_tool_use: false,
+        },
+    );
+    context.set_cache_usage(cache_usage);
+    if provider.identity_normalization() {
+        context.enable_identity_filter();
+    }
+    for result in decoder.decode_iter() {
+        match result {
+            Ok(frame) => match Event::from_frame(frame) {
+                Ok(event) => context.process_and_buffer(&event),
+                Err(error) => {
+                    tracing::warn!(error = %error, "strict JSON attempt event decode failed")
+                }
+            },
+            Err(error) => tracing::warn!(error = %error, "strict JSON attempt frame decode failed"),
+        }
+    }
+    let events = context.finish_and_get_all_events();
+    let terminal_error = context.terminal_error_message();
+    let (input, output, creation, read, credits) = context.final_usage();
+    Ok(BufferedAttempt {
+        events,
+        credential_id,
+        usage: TraceUsage {
+            input_tokens: input.max(0) as u64,
+            output_tokens: output.max(0) as u64,
+            cache_creation_tokens: creation.max(0) as u64,
+            cache_read_tokens: read.max(0) as u64,
+            credits: if credits.is_finite() && credits > 0.0 {
+                credits
+            } else {
+                0.0
+            },
+        },
+        credits,
+        terminal_error,
+    })
+}
+
+fn strict_json_route_allowed(payload: &MessagesRequest) -> bool {
+    if !super::exact_output::strict_json_requested(payload)
+        || payload
+            .tools
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty())
+        || payload.tool_choice.is_some()
+        || payload.thinking.as_ref().is_some_and(Thinking::is_enabled)
+        || websearch::has_web_search_tool(payload)
+        || websearch::has_web_search_among_tools(payload)
+    {
+        return false;
+    }
+    !payload.messages.iter().any(|message| {
+        message.content.as_array().is_some_and(|blocks| {
+            blocks.iter().any(|block| {
+                block.get("type").and_then(serde_json::Value::as_str) == Some("document")
+            })
+        })
+    })
+}
+
+async fn handle_strict_json_request(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    request_body: &str,
+    payload: &MessagesRequest,
+    input_tokens: i32,
+    hook: UsageRecordHook,
+    cache_usage: super::cache_metering::CacheUsage,
+    tracer: std::sync::Arc<RequestTracer>,
+    group: Option<String>,
+) -> Response {
+    let Some(retry_body) = super::exact_output::append_strict_json_retry_instruction(request_body)
+    else {
+        hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
+        tracer.finalize(
+            "error",
+            Some(outcome::BAD_REQUEST),
+            Some("failed to prepare strict JSON retry"),
+            None,
+            TraceUsage::zero(),
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse::new(
+                "internal_error",
+                "Failed to prepare strict JSON request",
+            )),
+        )
+            .into_response();
+    };
+    let bodies = [request_body.to_owned(), retry_body];
+    let model = payload.model.clone();
+    let recovery = recover_strict_json_attempts(|attempt_index| {
+        let provider = provider.clone();
+        let body = bodies[attempt_index].clone();
+        let model = model.clone();
+        let tracer = tracer.clone();
+        let group = group.clone();
+        async move {
+            collect_buffered_attempt(
+                provider,
+                body,
+                model,
+                input_tokens,
+                cache_usage,
+                tracer,
+                group,
+            )
+            .await
+        }
+    })
+    .await;
+
+    let (final_input, cache_creation, cache_read) =
+        split_non_stream_usage(input_tokens, None, &cache_usage);
+    match recovery {
+        Ok(recovered) => {
+            let credential_id = recovered
+                .attempts
+                .last()
+                .map(|attempt| attempt.credential_id)
+                .unwrap_or(0);
+            let credits = recovered
+                .attempts
+                .iter()
+                .map(|attempt| attempt.credits.max(0.0))
+                .sum::<f64>();
+            let internal_output_tokens = recovered
+                .attempts
+                .iter()
+                .map(|attempt| attempt.usage.output_tokens)
+                .sum::<u64>();
+            let output_tokens = token::count_tokens(&recovered.json).max(1) as i32;
+            let trace_usage = TraceUsage {
+                input_tokens: final_input.max(0) as u64,
+                output_tokens: output_tokens.max(0) as u64,
+                cache_creation_tokens: cache_creation.max(0) as u64,
+                cache_read_tokens: cache_read.max(0) as u64,
+                credits,
+            };
+            tracing::debug!(
+                attempts = recovered.attempts.len(),
+                output_bytes = recovered.json.len(),
+                internal_output_tokens,
+                "recovered strict JSON response"
+            );
+            hook.record(
+                credential_id,
+                final_input,
+                output_tokens,
+                cache_creation,
+                cache_read,
+                credits,
+                "success",
+            );
+            tracer.mark_first_token();
+            tracer.finalize("success", None, None, None, trace_usage);
+
+            if payload.stream {
+                let body = build_local_text_stream_events(
+                    &payload.model,
+                    &recovered.json,
+                    input_tokens,
+                    cache_usage,
+                )
+                .into_iter()
+                .map(|event| event.to_sse_string())
+                .collect::<String>();
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .header(header::CACHE_CONTROL, "no-cache")
+                    .header(header::CONNECTION, "keep-alive")
+                    .body(Body::from(body))
+                    .unwrap()
+            } else {
+                (
+                    StatusCode::OK,
+                    Json(build_local_text_message(
+                        &payload.model,
+                        &recovered.json,
+                        input_tokens,
+                        &cache_usage,
+                    )),
+                )
+                    .into_response()
+            }
+        }
+        Err(failure) => {
+            let credential_id = failure
+                .attempts
+                .last()
+                .map(|attempt| attempt.credential_id)
+                .unwrap_or(0);
+            let credits = failure
+                .attempts
+                .iter()
+                .map(|attempt| attempt.credits.max(0.0))
+                .sum::<f64>();
+            let trace_usage = TraceUsage {
+                input_tokens: final_input.max(0) as u64,
+                output_tokens: 0,
+                cache_creation_tokens: cache_creation.max(0) as u64,
+                cache_read_tokens: cache_read.max(0) as u64,
+                credits,
+            };
+            hook.record(
+                credential_id,
+                final_input,
+                0,
+                cache_creation,
+                cache_read,
+                credits,
+                "error",
+            );
+            if let Some(source) = failure.source {
+                let attempt_outcome = last_attempt_outcome(&tracer);
+                tracer.finalize(
+                    "error",
+                    attempt_outcome,
+                    Some(&source.to_string()),
+                    None,
+                    trace_usage,
+                );
+                return map_provider_error(source);
+            }
+
+            let message = "Upstream did not produce one complete JSON value after one retry";
+            tracing::warn!(
+                attempts = failure.attempts.len(),
+                "strict JSON recovery exhausted"
+            );
+            tracer.finalize(
+                "error",
+                Some(outcome::BAD_REQUEST),
+                Some(message),
+                None,
+                trace_usage,
+            );
+            if payload.stream {
+                let body = SseEvent::new(
+                    "error",
+                    json!({
+                        "type": "error",
+                        "error": {
+                            "type": "upstream_json_protocol_error",
+                            "message": message
+                        }
+                    }),
+                )
+                .to_sse_string();
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .header(header::CACHE_CONTROL, "no-cache")
+                    .header(header::CONNECTION, "keep-alive")
+                    .body(Body::from(body))
+                    .unwrap()
+            } else {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(ErrorResponse::new("upstream_json_protocol_error", message)),
+                )
+                    .into_response()
+            }
+        }
+    }
 }
 
 fn local_exact_system_output(
@@ -1081,6 +1449,8 @@ pub async fn post_messages(
         return response;
     }
 
+    let strict_json_candidate = strict_json_route_allowed(&payload);
+
     let document_expansion = match super::document::expand_pdf_documents(&mut payload).await {
         Ok(expansion) => expansion,
         Err(error) => {
@@ -1233,6 +1603,31 @@ pub async fn post_messages(
             usage.with_hit_rate_bounds(hr_min, hr_max)
         })
         .unwrap_or_default();
+
+    if strict_json_candidate {
+        let tracer = std::sync::Arc::new(RequestTracer::new(
+            &state,
+            RequestTraceOptions {
+                key_ctx: key_ctx.clone(),
+                model: payload.model.clone(),
+                is_stream: payload.stream,
+                reasoning_effort: effort_from_fields(&kiro_request.additional_model_request_fields),
+                context_1m: beta_has_context_1m(&headers),
+                thinking: false,
+            },
+        ));
+        return handle_strict_json_request(
+            provider,
+            &request_body,
+            &payload,
+            total_input_tokens,
+            hook,
+            cache_usage,
+            tracer,
+            key_ctx.group.clone(),
+        )
+        .await;
+    }
 
     if payload.stream {
         // 流式响应
@@ -2553,6 +2948,8 @@ pub async fn post_messages_cc(
         return response;
     }
 
+    let strict_json_candidate = strict_json_route_allowed(&payload);
+
     let document_expansion = match super::document::expand_pdf_documents(&mut payload).await {
         Ok(expansion) => expansion,
         Err(error) => {
@@ -2703,6 +3100,31 @@ pub async fn post_messages_cc(
             usage.with_hit_rate_bounds(hr_min, hr_max)
         })
         .unwrap_or_default();
+
+    if strict_json_candidate {
+        let tracer = std::sync::Arc::new(RequestTracer::new(
+            &state,
+            RequestTraceOptions {
+                key_ctx: key_ctx.clone(),
+                model: payload.model.clone(),
+                is_stream: payload.stream,
+                reasoning_effort: effort_from_fields(&kiro_request.additional_model_request_fields),
+                context_1m: beta_has_context_1m(&headers),
+                thinking: false,
+            },
+        ));
+        return handle_strict_json_request(
+            provider,
+            &request_body,
+            &payload,
+            total_input_tokens,
+            hook,
+            cache_usage,
+            tracer,
+            key_ctx.group.clone(),
+        )
+        .await;
+    }
 
     if payload.stream {
         // 流式响应（缓冲模式）
@@ -3299,6 +3721,80 @@ mod tests {
             )),
             None
         );
+    }
+
+    #[test]
+    fn strict_json_from_events_extracts_only_one_complete_visible_value() {
+        let valid = build_local_text_stream_events(
+            "claude-opus-4-8",
+            "Working... {\"a\":1}",
+            20,
+            crate::anthropic::cache_metering::CacheUsage::default(),
+        );
+        assert_eq!(strict_json_from_events(&valid), Some("{\"a\":1}".into()));
+
+        let truncated = build_local_text_stream_events(
+            "claude-opus-4-8",
+            "Working... {\"a\":",
+            20,
+            crate::anthropic::cache_metering::CacheUsage::default(),
+        );
+        assert_eq!(strict_json_from_events(&truncated), None);
+    }
+
+    #[tokio::test]
+    async fn strict_json_recovery_retries_once_then_accepts_valid_json() {
+        let attempt = |text: &str| BufferedAttempt {
+            events: build_local_text_stream_events(
+                "claude-opus-4-8",
+                text,
+                20,
+                crate::anthropic::cache_metering::CacheUsage::default(),
+            ),
+            credential_id: 1,
+            usage: TraceUsage::zero(),
+            credits: 0.0,
+            terminal_error: None,
+        };
+        let mut attempts =
+            std::collections::VecDeque::from([attempt("Working... {\"a\":"), attempt("{\"a\":1}")]);
+        let mut calls = 0;
+        let recovered = recover_strict_json_attempts(|_| {
+            calls += 1;
+            futures::future::ready(Ok(attempts.pop_front().unwrap()))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(calls, 2);
+        assert_eq!(recovered.json, "{\"a\":1}");
+        assert_eq!(recovered.attempts.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn strict_json_recovery_stops_after_two_invalid_attempts() {
+        let mut calls = 0;
+        let failure = recover_strict_json_attempts(|_| {
+            calls += 1;
+            futures::future::ready(Ok(BufferedAttempt {
+                events: build_local_text_stream_events(
+                    "claude-opus-4-8",
+                    "{\"a\":",
+                    20,
+                    crate::anthropic::cache_metering::CacheUsage::default(),
+                ),
+                credential_id: 1,
+                usage: TraceUsage::zero(),
+                credits: 0.0,
+                terminal_error: None,
+            }))
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(calls, 2);
+        assert_eq!(failure.attempts.len(), 2);
+        assert!(failure.source.is_none());
     }
 
     #[test]
