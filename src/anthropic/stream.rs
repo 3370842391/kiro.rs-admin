@@ -2298,6 +2298,13 @@ impl StreamContext {
             if let Some(text) = reasoning.text.as_deref()
                 && !text.is_empty()
             {
+                if self.tool_choice_policy.is_required()
+                    && !self.saw_upstream_tool_use
+                    && !self.required_tool_preamble_released
+                {
+                    self.required_tool_preamble.push_str(text);
+                    return Vec::new();
+                }
                 self.output_tokens += estimate_tokens(text);
                 return self.create_text_delta_events(text);
             }
@@ -3085,6 +3092,48 @@ mod tests {
         events.extend(ctx.generate_final_events());
 
         assert_eq!(events[0].event, "message_start");
+        let first_content = events
+            .iter()
+            .find(|event| event.event == "content_block_start")
+            .expect("required tool response must contain a content block");
+        assert_eq!(first_content.data["content_block"]["type"], "tool_use");
+        assert_eq!(first_content.data["index"], 0);
+        assert!(!events.iter().any(|event| {
+            event.event == "content_block_start" && event.data["content_block"]["type"] == "text"
+        }));
+    }
+
+    #[test]
+    fn required_native_tool_discards_unrequested_reasoning_text_before_tool() {
+        let known = ["get_weather".to_string()].into_iter().collect();
+        let mut ctx = StreamContext::new_with_constraints(
+            "claude-opus-4-8",
+            10,
+            false,
+            false,
+            HashMap::new(),
+            known,
+            super::super::converter::ToolChoicePolicy::RequiredSpecific {
+                name: "get_weather".into(),
+                disable_parallel_tool_use: false,
+            },
+        );
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_reasoning_content(
+            &crate::kiro::model::events::ReasoningContentEvent {
+                text: Some("I should call the weather tool.".into()),
+                signature: None,
+                redacted_content: None,
+            },
+        ));
+        events.extend(ctx.process_tool_use(&tool_evt(
+            "tool_1",
+            "get_weather",
+            "{\"location\":\"Paris\"}",
+            true,
+        )));
+        events.extend(ctx.generate_final_events());
+
         let first_content = events
             .iter()
             .find(|event| event.event == "content_block_start")
