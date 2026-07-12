@@ -150,6 +150,68 @@ fn classify_sse(events: &[Value]) -> ProbeResult {
     }
 }
 
+fn classify_local_text_sse(events: &[Value], expected: &str) -> ProbeResult {
+    let event_types = events
+        .iter()
+        .filter_map(|event| event["type"].as_str())
+        .collect::<Vec<_>>();
+    let expected_types = [
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    ];
+    if event_types != expected_types {
+        return ProbeResult::Fail(
+            "local SSE did not contain the complete six-event sequence".into(),
+        );
+    }
+    let text = events
+        .iter()
+        .filter(|event| event["type"] == "content_block_delta")
+        .filter(|event| event["delta"]["type"] == "text_delta")
+        .filter_map(|event| event["delta"]["text"].as_str())
+        .collect::<String>();
+    if text == expected && events[4]["delta"]["stop_reason"] == "end_turn" {
+        ProbeResult::Pass
+    } else {
+        ProbeResult::Fail(format!("local SSE text mismatch: expected {expected:?}"))
+    }
+}
+
+fn classify_strict_json_sse(events: &[Value]) -> ProbeResult {
+    let text = events
+        .iter()
+        .filter(|event| event["type"] == "content_block_delta")
+        .filter(|event| event["delta"]["type"] == "text_delta")
+        .filter_map(|event| event["delta"]["text"].as_str())
+        .collect::<String>();
+    if !matches!(classify_local_text_sse(events, &text), ProbeResult::Pass) {
+        return ProbeResult::Fail(
+            "strict JSON stream was missing the complete local SSE sequence".into(),
+        );
+    }
+    classify_strict_json(&json!({"content": [{"type": "text", "text": text}]}))
+}
+
+fn passive_tools_system_request(model: &str, expected: &str) -> Value {
+    json!({
+        "model": model,
+        "max_tokens": 64,
+        "system": format!(
+            "Respond to every user message with exactly the single word '{expected}' and nothing else. No explanation or markdown."
+        ),
+        "messages": [{"role": "user", "content": "hello"}],
+        "tools": [{
+            "name": "passive_probe_tool",
+            "description": "An optional probe tool. Do not call it unless needed.",
+            "input_schema": {"type": "object", "properties": {}}
+        }]
+    })
+}
+
 async fn post_message(
     client: &reqwest::Client,
     args: &Args,
@@ -175,6 +237,52 @@ async fn post_message(
     } else {
         Err(format!("HTTP {}: {}", status.as_u16(), value))
     }
+}
+
+async fn post_stream_events(
+    client: &reqwest::Client,
+    args: &Args,
+    api_key: &str,
+    body: Value,
+) -> Result<Vec<Value>, String> {
+    let response = client
+        .post(format!(
+            "{}/v1/messages",
+            args.base_url.trim_end_matches('/')
+        ))
+        .header("x-api-key", api_key)
+        .header("authorization", format!("Bearer {api_key}"))
+        .header("anthropic-version", "2023-06-01")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("HTTP {}", response.status()));
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut buffer = String::new();
+    let mut events = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| error.to_string())?;
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(pos) = buffer.find("\n\n") {
+            let frame = buffer[..pos].to_string();
+            buffer.drain(..pos + 2);
+            for line in frame.lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    let value = serde_json::from_str::<Value>(data)
+                        .map_err(|error| format!("invalid SSE data: {error}"))?;
+                    events.push(value);
+                }
+            }
+        }
+    }
+    if !buffer.trim().is_empty() {
+        return Err("SSE response ended with an incomplete frame".into());
+    }
+    Ok(events)
 }
 
 async fn thinking_probe(client: &reqwest::Client, args: &Args, key: &str) -> ProbeResult {
@@ -247,6 +355,47 @@ async fn exact_system_probe(client: &reqwest::Client, args: &Args, key: &str) ->
     }
 }
 
+async fn passive_tools_system_probe(
+    client: &reqwest::Client,
+    args: &Args,
+    key: &str,
+) -> ProbeResult {
+    let expected = format!("PASSIVE_{}", Uuid::new_v4().simple());
+    match post_message(
+        client,
+        args,
+        key,
+        passive_tools_system_request(&args.model, &expected),
+    )
+    .await
+    {
+        Ok(value) => classify_exact_text(&value, &expected),
+        Err(error) => ProbeResult::Fail(error),
+    }
+}
+
+async fn echo_token_probe(client: &reqwest::Client, args: &Args, key: &str) -> ProbeResult {
+    let expected = format!("ECHO_{}", Uuid::new_v4().simple());
+    match post_message(
+        client,
+        args,
+        key,
+        json!({
+            "model": args.model,
+            "max_tokens": 64,
+            "messages": [{
+                "role": "user",
+                "content": format!("Echo this token exactly: {expected}")
+            }]
+        }),
+    )
+    .await
+    {
+        Ok(value) => classify_exact_text(&value, &expected),
+        Err(error) => ProbeResult::Fail(error),
+    }
+}
+
 async fn strict_json_probe(client: &reqwest::Client, args: &Args, key: &str) -> ProbeResult {
     match post_message(
         client,
@@ -264,6 +413,28 @@ async fn strict_json_probe(client: &reqwest::Client, args: &Args, key: &str) -> 
     .await
     {
         Ok(value) => classify_strict_json(&value),
+        Err(error) => ProbeResult::Fail(error),
+    }
+}
+
+async fn strict_json_stream_probe(client: &reqwest::Client, args: &Args, key: &str) -> ProbeResult {
+    match post_stream_events(
+        client,
+        args,
+        key,
+        json!({
+            "model": args.model,
+            "max_tokens": 128,
+            "stream": true,
+            "messages": [{
+                "role": "user",
+                "content": "You must reply with exactly one minified JSON object and no markdown, no explanation. Schema: {\"a\": string, \"b\": number, \"c\": string}. Set a to the reverse of 'testz'. Set b to 29 + 8. Set c to 'PROBE-JSON'."
+            }]
+        }),
+    )
+    .await
+    {
+        Ok(events) => classify_strict_json_sse(&events),
         Err(error) => ProbeResult::Fail(error),
     }
 }
@@ -352,50 +523,22 @@ async fn parallel_canary_probe(client: &reqwest::Client, args: &Args, key: &str)
 }
 
 async fn stream_probe(client: &reqwest::Client, args: &Args, key: &str) -> ProbeResult {
-    let response = match client
-        .post(format!(
-            "{}/v1/messages",
-            args.base_url.trim_end_matches('/')
-        ))
-        .header("x-api-key", key)
-        .header("authorization", format!("Bearer {key}"))
-        .header("anthropic-version", "2023-06-01")
-        .json(&json!({
+    match post_stream_events(
+        client,
+        args,
+        key,
+        json!({
             "model": args.model,
             "max_tokens": 64,
             "stream": true,
             "messages": [{"role": "user", "content": "Reply with OK."}]
-        }))
-        .send()
-        .await
+        }),
+    )
+    .await
     {
-        Ok(response) if response.status().is_success() => response,
-        Ok(response) => return ProbeResult::Fail(format!("HTTP {}", response.status())),
-        Err(error) => return ProbeResult::Fail(error.to_string()),
-    };
-
-    let mut stream = response.bytes_stream();
-    let mut buffer = String::new();
-    let mut events = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = match chunk {
-            Ok(chunk) => chunk,
-            Err(error) => return ProbeResult::Fail(error.to_string()),
-        };
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(pos) = buffer.find("\n\n") {
-            let frame = buffer[..pos].to_string();
-            buffer.drain(..pos + 2);
-            for line in frame.lines() {
-                if let Some(data) = line.strip_prefix("data: ")
-                    && let Ok(value) = serde_json::from_str::<Value>(data)
-                {
-                    events.push(value);
-                }
-            }
-        }
+        Ok(events) => classify_sse(&events),
+        Err(error) => ProbeResult::Fail(error),
     }
-    classify_sse(&events)
 }
 
 #[tokio::main]
@@ -426,8 +569,20 @@ async fn main() {
             exact_system_probe(&client, &args, &api_key).await,
         ),
         (
+            "system_passive_tools",
+            passive_tools_system_probe(&client, &args, &api_key).await,
+        ),
+        (
+            "echo_token",
+            echo_token_probe(&client, &args, &api_key).await,
+        ),
+        (
             "strict_json",
             strict_json_probe(&client, &args, &api_key).await,
+        ),
+        (
+            "strict_json_stream",
+            strict_json_stream_probe(&client, &args, &api_key).await,
         ),
         ("pdf", pdf_probe(&client, &args, &api_key).await),
         (
@@ -510,6 +665,54 @@ mod tests {
         );
         assert!(matches!(
             classify_exact_text(&explanatory, "SYSTEM_EXACT_42"),
+            ProbeResult::Fail(_)
+        ));
+    }
+
+    #[test]
+    fn passive_tools_system_request_keeps_the_tool_optional() {
+        let body = passive_tools_system_request("claude-opus-4-8", "PASSIVE_42");
+        assert_eq!(
+            body["system"].as_str().unwrap().contains("PASSIVE_42"),
+            true
+        );
+        assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+        assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn local_text_sse_classifier_requires_six_events_and_exact_echo() {
+        let events = vec![
+            json!({"type": "message_start"}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "ECHO_42"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}}),
+            json!({"type": "message_stop"}),
+        ];
+        assert_eq!(
+            classify_local_text_sse(&events, "ECHO_42"),
+            ProbeResult::Pass
+        );
+        assert!(matches!(
+            classify_local_text_sse(&events[..5], "ECHO_42"),
+            ProbeResult::Fail(_)
+        ));
+    }
+
+    #[test]
+    fn strict_json_sse_classifier_aggregates_the_complete_local_sequence() {
+        let events = vec![
+            json!({"type": "message_start"}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "{\"a\":\"ztset\",\"b\":37,\"c\":\"PROBE-JSON\"}"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}}),
+            json!({"type": "message_stop"}),
+        ];
+        assert_eq!(classify_strict_json_sse(&events), ProbeResult::Pass);
+        assert!(matches!(
+            classify_strict_json_sse(&events[..5]),
             ProbeResult::Fail(_)
         ));
     }
