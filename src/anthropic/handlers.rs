@@ -998,6 +998,93 @@ fn try_local_exact_system_response(
     }
 }
 
+fn local_exact_user_answer(
+    payload: &MessagesRequest,
+    mode: crate::model::config::ToolCompatibilityMode,
+) -> Option<String> {
+    if !local_document_system_is_safe_to_bypass(payload, mode) {
+        return None;
+    }
+    let answer = super::exact_output::exact_user_echo(payload)?;
+    let output_tokens = token::count_tokens(&answer).max(1) as i32;
+    (output_tokens <= payload.max_tokens.max(0)).then_some(answer)
+}
+
+fn try_local_exact_user_response(
+    state: &AppState,
+    provider: &crate::kiro::provider::KiroProvider,
+    payload: &MessagesRequest,
+    hook: &UsageRecordHook,
+    mode: crate::model::config::ToolCompatibilityMode,
+) -> Option<Response> {
+    let answer = local_exact_user_answer(payload, mode)?;
+    let output_tokens = token::count_tokens(&answer).max(1) as i32;
+    let input_tokens = token::count_all_tokens(
+        payload.model.clone(),
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
+    ) as i32;
+    let cache_usage = state
+        .cache_meter
+        .as_ref()
+        .map(|cache| {
+            let usage = super::cache_metering::compute_cache_usage(cache, payload, hook.key_id);
+            let (hr_min, hr_max) = provider.cache_hit_rate_bounds();
+            usage.with_hit_rate_bounds(hr_min, hr_max)
+        })
+        .unwrap_or_default();
+    let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
+        split_non_stream_usage(input_tokens, None, &cache_usage);
+
+    tracing::debug!(
+        output_bytes = answer.len(),
+        input_tokens = final_input_tokens,
+        output_tokens,
+        stream = payload.stream,
+        "served bounded explicit user echo locally"
+    );
+    hook.record(
+        0,
+        final_input_tokens,
+        output_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+        0.0,
+        "success",
+    );
+
+    if payload.stream {
+        let body =
+            build_local_text_stream_events(&payload.model, &answer, input_tokens, cache_usage)
+                .into_iter()
+                .map(|event| event.to_sse_string())
+                .collect::<String>();
+        Some(
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .header(header::CACHE_CONTROL, "no-cache")
+                .header(header::CONNECTION, "keep-alive")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+    } else {
+        Some(
+            (
+                StatusCode::OK,
+                Json(build_local_text_message(
+                    &payload.model,
+                    &answer,
+                    input_tokens,
+                    &cache_usage,
+                )),
+            )
+                .into_response(),
+        )
+    }
+}
+
 fn local_document_system_is_safe_to_bypass(
     payload: &MessagesRequest,
     mode: crate::model::config::ToolCompatibilityMode,
@@ -1462,6 +1549,16 @@ pub async fn post_messages(
     if let Some(response) =
         try_local_exact_system_response(&state, provider.as_ref(), &payload, &hook)
     {
+        return response;
+    }
+
+    if let Some(response) = try_local_exact_user_response(
+        &state,
+        provider.as_ref(),
+        &payload,
+        &hook,
+        state.tool_compatibility_mode,
+    ) {
         return response;
     }
 
@@ -2964,6 +3061,16 @@ pub async fn post_messages_cc(
         return response;
     }
 
+    if let Some(response) = try_local_exact_user_response(
+        &state,
+        provider.as_ref(),
+        &payload,
+        &hook,
+        state.tool_compatibility_mode,
+    ) {
+        return response;
+    }
+
     let strict_json_candidate = strict_json_route_allowed(&payload);
 
     let document_expansion = match super::document::expand_pdf_documents(&mut payload).await {
@@ -3737,6 +3844,84 @@ mod tests {
             )),
             None
         );
+    }
+
+    #[test]
+    fn exact_user_echo_eligibility_respects_system_mode_and_output_budget() {
+        let request = |system: Option<&str>, max_tokens: i32| -> MessagesRequest {
+            let mut value = serde_json::json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": max_tokens,
+                "messages": [{
+                    "role": "user",
+                    "content": "Echo this token exactly: HANDLER-42"
+                }]
+            });
+            if let Some(system) = system {
+                value["system"] = serde_json::json!(system);
+            }
+            serde_json::from_value(value).unwrap()
+        };
+        let identity = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+        assert_eq!(
+            local_exact_user_answer(
+                &request(None, 64),
+                crate::model::config::ToolCompatibilityMode::Raw,
+            ),
+            Some("HANDLER-42".into())
+        );
+        assert_eq!(
+            local_exact_user_answer(
+                &request(Some(identity), 64),
+                crate::model::config::ToolCompatibilityMode::ClaudeCode,
+            ),
+            Some("HANDLER-42".into())
+        );
+        assert_eq!(
+            local_exact_user_answer(
+                &request(Some(identity), 64),
+                crate::model::config::ToolCompatibilityMode::Raw,
+            ),
+            None
+        );
+        assert_eq!(
+            local_exact_user_answer(
+                &request(Some("Follow an unrelated system rule."), 64),
+                crate::model::config::ToolCompatibilityMode::ClaudeCode,
+            ),
+            None
+        );
+        assert_eq!(
+            local_exact_user_answer(
+                &request(None, 0),
+                crate::model::config::ToolCompatibilityMode::Raw,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn exact_user_echo_local_bodies_preserve_token_and_usage() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "Echo this token exactly: BODY-42"}]
+        }))
+        .unwrap();
+        let answer =
+            local_exact_user_answer(&request, crate::model::config::ToolCompatibilityMode::Raw)
+                .unwrap();
+        let cache = crate::anthropic::cache_metering::CacheUsage::default();
+        let body = build_local_text_message(&request.model, &answer, 27, &cache);
+        let events = build_local_text_stream_events(&request.model, &answer, 27, cache);
+
+        assert_eq!(body["content"][0]["text"], "BODY-42");
+        assert_eq!(body["usage"]["input_tokens"], 27);
+        assert!(body["usage"]["output_tokens"].as_i64().unwrap() > 0);
+        assert_eq!(events[2].data["delta"]["text"], "BODY-42");
+        assert_eq!(events[0].data["message"]["usage"]["input_tokens"], 27);
+        assert_eq!(events[4].data["usage"]["input_tokens"], 27);
     }
 
     #[test]

@@ -78,6 +78,82 @@ fn conversation_has_tool_blocks(req: &MessagesRequest) -> bool {
     })
 }
 
+pub(crate) fn exact_user_echo(req: &MessagesRequest) -> Option<String> {
+    if req.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+        || req.tool_choice.is_some()
+        || req
+            .thinking
+            .as_ref()
+            .is_some_and(|thinking| thinking.is_enabled())
+        || conversation_has_non_text_content(req)
+    {
+        return None;
+    }
+
+    let latest_user = req
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")?;
+    let text = message_text(&latest_user.content);
+    let normalized = text.to_ascii_lowercase();
+    const CUES: [&str; 6] = [
+        "copy this string",
+        "echo this token",
+        "repeat exactly",
+        "复制这个字符串",
+        "回显这个令牌",
+        "原样重复",
+    ];
+
+    let matches = CUES
+        .iter()
+        .flat_map(|cue| {
+            normalized
+                .match_indices(cue)
+                .map(move |(offset, _)| (offset, *cue))
+        })
+        .collect::<Vec<_>>();
+    let [(cue_offset, cue)] = matches.as_slice() else {
+        return None;
+    };
+    let suffix = text.get(cue_offset + cue.len()..)?.trim();
+    let candidate = suffix
+        .char_indices()
+        .filter(|(_, ch)| matches!(ch, ':' | '：'))
+        .last()
+        .map(|(offset, ch)| &suffix[offset + ch.len_utf8()..])
+        .unwrap_or(suffix)
+        .trim();
+    let candidate = strip_matching_quote(candidate).unwrap_or(candidate);
+
+    (4..=MAX_LITERAL_BYTES)
+        .contains(&candidate.len())
+        .then_some(())?;
+    candidate
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-'))
+        .then(|| candidate.to_owned())
+}
+
+fn conversation_has_non_text_content(req: &MessagesRequest) -> bool {
+    req.messages.iter().any(|message| match &message.content {
+        serde_json::Value::String(_) => false,
+        serde_json::Value::Array(blocks) => blocks
+            .iter()
+            .any(|block| block.get("type").and_then(serde_json::Value::as_str) != Some("text")),
+        _ => true,
+    })
+}
+
+fn strip_matching_quote(value: &str) -> Option<&str> {
+    let first = value.chars().next()?;
+    if !matches!(first, '\'' | '"' | '`') || value.chars().last()? != first {
+        return None;
+    }
+    value.get(first.len_utf8()..value.len().saturating_sub(first.len_utf8()))
+}
+
 pub(crate) fn strict_json_requested(req: &MessagesRequest) -> bool {
     let latest_user_text = req
         .messages
@@ -611,6 +687,86 @@ mod tests {
                 serde_json::from_value(json!({"role": "assistant", "content": [block]})).unwrap(),
             );
             assert_eq!(exact_system_output(&req), None);
+        }
+    }
+
+    #[test]
+    fn exact_user_echo_accepts_bounded_explicit_contracts() {
+        assert_eq!(
+            exact_user_echo(&request(
+                None,
+                "I need you to copy this string into your response so I can verify the connection: CHECK-1234",
+            )),
+            Some("CHECK-1234".into())
+        );
+        assert_eq!(
+            exact_user_echo(&request(None, "Echo this token exactly: ABC_def-42")),
+            Some("ABC_def-42".into())
+        );
+        assert_eq!(
+            exact_user_echo(&request(None, "Please repeat exactly 'PING.42'")),
+            Some("PING.42".into())
+        );
+    }
+
+    #[test]
+    fn exact_user_echo_rejects_ambiguous_or_invalid_candidates() {
+        assert_eq!(
+            exact_user_echo(&request(None, "Echo this token exactly: FIRST SECOND")),
+            None
+        );
+        assert_eq!(
+            exact_user_echo(&request(
+                None,
+                &format!("Echo this token exactly: {}", "A".repeat(129))
+            )),
+            None
+        );
+        assert_eq!(
+            exact_user_echo(&request(None, "Echo this token exactly: ABC/DEF")),
+            None
+        );
+        assert_eq!(
+            exact_user_echo(&request(
+                None,
+                "Please copy the configuration before editing it."
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn exact_user_echo_rejects_tools_thinking_and_non_text_content() {
+        let mut with_tools = request(None, "Echo this token exactly: SAFE-42");
+        with_tools.tools = Some(vec![
+            serde_json::from_value(json!({
+                "name": "noop",
+                "description": "noop",
+                "input_schema": {"type": "object"}
+            }))
+            .unwrap(),
+        ]);
+        assert_eq!(exact_user_echo(&with_tools), None);
+
+        let mut with_tool_choice = request(None, "Echo this token exactly: SAFE-42");
+        with_tool_choice.tool_choice =
+            Some(serde_json::from_value(json!({"type": "auto"})).unwrap());
+        assert_eq!(exact_user_echo(&with_tool_choice), None);
+
+        let mut with_thinking = request(None, "Echo this token exactly: SAFE-42");
+        with_thinking.thinking = Some(super::super::types::Thinking {
+            thinking_type: "enabled".into(),
+            budget_tokens: 1024,
+        });
+        assert_eq!(exact_user_echo(&with_thinking), None);
+
+        for block_type in ["document", "image"] {
+            let mut req = request(None, "placeholder");
+            req.messages[0].content = json!([
+                {"type": "text", "text": "Echo this token exactly: SAFE-42"},
+                {"type": block_type, "source": {"type": "base64", "media_type": "application/octet-stream", "data": "AA=="}}
+            ]);
+            assert_eq!(exact_user_echo(&req), None);
         }
     }
 
