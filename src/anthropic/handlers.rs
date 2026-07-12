@@ -939,6 +939,7 @@ pub async fn post_messages(
             &payload.model,
             total_input_tokens,
             extract_thinking,
+            thinking_enabled,
             tool_name_map,
             known_tool_names,
             tool_choice_policy,
@@ -1542,6 +1543,7 @@ async fn handle_non_stream_request(
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
+    require_thinking: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
     tool_choice_policy: super::converter::ToolChoicePolicy,
@@ -1758,6 +1760,24 @@ async fn handle_non_stream_request(
         &known_tool_names,
         &tool_name_map,
     );
+    if let Err(message) = validate_required_thinking(require_thinking, &content) {
+        hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
+        tracer.finalize(
+            "error",
+            Some(outcome::BAD_REQUEST),
+            Some(message),
+            None,
+            TraceUsage::zero(),
+        );
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse::new(
+                "upstream_thinking_protocol_error",
+                message,
+            )),
+        )
+            .into_response();
+    }
     if let Err(message) = validate_tool_choice_content(&tool_choice_policy, &content) {
         hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
         tracer.finalize(
@@ -1883,6 +1903,25 @@ fn validate_non_stream_content(content: &[serde_json::Value]) -> Result<(), &'st
         Err("upstream returned no assistant content")
     } else {
         Ok(())
+    }
+}
+
+fn validate_required_thinking(
+    thinking_enabled: bool,
+    content: &[serde_json::Value],
+) -> Result<(), &'static str> {
+    if !thinking_enabled {
+        return Ok(());
+    }
+    if content.iter().any(|block| {
+        matches!(
+            block.get("type").and_then(serde_json::Value::as_str),
+            Some("thinking" | "redacted_thinking")
+        )
+    }) {
+        Ok(())
+    } else {
+        Err("client requested thinking but upstream produced no thinking content")
     }
 }
 
@@ -2284,6 +2323,7 @@ pub async fn post_messages_cc(
             &payload.model,
             total_input_tokens,
             extract_thinking,
+            thinking_enabled,
             tool_name_map,
             known_tool_names,
             tool_choice_policy,
@@ -2603,6 +2643,21 @@ mod tests {
             .unwrap_err()
             .contains("parallel")
         );
+    }
+
+    #[test]
+    fn enabled_thinking_rejects_plain_text_without_reasoning_block() {
+        let content = vec![serde_json::json!({"type": "text", "text": "plain"})];
+        assert!(validate_required_thinking(true, &content).is_err());
+    }
+
+    #[test]
+    fn redacted_thinking_satisfies_required_thinking() {
+        let content = vec![serde_json::json!({
+            "type": "redacted_thinking",
+            "data": "encrypted"
+        })];
+        assert!(validate_required_thinking(true, &content).is_ok());
     }
 
     #[test]

@@ -1487,6 +1487,8 @@ pub struct StreamContext {
     emitted_tool_names: Vec<String>,
     /// 终止协议错误的 Anthropic 错误类型。
     terminal_protocol_error_type: Option<&'static str>,
+    /// 是否观察到真实 thinking 或 redacted_thinking 输出。
+    saw_reasoning_output: bool,
 }
 
 fn events_have_visible_output(events: &[SseEvent]) -> bool {
@@ -1595,6 +1597,7 @@ impl StreamContext {
             tool_choice_policy,
             emitted_tool_names: Vec::new(),
             terminal_protocol_error_type: None,
+            saw_reasoning_output: false,
         }
     }
 
@@ -1786,6 +1789,7 @@ impl StreamContext {
 
                     // 进入 thinking 块
                     self.in_thinking_block = true;
+                    self.saw_reasoning_output = true;
                     self.strip_thinking_leading_newline = true;
                     self.thinking_buffer =
                         self.thinking_buffer[start_pos + "<thinking>".len()..].to_string();
@@ -2219,6 +2223,7 @@ impl StreamContext {
         }
 
         let mut events = Vec::new();
+        self.saw_reasoning_output = true;
         let buffered = std::mem::take(&mut self.thinking_buffer);
         if !buffered.trim().is_empty() {
             events.extend(self.create_text_delta_events(&buffered));
@@ -2300,6 +2305,7 @@ impl StreamContext {
         if let Some(redacted) = reasoning.redacted_content.as_deref()
             && !redacted.is_empty()
         {
+            self.saw_reasoning_output = true;
             self.output_tokens += 8;
             events.extend(self.create_redacted_thinking_events(redacted));
         }
@@ -2724,6 +2730,16 @@ impl StreamContext {
                 self.terminal_protocol_error_type = Some("upstream_tool_choice_error");
             }
         }
+        if self.thinking_enabled
+            && !self.saw_reasoning_output
+            && self.tool_json_error.is_none()
+            && self.terminal_protocol_error.is_none()
+        {
+            self.terminal_protocol_error = Some(
+                "client requested thinking but upstream produced no thinking content".to_string(),
+            );
+            self.terminal_protocol_error_type = Some("upstream_thinking_protocol_error");
+        }
         if !self.has_visible_output
             && self.tool_json_error.is_none()
             && self.terminal_protocol_error.is_none()
@@ -2958,6 +2974,26 @@ mod tests {
 
         assert!(events.iter().any(|event| {
             event.event == "error" && event.data["error"]["type"] == "upstream_tool_choice_error"
+        }));
+        assert!(!events.iter().any(|event| event.event == "message_stop"));
+    }
+
+    #[test]
+    fn enabled_thinking_stream_ends_with_error_when_only_plain_text_arrives() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-8",
+            10,
+            true,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_assistant_response("plain text"));
+        events.extend(ctx.generate_final_events());
+
+        assert!(events.iter().any(|event| {
+            event.event == "error"
+                && event.data["error"]["type"] == "upstream_thinking_protocol_error"
         }));
         assert!(!events.iter().any(|event| event.event == "message_stop"));
     }

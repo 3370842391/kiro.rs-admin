@@ -1745,11 +1745,7 @@ fn generate_thinking_prefix(req: &MessagesRequest, model_id: &str) -> Option<Str
     None
 }
 
-/// 原生 reasoning 字段可表达请求时，不再向消息正文注入 XML。
 fn thinking_prefix_for_history(req: &MessagesRequest, model_id: &str) -> Option<String> {
-    if model_supports_native_reasoning(model_id) && native_reasoning_requested(req, model_id) {
-        return None;
-    }
     generate_thinking_prefix(req, model_id)
 }
 
@@ -3376,7 +3372,7 @@ mod tests {
     }
 
     #[test]
-    fn opus_4_8_uses_native_reasoning_without_thinking_xml() {
+    fn opus_4_8_keeps_native_reasoning_and_one_bounded_text_fallback() {
         use super::super::types::{SystemMessage, Thinking};
 
         let mut req = minimal_request_with_output_config("claude-opus-4.8");
@@ -3391,8 +3387,8 @@ mod tests {
 
         let result = convert_request(&req).unwrap();
         let wire = serde_json::to_string(&result.conversation_state).unwrap();
-        assert!(!wire.contains("<thinking_mode>"));
-        assert!(!wire.contains("<max_thinking_length>"));
+        assert_eq!(wire.matches("<thinking_mode>").count(), 1);
+        assert_eq!(wire.matches("<max_thinking_length>").count(), 1);
         assert_eq!(
             result
                 .additional_model_request_fields
