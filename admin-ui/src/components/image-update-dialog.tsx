@@ -15,7 +15,6 @@ import { Progress } from '@/components/ui/progress'
 import { applyImageUpdate, checkSystemUpdate } from '@/api/credentials'
 import { forceCheckSystemUpdate } from '@/lib/update-check'
 import { extractErrorMessage } from '@/lib/utils'
-import type { UpdateCheckInfo } from '@/types/api'
 
 interface ImageUpdateDialogProps {
   open: boolean
@@ -52,8 +51,8 @@ export function ImageUpdateDialog({ open, onOpenChange }: ImageUpdateDialogProps
     },
   })
 
-  const forceCheckMutation = useMutation<UpdateCheckInfo, Error, void>({
-    mutationFn: forceCheckSystemUpdate as () => Promise<UpdateCheckInfo>,
+  const forceCheckMutation = useMutation({
+    mutationFn: () => forceCheckSystemUpdate(),
     onSuccess: (result) => {
       queryClient.setQueryData(['system-update-check'], result)
       if (result.warning) {
