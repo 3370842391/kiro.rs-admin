@@ -623,51 +623,24 @@ const REQUIRED_TOOL_NUDGE: &str =
     " (Client requirement: you MUST call this tool before answering.)";
 const REQUIRED_ANY_NUDGE: &str =
     " (Client requirement: you MUST call at least one of the provided tools before answering.)";
+const REQUIRED_SCHEMA_METADATA_NUDGE: &str =
+    " Input is expected to include every property marked required by the schema.";
 
-/// 从规范化后的工具 schema 生成 Required-only 的短约束提示。
+/// 为含必填字段的工具生成固定的 Required-only 元数据提示。
 ///
-/// Kiro 上游偶发会在已选择正确工具后仍返回空对象。这里仅重复 schema 中已经存在的
-/// required 字段和确定值（const / 单值 enum），不从用户文本猜测或伪造参数。
-fn required_tool_schema_nudge(schema: &serde_json::Value) -> String {
-    let required: Vec<&str> = schema
+/// 客户端 schema 完全可控，因此不能把字段名、const、enum 或随机 canary 值复制进
+/// 自然语言 description；否则会形成额外提示注入面，并增加 token。真实约束仍只由
+/// 结构化 inputSchema 承载。
+fn required_tool_schema_nudge(schema: &serde_json::Value) -> &'static str {
+    let has_required = schema
         .get("required")
         .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(serde_json::Value::as_str)
-        .collect();
-    if required.is_empty() {
-        return String::new();
+        .is_some_and(|required| !required.is_empty());
+    if has_required {
+        REQUIRED_SCHEMA_METADATA_NUDGE
+    } else {
+        ""
     }
-
-    let mut fixed_values = Vec::new();
-    let properties = schema
-        .get("properties")
-        .and_then(serde_json::Value::as_object);
-    for name in &required {
-        let Some(property) = properties.and_then(|properties| properties.get(*name)) else {
-            continue;
-        };
-        let fixed_value = property.get("const").or_else(|| {
-            let values = property.get("enum")?.as_array()?;
-            (values.len() == 1).then(|| &values[0])
-        });
-        if let Some(value) = fixed_value {
-            let literal = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
-            fixed_values.push(format!("{name}={literal}"));
-        }
-    }
-
-    let mut nudge = format!(
-        " Required input: include all required fields: {}. Do not call this tool with {{}}.",
-        required.join(", ")
-    );
-    if !fixed_values.is_empty() {
-        nudge.push_str(" Fixed schema values: ");
-        nudge.push_str(&fixed_values.join("; "));
-        nudge.push('.');
-    }
-    nudge
 }
 
 fn append_required_tool_nudge(tool: &mut ToolSpecification, policy_nudge: &str) {
@@ -2159,9 +2132,9 @@ mod tests {
         }
     }
 
-    fn converted_weather_description(
+    fn converted_weather_tool(
         tool_choice: Option<super::super::types::ToolChoice>,
-    ) -> String {
+    ) -> ToolSpecification {
         let mut req = minimal_request_with_output_config("claude-opus-4-8");
         req.output_config = None;
         req.tools = Some(vec![constrained_weather_tool()]);
@@ -2174,48 +2147,79 @@ mod tests {
             .user_input_message_context
             .tools[0]
             .tool_specification
-            .description
             .clone()
     }
 
+    fn converted_weather_description(
+        tool_choice: Option<super::super::types::ToolChoice>,
+    ) -> String {
+        converted_weather_tool(tool_choice).description
+    }
+
     #[test]
-    fn required_specific_tool_nudge_includes_schema_constraints() {
+    fn required_specific_tool_nudge_uses_static_schema_metadata() {
         use super::super::types::ToolChoice;
 
-        let description = converted_weather_description(Some(ToolChoice::Tool {
+        let tool = converted_weather_tool(Some(ToolChoice::Tool {
             name: "get_weather".to_string(),
             disable_parallel_tool_use: false,
         }));
-
-        for expected in ["city", "nonce", "unit", "Paris", "8b5d9233"] {
+        assert_eq!(
+            tool.description,
+            "Get current weather. (Client requirement: you MUST call this tool before answering.) Input is expected to include every property marked required by the schema."
+        );
+        for leaked in [
+            "city",
+            "nonce",
+            "unit",
+            "Paris",
+            "8b5d9233",
+            "{}",
+            "Fixed schema values",
+            "Do not call",
+        ] {
             assert!(
-                description.contains(expected),
-                "required tool nudge should contain {expected:?}: {description}"
+                !tool.description.contains(leaked),
+                "client-controlled schema content leaked into description: {leaked:?}"
             );
         }
-        assert!(description.contains("{}"), "应明确禁止空参数对象");
-        assert!(
-            !description.contains("celsius") && !description.contains("fahrenheit"),
-            "多值 enum 不是固定值，不应重复展开增加 token"
+        assert_eq!(
+            tool.input_schema.json["required"],
+            serde_json::json!(["city", "nonce", "unit"])
+        );
+        assert_eq!(
+            tool.input_schema.json["properties"]["city"]["const"],
+            "Paris"
+        );
+        assert_eq!(
+            tool.input_schema.json["properties"]["nonce"]["enum"],
+            serde_json::json!(["8b5d9233"])
         );
     }
 
     #[test]
-    fn required_any_tool_nudge_includes_schema_constraints() {
+    fn required_any_tool_nudge_uses_static_schema_metadata() {
         use super::super::types::ToolChoice;
 
         let description = converted_weather_description(Some(ToolChoice::Any {
             disable_parallel_tool_use: false,
         }));
-        assert!(description.contains("city"));
-        assert!(description.contains("Paris"));
-        assert!(description.contains("8b5d9233"));
+        assert_eq!(
+            description,
+            "Get current weather. (Client requirement: you MUST call at least one of the provided tools before answering.) Input is expected to include every property marked required by the schema."
+        );
     }
 
     #[test]
     fn auto_tool_choice_does_not_inject_schema_nudge() {
+        use super::super::types::ToolChoice;
+
         let description = converted_weather_description(None);
         assert_eq!(description, "Get current weather.");
+        let explicit_auto = converted_weather_description(Some(ToolChoice::Auto {
+            disable_parallel_tool_use: false,
+        }));
+        assert_eq!(explicit_auto, "Get current weather.");
     }
 
     #[test]
