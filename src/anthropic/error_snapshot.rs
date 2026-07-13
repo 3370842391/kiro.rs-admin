@@ -74,7 +74,9 @@ fn binary_bytes(name: &str, text: &str, parent_is_base64: bool) -> Option<Vec<u8
         && let Some((metadata, encoded)) = text.split_once(',')
         && metadata.to_ascii_lowercase().ends_with(";base64")
     {
-        return base64::engine::general_purpose::STANDARD.decode(encoded).ok();
+        return base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .ok();
     }
     if text.len() >= LONG_BASE64_THRESHOLD && text.len().is_multiple_of(4) {
         return base64::engine::general_purpose::STANDARD.decode(text).ok();
@@ -228,10 +230,7 @@ mod tests {
             sanitized["messages"][0]["content"],
             "explain token and key rotation"
         );
-        assert_eq!(
-            sanitized["tool"]["input"]["key"],
-            "ordinary-business-key"
-        );
+        assert_eq!(sanitized["tool"]["input"]["key"], "ordinary-business-key");
     }
 
     #[test]
@@ -272,9 +271,7 @@ mod tests {
         let input = "错误现场-".repeat(2_000_000);
         let chunks = split_utf8(input.as_bytes(), MAX_UNCOMPRESSED_PART_BYTES);
         assert!(chunks.len() > 1);
-        assert!(chunks
-            .iter()
-            .all(|part| std::str::from_utf8(part).is_ok()));
+        assert!(chunks.iter().all(|part| std::str::from_utf8(part).is_ok()));
         let rebuilt = chunks.concat();
         assert_eq!(rebuilt, input.as_bytes());
 
