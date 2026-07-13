@@ -1,0 +1,17 @@
+services:
+  kiro-rs-test:
+    image: kiro-rs-test:${TEST_IMAGE_TAG:-latest}
+    container_name: kiro-rs-test
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "0.0.0.0:8991:8990"
+    volumes:
+      - "./data-test:/app/config"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8990/"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
