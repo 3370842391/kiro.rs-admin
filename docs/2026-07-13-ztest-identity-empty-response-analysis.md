@@ -2,7 +2,7 @@
 
 > 日期：2026-07-13
 > 范围：生产 `8990`、公开测试实例 `8991`、当前 `kiro-rs 0.9.1`
-> 本文只记录证据、根因判断和下一轮方案，尚未修改业务代码或服务器路由。
+> 本文先记录根因证据，现已补充 2026-07-13 的实施、部署与验证结果。生产 `8990` 未变更。
 
 ## 1. 结论摘要
 
@@ -18,7 +18,7 @@
 
 - 生产容器镜像标签仍显示 `ghcr.io/3370842391/kiro-rs:sha-218ae0`，但容器内二进制已在线更新为 `kiro-rs 0.9.1`。
 - 公开测试容器运行镜像 `kiro-rs-test:61a2d53a013c`，二进制为 `kiro-rs 0.9.1`，健康状态为 `healthy`。
-- 测试站公网地址为 `http://43.225.196.10:8991`，管理端路径为 `/admin`；根路径 `/` 返回 404 是当前路由设计，不代表 API 离线。
+- 测试站现使用标准 HTTPS 入口 `https://rs-test.43-225-196-10.sslip.io`，管理端为 `/admin`，后端仍是隔离的 `127.0.0.1:8991`。
 
 ### 2.2 模型资料
 
@@ -203,10 +203,44 @@ Kiro 的 HTTP 200 响应体仍是 event-stream，内部可能包含：
 5. 先部署 8991，复测普通对话、流式、工具调用、长上下文和 Ztest；
 6. 证据稳定后再合并并更新生产 8990。
 
-## 7. 本轮未执行的操作
+## 7. 实施结果
 
-- 未修改 Rust、前端或 Docker 业务代码；
-- 未修改生产或测试配置；
-- 未给 8991 增加域名/TLS；
-- 未提交或推送本分析文档；
-- 文档未记录管理 Key、临时 `csk` 或任何凭据正文。
+已完成以下提交并集成到 `fix/ztest-identity-empty-response`：
+
+| 提交 | 内容 |
+|---|---|
+| `18af02f` | 允许精确官方 Claude Code system 与空 tools 命中严格模型资料回答 |
+| `0cf12d3` | 统一上游终止/失败分类，保留 Error/Exception，并安全重试首轮正常 EOF 空响应或半截工具 JSON |
+| `a8dbab3` | 保留 `ContentLengthExceededException → max_tokens` 兼容语义，限制异常摘要并清理重试状态 |
+| `5c4f625` | 增加 8991 HTTPS vhost、ACME bootstrap、续期钩子和回滚文档 |
+| `67d590c` | 收口只供测试使用的兼容接口；该提交已部署到公开 8991 |
+
+证书由 Let's Encrypt 签发，有效期到 2026-10-11；`certbot.timer` 已启用且处于 active，续期 dry-run 成功，宝塔 Nginx reload hook 已实测通过。生产 `kiro-rs-admin` 仍运行原镜像 `ghcr.io/3370842391/kiro-rs:sha-218ae0`。
+
+## 8. 验证结果
+
+本地完整验证：
+
+- `cargo test --locked -j 1`：probe 14/14、主测试 781/781；
+- `cargo check --locked -j 1`：成功，仅保留任务外既有 image resize dead-code 警告；
+- `bun test`：15/15；
+- `bun run build`：成功；
+- `git diff --check`：成功。
+
+公开 HTTPS 端到端验证：
+
+| 场景 | 结果 |
+|---|---|
+| `/admin` | HTTP 200 |
+| 未认证 `/v1/models` | HTTP 401 |
+| `context_window` + 官方 Claude Code system + `tools: []` | `1000000` |
+| `recent_event` + 官方 Claude Code system + `tools: []` | `January 2026` |
+| 普通非流式 | `TEST_OK`，`end_turn` |
+| 普通流式 | `STREAM_OK`，包含完整 `message_start` 到 `message_stop` 序列 |
+| 强制非流式工具调用 | 返回一个合法 `get_weather` tool_use，参数对象为 `{"city":"Paris"}` |
+| 工具结果续聊 | HTTP 200，返回非空文本并以 `end_turn` 收尾 |
+| 强制流式工具调用 | tool_use 块存在，拼接后的 `partial_json` 可解析，成功 terminal 完整 |
+
+测试容器镜像为 `kiro-rs-test:67d590c4d30a`，状态 `running/healthy`。当前还无法主动强制 Kiro 生成真实空响应，因此空响应重试主要由自动化状态矩阵覆盖；后续可在 Ztest 或真实长会话再次触发时通过新的错误类型和日志确认实际分支。
+
+文档未记录管理 Key、临时 `csk`、凭据正文或证书私钥。
