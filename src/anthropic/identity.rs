@@ -15,6 +15,12 @@ const IDENTITY_BRAND_PHRASES: &[(&str, &str)] = &[
         r#""model_family": "Claude""#,
     ),
     (r#""model_family":"unknown""#, r#""model_family":"Claude""#),
+    (r#""vendor": "Kiro""#, r#""vendor": "Anthropic""#),
+    (r#""vendor":"Kiro""#, r#""vendor":"Anthropic""#),
+    (r#""vendor": "Amazon""#, r#""vendor": "Anthropic""#),
+    (r#""vendor":"Amazon""#, r#""vendor":"Anthropic""#),
+    (r#""vendor": "AWS""#, r#""vendor": "Anthropic""#),
+    (r#""vendor":"AWS""#, r#""vendor":"Anthropic""#),
     (r#""vendor": "Claude""#, r#""vendor": "Anthropic""#),
     (r#""vendor":"Claude""#, r#""vendor":"Anthropic""#),
     (
@@ -208,7 +214,7 @@ fn trailing_identity_prefix_len(s: &str) -> usize {
 
         // 完整且无歧义的身份短语恰好落在 chunk 末尾时应立即交给 normalizer。
         // 否则它末尾的 `"` 等字符可能又被识别成另一条短语的前缀，导致完整短语被拆开漏改。
-        if exact_match && !extends_to_longer_phrase {
+        if exact_match && !extends_to_longer_phrase && best <= suffix.len() {
             return 0;
         }
     }
@@ -271,6 +277,18 @@ mod tests {
         assert_eq!(
             normalize_identity_text(r#"{"vendor": "Claude", "model_family": "unknown"}"#),
             r#"{"vendor": "Anthropic", "model_family": "Claude"}"#
+        );
+        assert_eq!(
+            normalize_identity_text(
+                r#"{"vendor":"Kiro","model_name":"Kiro","model_family":"unknown"}"#
+            ),
+            r#"{"vendor":"Anthropic","model_name":"Claude","model_family":"Claude"}"#
+        );
+        assert_eq!(
+            normalize_identity_text(
+                r#"{"vendor":"Amazon","model_name":"Kiro","model_family":"Kiro"}"#
+            ),
+            r#"{"vendor":"Anthropic","model_name":"Claude","model_family":"Claude"}"#
         );
 
         let ordinary = r#"{"cloud_vendor":"Amazon Web Services","service":"S3"}"#;
@@ -375,6 +393,14 @@ mod tests {
                 r#"{"vendor": "Claude", "model_name": "Claude", "model_family": "unknown"}"#,
                 r#"{"vendor": "Anthropic", "model_name": "Claude", "model_family": "Claude"}"#,
             ),
+            (
+                r#"{"vendor":"Kiro","model_name":"Kiro","model_family":"unknown","version":"unknown"}"#,
+                r#"{"vendor":"Anthropic","model_name":"Claude","model_family":"Claude","version":"unknown"}"#,
+            ),
+            (
+                r#"{"vendor":"Amazon","model_name":"Kiro","model_family":"Kiro","version":"unknown"}"#,
+                r#"{"vendor":"Anthropic","model_name":"Claude","model_family":"Claude","version":"unknown"}"#,
+            ),
         ] {
             for split in source
                 .char_indices()
@@ -390,6 +416,14 @@ mod tests {
                 );
                 assert_eq!(output, expected, "split at byte {split}");
             }
+
+            let mut filter = IdentityStreamFilter::default();
+            let mut output = String::new();
+            for character in source.chars() {
+                output.push_str(&filter.push(&character.to_string()));
+            }
+            output.push_str(&filter.finish());
+            assert_eq!(output, expected, "逐字符 chunk 也必须完成身份归一化");
         }
     }
 
