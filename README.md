@@ -818,6 +818,20 @@ Docker 镜像：
 
 容器内在线更新会下载对应平台二进制并替换当前可执行文件；替换后进程退出，由 Docker `restart: unless-stopped` 拉起新进程。回退依赖本地 `<exe>.backup`。
 
+- 更新弹窗打开和后台轮询使用 30 分钟服务端缓存，降低 GitHub API 压力。
+- 弹窗中的“强制检查”会请求 `/api/admin/system/update/check?force=true`，用于 Release 刚发布时立即刷新；查询失败时，后端可能返回带 `warning` 的旧缓存结果。
+
+### 服务器测试构建
+
+服务器测试构建仅用于内部验收，使用独立的 `kiro-rs-test` 容器、8991 端口和 `data-test` 配置目录；生产 8990 仍使用 GitHub/GHCR 镜像。两个容器不得共用宿主机配置目录。
+
+```bash
+./scripts/test-deploy.sh                 # deploy/master
+./scripts/test-deploy.sh 63c49359375227737b1d996a0b289425c67cc32a  # 指定 commit
+```
+
+首次构建会下载依赖；后续构建复用 BuildKit 中的 Bun、Cargo registry 和 Rust target 缓存。脚本在新镜像通过 smoke test 和健康检查后才保留测试容器；失败时会尝试恢复旧测试镜像。公网测试地址为 `http://43.225.196.10:8991/`，不要把生产客户流量指向 8991。
+
 <a id="development"></a>
 ## 开发
 

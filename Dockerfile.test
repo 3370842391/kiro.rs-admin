@@ -1,0 +1,38 @@
+# syntax=docker/dockerfile:1.7
+
+FROM oven/bun:1-alpine AS frontend-builder
+
+WORKDIR /app/admin-ui
+COPY admin-ui/package.json admin-ui/bun.lock ./
+RUN --mount=type=cache,id=kiro-test-bun,target=/root/.bun/install/cache \
+    bun install --frozen-lockfile --ignore-scripts
+COPY admin-ui ./
+RUN bun run build
+
+FROM rust:1.92-alpine AS builder
+
+RUN apk add --no-cache musl-dev perl make
+
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY --from=frontend-builder /app/admin-ui/dist /app/admin-ui/dist
+
+RUN --mount=type=cache,id=kiro-test-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=kiro-test-cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=kiro-test-cargo-target,target=/app/target \
+    cargo build --release --locked --no-default-features && \
+    cp /app/target/release/kiro-rs /tmp/kiro-rs
+
+FROM alpine:3.21
+
+RUN apk add --no-cache ca-certificates curl
+
+WORKDIR /app
+COPY --from=builder /tmp/kiro-rs /usr/local/bin/kiro-rs
+
+VOLUME ["/app/config"]
+EXPOSE 8990
+
+ENTRYPOINT ["kiro-rs"]
+CMD ["-c", "/app/config/config.json", "--credentials", "/app/config/credentials.json"]
