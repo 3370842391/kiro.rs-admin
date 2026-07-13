@@ -13,7 +13,9 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Progress } from '@/components/ui/progress'
 import { applyImageUpdate, checkSystemUpdate } from '@/api/credentials'
+import { forceCheckSystemUpdate } from '@/lib/update-check'
 import { extractErrorMessage } from '@/lib/utils'
+import type { UpdateCheckInfo } from '@/types/api'
 
 interface ImageUpdateDialogProps {
   open: boolean
@@ -30,7 +32,7 @@ export function ImageUpdateDialog({ open, onOpenChange }: ImageUpdateDialogProps
   const queryClient = useQueryClient()
   const [progress, setProgress] = useState(0)
 
-  const { data: updateCheck, isFetching, refetch } = useQuery({
+  const { data: updateCheck, isFetching } = useQuery({
     queryKey: ['system-update-check'],
     queryFn: () => checkSystemUpdate(false),
     enabled: open,
@@ -50,6 +52,23 @@ export function ImageUpdateDialog({ open, onOpenChange }: ImageUpdateDialogProps
     },
   })
 
+  const forceCheckMutation = useMutation<UpdateCheckInfo, Error, void>({
+    mutationFn: forceCheckSystemUpdate as () => Promise<UpdateCheckInfo>,
+    onSuccess: (result) => {
+      queryClient.setQueryData(['system-update-check'], result)
+      if (result.warning) {
+        toast.warning(result.warning)
+      } else if (result.hasUpdate) {
+        toast.success(`发现新版本 v${result.latestVersion}`)
+      } else {
+        toast.success('当前已是最新版本')
+      }
+    },
+    onError: (err) => {
+      toast.error(`检查更新失败: ${extractErrorMessage(err)}`)
+    },
+  })
+
   // 更新进行中：进度条平滑爬升到 ~90%，成功后跳 100%（下载在服务端，无法拿真实百分比）
   useEffect(() => {
     if (!applyMutation.isPending) return
@@ -65,7 +84,11 @@ export function ImageUpdateDialog({ open, onOpenChange }: ImageUpdateDialogProps
     if (!open) setProgress(0)
   }, [open])
 
-  const canUpdate = !!updateCheck?.hasUpdate && !applyMutation.isPending
+  const isChecking = isFetching || forceCheckMutation.isPending
+  const canUpdate =
+    !!updateCheck?.hasUpdate &&
+    !applyMutation.isPending &&
+    !forceCheckMutation.isPending
   const showProgress = applyMutation.isPending || progress > 0
 
   return (
@@ -125,12 +148,12 @@ export function ImageUpdateDialog({ open, onOpenChange }: ImageUpdateDialogProps
             type="button"
             variant="ghost"
             size="sm"
-            disabled={isFetching || applyMutation.isPending}
-            onClick={() => refetch()}
-            title="重新检查版本"
+            disabled={isChecking || applyMutation.isPending}
+            onClick={() => forceCheckMutation.mutate()}
+            title="绕过缓存并重新查询 GitHub Release"
           >
-            <RefreshCw className={`h-3.5 w-3.5 ${isFetching ? 'animate-spin' : ''}`} />
-            <span className="ml-1.5">检查</span>
+            <RefreshCw className={`h-3.5 w-3.5 ${isChecking ? 'animate-spin' : ''}`} />
+            <span className="ml-1.5">强制检查</span>
           </Button>
           <Button
             type="button"
