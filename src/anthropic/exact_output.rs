@@ -184,6 +184,61 @@ fn strip_matching_quote(value: &str) -> Option<&str> {
     value.get(first.len_utf8()..value.len().saturating_sub(first.len_utf8()))
 }
 
+const STRICT_JSON_TAIL_BYTES: usize = 4 * 1024;
+const STRICT_JSON_LOCAL_RADIUS_BYTES: usize = 256;
+
+fn utf8_tail(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut start = text.len() - max_bytes;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
+}
+
+fn utf8_local_window(text: &str, offset: usize, needle_len: usize) -> &str {
+    let mut start = offset.saturating_sub(STRICT_JSON_LOCAL_RADIUS_BYTES);
+    while start > 0 && !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (offset + needle_len + STRICT_JSON_LOCAL_RADIUS_BYTES).min(text.len());
+    while end > start && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[start..end]
+}
+
+fn has_json_output_command_cue(text: &str) -> bool {
+    [
+        "return",
+        "reply",
+        "respond",
+        "output",
+        "provide",
+        "只返回",
+        "仅返回",
+        "回复",
+        "输出",
+    ]
+    .iter()
+    .any(|cue| text.contains(cue))
+}
+
+fn has_single_json_value_cue(text: &str) -> bool {
+    [
+        "exactly one",
+        "exactly a single",
+        "single minified",
+        "one minified",
+        "只返回",
+        "仅返回",
+    ]
+    .iter()
+    .any(|cue| text.contains(cue))
+}
+
 pub(crate) fn strict_json_requested(req: &MessagesRequest) -> bool {
     let latest_user_text = req
         .messages
@@ -192,14 +247,14 @@ pub(crate) fn strict_json_requested(req: &MessagesRequest) -> bool {
         .find(|message| message.role == "user")
         .map(|message| message_text(&message.content))
         .unwrap_or_default();
-    let normalized = latest_user_text.to_lowercase();
-    normalized.contains("json")
-        && (normalized.contains("exactly one")
-            || normalized.contains("exactly a single")
-            || normalized.contains("single minified")
-            || normalized.contains("只返回")
-            || normalized.contains("仅返回"))
-        && has_no_extra_cue(&normalized)
+    let normalized = utf8_tail(&latest_user_text, STRICT_JSON_TAIL_BYTES).to_ascii_lowercase();
+
+    normalized.match_indices("json").any(|(offset, cue)| {
+        let window = utf8_local_window(&normalized, offset, cue.len());
+        has_json_output_command_cue(window)
+            && has_single_json_value_cue(window)
+            && has_no_extra_cue(window)
+    })
 }
 
 pub(crate) fn extract_single_json(text: &str) -> Option<String> {
@@ -977,6 +1032,50 @@ mod tests {
         assert!(!strict_json_requested(&request(
             None,
             "Please answer in JSON."
+        )));
+    }
+
+    #[test]
+    fn strict_json_ignores_distant_cues_in_large_code_context() {
+        let noisy_code = r#"
+            value, err := json.Marshal(payload)
+            // Exactly one purchase should succeed.
+            const historical_instruction: &str = "no markdown";
+        "#
+        .repeat(4_000);
+        let prompt = format!(
+            "{noisy_code}\n\nThe implementation is ready. Build the project and run the tests."
+        );
+
+        assert!(!strict_json_requested(&request(None, &prompt)));
+    }
+
+    #[test]
+    fn strict_json_accepts_explicit_instruction_at_end_of_large_context() {
+        let context = "let value = json.Marshal(payload);\n".repeat(20_000);
+        let prompt = format!(
+            "{context}\nReply with exactly one minified JSON object and no markdown or explanation."
+        );
+
+        assert!(strict_json_requested(&request(None, &prompt)));
+    }
+
+    #[test]
+    fn strict_json_requires_cues_in_one_local_window() {
+        let prompt = format!(
+            "Reply with exactly one result.{}JSON is mentioned here.{}No markdown.",
+            "x".repeat(700),
+            "y".repeat(700),
+        );
+
+        assert!(!strict_json_requested(&request(None, &prompt)));
+    }
+
+    #[test]
+    fn strict_json_accepts_explicit_chinese_instruction() {
+        assert!(strict_json_requested(&request(
+            None,
+            "仅返回一个 JSON 对象，不要解释。"
         )));
     }
 
