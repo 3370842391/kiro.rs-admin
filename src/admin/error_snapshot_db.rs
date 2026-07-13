@@ -1,7 +1,9 @@
+use std::io::Read as _;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use base64::Engine as _;
 use parking_lot::{Mutex, RwLock};
 use rusqlite::{Connection, OptionalExtension as _, params, params_from_iter};
 use serde::{Deserialize, Serialize};
@@ -99,6 +101,47 @@ pub enum InsertOutcome {
     Fallback(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CaptureMode {
+    Full,
+    MetadataOnly,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FallbackImportReport {
+    pub imported: usize,
+    pub existing: usize,
+    pub failed: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaintenanceReport {
+    pub deleted: usize,
+    pub imported: usize,
+    pub disk_pressure: bool,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageStatus {
+    pub db_bytes: u64,
+    pub wal_bytes: u64,
+    pub shm_bytes: u64,
+    pub fallback_bytes: u64,
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+    pub max_storage_bytes: u64,
+    pub min_free_disk_bytes: u64,
+    pub disk_pressure: bool,
+    pub records: u64,
+    pub pinned_records: u64,
+    pub critical_records: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotSummary {
@@ -168,11 +211,55 @@ pub struct ErrorSnapshotStore {
     #[allow(dead_code)]
     fallback_dir: Option<PathBuf>,
     policy: RwLock<ErrorSnapshotPolicy>,
-    #[allow(dead_code)]
     disk_pressure: AtomicBool,
+    storage_probe: Arc<dyn StorageProbe>,
 }
 
 pub type SharedErrorSnapshotStore = Arc<ErrorSnapshotStore>;
+
+trait StorageProbe: Send + Sync {
+    fn available_bytes(&self, path: &std::path::Path) -> std::io::Result<u64>;
+    fn tree_bytes(&self, paths: &[PathBuf]) -> std::io::Result<u64>;
+}
+
+#[derive(Debug)]
+struct RealStorageProbe;
+
+impl StorageProbe for RealStorageProbe {
+    fn available_bytes(&self, path: &std::path::Path) -> std::io::Result<u64> {
+        fs2::available_space(path)
+    }
+
+    fn tree_bytes(&self, paths: &[PathBuf]) -> std::io::Result<u64> {
+        paths.iter().try_fold(0u64, |total, path| {
+            total
+                .checked_add(path_tree_bytes(path)?)
+                .ok_or_else(|| std::io::Error::other("快照目录大小溢出"))
+        })
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FallbackEnvelope {
+    version: u32,
+    snapshot: serde_json::Value,
+    payloads: Vec<FallbackPayloadPart>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FallbackPayloadPart {
+    seq: u32,
+    kind: SnapshotPayloadKind,
+    attempt: Option<u32>,
+    codec: String,
+    content_type: String,
+    part_index: u32,
+    part_count: u32,
+    original_bytes: u64,
+    compressed_bytes: u64,
+    sha256: String,
+    data_b64: String,
+}
 
 impl ErrorSnapshotStore {
     pub fn open(
@@ -189,6 +276,7 @@ impl ErrorSnapshotStore {
             fallback_dir: Some(fallback_dir),
             policy: RwLock::new(policy),
             disk_pressure: AtomicBool::new(false),
+            storage_probe: Arc::new(RealStorageProbe),
         })
     }
 
@@ -201,6 +289,33 @@ impl ErrorSnapshotStore {
             fallback_dir: None,
             policy: RwLock::new(policy),
             disk_pressure: AtomicBool::new(false),
+            storage_probe: Arc::new(RealStorageProbe),
+        })
+    }
+
+    pub fn open_in_memory_with_fallback(
+        fallback_dir: PathBuf,
+        policy: ErrorSnapshotPolicy,
+    ) -> rusqlite::Result<Self> {
+        let mut store = Self::open_in_memory(policy)?;
+        store.fallback_dir = Some(fallback_dir);
+        Ok(store)
+    }
+
+    #[cfg(test)]
+    fn open_in_memory_with_probe(
+        policy: ErrorSnapshotPolicy,
+        storage_probe: Arc<dyn StorageProbe>,
+    ) -> rusqlite::Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        initialize_connection(&conn, true)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+            db_path: None,
+            fallback_dir: None,
+            policy: RwLock::new(policy),
+            disk_pressure: AtomicBool::new(false),
+            storage_probe,
         })
     }
 
@@ -433,6 +548,412 @@ impl ErrorSnapshotStore {
         )?;
         Ok(changed > 0)
     }
+
+    pub fn insert_with_fallback(&self, write: &SnapshotWrite) -> anyhow::Result<InsertOutcome> {
+        let mut last_error = None;
+        for delay_ms in [0u64, 25, 75, 150] {
+            if delay_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            }
+            match self.insert(write) {
+                Ok(outcome) => return Ok(outcome),
+                Err(error) if is_busy_error(&error) => last_error = Some(error),
+                Err(error) => {
+                    last_error = Some(error);
+                    break;
+                }
+            }
+        }
+        let error = last_error.unwrap_or_else(|| anyhow::anyhow!("未知快照数据库错误"));
+        let Some(dir) = &self.fallback_dir else {
+            return Err(error);
+        };
+        write_fallback_atomic(dir, write)?;
+        tracing::warn!(
+            snapshot_id = %write.snapshot_id,
+            trace_id = %write.trace_id,
+            error_type = %write.error_type,
+            "错误快照数据库写入失败，已写入 fallback"
+        );
+        Ok(InsertOutcome::Fallback(write.snapshot_id.clone()))
+    }
+
+    pub fn import_fallback(&self) -> anyhow::Result<FallbackImportReport> {
+        let Some(dir) = &self.fallback_dir else {
+            return Ok(FallbackImportReport::default());
+        };
+        self.import_fallback_dir(dir)
+    }
+
+    pub fn import_fallback_dir(
+        &self,
+        dir: &std::path::Path,
+    ) -> anyhow::Result<FallbackImportReport> {
+        if !dir.exists() {
+            return Ok(FallbackImportReport::default());
+        }
+        let corrupt_dir = dir.join("corrupt");
+        let mut report = FallbackImportReport::default();
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !entry.file_type()?.is_file()
+                || path.extension().and_then(|value| value.to_str()) != Some("zst")
+                || !path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|name| name.ends_with(".snapshot.zst"))
+            {
+                continue;
+            }
+            let write = match read_fallback(&path) {
+                Ok(write) => write,
+                Err(error) => {
+                    report.failed += 1;
+                    std::fs::create_dir_all(&corrupt_dir)?;
+                    let name = path
+                        .file_name()
+                        .ok_or_else(|| anyhow::anyhow!("fallback 文件名缺失"))?;
+                    let target = corrupt_dir.join(name);
+                    if target.exists() {
+                        let unique = corrupt_dir.join(format!(
+                            "{}.{}.corrupt",
+                            name.to_string_lossy(),
+                            uuid::Uuid::new_v4()
+                        ));
+                        std::fs::rename(&path, unique)?;
+                    } else {
+                        std::fs::rename(&path, target)?;
+                    }
+                    tracing::warn!(file = %name.to_string_lossy(), error = %error, "fallback 导入失败，已隔离");
+                    continue;
+                }
+            };
+            match self.insert(&write) {
+                Ok(InsertOutcome::Inserted(_)) | Ok(InsertOutcome::Fallback(_)) => {
+                    report.imported += 1;
+                    std::fs::remove_file(&path)?;
+                }
+                Ok(InsertOutcome::Existing(_)) => {
+                    report.existing += 1;
+                    std::fs::remove_file(&path)?;
+                }
+                Err(error) => {
+                    report.failed += 1;
+                    tracing::warn!(
+                        snapshot_id = %write.snapshot_id,
+                        trace_id = %write.trace_id,
+                        error_type = %write.error_type,
+                        error = %error,
+                        "fallback 数据库导入失败，保留文件等待下次重试"
+                    );
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    pub fn run_maintenance(&self) -> anyhow::Result<MaintenanceReport> {
+        self.run_maintenance_at(chrono::Utc::now().timestamp())
+    }
+
+    pub fn run_maintenance_at(&self, now_epoch: i64) -> anyhow::Result<MaintenanceReport> {
+        let imported = self.import_fallback()?.imported;
+        let policy = self.policy();
+        let retention_secs = i64::from(policy.retention_days).saturating_mul(86_400);
+        let cutoff = now_epoch.saturating_sub(retention_secs);
+        let mut deleted = 0usize;
+        {
+            let conn = self.conn.lock();
+            for severity in ["warning", "error", "info"] {
+                deleted += conn.execute(
+                    "DELETE FROM error_snapshots
+                     WHERE ts_epoch < ?1 AND severity = ?2
+                       AND pinned = 0 AND retention_exempt = 0 AND severity <> 'critical'",
+                    params![cutoff, severity],
+                )?;
+            }
+        }
+
+        let mut status = self.storage_status()?;
+        if status.total_bytes > policy.max_storage_bytes {
+            let conn = self.conn.lock();
+            loop {
+                let candidate: Option<(String, u64)> = conn
+                    .query_row(
+                        "SELECT snapshot_id, compressed_bytes FROM error_snapshots
+                         WHERE pinned = 0 AND retention_exempt = 0 AND severity <> 'critical'
+                           AND severity IN ('warning', 'error', 'info')
+                         ORDER BY CASE severity WHEN 'warning' THEN 0 WHEN 'error' THEN 1 ELSE 2 END,
+                                  ts_epoch ASC LIMIT 1",
+                        [],
+                        |row| Ok((row.get(0)?, from_u64(row.get::<_, i64>(1)?, 1)?)),
+                    )
+                    .optional()?;
+                let Some((id, estimated_bytes)) = candidate else {
+                    break;
+                };
+                deleted += conn.execute(
+                    "DELETE FROM error_snapshots WHERE snapshot_id = ?1
+                       AND pinned = 0 AND retention_exempt = 0 AND severity <> 'critical'",
+                    params![id],
+                )?;
+                status.total_bytes = status.total_bytes.saturating_sub(estimated_bytes.max(1));
+                if status.total_bytes <= policy.max_storage_bytes {
+                    break;
+                }
+            }
+        }
+        {
+            let conn = self.conn.lock();
+            conn.execute_batch(
+                "PRAGMA wal_checkpoint(TRUNCATE); PRAGMA incremental_vacuum(4096);",
+            )?;
+        }
+        status = self.storage_status()?;
+        let disk_pressure = status.available_bytes < policy.min_free_disk_bytes;
+        self.disk_pressure.store(disk_pressure, Ordering::Release);
+        Ok(MaintenanceReport {
+            deleted,
+            imported,
+            disk_pressure,
+            total_bytes: status.total_bytes,
+        })
+    }
+
+    pub fn capture_mode(&self) -> CaptureMode {
+        if self.disk_pressure.load(Ordering::Acquire) {
+            CaptureMode::MetadataOnly
+        } else {
+            CaptureMode::Full
+        }
+    }
+
+    pub fn storage_status(&self) -> anyhow::Result<StorageStatus> {
+        let policy = self.policy();
+        let mut paths = Vec::new();
+        let (db_bytes, wal_bytes, shm_bytes) = if let Some(db) = &self.db_path {
+            let wal = sidecar_path(db, "-wal");
+            let shm = sidecar_path(db, "-shm");
+            paths.extend([db.clone(), wal.clone(), shm.clone()]);
+            (
+                self.storage_probe.tree_bytes(std::slice::from_ref(db))?,
+                self.storage_probe.tree_bytes(std::slice::from_ref(&wal))?,
+                self.storage_probe.tree_bytes(std::slice::from_ref(&shm))?,
+            )
+        } else {
+            (0, 0, 0)
+        };
+        let fallback_bytes = if let Some(fallback) = &self.fallback_dir {
+            paths.push(fallback.clone());
+            self.storage_probe
+                .tree_bytes(std::slice::from_ref(fallback))?
+        } else {
+            0
+        };
+        let total_bytes = if paths.is_empty() {
+            self.storage_probe.tree_bytes(&[])?
+        } else {
+            self.storage_probe.tree_bytes(&paths)?
+        };
+        let probe_path = self
+            .db_path
+            .as_deref()
+            .and_then(std::path::Path::parent)
+            .or(self.fallback_dir.as_deref())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let available_bytes = self.storage_probe.available_bytes(probe_path)?;
+        let conn = self.conn.lock();
+        let (records, pinned_records, critical_records): (i64, i64, i64) = conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(CASE WHEN pinned = 1 THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN severity = 'critical' THEN 1 ELSE 0 END), 0)
+             FROM error_snapshots",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        Ok(StorageStatus {
+            db_bytes,
+            wal_bytes,
+            shm_bytes,
+            fallback_bytes,
+            total_bytes,
+            available_bytes,
+            max_storage_bytes: policy.max_storage_bytes,
+            min_free_disk_bytes: policy.min_free_disk_bytes,
+            disk_pressure: available_bytes < policy.min_free_disk_bytes,
+            records: u64::try_from(records)?,
+            pinned_records: u64::try_from(pinned_records)?,
+            critical_records: u64::try_from(critical_records)?,
+        })
+    }
+
+    pub fn recent_trace_links(&self, since_epoch: i64) -> anyhow::Result<Vec<(String, String)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT trace_id, snapshot_id FROM error_snapshots
+             WHERE ts_epoch >= ?1 ORDER BY ts_epoch ASC",
+        )?;
+        Ok(stmt
+            .query_map(params![since_epoch], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+}
+
+fn write_fallback_atomic(dir: &std::path::Path, write: &SnapshotWrite) -> anyhow::Result<()> {
+    validate_snapshot_filename(&write.snapshot_id)?;
+    std::fs::create_dir_all(dir)?;
+    let final_path = dir.join(format!("{}.snapshot.zst", write.snapshot_id));
+    if final_path.exists() {
+        return Ok(());
+    }
+    let mut snapshot = serde_json::to_value(write)?;
+    snapshot
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("fallback 快照元数据不是对象"))?
+        .remove("payloads");
+    let payloads = write
+        .payloads
+        .iter()
+        .map(|part| -> anyhow::Result<FallbackPayloadPart> {
+            Ok(FallbackPayloadPart {
+                seq: part.seq,
+                kind: part.kind,
+                attempt: part.attempt,
+                codec: part.codec.clone(),
+                content_type: part.content_type.clone(),
+                part_index: part.part_index,
+                part_count: part.part_count,
+                original_bytes: part.original_bytes,
+                compressed_bytes: u64::try_from(part.data.len())?,
+                sha256: part.sha256.clone(),
+                data_b64: base64::engine::general_purpose::STANDARD.encode(&part.data),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let envelope = FallbackEnvelope {
+        version: 1,
+        snapshot,
+        payloads,
+    };
+    let serialized = serde_json::to_vec(&envelope)?;
+    let compressed = zstd::stream::encode_all(serialized.as_slice(), 3)?;
+    let temp = dir.join(format!(
+        ".{}.{}.tmp",
+        write.snapshot_id,
+        uuid::Uuid::new_v4()
+    ));
+    if let Err(error) =
+        std::fs::write(&temp, compressed).and_then(|_| std::fs::rename(&temp, &final_path))
+    {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+fn read_fallback(path: &std::path::Path) -> anyhow::Result<SnapshotWrite> {
+    const MAX_FALLBACK_ENVELOPE_BYTES: u64 = 512 * 1024 * 1024;
+    if std::fs::metadata(path)?.len() > MAX_FALLBACK_ENVELOPE_BYTES {
+        anyhow::bail!("fallback 压缩文件超过读取上限");
+    }
+    let compressed = std::fs::read(path)?;
+    let decoder = zstd::stream::read::Decoder::new(compressed.as_slice())?;
+    let mut serialized = Vec::new();
+    decoder
+        .take(MAX_FALLBACK_ENVELOPE_BYTES + 1)
+        .read_to_end(&mut serialized)?;
+    if u64::try_from(serialized.len())? > MAX_FALLBACK_ENVELOPE_BYTES {
+        anyhow::bail!("fallback envelope 超过解压上限");
+    }
+    let envelope: FallbackEnvelope = serde_json::from_slice(&serialized)?;
+    if envelope.version != 1 {
+        anyhow::bail!("不支持的 fallback 版本: {}", envelope.version);
+    }
+    let mut parts = Vec::with_capacity(envelope.payloads.len());
+    for part in envelope.payloads {
+        let data = base64::engine::general_purpose::STANDARD.decode(&part.data_b64)?;
+        if u64::try_from(data.len())? != part.compressed_bytes {
+            anyhow::bail!("fallback payload 压缩长度校验失败");
+        }
+        parts.push(EncodedPayloadPart {
+            seq: part.seq,
+            kind: part.kind,
+            attempt: part.attempt,
+            codec: part.codec,
+            content_type: part.content_type,
+            part_index: part.part_index,
+            part_count: part.part_count,
+            original_bytes: part.original_bytes,
+            sha256: part.sha256,
+            data,
+        });
+    }
+    let mut snapshot = envelope.snapshot;
+    snapshot
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("fallback 快照元数据不是对象"))?
+        .insert("payloads".to_string(), serde_json::to_value(parts)?);
+    let write: SnapshotWrite = serde_json::from_value(snapshot)?;
+    validate_snapshot_filename(&write.snapshot_id)?;
+    Ok(write)
+}
+
+fn validate_snapshot_filename(id: &str) -> anyhow::Result<()> {
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        anyhow::bail!("snapshot_id 不能安全用作 fallback 文件名");
+    }
+    Ok(())
+}
+
+fn is_busy_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<rusqlite::Error>())
+        .is_some_and(|sqlite| {
+            matches!(
+                sqlite,
+                rusqlite::Error::SqliteFailure(code, _)
+                    if matches!(
+                        code.code,
+                        rusqlite::ErrorCode::DatabaseBusy
+                            | rusqlite::ErrorCode::DatabaseLocked
+                    )
+            )
+        })
+}
+
+fn sidecar_path(path: &std::path::Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn path_tree_bytes(path: &std::path::Path) -> std::io::Result<u64> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() {
+        return Ok(0);
+    }
+    if metadata.is_file() {
+        return Ok(metadata.len());
+    }
+    if !metadata.is_dir() {
+        return Ok(0);
+    }
+    std::fs::read_dir(path)?.try_fold(0u64, |total, entry| {
+        total
+            .checked_add(path_tree_bytes(&entry?.path())?)
+            .ok_or_else(|| std::io::Error::other("快照目录大小溢出"))
+    })
 }
 
 fn initialize_connection(conn: &Connection, is_new: bool) -> rusqlite::Result<()> {
@@ -700,6 +1221,22 @@ CREATE INDEX IF NOT EXISTS idx_error_payloads_snapshot ON error_snapshot_payload
 mod tests {
     use super::*;
 
+    #[derive(Debug)]
+    struct FixedProbe {
+        tree_bytes: u64,
+        available_bytes: u64,
+    }
+
+    impl StorageProbe for FixedProbe {
+        fn available_bytes(&self, _path: &std::path::Path) -> std::io::Result<u64> {
+            Ok(self.available_bytes)
+        }
+
+        fn tree_bytes(&self, _paths: &[PathBuf]) -> std::io::Result<u64> {
+            Ok(self.tree_bytes)
+        }
+    }
+
     fn test_policy() -> ErrorSnapshotPolicy {
         ErrorSnapshotPolicy {
             enabled: true,
@@ -755,6 +1292,37 @@ mod tests {
             omitted_due_to_disk_pressure: false,
             payloads: first,
         }
+    }
+
+    fn test_store_with_probe(tree_bytes: u64, available_bytes: u64) -> ErrorSnapshotStore {
+        ErrorSnapshotStore::open_in_memory_with_probe(
+            test_policy(),
+            Arc::new(FixedProbe {
+                tree_bytes,
+                available_bytes,
+            }),
+        )
+        .unwrap()
+    }
+
+    fn insert_at(
+        store: &ErrorSnapshotStore,
+        id: &str,
+        severity: SnapshotSeverity,
+        pinned: bool,
+        retention_exempt: bool,
+        ts_epoch: i64,
+    ) {
+        let mut write = sample_write(id, &format!("trace-{id}"));
+        write.severity = severity;
+        write.pinned = pinned;
+        write.retention_exempt = retention_exempt;
+        write.ts_epoch = ts_epoch;
+        store.insert(&write).unwrap();
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("kiro-{name}-{}", uuid::Uuid::new_v4()))
     }
 
     #[test]
@@ -843,5 +1411,74 @@ mod tests {
         assert!(store.delete("snap-1").unwrap());
         assert!(store.get("snap-1").unwrap().is_none());
         assert!(!store.delete("missing").unwrap());
+    }
+
+    #[test]
+    fn cleanup_never_deletes_pinned_or_critical_records() {
+        let store = test_store_with_probe(50, 1_000);
+        let mut policy = store.policy();
+        policy.retention_days = 1;
+        policy.max_storage_bytes = 1_000;
+        policy.min_free_disk_bytes = 100;
+        store.set_policy(policy);
+        insert_at(
+            &store,
+            "warning-old",
+            SnapshotSeverity::Warning,
+            false,
+            false,
+            1,
+        );
+        insert_at(
+            &store,
+            "error-old",
+            SnapshotSeverity::Error,
+            false,
+            false,
+            2,
+        );
+        insert_at(&store, "pinned", SnapshotSeverity::Warning, true, false, 3);
+        insert_at(
+            &store,
+            "critical",
+            SnapshotSeverity::Critical,
+            false,
+            true,
+            4,
+        );
+
+        let report = store.run_maintenance_at(100 * 86_400).unwrap();
+
+        assert!(report.deleted >= 2);
+        assert!(store.get("pinned").unwrap().is_some());
+        assert!(store.get("critical").unwrap().is_some());
+    }
+
+    #[test]
+    fn low_free_space_enters_metadata_only_mode() {
+        let store = test_store_with_probe(10_000, 99);
+        let mut policy = store.policy();
+        policy.min_free_disk_bytes = 100;
+        store.set_policy(policy);
+
+        let report = store.run_maintenance_at(1_000).unwrap();
+
+        assert!(report.disk_pressure);
+        assert_eq!(store.capture_mode(), CaptureMode::MetadataOnly);
+    }
+
+    #[test]
+    fn fallback_round_trip_is_atomic_and_idempotent() {
+        let dir = temp_path("snapshot-fallback");
+        let write = sample_write("snap-fallback", "trace-fallback");
+        write_fallback_atomic(&dir, &write).unwrap();
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+
+        let store = ErrorSnapshotStore::open_in_memory(test_policy()).unwrap();
+        assert_eq!(store.import_fallback_dir(&dir).unwrap().imported, 1);
+        assert_eq!(store.import_fallback_dir(&dir).unwrap().imported, 0);
+        assert!(store.get("snap-fallback").unwrap().is_some());
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
