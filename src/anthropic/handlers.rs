@@ -373,13 +373,7 @@ impl TraceSink for RequestTracer {
                 status,
                 body,
             } => {
-                snapshot.record_upstream_response(
-                    attempt,
-                    credential_id,
-                    endpoint,
-                    status,
-                    body,
-                );
+                snapshot.record_upstream_response(attempt, credential_id, endpoint, status, body);
             }
             TraceDiagnosticEvent::NetworkError {
                 attempt,
@@ -393,11 +387,7 @@ impl TraceSink for RequestTracer {
     }
 }
 
-fn finalize_immediate_response(
-    tracer: &RequestTracer,
-    response: &Response,
-    error_type: &str,
-) {
+fn finalize_immediate_response(tracer: &RequestTracer, response: &Response, error_type: &str) {
     if response.status().is_success() {
         tracer.finalize("success", None, None, None, TraceUsage::zero());
     } else {
@@ -426,11 +416,7 @@ fn finalize_immediate_error(
     );
 }
 
-fn finalize_client_disconnected(
-    tracer: &RequestTracer,
-    received_bytes: u64,
-    usage: TraceUsage,
-) {
+fn finalize_client_disconnected(tracer: &RequestTracer, received_bytes: u64, usage: TraceUsage) {
     const MESSAGE: &str = "client disconnected before the response stream completed";
     tracer.record_protocol_error("client_disconnected", MESSAGE);
     tracer.finalize(
@@ -974,8 +960,9 @@ fn prepare_strict_json_request_bodies(
     if let Some(format) = structured_format {
         let retry =
             super::exact_output::append_structured_output_instruction(request_body, format)?;
-        let threshold_retry = threshold_retry_body
-            .and_then(|body| super::exact_output::append_structured_output_instruction(body, format));
+        let threshold_retry = threshold_retry_body.and_then(|body| {
+            super::exact_output::append_structured_output_instruction(body, format)
+        });
         return Some(StrictJsonRequestBodies {
             bodies: [request_body.to_owned(), retry],
             threshold_retry_bodies: [threshold_retry_body.map(str::to_owned), threshold_retry],
@@ -989,7 +976,8 @@ fn prepare_strict_json_request_bodies(
         ],
         threshold_retry_bodies: [
             threshold_retry_body.map(str::to_owned),
-            threshold_retry_body.and_then(super::exact_output::append_strict_json_retry_instruction),
+            threshold_retry_body
+                .and_then(super::exact_output::append_strict_json_retry_instruction),
         ],
     })
 }
@@ -1010,13 +998,12 @@ async fn handle_strict_json_request(
         .output_config
         .as_ref()
         .and_then(|config| config.format.as_ref());
-    let Some(prepared) = prepare_strict_json_request_bodies(
-        request_body,
-        threshold_retry_body,
-        structured_format,
-    ) else {
+    let Some(prepared) =
+        prepare_strict_json_request_bodies(request_body, threshold_retry_body, structured_format)
+    else {
         hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
-        let (status, error_type, internal_message, client_message) = if structured_format.is_some() {
+        let (status, error_type, internal_message, client_message) = if structured_format.is_some()
+        {
             (
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
@@ -2091,7 +2078,10 @@ pub async fn post_messages(
             key_ctx: key_ctx.clone(),
             model: payload.model.clone(),
             is_stream: payload.stream,
-            reasoning_effort: payload.output_config.as_ref().map(|value| value.effort.clone()),
+            reasoning_effort: payload
+                .output_config
+                .as_ref()
+                .map(|value| value.effort.clone()),
             context_1m: beta_has_context_1m(&headers),
             thinking: reasoning_requested(&payload),
         },
@@ -2169,12 +2159,7 @@ pub async fn post_messages(
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
             let message = error.to_string();
             let response = map_document_error(error);
-            finalize_immediate_error(
-                &tracer,
-                response.status(),
-                "document_error",
-                &message,
-            );
+            finalize_immediate_error(&tracer, response.status(), "document_error", &message);
             return response;
         }
     };
@@ -2244,12 +2229,7 @@ pub async fn post_messages(
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
             let message = error.to_string();
             let response = map_document_error(error);
-            finalize_immediate_error(
-                &tracer,
-                response.status(),
-                "document_error",
-                &message,
-            );
+            finalize_immediate_error(&tracer, response.status(), "document_error", &message);
             return response;
         }
         Err(PrepareRequestError::Conversion(e)) => {
@@ -2887,13 +2867,7 @@ async fn run_realtime_sse_attempts(
         let mut probation = ProbationBuffer::default();
         let initial_events = probation.push_all(ctx.generate_initial_events());
         if !send_sse_events(&sender, tracer.as_ref(), initial_events).await {
-            finalize_realtime_client_disconnected(
-                &hook,
-                tracer.as_ref(),
-                &ctx,
-                credential_id,
-                0,
-            );
+            finalize_realtime_client_disconnected(&hook, tracer.as_ref(), &ctx, credential_id, 0);
             return;
         }
         let mut decoder = EventStreamDecoder::new();
@@ -3226,11 +3200,10 @@ async fn collect_non_stream_tool_attempt(
 
     for result in decoder.decode_iter() {
         match result {
-            Ok(frame) => {
-                match Event::from_frame(frame) {
-                    Ok(event) => {
-                        observation.observe(&event);
-                        match event {
+            Ok(frame) => match Event::from_frame(frame) {
+                Ok(event) => {
+                    observation.observe(&event);
+                    match event {
                         Event::AssistantResponse(response) => {
                             text_content.push_str(&response.content);
                         }
@@ -3299,14 +3272,13 @@ async fn collect_non_stream_tool_attempt(
                             stop_reason = "max_tokens".to_string();
                         }
                         _ => {}
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, attempt = attempt_index + 1, "事件帧解码失败");
-                        tracer.record_protocol_error("sse_state_error", &error.to_string());
                     }
                 }
-            }
+                Err(error) => {
+                    tracing::warn!(%error, attempt = attempt_index + 1, "事件帧解码失败");
+                    tracer.record_protocol_error("sse_state_error", &error.to_string());
+                }
+            },
             Err(error) => {
                 tracing::warn!(%error, attempt = attempt_index + 1, "解码事件失败");
                 tracer.record_protocol_error("sse_state_error", &error.to_string());
@@ -3944,7 +3916,10 @@ pub async fn post_messages_cc(
             key_ctx: key_ctx.clone(),
             model: payload.model.clone(),
             is_stream: payload.stream,
-            reasoning_effort: payload.output_config.as_ref().map(|value| value.effort.clone()),
+            reasoning_effort: payload
+                .output_config
+                .as_ref()
+                .map(|value| value.effort.clone()),
             context_1m: beta_has_context_1m(&headers),
             thinking: reasoning_requested(&payload),
         },
@@ -4023,12 +3998,7 @@ pub async fn post_messages_cc(
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
             let message = error.to_string();
             let response = map_document_error(error);
-            finalize_immediate_error(
-                &tracer,
-                response.status(),
-                "document_error",
-                &message,
-            );
+            finalize_immediate_error(&tracer, response.status(), "document_error", &message);
             return response;
         }
     };
@@ -4097,12 +4067,7 @@ pub async fn post_messages_cc(
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
             let message = error.to_string();
             let response = map_document_error(error);
-            finalize_immediate_error(
-                &tracer,
-                response.status(),
-                "document_error",
-                &message,
-            );
+            finalize_immediate_error(&tracer, response.status(), "document_error", &message);
             return response;
         }
         Err(PrepareRequestError::Conversion(e)) => {
@@ -4634,11 +4599,7 @@ fn finalize_buffered_client_disconnected(
         credits,
         "error",
     );
-    finalize_client_disconnected(
-        tracer,
-        received_bytes,
-        buffered_stream_trace_usage(ctx),
-    );
+    finalize_client_disconnected(tracer, received_bytes, buffered_stream_trace_usage(ctx));
 }
 
 #[cfg(test)]
@@ -4782,12 +4743,7 @@ mod tests {
         )
             .into_response();
 
-        finalize_immediate_error(
-            &tracer,
-            response.status(),
-            "document_error",
-            "bad document",
-        );
+        finalize_immediate_error(&tracer, response.status(), "document_error", "bad document");
 
         let page = snapshot_store
             .query_paged(&crate::admin::error_snapshot_db::SnapshotQuery {
@@ -4797,7 +4753,10 @@ mod tests {
             .unwrap();
         assert_eq!(page.total, 1);
         assert_eq!(page.records[0].http_status, Some(400));
-        assert_eq!(page.records[0].error_message.as_deref(), Some("bad document"));
+        assert_eq!(
+            page.records[0].error_message.as_deref(),
+            Some("bad document")
+        );
     }
 
     #[test]
@@ -4805,19 +4764,23 @@ mod tests {
         let (tracer, snapshot_store, _trace_store) =
             test_request_tracer_with_snapshot("trace-provider-diagnostics");
 
-        tracer.on_diagnostic(crate::admin::trace_db::TraceDiagnosticEvent::UpstreamRequest {
-            attempt: 0,
-            credential_id: 7,
-            endpoint: "ide",
-            body: r#"{"conversationState":{"currentMessage":"hello"}}"#,
-        });
-        tracer.on_diagnostic(crate::admin::trace_db::TraceDiagnosticEvent::UpstreamResponse {
-            attempt: 0,
-            credential_id: 7,
-            endpoint: "ide",
-            status: 400,
-            body: r#"{"message":"Invalid tool use format."}"#,
-        });
+        tracer.on_diagnostic(
+            crate::admin::trace_db::TraceDiagnosticEvent::UpstreamRequest {
+                attempt: 0,
+                credential_id: 7,
+                endpoint: "ide",
+                body: r#"{"conversationState":{"currentMessage":"hello"}}"#,
+            },
+        );
+        tracer.on_diagnostic(
+            crate::admin::trace_db::TraceDiagnosticEvent::UpstreamResponse {
+                attempt: 0,
+                credential_id: 7,
+                endpoint: "ide",
+                status: 400,
+                body: r#"{"message":"Invalid tool use format."}"#,
+            },
+        );
         tracer.on_attempt(TraceAttempt {
             attempt: 0,
             credential_id: 7,
@@ -5525,12 +5488,9 @@ mod tests {
             }),
         };
 
-        let prepared = prepare_strict_json_request_bodies(
-            &request_body,
-            Some(&threshold_body),
-            Some(&format),
-        )
-        .expect("structured output request bodies");
+        let prepared =
+            prepare_strict_json_request_bodies(&request_body, Some(&threshold_body), Some(&format))
+                .expect("structured output request bodies");
 
         assert!(!prepared.bodies[0].contains("exactly one JSON value"));
         assert!(!prepared.bodies[0].contains("\"required\":[\"answer\"]"));
@@ -5538,12 +5498,17 @@ mod tests {
             assert!(body.contains("Return exactly one JSON value"));
             assert!(body.contains("answer"));
         }
-        assert!(prepared.threshold_retry_bodies[0].as_deref().is_some_and(
-            |body| !body.contains("exactly one JSON value")
-        ));
-        assert!(prepared.threshold_retry_bodies[1].as_deref().is_some_and(
-            |body| body.contains("Return exactly one JSON value") && body.contains("answer")
-        ));
+        assert!(
+            prepared.threshold_retry_bodies[0]
+                .as_deref()
+                .is_some_and(|body| !body.contains("exactly one JSON value"))
+        );
+        assert!(
+            prepared.threshold_retry_bodies[1]
+                .as_deref()
+                .is_some_and(|body| body.contains("Return exactly one JSON value")
+                    && body.contains("answer"))
+        );
     }
 
     #[tokio::test]
@@ -6039,9 +6004,11 @@ mod tests {
         assert_eq!(content.len(), 2);
         assert_eq!(content[0]["type"], "thinking");
         assert_eq!(content[0]["thinking"], "legacy thinking");
-        assert!(content[0]["signature"]
-            .as_str()
-            .is_some_and(|signature| signature.starts_with("krs1_")));
+        assert!(
+            content[0]["signature"]
+                .as_str()
+                .is_some_and(|signature| signature.starts_with("krs1_"))
+        );
         assert_eq!(content[1]["type"], "text");
         assert_eq!(content[1]["text"], "final answer");
     }

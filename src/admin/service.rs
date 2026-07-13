@@ -717,8 +717,7 @@ fn validate_log_governance_request(
     ) && max_storage.saturating_add(min_free) > 1000
     {
         return Err(AdminServiceError::InvalidCredential(
-            "errorSnapshotMaxStorageGb + errorSnapshotMinFreeDiskGb 不能超过 1000"
-                .to_string(),
+            "errorSnapshotMaxStorageGb + errorSnapshotMinFreeDiskGb 不能超过 1000".to_string(),
         ));
     }
     Ok(())

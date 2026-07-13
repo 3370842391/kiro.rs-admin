@@ -1661,16 +1661,30 @@ fn parse_snapshot_query(params: &HashMap<String, String>) -> anyhow::Result<Snap
     let from_epoch = params
         .get("from")
         .filter(|value| !value.is_empty())
-        .map(|value| value.parse::<i64>().map_err(|_| anyhow::anyhow!("invalid from")))
+        .map(|value| {
+            value
+                .parse::<i64>()
+                .map_err(|_| anyhow::anyhow!("invalid from"))
+        })
         .transpose()?;
     let to_epoch = params
         .get("to")
         .filter(|value| !value.is_empty())
-        .map(|value| value.parse::<i64>().map_err(|_| anyhow::anyhow!("invalid to")))
+        .map(|value| {
+            value
+                .parse::<i64>()
+                .map_err(|_| anyhow::anyhow!("invalid to"))
+        })
         .transpose()?;
     Ok(SnapshotQuery {
-        trace_id: params.get("traceId").filter(|value| !value.is_empty()).cloned(),
-        model: params.get("model").filter(|value| !value.is_empty()).cloned(),
+        trace_id: params
+            .get("traceId")
+            .filter(|value| !value.is_empty())
+            .cloned(),
+        model: params
+            .get("model")
+            .filter(|value| !value.is_empty())
+            .cloned(),
         error_type: params
             .get("errorType")
             .filter(|value| !value.is_empty())
@@ -1764,7 +1778,10 @@ pub async fn get_error_snapshot_payload(
             .into_response()
         }
         Ok(None) => snapshot_error(StatusCode::NOT_FOUND, "snapshot payload not found"),
-        Err(error) => snapshot_error(StatusCode::INTERNAL_SERVER_ERROR, "snapshot integrity error"),
+        Err(error) => snapshot_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "snapshot integrity error",
+        ),
     }
 }
 
@@ -1814,7 +1831,10 @@ pub async fn download_error_snapshot(
             Ok(None) => return snapshot_error(StatusCode::NOT_FOUND, "snapshot payload not found"),
             Err(error) => {
                 tracing::error!(snapshot_id = %id, seq = meta.seq, error = %error, "snapshot integrity check failed");
-                return snapshot_error(StatusCode::INTERNAL_SERVER_ERROR, "snapshot integrity error");
+                return snapshot_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "snapshot integrity error",
+                );
             }
         };
         payloads.push(serde_json::json!({
@@ -1838,7 +1858,9 @@ pub async fn pin_error_snapshot(
     Path(id): Path<String>,
 ) -> Response {
     match state.error_snapshot_store.set_pinned(&id, true) {
-        Ok(true) => Json(super::types::SuccessResponse::new("error snapshot pinned")).into_response(),
+        Ok(true) => {
+            Json(super::types::SuccessResponse::new("error snapshot pinned")).into_response()
+        }
         Ok(false) => snapshot_error(StatusCode::NOT_FOUND, "error snapshot not found"),
         Err(error) => snapshot_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     }
@@ -1849,7 +1871,10 @@ pub async fn unpin_error_snapshot(
     Path(id): Path<String>,
 ) -> Response {
     match state.error_snapshot_store.set_pinned(&id, false) {
-        Ok(true) => Json(super::types::SuccessResponse::new("error snapshot unpinned")).into_response(),
+        Ok(true) => Json(super::types::SuccessResponse::new(
+            "error snapshot unpinned",
+        ))
+        .into_response(),
         Ok(false) => snapshot_error(StatusCode::NOT_FOUND, "error snapshot not found"),
         Err(error) => snapshot_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     }
@@ -1860,7 +1885,9 @@ pub async fn delete_error_snapshot(
     Path(id): Path<String>,
 ) -> Response {
     match state.error_snapshot_store.delete(&id) {
-        Ok(true) => Json(super::types::SuccessResponse::new("error snapshot deleted")).into_response(),
+        Ok(true) => {
+            Json(super::types::SuccessResponse::new("error snapshot deleted")).into_response()
+        }
         Ok(false) => snapshot_error(StatusCode::NOT_FOUND, "error snapshot not found"),
         Err(error) => snapshot_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     }
@@ -2177,10 +2204,12 @@ mod tests {
     fn download_response_is_attachment_and_nosniff() {
         let response = snapshot_download_response("snap-1", br#"{"safe":true}"#.to_vec());
         assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
-        assert!(response.headers()[header::CONTENT_DISPOSITION]
-            .to_str()
-            .unwrap()
-            .contains("attachment"));
+        assert!(
+            response.headers()[header::CONTENT_DISPOSITION]
+                .to_str()
+                .unwrap()
+                .contains("attachment")
+        );
         assert_eq!(response.headers()["x-content-type-options"], "nosniff");
     }
 }

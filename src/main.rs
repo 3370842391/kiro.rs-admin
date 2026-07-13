@@ -306,9 +306,7 @@ async fn main() {
         Err(error) => tracing::error!(%error, "错误快照 fallback 启动导入失败"),
     }
     if let Some(store) = &trace_store {
-        match error_snapshot_store
-            .recent_trace_links(chrono::Utc::now().timestamp() - 7 * 86_400)
-        {
+        match error_snapshot_store.recent_trace_links(chrono::Utc::now().timestamp() - 7 * 86_400) {
             Ok(links) => {
                 for (trace_id, snapshot_id) in links {
                     store.link_snapshot(&trace_id, &snapshot_id);

@@ -112,10 +112,7 @@ impl AppState {
         self
     }
 
-    pub fn with_error_snapshot_store(
-        mut self,
-        store: Option<SharedErrorSnapshotStore>,
-    ) -> Self {
+    pub fn with_error_snapshot_store(mut self, store: Option<SharedErrorSnapshotStore>) -> Self {
         self.error_snapshot_store = store;
         self
     }

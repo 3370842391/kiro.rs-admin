@@ -2354,12 +2354,9 @@ impl StreamContext {
             return Vec::new();
         }
 
-        let signature = self
-            .pending_thinking_signature
-            .take()
-            .unwrap_or_else(|| {
-                super::thinking_signature::issue_signature(&self.message_id, &self.thinking_buffer)
-            });
+        let signature = self.pending_thinking_signature.take().unwrap_or_else(|| {
+            super::thinking_signature::issue_signature(&self.message_id, &self.thinking_buffer)
+        });
         let mut events = vec![
             self.create_thinking_delta_event(idx, ""),
             self.create_signature_delta_event_with(idx, &signature),
@@ -2470,10 +2467,8 @@ impl StreamContext {
     /// 占位字符串以满足客户端本地校验。该字段不参与转发回 Kiro 的逻辑
     /// （converter 只读 `block.thinking`，不读 signature）。
     fn create_signature_delta_event(&self, index: i32) -> SseEvent {
-        let signature = super::thinking_signature::issue_signature(
-            &self.message_id,
-            &self.thinking_buffer,
-        );
+        let signature =
+            super::thinking_signature::issue_signature(&self.message_id, &self.thinking_buffer);
         self.create_signature_delta_event_with(index, &signature)
     }
 

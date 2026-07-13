@@ -21,8 +21,8 @@ use super::types::{
     AssistantParts, ChatCompletionRequest, OpenAIConversionError, OpenAIFunctionCall,
     OpenAIMessage, OpenAIToolCall, ResponsesRequest, assistant_message_for_history,
     assistant_parts_from_anthropic, chat_message_from_parts, chat_to_anthropic,
-    finish_reason_from_anthropic, openai_error, response_output_from_parts, responses_to_chat_request,
-    responses_usage_json, usage_json,
+    finish_reason_from_anthropic, openai_error, response_output_from_parts,
+    responses_to_chat_request, responses_usage_json, usage_json,
 };
 
 const MAX_COLLECT_BYTES: usize = 32 * 1024 * 1024;
@@ -192,7 +192,9 @@ fn openai_status_error(
     (status, Json(openai_error(message, error_type))).into_response()
 }
 
-fn load_previous_messages(previous_response_id: Option<&str>) -> Result<Vec<OpenAIMessage>, Response> {
+fn load_previous_messages(
+    previous_response_id: Option<&str>,
+) -> Result<Vec<OpenAIMessage>, Response> {
     let Some(id) = previous_response_id else {
         return Ok(Vec::new());
     };
@@ -346,13 +348,17 @@ struct ResponsesStreamMeta {
     messages_for_history: Vec<OpenAIMessage>,
 }
 
-async fn convert_responses_stream_response(response: Response, meta: ResponsesStreamMeta) -> Response {
+async fn convert_responses_stream_response(
+    response: Response,
+    meta: ResponsesStreamMeta,
+) -> Response {
     let status = response.status();
     if !status.is_success() {
         return convert_error_body(status, response.into_body()).await;
     }
 
-    let stream = transform_anthropic_sse(response.into_body(), ResponsesStreamTranslator::new(meta));
+    let stream =
+        transform_anthropic_sse(response.into_body(), ResponsesStreamTranslator::new(meta));
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
@@ -556,11 +562,7 @@ impl AnthropicSseTranslator for ChatStreamTranslator {
         match frame.event.as_str() {
             "message_start" => self.ensure_role(),
             "content_block_start" => {
-                if data
-                    .pointer("/content_block/type")
-                    .and_then(Value::as_str)
-                    == Some("tool_use")
-                {
+                if data.pointer("/content_block/type").and_then(Value::as_str) == Some("tool_use") {
                     let block_index = data.get("index").and_then(Value::as_i64).unwrap_or(0);
                     self.tools.insert(
                         block_index,
@@ -666,7 +668,9 @@ impl AnthropicSseTranslator for ChatStreamTranslator {
         self.done = true;
         let mut out = self.ensure_role();
         let finish_reason = self.finish_reason.as_deref().unwrap_or("stop");
-        let usage = self.include_usage.then(|| self.usage.clone().unwrap_or_else(|| json!(null)));
+        let usage = self
+            .include_usage
+            .then(|| self.usage.clone().unwrap_or_else(|| json!(null)));
         out.push(self.chunk(json!({}), Some(finish_reason), usage));
         out.push(Bytes::from_static(b"data: [DONE]\n\n"));
         out
@@ -853,11 +857,7 @@ impl AnthropicSseTranslator for ResponsesStreamTranslator {
         match frame.event.as_str() {
             "message_start" => self.ensure_created(),
             "content_block_start" => {
-                if data
-                    .pointer("/content_block/type")
-                    .and_then(Value::as_str)
-                    == Some("tool_use")
-                {
+                if data.pointer("/content_block/type").and_then(Value::as_str) == Some("tool_use") {
                     let block_index = data.get("index").and_then(Value::as_i64).unwrap_or(0);
                     self.tools.insert(
                         block_index,
@@ -1033,7 +1033,10 @@ impl AnthropicSseTranslator for ResponsesStreamTranslator {
             text: self.text.clone(),
             reasoning: self.reasoning.clone(),
             tool_calls: self.tool_calls.clone(),
-            stop_reason: self.stop_reason.clone().unwrap_or_else(|| "end_turn".to_string()),
+            stop_reason: self
+                .stop_reason
+                .clone()
+                .unwrap_or_else(|| "end_turn".to_string()),
             input_tokens: self
                 .usage
                 .as_ref()
@@ -1345,7 +1348,11 @@ mod tests {
     /// 注意裸 "web_search" 不满足该前缀，必须归一化。
     #[test]
     fn chat_request_converts_web_search_tool_variants() {
-        for typ in ["web_search", "web_search_preview", "web_search_preview_2025_03_11"] {
+        for typ in [
+            "web_search",
+            "web_search_preview",
+            "web_search_preview_2025_03_11",
+        ] {
             let req: ChatCompletionRequest = serde_json::from_value(json!({
                 "model": "gpt-5",
                 "messages": [{"role": "user", "content": "查一下今天的新闻"}],
@@ -1384,9 +1391,17 @@ mod tests {
         let converted = chat_to_anthropic(&req).unwrap();
         let tools = converted.anthropic.tools.unwrap();
         assert_eq!(tools.len(), 2);
-        assert!(tools.iter().any(|t| t.name == "web_search"
-            && t.tool_type.as_deref().is_some_and(|s| s.starts_with("web_search_"))));
-        assert!(tools.iter().any(|t| t.name == "get_weather" && t.tool_type.is_none()));
+        assert!(tools.iter().any(|t| {
+            t.name == "web_search"
+                && t.tool_type
+                    .as_deref()
+                    .is_some_and(|s| s.starts_with("web_search_"))
+        }));
+        assert!(
+            tools
+                .iter()
+                .any(|t| t.name == "get_weather" && t.tool_type.is_none())
+        );
     }
 
     /// 回归：OpenAI 并行工具调用（一条 assistant 带多个 tool_calls + 多条独立 tool
@@ -1418,13 +1433,20 @@ mod tests {
         // assistant 轮次带两个 tool_use
         assert_eq!(msgs[1].role, "assistant");
         let assistant_blocks = msgs[1].content.as_array().unwrap();
-        let tool_uses = assistant_blocks.iter().filter(|b| b["type"] == "tool_use").count();
+        let tool_uses = assistant_blocks
+            .iter()
+            .filter(|b| b["type"] == "tool_use")
+            .count();
         assert_eq!(tool_uses, 2);
 
         // 两个 tool_result 必须在同一条 user 消息里（关键：不能拆成两条）
         assert_eq!(msgs[2].role, "user");
         let results = msgs[2].content.as_array().unwrap();
-        assert_eq!(results.len(), 2, "两个 tool_result 必须合并进一条 user 消息");
+        assert_eq!(
+            results.len(),
+            2,
+            "两个 tool_result 必须合并进一条 user 消息"
+        );
         assert!(results.iter().all(|r| r["type"] == "tool_result"));
         assert_eq!(results[0]["tool_use_id"], "call_a");
         assert_eq!(results[1]["tool_use_id"], "call_b");
@@ -1469,7 +1491,10 @@ mod tests {
         let chat = responses_to_chat_request(&build("none"), Vec::new()).unwrap();
         let anthropic = chat_to_anthropic(&chat).unwrap().anthropic;
         assert!(anthropic.thinking.is_none(), "none 不应开启 thinking");
-        assert!(anthropic.output_config.is_none(), "none 不应下发 output_config");
+        assert!(
+            anthropic.output_config.is_none(),
+            "none 不应下发 output_config"
+        );
 
         // minimal → 归一化到 low（后端无 minimal 档）
         let chat = responses_to_chat_request(&build("minimal"), Vec::new()).unwrap();
@@ -1491,7 +1516,10 @@ mod tests {
                 expected,
                 "effort={input} 归一化错误"
             );
-            assert!(anthropic.thinking.is_some(), "effort={input} 应开启 thinking");
+            assert!(
+                anthropic.thinking.is_some(),
+                "effort={input} 应开启 thinking"
+            );
         }
     }
 
@@ -1580,7 +1608,10 @@ mod tests {
         assert_eq!(msg["role"], "assistant");
         assert_eq!(msg["content"][0]["type"], "output_text");
         assert_eq!(msg["content"][0]["text"], "done");
-        let fc = output.iter().find(|i| i["type"] == "function_call").unwrap();
+        let fc = output
+            .iter()
+            .find(|i| i["type"] == "function_call")
+            .unwrap();
         assert_eq!(fc["name"], "shell");
         assert_eq!(fc["call_id"], "call_x");
         // arguments 必须是 JSON 字符串，而非对象

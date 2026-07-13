@@ -63,9 +63,7 @@ impl ErrorSnapshotPolicy {
             max_storage_bytes: config.error_snapshot_max_storage_gb.saturating_mul(GIB),
             capture_recovered: config.error_snapshot_capture_recovered,
             capture_bodies: config.error_snapshot_capture_bodies,
-            min_free_disk_bytes: config
-                .error_snapshot_min_free_disk_gb
-                .saturating_mul(GIB),
+            min_free_disk_bytes: config.error_snapshot_min_free_disk_gb.saturating_mul(GIB),
         }
     }
 }

@@ -633,8 +633,8 @@ mod tests {
         });
         let mut blocks = vec![original.clone()];
 
-        let error = validate_tool_use_blocks(&std::collections::HashMap::new(), &mut blocks)
-            .unwrap_err();
+        let error =
+            validate_tool_use_blocks(&std::collections::HashMap::new(), &mut blocks).unwrap_err();
 
         assert_eq!(error.tool_name, "delete_everything");
         assert_eq!(blocks, vec![original]);
