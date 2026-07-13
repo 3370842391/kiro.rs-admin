@@ -580,6 +580,8 @@ fn build_validated_flush_content(
     tool_name_map: &std::collections::HashMap<String, String>,
     tool_contracts: &std::collections::HashMap<String, super::tool_schema::ToolContract>,
 ) -> Result<Vec<Value>, super::tool_schema::ToolSchemaError> {
+    let native_tool_ids: std::collections::HashSet<String> =
+        tool_uses.iter().map(|tool| tool.id.clone()).collect();
     let mut content = build_flush_content(
         presentation,
         text,
@@ -589,7 +591,55 @@ fn build_validated_flush_content(
         tool_name_map,
     );
     super::tool_schema::validate_tool_use_blocks(tool_contracts, &mut content)?;
+    super::stream::dedupe_reclaimed_tools_after_repair(&mut content, &native_tool_ids);
     Ok(content)
+}
+
+#[derive(Debug)]
+enum FinalRoundSearchError<E> {
+    ToolSchema(super::tool_schema::ToolSchemaError),
+    Search(E),
+}
+
+async fn search_final_round_after_preflight<E, Search, SearchFuture>(
+    text: &str,
+    tool_uses: &[CompletedToolUse],
+    known_tool_names: &std::collections::HashSet<String>,
+    tool_name_map: &std::collections::HashMap<String, String>,
+    tool_contracts: &std::collections::HashMap<String, super::tool_schema::ToolContract>,
+    mut search: Search,
+) -> Result<Vec<Option<WebSearchResults>>, FinalRoundSearchError<E>>
+where
+    Search: FnMut(String) -> SearchFuture,
+    SearchFuture: std::future::Future<Output = Result<Option<WebSearchResults>, E>>,
+{
+    let empty_results: Vec<Option<WebSearchResults>> = std::iter::repeat_with(|| None)
+        .take(tool_uses.len())
+        .collect();
+    build_validated_flush_content(
+        Vec::new(),
+        text,
+        tool_uses,
+        &empty_results,
+        known_tool_names,
+        tool_name_map,
+        tool_contracts,
+    )
+    .map_err(FinalRoundSearchError::ToolSchema)?;
+
+    let mut searched = Vec::with_capacity(tool_uses.len());
+    for tool in tool_uses {
+        if tool.name == "web_search" {
+            searched.push(
+                search(tool_query(tool))
+                    .await
+                    .map_err(FinalRoundSearchError::Search)?,
+            );
+        } else {
+            searched.push(None);
+        }
+    }
+    Ok(searched)
 }
 
 fn resolve_websearch_api_input(
@@ -690,32 +740,59 @@ pub(super) async fn run_web_search_loop(
         // in this final round here, then build the flushed content with web_search
         // presented as server_tool_use + web_search_tool_result while client tools
         // (exec, etc.) are returned verbatim.
-        let mut searched: Vec<Option<WebSearchResults>> = Vec::with_capacity(round.tool_uses.len());
-        for tu in &round.tool_uses {
-            if tu.name == "web_search" {
-                let (_id, mcp_request) = websearch::create_mcp_request(&tool_query(tu));
-                match websearch::call_mcp_api(&provider, &mcp_request).await {
-                    Ok(resp) => searched.push(websearch::parse_search_results(&resp)),
-                    Err(e) => {
-                        // Same pass-through discipline as the continue branch: a failed
-                        // search must surface as an error, never a silent success.
-                        tracing::warn!("web_search MCP call (final round) failed: {}", e);
-                        hook.record(
-                            last_credential_id,
-                            fallback_input_tokens,
-                            0,
-                            0,
-                            0,
-                            total_credits,
-                            "error",
-                        );
-                        return map_provider_error(e);
-                    }
+        let search_provider = provider.clone();
+        let searched = match search_final_round_after_preflight(
+            &round.text,
+            &round.tool_uses,
+            &round.known_tool_names,
+            &round.tool_name_map,
+            &round.tool_contracts,
+            move |query| {
+                let provider = search_provider.clone();
+                async move {
+                    let (_id, mcp_request) = websearch::create_mcp_request(&query);
+                    let response = websearch::call_mcp_api(&provider, &mcp_request).await?;
+                    Ok::<_, anyhow::Error>(websearch::parse_search_results(&response))
                 }
-            } else {
-                searched.push(None);
+            },
+        )
+        .await
+        {
+            Ok(searched) => searched,
+            Err(FinalRoundSearchError::ToolSchema(error)) => {
+                tracing::warn!(tool = %error.tool_name, "web_search loop 客户端工具参数不满足Schema");
+                hook.record(
+                    last_credential_id,
+                    final_input,
+                    0,
+                    0,
+                    0,
+                    total_credits,
+                    "error",
+                );
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(ErrorResponse::new(
+                        "upstream_tool_schema_error",
+                        error.to_string(),
+                    )),
+                )
+                    .into_response();
             }
-        }
+            Err(FinalRoundSearchError::Search(error)) => {
+                tracing::warn!("web_search MCP call (final round) failed: {}", error);
+                hook.record(
+                    last_credential_id,
+                    fallback_input_tokens,
+                    0,
+                    0,
+                    0,
+                    total_credits,
+                    "error",
+                );
+                return map_provider_error(error);
+            }
+        };
         let content = match build_validated_flush_content(
             presentation.clone(),
             &round.text,
@@ -1733,5 +1810,95 @@ mod tests {
             super::super::stream::ToolJsonAccumulatorError::IncompleteJson { .. }
                 | super::super::stream::ToolJsonAccumulatorError::InvalidJson { .. }
         ));
+    }
+
+    #[test]
+    fn mixed_websearch_deduplicates_reclaimed_tool_after_fixed_field_repair() {
+        let leaked =
+            "call\n<invoke name=\"exec\"><parameter name=\"cmd\">echo hi</parameter></invoke>";
+        let native = vec![CompletedToolUse {
+            id: "toolu_native".to_string(),
+            name: "exec".to_string(),
+            input: json!({"cmd": "echo hi", "nonce": "nonce-42"}),
+        }];
+        let contracts = std::collections::HashMap::from([(
+            "exec".to_string(),
+            super::super::tool_schema::ToolContract {
+                client_name: "exec".to_string(),
+                schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "cmd": {"type": "string"},
+                        "nonce": {"type": "string", "const": "nonce-42"}
+                    },
+                    "required": ["cmd", "nonce"],
+                    "additionalProperties": false
+                }),
+            },
+        )]);
+
+        let content = build_validated_flush_content(
+            Vec::new(),
+            leaked,
+            &native,
+            &[None],
+            &names(&["exec"]),
+            &nomap(),
+            &contracts,
+        )
+        .unwrap();
+
+        let tools = content
+            .iter()
+            .filter(|block| block["type"] == "tool_use")
+            .collect::<Vec<_>>();
+        assert_eq!(tools.len(), 1, "修复后相同的文本调用不得重复交付");
+        assert_eq!(tools[0]["id"], "toolu_native", "必须优先保留原生工具调用");
+    }
+
+    #[tokio::test]
+    async fn mixed_websearch_invalid_client_tool_performs_zero_search_calls() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let tool_uses = vec![
+            tu("web_search"),
+            CompletedToolUse {
+                id: "toolu_exec".to_string(),
+                name: "exec".to_string(),
+                input: json!({}),
+            },
+        ];
+        let contracts = std::collections::HashMap::from([(
+            "exec".to_string(),
+            super::super::tool_schema::ToolContract {
+                client_name: "exec".to_string(),
+                schema: json!({
+                    "type": "object",
+                    "properties": {"cmd": {"type": "string"}},
+                    "required": ["cmd"]
+                }),
+            },
+        )]);
+
+        let result = search_final_round_after_preflight(
+            "",
+            &tool_uses,
+            &names(&["web_search", "exec"]),
+            &nomap(),
+            &contracts,
+            move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok::<Option<WebSearchResults>, ()>(None))
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(FinalRoundSearchError::ToolSchema(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }

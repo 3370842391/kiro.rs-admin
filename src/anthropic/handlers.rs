@@ -3114,6 +3114,11 @@ fn normalize_and_validate_non_stream_content(
     Vec<serde_json::Value>,
     Result<Vec<String>, super::tool_schema::ToolSchemaError>,
 ) {
+    let native_tool_ids: std::collections::HashSet<String> = native_tool_uses
+        .iter()
+        .filter_map(|block| block.get("id").and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+        .collect();
     let mut content = super::stream::normalize_non_stream_content_blocks(
         base_content,
         native_tool_uses,
@@ -3121,6 +3126,9 @@ fn normalize_and_validate_non_stream_content(
         tool_name_map,
     );
     let validation = super::tool_schema::validate_tool_use_blocks(tool_contracts, &mut content);
+    if validation.is_ok() {
+        super::stream::dedupe_reclaimed_tools_after_repair(&mut content, &native_tool_ids);
+    }
     (content, validation)
 }
 
@@ -5053,6 +5061,52 @@ mod tests {
         };
 
         assert!(!state.should_retry());
+    }
+
+    #[test]
+    fn non_stream_deduplicates_reclaimed_tool_after_fixed_field_repair() {
+        let known = ["exec".to_string()].into_iter().collect();
+        let contracts = std::collections::HashMap::from([(
+            "exec".to_string(),
+            super::super::tool_schema::ToolContract {
+                client_name: "exec".to_string(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "cmd": {"type": "string"},
+                        "nonce": {"type": "string", "const": "nonce-42"}
+                    },
+                    "required": ["cmd", "nonce"],
+                    "additionalProperties": false
+                }),
+            },
+        )]);
+        let base = vec![serde_json::json!({
+            "type": "text",
+            "text": "call\n<invoke name=\"exec\"><parameter name=\"cmd\">echo hi</parameter></invoke>"
+        })];
+        let native = vec![serde_json::json!({
+            "type": "tool_use",
+            "id": "toolu_native",
+            "name": "exec",
+            "input": {"cmd": "echo hi", "nonce": "nonce-42"}
+        })];
+
+        let (content, validation) = normalize_and_validate_non_stream_content(
+            base,
+            native,
+            &known,
+            &std::collections::HashMap::new(),
+            &contracts,
+        );
+
+        assert!(validation.is_ok());
+        let tools = content
+            .iter()
+            .filter(|block| block["type"] == "tool_use")
+            .collect::<Vec<_>>();
+        assert_eq!(tools.len(), 1, "修复后相同的文本调用不得重复交付");
+        assert_eq!(tools[0]["id"], "toolu_native", "必须优先保留原生工具调用");
     }
 
     #[test]

@@ -864,6 +864,34 @@ fn tool_semantic_key(block: &serde_json::Value) -> Option<String> {
     Some(format!("{name}\0{input}"))
 }
 
+/// 固定字段修复后再次去重文本捞回调用与原生结构化调用。
+///
+/// 只移除与原生调用语义相同的捞回块，原生块即使参数相同也保留各自 ID，避免改变
+/// 客户显式并行调用语义。
+pub(crate) fn dedupe_reclaimed_tools_after_repair(
+    blocks: &mut Vec<serde_json::Value>,
+    native_tool_ids: &std::collections::HashSet<String>,
+) {
+    let native_keys: std::collections::HashSet<String> = blocks
+        .iter()
+        .filter(|block| {
+            block
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| native_tool_ids.contains(id))
+        })
+        .filter_map(tool_semantic_key)
+        .collect();
+
+    blocks.retain(|block| {
+        let is_native = block
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| native_tool_ids.contains(id));
+        is_native || tool_semantic_key(block).is_none_or(|key| !native_keys.contains(&key))
+    });
+}
+
 pub(crate) fn normalize_non_stream_content_blocks(
     base_content: Vec<serde_json::Value>,
     native_tool_uses: Vec<serde_json::Value>,
