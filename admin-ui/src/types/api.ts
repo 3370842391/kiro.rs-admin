@@ -639,3 +639,14 @@ export interface UpdateGroupRequest {
   /** 新备注；空字符串清除；undefined 保留原值 */
   description?: string
 }
+
+// ============ 图片总预算治理 ============
+
+export interface ImageBudgetConfig {
+  enabled: boolean
+  totalBase64BudgetBytes: number
+  historyMaxDimension: number
+  historyJpegQuality: number
+  retryHistoryMaxDimension: number
+  retryHistoryJpegQuality: number
+}

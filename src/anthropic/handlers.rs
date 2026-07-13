@@ -10,6 +10,7 @@ use crate::admin::trace_db::{
     SharedTraceStore, TraceAttempt, TraceKeySource, TraceRecord, TraceSink, outcome,
 };
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
+use crate::kiro::image_budget::{ImageBudgetError, PreparedKiroBodies, prepare_kiro_bodies};
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
@@ -356,7 +357,7 @@ fn classify_provider_error(err: &Error) -> ClassifiedProviderError {
         return ClassifiedProviderError {
             http_status: StatusCode::BAD_REQUEST,
             error_type: "invalid_request_error",
-            public_message: "Context window is full. Reduce conversation history, system prompt, or tools.",
+            public_message: "The upstream request body is too large. Reduce image count, attachment size, or conversation history.",
         };
     }
     if text.contains("Input is too long") {
@@ -637,6 +638,7 @@ where
 async fn collect_buffered_attempt(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: String,
+    threshold_retry_body: Option<String>,
     model: String,
     input_tokens: i32,
     cache_usage: super::cache_metering::CacheUsage,
@@ -644,7 +646,12 @@ async fn collect_buffered_attempt(
     group: Option<String>,
 ) -> anyhow::Result<BufferedAttempt> {
     let call_result = provider
-        .call_api(&request_body, Some(tracer.as_ref()), group.as_deref())
+        .call_api_with_content_length_retry(
+            &request_body,
+            threshold_retry_body.as_deref(),
+            Some(tracer.as_ref()),
+            group.as_deref(),
+        )
         .await?;
     let credential_id = call_result.credential_id;
     let body = call_result.response.bytes().await?;
@@ -727,6 +734,7 @@ fn strict_json_route_allowed(payload: &MessagesRequest) -> bool {
 async fn handle_strict_json_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
+    threshold_retry_body: Option<&str>,
     payload: &MessagesRequest,
     input_tokens: i32,
     hook: UsageRecordHook,
@@ -754,11 +762,24 @@ async fn handle_strict_json_request(
             .into_response();
     };
     let bodies = [request_body.to_owned(), retry_body];
+    let threshold_retry_bodies = [
+        threshold_retry_body.map(str::to_owned),
+        threshold_retry_body.and_then(super::exact_output::append_strict_json_retry_instruction),
+    ];
     let model = payload.model.clone();
     let recovery = recover_strict_json_attempts_with_validator(
         |attempt_index| {
             let provider = provider.clone();
-            let body = bodies[attempt_index].clone();
+            let (body, threshold_retry_body) = if attempt_index == 0 {
+                (bodies[0].clone(), threshold_retry_bodies[0].clone())
+            } else {
+                (
+                    threshold_retry_bodies[1]
+                        .clone()
+                        .unwrap_or_else(|| bodies[1].clone()),
+                    None,
+                )
+            };
             let model = model.clone();
             let tracer = tracer.clone();
             let group = group.clone();
@@ -766,6 +787,7 @@ async fn handle_strict_json_request(
                 collect_buffered_attempt(
                     provider,
                     body,
+                    threshold_retry_body,
                     model,
                     input_tokens,
                     cache_usage,
@@ -1563,6 +1585,61 @@ async fn prepare_request(
     convert_request_with_mode(payload, mode).map_err(PrepareRequestError::Conversion)
 }
 
+fn prepare_outbound_kiro_bodies(
+    request: &KiroRequest,
+    provider: &crate::kiro::provider::KiroProvider,
+) -> Result<PreparedKiroBodies, Response> {
+    match prepare_kiro_bodies(request, provider.image_budget_policy()) {
+        Ok(prepared) => {
+            tracing::info!(
+                image_count = prepared.primary_stats.image_count,
+                history_image_count = prepared.primary_stats.history_image_count,
+                current_image_count = prepared.primary_stats.current_image_count,
+                image_before_b64_kb = prepared.primary_stats.before_base64_bytes / 1024,
+                image_after_b64_kb = prepared.primary_stats.after_base64_bytes / 1024,
+                resized_history_images = prepared.primary_stats.resized_history_images,
+                threshold_retry_available = prepared.threshold_retry_body.is_some(),
+                threshold_retry_b64_kb = prepared
+                    .retry_stats
+                    .map(|stats| stats.after_base64_bytes / 1024),
+                "Kiro 出站图片预算处理完成"
+            );
+            Ok(prepared)
+        }
+        Err(ImageBudgetError::Exceeded {
+            count,
+            total,
+            budget,
+        }) => {
+            tracing::warn!(
+                image_count = count,
+                image_b64_bytes = total,
+                budget_bytes = budget,
+                "图片总量预检失败"
+            );
+            Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    "invalid_request_error",
+                    "Image payload exceeds the configured upstream budget after compressing historical images. Reduce images or start a new conversation.",
+                )),
+            )
+                .into_response())
+        }
+        Err(error) => {
+            tracing::error!(%error, "准备 Kiro 图片预算请求体失败");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "internal_error",
+                    "Failed to prepare the upstream request body.",
+                )),
+            )
+                .into_response())
+        }
+    }
+}
+
 /// POST /v1/messages
 ///
 /// 创建消息（对话）
@@ -1741,21 +1818,15 @@ pub async fn post_messages(
         additional_model_request_fields: conversion_result.additional_model_request_fields,
     };
 
-    let request_body = match serde_json::to_string(&kiro_request) {
-        Ok(body) => body,
-        Err(e) => {
-            tracing::error!("序列化请求失败: {}", e);
+    let prepared_bodies = match prepare_outbound_kiro_bodies(&kiro_request, provider.as_ref()) {
+        Ok(prepared) => prepared,
+        Err(response) => {
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    "internal_error",
-                    format!("序列化请求失败: {}", e),
-                )),
-            )
-                .into_response();
+            return response;
         }
     };
+    let request_body = &prepared_bodies.primary_body;
+    let threshold_retry_body = prepared_bodies.threshold_retry_body.as_deref();
 
     tracing::debug!("Kiro request body: {}", request_body);
 
@@ -1805,7 +1876,8 @@ pub async fn post_messages(
         ));
         return handle_strict_json_request(
             provider,
-            &request_body,
+            request_body,
+            threshold_retry_body,
             &payload,
             total_input_tokens,
             hook,
@@ -1831,7 +1903,8 @@ pub async fn post_messages(
         ));
         handle_stream_request(
             provider,
-            &request_body,
+            request_body,
+            threshold_retry_body,
             &payload.model,
             total_input_tokens,
             thinking_enabled,
@@ -1860,7 +1933,8 @@ pub async fn post_messages(
         ));
         handle_non_stream_request(
             provider,
-            &request_body,
+            request_body,
+            threshold_retry_body,
             &payload.model,
             total_input_tokens,
             extract_thinking,
@@ -1881,6 +1955,7 @@ pub async fn post_messages(
 async fn handle_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
+    threshold_retry_body: Option<&str>,
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
@@ -1897,6 +1972,7 @@ async fn handle_stream_request(
         let stream = create_early_sse_stream(
             provider,
             request_body.to_owned(),
+            threshold_retry_body.map(str::to_owned),
             model.to_owned(),
             input_tokens,
             thinking_enabled,
@@ -1920,7 +1996,12 @@ async fn handle_stream_request(
 
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
-        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
+        .call_api_stream_with_content_length_retry(
+            request_body,
+            threshold_retry_body,
+            Some(tracer.as_ref()),
+            group.as_deref(),
+        )
         .await
     {
         Ok(resp) => resp,
@@ -1999,6 +2080,7 @@ struct EarlyStreamSetup {
 fn create_early_sse_stream(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: String,
+    threshold_retry_body: Option<String>,
     model: String,
     input_tokens: i32,
     thinking_enabled: bool,
@@ -2017,8 +2099,9 @@ fn create_early_sse_stream(
     let strict_thinking_validation = provider.strict_thinking_validation();
     let call = async move {
         provider
-            .call_api_stream(
+            .call_api_stream_with_content_length_retry(
                 &request_body,
+                threshold_retry_body.as_deref(),
                 Some(tracer_for_call.as_ref()),
                 group.as_deref(),
             )
@@ -2489,6 +2572,7 @@ enum NonStreamCollectError {
 async fn collect_non_stream_tool_attempt(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
+    threshold_retry_body: Option<&str>,
     model: &str,
     input_tokens: i32,
     tool_name_map: &std::collections::HashMap<String, String>,
@@ -2497,7 +2581,12 @@ async fn collect_non_stream_tool_attempt(
     attempt_index: u8,
 ) -> Result<NonStreamToolAttempt, NonStreamCollectError> {
     let call_result = provider
-        .call_api(request_body, Some(tracer.as_ref()), group)
+        .call_api_with_content_length_retry(
+            request_body,
+            threshold_retry_body,
+            Some(tracer.as_ref()),
+            group,
+        )
         .await
         .map_err(NonStreamCollectError::Provider)?;
     let credential_id = call_result.credential_id;
@@ -2644,6 +2733,7 @@ async fn collect_non_stream_tool_attempt(
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
+    threshold_retry_body: Option<&str>,
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
@@ -2658,9 +2748,15 @@ async fn handle_non_stream_request(
 ) -> Response {
     let collection = super::tool_attempt::run_with_single_retry(
         |attempt_index| {
+            let (attempt_body, attempt_threshold_retry_body) = if attempt_index == 0 {
+                (request_body, threshold_retry_body)
+            } else {
+                (threshold_retry_body.unwrap_or(request_body), None)
+            };
             collect_non_stream_tool_attempt(
                 provider.clone(),
-                request_body,
+                attempt_body,
+                attempt_threshold_retry_body,
                 model,
                 input_tokens,
                 &tool_name_map,
@@ -3329,21 +3425,15 @@ pub async fn post_messages_cc(
         additional_model_request_fields: conversion_result.additional_model_request_fields,
     };
 
-    let request_body = match serde_json::to_string(&kiro_request) {
-        Ok(body) => body,
-        Err(e) => {
-            tracing::error!("序列化请求失败: {}", e);
+    let prepared_bodies = match prepare_outbound_kiro_bodies(&kiro_request, provider.as_ref()) {
+        Ok(prepared) => prepared,
+        Err(response) => {
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    "internal_error",
-                    format!("序列化请求失败: {}", e),
-                )),
-            )
-                .into_response();
+            return response;
         }
     };
+    let request_body = &prepared_bodies.primary_body;
+    let threshold_retry_body = prepared_bodies.threshold_retry_body.as_deref();
 
     tracing::debug!("Kiro request body: {}", request_body);
 
@@ -3392,7 +3482,8 @@ pub async fn post_messages_cc(
         ));
         return handle_strict_json_request(
             provider,
-            &request_body,
+            request_body,
+            threshold_retry_body,
             &payload,
             total_input_tokens,
             hook,
@@ -3418,7 +3509,8 @@ pub async fn post_messages_cc(
         ));
         handle_stream_request_buffered(
             provider,
-            &request_body,
+            request_body,
+            threshold_retry_body,
             &payload.model,
             thinking_enabled,
             tool_name_map,
@@ -3447,7 +3539,8 @@ pub async fn post_messages_cc(
         ));
         handle_non_stream_request(
             provider,
-            &request_body,
+            request_body,
+            threshold_retry_body,
             &payload.model,
             total_input_tokens,
             extract_thinking,
@@ -3471,6 +3564,7 @@ pub async fn post_messages_cc(
 async fn handle_stream_request_buffered(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
+    threshold_retry_body: Option<&str>,
     model: &str,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
@@ -3484,7 +3578,12 @@ async fn handle_stream_request_buffered(
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
-        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
+        .call_api_stream_with_content_length_retry(
+            request_body,
+            threshold_retry_body,
+            Some(tracer.as_ref()),
+            group.as_deref(),
+        )
         .await
     {
         Ok(resp) => resp,

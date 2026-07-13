@@ -91,6 +91,45 @@ pub struct ProcessedImage {
     pub final_bytes: usize,
 }
 
+/// 总图片预算器使用的确定性历史图片重编码目标。
+#[derive(Debug, Clone, Copy)]
+pub struct ResizeTarget {
+    pub max_long_side: u32,
+    pub jpeg_quality: u8,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ImageResizeError {
+    #[error("不支持重编码的图片格式: {0}")]
+    UnsupportedFormat(String),
+    #[error("图片重编码失败: {0}")]
+    Processing(String),
+}
+
+/// 从原始 base64 最多重编码一次。该入口不读取环境变量，也不静默透传失败，供总预算器
+/// 明确区分“已压缩”和“不可压缩”。GIF 可能包含动画，因此不会转成 JPEG。
+pub fn shrink_image_with_target(
+    format: &str,
+    data_base64: &str,
+    target: ResizeTarget,
+) -> Result<ProcessedImage, ImageResizeError> {
+    let format = format.to_ascii_lowercase();
+    if format == "gif" {
+        return Err(ImageResizeError::UnsupportedFormat(format));
+    }
+    shrink_static_image(
+        ResizeConfig {
+            enabled: true,
+            max_long_side: target.max_long_side.max(1),
+            max_bytes: usize::MAX,
+            jpeg_quality: target.jpeg_quality.clamp(1, 100),
+        },
+        &format,
+        data_base64,
+    )
+    .map_err(|error| ImageResizeError::Processing(error.to_string()))
+}
+
 /// Main entry: processes a single inbound image with the rule "small enough -> pass / large -> shrink"
 ///
 /// `format` is the last segment of the source media-type ("png" / "jpeg" / "gif" / "webp"),

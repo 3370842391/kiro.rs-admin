@@ -25,10 +25,11 @@ use super::{
         CreateClientKeyResponse, CredentialResponseTestRequest, GlobalProxyResponse,
         ProxyCheckUrlRequest, SetAccountThrottleConfigRequest, SetCacheHitRateRequest,
         SetCachePolicyRequest, SetDisabledRequest, SetEndpointChainsRequest, SetGlobalProxyRequest,
-        SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
-        SetProxyBalancingModeRequest, SetRetryPolicyRequest, SetUpdateConfigRequest,
-        StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse, UpdateAdminKeyRequest,
-        UpdateClientKeyRequest, UpdateCredentialRequest, UpdateRefreshTokenRequest,
+        SetImageBudgetRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
+        SetPriorityRequest, SetProxyBalancingModeRequest, SetRetryPolicyRequest,
+        SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
+        UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
+        UpdateRefreshTokenRequest,
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
 };
@@ -662,6 +663,25 @@ pub async fn set_cache_hit_rate(
     match state.service.set_cache_hit_rate(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/image-budget
+pub async fn get_image_budget(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.get_image_budget() {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
+
+/// PUT /api/admin/config/image-budget
+pub async fn set_image_budget(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetImageBudgetRequest>,
+) -> impl IntoResponse {
+    match state.service.set_image_budget(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
     }
 }
 

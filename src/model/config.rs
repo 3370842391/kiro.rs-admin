@@ -415,6 +415,30 @@ pub struct Config {
     #[serde(default)]
     pub cache_hit_rate_max_pct: u32,
 
+    /// 是否启用 Kiro 出站图片总预算治理。只压缩历史图片，不修改当前轮图片。
+    #[serde(default = "default_true")]
+    pub image_budget_enabled: bool,
+
+    /// 所有历史与当前轮图片的 base64 总预算字节数。
+    #[serde(default = "default_image_total_budget")]
+    pub image_total_base64_budget_bytes: usize,
+
+    /// 普通预检压缩历史图片时的最大边长。
+    #[serde(default = "default_image_history_dimension")]
+    pub image_history_max_dimension: u32,
+
+    /// 普通预检压缩历史图片时的 JPEG 质量。
+    #[serde(default = "default_image_history_quality")]
+    pub image_history_jpeg_quality: u8,
+
+    /// 上游请求体长度拒绝后，一次降级重试使用的历史图片最大边长。
+    #[serde(default = "default_image_retry_dimension")]
+    pub image_retry_history_max_dimension: u32,
+
+    /// 上游请求体长度拒绝后，一次降级重试使用的历史图片 JPEG 质量。
+    #[serde(default = "default_image_retry_quality")]
+    pub image_retry_history_jpeg_quality: u8,
+
     /// 端点特定的配置
     ///
     /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
@@ -536,6 +560,26 @@ fn default_cache_flush_interval_secs() -> u64 {
     60
 }
 
+fn default_image_total_budget() -> usize {
+    819_200
+}
+
+fn default_image_history_dimension() -> u32 {
+    1_280
+}
+
+fn default_image_history_quality() -> u8 {
+    72
+}
+
+fn default_image_retry_dimension() -> u32 {
+    960
+}
+
+fn default_image_retry_quality() -> u8 {
+    60
+}
+
 fn default_usage_log_retention_days() -> u32 {
     31
 }
@@ -592,6 +636,12 @@ impl Default for Config {
             cache_flush_interval_secs: default_cache_flush_interval_secs(),
             cache_hit_rate_min_pct: 0,
             cache_hit_rate_max_pct: 0,
+            image_budget_enabled: true,
+            image_total_base64_budget_bytes: default_image_total_budget(),
+            image_history_max_dimension: default_image_history_dimension(),
+            image_history_jpeg_quality: default_image_history_quality(),
+            image_retry_history_max_dimension: default_image_retry_dimension(),
+            image_retry_history_jpeg_quality: default_image_retry_quality(),
             endpoints: HashMap::new(),
             config_path: None,
         }
@@ -703,6 +753,25 @@ mod tests {
         assert_eq!(encoded["cacheAutoWithoutControl"], false);
         assert_eq!(encoded["cacheCapacity"], 8192);
         assert_eq!(encoded["cacheFlushIntervalSecs"], 30);
+    }
+
+    #[test]
+    fn image_budget_defaults_and_round_trips_in_camel_case() {
+        let defaulted: Config = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(defaulted.image_budget_enabled);
+        assert_eq!(defaulted.image_total_base64_budget_bytes, 819_200);
+        assert_eq!(defaulted.image_history_max_dimension, 1_280);
+        assert_eq!(defaulted.image_history_jpeg_quality, 72);
+        assert_eq!(defaulted.image_retry_history_max_dimension, 960);
+        assert_eq!(defaulted.image_retry_history_jpeg_quality, 60);
+
+        let encoded = serde_json::to_value(defaulted).unwrap();
+        assert_eq!(encoded["imageBudgetEnabled"], true);
+        assert_eq!(encoded["imageTotalBase64BudgetBytes"], 819_200);
+        assert_eq!(encoded["imageHistoryMaxDimension"], 1_280);
+        assert_eq!(encoded["imageHistoryJpegQuality"], 72);
+        assert_eq!(encoded["imageRetryHistoryMaxDimension"], 960);
+        assert_eq!(encoded["imageRetryHistoryJpegQuality"], 60);
     }
 
     #[test]

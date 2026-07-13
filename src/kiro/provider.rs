@@ -16,6 +16,7 @@ use crate::admin::trace_db::{TraceAttempt, TraceSink, outcome, truncate_snippet}
 use crate::anthropic::converter::normalize_model_id;
 use crate::http_client::{ProxyConfig, build_client_with_read_timeout};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
+use crate::kiro::image_budget::ImageBudgetPolicy;
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::events::Event;
@@ -27,7 +28,7 @@ use crate::kiro::model_capabilities::{ModelAvailability, ModelAvailabilityCache}
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::{RetryMode, RetryPolicy, TlsBackend};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 /// 每个凭据的最大重试次数
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
@@ -46,6 +47,39 @@ const MAX_POLICY_TOTAL_RETRIES: usize = 30;
 /// HTTP Client 缓存容量上限（不含常驻的全局代理 client）。
 /// 代理池条目较多时，避免每个不同代理都常驻一个 reqwest::Client 导致内存无界增长。
 const CLIENT_CACHE_CAP: usize = 64;
+
+fn is_content_length_threshold_error(error: &anyhow::Error) -> bool {
+    error
+        .to_string()
+        .contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD")
+}
+
+async fn call_with_content_length_retry<T, F, Fut>(
+    primary_body: &str,
+    threshold_retry_body: Option<&str>,
+    mut call: F,
+) -> anyhow::Result<T>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    match call(primary_body.to_owned()).await {
+        Ok(result) => Ok(result),
+        Err(error)
+            if is_content_length_threshold_error(&error)
+                && threshold_retry_body.is_some_and(|body| body != primary_body) =>
+        {
+            let retry_body = threshold_retry_body.expect("guarded by is_some_and");
+            tracing::warn!(
+                primary_bytes = primary_body.len(),
+                retry_bytes = retry_body.len(),
+                "上游拒绝请求体长度，使用更激进的历史图片压缩结果重试一次"
+            );
+            call(retry_body.to_owned()).await
+        }
+        Err(error) => Err(error),
+    }
+}
 
 /// 带容量上限的 HTTP Client 缓存。
 ///
@@ -187,6 +221,7 @@ pub struct KiroProvider {
     /// 通过 `streaming_profile_arn()` 直接命中，不再进入解析路径。
     profile_resolution_attempted: Mutex<HashSet<u64>>,
     model_availability: Mutex<ModelAvailabilityCache>,
+    image_budget_policy: RwLock<ImageBudgetPolicy>,
 }
 
 impl KiroProvider {
@@ -221,6 +256,18 @@ impl KiroProvider {
             build_client_with_read_timeout(proxy.as_ref(), 720, read_timeout_secs, tls_backend)
                 .expect("创建 HTTP 客户端失败");
         let client_cache = ClientCache::new(proxy.clone(), initial_client, CLIENT_CACHE_CAP);
+        let configured_image_budget = ImageBudgetPolicy {
+            enabled: token_manager.config().image_budget_enabled,
+            total_base64_budget_bytes: token_manager.config().image_total_base64_budget_bytes,
+            history_max_dimension: token_manager.config().image_history_max_dimension,
+            history_jpeg_quality: token_manager.config().image_history_jpeg_quality,
+            retry_history_max_dimension: token_manager.config().image_retry_history_max_dimension,
+            retry_history_jpeg_quality: token_manager.config().image_retry_history_jpeg_quality,
+        };
+        let image_budget_policy = configured_image_budget.validate().unwrap_or_else(|error| {
+            tracing::warn!(%error, "图片预算配置无效，回退内置默认值");
+            ImageBudgetPolicy::default()
+        });
 
         Self {
             token_manager,
@@ -232,7 +279,17 @@ impl KiroProvider {
             proxy_pool,
             profile_resolution_attempted: Mutex::new(HashSet::new()),
             model_availability: Mutex::new(ModelAvailabilityCache::new(Duration::from_secs(300))),
+            image_budget_policy: RwLock::new(image_budget_policy),
         }
+    }
+
+    pub fn image_budget_policy(&self) -> ImageBudgetPolicy {
+        *self.image_budget_policy.read()
+    }
+
+    pub fn set_image_budget_policy(&self, policy: ImageBudgetPolicy) -> anyhow::Result<()> {
+        *self.image_budget_policy.write() = policy.validate()?;
+        Ok(())
     }
 
     async fn model_availability_for(&self, credential_id: u64, model: &str) -> ModelAvailability {
@@ -741,6 +798,35 @@ impl KiroProvider {
     ) -> anyhow::Result<KiroCallResult> {
         self.call_api_with_retry(request_body, true, sink, group)
             .await
+    }
+
+    /// 非流式请求在上游明确返回请求体长度阈值错误时，使用预先生成的更小请求体重试一次。
+    pub async fn call_api_with_content_length_retry(
+        &self,
+        primary_body: &str,
+        threshold_retry_body: Option<&str>,
+        sink: Option<&dyn TraceSink>,
+        group: Option<&str>,
+    ) -> anyhow::Result<KiroCallResult> {
+        call_with_content_length_retry(primary_body, threshold_retry_body, |body| async move {
+            self.call_api(&body, sink, group).await
+        })
+        .await
+    }
+
+    /// 流式请求的请求体长度阈值降级重试；只发生在尚未取得成功响应、因此尚未向客户端
+    /// 交付任何模型事件时。
+    pub async fn call_api_stream_with_content_length_retry(
+        &self,
+        primary_body: &str,
+        threshold_retry_body: Option<&str>,
+        sink: Option<&dyn TraceSink>,
+        group: Option<&str>,
+    ) -> anyhow::Result<KiroCallResult> {
+        call_with_content_length_retry(primary_body, threshold_retry_body, |body| async move {
+            self.call_api_stream(&body, sink, group).await
+        })
+        .await
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -1906,5 +1992,57 @@ mod tests {
             readable_response_snippet_from_bytes(b"{\"message\":\"bad request\"}").as_deref(),
             Some("{\"message\":\"bad request\"}")
         );
+    }
+
+    #[tokio::test]
+    async fn content_length_error_uses_smaller_body_once() {
+        let mut calls = Vec::new();
+        let result = call_with_content_length_retry("primary", Some("retry"), |body| {
+            calls.push(body.clone());
+            async move {
+                if body == "primary" {
+                    Err(anyhow::anyhow!("CONTENT_LENGTH_EXCEEDS_THRESHOLD"))
+                } else {
+                    Ok(body)
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result, "retry");
+        assert_eq!(calls, vec!["primary", "retry"]);
+    }
+
+    #[tokio::test]
+    async fn non_threshold_error_is_not_retried() {
+        let mut calls = 0;
+        let error = call_with_content_length_retry("primary", Some("retry"), |_body| {
+            calls += 1;
+            async { Err::<String, _>(anyhow::anyhow!("MODEL_NOT_AVAILABLE")) }
+        })
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("MODEL_NOT_AVAILABLE"));
+        assert_eq!(calls, 1);
+    }
+
+    #[tokio::test]
+    async fn second_content_length_error_is_returned_without_third_call() {
+        let mut calls = 0;
+        let error = call_with_content_length_retry("primary", Some("retry"), |_body| {
+            calls += 1;
+            async { Err::<String, _>(anyhow::anyhow!("CONTENT_LENGTH_EXCEEDS_THRESHOLD")) }
+        })
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD")
+        );
+        assert_eq!(calls, 2);
     }
 }

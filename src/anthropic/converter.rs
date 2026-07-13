@@ -19,8 +19,6 @@ use crate::model::config::ToolCompatibilityMode;
 
 use super::types::{ContentBlock, ImageSource, MessagesRequest};
 
-use crate::image_resize::{ResizeConfig, maybe_shrink_image};
-
 /// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
 /// 规范化 JSON Schema，修复工具定义中常见的类型问题
 ///
@@ -941,16 +939,6 @@ fn determine_chat_trigger_type(_req: &MessagesRequest) -> String {
 fn process_message_content(
     content: &serde_json::Value,
 ) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
-    process_message_content_dedup(content, None)
-}
-
-/// Same as `process_message_content`, but when `dedup` is `Some` it deduplicates images by SHA256:
-/// the same image (identical base64) recurring across history is kept only on first sight and later replaced with placeholder text,
-/// avoiding the same screenshot being re-sent as base64 over multiple turns and burning tokens.
-fn process_message_content_dedup(
-    content: &serde_json::Value,
-    mut dedup: Option<&mut std::collections::HashSet<String>>,
-) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
     let mut text_parts = Vec::new();
     let mut images = Vec::new();
     let mut tool_results = Vec::new();
@@ -969,20 +957,14 @@ fn process_message_content_dedup(
                             }
                         }
                         "image" => {
-                            if let Some(source) = block.source
-                                && let Some(placeholder) =
-                                    extract_kiro_image(&source, &mut dedup, &mut images)
-                            {
-                                text_parts.push(placeholder);
+                            if let Some(source) = block.source {
+                                extract_kiro_image(&source, &mut images);
                             }
                         }
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
-                                let result_content = extract_tool_result_content(
-                                    &block.content,
-                                    &mut dedup,
-                                    &mut images,
-                                );
+                                let result_content =
+                                    extract_tool_result_content(&block.content, &mut images);
                                 let is_error = block.is_error.unwrap_or(false);
 
                                 let mut result = if is_error {
@@ -1043,31 +1025,14 @@ fn get_image_format(media_type: &str) -> Option<String> {
 
 /// Converts an image block's source into a `KiroImage` and pushes it onto the top-level `images`.
 ///
-/// Reuses the same conversion chain as top-level images (format validation + SHA256 dedup + resize + `from_base64`),
-/// so an image inside a tool_result is lifted into the top-level images field the same way.
-/// Returns `Some(placeholder)` when history dedup hit and the image was omitted; `None` when it was lifted or the format is unsupported.
-fn extract_kiro_image(
-    source: &ImageSource,
-    dedup: &mut Option<&mut std::collections::HashSet<String>>,
-    images: &mut Vec<KiroImage>,
-) -> Option<String> {
-    let format = get_image_format(&source.media_type)?;
-    // History dedup: an already-seen image omits its base64 and returns placeholder text
-    if let Some(seen) = dedup.as_deref_mut() {
-        let mut hasher = Sha256::new();
-        hasher.update(source.data.as_bytes());
-        let digest = format!("{:x}", hasher.finalize());
-        if !seen.insert(digest) {
-            return Some("[image omitted: identical to an earlier screenshot]".to_string());
-        }
-    }
-    let cfg = ResizeConfig::from_env();
-    let processed = maybe_shrink_image(cfg, &format, &source.data);
-    images.push(KiroImage::from_base64(
-        processed.format,
-        processed.data_base64,
-    ));
-    None
+/// Converter only validates the format and preserves the exact bytes. Global history-only image
+/// budgeting runs after the complete Kiro request has been assembled, preventing double JPEG
+/// encoding and ensuring the current turn is never modified.
+fn extract_kiro_image(source: &ImageSource, images: &mut Vec<KiroImage>) {
+    let Some(format) = get_image_format(&source.media_type) else {
+        return;
+    };
+    images.push(KiroImage::from_base64(format, source.data.clone()));
 }
 
 /// 提取工具结果内容
@@ -1077,7 +1042,6 @@ fn extract_kiro_image(
 /// If a tool_result has only images and no text, the placeholder text "[image attached]" is used.
 fn extract_tool_result_content(
     content: &Option<serde_json::Value>,
-    dedup: &mut Option<&mut std::collections::HashSet<String>>,
     images: &mut Vec<KiroImage>,
 ) -> String {
     match content {
@@ -1093,9 +1057,7 @@ fn extract_tool_result_content(
                     && let Some(source) = block.source
                 {
                     had_image = true;
-                    if let Some(placeholder) = extract_kiro_image(&source, dedup, images) {
-                        parts.push(placeholder);
-                    }
+                    extract_kiro_image(&source, images);
                 }
             }
             if parts.is_empty() && had_image {
@@ -1844,9 +1806,6 @@ fn build_history(
     // 处理调用方已经与 currentMessage 分离的常规消息历史。
     let mut user_buffer: Vec<&super::types::Message> = Vec::new();
     let mut assistant_buffer: Vec<&super::types::Message> = Vec::new();
-    // SHA256 dedup set for images spanning the whole history; a repeated image is kept only on first sight
-    let mut image_dedup: std::collections::HashSet<String> = std::collections::HashSet::new();
-
     for msg in messages {
         if msg.role == "user" {
             // 先处理累积的 assistant 消息
@@ -1859,7 +1818,7 @@ fn build_history(
         } else if msg.role == "assistant" {
             // 先处理累积的 user 消息
             if !user_buffer.is_empty() {
-                let merged_user = merge_user_messages(&user_buffer, model_id, &mut image_dedup)?;
+                let merged_user = merge_user_messages(&user_buffer, model_id)?;
                 history.push(Message::User(merged_user));
                 user_buffer.clear();
             }
@@ -1876,7 +1835,7 @@ fn build_history(
 
     // 刷新末尾累积的 user 消息，不生成客户端未提交的 assistant 内容。
     if !user_buffer.is_empty() {
-        let merged_user = merge_user_messages(&user_buffer, model_id, &mut image_dedup)?;
+        let merged_user = merge_user_messages(&user_buffer, model_id)?;
         history.push(Message::User(merged_user));
     }
 
@@ -1887,15 +1846,13 @@ fn build_history(
 fn merge_user_messages(
     messages: &[&super::types::Message],
     model_id: &str,
-    dedup: &mut std::collections::HashSet<String>,
 ) -> Result<HistoryUserMessage, ConversionError> {
     let mut content_parts = Vec::new();
     let mut all_images = Vec::new();
     let mut all_tool_results = Vec::new();
 
     for msg in messages {
-        let (text, images, tool_results) =
-            process_message_content_dedup(&msg.content, Some(dedup))?;
+        let (text, images, tool_results) = process_message_content(&msg.content)?;
         if !text.is_empty() {
             content_parts.push(text);
         }
@@ -4130,6 +4087,106 @@ mod tests {
 
     // base64 of a 1x1 PNG (valid PNG header, so resize just passes it through)
     const TINY_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+
+    #[test]
+    fn test_repeated_history_images_are_preserved() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let image_content = || {
+            serde_json::json!([
+                {"type": "text", "text": "inspect this screenshot"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": TINY_PNG_B64}}
+            ])
+        };
+        let req = MessagesRequest {
+            force_web_search_loop: false,
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: image_content(),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("first response"),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: image_content(),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("second response"),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("continue"),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        let history_images: Vec<&KiroImage> = result
+            .conversation_state
+            .history
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(message) => Some(message.user_input_message.images.as_slice()),
+                Message::Assistant(_) => None,
+            })
+            .flatten()
+            .collect();
+
+        assert_eq!(history_images.len(), 2, "重复历史图片不得被去重删除");
+        assert!(
+            history_images
+                .iter()
+                .all(|image| image.source.bytes == TINY_PNG_B64),
+            "历史图片在预算器运行前不得被 converter 重编码"
+        );
+    }
+
+    #[test]
+    fn test_current_image_bytes_are_preserved_by_converter() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            force_web_search_loop: false,
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": TINY_PNG_B64}}
+                ]),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        let images = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .images;
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].format, "png");
+        assert_eq!(images[0].source.bytes, TINY_PNG_B64);
+    }
 
     #[test]
     fn test_tool_result_image_lifts_to_top_level() {

@@ -1,7 +1,7 @@
 import { forwardRef, useEffect, useState, type ComponentPropsWithoutRef } from 'react'
 import {
   Activity, RefreshCw, UploadCloud, Settings, Key, Wand2, Eye, EyeOff, Copy,
-  MoreHorizontal, ShieldAlert, ShieldCheck, Gauge, Shuffle,
+  MoreHorizontal, ShieldAlert, ShieldCheck, Gauge, Shuffle, Images,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -31,6 +31,7 @@ import { ImageUpdateDialog } from '@/components/image-update-dialog'
 import { ModelMappingsDialog } from '@/components/model-mappings-dialog'
 import { EndpointChainsDialog } from '@/components/endpoint-chains-dialog'
 import { CachePolicyDialog } from '@/components/cache-policy-dialog'
+import { ImageBudgetDialog } from '@/components/image-budget-dialog'
 
 /**
  * 顶栏右侧通用工具栏：负载均衡切换、刷新、在线更新、设置（Key 管理）。
@@ -56,6 +57,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
   const [modelMappingsOpen, setModelMappingsOpen] = useState(false)
   const [endpointChainsOpen, setEndpointChainsOpen] = useState(false)
   const [cachePolicyOpen, setCachePolicyOpen] = useState(false)
+  const [imageBudgetOpen, setImageBudgetOpen] = useState(false)
   const [keyDialogOpen, setKeyDialogOpen] = useState(false)
   const [newKey, setNewKey] = useState('')
   const [showPlain, setShowPlain] = useState(false)
@@ -128,6 +130,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     openModelMappings: () => setModelMappingsOpen(true),
     openEndpointChains: () => setEndpointChainsOpen(true),
     openCachePolicy: () => setCachePolicyOpen(true),
+    openImageBudget: () => setImageBudgetOpen(true),
     openKeyDialog,
     retryPolicy,
     setRetryPolicy: (mode: RetryMode, customPolicy?: RetryPolicy | null) =>
@@ -155,6 +158,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
       <ModelMappingsDialog open={modelMappingsOpen} onOpenChange={setModelMappingsOpen} />
       <EndpointChainsDialog open={endpointChainsOpen} onOpenChange={setEndpointChainsOpen} />
       <CachePolicyDialog open={cachePolicyOpen} onOpenChange={setCachePolicyOpen} />
+      <ImageBudgetDialog open={imageBudgetOpen} onOpenChange={setImageBudgetOpen} />
 
       <Dialog
         open={keyDialogOpen}
@@ -265,6 +269,7 @@ interface ToolControls {
   openModelMappings: () => void
   openEndpointChains: () => void
   openCachePolicy: () => void
+  openImageBudget: () => void
   openKeyDialog: () => void
   retryPolicy?: RetryPolicyConfig
   setRetryPolicy: (mode: RetryMode, customPolicy?: RetryPolicy | null) => void
@@ -292,6 +297,7 @@ function FullTools({ controls }: { controls: ToolControls }) {
         onOpenModelMappings={controls.openModelMappings}
         onOpenEndpointChains={controls.openEndpointChains}
         onOpenCachePolicy={controls.openCachePolicy}
+        onOpenImageBudget={controls.openImageBudget}
       />
     </>
   )
@@ -341,6 +347,9 @@ function CompactTools({ controls }: { controls: ToolControls }) {
         </DropdownMenuItem>
         <DropdownMenuItem onSelect={controls.openCachePolicy}>
           <Gauge />缓存策略（TTL / 容量 / 命中率）
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={controls.openImageBudget}>
+          <Images />图片总预算（历史压缩 / 超限重试）
         </DropdownMenuItem>
         <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
         <DropdownMenuItem onSelect={controls.openKeyDialog}>
@@ -673,11 +682,13 @@ function KeySettingsMenu({
   onOpenModelMappings,
   onOpenEndpointChains,
   onOpenCachePolicy,
+  onOpenImageBudget,
 }: {
   onOpenKeyDialog: () => void
   onOpenModelMappings: () => void
   onOpenEndpointChains: () => void
   onOpenCachePolicy: () => void
+  onOpenImageBudget: () => void
 }) {
   return (
     <DropdownMenu>
@@ -696,6 +707,9 @@ function KeySettingsMenu({
         </DropdownMenuItem>
         <DropdownMenuItem onSelect={onOpenCachePolicy}>
           <Gauge />缓存策略（TTL / 容量 / 命中率）
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={onOpenImageBudget}>
+          <Images />图片总预算（历史压缩 / 超限重试）
         </DropdownMenuItem>
         <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
         <DropdownMenuItem onSelect={onOpenKeyDialog}>

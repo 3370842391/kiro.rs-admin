@@ -15,6 +15,7 @@ use crate::anthropic::cache_metering::{
 use crate::http_client::ProxyConfig;
 use crate::kiro::auth::idc::{self, BUILDER_ID_START_URL};
 use crate::kiro::auth::social;
+use crate::kiro::image_budget::ImageBudgetPolicy;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::credentials::{
     ExternalIdpImportFields, complete_external_idp_import_fields,
@@ -34,15 +35,15 @@ use super::types::{
     CredentialResponseTestResponse, CredentialStatusItem, CredentialsExportResponse,
     CredentialsStatusResponse, EnableOverageAllResult, EndpointBucketOption,
     EndpointChainsResponse, ExportedAccount, ExportedCredentials, GitHubRateLimitInfo,
-    ImageUpdateResponse, LoadBalancingModeResponse, LogGovernanceConfigResponse,
-    PollIdcLoginResponse, ProxyBalancingModeResponse, ProxyCheckAllResponse, ProxyCheckResponse,
-    ProxyCheckUrlRequest, ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult,
-    RetryPolicyResponse, SetAccountThrottleConfigRequest, SetCacheHitRateRequest,
-    SetCachePolicyRequest, SetEndpointChainsRequest, SetLoadBalancingModeRequest,
-    SetLogGovernanceConfigRequest, SetProxyBalancingModeRequest, SetRetryPolicyRequest,
-    SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
-    StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest,
-    UpdateRefreshTokenRequest,
+    ImageBudgetResponse, ImageUpdateResponse, LoadBalancingModeResponse,
+    LogGovernanceConfigResponse, PollIdcLoginResponse, ProxyBalancingModeResponse,
+    ProxyCheckAllResponse, ProxyCheckResponse, ProxyCheckUrlRequest, ProxyPoolEntry,
+    ProxyPoolResponse, QuotaExceededResult, RetryPolicyResponse, SetAccountThrottleConfigRequest,
+    SetCacheHitRateRequest, SetCachePolicyRequest, SetEndpointChainsRequest, SetImageBudgetRequest,
+    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetProxyBalancingModeRequest,
+    SetRetryPolicyRequest, SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse,
+    StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse,
+    UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -83,6 +84,17 @@ fn build_cache_policy_response(
             .and_then(|timestamp| DateTime::<Utc>::from_timestamp(timestamp, 0))
             .map(|value| value.to_rfc3339()),
         persist_enabled: stats.persist_enabled,
+    }
+}
+
+fn build_image_budget_response(policy: ImageBudgetPolicy) -> ImageBudgetResponse {
+    ImageBudgetResponse {
+        enabled: policy.enabled,
+        total_base64_budget_bytes: policy.total_base64_budget_bytes,
+        history_max_dimension: policy.history_max_dimension,
+        history_jpeg_quality: policy.history_jpeg_quality,
+        retry_history_max_dimension: policy.retry_history_max_dimension,
+        retry_history_jpeg_quality: policy.retry_history_jpeg_quality,
     }
 }
 
@@ -2244,6 +2256,52 @@ impl AdminService {
             .set_cache_hit_rate_bounds(req.min_pct, req.max_pct)
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
         Ok(self.get_cache_hit_rate())
+    }
+
+    pub fn get_image_budget(&self) -> Result<ImageBudgetResponse, AdminServiceError> {
+        let provider = self.kiro_provider.as_ref().ok_or_else(|| {
+            AdminServiceError::InternalError("Kiro provider 未初始化".to_string())
+        })?;
+        Ok(build_image_budget_response(provider.image_budget_policy()))
+    }
+
+    pub fn set_image_budget(
+        &self,
+        req: SetImageBudgetRequest,
+    ) -> Result<ImageBudgetResponse, AdminServiceError> {
+        let provider = self.kiro_provider.as_ref().ok_or_else(|| {
+            AdminServiceError::InternalError("Kiro provider 未初始化".to_string())
+        })?;
+        let policy = ImageBudgetPolicy {
+            enabled: req.enabled,
+            total_base64_budget_bytes: req.total_base64_budget_bytes,
+            history_max_dimension: req.history_max_dimension,
+            history_jpeg_quality: req.history_jpeg_quality,
+            retry_history_max_dimension: req.retry_history_max_dimension,
+            retry_history_jpeg_quality: req.retry_history_jpeg_quality,
+        }
+        .validate()
+        .map_err(|error| AdminServiceError::InvalidCredential(error.to_string()))?;
+
+        let config_path = self.token_manager.config().config_path().ok_or_else(|| {
+            AdminServiceError::InternalError("配置文件路径未知，无法持久化图片预算".to_string())
+        })?;
+        let mut config = Config::load(config_path)
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+        config.image_budget_enabled = policy.enabled;
+        config.image_total_base64_budget_bytes = policy.total_base64_budget_bytes;
+        config.image_history_max_dimension = policy.history_max_dimension;
+        config.image_history_jpeg_quality = policy.history_jpeg_quality;
+        config.image_retry_history_max_dimension = policy.retry_history_max_dimension;
+        config.image_retry_history_jpeg_quality = policy.retry_history_jpeg_quality;
+        config
+            .save()
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+
+        provider
+            .set_image_budget_policy(policy)
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+        Ok(build_image_budget_response(policy))
     }
 
     pub fn get_cache_policy(&self) -> Result<CachePolicyResponse, AdminServiceError> {

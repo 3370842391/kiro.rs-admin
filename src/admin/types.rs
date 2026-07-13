@@ -632,6 +632,28 @@ pub struct SetCacheHitRateRequest {
     pub max_pct: u32,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageBudgetResponse {
+    pub enabled: bool,
+    pub total_base64_budget_bytes: usize,
+    pub history_max_dimension: u32,
+    pub history_jpeg_quality: u8,
+    pub retry_history_max_dimension: u32,
+    pub retry_history_jpeg_quality: u8,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetImageBudgetRequest {
+    pub enabled: bool,
+    pub total_base64_budget_bytes: usize,
+    pub history_max_dimension: u32,
+    pub history_jpeg_quality: u8,
+    pub retry_history_max_dimension: u32,
+    pub retry_history_jpeg_quality: u8,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CachePolicyResponse {
