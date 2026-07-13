@@ -19,6 +19,7 @@
 mod binary_update;
 pub mod client_keys;
 mod error;
+pub mod error_snapshot_db;
 pub mod groups;
 mod handlers;
 mod middleware;
@@ -32,6 +33,7 @@ pub mod types;
 pub mod usage_stats;
 
 pub use client_keys::ClientKeyManager;
+pub use error_snapshot_db::{ErrorSnapshotStore, SharedErrorSnapshotStore};
 pub use groups::GroupManager;
 pub use middleware::AdminState;
 pub use model_mapping::{ModelMappingManager, SharedModelMappingManager};
