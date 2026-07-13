@@ -934,7 +934,7 @@ impl CompletedToolUse {
 /// 工具调用 JSON 累积过程中的错误。
 ///
 /// - `InvalidJson`：上游把某个 tool_use 的完整 `input` 拼出来后，仍不是合法 JSON。
-/// - `IncompleteJson`：整条流结束时仍有 tool_use 从未收到 `stop=true`，即上游在
+/// - `IncompleteJson`：整条流结束时仍有 tool_use 的 JSON 参数在 EOF 处未写完，即上游在
 ///   工具参数写到一半时截断（“流式半截 JSON”）。
 ///
 /// 两种情况都**不能**把半截 / 非法 JSON 当成完整工具调用转发给客户端——那会让
@@ -1058,58 +1058,67 @@ impl ToolJsonAccumulator {
         )))
     }
 
-    /// 流结束时收尾。对每个从未收到 `stop=true` 的残留缓冲分两种情况处理：
+    /// 流结束时收尾。对每个从未收到 `stop=true` 的残留缓冲分三种情况处理：
     ///
     /// - **空入参**（0 字节 / 纯空白）：上游把 tool_use 块开出来、但没写任何参数就断流，
     ///   等价于无参工具调用（如 `EnterPlanMode`）。按 `{}` **打捞**成完整工具调用返回，
     ///   与 base 版（首片即发 `content_block_start{input:{}}`、收尾补 `content_block_stop`）
     ///   行为一致——避免把合法的无参调用整个丢弃、连累整轮失败。
-    /// - **半截 JSON**（有字节但从未 stop）：上游在参数写到一半时截断，转发会让客户端
-    ///   拿到无法解析 / 语义残缺的参数，故**不打捞**，记为 `IncompleteJson`
-    ///   （多个残留时取字节数最多的那个作代表错误）。
+    /// - **完整 JSON**：把流结束视作隐式 `stop`，打捞成完整工具调用。
+    /// - **错误 JSON**：EOF 截断记为 `IncompleteJson`，其他语法错误记为 `InvalidJson`。
     ///
-    /// 返回 `(已打捞的完整工具调用, 半截错误)`；两者可同时非空（部分空参可救、部分半截报错）。
-    /// 调用后缓冲被清空，重复调用返回 `(空, None)`。
+    /// 收尾按批次原子提交：先解析全部残留，任一项错误就不返回本批任何工具调用；全部
+    /// 为空或完整时才统一返回。调用后缓冲被清空，重复调用返回 `(空, None)`。
     pub fn finish(
         &mut self,
         tool_name_map: &HashMap<String, String>,
     ) -> (Vec<CompletedToolUse>, Option<ToolJsonAccumulatorError>) {
-        let mut salvaged = Vec::new();
-        let mut incomplete: Option<ToolJsonAccumulatorError> = None;
-
-        // 稳定顺序：按 tool_use_id 排序，保证多缓冲时输出与错误代表选取的确定性。
+        // 稳定顺序：按 tool_use_id 排序，保证多缓冲时输出与代表错误选取的确定性。
         let mut entries: Vec<(String, (String, String))> = self.buffers.drain().collect();
         entries.sort_by(|a, b| a.0.cmp(&b.0));
 
+        let mut parsed = Vec::with_capacity(entries.len());
+        let mut error = None;
         for (tool_use_id, (kiro_name, input_json)) in entries {
-            if input_json.trim().is_empty() {
-                // 无参工具：打捞为 {}，经统一入口还原客户端工具名。
-                salvaged.push(CompletedToolUse::from_kiro(
-                    tool_use_id,
-                    &kiro_name,
-                    serde_json::json!({}),
-                    tool_name_map,
-                ));
+            let input = if input_json.trim().is_empty() {
+                serde_json::json!({})
             } else {
-                // 半截 JSON：取字节数最多的作代表错误，不打捞。
-                let bytes = input_json.len();
-                let larger = match &incomplete {
-                    Some(ToolJsonAccumulatorError::IncompleteJson { bytes: prev, .. }) => {
-                        bytes > *prev
+                match serde_json::from_str::<serde_json::Value>(&input_json) {
+                    Ok(input) => input,
+                    Err(parse_error) => {
+                        if error.is_none() {
+                            error = Some(if parse_error.is_eof() {
+                                ToolJsonAccumulatorError::IncompleteJson {
+                                    tool_use_id,
+                                    name: kiro_name,
+                                    bytes: input_json.len(),
+                                }
+                            } else {
+                                ToolJsonAccumulatorError::InvalidJson {
+                                    tool_use_id,
+                                    name: kiro_name,
+                                    message: parse_error.to_string(),
+                                }
+                            });
+                        }
+                        continue;
                     }
-                    _ => true,
-                };
-                if larger {
-                    incomplete = Some(ToolJsonAccumulatorError::IncompleteJson {
-                        tool_use_id,
-                        name: kiro_name,
-                        bytes,
-                    });
                 }
-            }
+            };
+            parsed.push((tool_use_id, kiro_name, input));
         }
 
-        (salvaged, incomplete)
+        if let Some(error) = error {
+            return (Vec::new(), Some(error));
+        }
+
+        let completed = parsed
+            .into_iter()
+            .map(|(tool_use_id, kiro_name, input)| {
+                CompletedToolUse::from_kiro(tool_use_id, &kiro_name, input, tool_name_map)
+            })
+            .collect();
+        (completed, None)
     }
 }
 
@@ -3458,11 +3467,69 @@ mod tests {
     }
 
     #[test]
-    fn tool_json_accumulator_finish_mixes_salvage_and_error() {
-        // 多残留：空参可救 + 半截报错，二者并存互不影响。
+    fn tool_json_accumulator_salvages_complete_json_without_stop() {
+        let mut acc = ToolJsonAccumulator::new();
+        let mut map = HashMap::new();
+        map.insert("fs_write".to_string(), "Write".to_string());
+        acc.push(
+            &tool_evt(
+                "write1",
+                "fs_write",
+                r#"{"path":"/tmp/a","text":"ok"}"#,
+                false,
+            ),
+            &map,
+        )
+        .unwrap();
+
+        let (completed, err) = acc.finish(&map);
+        assert!(err.is_none(), "完整 JSON 残留应按隐式 stop 打捞");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].id, "write1");
+        assert_eq!(completed[0].name, "Write");
+        assert_eq!(
+            completed[0].input,
+            serde_json::json!({"file_path": "/tmp/a", "content": "ok"})
+        );
+    }
+
+    #[test]
+    fn tool_json_accumulator_distinguishes_invalid_from_incomplete_at_finish() {
+        let mut incomplete = ToolJsonAccumulator::new();
+        incomplete
+            .push(
+                &tool_evt("incomplete1", "read_file", r#"{"path":"/a"#, false),
+                &HashMap::new(),
+            )
+            .unwrap();
+        let (completed, err) = incomplete.finish(&HashMap::new());
+        assert!(completed.is_empty());
+        assert!(matches!(
+            err,
+            Some(ToolJsonAccumulatorError::IncompleteJson { .. })
+        ));
+
+        let mut invalid = ToolJsonAccumulator::new();
+        invalid
+            .push(
+                &tool_evt("invalid1", "read_file", r#"{"path":]"#, false),
+                &HashMap::new(),
+            )
+            .unwrap();
+        let (completed, err) = invalid.finish(&HashMap::new());
+        assert!(completed.is_empty());
+        assert!(matches!(
+            err,
+            Some(ToolJsonAccumulatorError::InvalidJson { .. })
+        ));
+    }
+
+    #[test]
+    fn tool_json_accumulator_finish_is_atomic_when_any_entry_errors() {
+        // 多残留：即使完整项可打捞，只要任一项出错，本批也不得返回任何工具调用。
         let mut acc = ToolJsonAccumulator::new();
         acc.push(
-            &tool_evt("empty1", "EnterPlanMode", "", false),
+            &tool_evt("complete1", "EnterPlanMode", "{}", false),
             &HashMap::new(),
         )
         .unwrap();
@@ -3471,9 +3538,8 @@ mod tests {
             &HashMap::new(),
         )
         .unwrap();
-        let (salvaged, err) = acc.finish(&HashMap::new());
-        assert_eq!(salvaged.len(), 1, "空参应被打捞");
-        assert_eq!(salvaged[0].id, "empty1");
+        let (completed, err) = acc.finish(&HashMap::new());
+        assert!(completed.is_empty(), "错误批次不得部分提交工具调用");
         assert!(
             matches!(err, Some(ToolJsonAccumulatorError::IncompleteJson { .. })),
             "半截 JSON 仍应报错"
