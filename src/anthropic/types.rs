@@ -64,7 +64,7 @@ pub struct ModelsResponse {
 const MAX_BUDGET_TOKENS: i32 = 24576;
 
 /// Thinking 配置
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Thinking {
     #[serde(rename = "type")]
     pub thinking_type: String,
@@ -94,10 +94,19 @@ where
 }
 
 /// OutputConfig 配置
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct OutputConfig {
     #[serde(default = "default_effort")]
     pub effort: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<OutputFormat>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct OutputFormat {
+    #[serde(rename = "type")]
+    pub format_type: String,
+    pub schema: serde_json::Value,
 }
 
 fn default_effort() -> String {
@@ -105,14 +114,14 @@ fn default_effort() -> String {
 }
 
 /// Claude Code 请求中的 metadata
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Metadata {
     /// 用户 ID，格式如: user_xxx_account__session_0b4445e1-f5be-49e1-87ce-62bbc28ad705
     pub user_id: Option<String>,
 }
 
 /// Messages 请求体
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct MessagesRequest {
     pub model: String,
@@ -228,7 +237,7 @@ pub struct CacheControl {
 /// 1. 普通工具：{ name, description, input_schema }
 /// 2. WebSearch 工具：{ type: "web_search_20250305", name: "web_search", max_uses: 8 }
 /// Anthropic `tool_choice`：`auto` / `any` / `{type:"tool",name}` / `none`。
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolChoice {
     Auto {
@@ -377,5 +386,27 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn output_config_preserves_effort_and_json_schema_format() {
+        let config: OutputConfig = serde_json::from_value(serde_json::json!({
+            "effort": "high",
+            "format": {
+                "type": "json_schema",
+                "schema": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "integer"}},
+                    "required": ["answer"],
+                    "additionalProperties": false
+                }
+            }
+        }))
+        .unwrap();
+
+        let round_trip = serde_json::to_value(config).unwrap();
+        assert_eq!(round_trip["effort"], "high");
+        assert_eq!(round_trip["format"]["type"], "json_schema");
+        assert_eq!(round_trip["format"]["schema"]["required"][0], "answer");
     }
 }

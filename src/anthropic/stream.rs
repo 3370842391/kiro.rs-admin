@@ -20,8 +20,6 @@ use crate::kiro::model::events::Event;
 /// thinking 块结束时插入一个非空占位字符串以满足客户端本地校验。
 /// converter 在解析 assistant 消息回传 Kiro 时只读 `block.thinking`，不读
 /// signature，因此该占位字符串只在客户端 ↔ kiro.rs 之间存在，不会影响转发。
-pub(super) const THINKING_SIGNATURE_PLACEHOLDER: &str = "kiro-rs-thinking-signature";
-
 const TOOL_USE_XML_PREFIX: &str = "<tool_use";
 const TOOL_USE_XML_CLOSE: &str = "</tool_use>";
 
@@ -864,6 +862,34 @@ fn tool_semantic_key(block: &serde_json::Value) -> Option<String> {
     Some(format!("{name}\0{input}"))
 }
 
+/// 固定字段修复后再次去重文本捞回调用与原生结构化调用。
+///
+/// 只移除与原生调用语义相同的捞回块，原生块即使参数相同也保留各自 ID，避免改变
+/// 客户显式并行调用语义。
+pub(crate) fn dedupe_reclaimed_tools_after_repair(
+    blocks: &mut Vec<serde_json::Value>,
+    native_tool_ids: &std::collections::HashSet<String>,
+) {
+    let native_keys: std::collections::HashSet<String> = blocks
+        .iter()
+        .filter(|block| {
+            block
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| native_tool_ids.contains(id))
+        })
+        .filter_map(tool_semantic_key)
+        .collect();
+
+    blocks.retain(|block| {
+        let is_native = block
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| native_tool_ids.contains(id));
+        is_native || tool_semantic_key(block).is_none_or(|key| !native_keys.contains(&key))
+    });
+}
+
 pub(crate) fn normalize_non_stream_content_blocks(
     base_content: Vec<serde_json::Value>,
     native_tool_uses: Vec<serde_json::Value>,
@@ -1437,6 +1463,11 @@ pub struct StreamContext {
     /// 只有合成名在此集合里才允许捞回成结构化 tool_use，否则当文本吐出。
     /// 为空（请求未带 tools）时不捞回任何 invoke——宁可漏捞，不可误执行。
     pub known_tool_names: std::collections::HashSet<String>,
+    /// 客户端可见工具名对应的输入契约。工具 JSON 完整解析后、产生任何工具事件前验证。
+    tool_contracts: HashMap<String, super::tool_schema::ToolContract>,
+    /// 请求入口是否已显式初始化契约层。生产路径即使没有声明工具也会初始化为空，
+    /// 从而拒绝上游幻觉出的未请求工具；低层构造器保持向后兼容。
+    tool_contracts_initialized: bool,
     /// 跨整条流的「代码围栏」奇偶状态：每遇到一行以 ``` 开头就翻转。
     /// 在围栏内（true）时，`<invoke>` 一律不捞回（视为正文展示的代码块）。
     pub code_fence_open: bool,
@@ -1551,6 +1582,14 @@ impl StreamContext {
         self.context_window_size = value.max(1);
     }
 
+    pub(crate) fn set_tool_contracts(
+        &mut self,
+        contracts: HashMap<String, super::tool_schema::ToolContract>,
+    ) {
+        self.tool_contracts = contracts;
+        self.tool_contracts_initialized = true;
+    }
+
     /// 工具调用 JSON 错误信息（非法 / 半截）。上层据此把本次请求记为 error、
     /// 或在非流式路径返回 502。无错误时返回 `None`。
     pub fn terminal_error_message(&self) -> Option<String> {
@@ -1614,6 +1653,8 @@ impl StreamContext {
             tool_block_indices: HashMap::new(),
             tool_name_map,
             known_tool_names,
+            tool_contracts: HashMap::new(),
+            tool_contracts_initialized: false,
             code_fence_open: false,
             fence_scan_partial: String::new(),
             thinking_enabled,
@@ -2313,10 +2354,9 @@ impl StreamContext {
             return Vec::new();
         }
 
-        let signature = self
-            .pending_thinking_signature
-            .take()
-            .unwrap_or_else(|| THINKING_SIGNATURE_PLACEHOLDER.to_string());
+        let signature = self.pending_thinking_signature.take().unwrap_or_else(|| {
+            super::thinking_signature::issue_signature(&self.message_id, &self.thinking_buffer)
+        });
         let mut events = vec![
             self.create_thinking_delta_event(idx, ""),
             self.create_signature_delta_event_with(idx, &signature),
@@ -2427,7 +2467,9 @@ impl StreamContext {
     /// 占位字符串以满足客户端本地校验。该字段不参与转发回 Kiro 的逻辑
     /// （converter 只读 `block.thinking`，不读 signature）。
     fn create_signature_delta_event(&self, index: i32) -> SseEvent {
-        self.create_signature_delta_event_with(index, THINKING_SIGNATURE_PLACEHOLDER)
+        let signature =
+            super::thinking_signature::issue_signature(&self.message_id, &self.thinking_buffer);
+        self.create_signature_delta_event_with(index, &signature)
     }
 
     fn create_signature_delta_event_with(&self, index: i32, signature: &str) -> SseEvent {
@@ -2448,8 +2490,46 @@ impl StreamContext {
     ///
     /// 块索引按 `completed.id` 复用/分配（结构化按 tool_use_id 复用；invoke 合成用新 id 故新分配），
     /// 依次发 `content_block_start{name, input:{}}` → 单个完整 `input_json_delta` → `content_block_stop`。
-    fn emit_completed_tool_use(&mut self, completed: CompletedToolUse) -> Vec<SseEvent> {
+    fn emit_completed_tool_use(&mut self, mut completed: CompletedToolUse) -> Vec<SseEvent> {
         let mut events = Vec::new();
+        if self.tool_contracts_initialized {
+            let Some(contract) = self.tool_contracts.get(&completed.name) else {
+                let error = super::tool_schema::ToolSchemaError {
+                    tool_name: completed.name.clone(),
+                    violations: vec![super::tool_schema::ToolInputViolation::UndeclaredTool],
+                };
+                tracing::warn!(tool = %completed.name, "上游返回了未声明工具");
+                self.terminal_attempt_failure =
+                    Some(super::tool_attempt::AttemptFailure::InvalidToolSchema {
+                        message: error.to_string(),
+                    });
+                self.state_manager.set_stop_reason("error");
+                return events;
+            };
+            match super::tool_schema::validate_and_repair(&contract.schema, &mut completed.input) {
+                super::tool_schema::ToolInputOutcome::Valid => {}
+                super::tool_schema::ToolInputOutcome::Repaired { paths } => {
+                    tracing::warn!(
+                        tool = %contract.client_name,
+                        paths = ?paths,
+                        "确定性修复上游工具固定字段"
+                    );
+                }
+                super::tool_schema::ToolInputOutcome::Invalid { violations } => {
+                    let error = super::tool_schema::ToolSchemaError {
+                        tool_name: contract.client_name.clone(),
+                        violations,
+                    };
+                    tracing::warn!(tool = %contract.client_name, "上游工具参数不满足客户端Schema");
+                    self.terminal_attempt_failure =
+                        Some(super::tool_attempt::AttemptFailure::InvalidToolSchema {
+                            message: error.to_string(),
+                        });
+                    self.state_manager.set_stop_reason("error");
+                    return events;
+                }
+            }
+        }
         self.state_manager.set_has_tool_use(true);
         self.has_visible_output = true;
         self.emitted_tool_names.push(completed.name.clone());
@@ -2794,12 +2874,14 @@ impl StreamContext {
         {
             classified_failure = None;
         }
-        self.terminal_attempt_failure = classified_failure
-            .as_ref()
-            .filter(|failure| {
-                !matches!(failure, super::tool_attempt::AttemptFailure::EmptyResponse)
-            })
-            .cloned();
+        if self.terminal_attempt_failure.is_none() {
+            self.terminal_attempt_failure = classified_failure
+                .as_ref()
+                .filter(|failure| {
+                    !matches!(failure, super::tool_attempt::AttemptFailure::EmptyResponse)
+                })
+                .cloned();
+        }
         if self.saw_upstream_tool_use
             && !self.state_manager.has_tool_use()
             && self.tool_json_error.is_none()
@@ -3059,6 +3141,13 @@ impl BufferedStreamContext {
 
     pub fn set_context_window_size(&mut self, value: i32) {
         self.inner.set_context_window_size(value);
+    }
+
+    pub(crate) fn set_tool_contracts(
+        &mut self,
+        contracts: HashMap<String, super::tool_schema::ToolContract>,
+    ) {
+        self.inner.set_tool_contracts(contracts);
     }
 
     /// 开启流式身份归一化（委托给 inner StreamContext）。
@@ -3660,6 +3749,122 @@ mod tests {
             input: input.to_string(),
             stop,
         }
+    }
+
+    fn weather_contracts() -> HashMap<String, super::super::tool_schema::ToolContract> {
+        HashMap::from([(
+            "get_weather".to_string(),
+            super::super::tool_schema::ToolContract {
+                client_name: "get_weather".to_string(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"},
+                        "unit": {"type": "string", "enum": ["celsius"]}
+                    },
+                    "required": ["city", "unit"],
+                    "additionalProperties": false
+                }),
+            },
+        )])
+    }
+
+    #[test]
+    fn stream_repairs_fixed_tool_fields_before_any_tool_event_is_emitted() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            ["get_weather".to_string()].into_iter().collect(),
+        );
+        ctx.set_tool_contracts(weather_contracts());
+
+        let events = ctx.process_tool_use(&tool_evt(
+            "tool_1",
+            "get_weather",
+            r#"{"city":"Paris","unit":"wrong"}"#,
+            true,
+        ));
+        let json_delta = events
+            .iter()
+            .find(|event| event.event == "content_block_delta")
+            .expect("repaired tool input delta");
+        let input: serde_json::Value =
+            serde_json::from_str(json_delta.data["delta"]["partial_json"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(input["unit"], "celsius");
+    }
+
+    #[test]
+    fn stream_rejects_non_fixed_schema_violation_without_emitting_tool_block() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            ["get_weather".to_string()].into_iter().collect(),
+        );
+        ctx.set_tool_contracts(weather_contracts());
+
+        let tool_events = ctx.process_tool_use(&tool_evt(
+            "tool_1",
+            "get_weather",
+            r#"{"unit":"celsius"}"#,
+            true,
+        ));
+        let final_events = ctx.generate_final_events();
+
+        assert!(tool_events.is_empty());
+        assert!(final_events.iter().any(|event| {
+            event.event == "error" && event.data["error"]["type"] == "upstream_tool_schema_error"
+        }));
+        assert!(!final_events.iter().any(|event| {
+            event.event == "content_block_start"
+                && event.data["content_block"]["type"] == "tool_use"
+        }));
+    }
+
+    #[test]
+    fn stream_rejects_undeclared_tool_when_contracts_exist() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            ["get_weather".to_string()].into_iter().collect(),
+        );
+        ctx.set_tool_contracts(weather_contracts());
+
+        let tool_events =
+            ctx.process_tool_use(&tool_evt("tool_1", "delete_everything", r#"{}"#, true));
+        let final_events = ctx.generate_final_events();
+
+        assert!(tool_events.is_empty());
+        assert!(final_events.iter().any(|event| {
+            event.event == "error" && event.data["error"]["type"] == "upstream_tool_schema_error"
+        }));
+    }
+
+    #[test]
+    fn stream_rejects_unrequested_tool_after_empty_contracts_are_initialized() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        ctx.set_tool_contracts(HashMap::new());
+
+        let tool_events =
+            ctx.process_tool_use(&tool_evt("tool_1", "delete_everything", r#"{}"#, true));
+        let final_events = ctx.generate_final_events();
+
+        assert!(tool_events.is_empty());
+        assert!(final_events.iter().any(|event| {
+            event.event == "error" && event.data["error"]["type"] == "upstream_tool_schema_error"
+        }));
     }
 
     #[test]

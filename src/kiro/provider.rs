@@ -6,13 +6,16 @@
 //! 支持按凭据级 endpoint 切换不同 Kiro API 端点
 
 use reqwest::{Client, header};
+use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 use crate::admin::proxy_pool::{ProxyInFlightGuard, ProxyPoolManager};
-use crate::admin::trace_db::{TraceAttempt, TraceSink, outcome, truncate_snippet};
+use crate::admin::trace_db::{
+    TraceAttempt, TraceDiagnosticEvent, TraceSink, outcome, truncate_snippet,
+};
 use crate::anthropic::converter::normalize_model_id;
 use crate::http_client::{ProxyConfig, build_client_with_read_timeout};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
@@ -512,6 +515,8 @@ impl KiroProvider {
         config: &crate::model::config::Config,
         request_body: &str,
         proxy: Option<ProxyConfig>,
+        sink: Option<&dyn TraceSink>,
+        attempt: u32,
     ) -> anyhow::Result<reqwest::Response> {
         let rctx = RequestContext {
             credentials: &ctx.credentials,
@@ -523,15 +528,41 @@ impl KiroProvider {
         let url = endpoint.api_url(&rctx);
         let body = endpoint.transform_api_body(request_body, &rctx);
 
+        if let Some(sink) = sink {
+            sink.on_diagnostic(TraceDiagnosticEvent::UpstreamRequest {
+                attempt,
+                credential_id: ctx.id,
+                endpoint: endpoint.name(),
+                body: &body,
+            });
+        }
+
         tracing::debug!("使用端点 [{}] POST {}", endpoint.name(), url);
-        tracing::debug!("实际发送请求体: {}", body);
+        tracing::debug!(
+            credential_id = ctx.id,
+            attempt,
+            endpoint = endpoint.name(),
+            body_bytes = body.len(),
+            body_sha256 = %hex::encode(Sha256::digest(body.as_bytes())),
+            "实际发送请求体元数据"
+        );
 
         // 复用连接池的热 TLS 连接：从中转到 us-east-1 的 TLS 握手 1-3s，每请求
         // Connection:close 等于废掉 client_for_proxy 的连接池，把整个握手 RTT 计入
         // 首字节。改为 keep-alive 后同代理连接复用，是最大的 TFB 收益。空闲连接
         // 竞态（发请求瞬间上游关闭）由 call_api_with_retry 的网络错误重试兜底。
-        let base = self
-            .client_for_proxy(proxy.clone())?
+        let client = self.client_for_proxy(proxy.clone()).map_err(|error| {
+            if let Some(sink) = sink {
+                sink.on_diagnostic(TraceDiagnosticEvent::NetworkError {
+                    attempt,
+                    credential_id: ctx.id,
+                    endpoint: endpoint.name(),
+                    message: &error.to_string(),
+                });
+            }
+            error
+        })?;
+        let base = client
             .post(&url)
             .body(body)
             .header("content-type", endpoint.content_type())
@@ -539,15 +570,37 @@ impl KiroProvider {
         let request = endpoint.decorate_api(base, &rctx);
 
         // 打印实际发送的请求头（RUST_LOG=debug 时输出，便于排查问题）
-        let request = request
-            .build()
-            .map_err(|e| anyhow::anyhow!("构建请求失败: {}", e))?;
+        let request = request.build().map_err(|e| {
+            let error = anyhow::anyhow!("构建请求失败: {}", e);
+            if let Some(sink) = sink {
+                sink.on_diagnostic(TraceDiagnosticEvent::NetworkError {
+                    attempt,
+                    credential_id: ctx.id,
+                    endpoint: endpoint.name(),
+                    message: &error.to_string(),
+                });
+            }
+            error
+        })?;
         if tracing::enabled!(tracing::Level::DEBUG) {
             for (k, v) in request.headers() {
                 tracing::debug!("  header {}: {}", k, v.to_str().unwrap_or("<binary>"));
             }
         }
-        Ok(self.client_for_proxy(proxy)?.execute(request).await?)
+        match client.execute(request).await {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                if let Some(sink) = sink {
+                    sink.on_diagnostic(TraceDiagnosticEvent::NetworkError {
+                        attempt,
+                        credential_id: ctx.id,
+                        endpoint: endpoint.name(),
+                        message: &error.to_string(),
+                    });
+                }
+                Err(error.into())
+            }
+        }
     }
 
     async fn execute_api_request_with_proxy_failover(
@@ -557,6 +610,8 @@ impl KiroProvider {
         machine_id: &str,
         config: &crate::model::config::Config,
         request_body: &str,
+        sink: Option<&dyn TraceSink>,
+        attempt: u32,
     ) -> anyhow::Result<ProxyAttemptResult> {
         let candidates = self.proxy_candidates_for(ctx.id, &ctx.credentials);
         let candidate_count = candidates.len();
@@ -581,6 +636,8 @@ impl KiroProvider {
                     config,
                     request_body,
                     proxy.clone(),
+                    sink,
+                    attempt,
                 )
                 .await
             {
@@ -590,6 +647,15 @@ impl KiroProvider {
                         self.report_proxy_failure(ctx.id, proxy.as_ref());
                     }
                     if idx + 1 < candidate_count && should_try_next_proxy(status) {
+                        if let Some(sink) = sink {
+                            sink.on_diagnostic(TraceDiagnosticEvent::UpstreamResponse {
+                                attempt,
+                                credential_id: ctx.id,
+                                endpoint: endpoint.name(),
+                                status: status.as_u16(),
+                                body: "",
+                            });
+                        }
                         tracing::warn!(
                             "凭据 #{} 代理候选 {} 返回 HTTP {}，切换下一个候选",
                             ctx.id,
@@ -877,6 +943,8 @@ impl KiroProvider {
                 &machine_id,
                 config,
                 &request_body,
+                None,
+                0,
             )
             .await
         {
@@ -1248,6 +1316,8 @@ impl KiroProvider {
                     &machine_id,
                     config,
                     request_body,
+                    sink,
+                    attempt as u32,
                 )
                 .await
             {
@@ -1312,6 +1382,15 @@ impl KiroProvider {
 
             // 失败响应：读取 body 用于日志/错误信息
             let body = response.text().await.unwrap_or_default();
+            if let Some(sink) = sink {
+                sink.on_diagnostic(TraceDiagnosticEvent::UpstreamResponse {
+                    attempt: attempt as u32,
+                    credential_id: ctx.id,
+                    endpoint: endpoint_name,
+                    status: status.as_u16(),
+                    body: &body,
+                });
+            }
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
@@ -1542,6 +1621,8 @@ impl KiroProvider {
                             config,
                             request_body,
                             selected_proxy.clone(),
+                            sink,
+                            attempt as u32,
                         )
                         .await
                     {
@@ -1572,6 +1653,15 @@ impl KiroProvider {
                         Ok(fb_resp) => {
                             let fb_status = fb_resp.status();
                             let fb_body = fb_resp.text().await.unwrap_or_default();
+                            if let Some(sink) = sink {
+                                sink.on_diagnostic(TraceDiagnosticEvent::UpstreamResponse {
+                                    attempt: attempt as u32,
+                                    credential_id: ctx.id,
+                                    endpoint: fb_endpoint.name(),
+                                    status: fb_status.as_u16(),
+                                    body: &fb_body,
+                                });
+                            }
                             Self::emit_attempt(
                                 sink,
                                 attempt,

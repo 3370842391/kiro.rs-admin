@@ -586,6 +586,8 @@ pub struct ConversionResult {
     /// 只有合成出的工具名在此集合里，才允许把字面 `<invoke>` 捞回成结构化 tool_use；
     /// 否则当普通文本吐出，避免把「正文展示的工具调用」误执行成真命令。
     pub known_tool_names: std::collections::HashSet<String>,
+    /// 客户端原始工具名对应的规范化输入契约。仅用于响应交付前验证，绝不复制到工具描述。
+    pub tool_contracts: std::collections::HashMap<String, super::tool_schema::ToolContract>,
     /// Additional model request fields (including `output_config.effort`), translated from the
     /// `output_config` field of the client's Anthropic request. Not sent when empty.
     pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
@@ -623,6 +625,31 @@ const REQUIRED_TOOL_NUDGE: &str =
     " (Client requirement: you MUST call this tool before answering.)";
 const REQUIRED_ANY_NUDGE: &str =
     " (Client requirement: you MUST call at least one of the provided tools before answering.)";
+const REQUIRED_SCHEMA_METADATA_NUDGE: &str =
+    " Input is expected to include every property marked required by the schema.";
+
+/// 为含必填字段的工具生成固定的 Required-only 元数据提示。
+///
+/// 客户端 schema 完全可控，因此不能把字段名、const、enum 或随机 canary 值复制进
+/// 自然语言 description；否则会形成额外提示注入面，并增加 token。真实约束仍只由
+/// 结构化 inputSchema 承载。
+fn required_tool_schema_nudge(schema: &serde_json::Value) -> &'static str {
+    let has_required = schema
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|required| !required.is_empty());
+    if has_required {
+        REQUIRED_SCHEMA_METADATA_NUDGE
+    } else {
+        ""
+    }
+}
+
+fn append_required_tool_nudge(tool: &mut ToolSpecification, policy_nudge: &str) {
+    tool.description.push_str(policy_nudge);
+    tool.description
+        .push_str(&required_tool_schema_nudge(&tool.input_schema.json));
+}
 
 /// 由 `tool_choice` + 已声明工具解析策略。指定工具不存在时回落 Auto（不报错，最大兼容）。
 pub fn resolve_tool_choice_policy(
@@ -679,6 +706,7 @@ pub enum ConversionError {
     /// Claude Code 工具无法映射到 Kiro 内置工具（如 Read.pages 无对应、内置缺 schema）。
     UnsupportedToolMapping(String),
     InvalidToolChoice(String),
+    InvalidToolHistory(String),
 }
 
 impl std::fmt::Display for ConversionError {
@@ -688,6 +716,9 @@ impl std::fmt::Display for ConversionError {
             ConversionError::EmptyMessages => write!(f, "消息列表为空"),
             ConversionError::UnsupportedToolMapping(reason) => {
                 write!(f, "工具映射不支持: {}", reason)
+            }
+            ConversionError::InvalidToolHistory(reason) => {
+                write!(f, "工具调用历史无效: {}", reason)
             }
             ConversionError::InvalidToolChoice(reason) => {
                 write!(f, "工具选择无效: {}", reason)
@@ -788,9 +819,12 @@ pub fn convert_request_with_mode(
         .map_or(0, |index| index + 1);
     let history_messages = &messages[..current_start];
     let current_messages = &messages[current_start..];
-    let (text_content, images, tool_results) = process_current_user_messages(current_messages)?;
+    let (text_content, images, mut tool_results) = process_current_user_messages(current_messages)?;
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射；ClaudeCode 模式做内置工具适配）
+    // 同时保留客户端可见名称对应的规范化 schema，供响应交付前验证；不把 schema
+    // 字段和值复制进 description，避免额外 token 注入。
+    let tool_contracts = build_tool_contracts(&req.tools);
     let mut tool_name_map = HashMap::new();
     let mut tools = convert_tools(&req.tools, &mut tool_name_map, tool_compatibility_mode)?;
 
@@ -819,9 +853,7 @@ pub fn convert_request_with_mode(
         ToolChoicePolicy::Disabled => tools.clear(),
         ToolChoicePolicy::RequiredAny { .. } => {
             for t in &mut tools {
-                t.tool_specification
-                    .description
-                    .push_str(REQUIRED_ANY_NUDGE);
+                append_required_tool_nudge(&mut t.tool_specification, REQUIRED_ANY_NUDGE);
             }
         }
         ToolChoicePolicy::RequiredSpecific {
@@ -836,9 +868,7 @@ pub fn convert_request_with_mode(
                         .is_some_and(|orig| orig == client_name)
             });
             for t in &mut tools {
-                t.tool_specification
-                    .description
-                    .push_str(REQUIRED_TOOL_NUDGE);
+                append_required_tool_nudge(&mut t.tool_specification, REQUIRED_TOOL_NUDGE);
             }
         }
         ToolChoicePolicy::Auto { .. } => {}
@@ -856,6 +886,11 @@ pub fn convert_request_with_mode(
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
     // 同时返回孤立的 tool_use_id 集合，用于后续清理
+    // Kiro 仅接受 ASCII 字母、数字、下划线和连字符组成且不超过 64 字节的工具 ID。
+    // 只修改本次转换生成的 Kiro 请求副本，并在现有配对过滤前拒绝重复或孤立引用。
+    super::tool_history::normalize_tool_history_ids(&mut history, &mut tool_results)
+        .map_err(|error| ConversionError::InvalidToolHistory(error.to_string()))?;
+
     let (validated_tool_results, orphaned_tool_use_ids) =
         validate_tool_pairing(&history, &tool_results);
 
@@ -924,9 +959,37 @@ pub fn convert_request_with_mode(
         conversation_state,
         tool_name_map,
         known_tool_names,
+        tool_contracts,
         additional_model_request_fields,
         tool_choice_policy,
     })
+}
+
+fn build_tool_contracts(
+    tools: &Option<Vec<super::types::Tool>>,
+) -> std::collections::HashMap<String, super::tool_schema::ToolContract> {
+    let mut contracts = std::collections::HashMap::new();
+    let Some(tools) = tools else {
+        return contracts;
+    };
+
+    for tool in tools {
+        if tool.name.is_empty()
+            || tool
+                .tool_type
+                .as_deref()
+                .is_some_and(|kind| kind.starts_with("web_search"))
+        {
+            continue;
+        }
+        contracts
+            .entry(tool.name.clone())
+            .or_insert_with(|| super::tool_schema::ToolContract {
+                client_name: tool.name.clone(),
+                schema: normalize_json_schema(serde_json::json!(tool.input_schema)),
+            });
+    }
+    contracts
 }
 
 /// 确定聊天触发类型
@@ -2090,6 +2153,117 @@ mod tests {
         ));
     }
 
+    fn constrained_weather_tool() -> super::super::types::Tool {
+        super::super::types::Tool {
+            tool_type: None,
+            name: "get_weather".to_string(),
+            description: "Get current weather.".to_string(),
+            input_schema: serde_json::from_value(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string", "const": "Paris"},
+                    "nonce": {"type": "string", "enum": ["8b5d9233"]},
+                    "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+                },
+                "required": ["city", "nonce", "unit"],
+                "additionalProperties": false
+            }))
+            .unwrap(),
+            max_uses: None,
+            cache_control: None,
+        }
+    }
+
+    fn converted_weather_tool(
+        tool_choice: Option<super::super::types::ToolChoice>,
+    ) -> ToolSpecification {
+        let mut req = minimal_request_with_output_config("claude-opus-4-8");
+        req.output_config = None;
+        req.tools = Some(vec![constrained_weather_tool()]);
+        req.tool_choice = tool_choice;
+        convert_request_with_mode(&req, ToolCompatibilityMode::ClaudeCode)
+            .unwrap()
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools[0]
+            .tool_specification
+            .clone()
+    }
+
+    fn converted_weather_description(
+        tool_choice: Option<super::super::types::ToolChoice>,
+    ) -> String {
+        converted_weather_tool(tool_choice).description
+    }
+
+    #[test]
+    fn required_specific_tool_nudge_uses_static_schema_metadata() {
+        use super::super::types::ToolChoice;
+
+        let tool = converted_weather_tool(Some(ToolChoice::Tool {
+            name: "get_weather".to_string(),
+            disable_parallel_tool_use: false,
+        }));
+        assert_eq!(
+            tool.description,
+            "Get current weather. (Client requirement: you MUST call this tool before answering.) Input is expected to include every property marked required by the schema."
+        );
+        for leaked in [
+            "city",
+            "nonce",
+            "unit",
+            "Paris",
+            "8b5d9233",
+            "{}",
+            "Fixed schema values",
+            "Do not call",
+        ] {
+            assert!(
+                !tool.description.contains(leaked),
+                "client-controlled schema content leaked into description: {leaked:?}"
+            );
+        }
+        assert_eq!(
+            tool.input_schema.json["required"],
+            serde_json::json!(["city", "nonce", "unit"])
+        );
+        assert_eq!(
+            tool.input_schema.json["properties"]["city"]["const"],
+            "Paris"
+        );
+        assert_eq!(
+            tool.input_schema.json["properties"]["nonce"]["enum"],
+            serde_json::json!(["8b5d9233"])
+        );
+    }
+
+    #[test]
+    fn required_any_tool_nudge_uses_static_schema_metadata() {
+        use super::super::types::ToolChoice;
+
+        let description = converted_weather_description(Some(ToolChoice::Any {
+            disable_parallel_tool_use: false,
+        }));
+        assert_eq!(
+            description,
+            "Get current weather. (Client requirement: you MUST call at least one of the provided tools before answering.) Input is expected to include every property marked required by the schema."
+        );
+    }
+
+    #[test]
+    fn auto_tool_choice_does_not_inject_schema_nudge() {
+        use super::super::types::ToolChoice;
+
+        let description = converted_weather_description(None);
+        assert_eq!(description, "Get current weather.");
+        let explicit_auto = converted_weather_description(Some(ToolChoice::Auto {
+            disable_parallel_tool_use: false,
+        }));
+        assert_eq!(explicit_auto, "Get current weather.");
+    }
+
     #[test]
     fn test_map_model_sonnet() {
         assert!(
@@ -2349,6 +2523,7 @@ mod tests {
             thinking: None,
             output_config: Some(OutputConfig {
                 effort: effort.to_string(),
+                format: None,
             }),
             metadata: None,
         }
@@ -3632,6 +3807,227 @@ mod tests {
                 .count(),
             4
         );
+    }
+
+    fn tool_history_request(messages: Vec<super::super::types::Message>) -> MessagesRequest {
+        MessagesRequest {
+            force_web_search_loop: false,
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages,
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn convert_request_normalizes_invalid_tool_id_pair_before_upstream_validation() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = tool_history_request(vec![
+            AnthropicMessage {
+                role: "user".into(),
+                content: serde_json::json!("weather"),
+            },
+            AnthropicMessage {
+                role: "assistant".into(),
+                content: serde_json::json!([{
+                    "type": "tool_use",
+                    "id": "tool/get_weather/1",
+                    "name": "get_weather",
+                    "input": {"city": "Paris"}
+                }]),
+            },
+            AnthropicMessage {
+                role: "user".into(),
+                content: serde_json::json!([{
+                    "type": "tool_result",
+                    "tool_use_id": "tool/get_weather/1",
+                    "content": "sunny"
+                }]),
+            },
+        ]);
+
+        let converted = convert_request(&req).unwrap();
+        let Message::Assistant(assistant) = &converted.conversation_state.history[1] else {
+            panic!("expected assistant tool-use history")
+        };
+        let normalized = &assistant
+            .assistant_response_message
+            .tool_uses
+            .as_ref()
+            .unwrap()[0]
+            .tool_use_id;
+        let result_id = &converted
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tool_results[0]
+            .tool_use_id;
+
+        assert_ne!(normalized, "tool/get_weather/1");
+        assert!(super::super::tool_history::is_upstream_safe_tool_id(
+            normalized
+        ));
+        assert_eq!(result_id, normalized);
+    }
+
+    #[test]
+    fn convert_request_preserves_safe_tool_id_pair() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = tool_history_request(vec![
+            AnthropicMessage {
+                role: "user".into(),
+                content: serde_json::json!("weather"),
+            },
+            AnthropicMessage {
+                role: "assistant".into(),
+                content: serde_json::json!([{
+                    "type": "tool_use",
+                    "id": "tooluse_abc-123",
+                    "name": "get_weather",
+                    "input": {}
+                }]),
+            },
+            AnthropicMessage {
+                role: "user".into(),
+                content: serde_json::json!([{
+                    "type": "tool_result",
+                    "tool_use_id": "tooluse_abc-123",
+                    "content": "sunny"
+                }]),
+            },
+        ]);
+
+        let converted = convert_request(&req).unwrap();
+        let Message::Assistant(assistant) = &converted.conversation_state.history[1] else {
+            panic!("expected assistant tool-use history")
+        };
+        assert_eq!(
+            assistant
+                .assistant_response_message
+                .tool_uses
+                .as_ref()
+                .unwrap()[0]
+                .tool_use_id,
+            "tooluse_abc-123"
+        );
+        assert_eq!(
+            converted
+                .conversation_state
+                .current_message
+                .user_input_message
+                .user_input_message_context
+                .tool_results[0]
+                .tool_use_id,
+            "tooluse_abc-123"
+        );
+    }
+
+    #[test]
+    fn convert_request_rejects_duplicate_tool_use_id_locally() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = tool_history_request(vec![
+            AnthropicMessage {
+                role: "user".into(),
+                content: serde_json::json!("weather"),
+            },
+            AnthropicMessage {
+                role: "assistant".into(),
+                content: serde_json::json!([
+                    {"type": "tool_use", "id": "a:b", "name": "first", "input": {}},
+                    {"type": "tool_use", "id": "a:b", "name": "second", "input": {}}
+                ]),
+            },
+            AnthropicMessage {
+                role: "user".into(),
+                content: serde_json::json!([{
+                    "type": "tool_result",
+                    "tool_use_id": "a:b",
+                    "content": "done"
+                }]),
+            },
+        ]);
+
+        assert!(matches!(
+            convert_request(&req),
+            Err(ConversionError::InvalidToolHistory(reason))
+                if reason.contains("duplicate tool_use id")
+        ));
+    }
+
+    #[test]
+    fn convert_request_rejects_orphan_tool_result_locally() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = tool_history_request(vec![AnthropicMessage {
+            role: "user".into(),
+            content: serde_json::json!([{
+                "type": "tool_result",
+                "tool_use_id": "missing/tool/1",
+                "content": "orphan"
+            }]),
+        }]);
+
+        assert!(matches!(
+            convert_request(&req),
+            Err(ConversionError::InvalidToolHistory(reason))
+                if reason.contains("unknown tool_use id")
+        ));
+    }
+
+    #[test]
+    fn conversion_retains_normalized_client_tool_contract_without_description_injection() {
+        use std::collections::BTreeMap;
+
+        let req = MessagesRequest {
+            force_web_search_loop: false,
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 256,
+            messages: vec![super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::json!("weather"),
+            }],
+            stream: false,
+            system: None,
+            tools: Some(vec![super::super::types::Tool {
+                tool_type: None,
+                name: "get_weather".to_string(),
+                description: "customer description must not become contract data".to_string(),
+                input_schema: BTreeMap::from([
+                    ("type".to_string(), serde_json::json!("object")),
+                    (
+                        "properties".to_string(),
+                        serde_json::json!({
+                            "unit": {"type": "string", "enum": ["celsius"]}
+                        }),
+                    ),
+                    ("required".to_string(), serde_json::json!(["unit"])),
+                ]),
+                max_uses: None,
+                cache_control: None,
+            }]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let converted = convert_request(&req).unwrap();
+        let contract = converted.tool_contracts.get("get_weather").unwrap();
+
+        assert_eq!(contract.client_name, "get_weather");
+        assert_eq!(contract.schema["type"], "object");
+        assert_eq!(contract.schema["properties"]["unit"]["enum"][0], "celsius");
+        assert!(!contract.schema.to_string().contains("customer description"));
     }
 
     #[test]

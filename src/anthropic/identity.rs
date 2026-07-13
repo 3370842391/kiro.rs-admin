@@ -10,6 +10,27 @@
 /// 只匹配"由 X 制造/开发"这类身份锚点短语，避免误伤正文里合法出现的 AWS / Amazon
 /// （例如客户在写 AWS Lambda / Amazon S3 相关代码）。
 const IDENTITY_BRAND_PHRASES: &[(&str, &str)] = &[
+    (
+        r#""model_family": "unknown""#,
+        r#""model_family": "Claude""#,
+    ),
+    (r#""model_family":"unknown""#, r#""model_family":"Claude""#),
+    (r#""vendor": "Kiro""#, r#""vendor": "Anthropic""#),
+    (r#""vendor":"Kiro""#, r#""vendor":"Anthropic""#),
+    (r#""vendor": "Amazon""#, r#""vendor": "Anthropic""#),
+    (r#""vendor":"Amazon""#, r#""vendor":"Anthropic""#),
+    (r#""vendor": "AWS""#, r#""vendor": "Anthropic""#),
+    (r#""vendor":"AWS""#, r#""vendor":"Anthropic""#),
+    (r#""vendor": "Claude""#, r#""vendor": "Anthropic""#),
+    (r#""vendor":"Claude""#, r#""vendor":"Anthropic""#),
+    (
+        r#""vendor": "Amazon Web Services""#,
+        r#""vendor": "Anthropic""#,
+    ),
+    (
+        r#""vendor":"Amazon Web Services""#,
+        r#""vendor":"Anthropic""#,
+    ),
     ("made by AWS", "made by Anthropic"),
     ("made by Amazon Web Services", "made by Anthropic"),
     ("made by Amazon", "made by Anthropic"),
@@ -64,7 +85,7 @@ fn replace_ci(haystack: &str, from: &str, to: &str) -> String {
 
 /// 整词 "Kiro" → "Claude"（大小写不敏感匹配，统一替换为 "Claude"）。
 /// 词边界：前后字符都不是 ASCII 字母/数字，避免命中 "Kiron" 之类。
-fn replace_word_kiro(text: &str) -> String {
+fn replace_word_kiro(text: &str, before_text_is_word: bool) -> String {
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
     let mut i = 0usize;
@@ -74,11 +95,14 @@ fn replace_word_kiro(text: &str) -> String {
             && text.is_char_boundary(after_idx)
             && text[i..after_idx].eq_ignore_ascii_case("kiro")
         {
-            let before_ok = i == 0
-                || !bytes
+            let before_ok = if i == 0 {
+                !before_text_is_word
+            } else {
+                !bytes
                     .get(i - 1)
                     .map(|b| b.is_ascii_alphanumeric())
-                    .unwrap_or(false);
+                    .unwrap_or(false)
+            };
             let after_ok = after_idx >= text.len()
                 || !bytes
                     .get(after_idx)
@@ -98,8 +122,7 @@ fn replace_word_kiro(text: &str) -> String {
     out
 }
 
-/// 归一化助手输出里的品牌身份泄漏。顺序：品牌短语 → 描述短语 → 整词 Kiro。
-pub(crate) fn normalize_identity_text(text: &str) -> String {
+fn normalize_identity_text_with_left_context(text: &str, before_text_is_word: bool) -> String {
     if text.is_empty() {
         return String::new();
     }
@@ -110,7 +133,12 @@ pub(crate) fn normalize_identity_text(text: &str) -> String {
     for (from, to) in IDENTITY_DESC_PHRASES {
         s = replace_ci(&s, from, to);
     }
-    replace_word_kiro(&s)
+    replace_word_kiro(&s, before_text_is_word)
+}
+
+/// 归一化助手输出里的品牌身份泄漏。顺序：品牌短语 → 描述短语 → 整词 Kiro。
+pub(crate) fn normalize_identity_text(text: &str) -> String {
+    normalize_identity_text_with_left_context(text, false)
 }
 
 /// 流式身份过滤器：跨 chunk 归一化已知身份短语。
@@ -121,6 +149,8 @@ pub(crate) fn normalize_identity_text(text: &str) -> String {
 pub(crate) struct IdentityStreamFilter {
     /// 上一 chunk 末尾疑似身份短语前缀的残留。
     pending: String,
+    /// `pending`（为空时为下一 chunk）之前的原始字符是否属于 ASCII 单词。
+    before_pending_is_word: bool,
 }
 
 impl IdentityStreamFilter {
@@ -131,16 +161,30 @@ impl IdentityStreamFilter {
         }
         let mut combined = std::mem::take(&mut self.pending);
         combined.push_str(chunk);
-        let keep = trailing_identity_prefix_len(&combined);
+        let before_combined_is_word = self.before_pending_is_word;
+        let keep = trailing_identity_prefix_len(&combined, before_combined_is_word);
         let (emit_part, hold_part) = combined.split_at(combined.len() - keep);
+        self.before_pending_is_word = if hold_part.is_empty() {
+            combined
+                .chars()
+                .next_back()
+                .is_some_and(|character| character.is_ascii_alphanumeric())
+        } else {
+            emit_part
+                .chars()
+                .next_back()
+                .map(|character| character.is_ascii_alphanumeric())
+                .unwrap_or(before_combined_is_word)
+        };
         self.pending = hold_part.to_string();
-        normalize_identity_text(emit_part)
+        normalize_identity_text_with_left_context(emit_part, before_combined_is_word)
     }
 
     /// 流结束时 flush 残留。
     pub(crate) fn finish(&mut self) -> String {
         let rest = std::mem::take(&mut self.pending);
-        normalize_identity_text(&rest)
+        let before_rest_is_word = std::mem::take(&mut self.before_pending_is_word);
+        normalize_identity_text_with_left_context(&rest, before_rest_is_word)
     }
 }
 
@@ -150,8 +194,9 @@ fn identity_source_phrases() -> impl Iterator<Item = &'static str> {
         .chain(IDENTITY_DESC_PHRASES.iter().map(|(from, _)| *from))
 }
 
-/// 返回 `s` 末尾属于任一已知源短语（忽略 ASCII 大小写）严格前缀的最大字节数。
-fn trailing_identity_prefix_len(s: &str) -> usize {
+/// 返回 `s` 末尾需要暂存的身份短语前缀最大字节数。
+/// 除严格前缀外，完整 `Kiro` 也要等待下个字符确认右词边界。
+fn trailing_identity_prefix_len(s: &str, before_s_is_word: bool) -> usize {
     let max_target_len = identity_source_phrases().map(str::len).max().unwrap_or(0);
     let min_start = s.len().saturating_sub(max_target_len.saturating_sub(1));
     let mut best = 0usize;
@@ -165,21 +210,45 @@ fn trailing_identity_prefix_len(s: &str) -> usize {
         if suffix.is_empty() {
             continue;
         }
-        let before_is_word = s[..start]
-            .chars()
-            .next_back()
-            .is_some_and(|c| c.is_ascii_alphanumeric());
+        let before_is_word = if start == 0 {
+            before_s_is_word
+        } else {
+            s[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphanumeric())
+        };
 
+        let mut exact_match = false;
+        let mut extends_to_longer_phrase = false;
         for target in identity_source_phrases() {
-            if suffix.len() >= target.len() || !target.is_char_boundary(suffix.len()) {
-                continue;
-            }
             if before_is_word && target.as_bytes()[0].is_ascii_alphanumeric() {
                 continue;
             }
-            if target[..suffix.len()].eq_ignore_ascii_case(suffix) {
+
+            if suffix.len() == target.len() && suffix.eq_ignore_ascii_case(target) {
+                if target.eq_ignore_ascii_case("kiro") {
+                    extends_to_longer_phrase = true;
+                    best = best.max(suffix.len());
+                } else {
+                    exact_match = true;
+                }
+                continue;
+            }
+
+            if suffix.len() < target.len()
+                && target.is_char_boundary(suffix.len())
+                && target[..suffix.len()].eq_ignore_ascii_case(suffix)
+            {
+                extends_to_longer_phrase = true;
                 best = best.max(suffix.len());
             }
+        }
+
+        // 完整且无歧义的身份短语恰好落在 chunk 末尾时应立即交给 normalizer。
+        // 否则它末尾的 `"` 等字符可能又被识别成另一条短语的前缀，导致完整短语被拆开漏改。
+        if exact_match && !extends_to_longer_phrase && best <= suffix.len() {
+            return 0;
         }
     }
 
@@ -223,6 +292,55 @@ mod tests {
     }
 
     #[test]
+    fn rewrites_identity_vendor_json_without_touching_other_aws_fields() {
+        assert_eq!(
+            normalize_identity_text(r#"{"vendor":"Amazon Web Services","model_name":"Claude"}"#),
+            r#"{"vendor":"Anthropic","model_name":"Claude"}"#
+        );
+        assert_eq!(
+            normalize_identity_text(
+                r#"{"vendor": "Amazon Web Services", "model_family": "Claude"}"#
+            ),
+            r#"{"vendor": "Anthropic", "model_family": "Claude"}"#
+        );
+        assert_eq!(
+            normalize_identity_text(r#"{"vendor":"Claude","model_family":"unknown"}"#),
+            r#"{"vendor":"Anthropic","model_family":"Claude"}"#
+        );
+        assert_eq!(
+            normalize_identity_text(r#"{"vendor": "Claude", "model_family": "unknown"}"#),
+            r#"{"vendor": "Anthropic", "model_family": "Claude"}"#
+        );
+        assert_eq!(
+            normalize_identity_text(
+                r#"{"vendor":"Kiro","model_name":"Kiro","model_family":"unknown"}"#
+            ),
+            r#"{"vendor":"Anthropic","model_name":"Claude","model_family":"Claude"}"#
+        );
+        assert_eq!(
+            normalize_identity_text(
+                r#"{"vendor":"Amazon","model_name":"Kiro","model_family":"Kiro"}"#
+            ),
+            r#"{"vendor":"Anthropic","model_name":"Claude","model_family":"Claude"}"#
+        );
+        assert_eq!(
+            normalize_identity_text(
+                r#"{"vendor":"AWS","model_name":"Kiro","model_family":"unknown"}"#
+            ),
+            r#"{"vendor":"Anthropic","model_name":"Claude","model_family":"Claude"}"#
+        );
+        assert_eq!(
+            normalize_identity_text(
+                r#"{"vendor": "AWS", "model_name": "Kiro", "model_family": "unknown"}"#
+            ),
+            r#"{"vendor": "Anthropic", "model_name": "Claude", "model_family": "Claude"}"#
+        );
+
+        let ordinary = r#"{"cloud_vendor":"Amazon Web Services","service":"S3"}"#;
+        assert_eq!(normalize_identity_text(ordinary), ordinary);
+    }
+
+    #[test]
     fn empty_is_empty() {
         assert_eq!(normalize_identity_text(""), "");
     }
@@ -252,6 +370,23 @@ mod tests {
         let mut f = IdentityStreamFilter::default();
         let out = format!("{}{}", f.push("I am Kiro here"), f.finish());
         assert_eq!(out, "I am Claude here");
+    }
+
+    #[test]
+    fn stream_filter_preserves_kiro_word_boundaries_across_chunks() {
+        fn stream(chunks: &[&str]) -> String {
+            let mut filter = IdentityStreamFilter::default();
+            let mut output = String::new();
+            for chunk in chunks {
+                output.push_str(&filter.push(chunk));
+            }
+            output.push_str(&filter.finish());
+            output
+        }
+
+        assert_eq!(stream(&["Kiro", "n"]), "Kiron");
+        assert_eq!(stream(&["x", "Kiro "]), "xKiro ");
+        assert_eq!(stream(&["Kiro", ", ok"]), "Claude, ok");
     }
 
     #[test]
@@ -298,6 +433,80 @@ mod tests {
                 f.finish()
             );
             assert_eq!(out, expected, "split at byte {split}");
+        }
+    }
+
+    #[test]
+    fn stream_filter_handles_every_split_of_identity_vendor_json() {
+        for (source, expected) in [
+            (
+                r#"{"vendor":"Amazon Web Services","model_name":"Claude"}"#,
+                r#"{"vendor":"Anthropic","model_name":"Claude"}"#,
+            ),
+            (
+                r#"{"vendor": "Amazon Web Services", "model_name": "Claude"}"#,
+                r#"{"vendor": "Anthropic", "model_name": "Claude"}"#,
+            ),
+            (
+                r#"{"vendor":"Claude","model_name":"Claude","model_family":"unknown"}"#,
+                r#"{"vendor":"Anthropic","model_name":"Claude","model_family":"Claude"}"#,
+            ),
+            (
+                r#"{"vendor": "Claude", "model_name": "Claude", "model_family": "unknown"}"#,
+                r#"{"vendor": "Anthropic", "model_name": "Claude", "model_family": "Claude"}"#,
+            ),
+            (
+                r#"{"vendor":"Kiro","model_name":"Kiro","model_family":"unknown","version":"unknown"}"#,
+                r#"{"vendor":"Anthropic","model_name":"Claude","model_family":"Claude","version":"unknown"}"#,
+            ),
+            (
+                r#"{"vendor":"Amazon","model_name":"Kiro","model_family":"Kiro","version":"unknown"}"#,
+                r#"{"vendor":"Anthropic","model_name":"Claude","model_family":"Claude","version":"unknown"}"#,
+            ),
+            (
+                r#"{"vendor":"AWS","model_name":"Kiro","model_family":"unknown","version":"unknown"}"#,
+                r#"{"vendor":"Anthropic","model_name":"Claude","model_family":"Claude","version":"unknown"}"#,
+            ),
+            (
+                r#"{"vendor": "AWS", "model_name": "Kiro", "model_family": "unknown", "version": "unknown"}"#,
+                r#"{"vendor": "Anthropic", "model_name": "Claude", "model_family": "Claude", "version": "unknown"}"#,
+            ),
+        ] {
+            for split in source
+                .char_indices()
+                .map(|(index, _)| index)
+                .chain([source.len()])
+            {
+                let mut filter = IdentityStreamFilter::default();
+                let output = format!(
+                    "{}{}{}",
+                    filter.push(&source[..split]),
+                    filter.push(&source[split..]),
+                    filter.finish()
+                );
+                assert_eq!(output, expected, "split at byte {split}");
+            }
+
+            let mut filter = IdentityStreamFilter::default();
+            let mut output = String::new();
+            for character in source.chars() {
+                output.push_str(&filter.push(&character.to_string()));
+            }
+            output.push_str(&filter.finish());
+            assert_eq!(output, expected, "逐字符 chunk 也必须完成身份归一化");
+
+            let unicode_source = format!("前缀🙂{source}后缀🚀");
+            let unicode_expected = format!("前缀🙂{expected}后缀🚀");
+            let mut filter = IdentityStreamFilter::default();
+            let mut output = String::new();
+            for character in unicode_source.chars() {
+                output.push_str(&filter.push(&character.to_string()));
+            }
+            output.push_str(&filter.finish());
+            assert_eq!(
+                output, unicode_expected,
+                "Unicode 包围并逐字符 chunk 也必须完成身份归一化"
+            );
         }
     }
 

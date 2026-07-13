@@ -362,6 +362,8 @@ pub struct AdminService {
     trace_store: Option<crate::admin::trace_db::SharedTraceStore>,
     /// 用量日志记录器（用于日志治理：保留天数运行时可改）
     usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
+    /// 失败请求完整脱敏现场存储与容量治理。
+    error_snapshot_store: Option<crate::admin::error_snapshot_db::SharedErrorSnapshotStore>,
     /// 与 Anthropic 路由共享的 KiroProvider，用于 Admin 显式响应测试。
     kiro_provider: Option<Arc<KiroProvider>>,
     /// 与 Anthropic 路由共享的缓存计量器，用于运行时策略控制。
@@ -681,6 +683,46 @@ fn subscription_type_from_title(title: Option<&str>) -> &'static str {
 /// 指向本 fork，与 binary_update.rs 的 GITHUB_REPO 保持一致。
 const GITHUB_RELEASES_REPO: &str = "3370842391/kiro.rs-admin";
 
+fn validate_log_governance_request(
+    req: &SetLogGovernanceConfigRequest,
+) -> Result<(), AdminServiceError> {
+    for (name, value, max) in [
+        (
+            "errorSnapshotRetentionDays",
+            req.error_snapshot_retention_days.map(u64::from),
+            3650,
+        ),
+        (
+            "errorSnapshotMaxStorageGb",
+            req.error_snapshot_max_storage_gb,
+            900,
+        ),
+        (
+            "errorSnapshotMinFreeDiskGb",
+            req.error_snapshot_min_free_disk_gb,
+            900,
+        ),
+    ] {
+        if let Some(value) = value
+            && !(1..=max).contains(&value)
+        {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "{name} 必须在 1..={max} 内: {value}"
+            )));
+        }
+    }
+    if let (Some(max_storage), Some(min_free)) = (
+        req.error_snapshot_max_storage_gb,
+        req.error_snapshot_min_free_disk_gb,
+    ) && max_storage.saturating_add(min_free) > 1000
+    {
+        return Err(AdminServiceError::InvalidCredential(
+            "errorSnapshotMaxStorageGb + errorSnapshotMinFreeDiskGb 不能超过 1000".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 impl AdminService {
     pub fn new(
         token_manager: Arc<MultiTokenManager>,
@@ -706,6 +748,7 @@ impl AdminService {
             social_sessions: Arc::new(Mutex::new(HashMap::new())),
             trace_store: None,
             usage_recorder: None,
+            error_snapshot_store: None,
             kiro_provider: None,
             cache_meter: None,
             model_profiles: None,
@@ -741,9 +784,11 @@ impl AdminService {
         mut self,
         trace_store: Option<crate::admin::trace_db::SharedTraceStore>,
         usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
+        error_snapshot_store: Option<crate::admin::error_snapshot_db::SharedErrorSnapshotStore>,
     ) -> Self {
         self.trace_store = trace_store;
         self.usage_recorder = usage_recorder;
+        self.error_snapshot_store = error_snapshot_store;
         self
     }
 
@@ -2700,6 +2745,14 @@ impl AdminService {
     /// 读取日志治理配置（trace 开关 / trace 保留天数 / usage 保留天数）
     pub fn get_log_governance_config(&self) -> LogGovernanceConfigResponse {
         let cfg = self.token_manager.config();
+        let snapshot_policy = self
+            .error_snapshot_store
+            .as_ref()
+            .map(|store| store.policy())
+            .unwrap_or_else(|| {
+                crate::admin::error_snapshot_db::ErrorSnapshotPolicy::from_config(&cfg)
+            });
+        const GIB: u64 = 1024 * 1024 * 1024;
         LogGovernanceConfigResponse {
             trace_enabled: self
                 .trace_store
@@ -2716,6 +2769,12 @@ impl AdminService {
                 .as_ref()
                 .map(|r| r.retention_days() as u32)
                 .unwrap_or(cfg.usage_log_retention_days),
+            error_snapshot_enabled: snapshot_policy.enabled,
+            error_snapshot_retention_days: snapshot_policy.retention_days,
+            error_snapshot_max_storage_gb: snapshot_policy.max_storage_bytes / GIB,
+            error_snapshot_capture_recovered: snapshot_policy.capture_recovered,
+            error_snapshot_capture_bodies: snapshot_policy.capture_bodies,
+            error_snapshot_min_free_disk_gb: snapshot_policy.min_free_disk_bytes / GIB,
         }
     }
 
@@ -2728,12 +2787,18 @@ impl AdminService {
         if req.trace_enabled.is_none()
             && req.trace_retention_days.is_none()
             && req.usage_log_retention_days.is_none()
+            && req.error_snapshot_enabled.is_none()
+            && req.error_snapshot_retention_days.is_none()
+            && req.error_snapshot_max_storage_gb.is_none()
+            && req.error_snapshot_capture_recovered.is_none()
+            && req.error_snapshot_capture_bodies.is_none()
+            && req.error_snapshot_min_free_disk_gb.is_none()
         {
             return Err(AdminServiceError::InvalidCredential(
-                "至少提供 traceEnabled / traceRetentionDays / usageLogRetentionDays 一个字段"
-                    .to_string(),
+                "至少提供一个日志治理字段".to_string(),
             ));
         }
+        validate_log_governance_request(&req)?;
         // 校验范围：保留天数 1..=365
         for (name, v) in [
             ("traceRetentionDays", req.trace_retention_days),
@@ -2764,6 +2829,35 @@ impl AdminService {
             if let Some(r) = &self.usage_recorder {
                 r.set_retention_days(days as i64);
             }
+        }
+        if let Some(store) = &self.error_snapshot_store {
+            const GIB: u64 = 1024 * 1024 * 1024;
+            let mut policy = store.policy();
+            if let Some(value) = req.error_snapshot_enabled {
+                policy.enabled = value;
+            }
+            if let Some(value) = req.error_snapshot_retention_days {
+                policy.retention_days = value;
+            }
+            if let Some(value) = req.error_snapshot_max_storage_gb {
+                policy.max_storage_bytes = value.saturating_mul(GIB);
+            }
+            if let Some(value) = req.error_snapshot_capture_recovered {
+                policy.capture_recovered = value;
+            }
+            if let Some(value) = req.error_snapshot_capture_bodies {
+                policy.capture_bodies = value;
+            }
+            if let Some(value) = req.error_snapshot_min_free_disk_gb {
+                policy.min_free_disk_bytes = value.saturating_mul(GIB);
+            }
+            if policy.max_storage_bytes / GIB + policy.min_free_disk_bytes / GIB > 1000 {
+                return Err(AdminServiceError::InvalidCredential(
+                    "errorSnapshotMaxStorageGb + errorSnapshotMinFreeDiskGb 不能超过 1000"
+                        .to_string(),
+                ));
+            }
+            store.set_policy(policy);
         }
 
         // 持久化到 config.json
@@ -2796,6 +2890,24 @@ impl AdminService {
         }
         if let Some(v) = req.usage_log_retention_days {
             config.usage_log_retention_days = v;
+        }
+        if let Some(v) = req.error_snapshot_enabled {
+            config.error_snapshot_enabled = v;
+        }
+        if let Some(v) = req.error_snapshot_retention_days {
+            config.error_snapshot_retention_days = v;
+        }
+        if let Some(v) = req.error_snapshot_max_storage_gb {
+            config.error_snapshot_max_storage_gb = v;
+        }
+        if let Some(v) = req.error_snapshot_capture_recovered {
+            config.error_snapshot_capture_recovered = v;
+        }
+        if let Some(v) = req.error_snapshot_capture_bodies {
+            config.error_snapshot_capture_bodies = v;
+        }
+        if let Some(v) = req.error_snapshot_min_free_disk_gb {
+            config.error_snapshot_min_free_disk_gb = v;
         }
         config
             .save()
@@ -4172,6 +4284,41 @@ impl AdminService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validates_error_snapshot_governance_ranges() {
+        assert!(
+            validate_log_governance_request(&SetLogGovernanceConfigRequest {
+                error_snapshot_retention_days: Some(90),
+                error_snapshot_max_storage_gb: Some(200),
+                error_snapshot_min_free_disk_gb: Some(100),
+                ..Default::default()
+            })
+            .is_ok()
+        );
+
+        for request in [
+            SetLogGovernanceConfigRequest {
+                error_snapshot_retention_days: Some(0),
+                ..Default::default()
+            },
+            SetLogGovernanceConfigRequest {
+                error_snapshot_max_storage_gb: Some(0),
+                ..Default::default()
+            },
+            SetLogGovernanceConfigRequest {
+                error_snapshot_min_free_disk_gb: Some(0),
+                ..Default::default()
+            },
+            SetLogGovernanceConfigRequest {
+                error_snapshot_max_storage_gb: Some(900),
+                error_snapshot_min_free_disk_gb: Some(101),
+                ..Default::default()
+            },
+        ] {
+            assert!(validate_log_governance_request(&request).is_err());
+        }
+    }
 
     #[test]
     fn cache_policy_response_calculates_capacity_usage() {

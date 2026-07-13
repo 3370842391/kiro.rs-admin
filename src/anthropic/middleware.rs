@@ -11,6 +11,7 @@ use axum::{
 };
 
 use crate::admin::client_keys::SharedClientKeyManager;
+use crate::admin::error_snapshot_db::SharedErrorSnapshotStore;
 use crate::admin::trace_db::{SharedTraceStore, TraceKeySource};
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
 use crate::common::auth;
@@ -50,6 +51,8 @@ pub struct AppState {
     pub cache_meter: Option<SharedCacheMeter>,
     /// 请求链路追踪存储（SQLite，可选）
     pub trace_store: Option<SharedTraceStore>,
+    /// 失败请求完整脱敏现场存储。
+    pub error_snapshot_store: Option<SharedErrorSnapshotStore>,
     /// 模型映射（OpenAI 兼容层请求时把源模型名转发到目标模型名）
     pub model_mappings: Option<crate::admin::SharedModelMappingManager>,
     /// 模型能力与身份资料。
@@ -72,6 +75,7 @@ impl AppState {
             usage_aggregator: None,
             cache_meter: None,
             trace_store: None,
+            error_snapshot_store: None,
             model_mappings: None,
             model_profiles: None,
         }
@@ -105,6 +109,11 @@ impl AppState {
     /// 注入链路追踪存储
     pub fn with_trace_store(mut self, store: Option<SharedTraceStore>) -> Self {
         self.trace_store = store;
+        self
+    }
+
+    pub fn with_error_snapshot_store(mut self, store: Option<SharedErrorSnapshotStore>) -> Self {
+        self.error_snapshot_store = store;
         self
     }
 

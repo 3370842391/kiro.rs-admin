@@ -882,18 +882,22 @@ mod tests {
             Some("eu-central-1")
         );
         assert_eq!(
-            region_from_profile_arn(
-                "arn:aws:codewhisperer:us-east-1:123456789012:profile/ABC"
-            )
-            .as_deref(),
+            region_from_profile_arn("arn:aws:codewhisperer:us-east-1:123456789012:profile/ABC")
+                .as_deref(),
             Some("us-east-1")
         );
         // BuilderID 占位符 → None
         assert_eq!(region_from_profile_arn(BUILDER_ID_PROFILE_ARN), None);
         // 服务名不符 / 格式不符 → None
-        assert_eq!(region_from_profile_arn("arn:aws:s3:us-east-1:x:bucket"), None);
+        assert_eq!(
+            region_from_profile_arn("arn:aws:s3:us-east-1:x:bucket"),
+            None
+        );
         assert_eq!(region_from_profile_arn("not-an-arn"), None);
-        assert_eq!(region_from_profile_arn("arn:aws:codewhisperer::x:profile/y"), None);
+        assert_eq!(
+            region_from_profile_arn("arn:aws:codewhisperer::x:profile/y"),
+            None
+        );
     }
 
     #[test]

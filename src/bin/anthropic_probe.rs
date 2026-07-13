@@ -94,6 +94,36 @@ fn classify_required_tool(response: &Value, name: &str) -> ProbeResult {
     }
 }
 
+fn classify_required_tool_contract(response: &Value, name: &str, nonce: &str) -> ProbeResult {
+    if classify_required_tool(response, name) != ProbeResult::Pass {
+        return ProbeResult::Fail(format!(
+            "required tool {name} name/order/stop_reason did not match"
+        ));
+    }
+    let Some(input) = response["content"]
+        .as_array()
+        .and_then(|blocks| {
+            blocks.iter().find(|block| {
+                !matches!(
+                    block["type"].as_str(),
+                    Some("thinking" | "redacted_thinking")
+                )
+            })
+        })
+        .and_then(|block| block["input"].as_object())
+    else {
+        return ProbeResult::Fail("required tool input was not an object".into());
+    };
+    if input.len() == 2
+        && input.get("value").and_then(Value::as_str) == Some("local-check")
+        && input.get("nonce").and_then(Value::as_str) == Some(nonce)
+    {
+        ProbeResult::Pass
+    } else {
+        ProbeResult::Fail("required tool input did not satisfy fixed schema values".into())
+    }
+}
+
 fn classify_exact_text(response: &Value, expected: &str) -> ProbeResult {
     let Some(blocks) = response["content"].as_array() else {
         return ProbeResult::Fail("response content is not an array".into());
@@ -149,6 +179,92 @@ fn classify_sse(events: &[Value]) -> ProbeResult {
         }
         _ => ProbeResult::Fail("SSE event order is incomplete or invalid".into()),
     }
+}
+
+fn classify_strict_anthropic_wire(wire: &str) -> Result<(), String> {
+    let normalized = wire.replace("\r\n", "\n");
+    let mut message_started = false;
+    let mut message_delta_seen = false;
+    let mut message_stopped = false;
+    let mut open_blocks = std::collections::HashSet::new();
+    let mut seen_blocks = std::collections::HashSet::new();
+
+    for frame in normalized.split("\n\n").filter(|frame| !frame.is_empty()) {
+        if message_stopped {
+            return Err("event appeared after message_stop".into());
+        }
+        let mut event_name = None;
+        let mut data = None;
+        for line in frame.lines() {
+            if line.starts_with(':') {
+                return Err("SSE comment is not allowed in strict message stream".into());
+            }
+            if let Some(value) = line.strip_prefix("event: ") {
+                if event_name.replace(value).is_some() {
+                    return Err("duplicate event field in SSE frame".into());
+                }
+            } else if let Some(value) = line.strip_prefix("data: ") {
+                if data.replace(value).is_some() {
+                    return Err("multiple data fields are not supported by strict probe".into());
+                }
+            } else if !line.is_empty() {
+                return Err("unsupported SSE field".into());
+            }
+        }
+        let event_name = event_name.ok_or("SSE frame is missing event field")?;
+        let payload: Value = serde_json::from_str(data.ok_or("SSE frame is missing data field")?)
+            .map_err(|error| format!("invalid SSE data: {error}"))?;
+        if payload["type"].as_str() != Some(event_name) {
+            return Err("SSE event field does not match data.type".into());
+        }
+
+        match event_name {
+            "message_start" if !message_started && !message_delta_seen => {
+                message_started = true;
+            }
+            "ping" if message_started && !message_delta_seen => {}
+            "content_block_start" if message_started && !message_delta_seen => {
+                let index = payload["index"]
+                    .as_i64()
+                    .ok_or("content_block_start is missing integer index")?;
+                if !seen_blocks.insert(index) || !open_blocks.insert(index) {
+                    return Err(format!("content block {index} started more than once"));
+                }
+            }
+            "content_block_delta" if message_started && !message_delta_seen => {
+                let index = payload["index"]
+                    .as_i64()
+                    .ok_or("content_block_delta is missing integer index")?;
+                if !open_blocks.contains(&index) {
+                    return Err(format!(
+                        "content block {index} delta arrived outside open block"
+                    ));
+                }
+            }
+            "content_block_stop" if message_started && !message_delta_seen => {
+                let index = payload["index"]
+                    .as_i64()
+                    .ok_or("content_block_stop is missing integer index")?;
+                if !open_blocks.remove(&index) {
+                    return Err(format!(
+                        "content block {index} stopped without matching start"
+                    ));
+                }
+            }
+            "message_delta" if message_started && !message_delta_seen && open_blocks.is_empty() => {
+                message_delta_seen = true;
+            }
+            "message_stop" if message_delta_seen && open_blocks.is_empty() => {
+                message_stopped = true;
+            }
+            _ => return Err(format!("invalid SSE event order at {event_name}")),
+        }
+    }
+
+    if !message_started || !message_delta_seen || !message_stopped || !open_blocks.is_empty() {
+        return Err("SSE stream ended before the strict terminal sequence".into());
+    }
+    Ok(())
 }
 
 fn classify_local_text_sse(events: &[Value], expected: &str) -> ProbeResult {
@@ -328,11 +444,13 @@ async fn post_stream_events(
 
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
+    let mut wire_bytes = Vec::new();
     let mut events = Vec::new();
     let mut transport_yields = 0usize;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| error.to_string())?;
         transport_yields += 1;
+        wire_bytes.extend_from_slice(&chunk);
         buffer.push_str(&String::from_utf8_lossy(&chunk));
         while let Some(pos) = buffer.find("\n\n") {
             let frame = buffer[..pos].to_string();
@@ -349,6 +467,9 @@ async fn post_stream_events(
     if !buffer.trim().is_empty() {
         return Err("SSE response ended with an incomplete frame".into());
     }
+    let wire = String::from_utf8(wire_bytes)
+        .map_err(|error| format!("SSE response was not valid UTF-8: {error}"))?;
+    classify_strict_anthropic_wire(&wire)?;
     Ok(StreamCapture {
         events,
         transport_yields,
@@ -376,6 +497,7 @@ async fn thinking_probe(client: &reqwest::Client, args: &Args, key: &str) -> Pro
 
 async fn tool_probe(client: &reqwest::Client, args: &Args, key: &str) -> ProbeResult {
     let name = "probe_echo";
+    let nonce = Uuid::new_v4().to_string();
     match post_message(
         client,
         args,
@@ -383,14 +505,18 @@ async fn tool_probe(client: &reqwest::Client, args: &Args, key: &str) -> ProbeRe
         json!({
             "model": args.model,
             "max_tokens": 256,
-            "messages": [{"role": "user", "content": "Call the provided tool with value local-check."}],
+            "messages": [{"role": "user", "content": "Call the provided tool now and follow its input schema exactly."}],
             "tools": [{
                 "name": name,
                 "description": "Return the provided value.",
                 "input_schema": {
                     "type": "object",
-                    "properties": {"value": {"type": "string"}},
-                    "required": ["value"]
+                    "properties": {
+                        "value": {"type": "string", "const": "local-check"},
+                        "nonce": {"type": "string", "const": nonce.clone()}
+                    },
+                    "required": ["value", "nonce"],
+                    "additionalProperties": false
                 }
             }],
             "tool_choice": {"type": "tool", "name": name}
@@ -398,7 +524,7 @@ async fn tool_probe(client: &reqwest::Client, args: &Args, key: &str) -> ProbeRe
     )
     .await
     {
-        Ok(value) => classify_required_tool(&value, name),
+        Ok(value) => classify_required_tool_contract(&value, name, &nonce),
         Err(error) => ProbeResult::Fail(error),
     }
 }
@@ -520,6 +646,65 @@ async fn strict_json_stream_probe(client: &reqwest::Client, args: &Args, key: &s
                 "content": "You must reply with exactly one minified JSON object and no markdown, no explanation. Schema: {\"a\": string, \"b\": number, \"c\": string}. Set a to the reverse of 'testz'. Set b to 29 + 8. Set c to 'PROBE-JSON'."
             }]
         }),
+    )
+    .await
+    {
+        Ok(capture) => classify_strict_json_stream_capture(&capture),
+        Err(error) => ProbeResult::Fail(error),
+    }
+}
+
+fn structured_output_request(model: &str, stream: bool) -> Value {
+    json!({
+        "model": model,
+        "max_tokens": 128,
+        "stream": stream,
+        "messages": [{
+            "role": "user",
+            "content": "Set a to the reverse of 'testz', b to 29 + 8, and c to 'PROBE-JSON'."
+        }],
+        "output_config": {
+            "format": {
+                "type": "json_schema",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "a": {"type": "string", "const": "ztset"},
+                        "b": {"type": "integer", "const": 37},
+                        "c": {"type": "string", "const": "PROBE-JSON"}
+                    },
+                    "required": ["a", "b", "c"],
+                    "additionalProperties": false
+                }
+            }
+        }
+    })
+}
+
+async fn structured_output_probe(client: &reqwest::Client, args: &Args, key: &str) -> ProbeResult {
+    match post_message(
+        client,
+        args,
+        key,
+        structured_output_request(&args.model, false),
+    )
+    .await
+    {
+        Ok(value) => classify_strict_json(&value),
+        Err(error) => ProbeResult::Fail(error),
+    }
+}
+
+async fn structured_output_stream_probe(
+    client: &reqwest::Client,
+    args: &Args,
+    key: &str,
+) -> ProbeResult {
+    match post_stream_events(
+        client,
+        args,
+        key,
+        structured_output_request(&args.model, true),
     )
     .await
     {
@@ -716,6 +901,14 @@ async fn main() {
             strict_json_stream_probe(&client, &args, &api_key).await,
         ),
         (
+            "structured_output",
+            structured_output_probe(&client, &args, &api_key).await,
+        ),
+        (
+            "structured_output_stream",
+            structured_output_stream_probe(&client, &args, &api_key).await,
+        ),
+        (
             "ping_health",
             ping_health_probe(&client, &args, &api_key).await,
         ),
@@ -788,6 +981,62 @@ mod tests {
             classify_required_tool(&text_first, "probe_echo"),
             ProbeResult::Fail(_)
         ));
+    }
+
+    #[test]
+    fn required_tool_contract_classifier_checks_schema_values_and_stop_reason() {
+        let valid = json!({
+            "content": [{
+                "type": "tool_use",
+                "name": "probe_echo",
+                "input": {"value": "local-check", "nonce": "nonce-42"}
+            }],
+            "stop_reason": "tool_use"
+        });
+        assert_eq!(
+            classify_required_tool_contract(&valid, "probe_echo", "nonce-42"),
+            ProbeResult::Pass
+        );
+
+        for invalid in [
+            json!({
+                "content": [{
+                    "type": "tool_use",
+                    "name": "probe_echo",
+                    "input": {"value": "wrong", "nonce": "nonce-42"}
+                }],
+                "stop_reason": "tool_use"
+            }),
+            json!({
+                "content": [{
+                    "type": "tool_use",
+                    "name": "probe_echo",
+                    "input": {"value": "local-check", "nonce": "wrong"}
+                }],
+                "stop_reason": "tool_use"
+            }),
+            json!({
+                "content": [{
+                    "type": "tool_use",
+                    "name": "probe_echo",
+                    "input": {"value": "local-check", "nonce": "nonce-42", "extra": true}
+                }],
+                "stop_reason": "tool_use"
+            }),
+            json!({
+                "content": [{
+                    "type": "tool_use",
+                    "name": "probe_echo",
+                    "input": {"value": "local-check", "nonce": "nonce-42"}
+                }],
+                "stop_reason": "end_turn"
+            }),
+        ] {
+            assert!(matches!(
+                classify_required_tool_contract(&invalid, "probe_echo", "nonce-42"),
+                ProbeResult::Fail(_)
+            ));
+        }
     }
 
     #[test]
@@ -908,6 +1157,19 @@ mod tests {
     }
 
     #[test]
+    fn structured_output_probe_request_sends_format_for_both_response_modes() {
+        for stream in [false, true] {
+            let body = structured_output_request("claude-opus-4-8", stream);
+            assert_eq!(body["stream"], stream);
+            assert_eq!(body["output_config"]["format"]["type"], "json_schema");
+            assert_eq!(
+                body["output_config"]["format"]["schema"]["required"],
+                json!(["a", "b", "c"])
+            );
+        }
+    }
+
+    #[test]
     fn latency_cv_is_zero_for_stable_samples() {
         assert_eq!(coefficient_of_variation(&[10.0, 10.0, 10.0]), 0.0);
         let cv = coefficient_of_variation(&[10.0, 11.0, 9.0]);
@@ -932,6 +1194,33 @@ mod tests {
         ];
         assert_eq!(classify_sse(&events), ProbeResult::Pass);
         assert!(matches!(classify_sse(&events[..4]), ProbeResult::Fail(_)));
+    }
+
+    #[test]
+    fn strict_wire_probe_rejects_events_before_message_start() {
+        let wire = concat!(
+            ": connected\n\n",
+            "event: ping\ndata: {\"type\":\"ping\"}\n\n",
+            "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\"}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        );
+
+        assert!(classify_strict_anthropic_wire(wire).is_err());
+    }
+
+    #[test]
+    fn strict_wire_probe_accepts_paired_content_blocks_and_one_terminal() {
+        let wire = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\"}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        );
+
+        assert_eq!(classify_strict_anthropic_wire(wire), Ok(()));
     }
 
     #[test]

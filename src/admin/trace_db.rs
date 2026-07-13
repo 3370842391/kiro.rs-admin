@@ -138,6 +138,9 @@ pub struct TraceRecord {
     /// 与 reasoning_effort 独立：请求了推理但未解析出具体档位时仍为 true。
     #[serde(default)]
     pub thinking: bool,
+    /// 失败请求对应的持久化错误快照 ID。
+    #[serde(default)]
+    pub snapshot_id: Option<String>,
     /// 每跳明细
     pub attempts: Vec<TraceAttempt>,
 }
@@ -173,8 +176,31 @@ pub fn truncate_snippet(body: &str) -> Option<String> {
 }
 
 /// 链路上报接收端：provider 在重试循环里每跳调用 [`Self::on_attempt`]
+pub enum TraceDiagnosticEvent<'a> {
+    UpstreamRequest {
+        attempt: u32,
+        credential_id: u64,
+        endpoint: &'a str,
+        body: &'a str,
+    },
+    UpstreamResponse {
+        attempt: u32,
+        credential_id: u64,
+        endpoint: &'a str,
+        status: u16,
+        body: &'a str,
+    },
+    NetworkError {
+        attempt: u32,
+        credential_id: u64,
+        endpoint: &'a str,
+        message: &'a str,
+    },
+}
+
 pub trait TraceSink: Send + Sync {
     fn on_attempt(&self, attempt: TraceAttempt);
+    fn on_diagnostic(&self, _event: TraceDiagnosticEvent<'_>) {}
 }
 
 /// 查询过滤条件
@@ -267,7 +293,7 @@ impl TraceStore {
         // (列名, 定义) —— 与 SCHEMA 中新增列保持一致
         // 注意 key_source 不带 NOT NULL：老库已有行需先以 NULL 添加再回填（SQLite ALTER ADD COLUMN
         // NOT NULL 不带常量 DEFAULT 时无法对已有行赋值）。新插入永远写入合法值。
-        let columns: [(&str, &str); 11] = [
+        let columns: [(&str, &str); 12] = [
             ("input_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("output_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"),
@@ -279,6 +305,7 @@ impl TraceStore {
             ("reasoning_effort", "TEXT"),
             ("context_1m", "INTEGER NOT NULL DEFAULT 0"),
             ("thinking", "INTEGER NOT NULL DEFAULT 0"),
+            ("snapshot_id", "TEXT"),
         ];
         let key_source_added = !existing.contains("key_source");
         for (name, def) in columns {
@@ -293,6 +320,10 @@ impl TraceStore {
                  THEN 'masterApiKey' ELSE 'clientKey' END WHERE key_source IS NULL;",
             )?;
         }
+        // 必须在旧库补列之后创建，否则旧表尚无 snapshot_id 时索引会创建失败。
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_traces_snapshot ON traces(snapshot_id);",
+        )?;
         Ok(())
     }
 
@@ -340,8 +371,8 @@ impl TraceStore {
                  is_stream, final_status, final_credential_id, error_type, error_message, \
                  total_attempts, duration_ms, interrupted_after_bytes, \
                  input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, \
-                 credits, first_token_ms, upstream_first_byte_ms, reasoning_effort, context_1m, thinking) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
+                 credits, first_token_ms, upstream_first_byte_ms, reasoning_effort, context_1m, thinking, snapshot_id) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",
                 rusqlite::params![
                     rec.trace_id,
                     rec.ts,
@@ -367,6 +398,7 @@ impl TraceStore {
                     rec.reasoning_effort,
                     rec.context_1m as i64,
                     rec.thinking as i64,
+                    rec.snapshot_id,
                 ],
             )?;
             // 用「发射顺序下标」作为 attempt 主键分量，而非 provider 的重试轮次计数：
@@ -404,6 +436,22 @@ impl TraceStore {
                 tracing::warn!("trace 写入失败: {}", e);
             }
         }
+    }
+
+    /// 把已落库的 trace 与错误快照关联。相同关联可重复写入，冲突关联 fail-closed。
+    pub fn link_snapshot(&self, trace_id: &str, snapshot_id: &str) -> bool {
+        self.conn
+            .lock()
+            .execute(
+                "UPDATE traces SET snapshot_id = ?1
+                 WHERE trace_id = ?2 AND (snapshot_id IS NULL OR snapshot_id = ?1)",
+                rusqlite::params![snapshot_id, trace_id],
+            )
+            .map(|changed| changed > 0)
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, %trace_id, %snapshot_id, "回链错误快照失败");
+                false
+            })
     }
 
     /// 分页查询：返回 (当前页记录, 符合条件的总数)。仅 warn 失败，返回 (空, 0)。
@@ -504,7 +552,7 @@ impl TraceStore {
             "SELECT trace_id, ts, key_id, key_source, model, is_stream, final_status, final_credential_id, \
              error_type, error_message, total_attempts, duration_ms, interrupted_after_bytes, \
              input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits, first_token_ms, \
-             upstream_first_byte_ms, reasoning_effort, context_1m, thinking \
+             upstream_first_byte_ms, reasoning_effort, context_1m, thinking, snapshot_id \
              FROM traces {} ORDER BY ts_epoch DESC LIMIT {} OFFSET {}",
             where_sql, limit, q.offset
         );
@@ -535,6 +583,7 @@ impl TraceStore {
                 reasoning_effort: row.get::<_, Option<String>>(20)?,
                 context_1m: row.get::<_, i64>(21)? != 0,
                 thinking: row.get::<_, i64>(22)? != 0,
+                snapshot_id: row.get(23)?,
                 attempts: Vec::new(),
             })
         })?;
@@ -751,7 +800,8 @@ CREATE TABLE IF NOT EXISTS traces (
     upstream_first_byte_ms INTEGER,
     reasoning_effort  TEXT,
     context_1m        INTEGER NOT NULL DEFAULT 0,
-    thinking          INTEGER NOT NULL DEFAULT 0
+    thinking          INTEGER NOT NULL DEFAULT 0,
+    snapshot_id       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_traces_ts ON traces(ts_epoch DESC);
 CREATE INDEX IF NOT EXISTS idx_traces_status ON traces(final_status);
@@ -815,6 +865,7 @@ mod tests {
             reasoning_effort: None,
             context_1m: false,
             thinking: false,
+            snapshot_id: None,
             attempts: vec![
                 TraceAttempt {
                     attempt: 0,
@@ -877,6 +928,47 @@ mod tests {
         assert_eq!(out[0].cache_creation_tokens, 0);
         assert_eq!(out[0].first_token_ms, Some(3200));
         assert_eq!(out[0].upstream_first_byte_ms, Some(2800));
+    }
+
+    #[test]
+    fn migrates_snapshot_id_and_round_trips_it() {
+        let store = TraceStore::open_in_memory().unwrap();
+        let mut rec = sample(TraceSample {
+            trace_id: "trace-with-snapshot",
+            status: "error",
+            credential_id: 7,
+            model: "claude-opus-4-8",
+        });
+        rec.snapshot_id = Some("snap-7".into());
+        store.insert(&rec);
+        let out = store.query(&TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(out[0].snapshot_id.as_deref(), Some("snap-7"));
+    }
+
+    #[test]
+    fn links_existing_trace_idempotently() {
+        let store = TraceStore::open_in_memory().unwrap();
+        let rec = sample(TraceSample {
+            trace_id: "trace-link",
+            status: "error",
+            credential_id: 7,
+            model: "claude-opus-4-8",
+        });
+        store.insert(&rec);
+        assert!(store.link_snapshot("trace-link", "snap-link"));
+        assert!(store.link_snapshot("trace-link", "snap-link"));
+        assert_eq!(
+            store.query(&TraceQuery {
+                limit: 10,
+                ..Default::default()
+            })[0]
+                .snapshot_id
+                .as_deref(),
+            Some("snap-link")
+        );
     }
 
     #[test]

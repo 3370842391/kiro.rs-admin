@@ -336,6 +336,29 @@ pub(crate) fn append_strict_json_retry_instruction(request_body: &str) -> Option
     serde_json::to_string(&value).ok()
 }
 
+pub(crate) fn append_structured_output_instruction(
+    request_body: &str,
+    format: &super::types::OutputFormat,
+) -> Option<String> {
+    if format.format_type != "json_schema" {
+        return None;
+    }
+    let schema = serde_json::to_string(&format.schema).ok()?;
+    if schema.len() > 64 * 1024 {
+        return None;
+    }
+    let mut value: serde_json::Value = serde_json::from_str(request_body).ok()?;
+    let content = value
+        .pointer_mut("/conversationState/currentMessage/userInputMessage/content")?
+        .as_str()?
+        .to_owned();
+    *value.pointer_mut("/conversationState/currentMessage/userInputMessage/content")? =
+        serde_json::Value::String(format!(
+            "{content}\n\nReturn exactly one JSON value matching this JSON Schema. Do not include markdown, explanation, or text outside the JSON. Schema: {schema}"
+        ));
+    serde_json::to_string(&value).ok()
+}
+
 pub(crate) fn json_satisfies_explicit_constraints(req: &MessagesRequest, json: &str) -> bool {
     let latest_user_text = req
         .messages
@@ -908,6 +931,7 @@ mod tests {
         let mut with_output_config = request(None, "ping");
         with_output_config.output_config = Some(super::super::types::OutputConfig {
             effort: "low".into(),
+            format: None,
         });
         assert_eq!(local_ping_answer(&with_output_config, true), None);
 
@@ -1098,6 +1122,39 @@ mod tests {
             .unwrap();
         assert!(current.starts_with("current"));
         assert!(current.contains("complete JSON"));
+    }
+
+    #[test]
+    fn structured_output_instruction_adds_schema_only_to_current_message() {
+        let original = json!({
+            "conversationState": {
+                "history": [{"userInputMessage": {"content": "history"}}],
+                "currentMessage": {"userInputMessage": {"content": "current"}}
+            }
+        });
+        let format = super::super::types::OutputFormat {
+            format_type: "json_schema".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {"answer": {"type": "integer"}},
+                "required": ["answer"],
+                "additionalProperties": false
+            }),
+        };
+
+        let updated = append_structured_output_instruction(&original.to_string(), &format).unwrap();
+        let updated: serde_json::Value = serde_json::from_str(&updated).unwrap();
+        assert_eq!(
+            updated["conversationState"]["history"][0]["userInputMessage"]["content"],
+            "history"
+        );
+        let current = updated["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+            .as_str()
+            .unwrap();
+        assert!(current.starts_with("current"));
+        assert!(current.contains("exactly one JSON value"));
+        assert!(current.contains("\"required\":[\"answer\"]"));
+        assert!(!current.contains("```"));
     }
 
     #[test]

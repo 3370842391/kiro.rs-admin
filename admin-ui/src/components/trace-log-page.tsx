@@ -22,6 +22,7 @@ import {
   DropdownMenuTrigger,
   DropdownMenuContent,
   DropdownMenuLabel,
+  DropdownMenuSeparator,
 } from '@/components/ui/dropdown-menu'
 import {
   Tooltip,
@@ -46,6 +47,7 @@ import {
 } from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { TraceAttempt, TraceQuery, TraceRecord } from '@/types/api'
+import { ErrorSnapshotDialog } from '@/components/error-snapshot-dialog'
 
 /** 失败分类 → 中文标签 + Badge 颜色 */
 function outcomeStyle(outcome: string): {
@@ -387,6 +389,7 @@ function ExpandedTraceRow({ rec }: { rec: TraceRecord }) {
 
 /** 展开后的链路详情：错误摘要 + 每跳时间线 */
 function ExpandedDetail({ rec }: { rec: TraceRecord }) {
+  const [snapshotOpen, setSnapshotOpen] = useState(false)
   return (
     <div className="space-y-3">
       {rec.errorMessage && (
@@ -398,6 +401,19 @@ function ExpandedDetail({ rec }: { rec: TraceRecord }) {
         <div className="text-[12px] text-muted-foreground">
           中断前已发送 {rec.interruptedAfterBytes} 字节
         </div>
+      )}
+      {rec.snapshotId && (
+        <>
+          <Button size="sm" variant="outline" onClick={() => setSnapshotOpen(true)}>
+            <AlertTriangle className="h-3.5 w-3.5" />
+            查看错误快照
+          </Button>
+          <ErrorSnapshotDialog
+            snapshotId={rec.snapshotId}
+            open={snapshotOpen}
+            onOpenChange={setSnapshotOpen}
+          />
+        </>
       )}
       <div className="text-[12px] font-medium text-muted-foreground">
         尝试链路（{rec.attempts.length} 次
@@ -445,15 +461,21 @@ function Select({
   )
 }
 
-/** 日志治理设置下拉：trace 启用开关 + trace 保留天数 + usage 保留天数 */
+/** 日志治理设置下拉：trace、usage 与错误快照的运行时治理。 */
 function GovernanceButton() {
   const [open, setOpen] = useState(false)
   const { data: cfg, isLoading } = useLogGovernanceConfig()
   const { mutate, isPending } = useSetLogGovernanceConfig()
   const [traceDays, setTraceDays] = useState('')
   const [usageDays, setUsageDays] = useState('')
+  const [snapshotDays, setSnapshotDays] = useState('')
+  const [snapshotMaxGb, setSnapshotMaxGb] = useState('')
+  const [snapshotMinFreeGb, setSnapshotMinFreeGb] = useState('')
 
   const enabled = cfg?.traceEnabled ?? true
+  const errorSnapshotEnabled = cfg?.errorSnapshotEnabled ?? true
+  const errorSnapshotCaptureRecovered = cfg?.errorSnapshotCaptureRecovered ?? true
+  const errorSnapshotCaptureBodies = cfg?.errorSnapshotCaptureBodies ?? true
 
   const save = (patch: Record<string, unknown>, ok: string) => {
     mutate(patch, {
@@ -462,19 +484,26 @@ function GovernanceButton() {
     })
   }
 
-  const submitDays = (
+  const submitNumber = (
     e: React.FormEvent,
-    field: 'traceRetentionDays' | 'usageLogRetentionDays',
+    field:
+      | 'traceRetentionDays'
+      | 'usageLogRetentionDays'
+      | 'errorSnapshotRetentionDays'
+      | 'errorSnapshotMaxStorageGb'
+      | 'errorSnapshotMinFreeDiskGb',
     raw: string,
+    max: number,
+    label: string,
     reset: () => void,
   ) => {
     e.preventDefault()
     const n = parseInt(raw, 10)
-    if (isNaN(n) || n < 1 || n > 365) {
-      toast.error('保留天数需在 1..=365')
+    if (isNaN(n) || n < 1 || n > max) {
+      toast.error(`${label}需在 1..=${max}`)
       return
     }
-    save({ [field]: n }, '保留天数已更新')
+    save({ [field]: n }, `${label}已更新`)
     reset()
   }
 
@@ -486,7 +515,7 @@ function GovernanceButton() {
           治理设置
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-72">
+      <DropdownMenuContent align="end" className="max-h-[80vh] w-80 overflow-y-auto">
         <DropdownMenuLabel>请求链路追踪</DropdownMenuLabel>
         <div className="px-2 pb-2">
           <div className="flex items-center justify-between gap-2 rounded-md bg-secondary/40 px-2.5 py-2">
@@ -513,7 +542,7 @@ function GovernanceButton() {
           trace 保留天数（当前 {cfg?.traceRetentionDays ?? '—'}）
         </DropdownMenuLabel>
         <form
-          onSubmit={(e) => submitDays(e, 'traceRetentionDays', traceDays, () => setTraceDays(''))}
+          onSubmit={(e) => submitNumber(e, 'traceRetentionDays', traceDays, 365, 'trace 保留天数', () => setTraceDays(''))}
           className="flex items-center gap-1.5 px-2 pb-2"
         >
           <Input
@@ -534,7 +563,7 @@ function GovernanceButton() {
           usage 日志保留天数（当前 {cfg?.usageLogRetentionDays ?? '—'}）
         </DropdownMenuLabel>
         <form
-          onSubmit={(e) => submitDays(e, 'usageLogRetentionDays', usageDays, () => setUsageDays(''))}
+          onSubmit={(e) => submitNumber(e, 'usageLogRetentionDays', usageDays, 365, 'usage 保留天数', () => setUsageDays(''))}
           className="flex items-center gap-1.5 px-2 pb-2"
         >
           <Input
@@ -548,6 +577,121 @@ function GovernanceButton() {
             className="h-7 text-xs"
           />
           <Button type="submit" size="sm" variant="outline" className="h-7 text-xs" disabled={isPending || !usageDays.trim()}>
+            保存
+          </Button>
+        </form>
+        <DropdownMenuSeparator />
+        <DropdownMenuLabel>错误快照</DropdownMenuLabel>
+        <div className="space-y-2 px-2 pb-2">
+          <div className="flex items-center justify-between gap-3 rounded-md bg-secondary/40 px-2.5 py-2">
+            <div className="text-xs">
+              <div className="font-medium text-foreground">保存错误快照</div>
+              <div className="leading-snug text-muted-foreground">
+                关闭只停止 error_snapshots.db 写入，不影响 traces.db。
+              </div>
+            </div>
+            <Switch
+              checked={errorSnapshotEnabled}
+              disabled={isLoading || isPending}
+              onCheckedChange={(value) => save(
+                { errorSnapshotEnabled: value },
+                value ? '已开启错误快照' : '已关闭错误快照',
+              )}
+            />
+          </div>
+          <div className="flex items-center justify-between gap-3 rounded-md bg-secondary/40 px-2.5 py-2">
+            <div className="text-xs">
+              <div className="font-medium text-foreground">捕获重试后恢复的请求</div>
+              <div className="leading-snug text-muted-foreground">
+                保留首次失败但最终恢复的诊断现场。
+              </div>
+            </div>
+            <Switch
+              checked={errorSnapshotCaptureRecovered}
+              disabled={isLoading || isPending}
+              onCheckedChange={(value) => save(
+                { errorSnapshotCaptureRecovered: value },
+                value ? '已捕获恢复请求' : '已忽略恢复请求',
+              )}
+            />
+          </div>
+          <div className="flex items-center justify-between gap-3 rounded-md bg-secondary/40 px-2.5 py-2">
+            <div className="text-xs">
+              <div className="font-medium text-foreground">保存脱敏正文</div>
+              <div className="leading-snug text-muted-foreground">
+                关闭后仍保存元数据、工具诊断、上游错误和流尾。
+              </div>
+            </div>
+            <Switch
+              checked={errorSnapshotCaptureBodies}
+              disabled={isLoading || isPending}
+              onCheckedChange={(value) => save(
+                { errorSnapshotCaptureBodies: value },
+                value ? '已保存脱敏正文' : '已关闭正文保存',
+              )}
+            />
+          </div>
+        </div>
+        <DropdownMenuLabel className="pt-1">
+          快照保留天数（当前 {cfg?.errorSnapshotRetentionDays ?? '—'}）
+        </DropdownMenuLabel>
+        <form
+          onSubmit={(e) => submitNumber(e, 'errorSnapshotRetentionDays', snapshotDays, 3650, '快照保留天数', () => setSnapshotDays(''))}
+          className="flex items-center gap-1.5 px-2 pb-2"
+        >
+          <Input
+            type="number"
+            min={1}
+            max={3650}
+            placeholder="1..3650 天"
+            value={snapshotDays}
+            onChange={(e) => setSnapshotDays(e.target.value)}
+            disabled={isPending}
+            className="h-7 text-xs"
+          />
+          <Button type="submit" size="sm" variant="outline" className="h-7 text-xs" disabled={isPending || !snapshotDays.trim()}>
+            保存
+          </Button>
+        </form>
+        <DropdownMenuLabel className="pt-1">
+          最大存储（当前 {cfg?.errorSnapshotMaxStorageGb ?? '—'} GB）
+        </DropdownMenuLabel>
+        <form
+          onSubmit={(e) => submitNumber(e, 'errorSnapshotMaxStorageGb', snapshotMaxGb, 900, '最大存储 GB', () => setSnapshotMaxGb(''))}
+          className="flex items-center gap-1.5 px-2 pb-2"
+        >
+          <Input
+            type="number"
+            min={1}
+            max={900}
+            placeholder="1..900 GB"
+            value={snapshotMaxGb}
+            onChange={(e) => setSnapshotMaxGb(e.target.value)}
+            disabled={isPending}
+            className="h-7 text-xs"
+          />
+          <Button type="submit" size="sm" variant="outline" className="h-7 text-xs" disabled={isPending || !snapshotMaxGb.trim()}>
+            保存
+          </Button>
+        </form>
+        <DropdownMenuLabel className="pt-1">
+          最小空闲磁盘（当前 {cfg?.errorSnapshotMinFreeDiskGb ?? '—'} GB）
+        </DropdownMenuLabel>
+        <form
+          onSubmit={(e) => submitNumber(e, 'errorSnapshotMinFreeDiskGb', snapshotMinFreeGb, 900, '最小空闲磁盘 GB', () => setSnapshotMinFreeGb(''))}
+          className="flex items-center gap-1.5 px-2 pb-2"
+        >
+          <Input
+            type="number"
+            min={1}
+            max={900}
+            placeholder="1..900 GB"
+            value={snapshotMinFreeGb}
+            onChange={(e) => setSnapshotMinFreeGb(e.target.value)}
+            disabled={isPending}
+            className="h-7 text-xs"
+          />
+          <Button type="submit" size="sm" variant="outline" className="h-7 text-xs" disabled={isPending || !snapshotMinFreeGb.trim()}>
             保存
           </Button>
         </form>

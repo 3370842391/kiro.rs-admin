@@ -9,6 +9,7 @@ use axum::{
 };
 
 use crate::admin::client_keys::SharedClientKeyManager;
+use crate::admin::error_snapshot_db::SharedErrorSnapshotStore;
 use crate::admin::trace_db::SharedTraceStore;
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
 use crate::kiro::provider::KiroProvider;
@@ -43,6 +44,7 @@ pub fn create_router_with_provider(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -57,6 +59,7 @@ pub fn create_router(
     usage_aggregator: Option<SharedAggregator>,
     cache_meter: Option<SharedCacheMeter>,
     trace_store: Option<SharedTraceStore>,
+    error_snapshot_store: Option<SharedErrorSnapshotStore>,
     model_mappings: Option<crate::admin::SharedModelMappingManager>,
     model_profiles: Option<Arc<super::model_profile::ModelProfileStore>>,
 ) -> Router {
@@ -67,6 +70,7 @@ pub fn create_router(
     state = state.with_usage(client_keys, usage_recorder, usage_aggregator);
     state = state.with_cache_meter(cache_meter);
     state = state.with_trace_store(trace_store);
+    state = state.with_error_snapshot_store(error_snapshot_store);
     state = state.with_model_mappings(model_mappings);
     state = state.with_model_profiles(model_profiles);
 

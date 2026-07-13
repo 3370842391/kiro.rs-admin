@@ -13,6 +13,7 @@ use axum::{
 };
 
 use super::client_keys::SharedClientKeyManager;
+use super::error_snapshot_db::SharedErrorSnapshotStore;
 use super::groups::SharedGroupManager;
 use super::service::AdminService;
 use super::trace_db::SharedTraceStore;
@@ -33,6 +34,8 @@ pub struct AdminState {
     pub usage_aggregator: SharedAggregator,
     /// 请求链路追踪存储（与 anthropic 路由共享）
     pub trace_store: SharedTraceStore,
+    /// 错误快照存储（与业务路由共享）。
+    pub error_snapshot_store: SharedErrorSnapshotStore,
     /// 账号分组注册表（持久化到 groups.json）
     pub groups: SharedGroupManager,
     /// 模型映射注册表（持久化到 model_mappings.json，与 anthropic 路由共享）
@@ -47,6 +50,7 @@ impl AdminState {
         client_keys: SharedClientKeyManager,
         usage_aggregator: SharedAggregator,
         trace_store: SharedTraceStore,
+        error_snapshot_store: SharedErrorSnapshotStore,
         groups: SharedGroupManager,
         model_mappings: super::model_mapping::SharedModelMappingManager,
     ) -> Self {
@@ -56,6 +60,7 @@ impl AdminState {
             client_keys,
             usage_aggregator,
             trace_store,
+            error_snapshot_store,
             groups,
             model_mappings,
         }

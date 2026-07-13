@@ -12,10 +12,12 @@ use axum::{
 use bytes::Bytes;
 use chrono::{Datelike, Duration, Local, NaiveDate, TimeZone};
 use futures::StreamExt;
+use sha2::Digest as _;
 use std::sync::Arc;
 
 use super::{
     client_keys::mask_client_key,
+    error_snapshot_db::{SnapshotQuery, SnapshotSeverity},
     middleware::AdminState,
     trace_db::TraceQuery,
     types::{
@@ -1588,6 +1590,7 @@ pub async fn list_traces(
                 "finalEmail": final_email,
                 "errorType": r.error_type,
                 "errorMessage": r.error_message,
+                "snapshotId": r.snapshot_id,
                 "totalAttempts": r.total_attempts,
                 "durationMs": r.duration_ms,
                 "interruptedAfterBytes": r.interrupted_after_bytes,
@@ -1607,6 +1610,287 @@ pub async fn list_traces(
         })
         .collect();
     Json(serde_json::json!({ "records": enriched, "total": total }))
+}
+
+fn parse_snapshot_query(params: &HashMap<String, String>) -> anyhow::Result<SnapshotQuery> {
+    let parse_u64 = |name: &str| -> anyhow::Result<Option<u64>> {
+        params
+            .get(name)
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .map_err(|_| anyhow::anyhow!("invalid {name}"))
+            })
+            .transpose()
+    };
+    let parse_bool = |name: &str| -> anyhow::Result<Option<bool>> {
+        params
+            .get(name)
+            .filter(|value| !value.is_empty())
+            .map(|value| match value.as_str() {
+                "true" | "1" => Ok(true),
+                "false" | "0" => Ok(false),
+                _ => Err(anyhow::anyhow!("invalid {name}")),
+            })
+            .transpose()
+    };
+    let parse_usize = |name: &str, default: usize| -> anyhow::Result<usize> {
+        params
+            .get(name)
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .map_err(|_| anyhow::anyhow!("invalid {name}"))
+            })
+            .transpose()
+            .map(|value| value.unwrap_or(default))
+    };
+    let severity = params
+        .get("severity")
+        .filter(|value| !value.is_empty())
+        .map(|value| match value.as_str() {
+            "critical" => Ok(SnapshotSeverity::Critical),
+            "error" => Ok(SnapshotSeverity::Error),
+            "warning" => Ok(SnapshotSeverity::Warning),
+            "info" => Ok(SnapshotSeverity::Info),
+            _ => Err(anyhow::anyhow!("invalid severity")),
+        })
+        .transpose()?;
+    let from_epoch = params
+        .get("from")
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<i64>()
+                .map_err(|_| anyhow::anyhow!("invalid from"))
+        })
+        .transpose()?;
+    let to_epoch = params
+        .get("to")
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<i64>()
+                .map_err(|_| anyhow::anyhow!("invalid to"))
+        })
+        .transpose()?;
+    Ok(SnapshotQuery {
+        trace_id: params
+            .get("traceId")
+            .filter(|value| !value.is_empty())
+            .cloned(),
+        model: params
+            .get("model")
+            .filter(|value| !value.is_empty())
+            .cloned(),
+        error_type: params
+            .get("errorType")
+            .filter(|value| !value.is_empty())
+            .cloned(),
+        http_status: parse_u64("httpStatus")?.map(|value| value as u16),
+        credential_id: parse_u64("credentialId")?,
+        severity,
+        recovered: parse_bool("recovered")?,
+        pinned: parse_bool("pinned")?,
+        from_epoch,
+        to_epoch,
+        limit: parse_usize("limit", 50)?.min(500),
+        offset: parse_usize("offset", 0)?,
+    })
+}
+
+fn snapshot_error(status: StatusCode, message: impl Into<String>) -> Response {
+    (
+        status,
+        Json(super::types::AdminErrorResponse::new(
+            if status == StatusCode::BAD_REQUEST {
+                "invalid_request"
+            } else if status == StatusCode::NOT_FOUND {
+                "not_found"
+            } else {
+                "internal_error"
+            },
+            message,
+        )),
+    )
+        .into_response()
+}
+
+pub async fn list_error_snapshots(
+    State(state): State<AdminState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let query = match parse_snapshot_query(&params) {
+        Ok(query) => query,
+        Err(error) => return snapshot_error(StatusCode::BAD_REQUEST, error.to_string()),
+    };
+    match state.error_snapshot_store.query_paged(&query) {
+        Ok(page) => Json(page).into_response(),
+        Err(error) => snapshot_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+pub async fn error_snapshot_storage(State(state): State<AdminState>) -> Response {
+    match state.error_snapshot_store.storage_status() {
+        Ok(status) => Json(status).into_response(),
+        Err(error) => snapshot_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+pub async fn cleanup_error_snapshots(State(state): State<AdminState>) -> Response {
+    match state.error_snapshot_store.run_maintenance() {
+        Ok(report) => Json(report).into_response(),
+        Err(error) => snapshot_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+pub async fn get_error_snapshot(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.error_snapshot_store.get(&id) {
+        Ok(Some(detail)) => Json(detail).into_response(),
+        Ok(None) => snapshot_error(StatusCode::NOT_FOUND, "error snapshot not found"),
+        Err(error) => snapshot_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+pub async fn get_error_snapshot_payload(
+    State(state): State<AdminState>,
+    Path((id, seq)): Path<(String, u32)>,
+) -> Response {
+    match state.error_snapshot_store.read_payload(&id, seq) {
+        Ok(Some(payload)) => {
+            let content = payload_value(&payload.meta.content_type, &payload.data);
+            Json(serde_json::json!({
+                "seq": payload.meta.seq,
+                "kind": payload.meta.kind,
+                "attempt": payload.meta.attempt,
+                "contentType": payload.meta.content_type,
+                "originalBytes": payload.meta.original_bytes,
+                "compressedBytes": payload.meta.compressed_bytes,
+                "sha256": payload.meta.sha256,
+                "partCount": payload.meta.part_count,
+                "content": content,
+            }))
+            .into_response()
+        }
+        Ok(None) => snapshot_error(StatusCode::NOT_FOUND, "snapshot payload not found"),
+        Err(error) => snapshot_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "snapshot integrity error",
+        ),
+    }
+}
+
+fn payload_value(content_type: &str, data: &[u8]) -> serde_json::Value {
+    if content_type.contains("json") {
+        if let Ok(value) = serde_json::from_slice(data) {
+            return value;
+        }
+    }
+    if let Ok(text) = std::str::from_utf8(data) {
+        serde_json::Value::String(text.to_string())
+    } else {
+        serde_json::json!({
+            "binary": true,
+            "bytes": data.len(),
+            "sha256": hex::encode(sha2::Sha256::digest(data)),
+        })
+    }
+}
+
+fn snapshot_download_response(id: &str, data: Vec<u8>) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=error-snapshot-{id}.json"),
+        )
+        .header("x-content-type-options", "nosniff")
+        .body(Body::from(data))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+pub async fn download_error_snapshot(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Response {
+    let detail = match state.error_snapshot_store.get(&id) {
+        Ok(Some(detail)) => detail,
+        Ok(None) => return snapshot_error(StatusCode::NOT_FOUND, "error snapshot not found"),
+        Err(error) => return snapshot_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    };
+    let mut payloads = Vec::new();
+    for meta in detail.payloads {
+        let payload = match state.error_snapshot_store.read_payload(&id, meta.seq) {
+            Ok(Some(payload)) => payload,
+            Ok(None) => return snapshot_error(StatusCode::NOT_FOUND, "snapshot payload not found"),
+            Err(error) => {
+                tracing::error!(snapshot_id = %id, seq = meta.seq, error = %error, "snapshot integrity check failed");
+                return snapshot_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "snapshot integrity error",
+                );
+            }
+        };
+        payloads.push(serde_json::json!({
+            "seq": payload.meta.seq,
+            "kind": payload.meta.kind,
+            "attempt": payload.meta.attempt,
+            "contentType": payload.meta.content_type,
+            "sha256": payload.meta.sha256,
+            "content": payload_value(&payload.meta.content_type, &payload.data),
+        }));
+    }
+    let package = serde_json::json!({ "metadata": detail.summary, "payloads": payloads });
+    match serde_json::to_vec_pretty(&package) {
+        Ok(data) => snapshot_download_response(&id, data),
+        Err(error) => snapshot_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+pub async fn pin_error_snapshot(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.error_snapshot_store.set_pinned(&id, true) {
+        Ok(true) => {
+            Json(super::types::SuccessResponse::new("error snapshot pinned")).into_response()
+        }
+        Ok(false) => snapshot_error(StatusCode::NOT_FOUND, "error snapshot not found"),
+        Err(error) => snapshot_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+pub async fn unpin_error_snapshot(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.error_snapshot_store.set_pinned(&id, false) {
+        Ok(true) => Json(super::types::SuccessResponse::new(
+            "error snapshot unpinned",
+        ))
+        .into_response(),
+        Ok(false) => snapshot_error(StatusCode::NOT_FOUND, "error snapshot not found"),
+        Err(error) => snapshot_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+pub async fn delete_error_snapshot(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.error_snapshot_store.delete(&id) {
+        Ok(true) => {
+            Json(super::types::SuccessResponse::new("error snapshot deleted")).into_response()
+        }
+        Ok(false) => snapshot_error(StatusCode::NOT_FOUND, "error snapshot not found"),
+        Err(error) => snapshot_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
 }
 
 /// DELETE /api/admin/traces
@@ -1895,4 +2179,37 @@ pub async fn delete_group(
         name
     )))
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_snapshot_filters_and_caps_page_size() {
+        let params = HashMap::from([
+            ("severity".into(), "critical".into()),
+            ("recovered".into(), "true".into()),
+            ("pinned".into(), "false".into()),
+            ("limit".into(), "9999".into()),
+        ]);
+        let query = parse_snapshot_query(&params).unwrap();
+        assert_eq!(query.severity, Some(SnapshotSeverity::Critical));
+        assert_eq!(query.recovered, Some(true));
+        assert_eq!(query.pinned, Some(false));
+        assert_eq!(query.limit, 500);
+    }
+
+    #[test]
+    fn download_response_is_attachment_and_nosniff() {
+        let response = snapshot_download_response("snap-1", br#"{"safe":true}"#.to_vec());
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        assert!(
+            response.headers()[header::CONTENT_DISPOSITION]
+                .to_str()
+                .unwrap()
+                .contains("attachment")
+        );
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+    }
 }
