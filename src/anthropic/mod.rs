@@ -31,6 +31,7 @@ pub(crate) mod identity;
 pub(crate) mod middleware;
 mod router;
 pub mod stream;
+pub(crate) mod tool_attempt;
 pub mod types;
 pub(crate) mod usage;
 mod websearch;

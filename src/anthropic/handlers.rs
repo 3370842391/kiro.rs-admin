@@ -2466,98 +2466,75 @@ fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
 
 use super::converter::get_context_window_size;
 
-/// 处理非流式请求
-async fn handle_non_stream_request(
+struct NonStreamToolAttempt {
+    credential_id: u64,
+    text_content: String,
+    native_thinking: String,
+    native_thinking_signature: Option<String>,
+    native_redacted_thinking: Vec<String>,
+    tool_uses: Vec<serde_json::Value>,
+    upstream_signalled_tool_use: bool,
+    stop_reason: String,
+    upstream_context_tokens: Option<i32>,
+    credits: f64,
+    state: super::tool_attempt::ToolAttemptState,
+}
+
+enum NonStreamCollectError {
+    Provider(anyhow::Error),
+    Body { credential_id: u64, message: String },
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn collect_non_stream_tool_attempt(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     model: &str,
     input_tokens: i32,
-    thinking_enabled: bool,
-    require_thinking: bool,
-    tool_name_map: std::collections::HashMap<String, String>,
-    known_tool_names: std::collections::HashSet<String>,
-    tool_choice_policy: super::converter::ToolChoicePolicy,
-    hook: UsageRecordHook,
-    cache_usage: super::cache_metering::CacheUsage,
+    tool_name_map: &std::collections::HashMap<String, String>,
     tracer: std::sync::Arc<RequestTracer>,
-    group: Option<String>,
-) -> Response {
-    // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider
-        .call_api(request_body, Some(tracer.as_ref()), group.as_deref())
+    group: Option<&str>,
+    attempt_index: u8,
+) -> Result<NonStreamToolAttempt, NonStreamCollectError> {
+    let call_result = provider
+        .call_api(request_body, Some(tracer.as_ref()), group)
         .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
-            tracer.finalize(
-                "error",
-                last_attempt_outcome(&tracer),
-                Some(&e.to_string()),
-                None,
-                TraceUsage::zero(),
-            );
-            return map_provider_error(e);
-        }
-    };
-    let response = call_result.response;
+        .map_err(NonStreamCollectError::Provider)?;
     let credential_id = call_result.credential_id;
+    let body_bytes =
+        call_result
+            .response
+            .bytes()
+            .await
+            .map_err(|error| NonStreamCollectError::Body {
+                credential_id,
+                message: error.to_string(),
+            })?;
 
-    // 读取响应体
-    let body_bytes = match response.bytes().await {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            tracing::error!("读取响应体失败: {}", e);
-            hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
-            tracer.finalize(
-                "interrupted",
-                Some(outcome::STREAM_INTERRUPTED),
-                Some(&e.to_string()),
-                None,
-                TraceUsage::zero(),
-            );
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse::new(
-                    "api_error",
-                    format!("读取响应失败: {}", e),
-                )),
-            )
-                .into_response();
-        }
-    };
-
-    // 解析事件流
     let mut decoder = EventStreamDecoder::new();
-    if let Err(e) = decoder.feed(&body_bytes) {
-        tracing::warn!("缓冲区溢出: {}", e);
+    if let Err(error) = decoder.feed(&body_bytes) {
+        tracing::warn!(%error, attempt = attempt_index + 1, "非流式响应解码缓冲区溢出");
     }
 
     let mut text_content = String::new();
     let mut native_thinking = String::new();
-    let mut native_thinking_signature: Option<String> = None;
-    let mut native_redacted_thinking: Vec<String> = Vec::new();
-    let mut tool_uses: Vec<serde_json::Value> = Vec::new();
+    let mut native_thinking_signature = None;
+    let mut native_redacted_thinking = Vec::new();
+    let mut tool_uses = Vec::new();
     let mut upstream_signalled_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
-    // Kiro 整体上下文占用（包含客户端不可见的 foundational prompt）。
-    let mut upstream_context_tokens: Option<i32> = None;
-    // meteringEvent 上报的 credit 计费量（上游真实下发）；
-    // input/cache_* 的互斥分摊在拿到 total 真值后由 cache_usage 完成。
-    let mut credits: f64 = 0.0;
-
-    // 工具调用参数 JSON 累积器：按 tool_use_id 缓冲分片，stop 时整体解析。
-    // 半截 / 非法 JSON 显式暴露为错误（返回 502），不再静默回退 {} 或丢弃。
+    let mut upstream_context_tokens = None;
+    let mut credits = 0.0_f64;
     let mut tool_accumulator = super::stream::ToolJsonAccumulator::new();
-    let mut tool_json_error: Option<super::stream::ToolJsonAccumulatorError> = None;
+    let mut tool_json_error = None;
 
     for result in decoder.decode_iter() {
         match result {
             Ok(frame) => {
                 if let Ok(event) = Event::from_frame(frame) {
                     match event {
-                        Event::AssistantResponse(resp) => {
-                            text_content.push_str(&resp.content);
+                        Event::AssistantResponse(response) => {
+                            text_content.push_str(&response.content);
                         }
                         Event::ReasoningContent(reasoning) => {
                             if let Some(text) = reasoning.text
@@ -2583,33 +2560,26 @@ async fn handle_non_stream_request(
                                 tool_name = %tool_use.name,
                                 stop = tool_use.stop,
                                 input_bytes = tool_use.input.len(),
+                                attempt = attempt_index + 1,
                                 "received upstream non-stream tool_use fragment"
                             );
-                            match tool_accumulator.push(&tool_use, &tool_name_map) {
+                            match tool_accumulator.push(&tool_use, tool_name_map) {
                                 Ok(Some(completed)) => {
-                                    tracing::debug!(
-                                        tool_id = %completed.id,
-                                        tool_name = %completed.name,
-                                        input_bytes = completed.input.to_string().len(),
-                                        "collected completed non-stream tool_use block"
-                                    );
                                     tool_uses.push(completed.to_anthropic_block());
                                 }
                                 Ok(None) => {}
-                                Err(e) => {
-                                    tracing::error!("{}", e);
-                                    tool_json_error = Some(e);
+                                Err(error) => {
+                                    tracing::error!(%error, attempt = attempt_index + 1);
+                                    tool_json_error = Some(error);
                                 }
                             }
                         }
                         Event::ContextUsage(context_usage) => {
-                            // 从上下文使用百分比计算实际的 input_tokens
                             let window_size = get_context_window_size(model);
                             let actual_input_tokens =
-                                (context_usage.context_usage_percentage * (window_size as f64)
+                                (context_usage.context_usage_percentage * f64::from(window_size)
                                     / 100.0) as i32;
                             upstream_context_tokens = Some(actual_input_tokens);
-                            // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                             if context_usage.context_usage_percentage >= 100.0 {
                                 stop_reason = "model_context_window_exceeded".to_string();
                             }
@@ -2620,45 +2590,147 @@ async fn handle_non_stream_request(
                                 "received upstream context usage"
                             );
                         }
-                        Event::Metering(metering) => {
-                            // 上游只下发 credit；token / cache 字段不存在
-                            credits += metering.usage;
-                            tracing::debug!("metering credits +{:.6}", metering.usage);
-                        }
-                        Event::Exception { exception_type, .. } => {
-                            if exception_type == "ContentLengthExceededException" {
-                                stop_reason = "max_tokens".to_string();
-                            }
+                        Event::Metering(metering) => credits += metering.usage,
+                        Event::Exception { exception_type, .. }
+                            if exception_type == "ContentLengthExceededException" =>
+                        {
+                            stop_reason = "max_tokens".to_string();
                         }
                         _ => {}
                     }
                 }
             }
-            Err(e) => {
-                tracing::warn!("解码事件失败: {}", e);
-            }
+            Err(error) => tracing::warn!(%error, attempt = attempt_index + 1, "解码事件失败"),
         }
     }
 
-    // 收尾：对未收到 stop=true 的残留缓冲区分处理——
-    //   · 空入参（无参工具）→ 按 {} 打捞成完整 tool_use 加入响应；
-    //   · 半截 JSON（上游写参数途中截断）→ 记为 IncompleteJson，返回 502。
-    // 已有错误则保持不变。
     if tool_json_error.is_none() {
-        let (salvaged, incomplete) = tool_accumulator.finish(&tool_name_map);
-        for completed in salvaged {
-            tracing::warn!(
-                "上游在无参工具 {} ({}) 未发 stop=true 即断流，按 {{}} 打捞",
-                completed.name,
-                completed.id
-            );
-            tool_uses.push(completed.to_anthropic_block());
+        let (completed, error) = tool_accumulator.finish(tool_name_map);
+        if error.is_none() {
+            for tool_use in completed {
+                tracing::warn!(
+                    tool_id = %tool_use.id,
+                    tool_name = %tool_use.name,
+                    attempt = attempt_index + 1,
+                    "上游未发 stop=true；残留入参已严格解析为完整 JSON，按隐式 stop 打捞"
+                );
+                tool_uses.push(tool_use.to_anthropic_block());
+            }
         }
-        if let Some(e) = incomplete {
-            tracing::error!("{}", e);
-            tool_json_error = Some(e);
-        }
+        tool_json_error = error;
     }
+
+    Ok(NonStreamToolAttempt {
+        credential_id,
+        text_content,
+        native_thinking,
+        native_thinking_signature,
+        native_redacted_thinking,
+        tool_uses,
+        upstream_signalled_tool_use,
+        stop_reason,
+        upstream_context_tokens,
+        credits,
+        state: super::tool_attempt::ToolAttemptState {
+            attempt_index,
+            terminal_error: tool_json_error,
+            semantic_output_started: false,
+            tool_forwarded: false,
+        },
+    })
+}
+
+/// 处理非流式请求
+async fn handle_non_stream_request(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    request_body: &str,
+    model: &str,
+    input_tokens: i32,
+    thinking_enabled: bool,
+    require_thinking: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
+    known_tool_names: std::collections::HashSet<String>,
+    tool_choice_policy: super::converter::ToolChoicePolicy,
+    hook: UsageRecordHook,
+    cache_usage: super::cache_metering::CacheUsage,
+    tracer: std::sync::Arc<RequestTracer>,
+    group: Option<String>,
+) -> Response {
+    let collection = super::tool_attempt::run_with_single_retry(
+        |attempt_index| {
+            collect_non_stream_tool_attempt(
+                provider.clone(),
+                request_body,
+                model,
+                input_tokens,
+                &tool_name_map,
+                tracer.clone(),
+                group.as_deref(),
+                attempt_index,
+            )
+        },
+        |attempt, _| attempt.state.clone(),
+    )
+    .await;
+
+    let (attempt, attempt_count) = match collection {
+        Ok(result) => result,
+        Err(NonStreamCollectError::Provider(error)) => {
+            hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
+            tracer.finalize(
+                "error",
+                last_attempt_outcome(&tracer),
+                Some(&error.to_string()),
+                None,
+                TraceUsage::zero(),
+            );
+            return map_provider_error(error);
+        }
+        Err(NonStreamCollectError::Body {
+            credential_id,
+            message,
+        }) => {
+            tracing::error!(%message, "读取非流式响应体失败");
+            hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
+            tracer.finalize(
+                "interrupted",
+                Some(outcome::STREAM_INTERRUPTED),
+                Some(&message),
+                None,
+                TraceUsage::zero(),
+            );
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse::new(
+                    "api_error",
+                    format!("读取响应失败: {message}"),
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    if attempt_count == 2 {
+        tracing::warn!(
+            first_attempt_error = "incomplete_tool_json",
+            "非流式工具调用第一次在 JSON EOF 处截断，已完成一次受控重试"
+        );
+    }
+
+    let NonStreamToolAttempt {
+        credential_id,
+        text_content,
+        native_thinking,
+        native_thinking_signature,
+        native_redacted_thinking,
+        tool_uses,
+        upstream_signalled_tool_use,
+        mut stop_reason,
+        upstream_context_tokens,
+        credits,
+        state,
+    } = attempt;
+    let tool_json_error = state.terminal_error;
 
     // 工具调用 JSON 半截 / 非法：非流式路径尚未发送任何字节，直接回 502，
     // 明确暴露上游问题，而不是把无法解析的参数当成完整调用返回。
