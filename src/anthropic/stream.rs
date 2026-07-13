@@ -2460,7 +2460,20 @@ impl StreamContext {
     /// 依次发 `content_block_start{name, input:{}}` → 单个完整 `input_json_delta` → `content_block_stop`。
     fn emit_completed_tool_use(&mut self, mut completed: CompletedToolUse) -> Vec<SseEvent> {
         let mut events = Vec::new();
-        if let Some(contract) = self.tool_contracts.get(&completed.name) {
+        if !self.tool_contracts.is_empty() {
+            let Some(contract) = self.tool_contracts.get(&completed.name) else {
+                let error = super::tool_schema::ToolSchemaError {
+                    tool_name: completed.name.clone(),
+                    violations: vec![super::tool_schema::ToolInputViolation::UndeclaredTool],
+                };
+                tracing::warn!(tool = %completed.name, "上游返回了未声明工具");
+                self.terminal_attempt_failure =
+                    Some(super::tool_attempt::AttemptFailure::InvalidToolSchema {
+                        message: error.to_string(),
+                    });
+                self.state_manager.set_stop_reason("error");
+                return events;
+            };
             match super::tool_schema::validate_and_repair(&contract.schema, &mut completed.input) {
                 super::tool_schema::ToolInputOutcome::Valid => {}
                 super::tool_schema::ToolInputOutcome::Repaired { paths } => {
@@ -3777,6 +3790,27 @@ mod tests {
         assert!(!final_events.iter().any(|event| {
             event.event == "content_block_start"
                 && event.data["content_block"]["type"] == "tool_use"
+        }));
+    }
+
+    #[test]
+    fn stream_rejects_undeclared_tool_when_contracts_exist() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            ["get_weather".to_string()].into_iter().collect(),
+        );
+        ctx.set_tool_contracts(weather_contracts());
+
+        let tool_events =
+            ctx.process_tool_use(&tool_evt("tool_1", "delete_everything", r#"{}"#, true));
+        let final_events = ctx.generate_final_events();
+
+        assert!(tool_events.is_empty());
+        assert!(final_events.iter().any(|event| {
+            event.event == "error" && event.data["error"]["type"] == "upstream_tool_schema_error"
         }));
     }
 

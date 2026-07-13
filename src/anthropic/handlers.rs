@@ -2807,11 +2807,7 @@ fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
 
 struct NonStreamToolAttempt {
     credential_id: u64,
-    text_content: String,
-    native_thinking: String,
-    native_thinking_signature: Option<String>,
-    native_redacted_thinking: Vec<String>,
-    tool_uses: Vec<serde_json::Value>,
+    content: Vec<serde_json::Value>,
     upstream_signalled_tool_use: bool,
     stop_reason: String,
     upstream_context_tokens: Option<i32>,
@@ -2824,6 +2820,46 @@ enum NonStreamCollectError {
     Body { credential_id: u64, message: String },
 }
 
+fn normalize_and_validate_non_stream_content(
+    base_content: Vec<serde_json::Value>,
+    native_tool_uses: Vec<serde_json::Value>,
+    known_tool_names: &std::collections::HashSet<String>,
+    tool_name_map: &std::collections::HashMap<String, String>,
+    tool_contracts: &std::collections::HashMap<String, super::tool_schema::ToolContract>,
+) -> (
+    Vec<serde_json::Value>,
+    Result<Vec<String>, super::tool_schema::ToolSchemaError>,
+) {
+    let mut content = super::stream::normalize_non_stream_content_blocks(
+        base_content,
+        native_tool_uses,
+        known_tool_names,
+        tool_name_map,
+    );
+    let validation = super::tool_schema::validate_tool_use_blocks(tool_contracts, &mut content);
+    (content, validation)
+}
+
+fn non_stream_content_has_non_tool_semantic_output(content: &[serde_json::Value]) -> bool {
+    content.iter().any(
+        |block| match block.get("type").and_then(serde_json::Value::as_str) {
+            Some("text") => block
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| !text.is_empty()),
+            Some("thinking") => block
+                .get("thinking")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| !text.is_empty()),
+            Some("redacted_thinking") => block
+                .get("data")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|data| !data.is_empty()),
+            _ => false,
+        },
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn collect_non_stream_tool_attempt(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
@@ -2831,7 +2867,9 @@ async fn collect_non_stream_tool_attempt(
     threshold_retry_body: Option<&str>,
     input_tokens: i32,
     context_window_size: i32,
+    thinking_enabled: bool,
     tool_name_map: &std::collections::HashMap<String, String>,
+    known_tool_names: &std::collections::HashSet<String>,
     tool_contracts: &std::collections::HashMap<String, super::tool_schema::ToolContract>,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<&str>,
@@ -2968,11 +3006,27 @@ async fn collect_non_stream_tool_attempt(
         tool_json_error = error;
     }
 
-    let has_completed_tool = !tool_uses.is_empty();
-    let schema_failure = match super::tool_schema::validate_tool_use_blocks(
+    let text_content = crate::kiro::model::events::strip_tool_use_xml_leaks(&text_content);
+    let text_content = if provider.identity_normalization() {
+        super::identity::normalize_identity_text(&text_content)
+    } else {
+        text_content
+    };
+    let base_content = build_non_stream_content(
+        thinking_enabled,
+        text_content,
+        native_thinking,
+        native_thinking_signature,
+        native_redacted_thinking,
+    );
+    let (content, validation) = normalize_and_validate_non_stream_content(
+        base_content,
+        tool_uses,
+        known_tool_names,
+        tool_name_map,
         tool_contracts,
-        &mut tool_uses,
-    ) {
+    );
+    let schema_failure = match validation {
         Ok(repaired) => {
             if !repaired.is_empty() {
                 tracing::warn!(paths = ?repaired, attempt = attempt_index + 1, "确定性修复上游工具固定字段");
@@ -2986,11 +3040,16 @@ async fn collect_non_stream_tool_attempt(
             })
         }
     };
+    let has_completed_tool = schema_failure.is_none()
+        && content
+            .iter()
+            .any(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("tool_use"));
+    let has_non_tool_semantic_output = non_stream_content_has_non_tool_semantic_output(&content);
     let failure = schema_failure
         .clone()
         .or_else(|| observation.failure(tool_json_error, has_completed_tool));
     let semantic_output_started =
-        observation.semantic_output_started() || (has_completed_tool && schema_failure.is_none());
+        has_non_tool_semantic_output || (has_completed_tool && schema_failure.is_none());
     tracing::debug!(
         attempt = attempt_index + 1,
         saw_frame = observation.saw_frame(),
@@ -3002,11 +3061,7 @@ async fn collect_non_stream_tool_attempt(
 
     Ok(NonStreamToolAttempt {
         credential_id,
-        text_content,
-        native_thinking,
-        native_thinking_signature,
-        native_redacted_thinking,
-        tool_uses,
+        content,
         upstream_signalled_tool_use,
         stop_reason,
         upstream_context_tokens,
@@ -3053,7 +3108,9 @@ async fn handle_non_stream_request(
                 attempt_threshold_retry_body,
                 input_tokens,
                 context_window_size,
+                thinking_enabled,
                 &tool_name_map,
+                &known_tool_names,
                 &tool_contracts,
                 tracer.clone(),
                 group.as_deref(),
@@ -3110,11 +3167,7 @@ async fn handle_non_stream_request(
 
     let NonStreamToolAttempt {
         credential_id,
-        text_content,
-        native_thinking,
-        native_thinking_signature,
-        native_redacted_thinking,
-        tool_uses,
+        content,
         upstream_signalled_tool_use,
         mut stop_reason,
         upstream_context_tokens,
@@ -3140,30 +3193,6 @@ async fn handle_non_stream_request(
             .into_response();
     }
 
-    // 剥离混入文本的字面 <tool_use> XML 泄漏（非流式：整段文本已就绪，一次性剥离）。
-    let text_content = crate::kiro::model::events::strip_tool_use_xml_leaks(&text_content);
-
-    // 身份归一化：把 Kiro 网关注入的品牌自述改写回 Claude（底层就是真实 Claude 模型）。
-    let text_content = if provider.identity_normalization() {
-        super::identity::normalize_identity_text(&text_content)
-    } else {
-        text_content
-    };
-
-    // 先保留原有 thinking 解析，再把可恢复的 <invoke> 和原生工具事件归一化。
-    let base_content = build_non_stream_content(
-        thinking_enabled,
-        text_content,
-        native_thinking,
-        native_thinking_signature,
-        native_redacted_thinking,
-    );
-    let content = super::stream::normalize_non_stream_content_blocks(
-        base_content,
-        tool_uses,
-        &known_tool_names,
-        &tool_name_map,
-    );
     let content = normalize_required_tool_content(content, &tool_choice_policy);
     let strict_thinking_validation = provider.strict_thinking_validation();
     if require_thinking && !strict_thinking_validation && !content_has_reasoning(&content) {
@@ -4324,6 +4353,85 @@ mod tests {
             .unwrap_err()
             .contains("parallel")
         );
+    }
+
+    #[test]
+    fn non_stream_textual_invoke_is_normalized_before_schema_validation() {
+        let known = ["get_weather".to_string()].into_iter().collect();
+        let contracts = std::collections::HashMap::from([(
+            "get_weather".to_string(),
+            super::super::tool_schema::ToolContract {
+                client_name: "get_weather".to_string(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                    "additionalProperties": false
+                }),
+            },
+        )]);
+        let base = vec![serde_json::json!({
+            "type": "text",
+            "text": "call\n<invoke name=\"get_weather\"></invoke>"
+        })];
+
+        let (content, validation) = normalize_and_validate_non_stream_content(
+            base,
+            Vec::new(),
+            &known,
+            &std::collections::HashMap::new(),
+            &contracts,
+        );
+        let error = validation.unwrap_err();
+
+        assert_eq!(error.tool_name, "get_weather");
+        assert_eq!(content.len(), 1, "校验失败时仍须保留归一化结果用于重试门控");
+        assert!(matches!(
+            error.violations.as_slice(),
+            [super::super::tool_schema::ToolInputViolation::MissingRequired(path)]
+                if path == "$.city"
+        ));
+    }
+
+    #[test]
+    fn non_stream_schema_failure_after_narration_is_not_retryable() {
+        let known = ["get_weather".to_string()].into_iter().collect();
+        let contracts = std::collections::HashMap::from([(
+            "get_weather".to_string(),
+            super::super::tool_schema::ToolContract {
+                client_name: "get_weather".to_string(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }),
+            },
+        )]);
+        let base = vec![serde_json::json!({
+            "type": "text",
+            "text": "I will check.\n<invoke name=\"get_weather\"></invoke>"
+        })];
+        let (content, validation) = normalize_and_validate_non_stream_content(
+            base,
+            Vec::new(),
+            &known,
+            &std::collections::HashMap::new(),
+            &contracts,
+        );
+        let error = validation.unwrap_err();
+        let state = super::super::tool_attempt::ToolAttemptState {
+            attempt_index: 0,
+            termination: super::super::tool_attempt::AttemptTermination::Eof,
+            failure: Some(
+                super::super::tool_attempt::AttemptFailure::InvalidToolSchema {
+                    message: error.to_string(),
+                },
+            ),
+            semantic_output_started: non_stream_content_has_non_tool_semantic_output(&content),
+            tool_forwarded: false,
+        };
+
+        assert!(!state.should_retry());
     }
 
     #[test]

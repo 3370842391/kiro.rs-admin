@@ -280,10 +280,6 @@ impl AttemptObservation {
         self.saw_frame
     }
 
-    pub(crate) fn semantic_output_started(&self) -> bool {
-        self.semantic_output_started
-    }
-
     pub(crate) fn failure(
         &self,
         tool_json_error: Option<ToolJsonAccumulatorError>,

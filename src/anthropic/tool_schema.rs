@@ -6,6 +6,7 @@ pub(crate) struct ToolContract {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ToolInputViolation {
+    UndeclaredTool,
     MissingRequired(String),
     TypeMismatch { path: String, expected: String },
     ConstMismatch { path: String },
@@ -38,6 +39,7 @@ impl std::fmt::Display for ToolSchemaError {
                 formatter.write_str("; ")?;
             }
             match violation {
+                ToolInputViolation::UndeclaredTool => formatter.write_str("tool was not declared"),
                 ToolInputViolation::MissingRequired(path) => {
                     write!(formatter, "missing required {path}")
                 }
@@ -79,7 +81,13 @@ pub(crate) fn validate_tool_use_blocks(
             continue;
         };
         let Some(contract) = contracts.get(&name) else {
-            continue;
+            if contracts.is_empty() {
+                continue;
+            }
+            return Err(ToolSchemaError {
+                tool_name: name,
+                violations: vec![ToolInputViolation::UndeclaredTool],
+            });
         };
         let mut candidate = block
             .get("input")
@@ -280,28 +288,32 @@ fn repair_or_validate_fixed_value(
 ) {
     if let Some(expected) = schema.get("const")
         && value != expected
+        && required_property
     {
-        if required_property {
-            *value = expected.clone();
-            repairs.push(path.to_string());
-        } else {
-            violations.push(ToolInputViolation::ConstMismatch {
-                path: path.to_string(),
-            });
-        }
-        return;
+        *value = expected.clone();
+        repairs.push(path.to_string());
     }
 
-    let Some(values) = schema.get("enum").and_then(serde_json::Value::as_array) else {
-        return;
-    };
-    if values.iter().any(|expected| expected == value) {
-        return;
-    }
-    if required_property && values.len() == 1 {
+    if let Some(values) = schema.get("enum").and_then(serde_json::Value::as_array)
+        && !values.iter().any(|expected| expected == value)
+        && required_property
+        && values.len() == 1
+    {
         *value = values[0].clone();
         repairs.push(path.to_string());
-    } else {
+    }
+
+    if schema
+        .get("const")
+        .is_some_and(|expected| value != expected)
+    {
+        violations.push(ToolInputViolation::ConstMismatch {
+            path: path.to_string(),
+        });
+    }
+    if let Some(values) = schema.get("enum").and_then(serde_json::Value::as_array)
+        && !values.iter().any(|expected| expected == value)
+    {
         violations.push(ToolInputViolation::EnumMismatch {
             path: path.to_string(),
         });
@@ -566,5 +578,51 @@ mod tests {
         assert!(error.to_string().contains("$.city"));
         assert!(error.to_string().contains("$.secret_customer_value"));
         assert!(!error.to_string().contains("do-not-echo"));
+    }
+
+    #[test]
+    fn conflicting_required_const_and_single_enum_fails_closed_after_repair() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "const": "const-value",
+                    "enum": ["enum-value"]
+                }
+            },
+            "required": ["mode"]
+        });
+        let original = serde_json::json!({"mode": "upstream-value"});
+        let mut input = original.clone();
+
+        assert!(matches!(
+            validate_and_repair(&schema, &mut input),
+            ToolInputOutcome::Invalid { .. }
+        ));
+        assert_eq!(input, original, "冲突契约不得留下半修复参数");
+    }
+
+    #[test]
+    fn undeclared_tool_is_rejected_when_request_has_contracts() {
+        let contracts = std::collections::HashMap::from([(
+            "get_weather".to_string(),
+            ToolContract {
+                client_name: "get_weather".to_string(),
+                schema: serde_json::json!({"type": "object"}),
+            },
+        )]);
+        let original = serde_json::json!({
+            "type": "tool_use",
+            "id": "toolu_1",
+            "name": "delete_everything",
+            "input": {}
+        });
+        let mut blocks = vec![original.clone()];
+
+        let error = validate_tool_use_blocks(&contracts, &mut blocks).unwrap_err();
+
+        assert_eq!(error.tool_name, "delete_everything");
+        assert_eq!(blocks, vec![original]);
     }
 }
