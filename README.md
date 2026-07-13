@@ -859,6 +859,22 @@ cd admin-ui && bun run build
 git diff --check
 ```
 
+### Error snapshots and 8991 acceptance
+
+错误快照默认只在失败、中断、协议异常或配置允许的恢复请求上采集；成功请求不会写入完整请求体。快照写入独立的 `error_snapshots.db`，请求体、工具参数和上游响应会脱敏并压缩，图片/PDF/base64 仅保留长度与 SHA-256。生产环境不要把调试采集目录暴露到公网。
+
+管理端的“错误快照”页面可按 trace、错误类型、状态和时间筛选，也可查看脱敏 payload、下载、固定或删除快照。需要管理员 Key；关闭采集后仍保留已有快照，且不会创建新的完整采集上下文。
+
+在隔离的 8991 测试服务上运行只读 smoke check：
+
+```bash
+ERROR_SNAPSHOT_BASE_URL=http://127.0.0.1:8991/admin \\
+ERROR_SNAPSHOT_ADMIN_TOKEN="$ADMIN_API_KEY" \\
+./scripts/error-snapshot-smoke.sh
+```
+
+脚本默认不执行清理；确认使用的是 `data-test` 后，才可设置 `ERROR_SNAPSHOT_SMOKE_MUTATE=1` 验证清理接口。不要把生产 8990 的 Key、凭据或 `data/` 目录用于测试脚本。
+
 <a id="project-structure"></a>
 ## 目录结构
 
