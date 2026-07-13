@@ -1,7 +1,15 @@
 use std::io::Read as _;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use axum::http::HeaderMap;
 use base64::Engine as _;
+use parking_lot::Mutex;
 use sha2::{Digest as _, Sha256};
+
+use crate::admin::error_snapshot_db::{
+    CaptureMode, InsertOutcome, SharedErrorSnapshotStore, SnapshotSeverity, SnapshotWrite,
+};
+use crate::admin::trace_db::TraceKeySource;
 
 pub use crate::common::error_snapshot::{EncodedPayloadPart, SnapshotPayloadKind};
 
@@ -211,9 +219,526 @@ pub fn decode_payload_parts(
     Ok(output)
 }
 
+const STREAM_TAIL_MAX_BYTES: usize = 256 * 1024;
+
+pub struct ErrorSnapshotContext {
+    store: SharedErrorSnapshotStore,
+    trace_id: String,
+    snapshot_id: String,
+    key_id: u64,
+    key_source: TraceKeySource,
+    is_stream: bool,
+    ts: String,
+    ts_epoch: i64,
+    draft: Mutex<SnapshotDraft>,
+    finalized: AtomicBool,
+}
+
+struct SnapshotDraft {
+    headers: serde_json::Value,
+    client_request: serde_json::Value,
+    payloads: Vec<RawSnapshotPayload>,
+    attempts: Vec<AttemptObservation>,
+    protocol_errors: Vec<(String, String)>,
+    stream_tail: StreamTail,
+    final_credential_id: u64,
+    model: String,
+    endpoint: Option<String>,
+    tool_diagnostics: ToolDiagnostics,
+}
+
+#[derive(Clone)]
+struct RawSnapshotPayload {
+    kind: SnapshotPayloadKind,
+    attempt: Option<u32>,
+    content_type: String,
+    data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct AttemptObservation {
+    attempt: u32,
+    http_status: Option<u16>,
+    outcome: String,
+}
+
+#[derive(Default)]
+struct StreamTail {
+    bytes: Vec<u8>,
+}
+
+pub struct SnapshotFinalState {
+    pub final_status: String,
+    pub error_type: Option<String>,
+    pub error_message: Option<String>,
+    pub http_status: Option<u16>,
+    pub interrupted_after_bytes: Option<u64>,
+}
+
+impl SnapshotFinalState {
+    pub fn success() -> Self {
+        Self {
+            final_status: "success".to_string(),
+            error_type: None,
+            error_message: None,
+            http_status: Some(200),
+            interrupted_after_bytes: None,
+        }
+    }
+
+    pub fn error(error_type: &str, http_status: Option<u16>) -> Self {
+        Self {
+            final_status: "error".to_string(),
+            error_type: Some(error_type.to_string()),
+            error_message: None,
+            http_status,
+            interrupted_after_bytes: None,
+        }
+    }
+
+    pub fn interrupted(error_type: &str, sent_bytes: u64) -> Self {
+        Self {
+            final_status: "interrupted".to_string(),
+            error_type: Some(error_type.to_string()),
+            error_message: None,
+            http_status: None,
+            interrupted_after_bytes: Some(sent_bytes),
+        }
+    }
+}
+
+impl ErrorSnapshotContext {
+    pub fn new(
+        store: SharedErrorSnapshotStore,
+        trace_id: String,
+        key: &super::middleware::KeyContext,
+        headers: &HeaderMap,
+        request: &super::types::MessagesRequest,
+    ) -> Self {
+        let now = chrono::Utc::now();
+        let headers = sanitize_headers(headers);
+        let client_request = serde_json::to_value(request).unwrap_or_else(|error| {
+            serde_json::json!({
+                "serialization_error": error.to_string(),
+                "model": request.model,
+                "message_count": request.messages.len(),
+            })
+        });
+        let tool_diagnostics = analyze_tool_links(request);
+        Self {
+            store,
+            trace_id,
+            snapshot_id: format!("snap_{}", uuid::Uuid::new_v4().simple()),
+            key_id: key.key_id,
+            key_source: key.key_source,
+            is_stream: request.stream,
+            ts: now.to_rfc3339(),
+            ts_epoch: now.timestamp(),
+            draft: Mutex::new(SnapshotDraft {
+                headers,
+                client_request,
+                payloads: Vec::new(),
+                attempts: Vec::new(),
+                protocol_errors: Vec::new(),
+                stream_tail: StreamTail::default(),
+                final_credential_id: 0,
+                model: request.model.clone(),
+                endpoint: None,
+                tool_diagnostics,
+            }),
+            finalized: AtomicBool::new(false),
+        }
+    }
+
+    pub fn record_kiro_request(
+        &self,
+        attempt: u32,
+        credential_id: u64,
+        endpoint: &str,
+        body: &str,
+    ) {
+        let mut draft = self.draft.lock();
+        draft.final_credential_id = credential_id;
+        draft.endpoint = Some(endpoint.to_string());
+        draft.payloads.push(RawSnapshotPayload {
+            kind: SnapshotPayloadKind::KiroRequest,
+            attempt: Some(attempt),
+            content_type: "application/json".to_string(),
+            data: body.as_bytes().to_vec(),
+        });
+    }
+
+    pub fn record_upstream_response(&self, attempt: u32, status: u16, body: &str) {
+        self.record_attempt_status(
+            attempt,
+            Some(status),
+            if status < 400 { "success" } else { "error" },
+        );
+        self.draft.lock().payloads.push(RawSnapshotPayload {
+            kind: SnapshotPayloadKind::UpstreamResponse,
+            attempt: Some(attempt),
+            content_type: "application/json".to_string(),
+            data: body.as_bytes().to_vec(),
+        });
+    }
+
+    pub fn record_upstream_body(&self, attempt: u32, body: &[u8]) {
+        self.draft.lock().payloads.push(RawSnapshotPayload {
+            kind: SnapshotPayloadKind::UpstreamResponse,
+            attempt: Some(attempt),
+            content_type: "application/octet-stream".to_string(),
+            data: body.to_vec(),
+        });
+    }
+
+    pub fn record_network_error(&self, attempt: u32, message: &str) {
+        self.record_attempt_status(attempt, None, "network_error");
+        self.record_internal_error("network_error", message);
+    }
+
+    pub fn record_internal_error(&self, error_type: &str, message: &str) {
+        self.draft
+            .lock()
+            .protocol_errors
+            .push((error_type.to_string(), message.to_string()));
+    }
+
+    pub fn record_stream_chunk(&self, chunk: &[u8]) {
+        let mut draft = self.draft.lock();
+        draft.stream_tail.bytes.extend_from_slice(chunk);
+        let excess = draft
+            .stream_tail
+            .bytes
+            .len()
+            .saturating_sub(STREAM_TAIL_MAX_BYTES);
+        if excess > 0 {
+            draft.stream_tail.bytes.drain(..excess);
+        }
+    }
+
+    pub fn record_attempt_status(&self, attempt: u32, status: Option<u16>, outcome: &str) {
+        self.draft.lock().attempts.push(AttemptObservation {
+            attempt,
+            http_status: status,
+            outcome: outcome.to_string(),
+        });
+    }
+
+    pub fn set_outbound_metadata(&self, model: &str, endpoint: Option<&str>) {
+        let mut draft = self.draft.lock();
+        draft.model = model.to_string();
+        if let Some(endpoint) = endpoint {
+            draft.endpoint = Some(endpoint.to_string());
+        }
+    }
+
+    pub fn finalize(&self, state: SnapshotFinalState) -> anyhow::Result<Option<String>> {
+        if self.finalized.swap(true, Ordering::AcqRel) {
+            return Ok(None);
+        }
+        let policy = self.store.policy();
+        if !policy.enabled {
+            return Ok(None);
+        }
+        let draft = self.draft.lock();
+        let failed_attempt = draft.attempts.iter().any(|attempt| {
+            attempt
+                .http_status
+                .is_none_or(|status| !(200..400).contains(&status))
+                || attempt.outcome != "success"
+        });
+        let has_internal_error = !draft.protocol_errors.is_empty();
+        let final_success = state.final_status == "success";
+        let recovered = final_success && (failed_attempt || has_internal_error);
+        if final_success && !recovered {
+            return Ok(None);
+        }
+        if recovered && !policy.capture_recovered {
+            return Ok(None);
+        }
+        let error_type = state
+            .error_type
+            .clone()
+            .or_else(|| draft.protocol_errors.last().map(|entry| entry.0.clone()))
+            .or_else(|| {
+                draft
+                    .attempts
+                    .iter()
+                    .find(|attempt| attempt.outcome != "success")
+                    .map(|attempt| attempt.outcome.clone())
+            })
+            .unwrap_or_else(|| "recovered_request".to_string());
+        let severity = classify_severity(&error_type, recovered);
+        let retention_exempt = severity == SnapshotSeverity::Critical;
+        let metadata_only = self.store.capture_mode() == CaptureMode::MetadataOnly;
+        let include_bodies = policy.capture_bodies && !metadata_only;
+        let mut raw_payloads = Vec::new();
+        if include_bodies {
+            raw_payloads.push(RawSnapshotPayload {
+                kind: SnapshotPayloadKind::ClientRequest,
+                attempt: None,
+                content_type: "application/json".to_string(),
+                data: serde_json::to_vec(&sanitize_json(serde_json::json!({
+                    "headers": draft.headers,
+                    "request": draft.client_request,
+                })))?,
+            });
+        }
+        let request_bytes = serde_json::to_vec(&draft.client_request)?;
+        raw_payloads.push(RawSnapshotPayload {
+            kind: SnapshotPayloadKind::ToolDiagnostics,
+            attempt: None,
+            content_type: "application/json".to_string(),
+            data: serde_json::to_vec(&serde_json::json!({
+                "request_bytes": request_bytes.len(),
+                "request_sha256": hex::encode(Sha256::digest(&request_bytes)),
+                "tool_links": draft.tool_diagnostics,
+                "attempts": draft.attempts,
+            }))?,
+        });
+        for payload in &draft.payloads {
+            if include_bodies || payload.kind != SnapshotPayloadKind::KiroRequest {
+                raw_payloads.push(payload.clone());
+            }
+        }
+        if !draft.protocol_errors.is_empty() {
+            raw_payloads.push(RawSnapshotPayload {
+                kind: SnapshotPayloadKind::InternalError,
+                attempt: None,
+                content_type: "application/json".to_string(),
+                data: serde_json::to_vec(&draft.protocol_errors)?,
+            });
+        }
+        if !draft.stream_tail.bytes.is_empty() {
+            raw_payloads.push(RawSnapshotPayload {
+                kind: SnapshotPayloadKind::StreamTail,
+                attempt: None,
+                content_type: "application/octet-stream".to_string(),
+                data: draft.stream_tail.bytes.clone(),
+            });
+        }
+        let mut payloads = Vec::new();
+        for (seq, raw) in raw_payloads.into_iter().enumerate() {
+            let data = sanitize_payload_data(&raw.content_type, raw.data);
+            let mut encoded = encode_payload(raw.kind, raw.attempt, &raw.content_type, &data)?;
+            for part in &mut encoded {
+                part.seq = u32::try_from(seq)?;
+            }
+            payloads.extend(encoded);
+        }
+        let error_message = state
+            .error_message
+            .or_else(|| draft.protocol_errors.last().map(|entry| entry.1.clone()));
+        let http_status = state.http_status.or_else(|| {
+            draft
+                .attempts
+                .iter()
+                .rev()
+                .find_map(|attempt| attempt.http_status)
+        });
+        let write = SnapshotWrite {
+            snapshot_id: self.snapshot_id.clone(),
+            trace_id: self.trace_id.clone(),
+            ts: self.ts.clone(),
+            ts_epoch: self.ts_epoch,
+            model: draft.model.clone(),
+            is_stream: self.is_stream,
+            key_id: self.key_id,
+            key_source: self.key_source,
+            final_credential_id: draft.final_credential_id,
+            endpoint: draft.endpoint.clone(),
+            http_status,
+            final_status: state.final_status,
+            error_type,
+            severity,
+            error_message,
+            recovered,
+            pinned: false,
+            retention_exempt,
+            omitted_due_to_disk_pressure: metadata_only,
+            payloads,
+        };
+        let id = match self.store.insert_with_fallback(&write)? {
+            InsertOutcome::Inserted(id)
+            | InsertOutcome::Existing(id)
+            | InsertOutcome::Fallback(id) => id,
+        };
+        Ok(Some(id))
+    }
+}
+
+fn sanitize_payload_data(content_type: &str, data: Vec<u8>) -> Vec<u8> {
+    if content_type.contains("json")
+        && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&data)
+        && let Ok(encoded) = serde_json::to_vec(&sanitize_json(value))
+    {
+        return encoded;
+    }
+    data
+}
+
+fn sanitize_headers(headers: &HeaderMap) -> serde_json::Value {
+    let mut output = serde_json::Map::new();
+    for (name, value) in headers {
+        let value = value.to_str().map(str::to_owned).unwrap_or_else(|_| {
+            let bytes = value.as_bytes();
+            format!(
+                "[NON_UTF8 length={} sha256={}]",
+                bytes.len(),
+                hex::encode(Sha256::digest(bytes))
+            )
+        });
+        output.insert(name.to_string(), serde_json::Value::String(value));
+    }
+    sanitize_json(serde_json::Value::Object(output))
+}
+
+fn classify_severity(error_type: &str, recovered: bool) -> SnapshotSeverity {
+    if matches!(
+        error_type,
+        "tool_use_truncated"
+            | "tool_result_mismatch"
+            | "upstream_tool_protocol_error"
+            | "upstream_thinking_protocol_error"
+            | "sse_state_error"
+            | "utf8_decode_error"
+            | "snapshot_integrity_error"
+    ) {
+        SnapshotSeverity::Critical
+    } else if recovered {
+        SnapshotSeverity::Warning
+    } else {
+        SnapshotSeverity::Error
+    }
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub(crate) struct ToolDiagnostics {
+    pub invalid_ids: Vec<String>,
+    pub duplicate_tool_use_ids: Vec<String>,
+    pub unmatched_tool_results: Vec<String>,
+    pub missing_tool_results: Vec<String>,
+    pub block_order: Vec<serde_json::Value>,
+}
+
+pub(crate) fn analyze_tool_links(request: &super::types::MessagesRequest) -> ToolDiagnostics {
+    let mut diagnostics = ToolDiagnostics::default();
+    let mut tool_uses = std::collections::HashSet::new();
+    let mut tool_results = std::collections::HashSet::new();
+    let mut duplicates = std::collections::HashSet::new();
+    for (message_index, message) in request.messages.iter().enumerate() {
+        let Some(blocks) = message.content.as_array() else {
+            continue;
+        };
+        for (block_index, block) in blocks.iter().enumerate() {
+            match block.get("type").and_then(serde_json::Value::as_str) {
+                Some("tool_use") => {
+                    let id = block
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    if !valid_tool_id(&id) {
+                        diagnostics.invalid_ids.push(id.clone());
+                    }
+                    if !tool_uses.insert(id.clone()) && duplicates.insert(id.clone()) {
+                        diagnostics.duplicate_tool_use_ids.push(id.clone());
+                    }
+                    diagnostics.block_order.push(serde_json::json!({
+                        "message": message_index,
+                        "block": block_index,
+                        "role": message.role,
+                        "type": "tool_use",
+                        "id": id,
+                        "name": block.get("name").and_then(serde_json::Value::as_str),
+                    }));
+                }
+                Some("tool_result") => {
+                    let id = block
+                        .get("tool_use_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    tool_results.insert(id.clone());
+                    diagnostics.block_order.push(serde_json::json!({
+                        "message": message_index,
+                        "block": block_index,
+                        "role": message.role,
+                        "type": "tool_result",
+                        "tool_use_id": id,
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+    diagnostics.unmatched_tool_results = tool_results.difference(&tool_uses).cloned().collect();
+    diagnostics.missing_tool_results = tool_uses.difference(&tool_results).cloned().collect();
+    diagnostics.invalid_ids.sort();
+    diagnostics.duplicate_tool_use_ids.sort();
+    diagnostics.unmatched_tool_results.sort();
+    diagnostics.missing_tool_results.sort();
+    diagnostics
+}
+
+fn valid_tool_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_store() -> crate::admin::error_snapshot_db::SharedErrorSnapshotStore {
+        std::sync::Arc::new(
+            crate::admin::ErrorSnapshotStore::open_in_memory(
+                crate::admin::error_snapshot_db::ErrorSnapshotPolicy {
+                    enabled: true,
+                    retention_days: 90,
+                    max_storage_bytes: 1024 * 1024 * 1024,
+                    capture_recovered: true,
+                    capture_bodies: true,
+                    min_free_disk_bytes: 1,
+                },
+            )
+            .unwrap(),
+        )
+    }
+
+    fn sample_context(
+        store: crate::admin::error_snapshot_db::SharedErrorSnapshotStore,
+        capture_recovered: bool,
+        capture_bodies: bool,
+    ) -> ErrorSnapshotContext {
+        let mut policy = store.policy();
+        policy.capture_recovered = capture_recovered;
+        policy.capture_bodies = capture_bodies;
+        store.set_policy(policy);
+        let key = crate::anthropic::middleware::KeyContext {
+            key_id: 7,
+            group: None,
+            key_source: crate::admin::trace_db::TraceKeySource::ClientKey,
+        };
+        let request: crate::anthropic::types::MessagesRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": false
+            }))
+            .unwrap();
+        ErrorSnapshotContext::new(
+            store,
+            "trace-test".to_string(),
+            &key,
+            &axum::http::HeaderMap::new(),
+            &request,
+        )
+    }
 
     #[test]
     fn redacts_auth_fields_but_preserves_customer_text_and_tool_json() {
@@ -298,5 +823,94 @@ mod tests {
         .unwrap();
         let error = decode_payload_parts(&encoded, 128).unwrap_err();
         assert!(error.to_string().contains("解压上限"));
+    }
+
+    #[test]
+    fn pure_success_does_not_create_snapshot() {
+        let ctx = sample_context(test_store(), true, true);
+        ctx.record_attempt_status(0, Some(200), "success");
+        assert_eq!(ctx.finalize(SnapshotFinalState::success()).unwrap(), None);
+    }
+
+    #[test]
+    fn failed_request_creates_error_snapshot() {
+        let store = test_store();
+        let ctx = sample_context(store.clone(), true, true);
+        ctx.record_internal_error("upstream_tool_protocol_error", "tool JSON truncated");
+        let id = ctx
+            .finalize(SnapshotFinalState::error(
+                "upstream_tool_protocol_error",
+                Some(502),
+            ))
+            .unwrap()
+            .unwrap();
+        assert!(store.get(&id).unwrap().is_some());
+    }
+
+    #[test]
+    fn recovered_request_is_warning_when_capture_recovered_is_enabled() {
+        let store = test_store();
+        let ctx = sample_context(store.clone(), true, true);
+        ctx.record_attempt_status(0, Some(500), "transient");
+        ctx.record_attempt_status(1, Some(200), "success");
+        let id = ctx
+            .finalize(SnapshotFinalState::success())
+            .unwrap()
+            .unwrap();
+        let detail = store.get(&id).unwrap().unwrap();
+        assert!(detail.summary.recovered);
+        assert_eq!(
+            detail.summary.severity,
+            crate::admin::error_snapshot_db::SnapshotSeverity::Warning
+        );
+    }
+
+    #[test]
+    fn critical_protocol_error_is_retention_exempt() {
+        let store = test_store();
+        let ctx = sample_context(store.clone(), true, true);
+        ctx.record_internal_error("tool_use_truncated", "incomplete JSON");
+        let id = ctx
+            .finalize(SnapshotFinalState::error("tool_use_truncated", Some(502)))
+            .unwrap()
+            .unwrap();
+        let detail = store.get(&id).unwrap().unwrap();
+        assert_eq!(
+            detail.summary.severity,
+            crate::admin::error_snapshot_db::SnapshotSeverity::Critical
+        );
+        assert!(detail.summary.retention_exempt);
+    }
+
+    #[test]
+    fn tool_diagnostics_reports_invalid_duplicate_and_unmatched_ids() {
+        let request: crate::anthropic::types::MessagesRequest = serde_json::from_value(
+            serde_json::json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": 64,
+                "messages": [
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "tool/get_weather/1", "name": "get_weather", "input": {}},
+                        {"type": "tool_use", "id": "duplicate", "name": "get_weather", "input": {}},
+                        {"type": "tool_use", "id": "duplicate", "name": "get_weather", "input": {}}
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "missing-result", "content": "none"}
+                    ]}
+                ]
+            }),
+        )
+        .unwrap();
+
+        let diagnostics = analyze_tool_links(&request);
+
+        assert_eq!(diagnostics.invalid_ids, vec!["tool/get_weather/1"]);
+        assert_eq!(diagnostics.duplicate_tool_use_ids, vec!["duplicate"]);
+        assert_eq!(diagnostics.unmatched_tool_results, vec!["missing-result"]);
+        assert!(
+            diagnostics
+                .missing_tool_results
+                .contains(&"tool/get_weather/1".to_string())
+        );
     }
 }

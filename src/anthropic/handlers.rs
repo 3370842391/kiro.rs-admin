@@ -127,6 +127,8 @@ impl UsageRecordHook {
 /// `store` 为 None（未启用 Admin / trace）时所有方法都是空操作，零开销。
 pub(crate) struct RequestTracer {
     store: Option<SharedTraceStore>,
+    snapshot: Option<std::sync::Arc<super::error_snapshot::ErrorSnapshotContext>>,
+    finalized: std::sync::atomic::AtomicBool,
     trace_id: String,
     ts: String,
     key_id: u64,
@@ -134,7 +136,7 @@ pub(crate) struct RequestTracer {
     model: String,
     is_stream: bool,
     /// 本次请求实际下发的思考档位（low/medium/high/xhigh/max）；未启用/不支持为 None。
-    reasoning_effort: Option<String>,
+    reasoning_effort: parking_lot::Mutex<Option<String>>,
     /// 是否声明 1M 扩展上下文（客户端带 `anthropic-beta: context-1m-...` 头）。
     context_1m: bool,
     /// 客户端是否请求了推理（thinking 启用 或 显式 effort）；与档位独立。
@@ -177,16 +179,33 @@ struct RequestTraceOptions {
 }
 
 impl RequestTracer {
-    fn new(state: &AppState, options: RequestTraceOptions) -> Self {
+    fn new(
+        state: &AppState,
+        options: RequestTraceOptions,
+        headers: &HeaderMap,
+        request: &MessagesRequest,
+    ) -> Self {
+        let trace_id = Uuid::new_v4().to_string();
+        let snapshot = state.error_snapshot_store.as_ref().map(|store| {
+            std::sync::Arc::new(super::error_snapshot::ErrorSnapshotContext::new(
+                store.clone(),
+                trace_id.clone(),
+                &options.key_ctx,
+                headers,
+                request,
+            ))
+        });
         Self {
             store: state.trace_store.clone(),
-            trace_id: Uuid::new_v4().to_string(),
+            snapshot,
+            finalized: std::sync::atomic::AtomicBool::new(false),
+            trace_id,
             ts: Utc::now().to_rfc3339(),
             key_id: options.key_ctx.key_id,
             key_source: options.key_ctx.key_source,
             model: options.model,
             is_stream: options.is_stream,
-            reasoning_effort: options.reasoning_effort,
+            reasoning_effort: parking_lot::Mutex::new(options.reasoning_effort),
             context_1m: options.context_1m,
             thinking: options.thinking,
             started_at: Instant::now(),
@@ -212,6 +231,28 @@ impl RequestTracer {
         }
     }
 
+    pub fn set_reasoning_effort(&self, value: Option<String>) {
+        *self.reasoning_effort.lock() = value;
+    }
+
+    pub fn record_protocol_error(&self, error_type: &str, message: &str) {
+        if let Some(snapshot) = &self.snapshot {
+            snapshot.record_internal_error(error_type, message);
+        }
+    }
+
+    pub fn record_stream_chunk(&self, chunk: &[u8]) {
+        if let Some(snapshot) = &self.snapshot {
+            snapshot.record_stream_chunk(chunk);
+        }
+    }
+
+    pub fn record_kiro_request(&self, body: &str) {
+        if let Some(snapshot) = &self.snapshot {
+            snapshot.record_kiro_request(0, 0, "pending", body);
+        }
+    }
+
     fn last_http_status(&self) -> Option<u16> {
         self.attempts.lock().last().and_then(|a| a.http_status)
     }
@@ -225,7 +266,12 @@ impl RequestTracer {
         interrupted_after_bytes: Option<u64>,
         usage: TraceUsage,
     ) {
-        let Some(store) = &self.store else { return };
+        if self
+            .finalized
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
         let attempts = std::mem::take(&mut *self.attempts.lock());
         // 最终凭据：最后一跳的命中凭据（成功跳即命中凭据，失败跳即最后尝试的凭据）
         let final_credential_id = attempts.last().map(|a| a.credential_id).unwrap_or(0);
@@ -237,6 +283,23 @@ impl RequestTracer {
             .upstream_first_byte_at
             .lock()
             .map(|t| t.duration_since(self.started_at).as_millis() as u64);
+        let snapshot_id = self.snapshot.as_ref().and_then(|snapshot| {
+            let state = super::error_snapshot::SnapshotFinalState {
+                final_status: final_status.to_string(),
+                error_type: error_type.map(str::to_string),
+                error_message: error_message.map(str::to_string),
+                http_status: attempts.last().and_then(|attempt| attempt.http_status),
+                interrupted_after_bytes,
+            };
+            match snapshot.finalize(state) {
+                Ok(id) => id,
+                Err(error) => {
+                    tracing::error!(%error, trace_id = %self.trace_id, "持久化错误快照失败");
+                    None
+                }
+            }
+        });
+        let Some(store) = &self.store else { return };
         let rec = TraceRecord {
             trace_id: self.trace_id.clone(),
             ts: self.ts.clone(),
@@ -258,10 +321,10 @@ impl RequestTracer {
             credits: usage.credits,
             first_token_ms,
             upstream_first_byte_ms,
-            reasoning_effort: self.reasoning_effort.clone(),
+            reasoning_effort: self.reasoning_effort.lock().clone(),
             context_1m: self.context_1m,
             thinking: self.thinking,
-            snapshot_id: None,
+            snapshot_id,
             attempts,
         };
         store.insert(&rec);
@@ -270,7 +333,28 @@ impl RequestTracer {
 
 impl TraceSink for RequestTracer {
     fn on_attempt(&self, attempt: TraceAttempt) {
+        if let Some(snapshot) = &self.snapshot {
+            snapshot.record_attempt_status(attempt.attempt, attempt.http_status, &attempt.outcome);
+        }
         self.attempts.lock().push(attempt);
+    }
+}
+
+fn finalize_immediate_response(
+    tracer: &RequestTracer,
+    response: &Response,
+    error_type: &str,
+) {
+    if response.status().is_success() {
+        tracer.finalize("success", None, None, None, TraceUsage::zero());
+    } else {
+        tracer.finalize(
+            "error",
+            Some(error_type),
+            None,
+            None,
+            TraceUsage::zero(),
+        );
     }
 }
 
@@ -680,10 +764,12 @@ async fn collect_buffered_attempt(
     let credential_id = call_result.credential_id;
     let body = call_result.response.bytes().await?;
     tracer.mark_upstream_first_byte();
+    tracer.record_stream_chunk(&body);
 
     let mut decoder = EventStreamDecoder::new();
     if let Err(error) = decoder.feed(&body) {
         tracing::warn!(error = %error, "strict JSON attempt decoder buffer overflow");
+        tracer.record_protocol_error("sse_state_error", &error.to_string());
     }
     let mut context = BufferedStreamContext::new_with_constraints(
         model,
@@ -1820,12 +1906,32 @@ pub async fn post_messages(
         );
     }
     let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
+    let tracer = std::sync::Arc::new(RequestTracer::new(
+        &state,
+        RequestTraceOptions {
+            key_ctx: key_ctx.clone(),
+            model: payload.model.clone(),
+            is_stream: payload.stream,
+            reasoning_effort: payload.output_config.as_ref().map(|value| value.effort.clone()),
+            context_1m: beta_has_context_1m(&headers),
+            thinking: reasoning_requested(&payload),
+        },
+        &headers,
+        &payload,
+    ));
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
         None => {
             tracing::error!("KiroProvider 未配置");
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            tracer.finalize(
+                "error",
+                Some("service_unavailable"),
+                Some("Kiro API provider not configured"),
+                None,
+                TraceUsage::zero(),
+            );
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ErrorResponse::new(
@@ -1843,6 +1949,7 @@ pub async fn post_messages(
     if let Some(response) =
         try_local_model_profile_response(&state, provider.as_ref(), &payload, &hook)
     {
+        finalize_immediate_response(&tracer, &response, "model_profile_error");
         return response;
     }
 
@@ -1853,6 +1960,7 @@ pub async fn post_messages(
         &hook,
         state.tool_compatibility_mode,
     ) {
+        finalize_immediate_response(&tracer, &response, "exact_system_error");
         return response;
     }
 
@@ -1863,10 +1971,12 @@ pub async fn post_messages(
         &hook,
         state.tool_compatibility_mode,
     ) {
+        finalize_immediate_response(&tracer, &response, "exact_user_error");
         return response;
     }
 
     if let Some(response) = try_local_ping_response(&state, provider.as_ref(), &payload, &hook) {
+        finalize_immediate_response(&tracer, &response, "local_ping_error");
         return response;
     }
 
@@ -1879,7 +1989,9 @@ pub async fn post_messages(
         Err(error) => {
             tracing::warn!(error = %error, "Anthropic document preprocessing failed");
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            return map_document_error(error);
+            let response = map_document_error(error);
+            finalize_immediate_response(&tracer, &response, "document_error");
+            return response;
         }
     };
     if let Some(response) = try_local_document_identifier_response(
@@ -1890,6 +2002,7 @@ pub async fn post_messages(
         &hook,
         state.tool_compatibility_mode,
     ) {
+        finalize_immediate_response(&tracer, &response, "document_identifier_error");
         return response;
     }
 
@@ -1913,6 +2026,7 @@ pub async fn post_messages(
             "error"
         };
         hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
+        finalize_immediate_response(&tracer, &resp, "websearch_error");
         return resp;
     }
 
@@ -1923,7 +2037,7 @@ pub async fn post_messages(
         tracing::info!(
             "detected mixed tools containing web_search, entering the web_search agentic loop"
         );
-        return super::websearch_loop::run_web_search_loop(
+        let response = super::websearch_loop::run_web_search_loop(
             provider,
             payload,
             hook,
@@ -1933,6 +2047,8 @@ pub async fn post_messages(
             context_window_size,
         )
         .await;
+        finalize_immediate_response(&tracer, &response, "websearch_loop_error");
+        return response;
     }
 
     // 转换请求
@@ -1942,7 +2058,9 @@ pub async fn post_messages(
         Err(PrepareRequestError::Document(error)) => {
             tracing::warn!(error = %error, "Anthropic document preprocessing failed");
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            return map_document_error(error);
+            let response = map_document_error(error);
+            finalize_immediate_response(&tracer, &response, "document_error");
+            return response;
         }
         Err(PrepareRequestError::Conversion(e)) => {
             let (error_type, message) = match &e {
@@ -1966,6 +2084,14 @@ pub async fn post_messages(
             };
             tracing::warn!("请求转换失败: {}", e);
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            tracer.record_protocol_error("request_conversion_error", &message);
+            tracer.finalize(
+                "error",
+                Some("request_conversion_error"),
+                Some(&message),
+                None,
+                TraceUsage::zero(),
+            );
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse::new(error_type, message)),
@@ -1986,11 +2112,13 @@ pub async fn post_messages(
         Ok(prepared) => prepared,
         Err(response) => {
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            finalize_immediate_response(&tracer, &response, "request_body_error");
             return response;
         }
     };
     let request_body = &prepared_bodies.primary_body;
     let threshold_retry_body = prepared_bodies.threshold_retry_body.as_deref();
+    tracer.record_kiro_request(request_body);
 
     tracing::debug!("Kiro request body: {}", request_body);
 
@@ -2028,16 +2156,8 @@ pub async fn post_messages(
         .unwrap_or_default();
 
     if strict_json_candidate {
-        let tracer = std::sync::Arc::new(RequestTracer::new(
-            &state,
-            RequestTraceOptions {
-                key_ctx: key_ctx.clone(),
-                model: payload.model.clone(),
-                is_stream: payload.stream,
-                reasoning_effort: effort_from_fields(&kiro_request.additional_model_request_fields),
-                context_1m: beta_has_context_1m(&headers),
-                thinking: false,
-            },
+        tracer.set_reasoning_effort(effort_from_fields(
+            &kiro_request.additional_model_request_fields,
         ));
         return handle_strict_json_request(
             provider,
@@ -2056,16 +2176,8 @@ pub async fn post_messages(
 
     if payload.stream {
         // 流式响应
-        let tracer = std::sync::Arc::new(RequestTracer::new(
-            &state,
-            RequestTraceOptions {
-                key_ctx: key_ctx.clone(),
-                model: payload.model.clone(),
-                is_stream: true,
-                reasoning_effort: effort_from_fields(&kiro_request.additional_model_request_fields),
-                context_1m: beta_has_context_1m(&headers),
-                thinking: reasoning_requested(&payload),
-            },
+        tracer.set_reasoning_effort(effort_from_fields(
+            &kiro_request.additional_model_request_fields,
         ));
         handle_stream_request(
             provider,
@@ -2088,16 +2200,8 @@ pub async fn post_messages(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        let tracer = std::sync::Arc::new(RequestTracer::new(
-            &state,
-            RequestTraceOptions {
-                key_ctx: key_ctx.clone(),
-                model: payload.model.clone(),
-                is_stream: false,
-                reasoning_effort: effort_from_fields(&kiro_request.additional_model_request_fields),
-                context_1m: beta_has_context_1m(&headers),
-                thinking: reasoning_requested(&payload),
-            },
+        tracer.set_reasoning_effort(effort_from_fields(
+            &kiro_request.additional_model_request_fields,
         ));
         handle_non_stream_request(
             provider,
@@ -2666,10 +2770,12 @@ async fn run_realtime_sse_attempts(
                 chunk_result = body_stream.next() => match chunk_result {
                     Some(Ok(chunk)) => {
                         tracer.mark_upstream_first_byte();
+                        tracer.record_stream_chunk(&chunk);
                         received_bytes += chunk.len() as u64;
                         idle_deadline = TokioInstant::now() + Duration::from_secs(idle_timeout_secs.max(1));
                         if let Err(error) = decoder.feed(&chunk) {
                             tracing::warn!(%error, attempt = attempt_index + 1, "流式解码缓冲区溢出");
+                            tracer.record_protocol_error("sse_state_error", &error.to_string());
                         }
                         let mut events = Vec::new();
                         for result in decoder.decode_iter() {
@@ -3599,6 +3705,19 @@ pub async fn post_messages_cc(
         "Received POST /cc/v1/messages request"
     );
     let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
+    let tracer = std::sync::Arc::new(RequestTracer::new(
+        &state,
+        RequestTraceOptions {
+            key_ctx: key_ctx.clone(),
+            model: payload.model.clone(),
+            is_stream: payload.stream,
+            reasoning_effort: payload.output_config.as_ref().map(|value| value.effort.clone()),
+            context_1m: beta_has_context_1m(&headers),
+            thinking: reasoning_requested(&payload),
+        },
+        &headers,
+        &payload,
+    ));
 
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
@@ -3606,6 +3725,13 @@ pub async fn post_messages_cc(
         None => {
             tracing::error!("KiroProvider 未配置");
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            tracer.finalize(
+                "error",
+                Some("service_unavailable"),
+                Some("Kiro API provider not configured"),
+                None,
+                TraceUsage::zero(),
+            );
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ErrorResponse::new(
@@ -3623,6 +3749,7 @@ pub async fn post_messages_cc(
     if let Some(response) =
         try_local_model_profile_response(&state, provider.as_ref(), &payload, &hook)
     {
+        finalize_immediate_response(&tracer, &response, "model_profile_error");
         return response;
     }
 
@@ -3633,6 +3760,7 @@ pub async fn post_messages_cc(
         &hook,
         state.tool_compatibility_mode,
     ) {
+        finalize_immediate_response(&tracer, &response, "exact_system_error");
         return response;
     }
 
@@ -3643,10 +3771,12 @@ pub async fn post_messages_cc(
         &hook,
         state.tool_compatibility_mode,
     ) {
+        finalize_immediate_response(&tracer, &response, "exact_user_error");
         return response;
     }
 
     if let Some(response) = try_local_ping_response(&state, provider.as_ref(), &payload, &hook) {
+        finalize_immediate_response(&tracer, &response, "local_ping_error");
         return response;
     }
 
@@ -3659,7 +3789,9 @@ pub async fn post_messages_cc(
         Err(error) => {
             tracing::warn!(error = %error, "Anthropic document preprocessing failed");
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            return map_document_error(error);
+            let response = map_document_error(error);
+            finalize_immediate_response(&tracer, &response, "document_error");
+            return response;
         }
     };
     if let Some(response) = try_local_document_identifier_response(
@@ -3670,6 +3802,7 @@ pub async fn post_messages_cc(
         &hook,
         state.tool_compatibility_mode,
     ) {
+        finalize_immediate_response(&tracer, &response, "document_identifier_error");
         return response;
     }
 
@@ -3692,6 +3825,7 @@ pub async fn post_messages_cc(
             "error"
         };
         hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
+        finalize_immediate_response(&tracer, &resp, "websearch_error");
         return resp;
     }
 
@@ -3702,7 +3836,7 @@ pub async fn post_messages_cc(
         tracing::info!(
             "detected mixed tools containing web_search, entering the web_search agentic loop"
         );
-        return super::websearch_loop::run_web_search_loop(
+        let response = super::websearch_loop::run_web_search_loop(
             provider,
             payload,
             hook,
@@ -3712,6 +3846,8 @@ pub async fn post_messages_cc(
             context_window_size,
         )
         .await;
+        finalize_immediate_response(&tracer, &response, "websearch_loop_error");
+        return response;
     }
 
     // 转换请求
@@ -3721,7 +3857,9 @@ pub async fn post_messages_cc(
         Err(PrepareRequestError::Document(error)) => {
             tracing::warn!(error = %error, "Anthropic document preprocessing failed");
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            return map_document_error(error);
+            let response = map_document_error(error);
+            finalize_immediate_response(&tracer, &response, "document_error");
+            return response;
         }
         Err(PrepareRequestError::Conversion(e)) => {
             let (error_type, message) = match &e {
@@ -3745,6 +3883,14 @@ pub async fn post_messages_cc(
             };
             tracing::warn!("请求转换失败: {}", e);
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            tracer.record_protocol_error("request_conversion_error", &message);
+            tracer.finalize(
+                "error",
+                Some("request_conversion_error"),
+                Some(&message),
+                None,
+                TraceUsage::zero(),
+            );
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse::new(error_type, message)),
@@ -3765,11 +3911,13 @@ pub async fn post_messages_cc(
         Ok(prepared) => prepared,
         Err(response) => {
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            finalize_immediate_response(&tracer, &response, "request_body_error");
             return response;
         }
     };
     let request_body = &prepared_bodies.primary_body;
     let threshold_retry_body = prepared_bodies.threshold_retry_body.as_deref();
+    tracer.record_kiro_request(request_body);
 
     tracing::debug!("Kiro request body: {}", request_body);
 
@@ -3806,16 +3954,8 @@ pub async fn post_messages_cc(
         .unwrap_or_default();
 
     if strict_json_candidate {
-        let tracer = std::sync::Arc::new(RequestTracer::new(
-            &state,
-            RequestTraceOptions {
-                key_ctx: key_ctx.clone(),
-                model: payload.model.clone(),
-                is_stream: payload.stream,
-                reasoning_effort: effort_from_fields(&kiro_request.additional_model_request_fields),
-                context_1m: beta_has_context_1m(&headers),
-                thinking: false,
-            },
+        tracer.set_reasoning_effort(effort_from_fields(
+            &kiro_request.additional_model_request_fields,
         ));
         return handle_strict_json_request(
             provider,
@@ -3834,16 +3974,8 @@ pub async fn post_messages_cc(
 
     if payload.stream {
         // 流式响应（缓冲模式）
-        let tracer = std::sync::Arc::new(RequestTracer::new(
-            &state,
-            RequestTraceOptions {
-                key_ctx: key_ctx.clone(),
-                model: payload.model.clone(),
-                is_stream: true,
-                reasoning_effort: effort_from_fields(&kiro_request.additional_model_request_fields),
-                context_1m: beta_has_context_1m(&headers),
-                thinking: reasoning_requested(&payload),
-            },
+        tracer.set_reasoning_effort(effort_from_fields(
+            &kiro_request.additional_model_request_fields,
         ));
         handle_stream_request_buffered(
             provider,
@@ -3866,16 +3998,8 @@ pub async fn post_messages_cc(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        let tracer = std::sync::Arc::new(RequestTracer::new(
-            &state,
-            RequestTraceOptions {
-                key_ctx: key_ctx.clone(),
-                model: payload.model.clone(),
-                is_stream: false,
-                reasoning_effort: effort_from_fields(&kiro_request.additional_model_request_fields),
-                context_1m: beta_has_context_1m(&headers),
-                thinking: reasoning_requested(&payload),
-            },
+        tracer.set_reasoning_effort(effort_from_fields(
+            &kiro_request.additional_model_request_fields,
         ));
         handle_non_stream_request(
             provider,
@@ -4075,10 +4199,12 @@ async fn run_buffered_sse_attempts(
                 chunk_result = body_stream.next() => match chunk_result {
                     Some(Ok(chunk)) => {
                         tracer.mark_upstream_first_byte();
+                        tracer.record_stream_chunk(&chunk);
                         received_bytes += chunk.len() as u64;
                         idle_deadline = TokioInstant::now() + Duration::from_secs(idle_timeout_secs.max(1));
                         if let Err(error) = decoder.feed(&chunk) {
                             tracing::warn!(%error, attempt = attempt_index + 1, "缓冲流解码缓冲区溢出");
+                            tracer.record_protocol_error("sse_state_error", &error.to_string());
                         }
                         for result in decoder.decode_iter() {
                             match result {
