@@ -186,14 +186,15 @@ impl RequestTracer {
         request: &MessagesRequest,
     ) -> Self {
         let trace_id = Uuid::new_v4().to_string();
-        let snapshot = state.error_snapshot_store.as_ref().map(|store| {
-            std::sync::Arc::new(super::error_snapshot::ErrorSnapshotContext::new(
+        let snapshot = state.error_snapshot_store.as_ref().and_then(|store| {
+            super::error_snapshot::ErrorSnapshotContext::new_if_enabled(
                 store.clone(),
                 trace_id.clone(),
                 &options.key_ctx,
                 headers,
                 request,
-            ))
+            )
+            .map(std::sync::Arc::new)
         });
         Self {
             store: state.trace_store.clone(),
@@ -237,6 +238,13 @@ impl RequestTracer {
 
     pub fn record_protocol_error(&self, error_type: &str, message: &str) {
         if let Some(snapshot) = &self.snapshot {
+            snapshot.record_internal_error(error_type, message);
+        }
+    }
+
+    pub fn record_local_error(&self, status: StatusCode, error_type: &str, message: &str) {
+        if let Some(snapshot) = &self.snapshot {
+            snapshot.record_attempt_status(0, Some(status.as_u16()), "local_error");
             snapshot.record_internal_error(error_type, message);
         }
     }
@@ -348,12 +356,52 @@ fn finalize_immediate_response(
     if response.status().is_success() {
         tracer.finalize("success", None, None, None, TraceUsage::zero());
     } else {
-        tracer.finalize(
-            "error",
-            Some(error_type),
-            None,
-            None,
-            TraceUsage::zero(),
+        let message = format!(
+            "local response returned HTTP {} {}",
+            response.status().as_u16(),
+            response.status().canonical_reason().unwrap_or("error")
+        );
+        finalize_immediate_error(tracer, response.status(), error_type, &message);
+    }
+}
+
+fn finalize_immediate_error(
+    tracer: &RequestTracer,
+    status: StatusCode,
+    error_type: &str,
+    message: &str,
+) {
+    tracer.record_local_error(status, error_type, message);
+    tracer.finalize(
+        "error",
+        Some(error_type),
+        Some(message),
+        None,
+        TraceUsage::zero(),
+    );
+}
+
+fn finalize_client_disconnected(
+    tracer: &RequestTracer,
+    received_bytes: u64,
+    usage: TraceUsage,
+) {
+    const MESSAGE: &str = "client disconnected before the response stream completed";
+    tracer.record_protocol_error("client_disconnected", MESSAGE);
+    tracer.finalize(
+        "interrupted",
+        Some("client_disconnected"),
+        Some(MESSAGE),
+        Some(received_bytes),
+        usage,
+    );
+}
+
+fn record_strict_json_recovery(tracer: &RequestTracer, attempts: usize) {
+    if attempts > 1 {
+        tracer.record_protocol_error(
+            "structured_output_retry",
+            "the first structured output attempt was invalid and a retry recovered",
         );
     }
 }
@@ -859,12 +907,11 @@ async fn handle_strict_json_request(
     let Some(retry_body) = super::exact_output::append_strict_json_retry_instruction(request_body)
     else {
         hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
-        tracer.finalize(
-            "error",
-            Some(outcome::BAD_REQUEST),
-            Some("failed to prepare strict JSON retry"),
-            None,
-            TraceUsage::zero(),
+        finalize_immediate_error(
+            tracer.as_ref(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "failed to prepare strict JSON retry",
         );
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -958,6 +1005,7 @@ async fn handle_strict_json_request(
                 credits,
                 "success",
             );
+            record_strict_json_recovery(tracer.as_ref(), recovered.attempts.len());
             tracer.mark_first_token();
             tracer.finalize("success", None, None, None, trace_usage);
 
@@ -1925,12 +1973,11 @@ pub async fn post_messages(
         None => {
             tracing::error!("KiroProvider 未配置");
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            tracer.finalize(
-                "error",
-                Some("service_unavailable"),
-                Some("Kiro API provider not configured"),
-                None,
-                TraceUsage::zero(),
+            finalize_immediate_error(
+                &tracer,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                "Kiro API provider not configured",
             );
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1989,8 +2036,14 @@ pub async fn post_messages(
         Err(error) => {
             tracing::warn!(error = %error, "Anthropic document preprocessing failed");
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            let message = error.to_string();
             let response = map_document_error(error);
-            finalize_immediate_response(&tracer, &response, "document_error");
+            finalize_immediate_error(
+                &tracer,
+                response.status(),
+                "document_error",
+                &message,
+            );
             return response;
         }
     };
@@ -2058,8 +2111,14 @@ pub async fn post_messages(
         Err(PrepareRequestError::Document(error)) => {
             tracing::warn!(error = %error, "Anthropic document preprocessing failed");
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            let message = error.to_string();
             let response = map_document_error(error);
-            finalize_immediate_response(&tracer, &response, "document_error");
+            finalize_immediate_error(
+                &tracer,
+                response.status(),
+                "document_error",
+                &message,
+            );
             return response;
         }
         Err(PrepareRequestError::Conversion(e)) => {
@@ -2084,13 +2143,11 @@ pub async fn post_messages(
             };
             tracing::warn!("请求转换失败: {}", e);
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            tracer.record_protocol_error("request_conversion_error", &message);
-            tracer.finalize(
-                "error",
-                Some("request_conversion_error"),
-                Some(&message),
-                None,
-                TraceUsage::zero(),
+            finalize_immediate_error(
+                &tracer,
+                StatusCode::BAD_REQUEST,
+                "request_conversion_error",
+                &message,
             );
             return (
                 StatusCode::BAD_REQUEST,
@@ -2719,7 +2776,10 @@ async fn run_realtime_sse_attempts(
         } else {
             let retry_result = tokio::select! {
                 biased;
-                _ = sender.closed() => return,
+                _ = sender.closed() => {
+                    finalize_client_disconnected(tracer.as_ref(), 0, TraceUsage::zero());
+                    return;
+                },
                 result = setup.call_retry(tracer.as_ref()) => result,
             };
             match retry_result {
@@ -2749,6 +2809,13 @@ async fn run_realtime_sse_attempts(
         let mut probation = ProbationBuffer::default();
         let initial_events = probation.push_all(ctx.generate_initial_events());
         if !send_sse_events(&sender, tracer.as_ref(), initial_events).await {
+            finalize_realtime_client_disconnected(
+                &hook,
+                tracer.as_ref(),
+                &ctx,
+                credential_id,
+                0,
+            );
             return;
         }
         let mut decoder = EventStreamDecoder::new();
@@ -2789,6 +2856,13 @@ async fn run_realtime_sse_attempts(
                         }
                         let visible = probation.push_all(events);
                         if !send_sse_events(&sender, tracer.as_ref(), visible).await {
+                            finalize_realtime_client_disconnected(
+                                &hook,
+                                tracer.as_ref(),
+                                &ctx,
+                                credential_id,
+                                received_bytes,
+                            );
                             return;
                         }
                     }
@@ -2800,6 +2874,13 @@ async fn run_realtime_sse_attempts(
                 },
                 _ = ping_interval.tick() => {
                     if sender.send(Ok(create_ping_sse())).await.is_err() {
+                        finalize_realtime_client_disconnected(
+                            &hook,
+                            tracer.as_ref(),
+                            &ctx,
+                            credential_id,
+                            received_bytes,
+                        );
                         return;
                     }
                 }
@@ -2811,6 +2892,13 @@ async fn run_realtime_sse_attempts(
         };
 
         if matches!(termination, AttemptTermination::ClientClosed) {
+            finalize_realtime_client_disconnected(
+                &hook,
+                tracer.as_ref(),
+                &ctx,
+                credential_id,
+                received_bytes,
+            );
             return;
         }
 
@@ -2832,6 +2920,13 @@ async fn run_realtime_sse_attempts(
         let mut visible = visible;
         visible.extend(probation.take_pending());
         if !send_sse_events(&sender, tracer.as_ref(), visible).await {
+            finalize_realtime_client_disconnected(
+                &hook,
+                tracer.as_ref(),
+                &ctx,
+                credential_id,
+                received_bytes,
+            );
             return;
         }
         match termination {
@@ -2910,6 +3005,17 @@ fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
             0.0
         },
     }
+}
+
+fn finalize_realtime_client_disconnected(
+    hook: &UsageRecordHook,
+    tracer: &RequestTracer,
+    ctx: &StreamContext,
+    credential_id: u64,
+    received_bytes: u64,
+) {
+    record_stream_usage(hook, ctx, credential_id, "error");
+    finalize_client_disconnected(tracer, received_bytes, stream_trace_usage(ctx));
 }
 
 struct NonStreamToolAttempt {
@@ -3725,12 +3831,11 @@ pub async fn post_messages_cc(
         None => {
             tracing::error!("KiroProvider 未配置");
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            tracer.finalize(
-                "error",
-                Some("service_unavailable"),
-                Some("Kiro API provider not configured"),
-                None,
-                TraceUsage::zero(),
+            finalize_immediate_error(
+                &tracer,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                "Kiro API provider not configured",
             );
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -3789,8 +3894,14 @@ pub async fn post_messages_cc(
         Err(error) => {
             tracing::warn!(error = %error, "Anthropic document preprocessing failed");
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            let message = error.to_string();
             let response = map_document_error(error);
-            finalize_immediate_response(&tracer, &response, "document_error");
+            finalize_immediate_error(
+                &tracer,
+                response.status(),
+                "document_error",
+                &message,
+            );
             return response;
         }
     };
@@ -3857,8 +3968,14 @@ pub async fn post_messages_cc(
         Err(PrepareRequestError::Document(error)) => {
             tracing::warn!(error = %error, "Anthropic document preprocessing failed");
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            let message = error.to_string();
             let response = map_document_error(error);
-            finalize_immediate_response(&tracer, &response, "document_error");
+            finalize_immediate_error(
+                &tracer,
+                response.status(),
+                "document_error",
+                &message,
+            );
             return response;
         }
         Err(PrepareRequestError::Conversion(e)) => {
@@ -3883,13 +4000,11 @@ pub async fn post_messages_cc(
             };
             tracing::warn!("请求转换失败: {}", e);
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            tracer.record_protocol_error("request_conversion_error", &message);
-            tracer.finalize(
-                "error",
-                Some("request_conversion_error"),
-                Some(&message),
-                None,
-                TraceUsage::zero(),
+            finalize_immediate_error(
+                &tracer,
+                StatusCode::BAD_REQUEST,
+                "request_conversion_error",
+                &message,
             );
             return (
                 StatusCode::BAD_REQUEST,
@@ -4143,7 +4258,10 @@ async fn run_buffered_sse_attempts(
         } else {
             let retry_result = tokio::select! {
                 biased;
-                _ = sender.closed() => return,
+                _ = sender.closed() => {
+                    finalize_client_disconnected(tracer.as_ref(), 0, TraceUsage::zero());
+                    return;
+                },
                 result = setup.call_retry(tracer.as_ref()) => result,
             };
             match retry_result {
@@ -4189,6 +4307,13 @@ async fn run_buffered_sse_attempts(
                 _ = sender.closed() => break AttemptTermination::ClientClosed,
                 _ = ping_interval.tick() => {
                     if sender.send(Ok(create_ping_sse())).await.is_err() {
+                        finalize_buffered_client_disconnected(
+                            &hook,
+                            tracer.as_ref(),
+                            &ctx,
+                            credential_id,
+                            received_bytes,
+                        );
                         return;
                     }
                 }
@@ -4226,6 +4351,13 @@ async fn run_buffered_sse_attempts(
         };
 
         if matches!(termination, AttemptTermination::ClientClosed) {
+            finalize_buffered_client_disconnected(
+                &hook,
+                tracer.as_ref(),
+                &ctx,
+                credential_id,
+                received_bytes,
+            );
             return;
         }
 
@@ -4248,20 +4380,17 @@ async fn run_buffered_sse_attempts(
         let mut visible = visible;
         visible.extend(probation.take_pending());
         if !send_sse_events(&sender, tracer.as_ref(), visible).await {
+            finalize_buffered_client_disconnected(
+                &hook,
+                tracer.as_ref(),
+                &ctx,
+                credential_id,
+                received_bytes,
+            );
             return;
         }
         let (input, output, cache_creation, cache_read, credits) = ctx.final_usage();
-        let trace_usage = TraceUsage {
-            input_tokens: input.max(0) as u64,
-            output_tokens: output.max(0) as u64,
-            cache_creation_tokens: cache_creation.max(0) as u64,
-            cache_read_tokens: cache_read.max(0) as u64,
-            credits: if credits.is_finite() && credits > 0.0 {
-                credits
-            } else {
-                0.0
-            },
-        };
+        let trace_usage = buffered_stream_trace_usage(&ctx);
         match termination {
             AttemptTermination::Eof => {
                 if let Some(message) = ctx.terminal_error_message() {
@@ -4336,6 +4465,45 @@ async fn run_buffered_sse_attempts(
     }
 }
 
+fn buffered_stream_trace_usage(ctx: &BufferedStreamContext) -> TraceUsage {
+    let (input, output, cache_creation, cache_read, credits) = ctx.final_usage();
+    TraceUsage {
+        input_tokens: input.max(0) as u64,
+        output_tokens: output.max(0) as u64,
+        cache_creation_tokens: cache_creation.max(0) as u64,
+        cache_read_tokens: cache_read.max(0) as u64,
+        credits: if credits.is_finite() && credits > 0.0 {
+            credits
+        } else {
+            0.0
+        },
+    }
+}
+
+fn finalize_buffered_client_disconnected(
+    hook: &UsageRecordHook,
+    tracer: &RequestTracer,
+    ctx: &BufferedStreamContext,
+    credential_id: u64,
+    received_bytes: u64,
+) {
+    let (input, output, cache_creation, cache_read, credits) = ctx.final_usage();
+    hook.record(
+        credential_id,
+        input,
+        output,
+        cache_creation,
+        cache_read,
+        credits,
+        "error",
+    );
+    finalize_client_disconnected(
+        tracer,
+        received_bytes,
+        buffered_stream_trace_usage(ctx),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{
@@ -4346,6 +4514,154 @@ mod tests {
     use futures::{StreamExt, future};
 
     use super::*;
+
+    fn test_request_tracer_with_snapshot(
+        trace_id: &str,
+    ) -> (
+        RequestTracer,
+        crate::admin::error_snapshot_db::SharedErrorSnapshotStore,
+        crate::admin::trace_db::SharedTraceStore,
+    ) {
+        let snapshot_store = Arc::new(
+            crate::admin::ErrorSnapshotStore::open_in_memory(
+                crate::admin::error_snapshot_db::ErrorSnapshotPolicy {
+                    enabled: true,
+                    retention_days: 90,
+                    max_storage_bytes: 1024 * 1024 * 1024,
+                    capture_recovered: true,
+                    capture_bodies: true,
+                    min_free_disk_bytes: 1,
+                },
+            )
+            .unwrap(),
+        );
+        let key = KeyContext {
+            key_id: 3,
+            group: None,
+            key_source: TraceKeySource::ClientKey,
+        };
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        let snapshot = Arc::new(super::super::error_snapshot::ErrorSnapshotContext::new(
+            snapshot_store.clone(),
+            trace_id.to_string(),
+            &key,
+            &HeaderMap::new(),
+            &request,
+        ));
+        let trace_store = Arc::new(crate::admin::trace_db::TraceStore::open_in_memory().unwrap());
+        (
+            RequestTracer {
+                store: Some(trace_store.clone()),
+                snapshot: Some(snapshot),
+                finalized: std::sync::atomic::AtomicBool::new(false),
+                trace_id: trace_id.to_string(),
+                ts: Utc::now().to_rfc3339(),
+                key_id: key.key_id,
+                key_source: key.key_source,
+                model: request.model.clone(),
+                is_stream: true,
+                reasoning_effort: parking_lot::Mutex::new(None),
+                context_1m: false,
+                thinking: false,
+                started_at: Instant::now(),
+                first_token_at: parking_lot::Mutex::new(None),
+                upstream_first_byte_at: parking_lot::Mutex::new(None),
+                attempts: parking_lot::Mutex::new(Vec::new()),
+            },
+            snapshot_store,
+            trace_store,
+        )
+    }
+
+    #[test]
+    fn client_disconnect_finalizes_interrupted_snapshot() {
+        let (tracer, snapshot_store, trace_store) =
+            test_request_tracer_with_snapshot("trace-client-disconnect");
+
+        finalize_client_disconnected(
+            &tracer,
+            321,
+            TraceUsage {
+                input_tokens: 11,
+                output_tokens: 7,
+                cache_creation_tokens: 3,
+                cache_read_tokens: 5,
+                credits: 0.25,
+            },
+        );
+
+        let page = snapshot_store
+            .query_paged(&crate::admin::error_snapshot_db::SnapshotQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.records[0].final_status, "interrupted");
+        assert_eq!(page.records[0].error_type, "client_disconnected");
+        let (records, total) = trace_store.query_paged(&Default::default());
+        assert_eq!(total, 1);
+        assert_eq!(records[0].input_tokens, 11);
+        assert_eq!(records[0].output_tokens, 7);
+        assert_eq!(records[0].cache_creation_tokens, 3);
+        assert_eq!(records[0].cache_read_tokens, 5);
+        assert_eq!(records[0].credits, 0.25);
+    }
+
+    #[test]
+    fn structured_json_semantic_retry_marks_recovered_snapshot() {
+        let (tracer, snapshot_store, _trace_store) =
+            test_request_tracer_with_snapshot("trace-structured-retry");
+
+        record_strict_json_recovery(&tracer, 2);
+        tracer.finalize("success", None, None, None, TraceUsage::zero());
+
+        let page = snapshot_store
+            .query_paged(&crate::admin::error_snapshot_db::SnapshotQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert!(page.records[0].recovered);
+        assert_eq!(
+            page.records[0].severity,
+            crate::admin::error_snapshot_db::SnapshotSeverity::Warning
+        );
+    }
+
+    #[test]
+    fn immediate_error_response_preserves_http_status_and_message() {
+        let (tracer, snapshot_store, _trace_store) =
+            test_request_tracer_with_snapshot("trace-immediate-error");
+        let response = (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("invalid_request_error", "bad document")),
+        )
+            .into_response();
+
+        finalize_immediate_error(
+            &tracer,
+            response.status(),
+            "document_error",
+            "bad document",
+        );
+
+        let page = snapshot_store
+            .query_paged(&crate::admin::error_snapshot_db::SnapshotQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.records[0].http_status, Some(400));
+        assert_eq!(page.records[0].error_message.as_deref(), Some("bad document"));
+    }
 
     fn failure_from_events(events: &[Event]) -> super::super::tool_attempt::AttemptFailure {
         let mut observation = super::super::tool_attempt::AttemptObservation::default();

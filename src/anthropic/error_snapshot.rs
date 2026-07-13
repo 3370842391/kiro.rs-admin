@@ -308,6 +308,19 @@ impl SnapshotFinalState {
 }
 
 impl ErrorSnapshotContext {
+    pub fn new_if_enabled(
+        store: SharedErrorSnapshotStore,
+        trace_id: String,
+        key: &super::middleware::KeyContext,
+        headers: &HeaderMap,
+        request: &super::types::MessagesRequest,
+    ) -> Option<Self> {
+        store
+            .policy()
+            .enabled
+            .then(|| Self::new(store, trace_id, key, headers, request))
+    }
+
     pub fn new(
         store: SharedErrorSnapshotStore,
         trace_id: String,
@@ -456,9 +469,12 @@ impl ErrorSnapshotContext {
         if recovered && !policy.capture_recovered {
             return Ok(None);
         }
-        let error_type = state
-            .error_type
-            .clone()
+        let critical_protocol_error = draft.protocol_errors.iter().rev().find(|(error_type, _)| {
+            classify_severity(error_type, false) == SnapshotSeverity::Critical
+        });
+        let error_type = critical_protocol_error
+            .map(|entry| entry.0.clone())
+            .or(state.error_type.clone())
             .or_else(|| draft.protocol_errors.last().map(|entry| entry.0.clone()))
             .or_else(|| {
                 draft
@@ -494,6 +510,7 @@ impl ErrorSnapshotContext {
                 "request_sha256": hex::encode(Sha256::digest(&request_bytes)),
                 "tool_links": draft.tool_diagnostics,
                 "attempts": draft.attempts,
+                "interrupted_after_bytes": state.interrupted_after_bytes,
             }))?,
         });
         for payload in &draft.payloads {
@@ -526,8 +543,9 @@ impl ErrorSnapshotContext {
             }
             payloads.extend(encoded);
         }
-        let error_message = state
-            .error_message
+        let error_message = critical_protocol_error
+            .map(|entry| entry.1.clone())
+            .or(state.error_message)
             .or_else(|| draft.protocol_errors.last().map(|entry| entry.1.clone()));
         let http_status = state.http_status.or_else(|| {
             draft
@@ -631,8 +649,11 @@ pub(crate) fn analyze_tool_links(request: &super::types::MessagesRequest) -> Too
             continue;
         };
         for (block_index, block) in blocks.iter().enumerate() {
-            match block.get("type").and_then(serde_json::Value::as_str) {
-                Some("tool_use") => {
+            match (
+                message.role.as_str(),
+                block.get("type").and_then(serde_json::Value::as_str),
+            ) {
+                ("assistant", Some("tool_use")) => {
                     let id = block
                         .get("id")
                         .and_then(serde_json::Value::as_str)
@@ -653,7 +674,7 @@ pub(crate) fn analyze_tool_links(request: &super::types::MessagesRequest) -> Too
                         "name": block.get("name").and_then(serde_json::Value::as_str),
                     }));
                 }
-                Some("tool_result") => {
+                ("user", Some("tool_result")) => {
                     let id = block
                         .get("tool_use_id")
                         .and_then(serde_json::Value::as_str)
@@ -883,6 +904,75 @@ mod tests {
     }
 
     #[test]
+    fn critical_protocol_error_is_not_downgraded_by_generic_final_error() {
+        let store = test_store();
+        let ctx = sample_context(store.clone(), true, true);
+        ctx.record_internal_error("sse_state_error", "decoder overflow");
+
+        let id = ctx
+            .finalize(SnapshotFinalState::error("bad_request", Some(502)))
+            .unwrap()
+            .unwrap();
+        let detail = store.get(&id).unwrap().unwrap();
+
+        assert_eq!(detail.summary.error_type, "sse_state_error");
+        assert_eq!(detail.summary.severity, SnapshotSeverity::Critical);
+        assert!(detail.summary.retention_exempt);
+    }
+
+    #[test]
+    fn disabled_policy_skips_snapshot_context_creation() {
+        let store = test_store();
+        let mut policy = store.policy();
+        policy.enabled = false;
+        store.set_policy(policy);
+        let key = crate::anthropic::middleware::KeyContext {
+            key_id: 7,
+            group: None,
+            key_source: crate::admin::trace_db::TraceKeySource::ClientKey,
+        };
+        let request: crate::anthropic::types::MessagesRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "must not be copied"}]
+            }))
+            .unwrap();
+
+        assert!(
+            ErrorSnapshotContext::new_if_enabled(
+                store,
+                "trace-disabled".to_string(),
+                &key,
+                &axum::http::HeaderMap::new(),
+                &request,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn interrupted_byte_count_is_preserved_in_diagnostics() {
+        let store = test_store();
+        let ctx = sample_context(store.clone(), true, true);
+        let id = ctx
+            .finalize(SnapshotFinalState::interrupted("client_closed", 1234))
+            .unwrap()
+            .unwrap();
+        let detail = store.get(&id).unwrap().unwrap();
+        let seq = detail
+            .payloads
+            .iter()
+            .find(|payload| payload.kind == SnapshotPayloadKind::ToolDiagnostics)
+            .unwrap()
+            .seq;
+        let payload = store.read_payload(&id, seq).unwrap().unwrap();
+        let diagnostics: serde_json::Value = serde_json::from_slice(&payload.data).unwrap();
+
+        assert_eq!(diagnostics["interrupted_after_bytes"], 1234);
+    }
+
+    #[test]
     fn tool_diagnostics_reports_invalid_duplicate_and_unmatched_ids() {
         let request: crate::anthropic::types::MessagesRequest = serde_json::from_value(
             serde_json::json!({
@@ -912,5 +1002,34 @@ mod tests {
                 .missing_tool_results
                 .contains(&"tool/get_weather/1".to_string())
         );
+    }
+
+    #[test]
+    fn tool_diagnostics_only_links_protocol_valid_roles() {
+        let long_valid_id = "a".repeat(64);
+        let request: crate::anthropic::types::MessagesRequest = serde_json::from_value(
+            serde_json::json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": 64,
+                "messages": [
+                    {"role": "user", "content": [
+                        {"type": "tool_use", "id": "wrong-role-use", "name": "ignored", "input": {}},
+                        {"type": "tool_result", "tool_use_id": long_valid_id, "content": "ok"}
+                    ]},
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": long_valid_id, "name": "valid", "input": {}},
+                        {"type": "tool_result", "tool_use_id": "wrong-role-result", "content": "ignored"}
+                    ]}
+                ]
+            }),
+        )
+        .unwrap();
+
+        let diagnostics = analyze_tool_links(&request);
+
+        assert!(diagnostics.invalid_ids.is_empty());
+        assert!(diagnostics.unmatched_tool_results.is_empty());
+        assert!(diagnostics.missing_tool_results.is_empty());
+        assert_eq!(diagnostics.block_order.len(), 2);
     }
 }
