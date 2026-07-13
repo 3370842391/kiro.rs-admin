@@ -4193,6 +4193,31 @@ mod tests {
     }
 
     #[test]
+    fn model_profile_errors_map_to_documented_http_statuses() {
+        use axum::http::StatusCode;
+
+        let revision = map_model_profile_error(ModelProfileError::RevisionConflict {
+            expected: 1,
+            actual: 2,
+        });
+        assert_eq!(revision.status_code(), StatusCode::CONFLICT);
+
+        let gone = map_model_profile_sync_error(SyncError::Preview(PreviewCacheError::Gone));
+        assert_eq!(gone.status_code(), StatusCode::GONE);
+
+        let upstream = map_model_profile_sync_error(SyncError::AllSourcesFailed(vec![
+            "kiro unavailable".to_string(),
+        ]));
+        assert_eq!(upstream.status_code(), StatusCode::BAD_GATEWAY);
+
+        let invalid = map_model_profile_error(ModelProfileError::InvalidField {
+            field: "knowledgeCutoff".to_string(),
+            message: "invalid date".to_string(),
+        });
+        assert_eq!(invalid.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
     fn semver_compares_correctly() {
         use std::cmp::Ordering;
         assert_eq!(compare_semver("0.3.0", "0.3.1"), Ordering::Less);
