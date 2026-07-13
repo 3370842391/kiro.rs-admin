@@ -1,5 +1,8 @@
 services:
   kiro-rs-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
     image: kiro-rs-test:${TEST_IMAGE_TAG:-latest}
     container_name: kiro-rs-test
     extra_hosts:

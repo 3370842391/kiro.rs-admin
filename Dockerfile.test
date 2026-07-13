@@ -4,7 +4,8 @@ FROM oven/bun:1-alpine AS frontend-builder
 
 WORKDIR /app/admin-ui
 COPY admin-ui/package.json admin-ui/bun.lock ./
-RUN bun install --frozen-lockfile --ignore-scripts
+RUN --mount=type=cache,id=kiro-test-bun,target=/root/.bun/install/cache \
+    bun install --frozen-lockfile --ignore-scripts
 COPY admin-ui ./
 RUN bun run build
 

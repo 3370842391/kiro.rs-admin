@@ -3,11 +3,12 @@ set -Eeuo pipefail
 
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly REPO_ROOT="$(git -C "${SCRIPT_DIR}/.." rev-parse --show-toplevel)"
-readonly LOCK_DIR="${TMPDIR:-/tmp}/kiro-rs-test-deploy.lock"
-readonly COMPOSE_FILE="${REPO_ROOT}/docker-compose.test.yml"
+readonly REMOTE="${TEST_GIT_REMOTE:-deploy}"
+readonly LOCK_DIR="${TEST_DEPLOY_LOCK_DIR:-${TMPDIR:-/tmp}/kiro-rs-test-deploy.lock}"
+readonly COMPOSE_FILE="${TEST_COMPOSE_FILE:-${REPO_ROOT}/docker-compose.test.yml}"
 readonly SERVICE="kiro-rs-test"
-readonly HEALTH_URL="http://127.0.0.1:8991/"
-readonly REQUESTED_REF="${1:-master}"
+readonly HEALTH_URL="${TEST_HEALTH_URL:-http://127.0.0.1:8991/}"
+readonly REQUESTED_REF="${1:-${REMOTE}/master}"
 
 SECONDS=0
 
@@ -24,15 +25,42 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
   exit 1
 fi
 
-git fetch --prune --tags deploy \
-  "+refs/heads/master:refs/remotes/deploy/master"
+readonly REMOTE_MASTER_REF="refs/remotes/${REMOTE}/master"
+git fetch "${REMOTE}" --prune --tags \
+  "+refs/heads/master:${REMOTE_MASTER_REF}"
 
 case "${REQUESTED_REF}" in
-  master | deploy/master | refs/heads/master | refs/remotes/deploy/master)
-    TARGET_REF="refs/remotes/deploy/master"
+  master | "${REMOTE}/master" | refs/heads/master | "${REMOTE_MASTER_REF}")
+    TARGET_REF="${REMOTE_MASTER_REF}"
+    ;;
+  "${REMOTE}/master"^* | "${REMOTE}/master"~*)
+    TARGET_REF="${REMOTE_MASTER_REF}${REQUESTED_REF#"${REMOTE}/master"}"
+    ;;
+  master^* | master~*)
+    TARGET_REF="${REMOTE_MASTER_REF}${REQUESTED_REF#master}"
     ;;
   *)
-    TARGET_REF="${REQUESTED_REF}"
+    if [[ "${REQUESTED_REF}" =~ ^[0-9a-fA-F]{7,64}$ ]] && \
+      git cat-file -e "${REQUESTED_REF}^{commit}" 2>/dev/null; then
+      TARGET_REF="${REQUESTED_REF}"
+    elif [[ "${REQUESTED_REF}" == refs/tags/* ]]; then
+      TARGET_REF="${REQUESTED_REF}"
+    else
+      BRANCH_NAME="${REQUESTED_REF}"
+      case "${BRANCH_NAME}" in
+        "${REMOTE}/"*) BRANCH_NAME="${BRANCH_NAME#"${REMOTE}/"}" ;;
+        refs/remotes/"${REMOTE}"/*)
+          BRANCH_NAME="${BRANCH_NAME#"refs/remotes/${REMOTE}/"}"
+          ;;
+        refs/heads/*) BRANCH_NAME="${BRANCH_NAME#refs/heads/}" ;;
+      esac
+      if ! git fetch "${REMOTE}" \
+        "+refs/heads/${BRANCH_NAME}:refs/remotes/${REMOTE}/${BRANCH_NAME}"; then
+        echo "Unable to fetch deployment ref: ${REQUESTED_REF}" >&2
+        exit 1
+      fi
+      TARGET_REF="refs/remotes/${REMOTE}/${BRANCH_NAME}"
+    fi
     ;;
 esac
 
@@ -91,10 +119,8 @@ restore_previous_image() {
   echo "Previous test image is healthy again at ${HEALTH_URL}." >&2
 }
 
-DOCKER_BUILDKIT=1 docker build \
-  --file Dockerfile.test \
-  --tag "${NEW_IMAGE}" \
-  .
+TEST_IMAGE_TAG="${NEW_TAG}" DOCKER_BUILDKIT=1 \
+  docker compose -f "${COMPOSE_FILE}" build "${SERVICE}"
 
 docker run --rm "${NEW_IMAGE}" --version
 

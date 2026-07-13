@@ -17,6 +17,7 @@ describe("8991 test builder contract", () => {
     const dockerfile = await repositoryFile("Dockerfile.test");
 
     expect(dockerfile).toContain("mount=type=cache");
+    expect(dockerfile).toContain("id=kiro-test-bun");
     expect(dockerfile).toContain(
       "cargo build --release --locked --no-default-features",
     );
@@ -28,6 +29,7 @@ describe("8991 test builder contract", () => {
     expect(compose).toContain("0.0.0.0:8991:8990");
     expect(compose).toContain("./data-test:/app/config");
     expect(compose).toContain("kiro-rs-test:${TEST_IMAGE_TAG:-latest}");
+    expect(compose).toContain("dockerfile: Dockerfile.test");
   });
 
   test("test deploy script performs detached, disposable health-checked deploys", async () => {
@@ -36,7 +38,12 @@ describe("8991 test builder contract", () => {
     expect(script).toContain("git checkout --detach");
     expect(script).toContain("http://127.0.0.1:8991/");
     expect(script).toContain("docker run --rm");
-    expect(script).not.toMatch(/docker\s+(?:stop|rm)\s+kiro-rs-admin/);
+    expect(script).toContain("TEST_GIT_REMOTE");
+    expect(script).toContain("TEST_COMPOSE_FILE");
+    expect(script).toContain("TEST_DEPLOY_LOCK_DIR");
+    expect(script).toContain("TEST_HEALTH_URL");
+    expect(script).toContain('git fetch "${REMOTE}"');
+    expect(script).not.toContain("kiro-rs-admin");
   });
 
   test("runtime test data is excluded from build context and version control", async () => {
