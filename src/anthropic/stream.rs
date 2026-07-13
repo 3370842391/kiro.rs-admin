@@ -940,7 +940,7 @@ impl CompletedToolUse {
 /// 两种情况都**不能**把半截 / 非法 JSON 当成完整工具调用转发给客户端——那会让
 /// 客户端拿到无法解析或语义错误的参数去执行工具。这里显式暴露为错误，由上层
 /// 决定回 502（非流式 / 缓冲流）或在 SSE 里补一个 `error` 事件（实时流）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolJsonAccumulatorError {
     InvalidJson {
         tool_use_id: String,
@@ -1506,6 +1506,10 @@ pub struct StreamContext {
     saw_reasoning_output: bool,
     /// 缺少真实 reasoning 时是否按严格协议终止流。
     strict_thinking_validation: bool,
+    /// AWS event-stream 的语义与显式失败信号。
+    attempt_observation: super::tool_attempt::AttemptObservation,
+    /// 收尾后统一得到的 attempt 失败分类。
+    terminal_attempt_failure: Option<super::tool_attempt::AttemptFailure>,
 }
 
 fn events_have_visible_output(events: &[SseEvent]) -> bool {
@@ -1550,9 +1554,15 @@ impl StreamContext {
     /// 工具调用 JSON 错误信息（非法 / 半截）。上层据此把本次请求记为 error、
     /// 或在非流式路径返回 502。无错误时返回 `None`。
     pub fn terminal_error_message(&self) -> Option<String> {
-        self.terminal_protocol_error
-            .clone()
+        self.terminal_attempt_failure
+            .as_ref()
+            .map(|failure| failure.public_error().1)
+            .or_else(|| self.terminal_protocol_error.clone())
             .or_else(|| self.tool_json_error.as_ref().map(|err| err.message()))
+    }
+
+    pub(crate) fn terminal_attempt_failure(&self) -> Option<&super::tool_attempt::AttemptFailure> {
+        self.terminal_attempt_failure.as_ref()
     }
 
     /// 返回工具 JSON 的 typed 终态，供 handler 精确区分可重试的 EOF 半截与其他错误。
@@ -1633,6 +1643,8 @@ impl StreamContext {
             terminal_protocol_error_type: None,
             saw_reasoning_output: false,
             strict_thinking_validation,
+            attempt_observation: super::tool_attempt::AttemptObservation::default(),
+            terminal_attempt_failure: None,
         }
     }
 
@@ -1699,6 +1711,7 @@ impl StreamContext {
 
     /// 处理 Kiro 事件并转换为 Anthropic SSE 事件
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
+        self.attempt_observation.observe(event);
         let events = match event {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
@@ -1734,20 +1747,20 @@ impl StreamContext {
             }
             Event::Error {
                 error_code,
-                error_message,
+                error_message: _,
             } => {
-                tracing::error!("收到错误事件: {} - {}", error_code, error_message);
+                tracing::error!(error_type = %error_code, "收到上游错误事件");
                 Vec::new()
             }
             Event::Exception {
                 exception_type,
-                message,
+                message: _,
             } => {
                 // 处理 ContentLengthExceededException
                 if exception_type == "ContentLengthExceededException" {
                     self.state_manager.set_stop_reason("max_tokens");
                 }
-                tracing::warn!("收到异常事件: {} - {}", exception_type, message);
+                tracing::warn!(error_type = %exception_type, "收到上游异常事件");
                 Vec::new()
             }
             _ => Vec::new(),
@@ -2768,16 +2781,38 @@ impl StreamContext {
         if events_have_visible_output(&events) {
             self.has_visible_output = true;
         }
+        let mut classified_failure = self.attempt_observation.failure(
+            self.tool_json_error.clone(),
+            self.state_manager.has_tool_use(),
+        );
+        if self.has_visible_output
+            && matches!(
+                classified_failure,
+                Some(super::tool_attempt::AttemptFailure::EmptyResponse)
+            )
+        {
+            classified_failure = None;
+        }
+        self.terminal_attempt_failure = classified_failure
+            .as_ref()
+            .filter(|failure| {
+                !matches!(failure, super::tool_attempt::AttemptFailure::EmptyResponse)
+            })
+            .cloned();
         if self.saw_upstream_tool_use
             && !self.state_manager.has_tool_use()
             && self.tool_json_error.is_none()
+            && self.terminal_attempt_failure.is_none()
         {
             self.terminal_protocol_error = Some(
                 "upstream ended with tool_use but produced no valid tool_use content block"
                     .to_string(),
             );
         }
-        if self.terminal_protocol_error.is_none() && self.tool_json_error.is_none() {
+        if self.terminal_protocol_error.is_none()
+            && self.tool_json_error.is_none()
+            && self.terminal_attempt_failure.is_none()
+        {
             let tool_choice_error = match &self.tool_choice_policy {
                 super::converter::ToolChoicePolicy::Auto {
                     disable_parallel_tool_use: true,
@@ -2822,6 +2857,7 @@ impl StreamContext {
             && self.has_visible_output
             && self.tool_json_error.is_none()
             && self.terminal_protocol_error.is_none()
+            && self.terminal_attempt_failure.is_none()
         {
             tracing::warn!(
                 model = %self.model,
@@ -2833,18 +2869,22 @@ impl StreamContext {
             && !self.saw_reasoning_output
             && self.tool_json_error.is_none()
             && self.terminal_protocol_error.is_none()
+            && self.terminal_attempt_failure.is_none()
         {
             self.terminal_protocol_error = Some(
                 "client requested thinking but upstream produced no thinking content".to_string(),
             );
             self.terminal_protocol_error_type = Some("upstream_thinking_protocol_error");
         }
-        if !self.has_visible_output
-            && self.tool_json_error.is_none()
+        if self.terminal_attempt_failure.is_none()
             && self.terminal_protocol_error.is_none()
+            && matches!(
+                classified_failure,
+                Some(super::tool_attempt::AttemptFailure::EmptyResponse)
+            )
         {
-            self.terminal_protocol_error =
-                Some("upstream returned no assistant content".to_string());
+            self.terminal_attempt_failure =
+                Some(super::tool_attempt::AttemptFailure::EmptyResponse);
         }
 
         let terminal_error = self.terminal_error_message();
@@ -2856,9 +2896,14 @@ impl StreamContext {
         );
         if let Some(message) = terminal_error {
             let error_type = self
-                .tool_json_error
+                .terminal_attempt_failure
                 .as_ref()
-                .map(ToolJsonAccumulatorError::error_type)
+                .map(|failure| failure.public_error().0)
+                .or_else(|| {
+                    self.tool_json_error
+                        .as_ref()
+                        .map(ToolJsonAccumulatorError::error_type)
+                })
                 .or(self.terminal_protocol_error_type)
                 .unwrap_or("upstream_protocol_error");
             events.push(SseEvent::new(
@@ -2885,6 +2930,56 @@ impl StreamContext {
             cache_read,
         ));
 
+        events
+    }
+
+    /// 按实际读取终止方式收尾；中断绝不生成成功 terminal，也不回显传输错误正文。
+    pub(crate) fn generate_final_events_for(
+        &mut self,
+        termination: &super::tool_attempt::AttemptTermination,
+    ) -> Vec<SseEvent> {
+        if matches!(
+            termination,
+            super::tool_attempt::AttemptTermination::ClientClosed
+        ) {
+            return Vec::new();
+        }
+        let mut events = self.generate_final_events();
+        if matches!(termination, super::tool_attempt::AttemptTermination::Eof) {
+            return events;
+        }
+
+        events.retain(|event| !matches!(event.event.as_str(), "message_delta" | "message_stop"));
+        let has_specific_failure = self
+            .terminal_attempt_failure
+            .as_ref()
+            .is_some_and(|failure| {
+                !matches!(failure, super::tool_attempt::AttemptFailure::EmptyResponse)
+            });
+        if !has_specific_failure {
+            events.retain(|event| event.event != "error");
+        }
+        if !events.iter().any(|event| event.event == "error") {
+            let (error_type, message) = match termination {
+                super::tool_attempt::AttemptTermination::ReadError(_) => (
+                    "upstream_stream_interrupted",
+                    "Upstream response stream was interrupted",
+                ),
+                super::tool_attempt::AttemptTermination::IdleTimeout => (
+                    "upstream_stream_idle_timeout",
+                    "Upstream response stream timed out",
+                ),
+                super::tool_attempt::AttemptTermination::Eof
+                | super::tool_attempt::AttemptTermination::ClientClosed => unreachable!(),
+            };
+            events.push(SseEvent::new(
+                "error",
+                json!({
+                    "type": "error",
+                    "error": {"type": error_type, "message": message}
+                }),
+            ));
+        }
         events
     }
 }
@@ -2993,6 +3088,13 @@ impl BufferedStreamContext {
     /// 2. 用客户端可见 input_tokens 更正 message_start 事件
     /// 3. 返回所有缓冲的事件
     pub fn finish_and_get_all_events(&mut self) -> Vec<SseEvent> {
+        self.finish_and_get_all_events_for(&super::tool_attempt::AttemptTermination::Eof)
+    }
+
+    pub(crate) fn finish_and_get_all_events_for(
+        &mut self,
+        termination: &super::tool_attempt::AttemptTermination,
+    ) -> Vec<SseEvent> {
         // 如果从未处理过事件，也要生成初始事件
         if !self.initial_events_generated {
             let initial_events = self.inner.generate_initial_events();
@@ -3004,7 +3106,7 @@ impl BufferedStreamContext {
         let (final_input_tokens, cache_creation, cache_read) = self.inner.resolved_usage();
 
         // 生成最终事件（StreamContext 内部会用同样的优先级与分摊）
-        let final_events = self.inner.generate_final_events();
+        let final_events = self.inner.generate_final_events_for(termination);
         self.event_buffer.extend(final_events);
 
         // 更正 message_start 事件中的 input_tokens 与 cache_* 字段
@@ -3040,6 +3142,10 @@ impl BufferedStreamContext {
     /// 工具调用 JSON 错误信息（转发内部 StreamContext）。缓冲流据此记 error。
     pub fn terminal_error_message(&self) -> Option<String> {
         self.inner.terminal_error_message()
+    }
+
+    pub(crate) fn terminal_attempt_failure(&self) -> Option<&super::tool_attempt::AttemptFailure> {
+        self.inner.terminal_attempt_failure()
     }
 
     /// 返回内部工具 JSON 的 typed 终态，供缓冲 handler 使用同一重试门。
@@ -3356,6 +3462,13 @@ mod tests {
             ctx.state_manager.get_stop_reason(),
             "model_context_window_exceeded"
         );
+        let events = ctx.generate_final_events();
+        assert!(events.iter().any(|event| {
+            event.event == "error"
+                && event.data["error"]["type"] == "upstream_context_window_exceeded"
+        }));
+        assert!(!events.iter().any(|event| event.event == "message_delta"));
+        assert!(!events.iter().any(|event| event.event == "message_stop"));
     }
 
     #[test]
@@ -3375,7 +3488,110 @@ mod tests {
         assert!(!events.iter().any(|event| event.event == "message_stop"));
         assert_eq!(
             ctx.terminal_error_message().as_deref(),
-            Some("upstream returned no assistant content")
+            Some("Upstream returned no assistant content after one retry")
+        );
+        let error = events.iter().find(|event| event.event == "error").unwrap();
+        assert_eq!(error.data["error"]["type"], "upstream_empty_response");
+    }
+
+    #[test]
+    fn explicit_upstream_exception_is_preserved_without_success_terminal_events() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4.8",
+            10,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let sensitive = "request body: secret customer document";
+        let _ = ctx.process_kiro_event(&Event::Exception {
+            exception_type: "ModelError".into(),
+            message: sensitive.into(),
+        });
+        let events = ctx.generate_final_events();
+
+        let error = events.iter().find(|event| event.event == "error").unwrap();
+        assert_eq!(error.data["error"]["type"], "upstream_protocol_error");
+        assert!(
+            error.data["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("ModelError")
+        );
+        assert!(!error.data.to_string().contains(sensitive));
+        assert!(!events.iter().any(|event| event.event == "message_delta"));
+        assert!(!events.iter().any(|event| event.event == "message_stop"));
+        assert!(matches!(
+            ctx.terminal_attempt_failure(),
+            Some(super::super::tool_attempt::AttemptFailure::UpstreamError {
+                error_type,
+                message,
+            }) if error_type == "ModelError" && message == sensitive
+        ));
+    }
+
+    #[test]
+    fn read_error_finalization_never_emits_success_terminal_events() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4.8",
+            10,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_assistant_response("partial text");
+        let events = ctx.generate_final_events_for(
+            &super::super::tool_attempt::AttemptTermination::ReadError(
+                "secret transport detail".into(),
+            ),
+        );
+
+        assert!(events.iter().any(|event| {
+            event.event == "error" && event.data["error"]["type"] == "upstream_stream_interrupted"
+        }));
+        assert!(!events.iter().any(|event| event.event == "message_delta"));
+        assert!(!events.iter().any(|event| event.event == "message_stop"));
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.data.to_string().contains("secret transport detail"))
+        );
+    }
+
+    #[test]
+    fn idle_timeout_and_client_close_never_emit_success_terminal_events() {
+        let mut idle = StreamContext::new_with_thinking(
+            "claude-opus-4.8",
+            10,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = idle.generate_initial_events();
+        let events = idle.generate_final_events_for(
+            &super::super::tool_attempt::AttemptTermination::IdleTimeout,
+        );
+        assert!(events.iter().any(|event| {
+            event.event == "error" && event.data["error"]["type"] == "upstream_stream_idle_timeout"
+        }));
+        assert!(!events.iter().any(|event| event.event == "message_delta"));
+        assert!(!events.iter().any(|event| event.event == "message_stop"));
+
+        let mut closed = StreamContext::new_with_thinking(
+            "claude-opus-4.8",
+            10,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        assert!(
+            closed
+                .generate_final_events_for(
+                    &super::super::tool_attempt::AttemptTermination::ClientClosed,
+                )
+                .is_empty()
         );
     }
 

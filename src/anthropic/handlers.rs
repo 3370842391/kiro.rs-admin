@@ -34,7 +34,7 @@ use uuid::Uuid;
 use super::converter::{ConversionError, convert_request_with_mode};
 use super::middleware::{AppState, KeyContext};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
-use super::tool_attempt::ProbationBuffer;
+use super::tool_attempt::{AttemptTermination, ProbationBuffer};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
     OutputConfig, Thinking,
@@ -560,6 +560,7 @@ struct BufferedAttempt {
     usage: TraceUsage,
     credits: f64,
     terminal_error: Option<String>,
+    attempt_failure: Option<super::tool_attempt::AttemptFailure>,
 }
 
 #[derive(Debug)]
@@ -572,6 +573,7 @@ struct StrictJsonRecovery {
 struct StrictJsonRecoveryFailure {
     attempts: Vec<BufferedAttempt>,
     source: Option<anyhow::Error>,
+    terminal_failure: Option<super::tool_attempt::AttemptFailure>,
 }
 
 fn strict_json_from_events(events: &[SseEvent]) -> Option<String> {
@@ -617,22 +619,41 @@ where
                 return Err(StrictJsonRecoveryFailure {
                     attempts,
                     source: Some(source),
+                    terminal_failure: None,
                 });
             }
         };
+        let terminal_failure = attempt.attempt_failure.clone().filter(|failure| {
+            matches!(
+                failure,
+                super::tool_attempt::AttemptFailure::ContextWindowExceeded
+                    | super::tool_attempt::AttemptFailure::UpstreamError { .. }
+            )
+        });
         let json = attempt
             .terminal_error
             .is_none()
             .then(|| strict_json_from_events(&attempt.events))
             .flatten();
         attempts.push(attempt);
+        if terminal_failure.is_some() {
+            return Err(StrictJsonRecoveryFailure {
+                attempts,
+                source: None,
+                terminal_failure,
+            });
+        }
         if let Some(json) = json.filter(|json| validate(json)) {
             return Ok(StrictJsonRecovery { json, attempts });
         }
     }
+    let terminal_failure = attempts
+        .last()
+        .and_then(|attempt| attempt.attempt_failure.clone());
     Err(StrictJsonRecoveryFailure {
         attempts,
         source: None,
+        terminal_failure,
     })
 }
 
@@ -692,6 +713,7 @@ async fn collect_buffered_attempt(
     }
     let events = context.finish_and_get_all_events();
     let terminal_error = context.terminal_error_message();
+    let attempt_failure = context.terminal_attempt_failure().cloned();
     let (input, output, creation, read, credits) = context.final_usage();
     Ok(BufferedAttempt {
         events,
@@ -709,6 +731,7 @@ async fn collect_buffered_attempt(
         },
         credits,
         terminal_error,
+        attempt_failure,
     })
 }
 
@@ -908,6 +931,37 @@ async fn handle_strict_json_request(
                     trace_usage,
                 );
                 return map_provider_error(source);
+            }
+
+            if let Some(attempt_failure) = failure.terminal_failure {
+                let (error_type, message) = attempt_failure.public_error();
+                tracer.finalize(
+                    "error",
+                    Some(outcome::BAD_REQUEST),
+                    Some(&message),
+                    None,
+                    trace_usage,
+                );
+                if payload.stream {
+                    let body = SseEvent::new(
+                        "error",
+                        json!({
+                            "type": "error",
+                            "error": {"type": error_type, "message": message}
+                        }),
+                    )
+                    .to_sse_string();
+                    return Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from(body))
+                        .unwrap();
+                }
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(ErrorResponse::new(error_type, message)),
+                )
+                    .into_response();
             }
 
             let message = "Upstream did not produce one complete JSON value after one retry";
@@ -2512,13 +2566,6 @@ fn create_sse_stream(
     })
 }
 
-#[derive(Debug)]
-enum StreamAttemptTermination {
-    Eof,
-    ReadError(String),
-    IdleTimeout,
-}
-
 async fn send_sse_events(
     sender: &tokio::sync::mpsc::Sender<Result<Bytes, Infallible>>,
     tracer: &RequestTracer,
@@ -2599,7 +2646,7 @@ async fn run_realtime_sse_attempts(
             };
             tokio::select! {
                 biased;
-                _ = sender.closed() => return,
+                _ = sender.closed() => break AttemptTermination::ClientClosed,
                 chunk_result = body_stream.next() => match chunk_result {
                     Some(Ok(chunk)) => {
                         tracer.mark_upstream_first_byte();
@@ -2625,9 +2672,9 @@ async fn run_realtime_sse_attempts(
                     }
                     Some(Err(error)) => {
                         tracing::error!(%error, attempt = attempt_index + 1, "读取响应流失败");
-                        break StreamAttemptTermination::ReadError(error.to_string());
+                        break AttemptTermination::ReadError(error.to_string());
                     }
-                    None => break StreamAttemptTermination::Eof,
+                    None => break AttemptTermination::Eof,
                 },
                 _ = ping_interval.tick() => {
                     if sender.send(Ok(create_ping_sse())).await.is_err() {
@@ -2636,20 +2683,26 @@ async fn run_realtime_sse_attempts(
                 }
                 _ = idle_fut => {
                     tracing::warn!(attempt = attempt_index + 1, received_bytes, idle_timeout_secs, "流式空闲超时，主动收尾");
-                    break StreamAttemptTermination::IdleTimeout;
+                    break AttemptTermination::IdleTimeout;
                 }
             }
         };
 
-        let final_events = ctx.generate_final_events();
+        if matches!(termination, AttemptTermination::ClientClosed) {
+            return;
+        }
+
+        let final_events = ctx.generate_final_events_for(&termination);
         let visible = probation.push_all(final_events);
-        let retryable = ctx
-            .terminal_tool_json_error()
-            .is_some_and(|error| probation.prepare_retry(attempt_index, error));
+        let retryable = probation.prepare_attempt_retry(
+            attempt_index,
+            termination.clone(),
+            ctx.terminal_attempt_failure().cloned(),
+        );
         if retryable {
             tracing::warn!(
                 attempt = attempt_index + 1,
-                "实时工具 JSON 首轮 EOF 半截且未提交，丢弃整轮并重试一次"
+                "实时首轮正常 EOF 且无语义输出，丢弃整轮并重试一次"
             );
             continue;
         }
@@ -2659,42 +2712,43 @@ async fn run_realtime_sse_attempts(
         if !send_sse_events(&sender, tracer.as_ref(), visible).await {
             return;
         }
-        if let Some(message) = ctx.terminal_error_message() {
-            record_stream_usage(&hook, &ctx, credential_id, "error");
-            tracer.finalize(
-                "error",
-                Some(outcome::BAD_REQUEST),
-                Some(&message),
-                None,
-                stream_trace_usage(&ctx),
-            );
-        } else {
-            match termination {
-                StreamAttemptTermination::Eof => {
+        match termination {
+            AttemptTermination::Eof => {
+                if let Some(message) = ctx.terminal_error_message() {
+                    record_stream_usage(&hook, &ctx, credential_id, "error");
+                    tracer.finalize(
+                        "error",
+                        Some(outcome::BAD_REQUEST),
+                        Some(&message),
+                        None,
+                        stream_trace_usage(&ctx),
+                    );
+                } else {
                     record_stream_usage(&hook, &ctx, credential_id, "success");
                     tracer.finalize("success", None, None, None, stream_trace_usage(&ctx));
                 }
-                StreamAttemptTermination::ReadError(message) => {
-                    record_stream_usage(&hook, &ctx, credential_id, "error");
-                    tracer.finalize(
-                        "interrupted",
-                        Some(outcome::STREAM_INTERRUPTED),
-                        Some(&message),
-                        Some(received_bytes),
-                        stream_trace_usage(&ctx),
-                    );
-                }
-                StreamAttemptTermination::IdleTimeout => {
-                    record_stream_usage(&hook, &ctx, credential_id, "error");
-                    tracer.finalize(
-                        "interrupted",
-                        Some(outcome::STREAM_INTERRUPTED),
-                        Some(&format!("stream idle timeout after {}s", idle_timeout_secs)),
-                        Some(received_bytes),
-                        stream_trace_usage(&ctx),
-                    );
-                }
             }
+            AttemptTermination::ReadError(message) => {
+                record_stream_usage(&hook, &ctx, credential_id, "error");
+                tracer.finalize(
+                    "interrupted",
+                    Some(outcome::STREAM_INTERRUPTED),
+                    Some(&message),
+                    Some(received_bytes),
+                    stream_trace_usage(&ctx),
+                );
+            }
+            AttemptTermination::IdleTimeout => {
+                record_stream_usage(&hook, &ctx, credential_id, "error");
+                tracer.finalize(
+                    "interrupted",
+                    Some(outcome::STREAM_INTERRUPTED),
+                    Some(&format!("stream idle timeout after {}s", idle_timeout_secs)),
+                    Some(received_bytes),
+                    stream_trace_usage(&ctx),
+                );
+            }
+            AttemptTermination::ClientClosed => return,
         }
         return;
     }
@@ -2803,11 +2857,13 @@ async fn collect_non_stream_tool_attempt(
     let mut credits = 0.0_f64;
     let mut tool_accumulator = super::stream::ToolJsonAccumulator::new();
     let mut tool_json_error = None;
+    let mut observation = super::tool_attempt::AttemptObservation::default();
 
     for result in decoder.decode_iter() {
         match result {
             Ok(frame) => {
                 if let Ok(event) = Event::from_frame(frame) {
+                    observation.observe(&event);
                     match event {
                         Event::AssistantResponse(response) => {
                             text_content.push_str(&response.content);
@@ -2896,6 +2952,18 @@ async fn collect_non_stream_tool_attempt(
         tool_json_error = error;
     }
 
+    let has_completed_tool = !tool_uses.is_empty();
+    let failure = observation.failure(tool_json_error, has_completed_tool);
+    let semantic_output_started = observation.semantic_output_started() || has_completed_tool;
+    tracing::debug!(
+        attempt = attempt_index + 1,
+        saw_frame = observation.saw_frame(),
+        semantic_output_started,
+        has_completed_tool,
+        failure_type = failure.as_ref().map(|failure| failure.public_error().0),
+        "classified non-stream upstream attempt"
+    );
+
     Ok(NonStreamToolAttempt {
         credential_id,
         text_content,
@@ -2909,8 +2977,9 @@ async fn collect_non_stream_tool_attempt(
         credits,
         state: super::tool_attempt::ToolAttemptState {
             attempt_index,
-            terminal_error: tool_json_error,
-            semantic_output_started: false,
+            termination: super::tool_attempt::AttemptTermination::Eof,
+            failure,
+            semantic_output_started,
             tool_forwarded: false,
         },
     })
@@ -2996,8 +3065,8 @@ async fn handle_non_stream_request(
 
     if attempt_count == 2 {
         tracing::warn!(
-            first_attempt_error = "incomplete_tool_json",
-            "非流式工具调用第一次在 JSON EOF 处截断，已完成一次受控重试"
+            first_attempt_error = "empty_or_incomplete_upstream_response",
+            "非流式首轮正常 EOF 且无语义输出，已完成一次受控重试"
         );
     }
 
@@ -3014,12 +3083,10 @@ async fn handle_non_stream_request(
         credits,
         state,
     } = attempt;
-    let tool_json_error = state.terminal_error;
-
-    // 工具调用 JSON 半截 / 非法：非流式路径尚未发送任何字节，直接回 502，
-    // 明确暴露上游问题，而不是把无法解析的参数当成完整调用返回。
-    if let Some(err) = tool_json_error {
-        let message = err.message();
+    // 上游 attempt 失败：非流式路径尚未发送任何字节，直接回 502。
+    // 显式 Error/Exception 的原始正文只保留在内部分类中，不回显给客户端。
+    if let Some(failure) = state.failure {
+        let (error_type, message) = failure.public_error();
         hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
         tracer.finalize(
             "error",
@@ -3030,7 +3097,7 @@ async fn handle_non_stream_request(
         );
         return (
             StatusCode::BAD_GATEWAY,
-            Json(ErrorResponse::new("upstream_tool_json_error", message)),
+            Json(ErrorResponse::new(error_type, message)),
         )
             .into_response();
     }
@@ -3918,7 +3985,7 @@ async fn run_buffered_sse_attempts(
             };
             tokio::select! {
                 biased;
-                _ = sender.closed() => return,
+                _ = sender.closed() => break AttemptTermination::ClientClosed,
                 _ = ping_interval.tick() => {
                     if sender.send(Ok(create_ping_sse())).await.is_err() {
                         return;
@@ -3926,7 +3993,7 @@ async fn run_buffered_sse_attempts(
                 }
                 _ = idle_fut => {
                     tracing::warn!(attempt = attempt_index + 1, received_bytes, idle_timeout_secs, "缓冲流空闲超时，主动收尾");
-                    break StreamAttemptTermination::IdleTimeout;
+                    break AttemptTermination::IdleTimeout;
                 }
                 chunk_result = body_stream.next() => match chunk_result {
                     Some(Ok(chunk)) => {
@@ -3948,23 +4015,29 @@ async fn run_buffered_sse_attempts(
                     }
                     Some(Err(error)) => {
                         tracing::error!(%error, attempt = attempt_index + 1, "读取缓冲响应流失败");
-                        break StreamAttemptTermination::ReadError(error.to_string());
+                        break AttemptTermination::ReadError(error.to_string());
                     }
-                    None => break StreamAttemptTermination::Eof,
+                    None => break AttemptTermination::Eof,
                 }
             }
         };
 
-        let all_events = ctx.finish_and_get_all_events();
+        if matches!(termination, AttemptTermination::ClientClosed) {
+            return;
+        }
+
+        let all_events = ctx.finish_and_get_all_events_for(&termination);
         let mut probation = ProbationBuffer::default();
         let visible = probation.push_all(all_events);
-        let retryable = ctx
-            .terminal_tool_json_error()
-            .is_some_and(|error| probation.prepare_retry(attempt_index, error));
+        let retryable = probation.prepare_attempt_retry(
+            attempt_index,
+            termination.clone(),
+            ctx.terminal_attempt_failure().cloned(),
+        );
         if retryable {
             tracing::warn!(
                 attempt = attempt_index + 1,
-                "CC 缓冲工具 JSON 首轮 EOF 半截且未提交，丢弃整轮并重试一次"
+                "CC 缓冲首轮正常 EOF 且无语义输出，丢弃整轮并重试一次"
             );
             continue;
         }
@@ -3986,26 +4059,26 @@ async fn run_buffered_sse_attempts(
                 0.0
             },
         };
-        if let Some(message) = ctx.terminal_error_message() {
-            hook.record(
-                credential_id,
-                input,
-                output,
-                cache_creation,
-                cache_read,
-                credits,
-                "error",
-            );
-            tracer.finalize(
-                "error",
-                Some(outcome::BAD_REQUEST),
-                Some(&message),
-                None,
-                trace_usage,
-            );
-        } else {
-            match termination {
-                StreamAttemptTermination::Eof => {
+        match termination {
+            AttemptTermination::Eof => {
+                if let Some(message) = ctx.terminal_error_message() {
+                    hook.record(
+                        credential_id,
+                        input,
+                        output,
+                        cache_creation,
+                        cache_read,
+                        credits,
+                        "error",
+                    );
+                    tracer.finalize(
+                        "error",
+                        Some(outcome::BAD_REQUEST),
+                        Some(&message),
+                        None,
+                        trace_usage,
+                    );
+                } else {
                     hook.record(
                         credential_id,
                         input,
@@ -4017,43 +4090,44 @@ async fn run_buffered_sse_attempts(
                     );
                     tracer.finalize("success", None, None, None, trace_usage);
                 }
-                StreamAttemptTermination::ReadError(message) => {
-                    hook.record(
-                        credential_id,
-                        input,
-                        output,
-                        cache_creation,
-                        cache_read,
-                        credits,
-                        "error",
-                    );
-                    tracer.finalize(
-                        "interrupted",
-                        Some(outcome::STREAM_INTERRUPTED),
-                        Some(&message),
-                        Some(received_bytes),
-                        trace_usage,
-                    );
-                }
-                StreamAttemptTermination::IdleTimeout => {
-                    hook.record(
-                        credential_id,
-                        input,
-                        output,
-                        cache_creation,
-                        cache_read,
-                        credits,
-                        "error",
-                    );
-                    tracer.finalize(
-                        "interrupted",
-                        Some(outcome::STREAM_INTERRUPTED),
-                        Some(&format!("stream idle timeout after {}s", idle_timeout_secs)),
-                        Some(received_bytes),
-                        trace_usage,
-                    );
-                }
             }
+            AttemptTermination::ReadError(message) => {
+                hook.record(
+                    credential_id,
+                    input,
+                    output,
+                    cache_creation,
+                    cache_read,
+                    credits,
+                    "error",
+                );
+                tracer.finalize(
+                    "interrupted",
+                    Some(outcome::STREAM_INTERRUPTED),
+                    Some(&message),
+                    Some(received_bytes),
+                    trace_usage,
+                );
+            }
+            AttemptTermination::IdleTimeout => {
+                hook.record(
+                    credential_id,
+                    input,
+                    output,
+                    cache_creation,
+                    cache_read,
+                    credits,
+                    "error",
+                );
+                tracer.finalize(
+                    "interrupted",
+                    Some(outcome::STREAM_INTERRUPTED),
+                    Some(&format!("stream idle timeout after {}s", idle_timeout_secs)),
+                    Some(received_bytes),
+                    trace_usage,
+                );
+            }
+            AttemptTermination::ClientClosed => return,
         }
         return;
     }
@@ -4069,6 +4143,46 @@ mod tests {
     use futures::{StreamExt, future};
 
     use super::*;
+
+    fn failure_from_events(events: &[Event]) -> super::super::tool_attempt::AttemptFailure {
+        let mut observation = super::super::tool_attempt::AttemptObservation::default();
+        for event in events {
+            observation.observe(event);
+        }
+        observation.failure(None, false).unwrap()
+    }
+
+    #[test]
+    fn non_stream_failure_preserves_error_exception_and_context_usage() {
+        assert_eq!(
+            failure_from_events(&[Event::Error {
+                error_code: "ValidationException".into(),
+                error_message: "context too large".into(),
+            }]),
+            super::super::tool_attempt::AttemptFailure::UpstreamError {
+                error_type: "ValidationException".into(),
+                message: "context too large".into(),
+            }
+        );
+        assert_eq!(
+            failure_from_events(&[Event::Exception {
+                exception_type: "ModelError".into(),
+                message: "model unavailable".into(),
+            }]),
+            super::super::tool_attempt::AttemptFailure::UpstreamError {
+                error_type: "ModelError".into(),
+                message: "model unavailable".into(),
+            }
+        );
+        assert_eq!(
+            failure_from_events(&[Event::ContextUsage(
+                crate::kiro::model::events::ContextUsageEvent {
+                    context_usage_percentage: 100.0,
+                },
+            )]),
+            super::super::tool_attempt::AttemptFailure::ContextWindowExceeded
+        );
+    }
 
     const PDF_CANARY_B64: &str = "JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCA2MTIgNzkyXSAvUmVzb3VyY2VzIDw8IC9Gb250IDw8IC9GMSA0IDAgUiA+PiA+PiAvQ29udGVudHMgNSAwIFIgPj4KZW5kb2JqCjQgMCBvYmoKPDwgL1R5cGUgL0ZvbnQgL1N1YnR5cGUgL1R5cGUxIC9CYXNlRm9udCAvSGVsdmV0aWNhID4+CmVuZG9iago1IDAgb2JqCjw8IC9MZW5ndGggNTQgPj4Kc3RyZWFtCkJUIC9GMSAxMiBUZiA3MiA3MjAgVGQgKFBERi1DT01QQVRJQklMSVRZLVRPS0VOKSBUaiBFVAplbmRzdHJlYW0KZW5kb2JqCnhyZWYKMCA2CjAwMDAwMDAwMDAgNjU1MzUgZiAKMDAwMDAwMDAwOSAwMDAwMCBuIAowMDAwMDAwMDU4IDAwMDAwIG4gCjAwMDAwMDAxMTUgMDAwMDAgbiAKMDAwMDAwMDI0MSAwMDAwMCBuIAowMDAwMDAwMzExIDAwMDAwIG4gCnRyYWlsZXIKPDwgL1NpemUgNiAvUm9vdCAxIDAgUiA+PgpzdGFydHhyZWYKNDE1CiUlRU9GCg==";
 
@@ -4518,6 +4632,7 @@ mod tests {
             usage: TraceUsage::zero(),
             credits: 0.0,
             terminal_error: None,
+            attempt_failure: None,
         };
         let mut attempts =
             std::collections::VecDeque::from([attempt("Working... {\"a\":"), attempt("{\"a\":1}")]);
@@ -4556,6 +4671,7 @@ mod tests {
             usage: TraceUsage::zero(),
             credits: 0.0,
             terminal_error: None,
+            attempt_failure: None,
         };
         let mut attempts = std::collections::VecDeque::from([
             attempt("{\"alpha\":\" ztset\",\"total\":37}"),
@@ -4592,6 +4708,7 @@ mod tests {
                 usage: TraceUsage::zero(),
                 credits: 0.0,
                 terminal_error: None,
+                attempt_failure: None,
             }))
         })
         .await
@@ -4600,6 +4717,62 @@ mod tests {
         assert_eq!(calls, 2);
         assert_eq!(failure.attempts.len(), 2);
         assert!(failure.source.is_none());
+    }
+
+    #[tokio::test]
+    async fn strict_json_recovery_does_not_retry_explicit_upstream_failure() {
+        let mut calls = 0;
+        let failure = recover_strict_json_attempts(|_| {
+            calls += 1;
+            futures::future::ready(Ok(BufferedAttempt {
+                events: Vec::new(),
+                credential_id: 1,
+                usage: TraceUsage::zero(),
+                credits: 0.0,
+                terminal_error: Some("internal upstream detail".into()),
+                attempt_failure: Some(super::super::tool_attempt::AttemptFailure::UpstreamError {
+                    error_type: "ModelError".into(),
+                    message: "secret request body".into(),
+                }),
+            }))
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(calls, 1);
+        assert!(matches!(
+            failure.terminal_failure,
+            Some(super::super::tool_attempt::AttemptFailure::UpstreamError {
+                ref error_type,
+                ref message,
+            }) if error_type == "ModelError" && message == "secret request body"
+        ));
+    }
+
+    #[tokio::test]
+    async fn strict_json_recovery_reports_second_empty_attempt_stably() {
+        let mut calls = 0;
+        let failure = recover_strict_json_attempts(|_| {
+            calls += 1;
+            futures::future::ready(Ok(BufferedAttempt {
+                events: Vec::new(),
+                credential_id: 1,
+                usage: TraceUsage::zero(),
+                credits: 0.0,
+                terminal_error: Some("internal empty detail".into()),
+                attempt_failure: Some(super::super::tool_attempt::AttemptFailure::EmptyResponse),
+            }))
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(calls, 2);
+        let terminal_failure = failure.terminal_failure.unwrap();
+        assert!(matches!(
+            terminal_failure,
+            super::super::tool_attempt::AttemptFailure::EmptyResponse
+        ));
+        assert_eq!(terminal_failure.public_error().0, "upstream_empty_response");
     }
 
     #[test]

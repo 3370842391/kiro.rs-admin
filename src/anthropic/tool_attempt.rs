@@ -1,4 +1,5 @@
 use super::stream::{SseEvent, ToolJsonAccumulatorError, ToolJsonAccumulatorError::IncompleteJson};
+use crate::kiro::model::events::Event;
 use std::collections::HashMap;
 use std::future::Future;
 
@@ -93,14 +94,31 @@ impl ProbationBuffer {
         attempt_index: u8,
         error: &ToolJsonAccumulatorError,
     ) -> bool {
-        if attempt_index != 0 || self.committed || self.tool_forwarded {
-            return false;
-        }
-        let retryable = matches!(error, ToolJsonAccumulatorError::IncompleteJson { .. });
-        if retryable {
+        self.prepare_attempt_retry(
+            attempt_index,
+            AttemptTermination::Eof,
+            Some(AttemptFailure::IncompleteToolJson(error.clone())),
+        )
+    }
+
+    pub(crate) fn prepare_attempt_retry(
+        &mut self,
+        attempt_index: u8,
+        termination: AttemptTermination,
+        failure: Option<AttemptFailure>,
+    ) -> bool {
+        let state = ToolAttemptState {
+            attempt_index,
+            termination,
+            failure,
+            semantic_output_started: self.committed,
+            tool_forwarded: self.tool_forwarded,
+        };
+        if state.should_retry() {
             self.pending.clear();
+            return true;
         }
-        retryable
+        false
     }
 }
 
@@ -137,14 +155,145 @@ fn event_has_semantic_output(event: &SseEvent) -> bool {
     }
 }
 
+/// 上游 attempt 的读取终止方式。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AttemptTermination {
+    Eof,
+    ReadError(String),
+    IdleTimeout,
+    ClientClosed,
+}
+
+/// 上游 attempt 在正常收尾后得到的语义失败分类。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AttemptFailure {
+    IncompleteToolJson(ToolJsonAccumulatorError),
+    EmptyResponse,
+    ContextWindowExceeded,
+    UpstreamError { error_type: String, message: String },
+}
+
+impl AttemptFailure {
+    /// 映射为稳定的客户端错误；显式上游异常不回显其正文。
+    pub(crate) fn public_error(&self) -> (&'static str, String) {
+        match self {
+            Self::IncompleteToolJson(error) => (error.error_type(), error.message()),
+            Self::EmptyResponse => (
+                "upstream_empty_response",
+                "Upstream returned no assistant content after one retry".to_string(),
+            ),
+            Self::ContextWindowExceeded => (
+                "upstream_context_window_exceeded",
+                "Upstream context window was exceeded".to_string(),
+            ),
+            Self::UpstreamError { error_type, .. } => {
+                let safe_type = error_type
+                    .chars()
+                    .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+                    .take(64)
+                    .collect::<String>();
+                let safe_type = if safe_type.is_empty() {
+                    "unknown upstream error"
+                } else {
+                    safe_type.as_str()
+                };
+                (
+                    "upstream_protocol_error",
+                    format!("Upstream reported {safe_type}"),
+                )
+            }
+        }
+    }
+}
+
+/// 从 AWS event-stream 中累积本轮 attempt 的语义与显式失败信号。
+#[derive(Debug, Default)]
+pub(crate) struct AttemptObservation {
+    saw_frame: bool,
+    semantic_output_started: bool,
+    context_window_exceeded: bool,
+    upstream_error: Option<(String, String)>,
+}
+
+impl AttemptObservation {
+    pub(crate) fn observe(&mut self, event: &Event) {
+        self.saw_frame = true;
+        match event {
+            Event::AssistantResponse(response) => {
+                self.semantic_output_started |= !response.content.is_empty();
+            }
+            Event::ReasoningContent(reasoning) => {
+                self.semantic_output_started |= reasoning
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| !text.is_empty())
+                    || reasoning
+                        .redacted_content
+                        .as_deref()
+                        .is_some_and(|content| !content.is_empty());
+            }
+            Event::ContextUsage(context_usage) => {
+                self.context_window_exceeded |= context_usage.context_usage_percentage >= 100.0;
+            }
+            Event::Error {
+                error_code,
+                error_message,
+            } => {
+                self.upstream_error
+                    .get_or_insert_with(|| (error_code.clone(), error_message.clone()));
+            }
+            Event::Exception {
+                exception_type,
+                message,
+            } => {
+                self.upstream_error
+                    .get_or_insert_with(|| (exception_type.clone(), message.clone()));
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn saw_frame(&self) -> bool {
+        self.saw_frame
+    }
+
+    pub(crate) fn semantic_output_started(&self) -> bool {
+        self.semantic_output_started
+    }
+
+    pub(crate) fn failure(
+        &self,
+        tool_json_error: Option<ToolJsonAccumulatorError>,
+        tool_semantic_output: bool,
+    ) -> Option<AttemptFailure> {
+        if let Some(error) = tool_json_error {
+            return Some(AttemptFailure::IncompleteToolJson(error));
+        }
+        if self.context_window_exceeded {
+            return Some(AttemptFailure::ContextWindowExceeded);
+        }
+        if let Some((error_type, message)) = &self.upstream_error {
+            return Some(AttemptFailure::UpstreamError {
+                error_type: error_type.clone(),
+                message: message.clone(),
+            });
+        }
+        if !self.semantic_output_started && !tool_semantic_output {
+            return Some(AttemptFailure::EmptyResponse);
+        }
+        None
+    }
+}
+
 /// 单次上游工具生成 attempt 的提交状态。
 ///
-/// 只有第一次、尚未向客户端提交任何语义内容或工具调用、并且终态为 EOF 半截 JSON
-/// 时才能透明重试。非法 JSON 与已经提交的输出都必须原样失败，防止重复执行工具。
+/// 只有第一次、尚未向客户端提交任何语义内容或工具调用、并且正常 EOF 后得到纯空响应
+/// 或半截工具 JSON 时才能透明重试。非法 JSON 与已经提交的输出都必须原样失败，防止重复执行工具。
 #[derive(Debug, Clone)]
 pub(crate) struct ToolAttemptState {
     pub attempt_index: u8,
-    pub terminal_error: Option<ToolJsonAccumulatorError>,
+    pub termination: AttemptTermination,
+    pub failure: Option<AttemptFailure>,
     pub semantic_output_started: bool,
     pub tool_forwarded: bool,
 }
@@ -152,9 +301,14 @@ pub(crate) struct ToolAttemptState {
 impl ToolAttemptState {
     pub(crate) fn should_retry(&self) -> bool {
         self.attempt_index == 0
+            && self.termination == AttemptTermination::Eof
             && !self.semantic_output_started
             && !self.tool_forwarded
-            && matches!(self.terminal_error, Some(IncompleteJson { .. }))
+            && matches!(
+                self.failure,
+                Some(AttemptFailure::EmptyResponse)
+                    | Some(AttemptFailure::IncompleteToolJson(IncompleteJson { .. }))
+            )
     }
 }
 
@@ -196,11 +350,116 @@ mod tests {
         }
     }
 
+    fn empty_attempt() -> ToolAttemptState {
+        ToolAttemptState {
+            attempt_index: 0,
+            termination: AttemptTermination::Eof,
+            failure: Some(AttemptFailure::EmptyResponse),
+            semantic_output_started: false,
+            tool_forwarded: false,
+        }
+    }
+
+    #[test]
+    fn retries_only_first_normal_eof_empty_or_incomplete_attempt() {
+        let empty = empty_attempt();
+        assert!(empty.should_retry());
+        assert!(
+            ToolAttemptState {
+                failure: Some(AttemptFailure::IncompleteToolJson(incomplete())),
+                ..empty.clone()
+            }
+            .should_retry()
+        );
+
+        assert!(
+            !ToolAttemptState {
+                attempt_index: 1,
+                ..empty.clone()
+            }
+            .should_retry()
+        );
+        assert!(
+            !ToolAttemptState {
+                termination: AttemptTermination::ReadError("connection reset".into()),
+                ..empty.clone()
+            }
+            .should_retry()
+        );
+        assert!(
+            !ToolAttemptState {
+                termination: AttemptTermination::IdleTimeout,
+                ..empty.clone()
+            }
+            .should_retry()
+        );
+        assert!(
+            !ToolAttemptState {
+                termination: AttemptTermination::ClientClosed,
+                ..empty.clone()
+            }
+            .should_retry()
+        );
+        assert!(
+            !ToolAttemptState {
+                semantic_output_started: true,
+                ..empty.clone()
+            }
+            .should_retry()
+        );
+        assert!(
+            !ToolAttemptState {
+                tool_forwarded: true,
+                ..empty.clone()
+            }
+            .should_retry()
+        );
+        assert!(
+            !ToolAttemptState {
+                failure: Some(AttemptFailure::ContextWindowExceeded),
+                ..empty.clone()
+            }
+            .should_retry()
+        );
+        assert!(
+            !ToolAttemptState {
+                failure: Some(AttemptFailure::UpstreamError {
+                    error_type: "ValidationException".into(),
+                    message: "invalid request".into(),
+                }),
+                ..empty
+            }
+            .should_retry()
+        );
+    }
+
+    #[test]
+    fn attempt_failures_use_stable_public_errors_without_upstream_body() {
+        let (error_type, message) = AttemptFailure::EmptyResponse.public_error();
+        assert_eq!(error_type, "upstream_empty_response");
+        assert_eq!(
+            message,
+            "Upstream returned no assistant content after one retry"
+        );
+
+        let sensitive = "request body: secret customer document";
+        let (error_type, message) = AttemptFailure::UpstreamError {
+            error_type: "ValidationException".into(),
+            message: sensitive.into(),
+        }
+        .public_error();
+        assert_eq!(error_type, "upstream_protocol_error");
+        assert!(message.contains("ValidationException"));
+        assert!(!message.contains(sensitive));
+        assert!(!message.contains("secret customer document"));
+    }
+
     #[test]
     fn retries_only_first_incomplete_uncommitted_attempt() {
         let retryable = ToolAttemptState {
             attempt_index: 0,
-            terminal_error: Some(incomplete()),
+            termination: AttemptTermination::Eof,
+            failure: Some(AttemptFailure::IncompleteToolJson(incomplete())),
             semantic_output_started: false,
             tool_forwarded: false,
         };
@@ -233,11 +492,14 @@ mod tests {
     fn invalid_json_is_never_retryable() {
         let state = ToolAttemptState {
             attempt_index: 0,
-            terminal_error: Some(ToolJsonAccumulatorError::InvalidJson {
-                tool_use_id: "tool_1".to_string(),
-                name: "fs_write".to_string(),
-                message: "expected value".to_string(),
-            }),
+            termination: AttemptTermination::Eof,
+            failure: Some(AttemptFailure::IncompleteToolJson(
+                ToolJsonAccumulatorError::InvalidJson {
+                    tool_use_id: "tool_1".to_string(),
+                    name: "fs_write".to_string(),
+                    message: "expected value".to_string(),
+                },
+            )),
             semantic_output_started: false,
             tool_forwarded: false,
         };
@@ -249,13 +511,15 @@ mod tests {
         let mut attempts = VecDeque::from([
             ToolAttemptState {
                 attempt_index: 0,
-                terminal_error: Some(incomplete()),
+                termination: AttemptTermination::Eof,
+                failure: Some(AttemptFailure::IncompleteToolJson(incomplete())),
                 semantic_output_started: false,
                 tool_forwarded: false,
             },
             ToolAttemptState {
                 attempt_index: 1,
-                terminal_error: None,
+                termination: AttemptTermination::Eof,
+                failure: None,
                 semantic_output_started: false,
                 tool_forwarded: false,
             },
@@ -268,7 +532,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(state.terminal_error.is_none());
+        assert!(state.failure.is_none());
         assert_eq!(attempt_count, 2);
     }
 
@@ -276,11 +540,14 @@ mod tests {
     async fn run_with_single_retry_stops_after_invalid_first_attempt() {
         let invalid = ToolAttemptState {
             attempt_index: 0,
-            terminal_error: Some(ToolJsonAccumulatorError::InvalidJson {
-                tool_use_id: "tool_1".to_string(),
-                name: "fs_write".to_string(),
-                message: "expected value".to_string(),
-            }),
+            termination: AttemptTermination::Eof,
+            failure: Some(AttemptFailure::IncompleteToolJson(
+                ToolJsonAccumulatorError::InvalidJson {
+                    tool_use_id: "tool_1".to_string(),
+                    name: "fs_write".to_string(),
+                    message: "expected value".to_string(),
+                },
+            )),
             semantic_output_started: false,
             tool_forwarded: false,
         };
