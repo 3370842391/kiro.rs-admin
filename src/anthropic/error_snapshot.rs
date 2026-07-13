@@ -278,6 +278,37 @@ struct StreamTail {
     bytes: Vec<u8>,
 }
 
+impl StreamTail {
+    fn push(&mut self, chunk: &[u8]) {
+        self.bytes.extend_from_slice(chunk);
+        let excess = self.bytes.len().saturating_sub(STREAM_TAIL_MAX_BYTES);
+        if excess == 0 {
+            return;
+        }
+        let mut start = excess;
+        while start < self.bytes.len() && std::str::from_utf8(&self.bytes[start..]).is_err() {
+            start += 1;
+        }
+        if start < self.bytes.len() {
+            self.bytes.drain(..start);
+        } else {
+            self.bytes.drain(..excess);
+        }
+    }
+
+    fn snapshot_bytes(&self) -> Vec<u8> {
+        if std::str::from_utf8(&self.bytes).is_ok() {
+            return self.bytes.clone();
+        }
+        serde_json::to_vec(&serde_json::json!({
+            "invalid_utf8": true,
+            "original_bytes": self.bytes.len(),
+            "sha256": hex::encode(Sha256::digest(&self.bytes)),
+        }))
+        .unwrap_or_default()
+    }
+}
+
 pub struct SnapshotFinalState {
     pub final_status: String,
     pub error_type: Option<String>,
@@ -478,15 +509,7 @@ impl ErrorSnapshotContext {
 
     pub fn record_stream_chunk(&self, chunk: &[u8]) {
         let mut draft = self.draft.lock();
-        draft.stream_tail.bytes.extend_from_slice(chunk);
-        let excess = draft
-            .stream_tail
-            .bytes
-            .len()
-            .saturating_sub(STREAM_TAIL_MAX_BYTES);
-        if excess > 0 {
-            draft.stream_tail.bytes.drain(..excess);
-        }
+        draft.stream_tail.push(chunk);
     }
 
     pub fn record_attempt_status(&self, attempt: u32, status: Option<u16>, outcome: &str) {
@@ -584,7 +607,7 @@ impl ErrorSnapshotContext {
                 kind: SnapshotPayloadKind::StreamTail,
                 attempt: None,
                 content_type: "application/octet-stream".to_string(),
-                data: draft.stream_tail.bytes.clone(),
+                data: draft.stream_tail.snapshot_bytes(),
             });
         }
         let mut payloads = Vec::new();
@@ -1023,6 +1046,29 @@ mod tests {
         let diagnostics: serde_json::Value = serde_json::from_slice(&payload.data).unwrap();
 
         assert_eq!(diagnostics["interrupted_after_bytes"], 1234);
+    }
+
+    #[test]
+    fn stream_tail_keeps_latest_256_kib_on_utf8_boundary() {
+        let mut tail = StreamTail::default();
+        tail.push("开头".repeat(100_000).as_bytes());
+        tail.push(b"FINAL_EVENT");
+        let bytes = tail.snapshot_bytes();
+
+        assert!(bytes.len() <= STREAM_TAIL_MAX_BYTES);
+        assert!(std::str::from_utf8(&bytes).is_ok());
+        assert!(bytes.ends_with(b"FINAL_EVENT"));
+    }
+
+    #[test]
+    fn stream_tail_replaces_invalid_utf8_with_length_and_digest() {
+        let mut tail = StreamTail::default();
+        tail.push(&[0xff, 0xfe, 0xfd]);
+        let value: serde_json::Value = serde_json::from_slice(&tail.snapshot_bytes()).unwrap();
+
+        assert_eq!(value["invalid_utf8"], true);
+        assert_eq!(value["original_bytes"], 3);
+        assert_eq!(value["sha256"].as_str().unwrap().len(), 64);
     }
 
     #[test]

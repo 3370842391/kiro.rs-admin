@@ -6,6 +6,7 @@
 //! 支持按凭据级 endpoint 切换不同 Kiro API 端点
 
 use reqwest::{Client, header};
+use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -537,7 +538,14 @@ impl KiroProvider {
         }
 
         tracing::debug!("使用端点 [{}] POST {}", endpoint.name(), url);
-        tracing::debug!("实际发送请求体: {}", body);
+        tracing::debug!(
+            credential_id = ctx.id,
+            attempt,
+            endpoint = endpoint.name(),
+            body_bytes = body.len(),
+            body_sha256 = %hex::encode(Sha256::digest(body.as_bytes())),
+            "实际发送请求体元数据"
+        );
 
         // 复用连接池的热 TLS 连接：从中转到 us-east-1 的 TLS 握手 1-3s，每请求
         // Connection:close 等于废掉 client_for_proxy 的连接池，把整个握手 RTT 计入

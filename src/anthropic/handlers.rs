@@ -28,6 +28,7 @@ use bytes::Bytes;
 use chrono::Utc;
 use futures::{Stream, StreamExt, stream};
 use serde_json::json;
+use sha2::{Digest as _, Sha256};
 use std::time::Duration;
 use tokio::time::{Instant as TokioInstant, interval};
 use uuid::Uuid;
@@ -237,6 +238,10 @@ impl RequestTracer {
         *self.reasoning_effort.lock() = value;
     }
 
+    pub fn trace_id(&self) -> &str {
+        &self.trace_id
+    }
+
     pub fn record_protocol_error(&self, error_type: &str, message: &str) {
         if let Some(snapshot) = &self.snapshot {
             snapshot.record_internal_error(error_type, message);
@@ -253,6 +258,12 @@ impl RequestTracer {
     pub fn record_stream_chunk(&self, chunk: &[u8]) {
         if let Some(snapshot) = &self.snapshot {
             snapshot.record_stream_chunk(chunk);
+        }
+    }
+
+    pub fn record_upstream_body(&self, attempt: u32, body: &[u8]) {
+        if let Some(snapshot) = &self.snapshot {
+            snapshot.record_upstream_body(attempt, body);
         }
     }
 
@@ -834,6 +845,7 @@ async fn collect_buffered_attempt(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    attempt_index: usize,
 ) -> anyhow::Result<BufferedAttempt> {
     let call_result = provider
         .call_api_with_content_length_retry(
@@ -847,6 +859,7 @@ async fn collect_buffered_attempt(
     let body = call_result.response.bytes().await?;
     tracer.mark_upstream_first_byte();
     tracer.record_stream_chunk(&body);
+    tracer.record_upstream_body(attempt_index as u32, &body);
 
     let mut decoder = EventStreamDecoder::new();
     if let Err(error) = decoder.feed(&body) {
@@ -874,10 +887,14 @@ async fn collect_buffered_attempt(
             Ok(frame) => match Event::from_frame(frame) {
                 Ok(event) => context.process_and_buffer(&event),
                 Err(error) => {
-                    tracing::warn!(error = %error, "strict JSON attempt event decode failed")
+                    tracing::warn!(error = %error, "strict JSON attempt event decode failed");
+                    tracer.record_protocol_error("sse_state_error", &error.to_string());
                 }
             },
-            Err(error) => tracing::warn!(error = %error, "strict JSON attempt frame decode failed"),
+            Err(error) => {
+                tracing::warn!(error = %error, "strict JSON attempt frame decode failed");
+                tracer.record_protocol_error("sse_state_error", &error.to_string());
+            }
         }
     }
     let events = context.finish_and_get_all_events();
@@ -989,6 +1006,7 @@ async fn handle_strict_json_request(
                     cache_usage,
                     tracer,
                     group,
+                    attempt_index,
                 )
                 .await
             }
@@ -1092,6 +1110,7 @@ async fn handle_strict_json_request(
             );
             if let Some(source) = failure.source {
                 let attempt_outcome = last_attempt_outcome(&tracer);
+                tracer.record_protocol_error("structured_output_error", &source.to_string());
                 tracer.finalize(
                     "error",
                     attempt_outcome,
@@ -1104,6 +1123,7 @@ async fn handle_strict_json_request(
 
             if let Some(attempt_failure) = failure.terminal_failure {
                 let (error_type, message) = attempt_failure.public_error();
+                tracer.record_protocol_error(error_type, &message);
                 tracer.finalize(
                     "error",
                     Some(outcome::BAD_REQUEST),
@@ -1138,6 +1158,7 @@ async fn handle_strict_json_request(
                 attempts = failure.attempts.len(),
                 "strict JSON recovery exhausted"
             );
+            tracer.record_protocol_error("structured_output_error", message);
             tracer.finalize(
                 "error",
                 Some(outcome::BAD_REQUEST),
@@ -2209,7 +2230,14 @@ pub async fn post_messages(
     };
     let request_body = &prepared_bodies.primary_body;
     let threshold_retry_body = prepared_bodies.threshold_retry_body.as_deref();
-    tracing::debug!("Kiro request body: {}", request_body);
+    tracing::debug!(
+        trace_id = %tracer.trace_id(),
+        body_bytes = request_body.len(),
+        body_sha256 = %hex::encode(Sha256::digest(request_body.as_bytes())),
+        model = %payload.model,
+        stream = payload.stream,
+        "Kiro request prepared"
+    );
 
     // 估算输入 tokens
     let total_input_tokens = token::count_all_tokens(
@@ -2881,9 +2909,15 @@ async fn run_realtime_sse_attempts(
                             match result {
                                 Ok(frame) => match Event::from_frame(frame) {
                                     Ok(event) => events.extend(ctx.process_kiro_event(&event)),
-                                    Err(error) => tracing::warn!(%error, attempt = attempt_index + 1, "流式事件解码失败"),
+                                    Err(error) => {
+                                        tracing::warn!(%error, attempt = attempt_index + 1, "流式事件解码失败");
+                                        tracer.record_protocol_error("sse_state_error", &error.to_string());
+                                    }
                                 },
-                                Err(error) => tracing::warn!(%error, attempt = attempt_index + 1, "流式 frame 解码失败"),
+                                Err(error) => {
+                                    tracing::warn!(%error, attempt = attempt_index + 1, "流式 frame 解码失败");
+                                    tracer.record_protocol_error("sse_state_error", &error.to_string());
+                                }
                             }
                         }
                         let visible = probation.push_all(events);
@@ -2900,6 +2934,7 @@ async fn run_realtime_sse_attempts(
                     }
                     Some(Err(error)) => {
                         tracing::error!(%error, attempt = attempt_index + 1, "读取响应流失败");
+                        tracer.record_protocol_error("stream_read_error", &error.to_string());
                         break AttemptTermination::ReadError(error.to_string());
                     }
                     None => break AttemptTermination::Eof,
@@ -2918,6 +2953,10 @@ async fn run_realtime_sse_attempts(
                 }
                 _ = idle_fut => {
                     tracing::warn!(attempt = attempt_index + 1, received_bytes, idle_timeout_secs, "流式空闲超时，主动收尾");
+                    tracer.record_protocol_error(
+                        "stream_idle_timeout",
+                        &format!("stream idle timeout after {idle_timeout_secs}s"),
+                    );
                     break AttemptTermination::IdleTimeout;
                 }
             }
@@ -2981,7 +3020,7 @@ async fn run_realtime_sse_attempts(
                 record_stream_usage(&hook, &ctx, credential_id, "error");
                 tracer.finalize(
                     "interrupted",
-                    Some(outcome::STREAM_INTERRUPTED),
+                    Some("stream_read_error"),
                     Some(&message),
                     Some(received_bytes),
                     stream_trace_usage(&ctx),
@@ -2991,7 +3030,7 @@ async fn run_realtime_sse_attempts(
                 record_stream_usage(&hook, &ctx, credential_id, "error");
                 tracer.finalize(
                     "interrupted",
-                    Some(outcome::STREAM_INTERRUPTED),
+                    Some("stream_idle_timeout"),
                     Some(&format!("stream idle timeout after {}s", idle_timeout_secs)),
                     Some(received_bytes),
                     stream_trace_usage(&ctx),
@@ -3143,6 +3182,7 @@ async fn collect_non_stream_tool_attempt(
     let mut decoder = EventStreamDecoder::new();
     if let Err(error) = decoder.feed(&body_bytes) {
         tracing::warn!(%error, attempt = attempt_index + 1, "非流式响应解码缓冲区溢出");
+        tracer.record_protocol_error("sse_state_error", &error.to_string());
     }
 
     let mut text_content = String::new();
@@ -3161,9 +3201,10 @@ async fn collect_non_stream_tool_attempt(
     for result in decoder.decode_iter() {
         match result {
             Ok(frame) => {
-                if let Ok(event) = Event::from_frame(frame) {
-                    observation.observe(&event);
-                    match event {
+                match Event::from_frame(frame) {
+                    Ok(event) => {
+                        observation.observe(&event);
+                        match event {
                         Event::AssistantResponse(response) => {
                             text_content.push_str(&response.content);
                         }
@@ -3201,6 +3242,10 @@ async fn collect_non_stream_tool_attempt(
                                 Ok(None) => {}
                                 Err(error) => {
                                     tracing::error!(%error, attempt = attempt_index + 1);
+                                    tracer.record_protocol_error(
+                                        "upstream_tool_protocol_error",
+                                        &error.to_string(),
+                                    );
                                     tool_json_error = Some(error);
                                 }
                             }
@@ -3228,10 +3273,18 @@ async fn collect_non_stream_tool_attempt(
                             stop_reason = "max_tokens".to_string();
                         }
                         _ => {}
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, attempt = attempt_index + 1, "事件帧解码失败");
+                        tracer.record_protocol_error("sse_state_error", &error.to_string());
                     }
                 }
             }
-            Err(error) => tracing::warn!(%error, attempt = attempt_index + 1, "解码事件失败"),
+            Err(error) => {
+                tracing::warn!(%error, attempt = attempt_index + 1, "解码事件失败");
+                tracer.record_protocol_error("sse_state_error", &error.to_string());
+            }
         }
     }
 
@@ -3249,6 +3302,9 @@ async fn collect_non_stream_tool_attempt(
             }
         }
         tool_json_error = error;
+        if let Some(error) = &tool_json_error {
+            tracer.record_protocol_error("upstream_tool_protocol_error", &error.to_string());
+        }
     }
 
     let text_content = crate::kiro::model::events::strip_tool_use_xml_leaks(&text_content);
@@ -3293,6 +3349,9 @@ async fn collect_non_stream_tool_attempt(
     let failure = schema_failure
         .clone()
         .or_else(|| observation.failure(tool_json_error, has_completed_tool));
+    if failure.is_some() {
+        tracer.record_upstream_body(attempt_index as u32, &body_bytes);
+    }
     let semantic_output_started =
         has_non_tool_semantic_output || (has_completed_tool && schema_failure.is_none());
     tracing::debug!(
@@ -3408,6 +3467,10 @@ async fn handle_non_stream_request(
             first_attempt_error = "empty_or_incomplete_upstream_response",
             "非流式首轮正常 EOF 且无语义输出，已完成一次受控重试"
         );
+        tracer.record_protocol_error(
+            "upstream_empty_response",
+            "the first non-stream response had no semantic output and was retried",
+        );
     }
 
     let NonStreamToolAttempt {
@@ -3424,6 +3487,7 @@ async fn handle_non_stream_request(
     if let Some(failure) = state.failure {
         let (error_type, message) = failure.public_error();
         hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
+        tracer.record_protocol_error(error_type, &message);
         tracer.finalize(
             "error",
             Some(outcome::BAD_REQUEST),
@@ -4064,7 +4128,14 @@ pub async fn post_messages_cc(
     };
     let request_body = &prepared_bodies.primary_body;
     let threshold_retry_body = prepared_bodies.threshold_retry_body.as_deref();
-    tracing::debug!("Kiro request body: {}", request_body);
+    tracing::debug!(
+        trace_id = %tracer.trace_id(),
+        body_bytes = request_body.len(),
+        body_sha256 = %hex::encode(Sha256::digest(request_body.as_bytes())),
+        model = %payload.model,
+        stream = payload.stream,
+        "Kiro request prepared"
+    );
 
     // 计算总 input tokens
     let total_input_tokens = token::count_all_tokens(
@@ -4349,6 +4420,10 @@ async fn run_buffered_sse_attempts(
                 }
                 _ = idle_fut => {
                     tracing::warn!(attempt = attempt_index + 1, received_bytes, idle_timeout_secs, "缓冲流空闲超时，主动收尾");
+                    tracer.record_protocol_error(
+                        "stream_idle_timeout",
+                        &format!("stream idle timeout after {idle_timeout_secs}s"),
+                    );
                     break AttemptTermination::IdleTimeout;
                 }
                 chunk_result = body_stream.next() => match chunk_result {
@@ -4373,6 +4448,7 @@ async fn run_buffered_sse_attempts(
                     }
                     Some(Err(error)) => {
                         tracing::error!(%error, attempt = attempt_index + 1, "读取缓冲响应流失败");
+                        tracer.record_protocol_error("stream_read_error", &error.to_string());
                         break AttemptTermination::ReadError(error.to_string());
                     }
                     None => break AttemptTermination::Eof,
@@ -4465,7 +4541,7 @@ async fn run_buffered_sse_attempts(
                 );
                 tracer.finalize(
                     "interrupted",
-                    Some(outcome::STREAM_INTERRUPTED),
+                    Some("stream_read_error"),
                     Some(&message),
                     Some(received_bytes),
                     trace_usage,
@@ -4483,7 +4559,7 @@ async fn run_buffered_sse_attempts(
                 );
                 tracer.finalize(
                     "interrupted",
-                    Some(outcome::STREAM_INTERRUPTED),
+                    Some("stream_idle_timeout"),
                     Some(&format!("stream idle timeout after {}s", idle_timeout_secs)),
                     Some(received_bytes),
                     trace_usage,
