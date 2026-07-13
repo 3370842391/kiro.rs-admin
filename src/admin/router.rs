@@ -32,6 +32,9 @@ use super::{
         stats_by_credential, stats_by_model, stats_overview, stats_timeseries, sync_model_profiles,
         test_credential_response, trace_failure_stats, update_admin_key, update_client_key,
         update_credential, update_group, update_refresh_token, upsert_model_mapping,
+        cleanup_error_snapshots, delete_error_snapshot, download_error_snapshot,
+        error_snapshot_storage, get_error_snapshot, get_error_snapshot_payload,
+        list_error_snapshots, pin_error_snapshot, unpin_error_snapshot,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -221,6 +224,20 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/stats/by-credential", get(stats_by_credential))
         .route("/traces/failure-stats", get(trace_failure_stats))
         .route("/traces", get(list_traces).delete(clear_traces))
+        .route("/error-snapshots", get(list_error_snapshots))
+        .route("/error-snapshots/storage", get(error_snapshot_storage))
+        .route("/error-snapshots/cleanup", post(cleanup_error_snapshots))
+        .route(
+            "/error-snapshots/{id}",
+            get(get_error_snapshot).delete(delete_error_snapshot),
+        )
+        .route(
+            "/error-snapshots/{id}/payload/{seq}",
+            get(get_error_snapshot_payload),
+        )
+        .route("/error-snapshots/{id}/download", get(download_error_snapshot))
+        .route("/error-snapshots/{id}/pin", post(pin_error_snapshot))
+        .route("/error-snapshots/{id}/unpin", post(unpin_error_snapshot))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,
