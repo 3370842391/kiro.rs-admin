@@ -32,6 +32,7 @@
 ```json
 {
   "version": 1,
+  "revision": 1,
   "profiles": {
     "claude-opus-4-8": {
       "contextWindowTokens": {
@@ -71,6 +72,9 @@
 4. 清空某个手填字段等价于删除该 override，下次同步可以重新补值。
 5. 数字字段必须为正整数；日期接受 `YYYY-MM` 或 `YYYY-MM-DD`，落盘前规范化。
 6. 使用临时文件加原子替换落盘；写入失败时运行时资料保持不变。
+7. `revision` 每次成功写入递增，用于预览、应用和并发写入的 CAS 校验。
+
+所有 `PATCH`、`fetch`、`sync`、`apply` 和 `DELETE` 共用一个单写事务锁。事务在锁内读取当前 revision、合并字段、写临时文件、原子替换，只有落盘成功后才交换内存快照。客户端提交的 `baseRevision` 过期时返回 HTTP 409，不允许后写请求覆盖并发完成的手填锁定值。
 
 ## 4. 数据来源与优先级
 
@@ -98,14 +102,16 @@ Kiro 没有返回的知识截止日期、发布日期和最大输出不得猜测
 ### 4.3 字段级优先级
 
 ```text
-已锁定手填值
-  > Kiro 当前健康凭据观测值（仅上下文窗口）
+任何已经持久化的字段值（locked 只控制能否覆盖）
+  > 字段为空时：Kiro 当前健康凭据观测值（仅上下文窗口）
   > models.dev 的 anthropic 条目
   > 项目内置已验证值
   > 空值
 ```
 
-普通同步只填空值，不覆盖任何已有字段。管理员只有进入差异预览并明确勾选字段，才能覆盖未锁定字段；锁定字段必须先解除锁定。
+该优先级用于“持久化字段为空时，从多个候选来源选择填充值”以及生成运行时 resolved 资料。内置值只是运行时兜底，不等价于已经持久化，因此不会阻止普通同步补值。
+
+普通同步只填持久化空值，不覆盖任何已经落盘的字段，即使新来源优先级更高。管理员只有进入差异预览并明确勾选字段，才能覆盖未锁定字段；锁定字段必须先解除锁定。这样“一键同步不改现有资料”和“空字段选择可信度最高的来源”不会冲突。
 
 ## 5. 获取与同步
 
@@ -133,9 +139,36 @@ Kiro 没有返回的知识截止日期、发布日期和最大输出不得猜测
 
 单个凭据失败不回滚其他成功模型；如果所有 Kiro 查询和公网查询都失败，则不写文件并返回失败。
 
+执行边界：
+
+- “健康凭据”复用 TokenManager 当前可调度标准：未禁用、认证可用且不处于不可用冷却状态。
+- Kiro 查询最多 4 个并发，每个凭据超时 15 秒。
+- `models.dev` 超时 10 秒，成功响应在进程内缓存 30 分钟；管理端可显式强制刷新。
+- canonical 匹配只接受规范化后完全相同的模型 ID；`@default`、`-thinking`、`-fast` 等不同条目不会自动并入基础模型。
+- `models.dev` 同一 provider 出现多个完全相同 canonical ID 时视为冲突，不自动选择，返回 warning。
+
 ### 5.3 强制覆盖
 
 强制覆盖不是默认同步的一部分。管理端先展示字段级差异，再由管理员勾选具体字段。后端仍会拒绝覆盖锁定字段，直到管理员显式解除对应字段锁定。
+
+预览返回当前 `revision` 和每个候选字段的确定值、来源、现值与锁状态。应用请求必须把预览值原样带回：
+
+```json
+{
+  "baseRevision": 12,
+  "changes": [
+    {
+      "modelId": "claude-opus-4-8",
+      "field": "contextWindowTokens",
+      "value": 1000000,
+      "source": "kiro:list-available-models",
+      "lock": false
+    }
+  ]
+}
+```
+
+`apply` 不重新猜测来源，也不接受预览中不存在的值。revision 已变化返回 409，锁定字段返回 409；管理员重新预览后才能再次应用。
 
 ## 6. Admin API
 
@@ -148,16 +181,18 @@ DELETE /api/admin/model-profiles/:modelId
 POST   /api/admin/model-profiles/:modelId/fetch
 POST   /api/admin/model-profiles/sync
 POST   /api/admin/model-profiles/preview
+POST   /api/admin/model-profiles/apply
 ```
 
 语义：
 
 - `GET` 返回资料、字段来源、锁定状态和最近同步摘要。
-- `PATCH` 部分更新字段；手填非空值默认锁定。
-- `DELETE` 删除指定模型的手填和同步资料，不影响模型映射。
+- `PATCH` 使用 `baseRevision` 部分更新字段；手填非空值默认锁定。
+- `DELETE` 使用 `baseRevision` 删除指定模型的手填和同步资料，不影响模型映射。
 - `fetch` 获取当前模型并只补空值。
 - `sync` 扫描健康凭据并只补空值。
 - `preview` 计算强制覆盖差异但不落盘。
+- `apply` 使用 `baseRevision` 原子应用预览中明确选择的未锁定字段。
 
 最近同步摘要只保存在当前进程内，重启后为空；能力资料本身按前述文件持久化。
 
@@ -186,6 +221,10 @@ POST   /api/admin/model-profiles/preview
 
 编辑弹窗允许逐字段填写、锁定或清空。公开来源值与手填值并排展示，避免管理员不知道同步为什么跳过某字段。
 
+“清空字段”只删除该字段的持久化 override，随后 UI 可以继续展示 source=`builtin` 的 resolved 兜底。“删除模型资料”删除该模型全部持久化字段，但不创建隐藏 tombstone，也不会删除内置模型；如果需要隐藏模型，应继续使用现有模型映射或未来独立功能。
+
+治理设置增加“启用模型资料认证回复”开关，对应 `config.json` 字段 `modelProfileExactAnswersEnabled`，默认 `true`。关闭后仍可编辑和同步资料，但所有认证探针继续走正常上游。
+
 ## 8. 本地确定性认证回复
 
 新增独立的 `exact_model_profile_answer()`，复用现有本地标准 Anthropic 消息与 SSE 构造器。
@@ -197,17 +236,39 @@ POST   /api/admin/model-profiles/preview
 
 安全门槛：
 
-- 请求只有一个当前用户文本问题；允许无行为约束的普通 system 元数据。
+- `messages.len() == 1`，唯一消息角色为 user，content 只能是一个 text block，UTF-8 字节长度不超过 512。
+- system 必须缺失、为空字符串或只包含空白；不接受任意 system 元数据。
 - 不存在 tools、tool_choice、thinking、图片、PDF、web search 或 output config。
-- 问题必须同时匹配明确主题和严格输出格式，不能只因历史中出现关键词而触发。
+- 只接受下面列出的完整模板族；模板比较忽略大小写和首尾空白，允许 `please`、`reply/respond`、`just/only` 等列出的同义词，但不接受额外任务句。
 - 答案只能来自当前 canonical model 的已配置资料，不能照抄用户给出的候选值。
 - 资料缺失或格式不合法时返回 `None`，继续正常调用上游。
 - 不拦截普通“介绍这个模型”“讨论上下文窗口”等开放式问题。
+
+允许的模板族：
+
+```text
+context_window_en := [please] (what is|tell me) your maximum context window [size] in tokens?
+                     (reply|respond) with (just|only) [a] single integer
+                     [no commas, no units, no explanation] [example integer]
+
+knowledge_cutoff_en := [please] (what is|tell me) your knowledge cutoff [date]?
+                       (reply|respond) with (just|only) the month and year
+                       [no additional explanation] [example month and year]
+
+context_window_zh := 请问你的最大上下文窗口是多少 token？只返回一个不带单位和解释的整数。
+knowledge_cutoff_zh := 你的知识截止日期是什么时候？只返回月份和年份，不要附加解释。
+```
+
+实现使用有边界的解析器组合这些固定子句，不做全文任意关键词搜索。出现第三个任务、身份改写、候选答案要求或模板外指令时必须拒绝本地回答。
+
+可用于本地确定性回答的数据来源仅包括：手填值、Kiro 的上下文观测、`models.dev:anthropic`、项目内明确标记为 verified 的内置值。字段是否锁定只控制同步覆盖，不改变当前值的可信资格。启发式模型族兜底不属于可信资料。
 
 输出格式：
 
 - 上下文窗口：十进制整数，例如 `1000000`。
 - 知识截止日期：英文月份加四位年份，例如 `January 2026`。
+
+保存为 `YYYY-MM-DD` 的截止日期在回答时忽略日，只输出对应月份和年份；非法月份在保存阶段即被拒绝。
 
 流式与非流式都返回完整标准协议事件和正常 usage。该本地回复不修改请求正文，也不向上游发送任何额外身份提示词。
 
@@ -235,7 +296,7 @@ POST   /api/admin/model-profiles/preview
 - Kiro 某凭据失败：记录摘要，继续其他凭据。
 - models.dev 超时或结构变化：保留已有资料，Kiro 同步仍可完成。
 - 多凭据上下文值冲突：不自动覆盖已有值；新模型采用健康观测中的保守最小值，并在 UI 标记冲突。
-- 未知模型：不伪造截止日期；认证探针继续走上游。
+- 未知模型或只有启发式兜底：不伪造截止日期；认证探针继续走上游。
 
 日志只记录模型 ID、来源、字段名和结果，不记录凭据、用户请求正文或公网完整响应。
 
@@ -262,6 +323,7 @@ POST   /api/admin/model-profiles/preview
 ### Admin 与前端测试
 
 - CRUD、获取、同步、预览和锁定冲突返回正确状态码。
+- 并发 PATCH/sync/apply 使用 revision 防止丢失更新，过期 revision 返回 409。
 - React Query 保存或同步后刷新资料表。
 - 来源、锁定和冲突徽章正确显示。
 - 前端构建、类型检查通过。
@@ -277,7 +339,7 @@ POST   /api/admin/model-profiles/preview
 
 先部署到 8991 测试容器，运行本地探针和真实 Claude Code 会话；确认无误后再进入生产。
 
-回退时可以关闭本地模型资料认证回复开关，资料文件仍保留；也可回退该提交，现有 `model_mappings.json`、凭据和 traces 不受影响。
+回退时可以通过 `modelProfileExactAnswersEnabled=false` 关闭本地模型资料认证回复，资料文件仍保留；也可回退该提交，现有 `model_mappings.json`、凭据和 traces 不受影响。
 
 ## 13. 非目标
 
