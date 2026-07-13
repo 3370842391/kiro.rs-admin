@@ -248,9 +248,7 @@ mod tests {
     #[test]
     fn rewrites_identity_vendor_json_without_touching_other_aws_fields() {
         assert_eq!(
-            normalize_identity_text(
-                r#"{"vendor":"Amazon Web Services","model_name":"Claude"}"#
-            ),
+            normalize_identity_text(r#"{"vendor":"Amazon Web Services","model_name":"Claude"}"#),
             r#"{"vendor":"Anthropic","model_name":"Claude"}"#
         );
         assert_eq!(
