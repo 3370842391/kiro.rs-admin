@@ -3526,10 +3526,11 @@ mod tests {
 
     #[test]
     fn tool_json_accumulator_finish_is_atomic_when_any_entry_errors() {
-        // 多残留：即使完整项可打捞，只要任一项出错，本批也不得返回任何工具调用。
+        // 多残留：旧实现会先把空参工具按 {} 打捞，再同时返回半截错误；
+        // 新契约要求只要任一项出错，本批就不得返回任何工具调用。
         let mut acc = ToolJsonAccumulator::new();
         acc.push(
-            &tool_evt("complete1", "EnterPlanMode", "{}", false),
+            &tool_evt("empty1", "EnterPlanMode", "", false),
             &HashMap::new(),
         )
         .unwrap();
@@ -3544,6 +3545,28 @@ mod tests {
             matches!(err, Some(ToolJsonAccumulatorError::IncompleteJson { .. })),
             "半截 JSON 仍应报错"
         );
+    }
+
+    #[test]
+    fn tool_json_accumulator_finish_is_atomic_with_invalid_json() {
+        let mut acc = ToolJsonAccumulator::new();
+        acc.push(
+            &tool_evt("empty1", "EnterPlanMode", "", false),
+            &HashMap::new(),
+        )
+        .unwrap();
+        acc.push(
+            &tool_evt("invalid1", "read_file", r#"{"path":]"#, false),
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        let (completed, err) = acc.finish(&HashMap::new());
+        assert!(completed.is_empty(), "非法 JSON 批次不得部分提交空参工具");
+        assert!(matches!(
+            err,
+            Some(ToolJsonAccumulatorError::InvalidJson { .. })
+        ));
     }
 
     #[test]
