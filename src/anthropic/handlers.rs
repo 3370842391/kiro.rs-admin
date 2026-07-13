@@ -34,6 +34,7 @@ use uuid::Uuid;
 use super::converter::{ConversionError, convert_request_with_mode};
 use super::middleware::{AppState, KeyContext};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
+use super::tool_attempt::ProbationBuffer;
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
     OutputConfig, Thinking,
@@ -2059,10 +2060,79 @@ pub async fn post_messages(
 }
 
 /// 处理流式请求
+struct StreamAttemptSetup {
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    request_body: String,
+    threshold_retry_body: Option<String>,
+    model: String,
+    input_tokens: i32,
+    context_window_size: i32,
+    thinking_enabled: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
+    known_tool_names: std::collections::HashSet<String>,
+    tool_choice_policy: super::converter::ToolChoicePolicy,
+    cache_usage: super::cache_metering::CacheUsage,
+    group: Option<String>,
+    identity_normalization: bool,
+    strict_thinking_validation: bool,
+}
+
+impl StreamAttemptSetup {
+    fn new_context(&self) -> StreamContext {
+        let mut ctx = StreamContext::new_with_constraints(
+            &self.model,
+            self.input_tokens,
+            self.thinking_enabled,
+            self.strict_thinking_validation,
+            self.tool_name_map.clone(),
+            self.known_tool_names.clone(),
+            self.tool_choice_policy.clone(),
+        );
+        ctx.set_context_window_size(self.context_window_size);
+        ctx.cache_usage = self.cache_usage;
+        if self.identity_normalization {
+            ctx.enable_identity_filter();
+        }
+        ctx
+    }
+
+    fn new_buffered_context(&self) -> BufferedStreamContext {
+        let mut ctx = BufferedStreamContext::new_with_constraints(
+            &self.model,
+            self.input_tokens,
+            self.thinking_enabled,
+            self.strict_thinking_validation,
+            self.tool_name_map.clone(),
+            self.known_tool_names.clone(),
+            self.tool_choice_policy.clone(),
+        );
+        ctx.set_context_window_size(self.context_window_size);
+        ctx.set_cache_usage(self.cache_usage);
+        if self.identity_normalization {
+            ctx.enable_identity_filter();
+        }
+        ctx
+    }
+
+    async fn call_retry(
+        &self,
+        tracer: &RequestTracer,
+    ) -> anyhow::Result<crate::kiro::provider::KiroCallResult> {
+        let retry_body = self
+            .threshold_retry_body
+            .as_deref()
+            .unwrap_or(&self.request_body);
+        self.provider
+            .call_api_stream(retry_body, Some(tracer), self.group.as_deref())
+            .await
+    }
+}
+
 async fn handle_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     threshold_retry_body: Option<&str>,
+    model: &str,
     input_tokens: i32,
     context_window_size: i32,
     thinking_enabled: bool,
@@ -2126,39 +2196,26 @@ async fn handle_stream_request(
             return map_provider_error(e);
         }
     };
-    let response = call_result.response;
-    let credential_id = call_result.credential_id;
-
-    // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_constraints(
-        model,
+    let attempt_setup = StreamAttemptSetup {
+        provider: provider.clone(),
+        request_body: request_body.to_owned(),
+        threshold_retry_body: threshold_retry_body.map(str::to_owned),
+        model: model.to_owned(),
         input_tokens,
+        context_window_size,
         thinking_enabled,
-        provider.strict_thinking_validation(),
         tool_name_map,
         known_tool_names,
         tool_choice_policy,
-    );
-    ctx.set_context_window_size(context_window_size);
-    ctx.cache_usage = cache_usage;
-    if provider.identity_normalization() {
-        ctx.enable_identity_filter();
-    }
-
-    // 生成初始事件
-    let initial_events = ctx.generate_initial_events();
+        cache_usage,
+        group,
+        identity_normalization: provider.identity_normalization(),
+        strict_thinking_validation: provider.strict_thinking_validation(),
+    };
 
     // 创建 SSE 流（带 idle watchdog：上游首字节前挂死 / 中途停流超阈值主动收尾）
     let idle_timeout_secs = provider.stream_idle_timeout_secs();
-    let stream = create_sse_stream(
-        response,
-        ctx,
-        initial_events,
-        hook,
-        credential_id,
-        tracer,
-        idle_timeout_secs,
-    );
+    let stream = create_sse_stream(call_result, attempt_setup, hook, tracer, idle_timeout_secs);
 
     // 返回 SSE 响应
     Response::builder()
@@ -2171,19 +2228,10 @@ async fn handle_stream_request(
 }
 
 struct EarlyStreamSetup {
-    model: String,
-    input_tokens: i32,
-    context_window_size: i32,
-    thinking_enabled: bool,
-    tool_name_map: std::collections::HashMap<String, String>,
-    known_tool_names: std::collections::HashSet<String>,
-    tool_choice_policy: super::converter::ToolChoicePolicy,
+    attempt: StreamAttemptSetup,
     hook: UsageRecordHook,
-    cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     idle_timeout_secs: u64,
-    identity_normalization: bool,
-    strict_thinking_validation: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2205,68 +2253,56 @@ fn create_early_sse_stream(
     idle_timeout_secs: u64,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let tracer_for_call = tracer.clone();
-    // 在 provider 被 move 进 call 之前捕获身份归一化开关。
-    let identity_normalization = provider.identity_normalization();
-    let strict_thinking_validation = provider.strict_thinking_validation();
+    let provider_for_call = provider.clone();
+    let request_body_for_call = request_body.clone();
+    let threshold_retry_body_for_call = threshold_retry_body.clone();
+    let group_for_call = group.clone();
     let call = async move {
-        provider
+        provider_for_call
             .call_api_stream_with_content_length_retry(
-                &request_body,
-                threshold_retry_body.as_deref(),
+                &request_body_for_call,
+                threshold_retry_body_for_call.as_deref(),
                 Some(tracer_for_call.as_ref()),
-                group.as_deref(),
+                group_for_call.as_deref(),
             )
             .await
     };
     let mut setup = Some(EarlyStreamSetup {
-        model,
-        input_tokens,
-        context_window_size,
-        thinking_enabled,
-        tool_name_map,
-        known_tool_names,
-        tool_choice_policy,
+        attempt: StreamAttemptSetup {
+            provider: provider.clone(),
+            request_body,
+            threshold_retry_body,
+            model,
+            input_tokens,
+            context_window_size,
+            thinking_enabled,
+            tool_name_map,
+            known_tool_names,
+            tool_choice_policy,
+            cache_usage,
+            group,
+            identity_normalization: provider.identity_normalization(),
+            strict_thinking_validation: provider.strict_thinking_validation(),
+        },
         hook,
-        cache_usage,
         tracer,
         idle_timeout_secs,
-        identity_normalization,
-        strict_thinking_validation,
     });
 
     flatten_pending_call(call, move |result| {
         let setup = setup.take().expect("early stream setup consumed once");
         match result {
-            Ok(call_result) => {
-                let mut ctx = StreamContext::new_with_constraints(
-                    setup.model,
-                    setup.input_tokens,
-                    setup.thinking_enabled,
-                    setup.strict_thinking_validation,
-                    setup.tool_name_map,
-                    setup.known_tool_names,
-                    setup.tool_choice_policy,
-                );
-                ctx.set_context_window_size(setup.context_window_size);
-                ctx.cache_usage = setup.cache_usage;
-                if setup.identity_normalization {
-                    ctx.enable_identity_filter();
-                }
-                let initial_events = ctx.generate_initial_events();
-                Box::pin(create_sse_stream(
-                    call_result.response,
-                    ctx,
-                    initial_events,
-                    setup.hook,
-                    call_result.credential_id,
-                    setup.tracer,
-                    setup.idle_timeout_secs,
-                ))
-            }
+            Ok(call_result) => Box::pin(create_sse_stream(
+                call_result,
+                setup.attempt,
+                setup.hook,
+                setup.tracer,
+                setup.idle_timeout_secs,
+            )),
             Err(err) => {
                 setup
                     .hook
-                    .record(0, setup.input_tokens, 0, 0, 0, 0.0, "error");
+                    .record(0, setup.attempt.input_tokens, 0, 0, 0, 0.0, "error");
                 let upstream_status = setup.tracer.last_http_status();
                 let error_type = last_attempt_outcome(&setup.tracer);
                 let error_text = err.to_string();
@@ -2413,11 +2449,13 @@ fn create_ping_sse() -> Bytes {
 
 fn is_client_visible_content(event: &SseEvent) -> bool {
     if event.event == "content_block_start" {
-        return event
-            .data
-            .pointer("/content_block/type")
-            .and_then(serde_json::Value::as_str)
-            == Some("tool_use");
+        return matches!(
+            event
+                .data
+                .pointer("/content_block/type")
+                .and_then(serde_json::Value::as_str),
+            Some("tool_use" | "redacted_thinking")
+        );
     }
     if event.event != "content_block_delta" {
         return false;
@@ -2454,36 +2492,104 @@ fn mark_first_token_if_visible(tracer: &RequestTracer, events: &[SseEvent]) {
 
 /// 创建 SSE 事件流
 fn create_sse_stream(
-    response: reqwest::Response,
-    ctx: StreamContext,
-    initial_events: Vec<SseEvent>,
+    first_call: crate::kiro::provider::KiroCallResult,
+    setup: StreamAttemptSetup,
     hook: UsageRecordHook,
-    credential_id: u64,
     tracer: std::sync::Arc<RequestTracer>,
     idle_timeout_secs: u64,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    // 先发送初始事件
-    let initial_stream = stream::iter(
-        initial_events
-            .into_iter()
-            .map(|e| Ok(Bytes::from(e.to_sse_string()))),
-    );
+    let (sender, receiver) = tokio::sync::mpsc::channel(16);
+    tokio::spawn(run_realtime_sse_attempts(
+        first_call,
+        setup,
+        hook,
+        tracer,
+        idle_timeout_secs,
+        sender,
+    ));
+    stream::unfold(receiver, |mut receiver| async move {
+        receiver.recv().await.map(|item| (item, receiver))
+    })
+}
 
-    // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
-    let body_stream = response.bytes_stream();
+#[derive(Debug)]
+enum StreamAttemptTermination {
+    Eof,
+    ReadError(String),
+    IdleTimeout,
+}
 
-    // idle watchdog 的初始截止时间：进入流处理即开始计时（覆盖首字节前挂死）。
-    let idle_deadline = TokioInstant::now() + Duration::from_secs(idle_timeout_secs.max(1));
+async fn send_sse_events(
+    sender: &tokio::sync::mpsc::Sender<Result<Bytes, Infallible>>,
+    tracer: &RequestTracer,
+    events: Vec<SseEvent>,
+) -> bool {
+    mark_first_token_if_visible(tracer, &events);
+    for event in events {
+        if sender
+            .send(Ok(Bytes::from(event.to_sse_string())))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+    true
+}
 
-    let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), hook, credential_id, tracer, 0u64, idle_deadline),
-        move |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes, mut idle_deadline)| async move {
-            if finished {
-                return None;
+async fn run_realtime_sse_attempts(
+    first_call: crate::kiro::provider::KiroCallResult,
+    setup: StreamAttemptSetup,
+    hook: UsageRecordHook,
+    tracer: std::sync::Arc<RequestTracer>,
+    idle_timeout_secs: u64,
+    sender: tokio::sync::mpsc::Sender<Result<Bytes, Infallible>>,
+) {
+    let mut first_call = Some(first_call);
+    for attempt_index in 0_u8..=1 {
+        let call_result = if let Some(call_result) = first_call.take() {
+            call_result
+        } else {
+            let retry_result = tokio::select! {
+                biased;
+                _ = sender.closed() => return,
+                result = setup.call_retry(tracer.as_ref()) => result,
+            };
+            match retry_result {
+                Ok(call_result) => call_result,
+                Err(error) => {
+                    hook.record(0, setup.input_tokens, 0, 0, 0, 0.0, "error");
+                    let upstream_status = tracer.last_http_status();
+                    let error_type = last_attempt_outcome(&tracer);
+                    let message = error.to_string();
+                    tracer.finalize(
+                        "error",
+                        error_type,
+                        Some(&message),
+                        None,
+                        TraceUsage::zero(),
+                    );
+                    let _ = sender
+                        .send(Ok(provider_error_sse(error, upstream_status)))
+                        .await;
+                    return;
+                }
             }
+        };
+        let credential_id = call_result.credential_id;
+        let mut body_stream = Box::pin(call_result.response.bytes_stream());
+        let mut ctx = setup.new_context();
+        let mut probation = ProbationBuffer::default();
+        let initial_events = probation.push_all(ctx.generate_initial_events());
+        if !send_sse_events(&sender, tracer.as_ref(), initial_events).await {
+            return;
+        }
+        let mut decoder = EventStreamDecoder::new();
+        let mut ping_interval = interval(Duration::from_secs(PING_INTERVAL_SECS));
+        let mut received_bytes = 0_u64;
+        let mut idle_deadline = TokioInstant::now() + Duration::from_secs(idle_timeout_secs.max(1));
 
-            // idle watchdog：仅在 idle_timeout_secs > 0 时武装。截止时间跨 select 迭代持续，
-            // 每收到一个 chunk 就顺延，故 ping 分支（每 25s 唤醒）不会重置它——只有真实数据才会。
+        let termination = loop {
             let idle_fut = async {
                 if idle_timeout_secs == 0 {
                     std::future::pending::<()>().await;
@@ -2491,137 +2597,107 @@ fn create_sse_stream(
                     tokio::time::sleep_until(idle_deadline).await;
                 }
             };
-
-            // 使用 select! 同时等待数据、ping 定时器与 idle watchdog
             tokio::select! {
-                // 处理数据流
-                chunk_result = body_stream.next() => {
-                    match chunk_result {
-                        Some(Ok(chunk)) => {
-                            tracer.mark_upstream_first_byte();
-                            sent_bytes += chunk.len() as u64;
-                            // 收到真实字节：顺延 idle 截止时间
-                            idle_deadline = TokioInstant::now() + Duration::from_secs(idle_timeout_secs.max(1));
-                            // 解码事件
-                            if let Err(e) = decoder.feed(&chunk) {
-                                tracing::warn!("缓冲区溢出: {}", e);
-                            }
-
-                            let mut events = Vec::new();
-                            for result in decoder.decode_iter() {
-                                match result {
-                                    Ok(frame) => {
-                                        if let Ok(event) = Event::from_frame(frame) {
-                                            let sse_events = ctx.process_kiro_event(&event);
-                                            events.extend(sse_events);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!("解码事件失败: {}", e);
-                                    }
-                                }
-                            }
-                            mark_first_token_if_visible(&tracer, &events);
-
-                            // 转换为 SSE 字节流
-                            let bytes: Vec<Result<Bytes, Infallible>> = events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
-
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, idle_deadline)))
+                biased;
+                _ = sender.closed() => return,
+                chunk_result = body_stream.next() => match chunk_result {
+                    Some(Ok(chunk)) => {
+                        tracer.mark_upstream_first_byte();
+                        received_bytes += chunk.len() as u64;
+                        idle_deadline = TokioInstant::now() + Duration::from_secs(idle_timeout_secs.max(1));
+                        if let Err(error) = decoder.feed(&chunk) {
+                            tracing::warn!(%error, attempt = attempt_index + 1, "流式解码缓冲区溢出");
                         }
-                        Some(Err(e)) => {
-                            tracing::error!("读取响应流失败: {}", e);
-                            // 发送最终事件并结束（记为 error）
-                            let final_events = ctx.generate_final_events();
-                            mark_first_token_if_visible(&tracer, &final_events);
-                            record_stream_usage(&hook, &ctx, credential_id, "error");
-                            // 已开始返回内容后上游断流：标记为 interrupted，带已发送字节数
-                            tracer.finalize(
-                                "interrupted",
-                                Some(outcome::STREAM_INTERRUPTED),
-                                Some(&e.to_string()),
-                                Some(sent_bytes),
-                                stream_trace_usage(&ctx),
-                            );
-                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, idle_deadline)))
-                        }
-                        None => {
-                            // 流结束，发送最终事件（generate_final_events 内部会 finish()
-                            // 累积器，据此判定是否有半截 / 非法工具调用 JSON）。
-                            let final_events = ctx.generate_final_events();
-                            mark_first_token_if_visible(&tracer, &final_events);
-                            if let Some(message) = ctx.terminal_error_message() {
-                                // 工具调用 JSON 半截 / 非法：实时流已回 200，无法改状态码，
-                                // 只能记 error 并让 generate_final_events 补发的 `error` 事件透传给客户端。
-                                record_stream_usage(&hook, &ctx, credential_id, "error");
-                                tracer.finalize(
-                                    "error",
-                                    Some(outcome::BAD_REQUEST),
-                                    Some(&message),
-                                    None,
-                                    stream_trace_usage(&ctx),
-                                );
-                            } else {
-                                record_stream_usage(&hook, &ctx, credential_id, "success");
-                                tracer.finalize(
-                                    "success",
-                                    None,
-                                    None,
-                                    None,
-                                    stream_trace_usage(&ctx),
-                                );
+                        let mut events = Vec::new();
+                        for result in decoder.decode_iter() {
+                            match result {
+                                Ok(frame) => match Event::from_frame(frame) {
+                                    Ok(event) => events.extend(ctx.process_kiro_event(&event)),
+                                    Err(error) => tracing::warn!(%error, attempt = attempt_index + 1, "流式事件解码失败"),
+                                },
+                                Err(error) => tracing::warn!(%error, attempt = attempt_index + 1, "流式 frame 解码失败"),
                             }
-                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, idle_deadline)))
+                        }
+                        let visible = probation.push_all(events);
+                        if !send_sse_events(&sender, tracer.as_ref(), visible).await {
+                            return;
                         }
                     }
-                }
-                // 发送 ping 保活
+                    Some(Err(error)) => {
+                        tracing::error!(%error, attempt = attempt_index + 1, "读取响应流失败");
+                        break StreamAttemptTermination::ReadError(error.to_string());
+                    }
+                    None => break StreamAttemptTermination::Eof,
+                },
                 _ = ping_interval.tick() => {
-                    tracing::trace!("发送 ping 保活事件");
-                    let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, idle_deadline)))
+                    if sender.send(Ok(create_ping_sse())).await.is_err() {
+                        return;
+                    }
                 }
-                // idle watchdog：连续 idle_timeout_secs 秒没有真实字节 → 主动收尾。
-                // 覆盖上游返回 200 后首字节前挂死、以及中途停流两种情况。已回 200 无法
-                // 改状态码，只能发最终事件让客户端拿到一个干净的结束，而非空烧到绝对超时。
                 _ = idle_fut => {
-                    tracing::warn!(
-                        "流式空闲超时（{}s 无字节），主动收尾。已发送 {} 字节",
-                        idle_timeout_secs,
-                        sent_bytes
+                    tracing::warn!(attempt = attempt_index + 1, received_bytes, idle_timeout_secs, "流式空闲超时，主动收尾");
+                    break StreamAttemptTermination::IdleTimeout;
+                }
+            }
+        };
+
+        let final_events = ctx.generate_final_events();
+        let visible = probation.push_all(final_events);
+        let retryable = ctx
+            .terminal_tool_json_error()
+            .is_some_and(|error| probation.prepare_retry(attempt_index, error));
+        if retryable {
+            tracing::warn!(
+                attempt = attempt_index + 1,
+                "实时工具 JSON 首轮 EOF 半截且未提交，丢弃整轮并重试一次"
+            );
+            continue;
+        }
+
+        let mut visible = visible;
+        visible.extend(probation.take_pending());
+        if !send_sse_events(&sender, tracer.as_ref(), visible).await {
+            return;
+        }
+        if let Some(message) = ctx.terminal_error_message() {
+            record_stream_usage(&hook, &ctx, credential_id, "error");
+            tracer.finalize(
+                "error",
+                Some(outcome::BAD_REQUEST),
+                Some(&message),
+                None,
+                stream_trace_usage(&ctx),
+            );
+        } else {
+            match termination {
+                StreamAttemptTermination::Eof => {
+                    record_stream_usage(&hook, &ctx, credential_id, "success");
+                    tracer.finalize("success", None, None, None, stream_trace_usage(&ctx));
+                }
+                StreamAttemptTermination::ReadError(message) => {
+                    record_stream_usage(&hook, &ctx, credential_id, "error");
+                    tracer.finalize(
+                        "interrupted",
+                        Some(outcome::STREAM_INTERRUPTED),
+                        Some(&message),
+                        Some(received_bytes),
+                        stream_trace_usage(&ctx),
                     );
-                    let final_events = ctx.generate_final_events();
-                    mark_first_token_if_visible(&tracer, &final_events);
+                }
+                StreamAttemptTermination::IdleTimeout => {
                     record_stream_usage(&hook, &ctx, credential_id, "error");
                     tracer.finalize(
                         "interrupted",
                         Some(outcome::STREAM_INTERRUPTED),
                         Some(&format!("stream idle timeout after {}s", idle_timeout_secs)),
-                        Some(sent_bytes),
+                        Some(received_bytes),
                         stream_trace_usage(&ctx),
                     );
-                    let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                        .into_iter()
-                        .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                        .collect();
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, idle_deadline)))
                 }
             }
-        },
-    )
-    .flatten();
-
-    initial_stream.chain(processing_stream)
+        }
+        return;
+    }
 }
 
 /// 从 StreamContext 提取最终用量并写入 hook
@@ -2684,7 +2760,6 @@ async fn collect_non_stream_tool_attempt(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     threshold_retry_body: Option<&str>,
-    model: &str,
     input_tokens: i32,
     context_window_size: i32,
     tool_name_map: &std::collections::HashMap<String, String>,
@@ -3725,35 +3800,27 @@ async fn handle_stream_request_buffered(
             return map_provider_error(e);
         }
     };
-    let response = call_result.response;
-    let credential_id = call_result.credential_id;
-
-    // 创建缓冲流处理上下文
-    let mut ctx = BufferedStreamContext::new_with_constraints(
-        model,
-        fallback_input_tokens,
+    let attempt_setup = StreamAttemptSetup {
+        provider: provider.clone(),
+        request_body: request_body.to_owned(),
+        threshold_retry_body: threshold_retry_body.map(str::to_owned),
+        model: model.to_owned(),
+        input_tokens: fallback_input_tokens,
+        context_window_size,
         thinking_enabled,
-        provider.strict_thinking_validation(),
         tool_name_map,
         known_tool_names,
         tool_choice_policy,
-    );
-    ctx.set_context_window_size(context_window_size);
-    ctx.set_cache_usage(cache_usage);
-    if provider.identity_normalization() {
-        ctx.enable_identity_filter();
-    }
+        cache_usage,
+        group,
+        identity_normalization: provider.identity_normalization(),
+        strict_thinking_validation: provider.strict_thinking_validation(),
+    };
 
     // 创建缓冲 SSE 流
     let idle_timeout_secs = provider.stream_idle_timeout_secs();
-    let stream = create_buffered_sse_stream(
-        response,
-        ctx,
-        hook,
-        credential_id,
-        tracer,
-        idle_timeout_secs,
-    );
+    let stream =
+        create_buffered_sse_stream(call_result, attempt_setup, hook, tracer, idle_timeout_secs);
 
     // 返回 SSE 响应
     Response::builder()
@@ -3773,188 +3840,223 @@ async fn handle_stream_request_buffered(
 /// 3. 流结束后，用正确的 input_tokens 更正 message_start 事件
 /// 4. 一次性发送所有事件
 fn create_buffered_sse_stream(
-    response: reqwest::Response,
-    ctx: BufferedStreamContext,
+    first_call: crate::kiro::provider::KiroCallResult,
+    setup: StreamAttemptSetup,
     hook: UsageRecordHook,
-    credential_id: u64,
     tracer: std::sync::Arc<RequestTracer>,
     idle_timeout_secs: u64,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    let body_stream = response.bytes_stream();
+    let (sender, receiver) = tokio::sync::mpsc::channel(16);
+    tokio::spawn(run_buffered_sse_attempts(
+        first_call,
+        setup,
+        hook,
+        tracer,
+        idle_timeout_secs,
+        sender,
+    ));
+    stream::unfold(receiver, |mut receiver| async move {
+        receiver.recv().await.map(|item| (item, receiver))
+    })
+}
 
-    // idle watchdog 的初始截止时间：进入流处理即开始计时（覆盖首字节前挂死）。
-    let idle_deadline = TokioInstant::now() + Duration::from_secs(idle_timeout_secs.max(1));
-
-    stream::unfold(
-        (
-            body_stream,
-            ctx,
-            EventStreamDecoder::new(),
-            false,
-            interval(Duration::from_secs(PING_INTERVAL_SECS)),
-            hook,
-            credential_id,
-            tracer,
-            0u64,
-            idle_deadline,
-        ),
-        move |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes, mut idle_deadline)| async move {
-            if finished {
-                return None;
+async fn run_buffered_sse_attempts(
+    first_call: crate::kiro::provider::KiroCallResult,
+    setup: StreamAttemptSetup,
+    hook: UsageRecordHook,
+    tracer: std::sync::Arc<RequestTracer>,
+    idle_timeout_secs: u64,
+    sender: tokio::sync::mpsc::Sender<Result<Bytes, Infallible>>,
+) {
+    let mut first_call = Some(first_call);
+    for attempt_index in 0_u8..=1 {
+        let call_result = if let Some(call_result) = first_call.take() {
+            call_result
+        } else {
+            let retry_result = tokio::select! {
+                biased;
+                _ = sender.closed() => return,
+                result = setup.call_retry(tracer.as_ref()) => result,
+            };
+            match retry_result {
+                Ok(call_result) => call_result,
+                Err(error) => {
+                    hook.record(0, setup.input_tokens, 0, 0, 0, 0.0, "error");
+                    let upstream_status = tracer.last_http_status();
+                    let error_type = last_attempt_outcome(&tracer);
+                    let message = error.to_string();
+                    tracer.finalize(
+                        "error",
+                        error_type,
+                        Some(&message),
+                        None,
+                        TraceUsage::zero(),
+                    );
+                    let _ = sender
+                        .send(Ok(provider_error_sse(error, upstream_status)))
+                        .await;
+                    return;
+                }
             }
+        };
+        let credential_id = call_result.credential_id;
+        let mut body_stream = Box::pin(call_result.response.bytes_stream());
+        let mut ctx = setup.new_buffered_context();
+        let mut decoder = EventStreamDecoder::new();
+        let mut ping_interval = interval(Duration::from_secs(PING_INTERVAL_SECS));
+        let mut received_bytes = 0_u64;
+        let mut idle_deadline = TokioInstant::now() + Duration::from_secs(idle_timeout_secs.max(1));
 
-            loop {
-                // idle watchdog：仅在 idle_timeout_secs > 0 时武装；每收到真实字节顺延，
-                // ping 分支（每 25s）不会重置它。idle_fut 在循环内每轮重建，捕获 idle_deadline
-                // 的**拷贝**（TokioInstant 是 Copy），故 chunk 分支重新赋值 idle_deadline 不与之冲突。
-                let deadline = idle_deadline;
-                let idle_fut = async move {
-                    if idle_timeout_secs == 0 {
-                        std::future::pending::<()>().await;
-                    } else {
-                        tokio::time::sleep_until(deadline).await;
+        let termination = loop {
+            let deadline = idle_deadline;
+            let idle_fut = async move {
+                if idle_timeout_secs == 0 {
+                    std::future::pending::<()>().await;
+                } else {
+                    tokio::time::sleep_until(deadline).await;
+                }
+            };
+            tokio::select! {
+                biased;
+                _ = sender.closed() => return,
+                _ = ping_interval.tick() => {
+                    if sender.send(Ok(create_ping_sse())).await.is_err() {
+                        return;
                     }
-                };
-
-                tokio::select! {
-                    // 使用 biased 模式，优先检查 ping 定时器
-                    // 避免在上游 chunk 密集时 ping 被"饿死"
-                    biased;
-
-                    // 优先检查 ping 保活（等待期间唯一发送的数据）
-                    _ = ping_interval.tick() => {
-                        tracing::trace!("发送 ping 保活事件（缓冲模式）");
-                        let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, idle_deadline)));
-                    }
-
-                    // idle watchdog：连续 idle_timeout_secs 秒无真实字节 → 主动收尾。
-                    // 缓冲模式尚未向客户端发过任何内容事件，收尾即把已缓冲事件一次性吐出。
-                    _ = idle_fut => {
-                        tracing::warn!(
-                            "缓冲流空闲超时（{}s 无字节），主动收尾。已接收 {} 字节",
-                            idle_timeout_secs,
-                            sent_bytes
-                        );
-                        let all_events = ctx.finish_and_get_all_events();
-                        mark_first_token_if_visible(&tracer, &all_events);
-                        let (i, o, cc, cr, credits) = ctx.final_usage();
-                        hook.record(credential_id, i, o, cc, cr, credits, "error");
-                        tracer.finalize(
-                            "interrupted",
-                            Some(outcome::STREAM_INTERRUPTED),
-                            Some(&format!("stream idle timeout after {}s", idle_timeout_secs)),
-                            Some(sent_bytes),
-                            TraceUsage {
-                                input_tokens: i.max(0) as u64,
-                                output_tokens: o.max(0) as u64,
-                                cache_creation_tokens: cc.max(0) as u64,
-                                cache_read_tokens: cr.max(0) as u64,
-                                credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
-                            },
-                        );
-                        let bytes: Vec<Result<Bytes, Infallible>> = all_events
-                            .into_iter()
-                            .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                            .collect();
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, idle_deadline)));
-                    }
-
-                    // 然后处理数据流
-                    chunk_result = body_stream.next() => {
-                        match chunk_result {
-                            Some(Ok(chunk)) => {
-                                tracer.mark_upstream_first_byte();
-                                sent_bytes += chunk.len() as u64;
-                                // 收到真实字节：顺延 idle 截止时间
-                                idle_deadline = TokioInstant::now() + Duration::from_secs(idle_timeout_secs.max(1));
-                                // 解码事件
-                                if let Err(e) = decoder.feed(&chunk) {
-                                    tracing::warn!("缓冲区溢出: {}", e);
-                                }
-
-                                for result in decoder.decode_iter() {
-                                    match result {
-                                        Ok(frame) => {
-                                            if let Ok(event) = Event::from_frame(frame) {
-                                                // 缓冲事件（复用 StreamContext 的处理逻辑）
-                                                ctx.process_and_buffer(&event);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!("解码事件失败: {}", e);
-                                        }
-                                    }
-                                }
-                                // 继续读取下一个 chunk，不发送任何数据
-                            }
-                            Some(Err(e)) => {
-                                tracing::error!("读取响应流失败: {}", e);
-                                // 发生错误，完成处理并返回所有事件
-                                let all_events = ctx.finish_and_get_all_events();
-                                mark_first_token_if_visible(&tracer, &all_events);
-                                let (i, o, cc, cr, credits) = ctx.final_usage();
-                                hook.record(credential_id, i, o, cc, cr, credits, "error");
-                                // 缓冲模式 chunk 读取失败：上游中途断流
-                                tracer.finalize(
-                                    "interrupted",
-                                    Some(outcome::STREAM_INTERRUPTED),
-                                    Some(&e.to_string()),
-                                    Some(sent_bytes),
-                                    TraceUsage {
-                                        input_tokens: i.max(0) as u64,
-                                        output_tokens: o.max(0) as u64,
-                                        cache_creation_tokens: cc.max(0) as u64,
-                                        cache_read_tokens: cr.max(0) as u64,
-                                        credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
-                                    },
-                                );
-                                let bytes: Vec<Result<Bytes, Infallible>> = all_events
-                                    .into_iter()
-                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                    .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, idle_deadline)));
-                            }
-                            None => {
-                                // 流结束，完成处理并返回所有事件（已更正 input_tokens）。
-                                // finish_and_get_all_events 内部会 finish() 累积器；若有半截 /
-                                // 非法工具调用 JSON，error 事件已随缓冲发出，这里据此记 error。
-                                let all_events = ctx.finish_and_get_all_events();
-                                mark_first_token_if_visible(&tracer, &all_events);
-                                let (i, o, cc, cr, credits) = ctx.final_usage();
-                                let trace_usage = TraceUsage {
-                                    input_tokens: i.max(0) as u64,
-                                    output_tokens: o.max(0) as u64,
-                                    cache_creation_tokens: cc.max(0) as u64,
-                                    cache_read_tokens: cr.max(0) as u64,
-                                    credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
-                                };
-                                if let Some(message) = ctx.terminal_error_message() {
-                                    hook.record(credential_id, i, o, cc, cr, credits, "error");
-                                    tracer.finalize(
-                                        "error",
-                                        Some(outcome::BAD_REQUEST),
-                                        Some(&message),
-                                        None,
-                                        trace_usage,
-                                    );
-                                } else {
-                                    hook.record(credential_id, i, o, cc, cr, credits, "success");
-                                    tracer.finalize("success", None, None, None, trace_usage);
-                                }
-                                let bytes: Vec<Result<Bytes, Infallible>> = all_events
-                                    .into_iter()
-                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                    .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, idle_deadline)));
+                }
+                _ = idle_fut => {
+                    tracing::warn!(attempt = attempt_index + 1, received_bytes, idle_timeout_secs, "缓冲流空闲超时，主动收尾");
+                    break StreamAttemptTermination::IdleTimeout;
+                }
+                chunk_result = body_stream.next() => match chunk_result {
+                    Some(Ok(chunk)) => {
+                        tracer.mark_upstream_first_byte();
+                        received_bytes += chunk.len() as u64;
+                        idle_deadline = TokioInstant::now() + Duration::from_secs(idle_timeout_secs.max(1));
+                        if let Err(error) = decoder.feed(&chunk) {
+                            tracing::warn!(%error, attempt = attempt_index + 1, "缓冲流解码缓冲区溢出");
+                        }
+                        for result in decoder.decode_iter() {
+                            match result {
+                                Ok(frame) => match Event::from_frame(frame) {
+                                    Ok(event) => ctx.process_and_buffer(&event),
+                                    Err(error) => tracing::warn!(%error, attempt = attempt_index + 1, "缓冲流事件解码失败"),
+                                },
+                                Err(error) => tracing::warn!(%error, attempt = attempt_index + 1, "缓冲流 frame 解码失败"),
                             }
                         }
                     }
+                    Some(Err(error)) => {
+                        tracing::error!(%error, attempt = attempt_index + 1, "读取缓冲响应流失败");
+                        break StreamAttemptTermination::ReadError(error.to_string());
+                    }
+                    None => break StreamAttemptTermination::Eof,
                 }
             }
-        },
-    )
-    .flatten()
+        };
+
+        let all_events = ctx.finish_and_get_all_events();
+        let mut probation = ProbationBuffer::default();
+        let visible = probation.push_all(all_events);
+        let retryable = ctx
+            .terminal_tool_json_error()
+            .is_some_and(|error| probation.prepare_retry(attempt_index, error));
+        if retryable {
+            tracing::warn!(
+                attempt = attempt_index + 1,
+                "CC 缓冲工具 JSON 首轮 EOF 半截且未提交，丢弃整轮并重试一次"
+            );
+            continue;
+        }
+
+        let mut visible = visible;
+        visible.extend(probation.take_pending());
+        if !send_sse_events(&sender, tracer.as_ref(), visible).await {
+            return;
+        }
+        let (input, output, cache_creation, cache_read, credits) = ctx.final_usage();
+        let trace_usage = TraceUsage {
+            input_tokens: input.max(0) as u64,
+            output_tokens: output.max(0) as u64,
+            cache_creation_tokens: cache_creation.max(0) as u64,
+            cache_read_tokens: cache_read.max(0) as u64,
+            credits: if credits.is_finite() && credits > 0.0 {
+                credits
+            } else {
+                0.0
+            },
+        };
+        if let Some(message) = ctx.terminal_error_message() {
+            hook.record(
+                credential_id,
+                input,
+                output,
+                cache_creation,
+                cache_read,
+                credits,
+                "error",
+            );
+            tracer.finalize(
+                "error",
+                Some(outcome::BAD_REQUEST),
+                Some(&message),
+                None,
+                trace_usage,
+            );
+        } else {
+            match termination {
+                StreamAttemptTermination::Eof => {
+                    hook.record(
+                        credential_id,
+                        input,
+                        output,
+                        cache_creation,
+                        cache_read,
+                        credits,
+                        "success",
+                    );
+                    tracer.finalize("success", None, None, None, trace_usage);
+                }
+                StreamAttemptTermination::ReadError(message) => {
+                    hook.record(
+                        credential_id,
+                        input,
+                        output,
+                        cache_creation,
+                        cache_read,
+                        credits,
+                        "error",
+                    );
+                    tracer.finalize(
+                        "interrupted",
+                        Some(outcome::STREAM_INTERRUPTED),
+                        Some(&message),
+                        Some(received_bytes),
+                        trace_usage,
+                    );
+                }
+                StreamAttemptTermination::IdleTimeout => {
+                    hook.record(
+                        credential_id,
+                        input,
+                        output,
+                        cache_creation,
+                        cache_read,
+                        credits,
+                        "error",
+                    );
+                    tracer.finalize(
+                        "interrupted",
+                        Some(outcome::STREAM_INTERRUPTED),
+                        Some(&format!("stream idle timeout after {}s", idle_timeout_secs)),
+                        Some(received_bytes),
+                        trace_usage,
+                    );
+                }
+            }
+        }
+        return;
+    }
 }
 
 #[cfg(test)]
@@ -4686,7 +4788,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn early_error_stream_sends_comment_then_error_without_message_start() {
+    async fn early_stream_error_sends_comment_then_error_without_message_start() {
         let stream = early_error_test_stream(anyhow::anyhow!("connection reset"), Some(502));
         futures::pin_mut!(stream);
         let first = stream.next().await.unwrap().unwrap();
@@ -4698,7 +4800,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flatten_pending_call_preserves_success_stream_order() {
+    async fn early_stream_preserves_pending_call_success_order() {
         let inner: BoxByteStream = Box::pin(stream::iter(vec![
             Ok(Bytes::from_static(b"event: message_start\ndata: {}\n\n")),
             Ok(Bytes::from_static(
@@ -4738,6 +4840,10 @@ mod tests {
         assert!(is_client_visible_content(&SseEvent::new(
             "content_block_start",
             json!({"content_block":{"type":"tool_use","name":"Bash"}}),
+        )));
+        assert!(is_client_visible_content(&SseEvent::new(
+            "content_block_start",
+            json!({"content_block":{"type":"redacted_thinking","data":"ciphertext"}}),
         )));
     }
 

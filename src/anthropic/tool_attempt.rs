@@ -1,5 +1,141 @@
-use super::stream::{ToolJsonAccumulatorError, ToolJsonAccumulatorError::IncompleteJson};
+use super::stream::{SseEvent, ToolJsonAccumulatorError, ToolJsonAccumulatorError::IncompleteJson};
+use std::collections::HashMap;
 use std::future::Future;
+
+/// 实时 SSE 的试运行缓冲。
+///
+/// `message_start` 和空 content delta 会暂存在内存中；首个非空文本、thinking、
+/// redacted thinking 或完整工具块出现时，缓冲与该事件一起原子提交。提交之后任何失败
+/// 都不允许透明重试，防止重复文本或重复工具执行。
+#[derive(Debug, Default)]
+pub(crate) struct ProbationBuffer {
+    pending: Vec<SseEvent>,
+    committed: bool,
+    tool_forwarded: bool,
+    pending_tools: HashMap<i64, bool>,
+}
+
+impl ProbationBuffer {
+    pub(crate) fn push(&mut self, event: SseEvent) -> Vec<SseEvent> {
+        if self.committed {
+            return vec![event];
+        }
+
+        let complete_tool = self.observe_tool_event(&event);
+        let semantic_output = complete_tool || event_has_semantic_output(&event);
+        self.tool_forwarded |= complete_tool;
+        self.pending.push(event);
+
+        if semantic_output {
+            self.committed = true;
+            return std::mem::take(&mut self.pending);
+        }
+        Vec::new()
+    }
+
+    pub(crate) fn push_all(&mut self, events: Vec<SseEvent>) -> Vec<SseEvent> {
+        let mut output = Vec::new();
+        for event in events {
+            output.extend(self.push(event));
+        }
+        output
+    }
+
+    #[cfg(test)]
+    pub(crate) fn committed(&self) -> bool {
+        self.committed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tool_forwarded(&self) -> bool {
+        self.tool_forwarded
+    }
+
+    pub(crate) fn take_pending(&mut self) -> Vec<SseEvent> {
+        std::mem::take(&mut self.pending)
+    }
+
+    fn observe_tool_event(&mut self, event: &SseEvent) -> bool {
+        let Some(index) = event.data.get("index").and_then(serde_json::Value::as_i64) else {
+            return false;
+        };
+        if event.event == "content_block_start"
+            && event
+                .data
+                .pointer("/content_block/type")
+                .and_then(serde_json::Value::as_str)
+                == Some("tool_use")
+        {
+            self.pending_tools.insert(index, false);
+            return false;
+        }
+        if event.event == "content_block_delta"
+            && event
+                .data
+                .pointer("/delta/type")
+                .and_then(serde_json::Value::as_str)
+                == Some("input_json_delta")
+        {
+            if let Some(has_json) = self.pending_tools.get_mut(&index) {
+                *has_json = true;
+            }
+            return false;
+        }
+        if event.event == "content_block_stop" {
+            return self.pending_tools.remove(&index).unwrap_or(false);
+        }
+        false
+    }
+
+    /// 若失败仍处于首轮未提交窗口，丢弃该轮缓冲并允许重试一次。
+    pub(crate) fn prepare_retry(
+        &mut self,
+        attempt_index: u8,
+        error: &ToolJsonAccumulatorError,
+    ) -> bool {
+        if attempt_index != 0 || self.committed || self.tool_forwarded {
+            return false;
+        }
+        let retryable = matches!(error, ToolJsonAccumulatorError::IncompleteJson { .. });
+        if retryable {
+            self.pending.clear();
+        }
+        retryable
+    }
+}
+
+fn event_has_semantic_output(event: &SseEvent) -> bool {
+    if event.event == "content_block_start" {
+        return event
+            .data
+            .pointer("/content_block/type")
+            .and_then(serde_json::Value::as_str)
+            == Some("redacted_thinking");
+    }
+    if event.event != "content_block_delta" {
+        return false;
+    }
+    match event
+        .data
+        .pointer("/delta/type")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("text_delta") => event
+            .data
+            .pointer("/delta/text")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| !text.is_empty()),
+        Some("thinking_delta") => event
+            .data
+            .pointer("/delta/thinking")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|thinking| !thinking.is_empty()),
+        // 工具参数 delta 只有在同一 tool_use 块 stop 后才算完整；单个 partial_json
+        // 绝不能开启提交窗口，否则 EOF 半截会被误认为已向客户端提交。
+        Some("input_json_delta") => false,
+        _ => false,
+    }
+}
 
 /// 单次上游工具生成 attempt 的提交状态。
 ///
@@ -47,7 +183,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::anthropic::stream::ToolJsonAccumulatorError;
+    use crate::anthropic::stream::{SseEvent, ToolJsonAccumulatorError};
+    use crate::kiro::model::events::{AssistantResponseEvent, Event, ToolUseEvent};
+    use serde_json::json;
     use std::collections::VecDeque;
 
     fn incomplete() -> ToolJsonAccumulatorError {
@@ -160,5 +298,359 @@ mod tests {
 
         assert_eq!(calls.get(), 1);
         assert_eq!(attempt_count, 1);
+    }
+
+    fn message_start() -> SseEvent {
+        SseEvent::new("message_start", json!({"type": "message_start"}))
+    }
+
+    fn text_delta(text: &str) -> SseEvent {
+        SseEvent::new(
+            "content_block_delta",
+            json!({"delta": {"type": "text_delta", "text": text}}),
+        )
+    }
+
+    fn tool_start(id: &str) -> SseEvent {
+        SseEvent::new(
+            "content_block_start",
+            json!({
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": id,
+                    "name": "fs_write",
+                    "input": {}
+                }
+            }),
+        )
+    }
+
+    fn tool_delta(index: i32, json: &str) -> SseEvent {
+        SseEvent::new(
+            "content_block_delta",
+            json!({
+                "index": index,
+                "delta": {"type": "input_json_delta", "partial_json": json}
+            }),
+        )
+    }
+
+    fn block_stop(index: i32) -> SseEvent {
+        SseEvent::new(
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": index}),
+        )
+    }
+
+    fn error_event() -> SseEvent {
+        SseEvent::new(
+            "error",
+            json!({
+                "type": "error",
+                "error": {"type": "upstream_tool_json_error", "message": "incomplete"}
+            }),
+        )
+    }
+
+    fn kiro_tool(id: &str, input: &str, stop: bool) -> Event {
+        Event::ToolUse(ToolUseEvent {
+            name: "custom_tool".to_string(),
+            tool_use_id: id.to_string(),
+            input: input.to_string(),
+            stop,
+        })
+    }
+
+    fn stream_context() -> crate::anthropic::stream::StreamContext {
+        crate::anthropic::stream::StreamContext::new_with_thinking(
+            "claude-test",
+            10,
+            false,
+            std::collections::HashMap::new(),
+            std::collections::HashSet::new(),
+        )
+    }
+
+    #[test]
+    fn realtime_probation_discards_first_incomplete_attempt_before_commit() {
+        let mut buffer = ProbationBuffer::default();
+        assert!(buffer.push(message_start()).is_empty());
+
+        assert!(buffer.prepare_retry(0, &incomplete()));
+        assert!(buffer.take_pending().is_empty());
+        assert!(!buffer.committed());
+    }
+
+    #[test]
+    fn realtime_probation_commits_after_first_text_and_never_retries() {
+        let mut buffer = ProbationBuffer::default();
+        assert!(buffer.push(message_start()).is_empty());
+
+        let committed = buffer.push(text_delta("hello"));
+        assert_eq!(committed.len(), 2);
+        assert_eq!(committed[0].event, "message_start");
+        assert_eq!(committed[1].data["delta"]["text"], "hello");
+        assert!(buffer.committed());
+        assert!(!buffer.prepare_retry(0, &incomplete()));
+    }
+
+    #[test]
+    fn realtime_probation_commits_complete_tool_and_never_retries() {
+        let mut buffer = ProbationBuffer::default();
+        assert!(buffer.push(message_start()).is_empty());
+
+        assert!(buffer.push(tool_start("tool_1")).is_empty());
+        assert!(
+            buffer
+                .push(tool_delta(0, r#"{"path":"/tmp/a"}"#))
+                .is_empty()
+        );
+        let committed = buffer.push(block_stop(0));
+        assert_eq!(committed.len(), 4);
+        assert!(buffer.tool_forwarded());
+        assert!(!buffer.prepare_retry(0, &incomplete()));
+    }
+
+    #[test]
+    fn realtime_probation_does_not_commit_partial_delta_or_retry_invalid_json() {
+        let mut partial = ProbationBuffer::default();
+        assert!(partial.push(message_start()).is_empty());
+        assert!(partial.push(tool_delta(0, r#"{"path":"/tmp"#)).is_empty());
+        assert!(!partial.committed(), "partial_json 本身不得算语义提交");
+        let invalid = ToolJsonAccumulatorError::InvalidJson {
+            tool_use_id: "tool_1".to_string(),
+            name: "fs_write".to_string(),
+            message: "expected value".to_string(),
+        };
+        let mut invalid_attempt = ProbationBuffer::default();
+        assert!(invalid_attempt.push(message_start()).is_empty());
+        assert!(!invalid_attempt.prepare_retry(0, &invalid));
+    }
+
+    #[test]
+    fn realtime_empty_deltas_are_not_semantic_but_redacted_thinking_is() {
+        let mut buffer = ProbationBuffer::default();
+        assert!(buffer.push(message_start()).is_empty());
+        assert!(buffer.push(text_delta("")).is_empty());
+        assert!(
+            buffer
+                .push(SseEvent::new(
+                    "content_block_delta",
+                    json!({"delta": {"type": "thinking_delta", "thinking": ""}}),
+                ))
+                .is_empty()
+        );
+        assert!(!buffer.committed());
+
+        let visible = buffer.push(SseEvent::new(
+            "content_block_start",
+            json!({
+                "index": 0,
+                "content_block": {"type": "redacted_thinking", "data": "ciphertext"}
+            }),
+        ));
+        assert_eq!(visible.len(), 4);
+        assert!(buffer.committed());
+    }
+
+    #[test]
+    fn realtime_second_incomplete_flushes_standard_error_without_success_terminal() {
+        let mut second = ProbationBuffer::default();
+        assert!(second.push(message_start()).is_empty());
+        assert!(second.push(error_event()).is_empty());
+        assert!(!second.prepare_retry(1, &incomplete()));
+
+        let visible = second.take_pending();
+        assert_eq!(
+            visible
+                .iter()
+                .filter(|event| event.event == "message_start")
+                .count(),
+            1
+        );
+        assert!(visible.iter().any(|event| event.event == "error"));
+        assert!(!visible.iter().any(|event| event.event == "message_delta"));
+        assert!(!visible.iter().any(|event| event.event == "message_stop"));
+    }
+
+    #[test]
+    fn buffered_retry_discards_first_attempt_and_exposes_only_second_result() {
+        let mut first = ProbationBuffer::default();
+        assert!(first.push(message_start()).is_empty());
+        assert!(first.push(error_event()).is_empty());
+        assert!(first.prepare_retry(0, &incomplete()));
+
+        let mut second = ProbationBuffer::default();
+        assert!(second.push(message_start()).is_empty());
+        let visible = second.push(text_delta("recovered"));
+        assert_eq!(
+            visible
+                .iter()
+                .filter(|event| event.event == "message_start")
+                .count(),
+            1
+        );
+        assert_eq!(visible.last().unwrap().data["delta"]["text"], "recovered");
+    }
+
+    #[test]
+    fn early_stream_comments_do_not_commit_probation() {
+        let mut buffer = ProbationBuffer::default();
+        assert!(buffer.push(message_start()).is_empty());
+        assert!(!buffer.committed(), "握手 comment/ping 不进入语义事件缓冲");
+        assert!(buffer.prepare_retry(0, &incomplete()));
+    }
+
+    #[test]
+    fn realtime_converter_first_incomplete_second_complete_exposes_one_message_start() {
+        let mut first_ctx = stream_context();
+        let mut first = ProbationBuffer::default();
+        assert!(
+            first
+                .push_all(first_ctx.generate_initial_events())
+                .is_empty()
+        );
+        assert!(
+            first
+                .push_all(first_ctx.process_kiro_event(&kiro_tool(
+                    "tool_1",
+                    r#"{"path":"/tmp"#,
+                    false,
+                )))
+                .is_empty()
+        );
+        assert!(first.push_all(first_ctx.generate_final_events()).is_empty());
+        let first_error = first_ctx.terminal_tool_json_error().unwrap();
+        assert!(first.prepare_retry(0, first_error));
+
+        let mut second_ctx = stream_context();
+        let mut second = ProbationBuffer::default();
+        let mut visible = second.push_all(second_ctx.generate_initial_events());
+        visible.extend(second.push_all(second_ctx.process_kiro_event(&kiro_tool(
+            "tool_2",
+            r#"{"path":"/tmp/a"}"#,
+            true,
+        ))));
+        visible.extend(second.push_all(second_ctx.generate_final_events()));
+        visible.extend(second.take_pending());
+
+        assert!(second_ctx.terminal_tool_json_error().is_none());
+        assert_eq!(
+            visible
+                .iter()
+                .filter(|event| event.event == "message_start")
+                .count(),
+            1
+        );
+        assert!(visible.iter().any(|event| {
+            event.event == "content_block_start"
+                && event.data["content_block"]["type"] == "tool_use"
+        }));
+        assert!(visible.iter().any(|event| event.event == "message_stop"));
+    }
+
+    #[test]
+    fn realtime_converter_text_before_incomplete_never_retries() {
+        let mut ctx = stream_context();
+        let mut probation = ProbationBuffer::default();
+        assert!(probation.push_all(ctx.generate_initial_events()).is_empty());
+        let mut response = AssistantResponseEvent::default();
+        response.content = "already visible".to_string();
+        assert!(
+            !probation
+                .push_all(ctx.process_kiro_event(&Event::AssistantResponse(response)))
+                .is_empty()
+        );
+        assert!(
+            probation
+                .push_all(ctx.process_kiro_event(&kiro_tool("tool_1", r#"{"path":"/tmp"#, false,)))
+                .is_empty()
+        );
+        let _ = probation.push_all(ctx.generate_final_events());
+        assert!(!probation.prepare_retry(0, ctx.terminal_tool_json_error().unwrap()));
+    }
+
+    #[test]
+    fn realtime_converter_complete_tool_before_second_incomplete_never_retries() {
+        let mut ctx = stream_context();
+        let mut probation = ProbationBuffer::default();
+        assert!(probation.push_all(ctx.generate_initial_events()).is_empty());
+        assert!(
+            !probation
+                .push_all(ctx.process_kiro_event(&kiro_tool(
+                    "tool_1",
+                    r#"{"path":"/tmp/a"}"#,
+                    true,
+                )))
+                .is_empty()
+        );
+        assert!(
+            probation
+                .push_all(ctx.process_kiro_event(&kiro_tool("tool_2", r#"{"path":"/tmp"#, false,)))
+                .is_empty()
+        );
+        let _ = probation.push_all(ctx.generate_final_events());
+        assert!(!probation.prepare_retry(0, ctx.terminal_tool_json_error().unwrap()));
+    }
+
+    #[test]
+    fn realtime_converter_second_incomplete_emits_error_without_success_terminal() {
+        let mut ctx = stream_context();
+        let mut probation = ProbationBuffer::default();
+        assert!(probation.push_all(ctx.generate_initial_events()).is_empty());
+        assert!(
+            probation
+                .push_all(ctx.process_kiro_event(&kiro_tool("tool_2", r#"{"path":"/tmp"#, false,)))
+                .is_empty()
+        );
+        assert!(probation.push_all(ctx.generate_final_events()).is_empty());
+        assert!(!probation.prepare_retry(1, ctx.terminal_tool_json_error().unwrap()));
+        let visible = probation.take_pending();
+
+        assert_eq!(
+            visible
+                .iter()
+                .filter(|event| event.event == "message_start")
+                .count(),
+            1
+        );
+        assert!(visible.iter().any(|event| event.event == "error"));
+        assert!(!visible.iter().any(|event| event.event == "message_delta"));
+        assert!(!visible.iter().any(|event| event.event == "message_stop"));
+    }
+
+    #[test]
+    fn buffered_context_first_incomplete_second_complete_uses_same_retry_gate() {
+        let new_context = || {
+            crate::anthropic::stream::BufferedStreamContext::new(
+                "claude-test",
+                10,
+                false,
+                std::collections::HashMap::new(),
+                std::collections::HashSet::new(),
+            )
+        };
+        let mut first_ctx = new_context();
+        first_ctx.process_and_buffer(&kiro_tool("tool_1", r#"{"path":"/tmp"#, false));
+        let first_events = first_ctx.finish_and_get_all_events();
+        let mut first = ProbationBuffer::default();
+        assert!(first.push_all(first_events).is_empty());
+        assert!(first.prepare_retry(0, first_ctx.terminal_tool_json_error().unwrap()));
+
+        let mut second_ctx = new_context();
+        second_ctx.process_and_buffer(&kiro_tool("tool_2", r#"{"path":"/tmp/a"}"#, true));
+        let second_events = second_ctx.finish_and_get_all_events();
+        let mut second = ProbationBuffer::default();
+        let mut visible = second.push_all(second_events);
+        visible.extend(second.take_pending());
+        assert!(second_ctx.terminal_tool_json_error().is_none());
+        assert_eq!(
+            visible
+                .iter()
+                .filter(|event| event.event == "message_start")
+                .count(),
+            1
+        );
     }
 }

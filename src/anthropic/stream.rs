@@ -1555,6 +1555,11 @@ impl StreamContext {
             .or_else(|| self.tool_json_error.as_ref().map(|err| err.message()))
     }
 
+    /// 返回工具 JSON 的 typed 终态，供 handler 精确区分可重试的 EOF 半截与其他错误。
+    pub fn terminal_tool_json_error(&self) -> Option<&ToolJsonAccumulatorError> {
+        self.tool_json_error.as_ref()
+    }
+
     /// 创建 StreamContext
     #[cfg(test)]
     pub fn new_with_thinking(
@@ -3036,6 +3041,11 @@ impl BufferedStreamContext {
     pub fn terminal_error_message(&self) -> Option<String> {
         self.inner.terminal_error_message()
     }
+
+    /// 返回内部工具 JSON 的 typed 终态，供缓冲 handler 使用同一重试门。
+    pub fn terminal_tool_json_error(&self) -> Option<&ToolJsonAccumulatorError> {
+        self.inner.terminal_tool_json_error()
+    }
 }
 
 /// 简单的 token 估算（中英文字符混合）
@@ -3389,6 +3399,10 @@ mod tests {
             event.event == "content_block_start"
                 && event.data["content_block"]["type"] == "tool_use"
         }));
+        assert!(matches!(
+            ctx.terminal_tool_json_error(),
+            Some(ToolJsonAccumulatorError::IncompleteJson { .. })
+        ));
     }
 
     // ---- ToolJsonAccumulator: 流式半截 / 非法工具调用 JSON ----
