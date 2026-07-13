@@ -1421,6 +1421,8 @@ pub struct StreamContext {
     pub state_manager: SseStateManager,
     /// 请求的模型名称
     pub model: String,
+    /// 本请求开始时解析出的不可变上下文窗口快照。
+    context_window_size: i32,
     /// 消息 ID
     pub message_id: String,
     /// 客户端可见输入与 Kiro 整体上下文占用的双轨计量。
@@ -1541,6 +1543,10 @@ impl StreamContext {
         self.input_usage.upstream_context_tokens()
     }
 
+    pub fn set_context_window_size(&mut self, value: i32) {
+        self.context_window_size = value.max(1);
+    }
+
     /// 工具调用 JSON 错误信息（非法 / 半截）。上层据此把本次请求记为 error、
     /// 或在非流式路径返回 502。无错误时返回 `None`。
     pub fn terminal_error_message(&self) -> Option<String> {
@@ -1580,9 +1586,12 @@ impl StreamContext {
         known_tool_names: std::collections::HashSet<String>,
         tool_choice_policy: super::converter::ToolChoicePolicy,
     ) -> Self {
+        let model = model.into();
+        let context_window_size = get_context_window_size(&model).max(1);
         Self {
             state_manager: SseStateManager::new(),
-            model: model.into(),
+            model,
+            context_window_size,
             message_id: format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
             input_usage: super::usage::InputTokenUsage::new(input_tokens),
             output_tokens: 0,
@@ -1691,9 +1700,9 @@ impl StreamContext {
             Event::ReasoningContent(reasoning) => self.process_reasoning_content(reasoning),
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
-                let window_size = get_context_window_size(&self.model);
-                let actual_input_tokens =
-                    (context_usage.context_usage_percentage * (window_size as f64) / 100.0) as i32;
+                let actual_input_tokens = (context_usage.context_usage_percentage
+                    * (self.context_window_size as f64)
+                    / 100.0) as i32;
                 self.input_usage
                     .observe_upstream_context(actual_input_tokens);
                 // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
@@ -2947,6 +2956,10 @@ impl BufferedStreamContext {
         self.inner.cache_usage = cache_usage;
     }
 
+    pub fn set_context_window_size(&mut self, value: i32) {
+        self.inner.set_context_window_size(value);
+    }
+
     /// 开启流式身份归一化（委托给 inner StreamContext）。
     pub fn enable_identity_filter(&mut self) {
         self.inner.enable_identity_filter();
@@ -3273,6 +3286,24 @@ mod tests {
 
         assert_eq!(ctx.resolved_usage(), (72, 0, 0));
         assert_eq!(ctx.upstream_context_tokens(), Some(5_417));
+    }
+
+    #[test]
+    fn context_window_snapshot_drives_context_usage() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "custom-model",
+            72,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        ctx.set_context_window_size(1_000_000);
+        ctx.process_kiro_event(&Event::ContextUsage(
+            crate::kiro::model::events::ContextUsageEvent {
+                context_usage_percentage: 50.0,
+            },
+        ));
+        assert_eq!(ctx.upstream_context_tokens(), Some(500_000));
     }
 
     #[test]

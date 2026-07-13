@@ -52,6 +52,8 @@ pub struct AppState {
     pub trace_store: Option<SharedTraceStore>,
     /// 模型映射（OpenAI 兼容层请求时把源模型名转发到目标模型名）
     pub model_mappings: Option<crate::admin::SharedModelMappingManager>,
+    /// 模型能力与身份资料。
+    pub model_profiles: Option<Arc<super::model_profile::ModelProfileStore>>,
 }
 
 impl AppState {
@@ -71,6 +73,7 @@ impl AppState {
             cache_meter: None,
             trace_store: None,
             model_mappings: None,
+            model_profiles: None,
         }
     }
 
@@ -111,6 +114,14 @@ impl AppState {
         mappings: Option<crate::admin::SharedModelMappingManager>,
     ) -> Self {
         self.model_mappings = mappings;
+        self
+    }
+
+    pub fn with_model_profiles(
+        mut self,
+        profiles: Option<Arc<super::model_profile::ModelProfileStore>>,
+    ) -> Self {
+        self.model_profiles = profiles;
         self
     }
 }

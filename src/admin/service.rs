@@ -12,6 +12,10 @@ use uuid::Uuid;
 use crate::anthropic::cache_metering::{
     ALLOWED_TTL_SECS, CachePolicy, CacheStats, SharedCacheMeter,
 };
+use crate::anthropic::model_profile::{
+    ManualField, ModelProfileError, ModelProfileStore, PatchProfile, ProfileField,
+    ResolvedModelProfile, StoredModelProfile,
+};
 use crate::http_client::ProxyConfig;
 use crate::kiro::auth::idc::{self, BUILDER_ID_START_URL};
 use crate::kiro::auth::social;
@@ -26,24 +30,34 @@ use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::{Config, RetryMode};
 
 use super::error::AdminServiceError;
+use super::model_profile_sync::{
+    ModelProfileSyncService, PreviewCacheError, SyncCollection, SyncError,
+};
 use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
-    AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse, AssignProxyRequest,
-    AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse, BalanceResponse,
-    BatchAddProxyRequest, BatchImportEvent, CacheHitRateResponse, CachePolicyResponse,
-    CheckRateLimitRequest, ClearCacheResponse, CompleteSocialLoginRequest,
-    CredentialResponseTestResponse, CredentialStatusItem, CredentialsExportResponse,
-    CredentialsStatusResponse, EnableOverageAllResult, EndpointBucketOption,
-    EndpointChainsResponse, ExportedAccount, ExportedCredentials, GitHubRateLimitInfo,
-    ImageBudgetResponse, ImageUpdateResponse, LoadBalancingModeResponse,
-    LogGovernanceConfigResponse, PollIdcLoginResponse, ProxyBalancingModeResponse,
+    AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse,
+    ApplyModelProfilesRequest, AssignProxyRequest, AssignRoundRobinResponse, AvailableModelItem,
+    AvailableModelsResponse, BalanceResponse, BatchAddProxyRequest, BatchImportEvent,
+    CacheHitRateResponse, CachePolicyResponse, CheckRateLimitRequest, ClearCacheResponse,
+    CompleteSocialLoginRequest, CredentialResponseTestResponse, CredentialStatusItem,
+    CredentialsExportResponse, CredentialsStatusResponse, EnableOverageAllResult,
+    EndpointBucketOption, EndpointChainsResponse, ExportedAccount, ExportedCredentials,
+    FetchModelProfileRequest, GitHubRateLimitInfo, ImageBudgetResponse, ImageUpdateResponse,
+    LoadBalancingModeResponse, LogGovernanceConfigResponse, ModelProfileFieldRefResponse,
+    ModelProfileFieldResponse,
+    ModelProfilePreviewChangeResponse, ModelProfilePreviewResponse, ModelProfileSettingsResponse,
+    ModelProfileSourceSummaryResponse, ModelProfileSyncResponse, ModelProfileSyncSummaryResponse,
+    ModelProfileViewResponse, ModelProfilesResponse, PatchModelProfileRequest,
+    PollIdcLoginResponse, PreviewModelProfilesRequest, ProxyBalancingModeResponse,
     ProxyCheckAllResponse, ProxyCheckResponse, ProxyCheckUrlRequest, ProxyPoolEntry,
-    ProxyPoolResponse, QuotaExceededResult, RetryPolicyResponse, SetAccountThrottleConfigRequest,
-    SetCacheHitRateRequest, SetCachePolicyRequest, SetEndpointChainsRequest, SetImageBudgetRequest,
-    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetProxyBalancingModeRequest,
-    SetRetryPolicyRequest, SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse,
-    StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse,
-    UpdateCredentialRequest, UpdateRefreshTokenRequest,
+    ProxyPoolResponse, QuotaExceededResult, ResolvedModelProfileResponse, RetryPolicyResponse,
+    RevisionRequest, SetAccountThrottleConfigRequest, SetCacheHitRateRequest,
+    SetCachePolicyRequest, SetEndpointChainsRequest, SetImageBudgetRequest,
+    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
+    SetModelProfileSettingsRequest, SetProxyBalancingModeRequest, SetRetryPolicyRequest,
+    SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse,
+    StartSocialLoginRequest, StartSocialLoginResponse, SyncModelProfilesRequest,
+    UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -95,6 +109,106 @@ fn build_image_budget_response(policy: ImageBudgetPolicy) -> ImageBudgetResponse
         history_jpeg_quality: policy.history_jpeg_quality,
         retry_history_max_dimension: policy.retry_history_max_dimension,
         retry_history_jpeg_quality: policy.retry_history_jpeg_quality,
+    }
+}
+
+fn profile_field_response<T: Clone + Serialize>(
+    field: Option<&ProfileField<T>>,
+) -> Option<ModelProfileFieldResponse<T>> {
+    field.map(|field| ModelProfileFieldResponse {
+        value: field.value.clone(),
+        source: field.source.clone(),
+        locked: field.locked,
+        updated_at: field.updated_at.clone(),
+    })
+}
+
+fn profile_view_response(
+    resolved: ResolvedModelProfile,
+    persisted: Option<&StoredModelProfile>,
+) -> ModelProfileViewResponse {
+    ModelProfileViewResponse {
+        model_id: resolved.model_id,
+        context_window_tokens: profile_field_response(
+            persisted.and_then(|profile| profile.context_window_tokens.as_ref()),
+        ),
+        max_output_tokens: profile_field_response(
+            persisted.and_then(|profile| profile.max_output_tokens.as_ref()),
+        ),
+        knowledge_cutoff: profile_field_response(
+            persisted.and_then(|profile| profile.knowledge_cutoff.as_ref()),
+        ),
+        release_date: profile_field_response(
+            persisted.and_then(|profile| profile.release_date.as_ref()),
+        ),
+        resolved: ResolvedModelProfileResponse {
+            context_window_tokens: profile_field_response(resolved.context_window_field.as_ref()),
+            max_output_tokens: profile_field_response(resolved.max_output_field.as_ref()),
+            knowledge_cutoff: profile_field_response(resolved.knowledge_cutoff_field.as_ref()),
+            release_date: profile_field_response(resolved.release_date_field.as_ref()),
+        },
+    }
+}
+
+fn map_model_profile_error(error: ModelProfileError) -> AdminServiceError {
+    let message = error.to_string();
+    match error {
+        ModelProfileError::RevisionConflict { .. } | ModelProfileError::LockedField { .. } => {
+            AdminServiceError::Conflict(message)
+        }
+        ModelProfileError::InvalidModelId(_)
+        | ModelProfileError::InvalidField { .. }
+        | ModelProfileError::UnknownPreviewChange(_) => {
+            AdminServiceError::InvalidCredential(message)
+        }
+        ModelProfileError::Read(_)
+        | ModelProfileError::Parse(_)
+        | ModelProfileError::UnsupportedVersion(_)
+        | ModelProfileError::Persist(_) => AdminServiceError::InternalError(message),
+    }
+}
+
+fn map_model_profile_sync_error(error: SyncError) -> AdminServiceError {
+    let message = error.to_string();
+    match error {
+        SyncError::ModelProfile(error) => map_model_profile_error(error),
+        SyncError::Preview(PreviewCacheError::Gone) => {
+            AdminServiceError::Gone("模型资料预览不存在、已过期或已消费".to_string())
+        }
+        SyncError::PreviewMismatch => AdminServiceError::InvalidCredential(message),
+        SyncError::AllSourcesFailed(_) | SyncError::PublicCatalog(_) => {
+            AdminServiceError::UpstreamError(message)
+        }
+    }
+}
+
+fn build_profile_sync_summary(
+    fill: crate::anthropic::model_profile::FillEmptyResult,
+    collection: &SyncCollection,
+) -> ModelProfileSyncSummaryResponse {
+    let map = |change: crate::anthropic::model_profile::ProfileChangeResult| {
+        ModelProfileFieldRefResponse {
+            model_id: change.model_id,
+            field: change.field,
+            source: change.source,
+            reason: change.reason,
+        }
+    };
+    ModelProfileSyncSummaryResponse {
+        applied: fill.applied.into_iter().map(map).collect(),
+        skipped: fill.skipped.into_iter().map(map).collect(),
+        warnings: collection.warnings.clone(),
+        sources: vec![ModelProfileSourceSummaryResponse {
+            source: "kiro+models.dev".to_string(),
+            ok: collection.successful_sources > 0,
+            models: collection
+                .candidates
+                .iter()
+                .map(|candidate| candidate.model_id.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            message: None,
+        }],
     }
 }
 
@@ -253,6 +367,12 @@ pub struct AdminService {
     kiro_provider: Option<Arc<KiroProvider>>,
     /// 与 Anthropic 路由共享的缓存计量器，用于运行时策略控制。
     cache_meter: Option<SharedCacheMeter>,
+    /// 与 Anthropic 路由共享的模型资料存储。
+    model_profiles: Option<Arc<ModelProfileStore>>,
+    /// Kiro + models.dev 资料收集与一次性预览服务。
+    model_profile_sync: Option<Arc<ModelProfileSyncService>>,
+    /// 最近一次同步摘要（进程内）。
+    last_model_profile_sync: Mutex<Option<ModelProfileSyncSummaryResponse>>,
 }
 
 /// Social 登录会话状态
@@ -589,6 +709,9 @@ impl AdminService {
             usage_recorder: None,
             kiro_provider: None,
             cache_meter: None,
+            model_profiles: None,
+            model_profile_sync: None,
+            last_model_profile_sync: Mutex::new(None),
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -634,6 +757,204 @@ impl AdminService {
     pub fn with_cache_meter(mut self, cache_meter: SharedCacheMeter) -> Self {
         self.cache_meter = Some(cache_meter);
         self
+    }
+
+    pub fn with_model_profiles(
+        mut self,
+        store: Arc<ModelProfileStore>,
+        sync: Arc<ModelProfileSyncService>,
+    ) -> Self {
+        self.model_profiles = Some(store);
+        self.model_profile_sync = Some(sync);
+        self
+    }
+
+    fn model_profile_components(
+        &self,
+    ) -> Result<(&Arc<ModelProfileStore>, &Arc<ModelProfileSyncService>), AdminServiceError> {
+        Ok((
+            self.model_profiles.as_ref().ok_or_else(|| {
+                AdminServiceError::InternalError("模型资料存储未初始化".to_string())
+            })?,
+            self.model_profile_sync.as_ref().ok_or_else(|| {
+                AdminServiceError::InternalError("模型资料同步器未初始化".to_string())
+            })?,
+        ))
+    }
+
+    pub fn get_model_profiles(&self) -> Result<ModelProfilesResponse, AdminServiceError> {
+        let (store, _) = self.model_profile_components()?;
+        let snapshot = store.snapshot();
+        let profiles = store
+            .list_resolved()
+            .into_iter()
+            .map(|resolved| {
+                let persisted = snapshot.profiles.get(&resolved.model_id);
+                profile_view_response(resolved, persisted)
+            })
+            .collect();
+        Ok(ModelProfilesResponse {
+            revision: snapshot.revision,
+            exact_answers_enabled: store.exact_answers_enabled(),
+            profiles,
+            last_sync: self.last_model_profile_sync.lock().clone(),
+        })
+    }
+
+    pub fn patch_model_profile(
+        &self,
+        model_id: String,
+        request: PatchModelProfileRequest,
+    ) -> Result<ModelProfilesResponse, AdminServiceError> {
+        let (store, _) = self.model_profile_components()?;
+        let integer = |field: Option<Option<super::types::ManualModelProfileField<i64>>>| {
+            field.map(|field| match field {
+                Some(field) => ManualField::set_with_lock(field.value, field.locked),
+                None => ManualField::clear(),
+            })
+        };
+        let string = |field: Option<Option<super::types::ManualModelProfileField<String>>>| {
+            field.map(|field| match field {
+                Some(field) => ManualField::set_with_lock(field.value, field.locked),
+                None => ManualField::clear(),
+            })
+        };
+        store
+            .patch(PatchProfile {
+                base_revision: request.base_revision,
+                model_id,
+                context_window_tokens: integer(request.context_window_tokens),
+                max_output_tokens: integer(request.max_output_tokens),
+                knowledge_cutoff: string(request.knowledge_cutoff),
+                release_date: string(request.release_date),
+            })
+            .map_err(map_model_profile_error)?;
+        self.get_model_profiles()
+    }
+
+    pub fn delete_model_profile(
+        &self,
+        model_id: String,
+        request: RevisionRequest,
+    ) -> Result<ModelProfilesResponse, AdminServiceError> {
+        let (store, _) = self.model_profile_components()?;
+        store
+            .delete(request.base_revision, &model_id)
+            .map_err(map_model_profile_error)?;
+        self.get_model_profiles()
+    }
+
+    pub async fn fetch_model_profile(
+        &self,
+        model_id: String,
+        request: FetchModelProfileRequest,
+    ) -> Result<ModelProfileSyncResponse, AdminServiceError> {
+        let (store, sync) = self.model_profile_components()?;
+        let collection = sync
+            .collect_one(&model_id, request.credential_id, request.force_public)
+            .await
+            .map_err(map_model_profile_sync_error)?;
+        let fill = store
+            .fill_empty_at(request.base_revision, collection.candidates.clone())
+            .map_err(map_model_profile_error)?;
+        let summary = build_profile_sync_summary(fill, &collection);
+        *self.last_model_profile_sync.lock() = Some(summary.clone());
+        Ok(ModelProfileSyncResponse {
+            snapshot: self.get_model_profiles()?,
+            summary,
+        })
+    }
+
+    pub async fn sync_model_profiles(
+        &self,
+        request: SyncModelProfilesRequest,
+    ) -> Result<ModelProfileSyncResponse, AdminServiceError> {
+        let (store, sync) = self.model_profile_components()?;
+        let collection = sync
+            .collect_all(request.force_public)
+            .await
+            .map_err(map_model_profile_sync_error)?;
+        let fill = store
+            .fill_empty_at(request.base_revision, collection.candidates.clone())
+            .map_err(map_model_profile_error)?;
+        let summary = build_profile_sync_summary(fill, &collection);
+        *self.last_model_profile_sync.lock() = Some(summary.clone());
+        Ok(ModelProfileSyncResponse {
+            snapshot: self.get_model_profiles()?,
+            summary,
+        })
+    }
+
+    pub async fn preview_model_profiles(
+        &self,
+        request: PreviewModelProfilesRequest,
+    ) -> Result<ModelProfilePreviewResponse, AdminServiceError> {
+        let (store, sync) = self.model_profile_components()?;
+        let collection = if let Some(model_id) = request.model_id {
+            sync.collect_one(&model_id, request.credential_id, request.force_public)
+                .await
+        } else {
+            sync.collect_all(request.force_public).await
+        }
+        .map_err(map_model_profile_sync_error)?;
+        let preview = sync
+            .create_preview(store, collection.candidates)
+            .map_err(map_model_profile_sync_error)?;
+        Ok(ModelProfilePreviewResponse {
+            preview_id: preview.preview_id,
+            base_revision: preview.revision,
+            expires_at: (Utc::now() + chrono::Duration::minutes(5)).to_rfc3339(),
+            changes: preview
+                .changes
+                .into_iter()
+                .map(|change| ModelProfilePreviewChangeResponse {
+                    id: change.id,
+                    model_id: change.model_id,
+                    field: change.field,
+                    value: change.value,
+                    source: change.source,
+                    current_value: change.current_value,
+                    current_source: change.current_source,
+                    locked: change.locked,
+                })
+                .collect(),
+            warnings: collection.warnings,
+        })
+    }
+
+    pub fn apply_model_profile_preview(
+        &self,
+        request: ApplyModelProfilesRequest,
+    ) -> Result<ModelProfilesResponse, AdminServiceError> {
+        let (store, sync) = self.model_profile_components()?;
+        sync.apply_preview(
+            store,
+            &request.preview_id,
+            request.base_revision,
+            &request.changes,
+        )
+        .map_err(map_model_profile_sync_error)?;
+        self.get_model_profiles()
+    }
+
+    pub fn set_model_profile_settings(
+        &self,
+        request: SetModelProfileSettingsRequest,
+    ) -> Result<ModelProfileSettingsResponse, AdminServiceError> {
+        let (store, _) = self.model_profile_components()?;
+        let path = self.token_manager.config().config_path().ok_or_else(|| {
+            AdminServiceError::InternalError("配置文件路径未知，无法保存模型资料设置".to_string())
+        })?;
+        let mut config = Config::load(path)
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+        config.model_profile_exact_answers_enabled = request.enabled;
+        config
+            .save()
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+        store.set_exact_answers_enabled(request.enabled);
+        Ok(ModelProfileSettingsResponse {
+            exact_answers_enabled: request.enabled,
+        })
     }
 
     /// 获取所有凭据状态

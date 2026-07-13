@@ -23,6 +23,7 @@ pub mod groups;
 mod handlers;
 mod middleware;
 pub mod model_mapping;
+pub mod model_profile_sync;
 pub mod proxy_pool;
 mod router;
 mod service;

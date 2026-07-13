@@ -641,6 +641,7 @@ async fn collect_buffered_attempt(
     threshold_retry_body: Option<String>,
     model: String,
     input_tokens: i32,
+    context_window_size: i32,
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
@@ -672,6 +673,7 @@ async fn collect_buffered_attempt(
             disable_parallel_tool_use: false,
         },
     );
+    context.set_context_window_size(context_window_size);
     context.set_cache_usage(cache_usage);
     if provider.identity_normalization() {
         context.enable_identity_filter();
@@ -737,6 +739,7 @@ async fn handle_strict_json_request(
     threshold_retry_body: Option<&str>,
     payload: &MessagesRequest,
     input_tokens: i32,
+    context_window_size: i32,
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
@@ -790,6 +793,7 @@ async fn handle_strict_json_request(
                     threshold_retry_body,
                     model,
                     input_tokens,
+                    context_window_size,
                     cache_usage,
                     tracer,
                     group,
@@ -1179,6 +1183,97 @@ fn try_local_ping_response(
                 .into_response(),
         )
     }
+}
+
+fn try_local_model_profile_response(
+    state: &AppState,
+    provider: &crate::kiro::provider::KiroProvider,
+    payload: &MessagesRequest,
+    hook: &UsageRecordHook,
+) -> Option<Response> {
+    let store = state.model_profiles.as_ref()?;
+    let mapped_model = state
+        .model_mappings
+        .as_ref()
+        .and_then(|mappings| mappings.resolve(&payload.model))
+        .unwrap_or_else(|| payload.model.clone());
+    let profile = store.resolve(&mapped_model);
+    let answer = super::model_profile_answer::exact_model_profile_answer(
+        payload,
+        &profile,
+        store.exact_answers_enabled(),
+    )?;
+    let output_tokens = token::count_tokens(&answer).max(1) as i32;
+    if output_tokens > payload.max_tokens.max(0) {
+        return None;
+    }
+    let input_tokens = token::count_all_tokens(
+        payload.model.clone(),
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
+    ) as i32;
+    let cache_usage = state
+        .cache_meter
+        .as_ref()
+        .map(|cache| {
+            let usage = super::cache_metering::compute_cache_usage(cache, payload, hook.key_id);
+            let (hr_min, hr_max) = provider.cache_hit_rate_bounds();
+            usage.with_hit_rate_bounds(hr_min, hr_max)
+        })
+        .unwrap_or_default();
+    let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
+        split_non_stream_usage(input_tokens, None, &cache_usage);
+    hook.record(
+        0,
+        final_input_tokens,
+        output_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+        0.0,
+        "success",
+    );
+    tracing::info!(
+        model_id = %profile.model_id,
+        stream = payload.stream,
+        "served strict model profile answer locally"
+    );
+    if payload.stream {
+        Some(local_text_stream_response(build_local_text_stream_events(
+            &payload.model,
+            &answer,
+            input_tokens,
+            cache_usage,
+        )))
+    } else {
+        Some(
+            (
+                StatusCode::OK,
+                Json(build_local_text_message(
+                    &payload.model,
+                    &answer,
+                    input_tokens,
+                    &cache_usage,
+                )),
+            )
+                .into_response(),
+        )
+    }
+}
+
+fn request_context_window_size(state: &AppState, payload: &MessagesRequest) -> i32 {
+    let mapped_model = state
+        .model_mappings
+        .as_ref()
+        .and_then(|mappings| mappings.resolve(&payload.model))
+        .unwrap_or_else(|| payload.model.clone());
+    state
+        .model_profiles
+        .as_ref()
+        .and_then(|store| store.resolve(&mapped_model).context_window_tokens)
+        .and_then(|value| i32::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| super::converter::get_context_window_size(&mapped_model))
 }
 
 fn local_document_system_is_safe_to_bypass(
@@ -1689,6 +1784,12 @@ pub async fn post_messages(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
+    if let Some(response) =
+        try_local_model_profile_response(&state, provider.as_ref(), &payload, &hook)
+    {
+        return response;
+    }
+
     if let Some(response) = try_local_exact_system_response(
         &state,
         provider.as_ref(),
@@ -1712,6 +1813,8 @@ pub async fn post_messages(
     if let Some(response) = try_local_ping_response(&state, provider.as_ref(), &payload, &hook) {
         return response;
     }
+
+    let context_window_size = request_context_window_size(&state, &payload);
 
     let strict_json_candidate = strict_json_route_allowed(&payload);
 
@@ -1771,6 +1874,7 @@ pub async fn post_messages(
             payload_stream,
             key_ctx.group.clone(),
             state.tool_compatibility_mode,
+            context_window_size,
         )
         .await;
     }
@@ -1880,6 +1984,7 @@ pub async fn post_messages(
             threshold_retry_body,
             &payload,
             total_input_tokens,
+            context_window_size,
             hook,
             cache_usage,
             tracer,
@@ -1907,6 +2012,7 @@ pub async fn post_messages(
             threshold_retry_body,
             &payload.model,
             total_input_tokens,
+            context_window_size,
             thinking_enabled,
             tool_name_map,
             known_tool_names,
@@ -1937,6 +2043,7 @@ pub async fn post_messages(
             threshold_retry_body,
             &payload.model,
             total_input_tokens,
+            context_window_size,
             extract_thinking,
             thinking_enabled,
             tool_name_map,
@@ -1956,8 +2063,8 @@ async fn handle_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     threshold_retry_body: Option<&str>,
-    model: &str,
     input_tokens: i32,
+    context_window_size: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
@@ -1975,6 +2082,7 @@ async fn handle_stream_request(
             threshold_retry_body.map(str::to_owned),
             model.to_owned(),
             input_tokens,
+            context_window_size,
             thinking_enabled,
             tool_name_map,
             known_tool_names,
@@ -2031,6 +2139,7 @@ async fn handle_stream_request(
         known_tool_names,
         tool_choice_policy,
     );
+    ctx.set_context_window_size(context_window_size);
     ctx.cache_usage = cache_usage;
     if provider.identity_normalization() {
         ctx.enable_identity_filter();
@@ -2064,6 +2173,7 @@ async fn handle_stream_request(
 struct EarlyStreamSetup {
     model: String,
     input_tokens: i32,
+    context_window_size: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
@@ -2083,6 +2193,7 @@ fn create_early_sse_stream(
     threshold_retry_body: Option<String>,
     model: String,
     input_tokens: i32,
+    context_window_size: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
@@ -2110,6 +2221,7 @@ fn create_early_sse_stream(
     let mut setup = Some(EarlyStreamSetup {
         model,
         input_tokens,
+        context_window_size,
         thinking_enabled,
         tool_name_map,
         known_tool_names,
@@ -2135,6 +2247,7 @@ fn create_early_sse_stream(
                     setup.known_tool_names,
                     setup.tool_choice_policy,
                 );
+                ctx.set_context_window_size(setup.context_window_size);
                 ctx.cache_usage = setup.cache_usage;
                 if setup.identity_normalization {
                     ctx.enable_identity_filter();
@@ -2547,8 +2660,6 @@ fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
     }
 }
 
-use super::converter::get_context_window_size;
-
 struct NonStreamToolAttempt {
     credential_id: u64,
     text_content: String,
@@ -2575,6 +2686,7 @@ async fn collect_non_stream_tool_attempt(
     threshold_retry_body: Option<&str>,
     model: &str,
     input_tokens: i32,
+    context_window_size: i32,
     tool_name_map: &std::collections::HashMap<String, String>,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<&str>,
@@ -2664,10 +2776,10 @@ async fn collect_non_stream_tool_attempt(
                             }
                         }
                         Event::ContextUsage(context_usage) => {
-                            let window_size = get_context_window_size(model);
-                            let actual_input_tokens =
-                                (context_usage.context_usage_percentage * f64::from(window_size)
-                                    / 100.0) as i32;
+                            let actual_input_tokens = (context_usage.context_usage_percentage
+                                * f64::from(context_window_size)
+                                / 100.0)
+                                as i32;
                             upstream_context_tokens = Some(actual_input_tokens);
                             if context_usage.context_usage_percentage >= 100.0 {
                                 stop_reason = "model_context_window_exceeded".to_string();
@@ -2736,6 +2848,7 @@ async fn handle_non_stream_request(
     threshold_retry_body: Option<&str>,
     model: &str,
     input_tokens: i32,
+    context_window_size: i32,
     thinking_enabled: bool,
     require_thinking: bool,
     tool_name_map: std::collections::HashMap<String, String>,
@@ -2757,8 +2870,8 @@ async fn handle_non_stream_request(
                 provider.clone(),
                 attempt_body,
                 attempt_threshold_retry_body,
-                model,
                 input_tokens,
+                context_window_size,
                 &tool_name_map,
                 tracer.clone(),
                 group.as_deref(),
@@ -3297,6 +3410,12 @@ pub async fn post_messages_cc(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
+    if let Some(response) =
+        try_local_model_profile_response(&state, provider.as_ref(), &payload, &hook)
+    {
+        return response;
+    }
+
     if let Some(response) = try_local_exact_system_response(
         &state,
         provider.as_ref(),
@@ -3320,6 +3439,8 @@ pub async fn post_messages_cc(
     if let Some(response) = try_local_ping_response(&state, provider.as_ref(), &payload, &hook) {
         return response;
     }
+
+    let context_window_size = request_context_window_size(&state, &payload);
 
     let strict_json_candidate = strict_json_route_allowed(&payload);
 
@@ -3378,6 +3499,7 @@ pub async fn post_messages_cc(
             payload_stream,
             key_ctx.group.clone(),
             state.tool_compatibility_mode,
+            context_window_size,
         )
         .await;
     }
@@ -3486,6 +3608,7 @@ pub async fn post_messages_cc(
             threshold_retry_body,
             &payload,
             total_input_tokens,
+            context_window_size,
             hook,
             cache_usage,
             tracer,
@@ -3513,6 +3636,7 @@ pub async fn post_messages_cc(
             threshold_retry_body,
             &payload.model,
             thinking_enabled,
+            context_window_size,
             tool_name_map,
             known_tool_names,
             tool_choice_policy,
@@ -3543,6 +3667,7 @@ pub async fn post_messages_cc(
             threshold_retry_body,
             &payload.model,
             total_input_tokens,
+            context_window_size,
             extract_thinking,
             thinking_enabled,
             tool_name_map,
@@ -3567,6 +3692,7 @@ async fn handle_stream_request_buffered(
     threshold_retry_body: Option<&str>,
     model: &str,
     thinking_enabled: bool,
+    context_window_size: i32,
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
     tool_choice_policy: super::converter::ToolChoicePolicy,
@@ -3612,6 +3738,7 @@ async fn handle_stream_request_buffered(
         known_tool_names,
         tool_choice_policy,
     );
+    ctx.set_context_window_size(context_window_size);
     ctx.set_cache_usage(cache_usage);
     if provider.identity_normalization() {
         ctx.enable_identity_filter();

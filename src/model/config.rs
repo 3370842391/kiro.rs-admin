@@ -324,6 +324,10 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub local_ping_response: bool,
 
+    /// 是否启用严格模型资料探针的本地确定性回复。
+    #[serde(default = "default_true")]
+    pub model_profile_exact_answers_enabled: bool,
+
     /// 工具兼容模式。默认 `claude-code`：把 Claude Code 内置工具名/入参双向适配为
     /// Kiro 内置工具；`raw` 保留旧行为、直接透传客户端工具 schema，用于排障。
     #[serde(default = "default_tool_compatibility_mode")]
@@ -619,6 +623,7 @@ impl Default for Config {
             extract_thinking: default_extract_thinking(),
             strict_thinking_validation: false,
             local_ping_response: default_true(),
+            model_profile_exact_answers_enabled: default_true(),
             tool_compatibility_mode: default_tool_compatibility_mode(),
             default_endpoint: default_endpoint(),
             trace_enabled: default_trace_enabled(),
@@ -725,6 +730,20 @@ mod tests {
         assert!(!disabled.local_ping_response);
         let encoded = serde_json::to_value(disabled).unwrap();
         assert_eq!(encoded["localPingResponse"], false);
+    }
+
+    #[test]
+    fn model_profile_exact_answers_default_on_and_round_trip_in_camel_case() {
+        let defaulted: Config = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(defaulted.model_profile_exact_answers_enabled);
+
+        let disabled: Config = serde_json::from_value(serde_json::json!({
+            "modelProfileExactAnswersEnabled": false
+        }))
+        .unwrap();
+        assert!(!disabled.model_profile_exact_answers_enabled);
+        let encoded = serde_json::to_value(disabled).unwrap();
+        assert_eq!(encoded["modelProfileExactAnswersEnabled"], false);
     }
 
     #[test]

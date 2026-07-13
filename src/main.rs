@@ -334,6 +334,20 @@ async fn main() {
         }),
     );
 
+    let model_profiles_path = cache_dir.join("model_profiles.json");
+    let model_profile_store = std::sync::Arc::new(
+        anthropic::model_profile::ModelProfileStore::load(&model_profiles_path).unwrap_or_else(
+            |error| {
+                tracing::warn!(%error, path = %model_profiles_path.display(), "模型资料加载失败，使用空持久化资料");
+                anthropic::model_profile::ModelProfileStore::new_empty_at(&model_profiles_path)
+            },
+        ),
+    );
+    model_profile_store.set_exact_answers_enabled(config.model_profile_exact_answers_enabled);
+    let model_profile_sync = std::sync::Arc::new(
+        admin::model_profile_sync::ModelProfileSyncService::new(token_manager.clone()),
+    );
+
     let anthropic_app = anthropic::create_router(
         Some(kiro_provider.clone()),
         config.extract_thinking,
@@ -344,6 +358,7 @@ async fn main() {
         Some(cache_meter.clone()),
         trace_store.clone(),
         Some(model_mapping_manager.clone()),
+        Some(model_profile_store.clone()),
     );
 
     // 构建 Admin API 路由（配置了非空 adminApiKey 时启用）
@@ -366,6 +381,7 @@ async fn main() {
             )
             .with_kiro_provider(kiro_provider.clone())
             .with_cache_meter(cache_meter.clone())
+            .with_model_profiles(model_profile_store.clone(), model_profile_sync.clone())
             .with_log_governance(
                 Some(admin_trace_store.clone()),
                 Some(usage_recorder.clone()),

@@ -42,6 +42,7 @@ pub fn create_router_with_provider(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -57,6 +58,7 @@ pub fn create_router(
     cache_meter: Option<SharedCacheMeter>,
     trace_store: Option<SharedTraceStore>,
     model_mappings: Option<crate::admin::SharedModelMappingManager>,
+    model_profiles: Option<Arc<super::model_profile::ModelProfileStore>>,
 ) -> Router {
     let mut state = AppState::new(extract_thinking, tool_compatibility_mode);
     if let Some(provider) = kiro_provider {
@@ -66,6 +68,7 @@ pub fn create_router(
     state = state.with_cache_meter(cache_meter);
     state = state.with_trace_store(trace_store);
     state = state.with_model_mappings(model_mappings);
+    state = state.with_model_profiles(model_profiles);
 
     // 需要认证的 /v1 路由
     let v1_routes = Router::new()

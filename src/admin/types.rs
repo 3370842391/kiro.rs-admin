@@ -1385,6 +1385,195 @@ pub struct UpsertModelMappingRequest {
     pub target: String,
 }
 
+// ============ 模型能力与身份资料 ============
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelProfileFieldResponse<T: Serialize> {
+    pub value: T,
+    pub source: String,
+    pub locked: bool,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedModelProfileResponse {
+    pub context_window_tokens: Option<ModelProfileFieldResponse<i64>>,
+    pub max_output_tokens: Option<ModelProfileFieldResponse<i64>>,
+    pub knowledge_cutoff: Option<ModelProfileFieldResponse<String>>,
+    pub release_date: Option<ModelProfileFieldResponse<String>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelProfileViewResponse {
+    pub model_id: String,
+    pub context_window_tokens: Option<ModelProfileFieldResponse<i64>>,
+    pub max_output_tokens: Option<ModelProfileFieldResponse<i64>>,
+    pub knowledge_cutoff: Option<ModelProfileFieldResponse<String>>,
+    pub release_date: Option<ModelProfileFieldResponse<String>>,
+    pub resolved: ResolvedModelProfileResponse,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelProfileFieldRefResponse {
+    pub model_id: String,
+    pub field: crate::anthropic::model_profile::ProfileFieldName,
+    pub source: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelProfileSourceSummaryResponse {
+    pub source: String,
+    pub ok: bool,
+    pub models: usize,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelProfileSyncSummaryResponse {
+    pub applied: Vec<ModelProfileFieldRefResponse>,
+    pub skipped: Vec<ModelProfileFieldRefResponse>,
+    pub warnings: Vec<String>,
+    pub sources: Vec<ModelProfileSourceSummaryResponse>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelProfilesResponse {
+    pub revision: u64,
+    pub exact_answers_enabled: bool,
+    pub profiles: Vec<ModelProfileViewResponse>,
+    pub last_sync: Option<ModelProfileSyncSummaryResponse>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManualModelProfileField<T> {
+    pub value: T,
+    #[serde(default = "default_true_value")]
+    pub locked: bool,
+}
+
+fn default_true_value() -> bool {
+    true
+}
+
+fn deserialize_patch_field<'de, D, T>(
+    deserializer: D,
+) -> Result<Option<Option<ManualModelProfileField<T>>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Some(Option::<ManualModelProfileField<T>>::deserialize(
+        deserializer,
+    )?))
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PatchModelProfileRequest {
+    pub base_revision: u64,
+    #[serde(default, deserialize_with = "deserialize_patch_field")]
+    pub context_window_tokens: Option<Option<ManualModelProfileField<i64>>>,
+    #[serde(default, deserialize_with = "deserialize_patch_field")]
+    pub max_output_tokens: Option<Option<ManualModelProfileField<i64>>>,
+    #[serde(default, deserialize_with = "deserialize_patch_field")]
+    pub knowledge_cutoff: Option<Option<ManualModelProfileField<String>>>,
+    #[serde(default, deserialize_with = "deserialize_patch_field")]
+    pub release_date: Option<Option<ManualModelProfileField<String>>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RevisionRequest {
+    pub base_revision: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FetchModelProfileRequest {
+    pub base_revision: u64,
+    #[serde(default)]
+    pub credential_id: Option<u64>,
+    #[serde(default)]
+    pub force_public: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncModelProfilesRequest {
+    pub base_revision: u64,
+    #[serde(default)]
+    pub force_public: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelProfileSyncResponse {
+    pub snapshot: ModelProfilesResponse,
+    pub summary: ModelProfileSyncSummaryResponse,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewModelProfilesRequest {
+    #[serde(default)]
+    pub force_public: bool,
+    #[serde(default)]
+    pub model_id: Option<String>,
+    #[serde(default)]
+    pub credential_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelProfilePreviewChangeResponse {
+    pub id: String,
+    pub model_id: String,
+    pub field: crate::anthropic::model_profile::ProfileFieldName,
+    pub value: serde_json::Value,
+    pub source: String,
+    pub current_value: Option<serde_json::Value>,
+    pub current_source: Option<String>,
+    pub locked: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelProfilePreviewResponse {
+    pub preview_id: String,
+    pub base_revision: u64,
+    pub expires_at: String,
+    pub changes: Vec<ModelProfilePreviewChangeResponse>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplyModelProfilesRequest {
+    pub preview_id: String,
+    pub base_revision: u64,
+    pub changes: Vec<crate::admin::model_profile_sync::ApplyPreviewChange>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetModelProfileSettingsRequest {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelProfileSettingsResponse {
+    pub exact_answers_enabled: bool,
+}
+
 /// 整表替换（前端一次性保存全部映射）
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1407,6 +1596,31 @@ mod tests {
         assert_eq!(patch.default_ttl_secs, Some(300));
         assert_eq!(patch.capacity, Some(8192));
         assert_eq!(patch.enabled, None);
+    }
+
+    #[test]
+    fn model_profile_patch_distinguishes_missing_null_and_value() {
+        let missing: PatchModelProfileRequest = serde_json::from_value(serde_json::json!({
+            "baseRevision": 4
+        }))
+        .unwrap();
+        assert!(missing.context_window_tokens.is_none());
+
+        let cleared: PatchModelProfileRequest = serde_json::from_value(serde_json::json!({
+            "baseRevision": 4,
+            "contextWindowTokens": null
+        }))
+        .unwrap();
+        assert!(matches!(cleared.context_window_tokens, Some(None)));
+
+        let set: PatchModelProfileRequest = serde_json::from_value(serde_json::json!({
+            "baseRevision": 4,
+            "contextWindowTokens": {"value": 1000000}
+        }))
+        .unwrap();
+        let field = set.context_window_tokens.flatten().unwrap();
+        assert_eq!(field.value, 1_000_000);
+        assert!(field.locked);
     }
 
     /// 回归：Kiro Hosted / IdC 登录成功后前端读 `credentialId`/`nextUrl`（camelCase）。

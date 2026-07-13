@@ -20,6 +20,12 @@ pub enum AdminServiceError {
 
     /// 凭据无效（验证失败）
     InvalidCredential(String),
+
+    /// revision 或锁定字段冲突
+    Conflict(String),
+
+    /// 一次性预览不存在、过期或已消费
+    Gone(String),
 }
 
 impl fmt::Display for AdminServiceError {
@@ -31,6 +37,8 @@ impl fmt::Display for AdminServiceError {
             AdminServiceError::UpstreamError(msg) => write!(f, "上游服务错误: {}", msg),
             AdminServiceError::InternalError(msg) => write!(f, "内部错误: {}", msg),
             AdminServiceError::InvalidCredential(msg) => write!(f, "凭据无效: {}", msg),
+            AdminServiceError::Conflict(msg) => write!(f, "状态冲突: {}", msg),
+            AdminServiceError::Gone(msg) => write!(f, "资源已过期: {}", msg),
         }
     }
 }
@@ -45,6 +53,8 @@ impl AdminServiceError {
             AdminServiceError::UpstreamError(_) => StatusCode::BAD_GATEWAY,
             AdminServiceError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AdminServiceError::InvalidCredential(_) => StatusCode::BAD_REQUEST,
+            AdminServiceError::Conflict(_) => StatusCode::CONFLICT,
+            AdminServiceError::Gone(_) => StatusCode::GONE,
         }
     }
 
@@ -57,6 +67,9 @@ impl AdminServiceError {
                 AdminErrorResponse::internal_error(self.to_string())
             }
             AdminServiceError::InvalidCredential(_) => {
+                AdminErrorResponse::invalid_request(self.to_string())
+            }
+            AdminServiceError::Conflict(_) | AdminServiceError::Gone(_) => {
                 AdminErrorResponse::invalid_request(self.to_string())
             }
         }

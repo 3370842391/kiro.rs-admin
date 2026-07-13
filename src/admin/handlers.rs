@@ -19,15 +19,18 @@ use super::{
     middleware::AdminState,
     trace_db::TraceQuery,
     types::{
-        AddCredentialRequest, AddProxyRequest, AssignProxyRequest, AssignRoundRobinRequest,
-        BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
-        ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest, CreateClientKeyRequest,
-        CreateClientKeyResponse, CredentialResponseTestRequest, GlobalProxyResponse,
-        ProxyCheckUrlRequest, SetAccountThrottleConfigRequest, SetCacheHitRateRequest,
-        SetCachePolicyRequest, SetDisabledRequest, SetEndpointChainsRequest, SetGlobalProxyRequest,
+        AddCredentialRequest, AddProxyRequest, ApplyModelProfilesRequest, AssignProxyRequest,
+        AssignRoundRobinRequest, BatchAddProxyRequest, BatchImportEvent, BatchImportRequest,
+        BatchImportSummary, ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest,
+        CreateClientKeyRequest, CreateClientKeyResponse, CredentialResponseTestRequest,
+        FetchModelProfileRequest, GlobalProxyResponse, PatchModelProfileRequest,
+        PreviewModelProfilesRequest, ProxyCheckUrlRequest, RevisionRequest,
+        SetAccountThrottleConfigRequest, SetCacheHitRateRequest, SetCachePolicyRequest,
+        SetDisabledRequest, SetEndpointChainsRequest, SetGlobalProxyRequest,
         SetImageBudgetRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
-        SetPriorityRequest, SetProxyBalancingModeRequest, SetRetryPolicyRequest,
-        SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
+        SetModelProfileSettingsRequest, SetPriorityRequest, SetProxyBalancingModeRequest,
+        SetRetryPolicyRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
+        StartSocialLoginRequest, SuccessResponse, SyncModelProfilesRequest,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
         UpdateRefreshTokenRequest,
     },
@@ -36,6 +39,86 @@ use super::{
 
 // Path 元组提取：(credential_id, session_id)
 type CredSessionPath = (u64, String);
+
+pub async fn get_model_profiles(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.get_model_profiles() {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
+
+pub async fn patch_model_profile(
+    State(state): State<AdminState>,
+    Path(model_id): Path<String>,
+    Json(request): Json<PatchModelProfileRequest>,
+) -> impl IntoResponse {
+    match state.service.patch_model_profile(model_id, request) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
+
+pub async fn delete_model_profile_entry(
+    State(state): State<AdminState>,
+    Path(model_id): Path<String>,
+    Json(request): Json<RevisionRequest>,
+) -> impl IntoResponse {
+    match state.service.delete_model_profile(model_id, request) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
+
+pub async fn fetch_model_profile(
+    State(state): State<AdminState>,
+    Path(model_id): Path<String>,
+    Json(request): Json<FetchModelProfileRequest>,
+) -> impl IntoResponse {
+    match state.service.fetch_model_profile(model_id, request).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
+
+pub async fn sync_model_profiles(
+    State(state): State<AdminState>,
+    Json(request): Json<SyncModelProfilesRequest>,
+) -> impl IntoResponse {
+    match state.service.sync_model_profiles(request).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
+
+pub async fn preview_model_profiles(
+    State(state): State<AdminState>,
+    Json(request): Json<PreviewModelProfilesRequest>,
+) -> impl IntoResponse {
+    match state.service.preview_model_profiles(request).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
+
+pub async fn apply_model_profile_preview(
+    State(state): State<AdminState>,
+    Json(request): Json<ApplyModelProfilesRequest>,
+) -> impl IntoResponse {
+    match state.service.apply_model_profile_preview(request) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
+
+pub async fn set_model_profile_settings(
+    State(state): State<AdminState>,
+    Json(request): Json<SetModelProfileSettingsRequest>,
+) -> impl IntoResponse {
+    match state.service.set_model_profile_settings(request) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
 
 /// GET /api/admin/credentials
 /// 获取所有凭据状态

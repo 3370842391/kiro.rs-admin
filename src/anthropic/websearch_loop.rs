@@ -26,7 +26,7 @@ use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::token;
 
-use super::converter::{ConversionError, convert_request_with_mode, get_context_window_size};
+use super::converter::{ConversionError, convert_request_with_mode};
 use super::handlers::{UsageRecordHook, map_provider_error};
 use super::stream::{CompletedToolUse, SseEvent};
 use super::types::{ErrorResponse, Message, MessagesRequest};
@@ -83,7 +83,7 @@ fn should_search_round(round_idx: usize, tool_uses: &[CompletedToolUse]) -> bool
 /// Buffer-decode one round of the upstream streaming response
 async fn decode_round(
     response: reqwest::Response,
-    model: &str,
+    context_window_size: i32,
     tool_name_map: &std::collections::HashMap<String, String>,
 ) -> RoundOutcome {
     let mut body_stream = response.bytes_stream();
@@ -137,8 +137,8 @@ async fn decode_round(
                     entry.1.push_str(&tu.input);
                 }
                 Event::ContextUsage(cu) => {
-                    let window = get_context_window_size(model);
-                    let actual = (cu.context_usage_percentage * (window as f64) / 100.0) as i32;
+                    let actual =
+                        (cu.context_usage_percentage * (context_window_size as f64) / 100.0) as i32;
                     upstream_context_tokens = Some(actual);
                     if cu.context_usage_percentage >= 100.0 {
                         stop_reason_override = Some("model_context_window_exceeded".to_string());
@@ -198,6 +198,7 @@ async fn run_round(
     fallback_input_tokens: i32,
     group: Option<&str>,
     tool_compatibility_mode: ToolCompatibilityMode,
+    context_window_size: i32,
 ) -> Result<(RoundOutcome, u64), Response> {
     let conversion = match convert_request_with_mode(payload, tool_compatibility_mode) {
         Ok(c) => c,
@@ -255,7 +256,7 @@ async fn run_round(
     let credential_id = call_result.credential_id;
     let mut outcome = decode_round(
         call_result.response,
-        &payload.model,
+        context_window_size,
         &conversion.tool_name_map,
     )
     .await;
@@ -547,6 +548,7 @@ pub(super) async fn run_web_search_loop(
     stream_client: bool,
     group: Option<String>,
     tool_compatibility_mode: ToolCompatibilityMode,
+    context_window_size: i32,
 ) -> Response {
     let fallback_input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -568,6 +570,7 @@ pub(super) async fn run_web_search_loop(
             fallback_input_tokens,
             group.as_deref(),
             tool_compatibility_mode,
+            context_window_size,
         )
         .await
         {

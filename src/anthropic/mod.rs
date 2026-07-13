@@ -29,6 +29,8 @@ pub(crate) mod exact_output;
 pub(crate) mod handlers;
 pub(crate) mod identity;
 pub(crate) mod middleware;
+pub mod model_profile;
+pub(crate) mod model_profile_answer;
 mod router;
 pub mod stream;
 pub(crate) mod tool_attempt;
