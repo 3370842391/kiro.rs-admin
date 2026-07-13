@@ -640,6 +640,12 @@ export interface LogGovernanceConfig {
   traceEnabled: boolean
   traceRetentionDays: number
   usageLogRetentionDays: number
+  errorSnapshotEnabled: boolean
+  errorSnapshotRetentionDays: number
+  errorSnapshotMaxStorageGb: number
+  errorSnapshotCaptureRecovered: boolean
+  errorSnapshotCaptureBodies: boolean
+  errorSnapshotMinFreeDiskGb: number
 }
 
 // 获取日志治理配置
