@@ -30,13 +30,14 @@ describe("8991 test builder contract", () => {
     expect(compose).toContain("./data-test:/app/config");
     expect(compose).toContain("kiro-rs-test:${TEST_IMAGE_TAG:-latest}");
     expect(compose).toContain("dockerfile: Dockerfile.test");
+    expect(compose).toContain("http://127.0.0.1:8990/admin");
   });
 
   test("test deploy script performs detached, disposable health-checked deploys", async () => {
     const script = await repositoryFile("scripts/test-deploy.sh");
 
     expect(script).toContain("git checkout --detach");
-    expect(script).toContain("http://127.0.0.1:8991/");
+    expect(script).toContain("http://127.0.0.1:8991/admin");
     expect(script).toContain("docker run --rm");
     expect(script).toContain("TEST_GIT_REMOTE");
     expect(script).toContain("TEST_COMPOSE_FILE");

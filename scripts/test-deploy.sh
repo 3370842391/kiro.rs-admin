@@ -7,7 +7,7 @@ readonly REMOTE="${TEST_GIT_REMOTE:-deploy}"
 readonly LOCK_DIR="${TEST_DEPLOY_LOCK_DIR:-${TMPDIR:-/tmp}/kiro-rs-test-deploy.lock}"
 readonly COMPOSE_FILE="${TEST_COMPOSE_FILE:-${REPO_ROOT}/docker-compose.test.yml}"
 readonly SERVICE="kiro-rs-test"
-readonly HEALTH_URL="${TEST_HEALTH_URL:-http://127.0.0.1:8991/}"
+readonly HEALTH_URL="${TEST_HEALTH_URL:-http://127.0.0.1:8991/admin}"
 readonly REQUESTED_REF="${1:-${REMOTE}/master}"
 
 SECONDS=0

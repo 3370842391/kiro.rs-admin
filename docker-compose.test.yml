@@ -13,7 +13,7 @@ services:
       - "./data-test:/app/config"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8990/"]
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8990/admin"]
       interval: 5s
       timeout: 3s
       retries: 12
