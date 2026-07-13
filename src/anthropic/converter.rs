@@ -624,6 +624,58 @@ const REQUIRED_TOOL_NUDGE: &str =
 const REQUIRED_ANY_NUDGE: &str =
     " (Client requirement: you MUST call at least one of the provided tools before answering.)";
 
+/// 从规范化后的工具 schema 生成 Required-only 的短约束提示。
+///
+/// Kiro 上游偶发会在已选择正确工具后仍返回空对象。这里仅重复 schema 中已经存在的
+/// required 字段和确定值（const / 单值 enum），不从用户文本猜测或伪造参数。
+fn required_tool_schema_nudge(schema: &serde_json::Value) -> String {
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    if required.is_empty() {
+        return String::new();
+    }
+
+    let mut fixed_values = Vec::new();
+    let properties = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object);
+    for name in &required {
+        let Some(property) = properties.and_then(|properties| properties.get(*name)) else {
+            continue;
+        };
+        let fixed_value = property.get("const").or_else(|| {
+            let values = property.get("enum")?.as_array()?;
+            (values.len() == 1).then(|| &values[0])
+        });
+        if let Some(value) = fixed_value {
+            let literal = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
+            fixed_values.push(format!("{name}={literal}"));
+        }
+    }
+
+    let mut nudge = format!(
+        " Required input: include all required fields: {}. Do not call this tool with {{}}.",
+        required.join(", ")
+    );
+    if !fixed_values.is_empty() {
+        nudge.push_str(" Fixed schema values: ");
+        nudge.push_str(&fixed_values.join("; "));
+        nudge.push('.');
+    }
+    nudge
+}
+
+fn append_required_tool_nudge(tool: &mut ToolSpecification, policy_nudge: &str) {
+    tool.description.push_str(policy_nudge);
+    tool.description
+        .push_str(&required_tool_schema_nudge(&tool.input_schema.json));
+}
+
 /// 由 `tool_choice` + 已声明工具解析策略。指定工具不存在时回落 Auto（不报错，最大兼容）。
 pub fn resolve_tool_choice_policy(
     choice: Option<&super::types::ToolChoice>,
@@ -819,9 +871,7 @@ pub fn convert_request_with_mode(
         ToolChoicePolicy::Disabled => tools.clear(),
         ToolChoicePolicy::RequiredAny { .. } => {
             for t in &mut tools {
-                t.tool_specification
-                    .description
-                    .push_str(REQUIRED_ANY_NUDGE);
+                append_required_tool_nudge(&mut t.tool_specification, REQUIRED_ANY_NUDGE);
             }
         }
         ToolChoicePolicy::RequiredSpecific {
@@ -836,9 +886,7 @@ pub fn convert_request_with_mode(
                         .is_some_and(|orig| orig == client_name)
             });
             for t in &mut tools {
-                t.tool_specification
-                    .description
-                    .push_str(REQUIRED_TOOL_NUDGE);
+                append_required_tool_nudge(&mut t.tool_specification, REQUIRED_TOOL_NUDGE);
             }
         }
         ToolChoicePolicy::Auto { .. } => {}
@@ -2088,6 +2136,86 @@ mod tests {
             Err(ConversionError::InvalidToolChoice(message))
                 if message.contains("missing")
         ));
+    }
+
+    fn constrained_weather_tool() -> super::super::types::Tool {
+        super::super::types::Tool {
+            tool_type: None,
+            name: "get_weather".to_string(),
+            description: "Get current weather.".to_string(),
+            input_schema: serde_json::from_value(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string", "const": "Paris"},
+                    "nonce": {"type": "string", "enum": ["8b5d9233"]},
+                    "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+                },
+                "required": ["city", "nonce", "unit"],
+                "additionalProperties": false
+            }))
+            .unwrap(),
+            max_uses: None,
+            cache_control: None,
+        }
+    }
+
+    fn converted_weather_description(
+        tool_choice: Option<super::super::types::ToolChoice>,
+    ) -> String {
+        let mut req = minimal_request_with_output_config("claude-opus-4-8");
+        req.output_config = None;
+        req.tools = Some(vec![constrained_weather_tool()]);
+        req.tool_choice = tool_choice;
+        convert_request_with_mode(&req, ToolCompatibilityMode::ClaudeCode)
+            .unwrap()
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools[0]
+            .tool_specification
+            .description
+            .clone()
+    }
+
+    #[test]
+    fn required_specific_tool_nudge_includes_schema_constraints() {
+        use super::super::types::ToolChoice;
+
+        let description = converted_weather_description(Some(ToolChoice::Tool {
+            name: "get_weather".to_string(),
+            disable_parallel_tool_use: false,
+        }));
+
+        for expected in ["city", "nonce", "unit", "Paris", "8b5d9233"] {
+            assert!(
+                description.contains(expected),
+                "required tool nudge should contain {expected:?}: {description}"
+            );
+        }
+        assert!(description.contains("{}"), "应明确禁止空参数对象");
+        assert!(
+            !description.contains("celsius") && !description.contains("fahrenheit"),
+            "多值 enum 不是固定值，不应重复展开增加 token"
+        );
+    }
+
+    #[test]
+    fn required_any_tool_nudge_includes_schema_constraints() {
+        use super::super::types::ToolChoice;
+
+        let description = converted_weather_description(Some(ToolChoice::Any {
+            disable_parallel_tool_use: false,
+        }));
+        assert!(description.contains("city"));
+        assert!(description.contains("Paris"));
+        assert!(description.contains("8b5d9233"));
+    }
+
+    #[test]
+    fn auto_tool_choice_does_not_inject_schema_nudge() {
+        let description = converted_weather_description(None);
+        assert_eq!(description, "Get current weather.");
     }
 
     #[test]
