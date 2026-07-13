@@ -129,6 +129,8 @@ retryHistoryJpegQuality=60
 - `tool_result.content[]` 中被转换或提升的图片。
 - `/v1/messages` 与 `/cc/v1/messages` 两条路径。
 
+现有 converter 的逐图环境变量压缩和历史 SHA256 去重必须由统一预算器接管：converter 保留原始图片及全部图片 block，预算器从原始数据最多重编码一次。这样不会先按单图规则压一次、再按总预算二次 JPEG 压缩，也不会因旧去重逻辑违反“不删除图片”。
+
 请求发送前执行：
 
 1. 扫描全部图片并区分当前最后一条 user 消息与历史消息。
