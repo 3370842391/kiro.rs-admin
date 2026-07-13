@@ -45,7 +45,7 @@ $remote = @'
 docker run --rm \
   -v /opt/kiro-rs-json-fix/admin-ui:/app \
   -w /app oven/bun:1-alpine \
-  sh -lc 'bun install --frozen-lockfile && bun run build'
+  sh -c 'bun install --frozen-lockfile && bun run build'
 '@
 ssh -p 18792 root@43.225.196.10 $remote
 ```
@@ -94,7 +94,7 @@ docker run --rm \
   -v kiro-json-cargo-git:/usr/local/cargo/git \
   -v kiro-json-target:/app/target \
   -w /app rust:1.92-alpine \
-  sh -lc 'apk add --no-cache musl-dev perl make >/dev/null && cargo test --no-default-features -j 8 strict_json_ignores_distant_cues_in_large_code_context'
+  sh -c 'apk add --no-cache musl-dev perl make >/dev/null && cargo test --no-default-features -j 8 strict_json_ignores_distant_cues_in_large_code_context'
 '@
 ssh -p 18792 root@43.225.196.10 $remote
 ```
@@ -192,7 +192,7 @@ docker run --rm \
   -v kiro-json-cargo-git:/usr/local/cargo/git \
   -v kiro-json-target:/app/target \
   -w /app rust:1.92-alpine \
-  sh -lc 'apk add --no-cache musl-dev perl make >/dev/null && cargo test --no-default-features -j 8 strict_json_ignores_distant_cues_in_large_code_context'
+  sh -c 'apk add --no-cache musl-dev perl make >/dev/null && cargo test --no-default-features -j 8 strict_json_ignores_distant_cues_in_large_code_context'
 '@
 ssh -p 18792 root@43.225.196.10 $remote
 ```
@@ -246,7 +246,7 @@ docker run --rm \
   -v kiro-json-cargo-git:/usr/local/cargo/git \
   -v kiro-json-target:/app/target \
   -w /app rust:1.92-alpine \
-  sh -lc 'apk add --no-cache musl-dev perl make >/dev/null && cargo test --no-default-features -j 8 anthropic::exact_output::tests'
+  sh -c 'apk add --no-cache musl-dev perl make >/dev/null && cargo test --no-default-features -j 8 anthropic::exact_output::tests'
 '@
 ssh -p 18792 root@43.225.196.10 $remote
 ```
@@ -275,7 +275,7 @@ docker run --rm \
   -v kiro-json-cargo-git:/usr/local/cargo/git \
   -v kiro-json-target:/app/target \
   -w /app rust:1.92-alpine \
-  sh -lc 'apk add --no-cache musl-dev perl make >/dev/null && cargo test --no-default-features -j 8 strict_json_from_events && cargo test --no-default-features -j 8 strict_json_recovery'
+  sh -c 'apk add --no-cache musl-dev perl make >/dev/null && cargo test --no-default-features -j 8 strict_json_from_events && cargo test --no-default-features -j 8 strict_json_recovery'
 '@
 ssh -p 18792 root@43.225.196.10 $remote
 ```
@@ -290,7 +290,7 @@ docker run --rm \
   -v kiro-json-cargo-git:/usr/local/cargo/git \
   -v kiro-json-target:/app/target \
   -w /app rust:1.92-alpine \
-  sh -lc 'apk add --no-cache musl-dev perl make >/dev/null && cargo test --no-default-features -j 8 --quiet && cargo check --no-default-features -j 8 --quiet'
+  sh -c 'apk add --no-cache musl-dev perl make >/dev/null && cargo test --no-default-features -j 8 --quiet && cargo check --no-default-features -j 8 --quiet'
 '@
 ssh -p 18792 root@43.225.196.10 $remote
 ```
@@ -347,7 +347,8 @@ docker run -d \
   --restart unless-stopped \
   kiro-rs-json-fix:test
 for _ in $(seq 1 30); do
-  curl -fsS http://127.0.0.1:18991/ >/dev/null && exit 0
+  status="$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:18991/ || true)"
+  test "$status" != 000 && exit 0
   sleep 1
 done
 docker logs --tail 100 kiro-rs-json-fix
