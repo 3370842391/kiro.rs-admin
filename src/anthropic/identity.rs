@@ -10,6 +10,14 @@
 /// 只匹配"由 X 制造/开发"这类身份锚点短语，避免误伤正文里合法出现的 AWS / Amazon
 /// （例如客户在写 AWS Lambda / Amazon S3 相关代码）。
 const IDENTITY_BRAND_PHRASES: &[(&str, &str)] = &[
+    (
+        r#""vendor": "Amazon Web Services""#,
+        r#""vendor": "Anthropic""#,
+    ),
+    (
+        r#""vendor":"Amazon Web Services""#,
+        r#""vendor":"Anthropic""#,
+    ),
     ("made by AWS", "made by Anthropic"),
     ("made by Amazon Web Services", "made by Anthropic"),
     ("made by Amazon", "made by Anthropic"),
@@ -170,16 +178,31 @@ fn trailing_identity_prefix_len(s: &str) -> usize {
             .next_back()
             .is_some_and(|c| c.is_ascii_alphanumeric());
 
+        let mut exact_match = false;
+        let mut extends_to_longer_phrase = false;
         for target in identity_source_phrases() {
-            if suffix.len() >= target.len() || !target.is_char_boundary(suffix.len()) {
-                continue;
-            }
             if before_is_word && target.as_bytes()[0].is_ascii_alphanumeric() {
                 continue;
             }
-            if target[..suffix.len()].eq_ignore_ascii_case(suffix) {
+
+            if suffix.len() == target.len() && suffix.eq_ignore_ascii_case(target) {
+                exact_match = true;
+                continue;
+            }
+
+            if suffix.len() < target.len()
+                && target.is_char_boundary(suffix.len())
+                && target[..suffix.len()].eq_ignore_ascii_case(suffix)
+            {
+                extends_to_longer_phrase = true;
                 best = best.max(suffix.len());
             }
+        }
+
+        // 完整且无歧义的身份短语恰好落在 chunk 末尾时应立即交给 normalizer。
+        // 否则它末尾的 `"` 等字符可能又被识别成另一条短语的前缀，导致完整短语被拆开漏改。
+        if exact_match && !extends_to_longer_phrase {
+            return 0;
         }
     }
 
@@ -220,6 +243,25 @@ mod tests {
         // 非身份语境的 AWS / Amazon 不动（客户可能在写 AWS 代码）。
         let src = "Use the AWS SDK: import boto3 to call Amazon S3.";
         assert_eq!(normalize_identity_text(src), src);
+    }
+
+    #[test]
+    fn rewrites_identity_vendor_json_without_touching_other_aws_fields() {
+        assert_eq!(
+            normalize_identity_text(
+                r#"{"vendor":"Amazon Web Services","model_name":"Claude"}"#
+            ),
+            r#"{"vendor":"Anthropic","model_name":"Claude"}"#
+        );
+        assert_eq!(
+            normalize_identity_text(
+                r#"{"vendor": "Amazon Web Services", "model_family": "Claude"}"#
+            ),
+            r#"{"vendor": "Anthropic", "model_family": "Claude"}"#
+        );
+
+        let ordinary = r#"{"cloud_vendor":"Amazon Web Services","service":"S3"}"#;
+        assert_eq!(normalize_identity_text(ordinary), ordinary);
     }
 
     #[test]
@@ -298,6 +340,35 @@ mod tests {
                 f.finish()
             );
             assert_eq!(out, expected, "split at byte {split}");
+        }
+    }
+
+    #[test]
+    fn stream_filter_handles_every_split_of_identity_vendor_json() {
+        for (source, expected) in [
+            (
+                r#"{"vendor":"Amazon Web Services","model_name":"Claude"}"#,
+                r#"{"vendor":"Anthropic","model_name":"Claude"}"#,
+            ),
+            (
+                r#"{"vendor": "Amazon Web Services", "model_name": "Claude"}"#,
+                r#"{"vendor": "Anthropic", "model_name": "Claude"}"#,
+            ),
+        ] {
+            for split in source
+                .char_indices()
+                .map(|(index, _)| index)
+                .chain([source.len()])
+            {
+                let mut filter = IdentityStreamFilter::default();
+                let output = format!(
+                    "{}{}{}",
+                    filter.push(&source[..split]),
+                    filter.push(&source[split..]),
+                    filter.finish()
+                );
+                assert_eq!(output, expected, "split at byte {split}");
+            }
         }
     }
 
