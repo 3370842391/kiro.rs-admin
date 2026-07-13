@@ -26,6 +26,7 @@ pub mod cache_metering;
 pub(crate) mod converter;
 mod document;
 pub(crate) mod exact_output;
+pub(crate) mod error_snapshot;
 pub(crate) mod handlers;
 pub(crate) mod identity;
 pub(crate) mod middleware;
