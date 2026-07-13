@@ -165,6 +165,7 @@ export function ModelProfilesDialog({ open, onOpenChange }: ModelProfilesDialogP
       {
         onSuccess: ({ summary: nextSummary }) => {
           setLastSummary(nextSummary)
+          setShowSummary(true)
           toast.success(`已获取 ${modelId}：补充 ${nextSummary.applied.length} 个字段`)
         },
         onError: (mutationError) => handleMutationError('获取', mutationError),
@@ -220,7 +221,7 @@ export function ModelProfilesDialog({ open, onOpenChange }: ModelProfilesDialogP
       title: '删除模型资料',
       description: (
         <>
-          将删除 <code>{profile.modelId}</code> 的全部持久化资料，但不会隐藏模型，也不会删除模型映射。
+          将删除 <code>{profile.modelId}</code> 的全部持久化资料；模型不会被隐藏，模型映射也不会删除，运行时会回退到 resolved/builtin 资料。
         </>
       ),
       confirmText: '删除资料',

@@ -107,6 +107,23 @@ describe('model profiles', () => {
     ).toBe(true)
   })
 
+  test('ignores lock metadata when checking whether a new profile has values', () => {
+    const draft = {
+      contextWindowTokens: '',
+      maxOutputTokens: '',
+      knowledgeCutoff: '',
+      releaseDate: '',
+      locks: {
+        contextWindowTokens: true,
+        maxOutputTokens: true,
+        knowledgeCutoff: true,
+        releaseDate: true,
+      },
+    }
+
+    expect(hasProfileDraftValue(draft)).toBe(false)
+  })
+
   test('buildProfilePatch locks manual values and emits null for cleared overrides', () => {
     expect(
       JSON.stringify(buildProfilePatch(7, {

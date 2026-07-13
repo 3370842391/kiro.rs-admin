@@ -70,7 +70,9 @@ export function validateProfileDraft(draft: ModelProfileDraftValues): string | n
 }
 
 export function hasProfileDraftValue(draft: ModelProfileDraftValues): boolean {
-  return Object.values(draft).some((value) => value.trim().length > 0)
+  return TOKEN_FIELDS.some((field) => draft[field].trim().length > 0)
+    || draft.knowledgeCutoff.trim().length > 0
+    || draft.releaseDate.trim().length > 0
 }
 
 export function buildProfilePatch(
