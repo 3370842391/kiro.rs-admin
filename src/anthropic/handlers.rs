@@ -972,13 +972,21 @@ fn prepare_strict_json_request_bodies(
     structured_format: Option<&super::types::OutputFormat>,
 ) -> Option<StrictJsonRequestBodies> {
     if let Some(format) = structured_format {
-        let retry =
+        let first =
             super::exact_output::append_structured_output_instruction(request_body, format)?;
-        let threshold = threshold_retry_body
-            .and_then(|body| super::exact_output::append_structured_output_instruction(body, format));
+        let retry = super::exact_output::append_strict_json_retry_instruction(&first)?;
+        let threshold_first = match threshold_retry_body {
+            Some(body) => Some(super::exact_output::append_structured_output_instruction(
+                body, format,
+            )?),
+            None => None,
+        };
+        let threshold_retry = threshold_first
+            .as_deref()
+            .and_then(super::exact_output::append_strict_json_retry_instruction);
         return Some(StrictJsonRequestBodies {
-            bodies: [request_body.to_owned(), retry],
-            threshold_retry_bodies: [threshold_retry_body.map(str::to_owned), threshold],
+            bodies: [first, retry],
+            threshold_retry_bodies: [threshold_first, threshold_retry],
         });
     }
 
@@ -5534,7 +5542,7 @@ mod tests {
 
         assert!(!prepared.bodies[0].contains("exactly one JSON value"));
         assert!(!prepared.bodies[0].contains("\"required\":[\"answer\"]"));
-        for body in prepared.bodies.into_iter().skip(1) {
+        for body in prepared.bodies.iter().skip(1) {
             assert!(body.contains("Return exactly one JSON value"));
             assert!(body.contains("answer"));
         }
