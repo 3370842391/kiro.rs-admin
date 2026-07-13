@@ -2738,7 +2738,7 @@ impl StreamContext {
             }
             for completed in salvaged {
                 tracing::warn!(
-                    "上游在无参工具 {} ({}) 未发 stop=true 即断流，按 {{}} 打捞发出",
+                    "上游工具 {} ({}) 未发 stop=true 即断流；残留入参已严格解析为完整 JSON，按隐式 stop 打捞发出",
                     completed.name,
                     completed.id
                 );
