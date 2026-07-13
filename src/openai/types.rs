@@ -772,6 +772,7 @@ fn openai_reasoning_to_anthropic(
         }),
         Some(OutputConfig {
             effort: normalized_effort.to_string(),
+            format: None,
         }),
     )
 }

@@ -98,6 +98,15 @@ where
 pub struct OutputConfig {
     #[serde(default = "default_effort")]
     pub effort: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<OutputFormat>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct OutputFormat {
+    #[serde(rename = "type")]
+    pub format_type: String,
+    pub schema: serde_json::Value,
 }
 
 fn default_effort() -> String {
@@ -377,5 +386,27 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn output_config_preserves_effort_and_json_schema_format() {
+        let config: OutputConfig = serde_json::from_value(serde_json::json!({
+            "effort": "high",
+            "format": {
+                "type": "json_schema",
+                "schema": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "integer"}},
+                    "required": ["answer"],
+                    "additionalProperties": false
+                }
+            }
+        }))
+        .unwrap();
+
+        let round_trip = serde_json::to_value(config).unwrap();
+        assert_eq!(round_trip["effort"], "high");
+        assert_eq!(round_trip["format"]["type"], "json_schema");
+        assert_eq!(round_trip["format"]["schema"]["required"][0], "answer");
     }
 }

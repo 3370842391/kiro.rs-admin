@@ -755,18 +755,24 @@ struct StrictJsonRecoveryFailure {
 }
 
 fn strict_json_from_events(events: &[SseEvent]) -> Option<String> {
+    let text = visible_text_from_events(events)?;
+    super::exact_output::extract_single_json(&text)
+}
+
+fn visible_text_from_events(events: &[SseEvent]) -> Option<String> {
     if events.iter().any(|event| {
         event.event == "content_block_start" && event.data["content_block"]["type"] == "tool_use"
     }) {
         return None;
     }
-    let text = events
-        .iter()
-        .filter(|event| event.event == "content_block_delta")
-        .filter(|event| event.data["delta"]["type"] == "text_delta")
-        .filter_map(|event| event.data["delta"]["text"].as_str())
-        .collect::<String>();
-    super::exact_output::extract_single_json(&text)
+    Some(
+        events
+            .iter()
+            .filter(|event| event.event == "content_block_delta")
+            .filter(|event| event.data["delta"]["type"] == "text_delta")
+            .filter_map(|event| event.data["delta"]["text"].as_str())
+            .collect::<String>(),
+    )
 }
 
 #[cfg(test)]
@@ -777,11 +783,12 @@ where
     F: FnMut(usize) -> Fut,
     Fut: Future<Output = anyhow::Result<BufferedAttempt>>,
 {
-    recover_strict_json_attempts_with_validator(collect, |_| true).await
+    recover_strict_json_attempts_with_validator(collect, false, |_| true).await
 }
 
 async fn recover_strict_json_attempts_with_validator<F, Fut, V>(
     mut collect: F,
+    require_exact_json: bool,
     mut validate: V,
 ) -> Result<StrictJsonRecovery, StrictJsonRecoveryFailure>
 where
@@ -811,7 +818,13 @@ where
         let json = attempt
             .terminal_error
             .is_none()
-            .then(|| strict_json_from_events(&attempt.events))
+            .then(|| {
+                if require_exact_json {
+                    visible_text_from_events(&attempt.events)
+                } else {
+                    strict_json_from_events(&attempt.events)
+                }
+            })
             .flatten();
         attempts.push(attempt);
         if terminal_failure.is_some() {
@@ -922,7 +935,12 @@ async fn collect_buffered_attempt(
 }
 
 fn strict_json_route_allowed(payload: &MessagesRequest) -> bool {
-    if !super::exact_output::strict_json_requested(payload)
+    let has_structured_format = payload
+        .output_config
+        .as_ref()
+        .and_then(|config| config.format.as_ref())
+        .is_some();
+    if !(has_structured_format || super::exact_output::strict_json_requested(payload))
         || payload
             .tools
             .as_ref()
@@ -943,6 +961,39 @@ fn strict_json_route_allowed(payload: &MessagesRequest) -> bool {
     })
 }
 
+struct StrictJsonRequestBodies {
+    bodies: [String; 2],
+    threshold_retry_bodies: [Option<String>; 2],
+}
+
+fn prepare_strict_json_request_bodies(
+    request_body: &str,
+    threshold_retry_body: Option<&str>,
+    structured_format: Option<&super::types::OutputFormat>,
+) -> Option<StrictJsonRequestBodies> {
+    if let Some(format) = structured_format {
+        let retry =
+            super::exact_output::append_structured_output_instruction(request_body, format)?;
+        let threshold = threshold_retry_body
+            .and_then(|body| super::exact_output::append_structured_output_instruction(body, format));
+        return Some(StrictJsonRequestBodies {
+            bodies: [request_body.to_owned(), retry],
+            threshold_retry_bodies: [threshold_retry_body.map(str::to_owned), threshold],
+        });
+    }
+
+    Some(StrictJsonRequestBodies {
+        bodies: [
+            request_body.to_owned(),
+            super::exact_output::append_strict_json_retry_instruction(request_body)?,
+        ],
+        threshold_retry_bodies: [
+            threshold_retry_body.map(str::to_owned),
+            threshold_retry_body.and_then(super::exact_output::append_strict_json_retry_instruction),
+        ],
+    })
+}
+
 async fn handle_strict_json_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -955,29 +1006,38 @@ async fn handle_strict_json_request(
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
 ) -> Response {
-    let Some(retry_body) = super::exact_output::append_strict_json_retry_instruction(request_body)
-    else {
+    let structured_format = payload
+        .output_config
+        .as_ref()
+        .and_then(|config| config.format.as_ref());
+    let Some(prepared) = prepare_strict_json_request_bodies(
+        request_body,
+        threshold_retry_body,
+        structured_format,
+    ) else {
         hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
-        finalize_immediate_error(
-            tracer.as_ref(),
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal_error",
-            "failed to prepare strict JSON retry",
-        );
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse::new(
+        let (status, error_type, internal_message, client_message) = if structured_format.is_some() {
+            (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "invalid or oversized structured output format",
+                "Invalid or oversized output_config.format",
+            )
+        } else {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
+                "failed to prepare strict JSON retry",
                 "Failed to prepare strict JSON request",
-            )),
-        )
-            .into_response();
+            )
+        };
+        finalize_immediate_error(tracer.as_ref(), status, error_type, internal_message);
+        return (status, Json(ErrorResponse::new(error_type, client_message))).into_response();
     };
-    let bodies = [request_body.to_owned(), retry_body];
-    let threshold_retry_bodies = [
-        threshold_retry_body.map(str::to_owned),
-        threshold_retry_body.and_then(super::exact_output::append_strict_json_retry_instruction),
-    ];
+    let StrictJsonRequestBodies {
+        bodies,
+        threshold_retry_bodies,
+    } = prepared;
     let model = payload.model.clone();
     let recovery = recover_strict_json_attempts_with_validator(
         |attempt_index| {
@@ -1011,7 +1071,13 @@ async fn handle_strict_json_request(
                 .await
             }
         },
-        |json| super::exact_output::json_satisfies_explicit_constraints(payload, json),
+        structured_format.is_some(),
+        |json| {
+            structured_format.map_or_else(
+                || super::exact_output::json_satisfies_explicit_constraints(payload, json),
+                |format| super::structured_output::validate_output_json(json, format).is_ok(),
+            )
+        },
     )
     .await;
 
@@ -1153,7 +1219,17 @@ async fn handle_strict_json_request(
                     .into_response();
             }
 
-            let message = "Upstream did not produce one complete JSON value after one retry";
+            let (error_type, message) = if structured_format.is_some() {
+                (
+                    "upstream_structured_output_error",
+                    "Upstream did not produce JSON matching output_config.format after one retry",
+                )
+            } else {
+                (
+                    "upstream_json_protocol_error",
+                    "Upstream did not produce one complete JSON value after one retry",
+                )
+            };
             tracing::warn!(
                 attempts = failure.attempts.len(),
                 "strict JSON recovery exhausted"
@@ -1172,7 +1248,7 @@ async fn handle_strict_json_request(
                     json!({
                         "type": "error",
                         "error": {
-                            "type": "upstream_json_protocol_error",
+                            "type": error_type,
                             "message": message
                         }
                     }),
@@ -1188,7 +1264,7 @@ async fn handle_strict_json_request(
             } else {
                 (
                     StatusCode::BAD_GATEWAY,
-                    Json(ErrorResponse::new("upstream_json_protocol_error", message)),
+                    Json(ErrorResponse::new(error_type, message)),
                 )
                     .into_response()
             }
@@ -2615,25 +2691,10 @@ fn create_early_sse_stream(
 /// Ping 事件间隔（25秒）
 const PING_INTERVAL_SECS: u64 = 25;
 
-const EARLY_CONNECTED_SSE: &[u8] = b": connected\n\n";
-const EARLY_PING_SSE: &[u8] = b"event: ping\ndata: {\"type\":\"ping\"}\n\n";
-const EARLY_PING_INTERVAL: Duration = Duration::from_secs(1);
-
 type BoxByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, Infallible>> + Send>>;
 
 enum PendingCallEvent<T> {
-    Comment(Bytes),
     Complete(anyhow::Result<T>),
-}
-
-impl<T> PendingCallEvent<T> {
-    #[cfg(test)]
-    fn comment_bytes(&self) -> Option<&[u8]> {
-        match self {
-            Self::Comment(bytes) => Some(bytes.as_ref()),
-            Self::Complete(_) => None,
-        }
-    }
 }
 
 fn pending_call_stream<F, T>(future: F) -> impl Stream<Item = PendingCallEvent<T>>
@@ -2641,47 +2702,7 @@ where
     F: Future<Output = anyhow::Result<T>> + Send + 'static,
     T: Send + 'static,
 {
-    struct State<F> {
-        future: Pin<Box<F>>,
-        heartbeat: tokio::time::Interval,
-        connected_sent: bool,
-        completed: bool,
-    }
-
-    let heartbeat = tokio::time::interval_at(
-        TokioInstant::now() + EARLY_PING_INTERVAL,
-        EARLY_PING_INTERVAL,
-    );
-    stream::unfold(
-        State {
-            future: Box::pin(future),
-            heartbeat,
-            connected_sent: false,
-            completed: false,
-        },
-        |mut state| async move {
-            if state.completed {
-                return None;
-            }
-            if !state.connected_sent {
-                state.connected_sent = true;
-                return Some((
-                    PendingCallEvent::Comment(Bytes::from_static(EARLY_CONNECTED_SSE)),
-                    state,
-                ));
-            }
-            tokio::select! {
-                result = &mut state.future => {
-                    state.completed = true;
-                    Some((PendingCallEvent::Complete(result), state))
-                }
-                _ = state.heartbeat.tick() => Some((
-                    PendingCallEvent::Comment(Bytes::from_static(EARLY_PING_SSE)),
-                    state,
-                )),
-            }
-        },
-    )
+    stream::once(async move { PendingCallEvent::Complete(future.await) })
 }
 
 fn flatten_pending_call<F, T, M>(
@@ -2696,9 +2717,6 @@ where
     pending_call_stream(future)
         .map(move |event| -> BoxByteStream {
             match event {
-                PendingCallEvent::Comment(bytes) => {
-                    Box::pin(stream::once(async move { Ok(bytes) }))
-                }
                 PendingCallEvent::Complete(result) => on_complete(result),
             }
         })
@@ -3786,8 +3804,9 @@ fn build_non_stream_content(
             content.push(json!({
                 "type": "thinking",
                 "thinking": native_thinking.clone(),
-                "signature": native_thinking_signature
-                    .unwrap_or_else(|| super::stream::THINKING_SIGNATURE_PLACEHOLDER.to_string()),
+                "signature": native_thinking_signature.unwrap_or_else(|| {
+                    super::thinking_signature::issue_signature("non-stream", &native_thinking)
+                }),
             }));
         } else {
             // 从完整文本中提取 thinking 块，兼容旧的 <thinking> 文本路径。
@@ -3798,7 +3817,10 @@ fn build_non_stream_content(
                 content.push(json!({
                     "type": "thinking",
                     "thinking": thinking_text,
-                    "signature": super::stream::THINKING_SIGNATURE_PLACEHOLDER,
+                    "signature": super::thinking_signature::issue_signature(
+                        "non-stream",
+                        &thinking_text,
+                    ),
                 }));
             }
 
@@ -3867,6 +3889,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     if is_opus_4_6 {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
+            format: None,
         });
     }
 }
@@ -5449,6 +5472,80 @@ mod tests {
         assert_eq!(strict_json_from_events(&truncated), None);
     }
 
+    #[test]
+    fn output_config_format_uses_buffered_strict_json_route_without_prompt_cues() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [{"role": "user", "content": "Give me the answer."}],
+            "output_config": {
+                "effort": "high",
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"answer": {"type": "integer"}},
+                        "required": ["answer"],
+                        "additionalProperties": false
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        assert!(strict_json_route_allowed(&request));
+    }
+
+    #[test]
+    fn structured_output_schema_is_present_in_first_and_retry_bodies() {
+        let request_body = serde_json::json!({
+            "conversationState": {
+                "currentMessage": {
+                    "userInputMessage": {"content": "return the answer"}
+                }
+            }
+        })
+        .to_string();
+        let threshold_body = serde_json::json!({
+            "conversationState": {
+                "currentMessage": {
+                    "userInputMessage": {"content": "return the shorter answer"}
+                }
+            }
+        })
+        .to_string();
+        let format = super::super::types::OutputFormat {
+            format_type: "json_schema".into(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {"answer": {"type": "integer"}},
+                "required": ["answer"],
+                "additionalProperties": false
+            }),
+        };
+
+        let prepared = prepare_strict_json_request_bodies(
+            &request_body,
+            Some(&threshold_body),
+            Some(&format),
+        )
+        .expect("structured output request bodies");
+
+        assert!(!prepared.bodies[0].contains("exactly one JSON value"));
+        assert!(!prepared.bodies[0].contains("\"required\":[\"answer\"]"));
+        for body in prepared.bodies.into_iter().skip(1) {
+            assert!(body.contains("Return exactly one JSON value"));
+            assert!(body.contains("answer"));
+        }
+        assert!(prepared.threshold_retry_bodies[0].as_deref().is_some_and(
+            |body| !body.contains("exactly one JSON value")
+        ));
+        assert!(prepared.threshold_retry_bodies[1].as_deref().is_some_and(
+            |body| body.contains("Return exactly one JSON value") && body.contains("answer")
+        ));
+    }
+
     #[tokio::test]
     async fn strict_json_recovery_retries_once_then_accepts_valid_json() {
         let attempt = |text: &str| BufferedAttempt {
@@ -5513,6 +5610,7 @@ mod tests {
                 calls += 1;
                 futures::future::ready(Ok(attempts.pop_front().unwrap()))
             },
+            false,
             |json| super::super::exact_output::json_satisfies_explicit_constraints(&request, json),
         )
         .await
@@ -5520,6 +5618,50 @@ mod tests {
 
         assert_eq!(calls, 2);
         assert_eq!(recovered.json, "{\"alpha\":\"ztset\",\"total\":37}");
+    }
+
+    #[tokio::test]
+    async fn structured_output_recovery_retries_markdown_wrapped_json() {
+        let format = super::super::types::OutputFormat {
+            format_type: "json_schema".into(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {"answer": {"type": "integer"}},
+                "required": ["answer"],
+                "additionalProperties": false
+            }),
+        };
+        let attempt = |text: &str| BufferedAttempt {
+            events: build_local_text_stream_events(
+                "claude-opus-4-8",
+                text,
+                20,
+                crate::anthropic::cache_metering::CacheUsage::default(),
+            ),
+            credential_id: 1,
+            usage: TraceUsage::zero(),
+            credits: 0.0,
+            terminal_error: None,
+            attempt_failure: None,
+        };
+        let mut attempts = std::collections::VecDeque::from([
+            attempt("```json\n{\"answer\":42}\n```"),
+            attempt("{\"answer\":42}"),
+        ]);
+        let mut calls = 0;
+        let recovered = recover_strict_json_attempts_with_validator(
+            |_| {
+                calls += 1;
+                futures::future::ready(Ok(attempts.pop_front().unwrap()))
+            },
+            true,
+            |json| super::super::structured_output::validate_output_json(json, &format).is_ok(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(calls, 2);
+        assert_eq!(recovered.json, "{\"answer\":42}");
     }
 
     #[tokio::test]
@@ -5694,48 +5836,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_call_stream_emits_connected_then_ping() {
+    async fn pending_call_stream_waits_silently_for_provider() {
         let stream = pending_call_stream(future::pending::<Result<(), anyhow::Error>>());
         futures::pin_mut!(stream);
 
-        let connected = stream.next().await.unwrap();
-        let connected_bytes = connected.comment_bytes().unwrap();
-        assert_eq!(connected_bytes, b": connected\n\n");
-        assert!(
-            !connected_bytes
-                .split(|byte| *byte == b'\n')
-                .any(|line| line.starts_with(b"data:")),
-            "connected 必须保持为 New API 忽略的 SSE 注释"
-        );
         assert!(
             tokio::time::timeout(Duration::from_millis(100), stream.next())
                 .await
                 .is_err(),
-            "ping 不应紧跟 connected 立即发出"
-        );
-        let ping = tokio::time::timeout(Duration::from_millis(1200), stream.next())
-            .await
-            .expect("1 秒后应产生 ping")
-            .unwrap();
-        let ping_bytes = ping.comment_bytes().unwrap();
-        assert_eq!(ping_bytes, b"event: ping\ndata: {\"type\":\"ping\"}\n\n");
-        assert!(
-            ping_bytes
-                .split(|byte| *byte == b'\n')
-                .any(|line| line.starts_with(b"data:")),
-            "ping 必须包含 New API 可识别的 data 行"
+            "message_start 前不得发送 comment 或 ping"
         );
     }
 
     #[tokio::test]
-    async fn pending_call_stream_completes_after_connected() {
+    async fn pending_call_stream_completes_without_prefix_event() {
         let stream = pending_call_stream(async { Ok::<_, anyhow::Error>(7u8) });
         futures::pin_mut!(stream);
 
         assert!(matches!(
             stream.next().await,
-            Some(PendingCallEvent::Comment(_))
+            Some(PendingCallEvent::Complete(Ok(7)))
         ));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn strict_pending_call_stream_emits_no_event_before_provider_completion() {
+        let stream = pending_call_stream(async { Ok::<_, anyhow::Error>(7u8) });
+        futures::pin_mut!(stream);
+
         assert!(matches!(
             stream.next().await,
             Some(PendingCallEvent::Complete(Ok(7)))
@@ -5760,10 +5889,11 @@ mod tests {
                 future::pending::<Result<(), anyhow::Error>>().await
             });
             futures::pin_mut!(stream);
-            assert!(matches!(
-                stream.next().await,
-                Some(PendingCallEvent::Comment(_))
-            ));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), stream.next())
+                    .await
+                    .is_err()
+            );
         }
         tokio::task::yield_now().await;
         assert!(dropped.load(Ordering::SeqCst));
@@ -5791,14 +5921,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn early_stream_error_sends_comment_then_error_without_message_start() {
+    async fn early_stream_error_starts_with_error_without_message_start() {
         let stream = early_error_test_stream(anyhow::anyhow!("connection reset"), Some(502));
         futures::pin_mut!(stream);
         let first = stream.next().await.unwrap().unwrap();
-        let second = stream.next().await.unwrap().unwrap();
-        assert_eq!(first, Bytes::from_static(EARLY_CONNECTED_SSE));
-        assert!(String::from_utf8_lossy(&second).starts_with("event: error\n"));
-        assert!(!String::from_utf8_lossy(&second).contains("message_start"));
+        assert!(String::from_utf8_lossy(&first).starts_with("event: error\n"));
+        assert!(!String::from_utf8_lossy(&first).contains("message_start"));
         assert!(stream.next().await.is_none());
     }
 
@@ -5812,10 +5940,6 @@ mod tests {
         ]));
         let stream = flatten_pending_call_for_test(Ok(inner));
         futures::pin_mut!(stream);
-        assert_eq!(
-            stream.next().await.unwrap().unwrap(),
-            Bytes::from_static(EARLY_CONNECTED_SSE)
-        );
         assert!(
             String::from_utf8_lossy(&stream.next().await.unwrap().unwrap())
                 .contains("message_start")
@@ -5915,10 +6039,9 @@ mod tests {
         assert_eq!(content.len(), 2);
         assert_eq!(content[0]["type"], "thinking");
         assert_eq!(content[0]["thinking"], "legacy thinking");
-        assert_eq!(
-            content[0]["signature"],
-            crate::anthropic::stream::THINKING_SIGNATURE_PLACEHOLDER
-        );
+        assert!(content[0]["signature"]
+            .as_str()
+            .is_some_and(|signature| signature.starts_with("krs1_")));
         assert_eq!(content[1]["type"], "text");
         assert_eq!(content[1]["text"], "final answer");
     }

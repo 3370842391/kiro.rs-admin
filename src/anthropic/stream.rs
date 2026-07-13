@@ -20,8 +20,6 @@ use crate::kiro::model::events::Event;
 /// thinking 块结束时插入一个非空占位字符串以满足客户端本地校验。
 /// converter 在解析 assistant 消息回传 Kiro 时只读 `block.thinking`，不读
 /// signature，因此该占位字符串只在客户端 ↔ kiro.rs 之间存在，不会影响转发。
-pub(super) const THINKING_SIGNATURE_PLACEHOLDER: &str = "kiro-rs-thinking-signature";
-
 const TOOL_USE_XML_PREFIX: &str = "<tool_use";
 const TOOL_USE_XML_CLOSE: &str = "</tool_use>";
 
@@ -2359,7 +2357,9 @@ impl StreamContext {
         let signature = self
             .pending_thinking_signature
             .take()
-            .unwrap_or_else(|| THINKING_SIGNATURE_PLACEHOLDER.to_string());
+            .unwrap_or_else(|| {
+                super::thinking_signature::issue_signature(&self.message_id, &self.thinking_buffer)
+            });
         let mut events = vec![
             self.create_thinking_delta_event(idx, ""),
             self.create_signature_delta_event_with(idx, &signature),
@@ -2470,7 +2470,11 @@ impl StreamContext {
     /// 占位字符串以满足客户端本地校验。该字段不参与转发回 Kiro 的逻辑
     /// （converter 只读 `block.thinking`，不读 signature）。
     fn create_signature_delta_event(&self, index: i32) -> SseEvent {
-        self.create_signature_delta_event_with(index, THINKING_SIGNATURE_PLACEHOLDER)
+        let signature = super::thinking_signature::issue_signature(
+            &self.message_id,
+            &self.thinking_buffer,
+        );
+        self.create_signature_delta_event_with(index, &signature)
     }
 
     fn create_signature_delta_event_with(&self, index: i32, signature: &str) -> SseEvent {

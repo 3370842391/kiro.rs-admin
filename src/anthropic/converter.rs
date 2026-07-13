@@ -2523,6 +2523,7 @@ mod tests {
             thinking: None,
             output_config: Some(OutputConfig {
                 effort: effort.to_string(),
+                format: None,
             }),
             metadata: None,
         }
