@@ -868,8 +868,8 @@ git diff --check
 在隔离的 8991 测试服务上运行只读 smoke check：
 
 ```bash
-ERROR_SNAPSHOT_BASE_URL=http://127.0.0.1:8991/admin \\
-ERROR_SNAPSHOT_ADMIN_TOKEN="$ADMIN_API_KEY" \\
+ERROR_SNAPSHOT_BASE_URL=http://127.0.0.1:8991/admin \
+ERROR_SNAPSHOT_ADMIN_TOKEN="$ADMIN_API_KEY" \
 ./scripts/error-snapshot-smoke.sh
 ```
 
