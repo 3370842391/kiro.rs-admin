@@ -176,8 +176,31 @@ pub fn truncate_snippet(body: &str) -> Option<String> {
 }
 
 /// 链路上报接收端：provider 在重试循环里每跳调用 [`Self::on_attempt`]
+pub enum TraceDiagnosticEvent<'a> {
+    UpstreamRequest {
+        attempt: u32,
+        credential_id: u64,
+        endpoint: &'a str,
+        body: &'a str,
+    },
+    UpstreamResponse {
+        attempt: u32,
+        credential_id: u64,
+        endpoint: &'a str,
+        status: u16,
+        body: &'a str,
+    },
+    NetworkError {
+        attempt: u32,
+        credential_id: u64,
+        endpoint: &'a str,
+        message: &'a str,
+    },
+}
+
 pub trait TraceSink: Send + Sync {
     fn on_attempt(&self, attempt: TraceAttempt);
+    fn on_diagnostic(&self, _event: TraceDiagnosticEvent<'_>) {}
 }
 
 /// 查询过滤条件

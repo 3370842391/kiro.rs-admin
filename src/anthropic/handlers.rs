@@ -7,7 +7,8 @@ use std::time::Instant;
 
 use crate::admin::client_keys::SharedClientKeyManager;
 use crate::admin::trace_db::{
-    SharedTraceStore, TraceAttempt, TraceKeySource, TraceRecord, TraceSink, outcome,
+    SharedTraceStore, TraceAttempt, TraceDiagnosticEvent, TraceKeySource, TraceRecord, TraceSink,
+    outcome,
 };
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
 use crate::kiro::image_budget::{ImageBudgetError, PreparedKiroBodies, prepare_kiro_bodies};
@@ -255,12 +256,6 @@ impl RequestTracer {
         }
     }
 
-    pub fn record_kiro_request(&self, body: &str) {
-        if let Some(snapshot) = &self.snapshot {
-            snapshot.record_kiro_request(0, 0, "pending", body);
-        }
-    }
-
     fn last_http_status(&self) -> Option<u16> {
         self.attempts.lock().last().and_then(|a| a.http_status)
     }
@@ -345,6 +340,45 @@ impl TraceSink for RequestTracer {
             snapshot.record_attempt_status(attempt.attempt, attempt.http_status, &attempt.outcome);
         }
         self.attempts.lock().push(attempt);
+    }
+
+    fn on_diagnostic(&self, event: TraceDiagnosticEvent<'_>) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        match event {
+            TraceDiagnosticEvent::UpstreamRequest {
+                attempt,
+                credential_id,
+                endpoint,
+                body,
+            } => {
+                snapshot.record_kiro_request(attempt, credential_id, endpoint, body);
+            }
+            TraceDiagnosticEvent::UpstreamResponse {
+                attempt,
+                credential_id,
+                endpoint,
+                status,
+                body,
+            } => {
+                snapshot.record_upstream_response(
+                    attempt,
+                    credential_id,
+                    endpoint,
+                    status,
+                    body,
+                );
+            }
+            TraceDiagnosticEvent::NetworkError {
+                attempt,
+                credential_id,
+                endpoint,
+                message,
+            } => {
+                snapshot.record_network_error(attempt, credential_id, endpoint, message);
+            }
+        }
     }
 }
 
@@ -2175,8 +2209,6 @@ pub async fn post_messages(
     };
     let request_body = &prepared_bodies.primary_body;
     let threshold_retry_body = prepared_bodies.threshold_retry_body.as_deref();
-    tracer.record_kiro_request(request_body);
-
     tracing::debug!("Kiro request body: {}", request_body);
 
     // 估算输入 tokens
@@ -4032,8 +4064,6 @@ pub async fn post_messages_cc(
     };
     let request_body = &prepared_bodies.primary_body;
     let threshold_retry_body = prepared_bodies.threshold_retry_body.as_deref();
-    tracer.record_kiro_request(request_body);
-
     tracing::debug!("Kiro request body: {}", request_body);
 
     // 计算总 input tokens
@@ -4661,6 +4691,78 @@ mod tests {
         assert_eq!(page.total, 1);
         assert_eq!(page.records[0].http_status, Some(400));
         assert_eq!(page.records[0].error_message.as_deref(), Some("bad document"));
+    }
+
+    #[test]
+    fn request_tracer_forwards_provider_diagnostics_without_duplicate_attempts() {
+        let (tracer, snapshot_store, _trace_store) =
+            test_request_tracer_with_snapshot("trace-provider-diagnostics");
+
+        tracer.on_diagnostic(crate::admin::trace_db::TraceDiagnosticEvent::UpstreamRequest {
+            attempt: 0,
+            credential_id: 7,
+            endpoint: "ide",
+            body: r#"{"conversationState":{"currentMessage":"hello"}}"#,
+        });
+        tracer.on_diagnostic(crate::admin::trace_db::TraceDiagnosticEvent::UpstreamResponse {
+            attempt: 0,
+            credential_id: 7,
+            endpoint: "ide",
+            status: 400,
+            body: r#"{"message":"Invalid tool use format."}"#,
+        });
+        tracer.on_attempt(TraceAttempt {
+            attempt: 0,
+            credential_id: 7,
+            endpoint: "ide".to_string(),
+            http_status: Some(400),
+            outcome: outcome::BAD_REQUEST.to_string(),
+            error_snippet: Some("Invalid tool use format.".to_string()),
+            duration_ms: 5,
+        });
+        tracer.finalize(
+            "error",
+            Some("bad_request"),
+            Some("Invalid tool use format."),
+            None,
+            TraceUsage::zero(),
+        );
+
+        let page = snapshot_store
+            .query_paged(&crate::admin::error_snapshot_db::SnapshotQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert!(page.records[0].payload_count >= 3);
+        assert_eq!(page.records[0].final_credential_id, 7);
+        assert_eq!(page.records[0].endpoint.as_deref(), Some("ide"));
+        let detail = snapshot_store
+            .get(&page.records[0].snapshot_id)
+            .unwrap()
+            .unwrap();
+        let seq = detail
+            .payloads
+            .iter()
+            .find(|payload| {
+                payload.kind == crate::common::error_snapshot::SnapshotPayloadKind::ToolDiagnostics
+            })
+            .unwrap()
+            .seq;
+        let payload = snapshot_store
+            .read_payload(&page.records[0].snapshot_id, seq)
+            .unwrap()
+            .unwrap();
+        let diagnostics: serde_json::Value = serde_json::from_slice(&payload.data).unwrap();
+        assert_eq!(diagnostics["attempts"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            diagnostics["upstream_diagnostics"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     fn failure_from_events(events: &[Event]) -> super::super::tool_attempt::AttemptFailure {

@@ -239,6 +239,7 @@ struct SnapshotDraft {
     client_request: serde_json::Value,
     payloads: Vec<RawSnapshotPayload>,
     attempts: Vec<AttemptObservation>,
+    upstream_diagnostics: Vec<UpstreamDiagnosticObservation>,
     protocol_errors: Vec<(String, String)>,
     stream_tail: StreamTail,
     final_credential_id: u64,
@@ -260,6 +261,16 @@ struct AttemptObservation {
     attempt: u32,
     http_status: Option<u16>,
     outcome: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct UpstreamDiagnosticObservation {
+    event: String,
+    attempt: u32,
+    credential_id: u64,
+    endpoint: String,
+    http_status: Option<u16>,
+    message: Option<String>,
 }
 
 #[derive(Default)]
@@ -352,6 +363,7 @@ impl ErrorSnapshotContext {
                 client_request,
                 payloads: Vec::new(),
                 attempts: Vec::new(),
+                upstream_diagnostics: Vec::new(),
                 protocol_errors: Vec::new(),
                 stream_tail: StreamTail::default(),
                 final_credential_id: 0,
@@ -373,6 +385,16 @@ impl ErrorSnapshotContext {
         let mut draft = self.draft.lock();
         draft.final_credential_id = credential_id;
         draft.endpoint = Some(endpoint.to_string());
+        draft
+            .upstream_diagnostics
+            .push(UpstreamDiagnosticObservation {
+                event: "request".to_string(),
+                attempt,
+                credential_id,
+                endpoint: endpoint.to_string(),
+                http_status: None,
+                message: None,
+            });
         draft.payloads.push(RawSnapshotPayload {
             kind: SnapshotPayloadKind::KiroRequest,
             attempt: Some(attempt),
@@ -381,13 +403,30 @@ impl ErrorSnapshotContext {
         });
     }
 
-    pub fn record_upstream_response(&self, attempt: u32, status: u16, body: &str) {
-        self.record_attempt_status(
-            attempt,
-            Some(status),
-            if status < 400 { "success" } else { "error" },
-        );
-        self.draft.lock().payloads.push(RawSnapshotPayload {
+    pub fn record_upstream_response(
+        &self,
+        attempt: u32,
+        credential_id: u64,
+        endpoint: &str,
+        status: u16,
+        body: &str,
+    ) {
+        let mut draft = self.draft.lock();
+        draft.final_credential_id = credential_id;
+        draft.endpoint = Some(endpoint.to_string());
+        draft
+            .upstream_diagnostics
+            .push(UpstreamDiagnosticObservation {
+                event: "response".to_string(),
+                attempt,
+                credential_id,
+                endpoint: endpoint.to_string(),
+                http_status: Some(status),
+                message: body
+                    .is_empty()
+                    .then(|| "response body was not consumed".to_string()),
+            });
+        draft.payloads.push(RawSnapshotPayload {
             kind: SnapshotPayloadKind::UpstreamResponse,
             attempt: Some(attempt),
             content_type: "application/json".to_string(),
@@ -404,9 +443,30 @@ impl ErrorSnapshotContext {
         });
     }
 
-    pub fn record_network_error(&self, attempt: u32, message: &str) {
-        self.record_attempt_status(attempt, None, "network_error");
-        self.record_internal_error("network_error", message);
+    pub fn record_network_error(
+        &self,
+        attempt: u32,
+        credential_id: u64,
+        endpoint: &str,
+        message: &str,
+    ) {
+        let mut draft = self.draft.lock();
+        draft.final_credential_id = credential_id;
+        draft.endpoint = Some(endpoint.to_string());
+        draft
+            .upstream_diagnostics
+            .push(UpstreamDiagnosticObservation {
+                event: "network_error".to_string(),
+                attempt,
+                credential_id,
+                endpoint: endpoint.to_string(),
+                http_status: None,
+                message: Some(message.to_string()),
+            });
+        draft.protocol_errors.push((
+            "network_error".to_string(),
+            format!("attempt {attempt}: {message}"),
+        ));
     }
 
     pub fn record_internal_error(&self, error_type: &str, message: &str) {
@@ -435,14 +495,6 @@ impl ErrorSnapshotContext {
             http_status: status,
             outcome: outcome.to_string(),
         });
-    }
-
-    pub fn set_outbound_metadata(&self, model: &str, endpoint: Option<&str>) {
-        let mut draft = self.draft.lock();
-        draft.model = model.to_string();
-        if let Some(endpoint) = endpoint {
-            draft.endpoint = Some(endpoint.to_string());
-        }
     }
 
     pub fn finalize(&self, state: SnapshotFinalState) -> anyhow::Result<Option<String>> {
@@ -510,6 +562,7 @@ impl ErrorSnapshotContext {
                 "request_sha256": hex::encode(Sha256::digest(&request_bytes)),
                 "tool_links": draft.tool_diagnostics,
                 "attempts": draft.attempts,
+                "upstream_diagnostics": draft.upstream_diagnostics,
                 "interrupted_after_bytes": state.interrupted_after_bytes,
             }))?,
         });
