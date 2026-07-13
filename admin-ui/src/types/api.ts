@@ -530,6 +530,8 @@ export interface TraceRecord {
   finalEmail?: string | null
   errorType: string | null
   errorMessage: string | null
+  /** 对应的持久化错误快照 */
+  snapshotId?: string | null
   totalAttempts: number
   durationMs: number
   /** 流式中断时已发送字节数 */

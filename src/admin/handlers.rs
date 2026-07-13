@@ -1588,6 +1588,7 @@ pub async fn list_traces(
                 "finalEmail": final_email,
                 "errorType": r.error_type,
                 "errorMessage": r.error_message,
+                "snapshotId": r.snapshot_id,
                 "totalAttempts": r.total_attempts,
                 "durationMs": r.duration_ms,
                 "interruptedAfterBytes": r.interrupted_after_bytes,

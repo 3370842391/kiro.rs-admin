@@ -261,6 +261,7 @@ impl RequestTracer {
             reasoning_effort: self.reasoning_effort.clone(),
             context_1m: self.context_1m,
             thinking: self.thinking,
+            snapshot_id: None,
             attempts,
         };
         store.insert(&rec);
