@@ -41,6 +41,8 @@ parking_lot = "0.12"  # 楂樻€ц兘鍚屾鍘熻
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 base64 = "0.22"
 pdf-extract = "0.12"
+zstd = "0.13"
+fs2 = "0.4"
 thiserror = "1"
 subtle = "2.6"        # 甯搁噺鏃堕棿姣旇緝锛堥槻姝㈡椂搴忔敾鍑伙級
 rust-embed = "8"      # 宓屽叆闈欐€佹枃浠?
@@ -49,3 +51,6 @@ flate2 = "1"        # tar.gz 瑙ｅ帇锛堝湪绾挎洿鏂帮級
 tar = "0.4"         # tar 瑙ｆ瀽锛堝湪绾挎洿鏂帮級
 zip = { version = "2", default-features = false, features = ["deflate"] }  # zip 瑙ｅ帇锛圵indows 鍦ㄧ嚎鏇存柊锛?
 rusqlite = { version = "0.32", features = ["bundled"] }  # 璇锋眰閾捐矾杩借釜鎸佷箙鍖栵紙鑷甫 SQLite 婧愮爜锛?
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

@@ -352,6 +352,30 @@ pub struct Config {
     #[serde(default = "default_usage_log_retention_days")]
     pub usage_log_retention_days: u32,
 
+    /// 是否记录失败、中断和可选恢复请求的完整脱敏诊断快照。
+    #[serde(default = "default_true")]
+    pub error_snapshot_enabled: bool,
+
+    /// 普通错误快照保留天数。critical 与手动 pin 不参加自动过期清理。
+    #[serde(default = "default_error_snapshot_retention_days")]
+    pub error_snapshot_retention_days: u32,
+
+    /// 错误快照总存储软上限（GiB）。
+    #[serde(default = "default_error_snapshot_max_storage_gb")]
+    pub error_snapshot_max_storage_gb: u64,
+
+    /// 是否保存经过重试后恢复成功的请求现场。
+    #[serde(default = "default_true")]
+    pub error_snapshot_capture_recovered: bool,
+
+    /// 是否保存脱敏后的请求/响应正文；关闭后仅记录结构化元数据。
+    #[serde(default = "default_true")]
+    pub error_snapshot_capture_bodies: bool,
+
+    /// 磁盘至少保留的空闲空间（GiB）；低于此值时新快照降级为元数据。
+    #[serde(default = "default_error_snapshot_min_free_disk_gb")]
+    pub error_snapshot_min_free_disk_gb: u64,
+
     /// 流式空闲超时（秒，默认 120）。
     ///
     /// 上游返回 200 后，若连续 `stream_idle_timeout_secs` 秒没有收到任何字节
@@ -536,6 +560,18 @@ fn default_trace_retention_days() -> u32 {
     7
 }
 
+fn default_error_snapshot_retention_days() -> u32 {
+    90
+}
+
+fn default_error_snapshot_max_storage_gb() -> u64 {
+    200
+}
+
+fn default_error_snapshot_min_free_disk_gb() -> u64 {
+    100
+}
+
 fn default_stream_idle_timeout_secs() -> u64 {
     120
 }
@@ -629,6 +665,12 @@ impl Default for Config {
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
+            error_snapshot_enabled: true,
+            error_snapshot_retention_days: default_error_snapshot_retention_days(),
+            error_snapshot_max_storage_gb: default_error_snapshot_max_storage_gb(),
+            error_snapshot_capture_recovered: true,
+            error_snapshot_capture_bodies: true,
+            error_snapshot_min_free_disk_gb: default_error_snapshot_min_free_disk_gb(),
             stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
             early_stream_handshake: false,
             identity_normalization: true,
@@ -717,6 +759,34 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_snapshot_defaults_are_safe_and_round_trip_in_camel_case() {
+        let defaulted: Config = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(defaulted.error_snapshot_enabled);
+        assert_eq!(defaulted.error_snapshot_retention_days, 90);
+        assert_eq!(defaulted.error_snapshot_max_storage_gb, 200);
+        assert!(defaulted.error_snapshot_capture_recovered);
+        assert!(defaulted.error_snapshot_capture_bodies);
+        assert_eq!(defaulted.error_snapshot_min_free_disk_gb, 100);
+
+        let custom: Config = serde_json::from_value(serde_json::json!({
+            "errorSnapshotEnabled": false,
+            "errorSnapshotRetentionDays": 30,
+            "errorSnapshotMaxStorageGb": 64,
+            "errorSnapshotCaptureRecovered": false,
+            "errorSnapshotCaptureBodies": false,
+            "errorSnapshotMinFreeDiskGb": 32
+        }))
+        .unwrap();
+        let encoded = serde_json::to_value(custom).unwrap();
+        assert_eq!(encoded["errorSnapshotEnabled"], false);
+        assert_eq!(encoded["errorSnapshotRetentionDays"], 30);
+        assert_eq!(encoded["errorSnapshotMaxStorageGb"], 64);
+        assert_eq!(encoded["errorSnapshotCaptureRecovered"], false);
+        assert_eq!(encoded["errorSnapshotCaptureBodies"], false);
+        assert_eq!(encoded["errorSnapshotMinFreeDiskGb"], 32);
+    }
 
     #[test]
     fn local_ping_response_defaults_on_and_round_trips_in_camel_case() {
