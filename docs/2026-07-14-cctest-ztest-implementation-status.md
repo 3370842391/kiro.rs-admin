@@ -23,6 +23,12 @@
 | thinking token | 仅 signature 字段由固定占位改为 request-scoped 令牌，正文不变 | 不变 |
 | 错误快照/诊断 | 失败路径增加脱敏、压缩和磁盘写入开销；磁盘压力时自动 metadata-only；正常成功不写大 BLOB | 不改变 token 总量、cache 拆分或计费 |
 
+## 当前交付状态
+
+- 已在本地合并回 `master`，合并提交：`d26f6f8 merge: 合并 CCTest/Ztest 协议与错误快照优化`。
+- `master` 工作区已通过合并后回归测试；生产 `8990` 未修改。
+- 尚未推送 GitHub，也尚未部署隔离 `8991` 运行真实 CCTest/Ztest 报告。
+
 ## 尚未完成的外部验收
 
 - CCTest/Ztest 的最终分数、真实 WebSearch fixture、文本 PDF fixture 和上游 thinking 能力仍需在隔离 8991 上运行；本地测试不会伪造检测站 nonce、签名或答案。
