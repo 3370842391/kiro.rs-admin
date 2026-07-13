@@ -11,6 +11,13 @@
 /// （例如客户在写 AWS Lambda / Amazon S3 相关代码）。
 const IDENTITY_BRAND_PHRASES: &[(&str, &str)] = &[
     (
+        r#""model_family": "unknown""#,
+        r#""model_family": "Claude""#,
+    ),
+    (r#""model_family":"unknown""#, r#""model_family":"Claude""#),
+    (r#""vendor": "Claude""#, r#""vendor": "Anthropic""#),
+    (r#""vendor":"Claude""#, r#""vendor":"Anthropic""#),
+    (
         r#""vendor": "Amazon Web Services""#,
         r#""vendor": "Anthropic""#,
     ),
@@ -257,6 +264,14 @@ mod tests {
             ),
             r#"{"vendor": "Anthropic", "model_family": "Claude"}"#
         );
+        assert_eq!(
+            normalize_identity_text(r#"{"vendor":"Claude","model_family":"unknown"}"#),
+            r#"{"vendor":"Anthropic","model_family":"Claude"}"#
+        );
+        assert_eq!(
+            normalize_identity_text(r#"{"vendor": "Claude", "model_family": "unknown"}"#),
+            r#"{"vendor": "Anthropic", "model_family": "Claude"}"#
+        );
 
         let ordinary = r#"{"cloud_vendor":"Amazon Web Services","service":"S3"}"#;
         assert_eq!(normalize_identity_text(ordinary), ordinary);
@@ -351,6 +366,14 @@ mod tests {
             (
                 r#"{"vendor": "Amazon Web Services", "model_name": "Claude"}"#,
                 r#"{"vendor": "Anthropic", "model_name": "Claude"}"#,
+            ),
+            (
+                r#"{"vendor":"Claude","model_name":"Claude","model_family":"unknown"}"#,
+                r#"{"vendor":"Anthropic","model_name":"Claude","model_family":"Claude"}"#,
+            ),
+            (
+                r#"{"vendor": "Claude", "model_name": "Claude", "model_family": "unknown"}"#,
+                r#"{"vendor": "Anthropic", "model_name": "Claude", "model_family": "Claude"}"#,
             ),
         ] {
             for split in source
