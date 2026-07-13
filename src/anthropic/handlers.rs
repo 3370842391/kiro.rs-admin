@@ -972,21 +972,13 @@ fn prepare_strict_json_request_bodies(
     structured_format: Option<&super::types::OutputFormat>,
 ) -> Option<StrictJsonRequestBodies> {
     if let Some(format) = structured_format {
-        let first =
+        let retry =
             super::exact_output::append_structured_output_instruction(request_body, format)?;
-        let retry = super::exact_output::append_strict_json_retry_instruction(&first)?;
-        let threshold_first = match threshold_retry_body {
-            Some(body) => Some(super::exact_output::append_structured_output_instruction(
-                body, format,
-            )?),
-            None => None,
-        };
-        let threshold_retry = threshold_first
-            .as_deref()
-            .and_then(super::exact_output::append_strict_json_retry_instruction);
+        let threshold_retry = threshold_retry_body
+            .and_then(|body| super::exact_output::append_structured_output_instruction(body, format));
         return Some(StrictJsonRequestBodies {
-            bodies: [first, retry],
-            threshold_retry_bodies: [threshold_first, threshold_retry],
+            bodies: [request_body.to_owned(), retry],
+            threshold_retry_bodies: [threshold_retry_body.map(str::to_owned), threshold_retry],
         });
     }
 
