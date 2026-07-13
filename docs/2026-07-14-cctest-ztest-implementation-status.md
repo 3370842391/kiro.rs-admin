@@ -27,12 +27,12 @@
 
 - CCTest/Ztest 的最终分数、真实 WebSearch fixture、文本 PDF fixture 和上游 thinking 能力仍需在隔离 8991 上运行；本地测试不会伪造检测站 nonce、签名或答案。
 - `scripts/error-snapshot-smoke.sh` 默认只读，需在 8991 使用管理员 Key 运行；设置 `ERROR_SNAPSHOT_SMOKE_MUTATE=1` 前必须确认挂载目录是 `data-test`。
-- 本地 `bun run build` 的默认 `tsc -b` 会把测试文件纳入类型检查，现有仓库测试类型声明会报错；生产源 `tsc`（排除 `*.test.*`）与 Vite 构建已单独通过。不要把临时 `tsconfig.production-check.json` 提交。
+- Admin UI 已将 `*.test.*` 排除出生产 TypeScript 编译范围；标准 `bun run build` 与 `bun test` 均可直接运行。不要把临时 `tsconfig.production-check.json` 提交。
 
 ## 本地验证证据
 
 - Rust：`cargo test --quiet --locked --no-default-features` → 探针 18/18、主测试 869/869，0 failed。
 - Rust：`cargo check --all-targets --locked --no-default-features` → exit 0；仅有既有 dead-code/unused 警告。
 - Admin UI：`bun test` → 19 pass / 0 fail。
-- Admin UI 生产源：`bunx tsc -p tsconfig.production-check.json --pretty false` 与 `bunx vite build` → 2577 modules built。
+- Admin UI：`bun run build` → 2577 modules built；`bun test` → 19 pass / 0 fail。
 - 8990 未修改；本分支只允许部署/验收 8991，当前未推送 GitHub、未合并 master。
