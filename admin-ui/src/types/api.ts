@@ -628,6 +628,146 @@ export interface UpsertModelMappingRequest {
   target: string
 }
 
+// ============ 模型能力与身份资料 ============
+
+export type ModelProfileFieldName =
+  | 'contextWindowTokens'
+  | 'maxOutputTokens'
+  | 'knowledgeCutoff'
+  | 'releaseDate'
+
+export interface ModelProfileField<T extends string | number> {
+  value: T
+  source: string
+  locked: boolean
+  updatedAt: string
+}
+
+export interface ResolvedModelProfile {
+  contextWindowTokens: ModelProfileField<number> | null
+  maxOutputTokens: ModelProfileField<number> | null
+  knowledgeCutoff: ModelProfileField<string> | null
+  releaseDate: ModelProfileField<string> | null
+}
+
+export interface ModelProfileView {
+  modelId: string
+  contextWindowTokens: ModelProfileField<number> | null
+  maxOutputTokens: ModelProfileField<number> | null
+  knowledgeCutoff: ModelProfileField<string> | null
+  releaseDate: ModelProfileField<string> | null
+  resolved: ResolvedModelProfile
+}
+
+export interface ModelProfileFieldRef {
+  modelId: string
+  field: ModelProfileFieldName
+  source: string
+  reason: string | null
+}
+
+export interface ModelProfileSourceSummary {
+  source: string
+  ok: boolean
+  models: number
+  message: string | null
+}
+
+export interface ModelProfileSyncSummary {
+  applied: ModelProfileFieldRef[]
+  skipped: ModelProfileFieldRef[]
+  warnings: string[]
+  sources: ModelProfileSourceSummary[]
+}
+
+export interface ModelProfilesResponse {
+  revision: number
+  exactAnswersEnabled: boolean
+  profiles: ModelProfileView[]
+  lastSync: ModelProfileSyncSummary | null
+}
+
+export interface ManualModelProfileField<T extends string | number> {
+  value: T
+  locked: boolean
+}
+
+export interface PatchModelProfileRequest {
+  baseRevision: number
+  contextWindowTokens?: ManualModelProfileField<number> | null
+  maxOutputTokens?: ManualModelProfileField<number> | null
+  knowledgeCutoff?: ManualModelProfileField<string> | null
+  releaseDate?: ManualModelProfileField<string> | null
+}
+
+export interface DeleteModelProfileRequest {
+  baseRevision: number
+}
+
+export interface FetchModelProfileRequest {
+  baseRevision: number
+  credentialId: number | null
+  forcePublic: boolean
+}
+
+export interface SyncModelProfilesRequest {
+  baseRevision: number
+  forcePublic: boolean
+}
+
+export interface ModelProfileSyncResponse {
+  snapshot: ModelProfilesResponse
+  summary: ModelProfileSyncSummary
+}
+
+export interface PreviewModelProfilesRequest {
+  forcePublic: boolean
+  modelId: string | null
+  credentialId: number | null
+}
+
+export interface ModelProfilePreviewChange {
+  id: string
+  modelId: string
+  field: ModelProfileFieldName
+  value: string | number
+  source: string
+  currentValue: string | number | null
+  currentSource: string | null
+  locked: boolean
+}
+
+export interface ModelProfilePreviewResponse {
+  previewId: string
+  baseRevision: number
+  expiresAt: string
+  changes: ModelProfilePreviewChange[]
+  warnings: string[]
+}
+
+export interface ApplyModelProfileChange {
+  id: string
+  modelId: string
+  field: ModelProfileFieldName
+  value: string | number
+  source: string
+  lock: boolean
+}
+
+export interface ApplyModelProfilesRequest {
+  previewId: string
+  baseRevision: number
+  changes: ApplyModelProfileChange[]
+}
+
+export interface SetModelProfileSettingsRequest {
+  enabled: boolean
+}
+
+export interface ModelProfileSettingsResponse {
+  exactAnswersEnabled: boolean
+}
+
 export interface CreateGroupRequest {
   name: string
   description?: string

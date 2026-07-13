@@ -1,7 +1,7 @@
 import { forwardRef, useEffect, useState, type ComponentPropsWithoutRef } from 'react'
 import {
   Activity, RefreshCw, UploadCloud, Settings, Key, Wand2, Eye, EyeOff, Copy,
-  MoreHorizontal, ShieldAlert, ShieldCheck, Gauge, Shuffle, Images,
+  MoreHorizontal, ShieldAlert, ShieldCheck, Gauge, Shuffle, Brain, Images,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -29,6 +29,7 @@ import {
 import { extractErrorMessage, generateApiKey } from '@/lib/utils'
 import { ImageUpdateDialog } from '@/components/image-update-dialog'
 import { ModelMappingsDialog } from '@/components/model-mappings-dialog'
+import { ModelProfilesDialog } from '@/components/model-profiles-dialog'
 import { EndpointChainsDialog } from '@/components/endpoint-chains-dialog'
 import { CachePolicyDialog } from '@/components/cache-policy-dialog'
 import { ImageBudgetDialog } from '@/components/image-budget-dialog'
@@ -55,6 +56,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
 
   const [imageUpdateOpen, setImageUpdateOpen] = useState(false)
   const [modelMappingsOpen, setModelMappingsOpen] = useState(false)
+  const [modelProfilesOpen, setModelProfilesOpen] = useState(false)
   const [endpointChainsOpen, setEndpointChainsOpen] = useState(false)
   const [cachePolicyOpen, setCachePolicyOpen] = useState(false)
   const [imageBudgetOpen, setImageBudgetOpen] = useState(false)
@@ -128,6 +130,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     loadBalancingMode: loadBalancingData?.mode,
     openImageUpdate: () => setImageUpdateOpen(true),
     openModelMappings: () => setModelMappingsOpen(true),
+    openModelProfiles: () => setModelProfilesOpen(true),
     openEndpointChains: () => setEndpointChainsOpen(true),
     openCachePolicy: () => setCachePolicyOpen(true),
     openImageBudget: () => setImageBudgetOpen(true),
@@ -156,6 +159,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
       {compact ? <CompactTools controls={controls} /> : <FullTools controls={controls} />}
       <ImageUpdateDialog open={imageUpdateOpen} onOpenChange={setImageUpdateOpen} />
       <ModelMappingsDialog open={modelMappingsOpen} onOpenChange={setModelMappingsOpen} />
+      <ModelProfilesDialog open={modelProfilesOpen} onOpenChange={setModelProfilesOpen} />
       <EndpointChainsDialog open={endpointChainsOpen} onOpenChange={setEndpointChainsOpen} />
       <CachePolicyDialog open={cachePolicyOpen} onOpenChange={setCachePolicyOpen} />
       <ImageBudgetDialog open={imageBudgetOpen} onOpenChange={setImageBudgetOpen} />
@@ -267,6 +271,7 @@ interface ToolControls {
   loadBalancingMode?: LoadBalancingMode
   openImageUpdate: () => void
   openModelMappings: () => void
+  openModelProfiles: () => void
   openEndpointChains: () => void
   openCachePolicy: () => void
   openImageBudget: () => void
@@ -295,6 +300,7 @@ function FullTools({ controls }: { controls: ToolControls }) {
       <KeySettingsMenu
         onOpenKeyDialog={controls.openKeyDialog}
         onOpenModelMappings={controls.openModelMappings}
+        onOpenModelProfiles={controls.openModelProfiles}
         onOpenEndpointChains={controls.openEndpointChains}
         onOpenCachePolicy={controls.openCachePolicy}
         onOpenImageBudget={controls.openImageBudget}
@@ -341,6 +347,9 @@ function CompactTools({ controls }: { controls: ToolControls }) {
         <DropdownMenuLabel>模型</DropdownMenuLabel>
         <DropdownMenuItem onSelect={controls.openModelMappings}>
           <Shuffle />模型映射（请求时模型名转发）
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={controls.openModelProfiles}>
+          <Brain />模型能力与身份
         </DropdownMenuItem>
         <DropdownMenuItem onSelect={controls.openEndpointChains}>
           <Shuffle />429 降级桶链（端点降级配置）
@@ -680,12 +689,14 @@ function ImageUpdateButton({ controls }: { controls: ToolControls }) {
 function KeySettingsMenu({
   onOpenKeyDialog,
   onOpenModelMappings,
+  onOpenModelProfiles,
   onOpenEndpointChains,
   onOpenCachePolicy,
   onOpenImageBudget,
 }: {
   onOpenKeyDialog: () => void
   onOpenModelMappings: () => void
+  onOpenModelProfiles: () => void
   onOpenEndpointChains: () => void
   onOpenCachePolicy: () => void
   onOpenImageBudget: () => void
@@ -701,6 +712,9 @@ function KeySettingsMenu({
         <DropdownMenuLabel>模型</DropdownMenuLabel>
         <DropdownMenuItem onSelect={onOpenModelMappings}>
           <Shuffle />模型映射（请求时模型名转发）
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={onOpenModelProfiles}>
+          <Brain />模型能力与身份
         </DropdownMenuItem>
         <DropdownMenuItem onSelect={onOpenEndpointChains}>
           <Shuffle />429 降级桶链（端点降级配置）
