@@ -1439,6 +1439,9 @@ pub struct StreamContext {
     pub known_tool_names: std::collections::HashSet<String>,
     /// 客户端可见工具名对应的输入契约。工具 JSON 完整解析后、产生任何工具事件前验证。
     tool_contracts: HashMap<String, super::tool_schema::ToolContract>,
+    /// 请求入口是否已显式初始化契约层。生产路径即使没有声明工具也会初始化为空，
+    /// 从而拒绝上游幻觉出的未请求工具；低层构造器保持向后兼容。
+    tool_contracts_initialized: bool,
     /// 跨整条流的「代码围栏」奇偶状态：每遇到一行以 ``` 开头就翻转。
     /// 在围栏内（true）时，`<invoke>` 一律不捞回（视为正文展示的代码块）。
     pub code_fence_open: bool,
@@ -1558,6 +1561,7 @@ impl StreamContext {
         contracts: HashMap<String, super::tool_schema::ToolContract>,
     ) {
         self.tool_contracts = contracts;
+        self.tool_contracts_initialized = true;
     }
 
     /// 工具调用 JSON 错误信息（非法 / 半截）。上层据此把本次请求记为 error、
@@ -1624,6 +1628,7 @@ impl StreamContext {
             tool_name_map,
             known_tool_names,
             tool_contracts: HashMap::new(),
+            tool_contracts_initialized: false,
             code_fence_open: false,
             fence_scan_partial: String::new(),
             thinking_enabled,
@@ -2460,7 +2465,7 @@ impl StreamContext {
     /// 依次发 `content_block_start{name, input:{}}` → 单个完整 `input_json_delta` → `content_block_stop`。
     fn emit_completed_tool_use(&mut self, mut completed: CompletedToolUse) -> Vec<SseEvent> {
         let mut events = Vec::new();
-        if !self.tool_contracts.is_empty() {
+        if self.tool_contracts_initialized {
             let Some(contract) = self.tool_contracts.get(&completed.name) else {
                 let error = super::tool_schema::ToolSchemaError {
                     tool_name: completed.name.clone(),
@@ -3803,6 +3808,27 @@ mod tests {
             ["get_weather".to_string()].into_iter().collect(),
         );
         ctx.set_tool_contracts(weather_contracts());
+
+        let tool_events =
+            ctx.process_tool_use(&tool_evt("tool_1", "delete_everything", r#"{}"#, true));
+        let final_events = ctx.generate_final_events();
+
+        assert!(tool_events.is_empty());
+        assert!(final_events.iter().any(|event| {
+            event.event == "error" && event.data["error"]["type"] == "upstream_tool_schema_error"
+        }));
+    }
+
+    #[test]
+    fn stream_rejects_unrequested_tool_after_empty_contracts_are_initialized() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        ctx.set_tool_contracts(HashMap::new());
 
         let tool_events =
             ctx.process_tool_use(&tool_evt("tool_1", "delete_everything", r#"{}"#, true));

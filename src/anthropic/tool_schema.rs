@@ -81,9 +81,6 @@ pub(crate) fn validate_tool_use_blocks(
             continue;
         };
         let Some(contract) = contracts.get(&name) else {
-            if contracts.is_empty() {
-                continue;
-            }
             return Err(ToolSchemaError {
                 tool_name: name,
                 violations: vec![ToolInputViolation::UndeclaredTool],
@@ -621,6 +618,23 @@ mod tests {
         let mut blocks = vec![original.clone()];
 
         let error = validate_tool_use_blocks(&contracts, &mut blocks).unwrap_err();
+
+        assert_eq!(error.tool_name, "delete_everything");
+        assert_eq!(blocks, vec![original]);
+    }
+
+    #[test]
+    fn unrequested_tool_is_rejected_when_request_has_no_contracts() {
+        let original = serde_json::json!({
+            "type": "tool_use",
+            "id": "toolu_1",
+            "name": "delete_everything",
+            "input": {}
+        });
+        let mut blocks = vec![original.clone()];
+
+        let error = validate_tool_use_blocks(&std::collections::HashMap::new(), &mut blocks)
+            .unwrap_err();
 
         assert_eq!(error.tool_name, "delete_everything");
         assert_eq!(blocks, vec![original]);

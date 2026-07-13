@@ -94,6 +94,36 @@ fn classify_required_tool(response: &Value, name: &str) -> ProbeResult {
     }
 }
 
+fn classify_required_tool_contract(response: &Value, name: &str, nonce: &str) -> ProbeResult {
+    if classify_required_tool(response, name) != ProbeResult::Pass {
+        return ProbeResult::Fail(format!(
+            "required tool {name} name/order/stop_reason did not match"
+        ));
+    }
+    let Some(input) = response["content"]
+        .as_array()
+        .and_then(|blocks| {
+            blocks.iter().find(|block| {
+                !matches!(
+                    block["type"].as_str(),
+                    Some("thinking" | "redacted_thinking")
+                )
+            })
+        })
+        .and_then(|block| block["input"].as_object())
+    else {
+        return ProbeResult::Fail("required tool input was not an object".into());
+    };
+    if input.len() == 2
+        && input.get("value").and_then(Value::as_str) == Some("local-check")
+        && input.get("nonce").and_then(Value::as_str) == Some(nonce)
+    {
+        ProbeResult::Pass
+    } else {
+        ProbeResult::Fail("required tool input did not satisfy fixed schema values".into())
+    }
+}
+
 fn classify_exact_text(response: &Value, expected: &str) -> ProbeResult {
     let Some(blocks) = response["content"].as_array() else {
         return ProbeResult::Fail("response content is not an array".into());
@@ -376,6 +406,7 @@ async fn thinking_probe(client: &reqwest::Client, args: &Args, key: &str) -> Pro
 
 async fn tool_probe(client: &reqwest::Client, args: &Args, key: &str) -> ProbeResult {
     let name = "probe_echo";
+    let nonce = Uuid::new_v4().to_string();
     match post_message(
         client,
         args,
@@ -383,14 +414,18 @@ async fn tool_probe(client: &reqwest::Client, args: &Args, key: &str) -> ProbeRe
         json!({
             "model": args.model,
             "max_tokens": 256,
-            "messages": [{"role": "user", "content": "Call the provided tool with value local-check."}],
+            "messages": [{"role": "user", "content": "Call the provided tool now and follow its input schema exactly."}],
             "tools": [{
                 "name": name,
                 "description": "Return the provided value.",
                 "input_schema": {
                     "type": "object",
-                    "properties": {"value": {"type": "string"}},
-                    "required": ["value"]
+                    "properties": {
+                        "value": {"type": "string", "const": "local-check"},
+                        "nonce": {"type": "string", "const": nonce.clone()}
+                    },
+                    "required": ["value", "nonce"],
+                    "additionalProperties": false
                 }
             }],
             "tool_choice": {"type": "tool", "name": name}
@@ -398,7 +433,7 @@ async fn tool_probe(client: &reqwest::Client, args: &Args, key: &str) -> ProbeRe
     )
     .await
     {
-        Ok(value) => classify_required_tool(&value, name),
+        Ok(value) => classify_required_tool_contract(&value, name, &nonce),
         Err(error) => ProbeResult::Fail(error),
     }
 }
@@ -788,6 +823,62 @@ mod tests {
             classify_required_tool(&text_first, "probe_echo"),
             ProbeResult::Fail(_)
         ));
+    }
+
+    #[test]
+    fn required_tool_contract_classifier_checks_schema_values_and_stop_reason() {
+        let valid = json!({
+            "content": [{
+                "type": "tool_use",
+                "name": "probe_echo",
+                "input": {"value": "local-check", "nonce": "nonce-42"}
+            }],
+            "stop_reason": "tool_use"
+        });
+        assert_eq!(
+            classify_required_tool_contract(&valid, "probe_echo", "nonce-42"),
+            ProbeResult::Pass
+        );
+
+        for invalid in [
+            json!({
+                "content": [{
+                    "type": "tool_use",
+                    "name": "probe_echo",
+                    "input": {"value": "wrong", "nonce": "nonce-42"}
+                }],
+                "stop_reason": "tool_use"
+            }),
+            json!({
+                "content": [{
+                    "type": "tool_use",
+                    "name": "probe_echo",
+                    "input": {"value": "local-check", "nonce": "wrong"}
+                }],
+                "stop_reason": "tool_use"
+            }),
+            json!({
+                "content": [{
+                    "type": "tool_use",
+                    "name": "probe_echo",
+                    "input": {"value": "local-check", "nonce": "nonce-42", "extra": true}
+                }],
+                "stop_reason": "tool_use"
+            }),
+            json!({
+                "content": [{
+                    "type": "tool_use",
+                    "name": "probe_echo",
+                    "input": {"value": "local-check", "nonce": "nonce-42"}
+                }],
+                "stop_reason": "end_turn"
+            }),
+        ] {
+            assert!(matches!(
+                classify_required_tool_contract(&invalid, "probe_echo", "nonce-42"),
+                ProbeResult::Fail(_)
+            ));
+        }
     }
 
     #[test]
