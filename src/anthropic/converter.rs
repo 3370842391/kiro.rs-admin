@@ -586,6 +586,8 @@ pub struct ConversionResult {
     /// 只有合成出的工具名在此集合里，才允许把字面 `<invoke>` 捞回成结构化 tool_use；
     /// 否则当普通文本吐出，避免把「正文展示的工具调用」误执行成真命令。
     pub known_tool_names: std::collections::HashSet<String>,
+    /// 客户端原始工具名对应的规范化输入契约。仅用于响应交付前验证，绝不复制到工具描述。
+    pub tool_contracts: std::collections::HashMap<String, super::tool_schema::ToolContract>,
     /// Additional model request fields (including `output_config.effort`), translated from the
     /// `output_config` field of the client's Anthropic request. Not sent when empty.
     pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
@@ -820,6 +822,9 @@ pub fn convert_request_with_mode(
     let (text_content, images, mut tool_results) = process_current_user_messages(current_messages)?;
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射；ClaudeCode 模式做内置工具适配）
+    // 同时保留客户端可见名称对应的规范化 schema，供响应交付前验证；不把 schema
+    // 字段和值复制进 description，避免额外 token 注入。
+    let tool_contracts = build_tool_contracts(&req.tools);
     let mut tool_name_map = HashMap::new();
     let mut tools = convert_tools(&req.tools, &mut tool_name_map, tool_compatibility_mode)?;
 
@@ -954,9 +959,37 @@ pub fn convert_request_with_mode(
         conversation_state,
         tool_name_map,
         known_tool_names,
+        tool_contracts,
         additional_model_request_fields,
         tool_choice_policy,
     })
+}
+
+fn build_tool_contracts(
+    tools: &Option<Vec<super::types::Tool>>,
+) -> std::collections::HashMap<String, super::tool_schema::ToolContract> {
+    let mut contracts = std::collections::HashMap::new();
+    let Some(tools) = tools else {
+        return contracts;
+    };
+
+    for tool in tools {
+        if tool.name.is_empty()
+            || tool
+                .tool_type
+                .as_deref()
+                .is_some_and(|kind| kind.starts_with("web_search"))
+        {
+            continue;
+        }
+        contracts
+            .entry(tool.name.clone())
+            .or_insert_with(|| super::tool_schema::ToolContract {
+                client_name: tool.name.clone(),
+                schema: normalize_json_schema(serde_json::json!(tool.input_schema)),
+            });
+    }
+    contracts
 }
 
 /// 确定聊天触发类型
@@ -3948,6 +3981,52 @@ mod tests {
             Err(ConversionError::InvalidToolHistory(reason))
                 if reason.contains("unknown tool_use id")
         ));
+    }
+
+    #[test]
+    fn conversion_retains_normalized_client_tool_contract_without_description_injection() {
+        use std::collections::BTreeMap;
+
+        let req = MessagesRequest {
+            force_web_search_loop: false,
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 256,
+            messages: vec![super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::json!("weather"),
+            }],
+            stream: false,
+            system: None,
+            tools: Some(vec![super::super::types::Tool {
+                tool_type: None,
+                name: "get_weather".to_string(),
+                description: "customer description must not become contract data".to_string(),
+                input_schema: BTreeMap::from([
+                    ("type".to_string(), serde_json::json!("object")),
+                    (
+                        "properties".to_string(),
+                        serde_json::json!({
+                            "unit": {"type": "string", "enum": ["celsius"]}
+                        }),
+                    ),
+                    ("required".to_string(), serde_json::json!(["unit"])),
+                ]),
+                max_uses: None,
+                cache_control: None,
+            }]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let converted = convert_request(&req).unwrap();
+        let contract = converted.tool_contracts.get("get_weather").unwrap();
+
+        assert_eq!(contract.client_name, "get_weather");
+        assert_eq!(contract.schema["type"], "object");
+        assert_eq!(contract.schema["properties"]["unit"]["enum"][0], "celsius");
+        assert!(!contract.schema.to_string().contains("customer description"));
     }
 
     #[test]

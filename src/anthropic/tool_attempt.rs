@@ -179,6 +179,7 @@ pub(crate) enum AttemptTermination {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AttemptFailure {
     IncompleteToolJson(ToolJsonAccumulatorError),
+    InvalidToolSchema { message: String },
     EmptyResponse,
     ContextWindowExceeded,
     UpstreamError { error_type: String, message: String },
@@ -189,6 +190,7 @@ impl AttemptFailure {
     pub(crate) fn public_error(&self) -> (&'static str, String) {
         match self {
             Self::IncompleteToolJson(error) => (error.error_type(), error.message()),
+            Self::InvalidToolSchema { message } => ("upstream_tool_schema_error", message.clone()),
             Self::EmptyResponse => (
                 "upstream_empty_response",
                 "Upstream returned no assistant content after one retry".to_string(),
@@ -309,7 +311,8 @@ impl AttemptObservation {
 /// 单次上游工具生成 attempt 的提交状态。
 ///
 /// 只有第一次、尚未向客户端提交任何语义内容或工具调用、并且正常 EOF 后得到纯空响应
-/// 或半截工具 JSON 时才能透明重试。非法 JSON 与已经提交的输出都必须原样失败，防止重复执行工具。
+/// 、半截工具 JSON或未交付的 Schema 错误时才能透明重试。非法 JSON 与已经提交的输出都
+/// 必须原样失败，防止重复执行工具。
 #[derive(Debug, Clone)]
 pub(crate) struct ToolAttemptState {
     pub attempt_index: u8,
@@ -329,6 +332,7 @@ impl ToolAttemptState {
                 self.failure,
                 Some(AttemptFailure::EmptyResponse)
                     | Some(AttemptFailure::IncompleteToolJson(IncompleteJson { .. }))
+                    | Some(AttemptFailure::InvalidToolSchema { .. })
             )
     }
 }
@@ -379,6 +383,32 @@ mod tests {
             semantic_output_started: false,
             tool_forwarded: false,
         }
+    }
+
+    #[test]
+    fn invalid_tool_schema_retries_only_before_semantic_output_and_only_once() {
+        let retryable = ToolAttemptState {
+            attempt_index: 0,
+            termination: AttemptTermination::Eof,
+            failure: Some(AttemptFailure::InvalidToolSchema {
+                message: "tool schema mismatch".to_string(),
+            }),
+            semantic_output_started: false,
+            tool_forwarded: false,
+        };
+        assert!(retryable.should_retry());
+
+        let second = ToolAttemptState {
+            attempt_index: 1,
+            ..retryable.clone()
+        };
+        assert!(!second.should_retry());
+
+        let after_text = ToolAttemptState {
+            semantic_output_started: true,
+            ..retryable
+        };
+        assert!(!after_text.should_retry());
     }
 
     #[test]

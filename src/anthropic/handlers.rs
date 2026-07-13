@@ -2010,6 +2010,7 @@ pub async fn post_messages(
 
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
+    let tool_contracts = conversion_result.tool_contracts;
     let tool_choice_policy = conversion_result.tool_choice_policy;
 
     // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存。
@@ -2075,6 +2076,7 @@ pub async fn post_messages(
             thinking_enabled,
             tool_name_map,
             known_tool_names,
+            tool_contracts,
             tool_choice_policy,
             hook,
             cache_usage,
@@ -2107,6 +2109,7 @@ pub async fn post_messages(
             thinking_enabled,
             tool_name_map,
             known_tool_names,
+            tool_contracts,
             tool_choice_policy,
             hook,
             cache_usage,
@@ -2128,6 +2131,7 @@ struct StreamAttemptSetup {
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
+    tool_contracts: std::collections::HashMap<String, super::tool_schema::ToolContract>,
     tool_choice_policy: super::converter::ToolChoicePolicy,
     cache_usage: super::cache_metering::CacheUsage,
     group: Option<String>,
@@ -2147,6 +2151,7 @@ impl StreamAttemptSetup {
             self.tool_choice_policy.clone(),
         );
         ctx.set_context_window_size(self.context_window_size);
+        ctx.set_tool_contracts(self.tool_contracts.clone());
         ctx.cache_usage = self.cache_usage;
         if self.identity_normalization {
             ctx.enable_identity_filter();
@@ -2165,6 +2170,7 @@ impl StreamAttemptSetup {
             self.tool_choice_policy.clone(),
         );
         ctx.set_context_window_size(self.context_window_size);
+        ctx.set_tool_contracts(self.tool_contracts.clone());
         ctx.set_cache_usage(self.cache_usage);
         if self.identity_normalization {
             ctx.enable_identity_filter();
@@ -2196,6 +2202,7 @@ async fn handle_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
+    tool_contracts: std::collections::HashMap<String, super::tool_schema::ToolContract>,
     tool_choice_policy: super::converter::ToolChoicePolicy,
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
@@ -2214,6 +2221,7 @@ async fn handle_stream_request(
             thinking_enabled,
             tool_name_map,
             known_tool_names,
+            tool_contracts,
             tool_choice_policy,
             hook,
             cache_usage,
@@ -2264,6 +2272,7 @@ async fn handle_stream_request(
         thinking_enabled,
         tool_name_map,
         known_tool_names,
+        tool_contracts,
         tool_choice_policy,
         cache_usage,
         group,
@@ -2303,6 +2312,7 @@ fn create_early_sse_stream(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
+    tool_contracts: std::collections::HashMap<String, super::tool_schema::ToolContract>,
     tool_choice_policy: super::converter::ToolChoicePolicy,
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
@@ -2336,6 +2346,7 @@ fn create_early_sse_stream(
             thinking_enabled,
             tool_name_map,
             known_tool_names,
+            tool_contracts,
             tool_choice_policy,
             cache_usage,
             group,
@@ -2821,6 +2832,7 @@ async fn collect_non_stream_tool_attempt(
     input_tokens: i32,
     context_window_size: i32,
     tool_name_map: &std::collections::HashMap<String, String>,
+    tool_contracts: &std::collections::HashMap<String, super::tool_schema::ToolContract>,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<&str>,
     attempt_index: u8,
@@ -2957,8 +2969,28 @@ async fn collect_non_stream_tool_attempt(
     }
 
     let has_completed_tool = !tool_uses.is_empty();
-    let failure = observation.failure(tool_json_error, has_completed_tool);
-    let semantic_output_started = observation.semantic_output_started() || has_completed_tool;
+    let schema_failure = match super::tool_schema::validate_tool_use_blocks(
+        tool_contracts,
+        &mut tool_uses,
+    ) {
+        Ok(repaired) => {
+            if !repaired.is_empty() {
+                tracing::warn!(paths = ?repaired, attempt = attempt_index + 1, "确定性修复上游工具固定字段");
+            }
+            None
+        }
+        Err(error) => {
+            tracing::warn!(tool = %error.tool_name, attempt = attempt_index + 1, "上游工具参数不满足客户端Schema");
+            Some(super::tool_attempt::AttemptFailure::InvalidToolSchema {
+                message: error.to_string(),
+            })
+        }
+    };
+    let failure = schema_failure
+        .clone()
+        .or_else(|| observation.failure(tool_json_error, has_completed_tool));
+    let semantic_output_started =
+        observation.semantic_output_started() || (has_completed_tool && schema_failure.is_none());
     tracing::debug!(
         attempt = attempt_index + 1,
         saw_frame = observation.saw_frame(),
@@ -3001,6 +3033,7 @@ async fn handle_non_stream_request(
     require_thinking: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
+    tool_contracts: std::collections::HashMap<String, super::tool_schema::ToolContract>,
     tool_choice_policy: super::converter::ToolChoicePolicy,
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
@@ -3021,6 +3054,7 @@ async fn handle_non_stream_request(
                 input_tokens,
                 context_window_size,
                 &tool_name_map,
+                &tool_contracts,
                 tracer.clone(),
                 group.as_deref(),
                 attempt_index,
@@ -3726,6 +3760,7 @@ pub async fn post_messages_cc(
 
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
+    let tool_contracts = conversion_result.tool_contracts;
     let tool_choice_policy = conversion_result.tool_choice_policy;
 
     // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存（estimate 口径）。
@@ -3789,6 +3824,7 @@ pub async fn post_messages_cc(
             context_window_size,
             tool_name_map,
             known_tool_names,
+            tool_contracts,
             tool_choice_policy,
             hook,
             total_input_tokens,
@@ -3822,6 +3858,7 @@ pub async fn post_messages_cc(
             thinking_enabled,
             tool_name_map,
             known_tool_names,
+            tool_contracts,
             tool_choice_policy,
             hook,
             cache_usage,
@@ -3845,6 +3882,7 @@ async fn handle_stream_request_buffered(
     context_window_size: i32,
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
+    tool_contracts: std::collections::HashMap<String, super::tool_schema::ToolContract>,
     tool_choice_policy: super::converter::ToolChoicePolicy,
     hook: UsageRecordHook,
     fallback_input_tokens: i32,
@@ -3885,6 +3923,7 @@ async fn handle_stream_request_buffered(
         thinking_enabled,
         tool_name_map,
         known_tool_names,
+        tool_contracts,
         tool_choice_policy,
         cache_usage,
         group,

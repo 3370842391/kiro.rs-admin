@@ -1437,6 +1437,8 @@ pub struct StreamContext {
     /// 只有合成名在此集合里才允许捞回成结构化 tool_use，否则当文本吐出。
     /// 为空（请求未带 tools）时不捞回任何 invoke——宁可漏捞，不可误执行。
     pub known_tool_names: std::collections::HashSet<String>,
+    /// 客户端可见工具名对应的输入契约。工具 JSON 完整解析后、产生任何工具事件前验证。
+    tool_contracts: HashMap<String, super::tool_schema::ToolContract>,
     /// 跨整条流的「代码围栏」奇偶状态：每遇到一行以 ``` 开头就翻转。
     /// 在围栏内（true）时，`<invoke>` 一律不捞回（视为正文展示的代码块）。
     pub code_fence_open: bool,
@@ -1551,6 +1553,13 @@ impl StreamContext {
         self.context_window_size = value.max(1);
     }
 
+    pub(crate) fn set_tool_contracts(
+        &mut self,
+        contracts: HashMap<String, super::tool_schema::ToolContract>,
+    ) {
+        self.tool_contracts = contracts;
+    }
+
     /// 工具调用 JSON 错误信息（非法 / 半截）。上层据此把本次请求记为 error、
     /// 或在非流式路径返回 502。无错误时返回 `None`。
     pub fn terminal_error_message(&self) -> Option<String> {
@@ -1614,6 +1623,7 @@ impl StreamContext {
             tool_block_indices: HashMap::new(),
             tool_name_map,
             known_tool_names,
+            tool_contracts: HashMap::new(),
             code_fence_open: false,
             fence_scan_partial: String::new(),
             thinking_enabled,
@@ -2448,8 +2458,33 @@ impl StreamContext {
     ///
     /// 块索引按 `completed.id` 复用/分配（结构化按 tool_use_id 复用；invoke 合成用新 id 故新分配），
     /// 依次发 `content_block_start{name, input:{}}` → 单个完整 `input_json_delta` → `content_block_stop`。
-    fn emit_completed_tool_use(&mut self, completed: CompletedToolUse) -> Vec<SseEvent> {
+    fn emit_completed_tool_use(&mut self, mut completed: CompletedToolUse) -> Vec<SseEvent> {
         let mut events = Vec::new();
+        if let Some(contract) = self.tool_contracts.get(&completed.name) {
+            match super::tool_schema::validate_and_repair(&contract.schema, &mut completed.input) {
+                super::tool_schema::ToolInputOutcome::Valid => {}
+                super::tool_schema::ToolInputOutcome::Repaired { paths } => {
+                    tracing::warn!(
+                        tool = %contract.client_name,
+                        paths = ?paths,
+                        "确定性修复上游工具固定字段"
+                    );
+                }
+                super::tool_schema::ToolInputOutcome::Invalid { violations } => {
+                    let error = super::tool_schema::ToolSchemaError {
+                        tool_name: contract.client_name.clone(),
+                        violations,
+                    };
+                    tracing::warn!(tool = %contract.client_name, "上游工具参数不满足客户端Schema");
+                    self.terminal_attempt_failure =
+                        Some(super::tool_attempt::AttemptFailure::InvalidToolSchema {
+                            message: error.to_string(),
+                        });
+                    self.state_manager.set_stop_reason("error");
+                    return events;
+                }
+            }
+        }
         self.state_manager.set_has_tool_use(true);
         self.has_visible_output = true;
         self.emitted_tool_names.push(completed.name.clone());
@@ -2794,12 +2829,14 @@ impl StreamContext {
         {
             classified_failure = None;
         }
-        self.terminal_attempt_failure = classified_failure
-            .as_ref()
-            .filter(|failure| {
-                !matches!(failure, super::tool_attempt::AttemptFailure::EmptyResponse)
-            })
-            .cloned();
+        if self.terminal_attempt_failure.is_none() {
+            self.terminal_attempt_failure = classified_failure
+                .as_ref()
+                .filter(|failure| {
+                    !matches!(failure, super::tool_attempt::AttemptFailure::EmptyResponse)
+                })
+                .cloned();
+        }
         if self.saw_upstream_tool_use
             && !self.state_manager.has_tool_use()
             && self.tool_json_error.is_none()
@@ -3059,6 +3096,13 @@ impl BufferedStreamContext {
 
     pub fn set_context_window_size(&mut self, value: i32) {
         self.inner.set_context_window_size(value);
+    }
+
+    pub(crate) fn set_tool_contracts(
+        &mut self,
+        contracts: HashMap<String, super::tool_schema::ToolContract>,
+    ) {
+        self.inner.set_tool_contracts(contracts);
     }
 
     /// 开启流式身份归一化（委托给 inner StreamContext）。
@@ -3660,6 +3704,80 @@ mod tests {
             input: input.to_string(),
             stop,
         }
+    }
+
+    fn weather_contracts() -> HashMap<String, super::super::tool_schema::ToolContract> {
+        HashMap::from([(
+            "get_weather".to_string(),
+            super::super::tool_schema::ToolContract {
+                client_name: "get_weather".to_string(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"},
+                        "unit": {"type": "string", "enum": ["celsius"]}
+                    },
+                    "required": ["city", "unit"],
+                    "additionalProperties": false
+                }),
+            },
+        )])
+    }
+
+    #[test]
+    fn stream_repairs_fixed_tool_fields_before_any_tool_event_is_emitted() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            ["get_weather".to_string()].into_iter().collect(),
+        );
+        ctx.set_tool_contracts(weather_contracts());
+
+        let events = ctx.process_tool_use(&tool_evt(
+            "tool_1",
+            "get_weather",
+            r#"{"city":"Paris","unit":"wrong"}"#,
+            true,
+        ));
+        let json_delta = events
+            .iter()
+            .find(|event| event.event == "content_block_delta")
+            .expect("repaired tool input delta");
+        let input: serde_json::Value =
+            serde_json::from_str(json_delta.data["delta"]["partial_json"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(input["unit"], "celsius");
+    }
+
+    #[test]
+    fn stream_rejects_non_fixed_schema_violation_without_emitting_tool_block() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            ["get_weather".to_string()].into_iter().collect(),
+        );
+        ctx.set_tool_contracts(weather_contracts());
+
+        let tool_events = ctx.process_tool_use(&tool_evt(
+            "tool_1",
+            "get_weather",
+            r#"{"unit":"celsius"}"#,
+            true,
+        ));
+        let final_events = ctx.generate_final_events();
+
+        assert!(tool_events.is_empty());
+        assert!(final_events.iter().any(|event| {
+            event.event == "error" && event.data["error"]["type"] == "upstream_tool_schema_error"
+        }));
+        assert!(!final_events.iter().any(|event| {
+            event.event == "content_block_start"
+                && event.data["content_block"]["type"] == "tool_use"
+        }));
     }
 
     #[test]

@@ -35,6 +35,7 @@ mod router;
 pub mod stream;
 pub(crate) mod tool_attempt;
 pub(crate) mod tool_history;
+pub(crate) mod tool_schema;
 pub mod types;
 pub(crate) mod usage;
 mod websearch;
