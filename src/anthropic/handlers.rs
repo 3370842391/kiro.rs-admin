@@ -1955,6 +1955,10 @@ pub async fn post_messages(
                     "invalid_request_error",
                     format!("工具映射不支持: {}", reason),
                 ),
+                ConversionError::InvalidToolHistory(reason) => (
+                    "invalid_request_error",
+                    format!("工具调用历史无效: {}", reason),
+                ),
                 ConversionError::InvalidToolChoice(reason) => {
                     ("invalid_request_error", format!("工具选择无效: {}", reason))
                 }
@@ -3666,6 +3670,10 @@ pub async fn post_messages_cc(
                 ConversionError::UnsupportedToolMapping(reason) => (
                     "invalid_request_error",
                     format!("工具映射不支持: {}", reason),
+                ),
+                ConversionError::InvalidToolHistory(reason) => (
+                    "invalid_request_error",
+                    format!("工具调用历史无效: {}", reason),
                 ),
                 ConversionError::InvalidToolChoice(reason) => {
                     ("invalid_request_error", format!("工具选择无效: {}", reason))

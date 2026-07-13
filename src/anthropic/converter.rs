@@ -704,6 +704,7 @@ pub enum ConversionError {
     /// Claude Code 工具无法映射到 Kiro 内置工具（如 Read.pages 无对应、内置缺 schema）。
     UnsupportedToolMapping(String),
     InvalidToolChoice(String),
+    InvalidToolHistory(String),
 }
 
 impl std::fmt::Display for ConversionError {
@@ -713,6 +714,9 @@ impl std::fmt::Display for ConversionError {
             ConversionError::EmptyMessages => write!(f, "消息列表为空"),
             ConversionError::UnsupportedToolMapping(reason) => {
                 write!(f, "工具映射不支持: {}", reason)
+            }
+            ConversionError::InvalidToolHistory(reason) => {
+                write!(f, "工具调用历史无效: {}", reason)
             }
             ConversionError::InvalidToolChoice(reason) => {
                 write!(f, "工具选择无效: {}", reason)
@@ -813,7 +817,7 @@ pub fn convert_request_with_mode(
         .map_or(0, |index| index + 1);
     let history_messages = &messages[..current_start];
     let current_messages = &messages[current_start..];
-    let (text_content, images, tool_results) = process_current_user_messages(current_messages)?;
+    let (text_content, images, mut tool_results) = process_current_user_messages(current_messages)?;
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射；ClaudeCode 模式做内置工具适配）
     let mut tool_name_map = HashMap::new();
@@ -877,6 +881,11 @@ pub fn convert_request_with_mode(
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
     // 同时返回孤立的 tool_use_id 集合，用于后续清理
+    // Kiro 仅接受 ASCII 字母、数字、下划线和连字符组成且不超过 64 字节的工具 ID。
+    // 只修改本次转换生成的 Kiro 请求副本，并在现有配对过滤前拒绝重复或孤立引用。
+    super::tool_history::normalize_tool_history_ids(&mut history, &mut tool_results)
+        .map_err(|error| ConversionError::InvalidToolHistory(error.to_string()))?;
+
     let (validated_tool_results, orphaned_tool_use_ids) =
         validate_tool_pairing(&history, &tool_results);
 
@@ -3764,6 +3773,181 @@ mod tests {
                 .count(),
             4
         );
+    }
+
+    fn tool_history_request(messages: Vec<super::super::types::Message>) -> MessagesRequest {
+        MessagesRequest {
+            force_web_search_loop: false,
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages,
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn convert_request_normalizes_invalid_tool_id_pair_before_upstream_validation() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = tool_history_request(vec![
+            AnthropicMessage {
+                role: "user".into(),
+                content: serde_json::json!("weather"),
+            },
+            AnthropicMessage {
+                role: "assistant".into(),
+                content: serde_json::json!([{
+                    "type": "tool_use",
+                    "id": "tool/get_weather/1",
+                    "name": "get_weather",
+                    "input": {"city": "Paris"}
+                }]),
+            },
+            AnthropicMessage {
+                role: "user".into(),
+                content: serde_json::json!([{
+                    "type": "tool_result",
+                    "tool_use_id": "tool/get_weather/1",
+                    "content": "sunny"
+                }]),
+            },
+        ]);
+
+        let converted = convert_request(&req).unwrap();
+        let Message::Assistant(assistant) = &converted.conversation_state.history[1] else {
+            panic!("expected assistant tool-use history")
+        };
+        let normalized = &assistant
+            .assistant_response_message
+            .tool_uses
+            .as_ref()
+            .unwrap()[0]
+            .tool_use_id;
+        let result_id = &converted
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tool_results[0]
+            .tool_use_id;
+
+        assert_ne!(normalized, "tool/get_weather/1");
+        assert!(super::super::tool_history::is_upstream_safe_tool_id(
+            normalized
+        ));
+        assert_eq!(result_id, normalized);
+    }
+
+    #[test]
+    fn convert_request_preserves_safe_tool_id_pair() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = tool_history_request(vec![
+            AnthropicMessage {
+                role: "user".into(),
+                content: serde_json::json!("weather"),
+            },
+            AnthropicMessage {
+                role: "assistant".into(),
+                content: serde_json::json!([{
+                    "type": "tool_use",
+                    "id": "tooluse_abc-123",
+                    "name": "get_weather",
+                    "input": {}
+                }]),
+            },
+            AnthropicMessage {
+                role: "user".into(),
+                content: serde_json::json!([{
+                    "type": "tool_result",
+                    "tool_use_id": "tooluse_abc-123",
+                    "content": "sunny"
+                }]),
+            },
+        ]);
+
+        let converted = convert_request(&req).unwrap();
+        let Message::Assistant(assistant) = &converted.conversation_state.history[1] else {
+            panic!("expected assistant tool-use history")
+        };
+        assert_eq!(
+            assistant
+                .assistant_response_message
+                .tool_uses
+                .as_ref()
+                .unwrap()[0]
+                .tool_use_id,
+            "tooluse_abc-123"
+        );
+        assert_eq!(
+            converted
+                .conversation_state
+                .current_message
+                .user_input_message
+                .user_input_message_context
+                .tool_results[0]
+                .tool_use_id,
+            "tooluse_abc-123"
+        );
+    }
+
+    #[test]
+    fn convert_request_rejects_duplicate_tool_use_id_locally() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = tool_history_request(vec![
+            AnthropicMessage {
+                role: "user".into(),
+                content: serde_json::json!("weather"),
+            },
+            AnthropicMessage {
+                role: "assistant".into(),
+                content: serde_json::json!([
+                    {"type": "tool_use", "id": "a:b", "name": "first", "input": {}},
+                    {"type": "tool_use", "id": "a:b", "name": "second", "input": {}}
+                ]),
+            },
+            AnthropicMessage {
+                role: "user".into(),
+                content: serde_json::json!([{
+                    "type": "tool_result",
+                    "tool_use_id": "a:b",
+                    "content": "done"
+                }]),
+            },
+        ]);
+
+        assert!(matches!(
+            convert_request(&req),
+            Err(ConversionError::InvalidToolHistory(reason))
+                if reason.contains("duplicate tool_use id")
+        ));
+    }
+
+    #[test]
+    fn convert_request_rejects_orphan_tool_result_locally() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = tool_history_request(vec![AnthropicMessage {
+            role: "user".into(),
+            content: serde_json::json!([{
+                "type": "tool_result",
+                "tool_use_id": "missing/tool/1",
+                "content": "orphan"
+            }]),
+        }]);
+
+        assert!(matches!(
+            convert_request(&req),
+            Err(ConversionError::InvalidToolHistory(reason))
+                if reason.contains("unknown tool_use id")
+        ));
     }
 
     #[test]

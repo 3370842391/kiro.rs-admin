@@ -214,6 +214,10 @@ async fn run_round(
                     "invalid_request_error",
                     format!("unsupported tool mapping: {}", reason),
                 ),
+                ConversionError::InvalidToolHistory(reason) => (
+                    "invalid_request_error",
+                    format!("invalid tool history: {}", reason),
+                ),
                 ConversionError::InvalidToolChoice(reason) => (
                     "invalid_request_error",
                     format!("invalid tool choice: {}", reason),

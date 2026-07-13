@@ -34,6 +34,7 @@ pub(crate) mod model_profile_answer;
 mod router;
 pub mod stream;
 pub(crate) mod tool_attempt;
+pub(crate) mod tool_history;
 pub mod types;
 pub(crate) mod usage;
 mod websearch;
