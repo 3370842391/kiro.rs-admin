@@ -584,6 +584,96 @@ export interface TracePage {
   total: number
 }
 
+export type SnapshotSeverity = 'critical' | 'error' | 'warning' | 'info'
+
+export type SnapshotPayloadKind =
+  | 'client_request'
+  | 'kiro_request'
+  | 'upstream_response'
+  | 'tool_diagnostics'
+  | 'stream_tail'
+  | 'internal_error'
+
+export interface ErrorSnapshotSummary {
+  snapshotId: string
+  traceId: string
+  ts: string
+  model: string
+  isStream: boolean
+  keyId: number
+  keySource: 'masterApiKey' | 'clientKey'
+  finalCredentialId: number
+  endpoint: string | null
+  httpStatus: number | null
+  finalStatus: string
+  errorType: string
+  severity: SnapshotSeverity
+  errorMessage: string | null
+  recovered: boolean
+  pinned: boolean
+  retentionExempt: boolean
+  omittedDueToDiskPressure: boolean
+  payloadCount: number
+  originalBytes: number
+  compressedBytes: number
+  createdAt: number
+  updatedAt: number
+}
+
+export interface ErrorSnapshotPayloadMeta {
+  seq: number
+  kind: SnapshotPayloadKind
+  attempt: number | null
+  contentType: string
+  originalBytes: number
+  compressedBytes: number
+  sha256: string
+  partCount: number
+}
+
+export interface ErrorSnapshotDetail extends ErrorSnapshotSummary {
+  payloads: ErrorSnapshotPayloadMeta[]
+}
+
+export interface ErrorSnapshotPayload extends ErrorSnapshotPayloadMeta {
+  content: unknown
+}
+
+export interface ErrorSnapshotQuery {
+  traceId?: string
+  model?: string
+  errorType?: string
+  httpStatus?: number
+  credentialId?: number
+  severity?: SnapshotSeverity | ''
+  recovered?: boolean
+  pinned?: boolean
+  from?: string
+  to?: string
+  limit?: number
+  offset?: number
+}
+
+export interface ErrorSnapshotPage {
+  records: ErrorSnapshotSummary[]
+  total: number
+}
+
+export interface ErrorSnapshotStorageStatus {
+  dbBytes: number
+  walBytes: number
+  shmBytes: number
+  fallbackBytes: number
+  totalBytes: number
+  availableBytes: number
+  maxStorageBytes: number
+  minFreeDiskBytes: number
+  diskPressure: boolean
+  records: number
+  pinnedRecords: number
+  criticalRecords: number
+}
+
 /** 单凭据失败分类计数（鉴权 / 账号风控 / 其他） */
 export interface FailureStats {
   auth: number
