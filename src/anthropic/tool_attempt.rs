@@ -98,6 +98,7 @@ impl ProbationBuffer {
     }
 
     /// 若失败仍处于首轮未提交窗口，丢弃该轮缓冲并允许重试一次。
+    #[cfg(test)]
     pub(crate) fn prepare_retry(
         &mut self,
         attempt_index: u8,

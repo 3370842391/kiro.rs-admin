@@ -1566,6 +1566,7 @@ impl StreamContext {
     }
 
     /// 返回工具 JSON 的 typed 终态，供 handler 精确区分可重试的 EOF 半截与其他错误。
+    #[cfg(test)]
     pub fn terminal_tool_json_error(&self) -> Option<&ToolJsonAccumulatorError> {
         self.tool_json_error.as_ref()
     }
@@ -3139,7 +3140,7 @@ impl BufferedStreamContext {
         )
     }
 
-    /// 工具调用 JSON 错误信息（转发内部 StreamContext）。缓冲流据此记 error。
+    /// 上游终态错误信息（转发内部 StreamContext）。缓冲流据此记 error。
     pub fn terminal_error_message(&self) -> Option<String> {
         self.inner.terminal_error_message()
     }
@@ -3148,7 +3149,7 @@ impl BufferedStreamContext {
         self.inner.terminal_attempt_failure()
     }
 
-    /// 返回内部工具 JSON 的 typed 终态，供缓冲 handler 使用同一重试门。
+    #[cfg(test)]
     pub fn terminal_tool_json_error(&self) -> Option<&ToolJsonAccumulatorError> {
         self.inner.terminal_tool_json_error()
     }
