@@ -3,6 +3,15 @@ use crate::kiro::model::events::Event;
 use std::collections::HashMap;
 use std::future::Future;
 
+const MAX_UPSTREAM_ERROR_MESSAGE_CHARS: usize = 512;
+
+fn bounded_upstream_error_message(message: &str) -> String {
+    message
+        .chars()
+        .take(MAX_UPSTREAM_ERROR_MESSAGE_CHARS)
+        .collect()
+}
+
 /// 实时 SSE 的试运行缓冲。
 ///
 /// `message_start` 和空 content delta 会暂存在内存中；首个非空文本、thinking、
@@ -116,6 +125,7 @@ impl ProbationBuffer {
         };
         if state.should_retry() {
             self.pending.clear();
+            self.pending_tools.clear();
             return true;
         }
         false
@@ -239,15 +249,25 @@ impl AttemptObservation {
                 error_code,
                 error_message,
             } => {
-                self.upstream_error
-                    .get_or_insert_with(|| (error_code.clone(), error_message.clone()));
+                self.upstream_error.get_or_insert_with(|| {
+                    (
+                        error_code.clone(),
+                        bounded_upstream_error_message(error_message),
+                    )
+                });
             }
             Event::Exception {
                 exception_type,
                 message,
             } => {
-                self.upstream_error
-                    .get_or_insert_with(|| (exception_type.clone(), message.clone()));
+                if exception_type != "ContentLengthExceededException" {
+                    self.upstream_error.get_or_insert_with(|| {
+                        (
+                            exception_type.clone(),
+                            bounded_upstream_error_message(message),
+                        )
+                    });
+                }
             }
             _ => {}
         }
@@ -455,6 +475,36 @@ mod tests {
     }
 
     #[test]
+    fn content_length_exception_keeps_existing_max_tokens_semantics() {
+        let mut observation = AttemptObservation::default();
+        let mut response = AssistantResponseEvent::default();
+        response.content = "partial output".into();
+        observation.observe(&Event::AssistantResponse(response));
+        observation.observe(&Event::Exception {
+            exception_type: "ContentLengthExceededException".into(),
+            message: "output limit reached".into(),
+        });
+
+        assert_eq!(observation.failure(None, false), None);
+    }
+
+    #[test]
+    fn upstream_error_detail_is_bounded_before_storage() {
+        let mut observation = AttemptObservation::default();
+        observation.observe(&Event::Exception {
+            exception_type: "ModelError".into(),
+            message: "敏".repeat(1000),
+        });
+
+        let Some(AttemptFailure::UpstreamError { message, .. }) = observation.failure(None, false)
+        else {
+            panic!("expected upstream failure");
+        };
+        assert_eq!(message.chars().count(), 512);
+        assert!(message.is_char_boundary(message.len()));
+    }
+
+    #[test]
     fn retries_only_first_incomplete_uncommitted_attempt() {
         let retryable = ToolAttemptState {
             attempt_index: 0,
@@ -647,6 +697,19 @@ mod tests {
         assert!(buffer.prepare_retry(0, &incomplete()));
         assert!(buffer.take_pending().is_empty());
         assert!(!buffer.committed());
+    }
+
+    #[test]
+    fn realtime_retry_clears_partial_tool_tracking() {
+        let mut buffer = ProbationBuffer::default();
+        assert!(buffer.push(message_start()).is_empty());
+        assert!(buffer.push(tool_start("tool_1")).is_empty());
+        assert!(buffer.push(tool_delta(0, r#"{"path":"/tmp"#)).is_empty());
+
+        assert!(buffer.prepare_retry(0, &incomplete()));
+        assert!(buffer.push(block_stop(0)).is_empty());
+        assert!(!buffer.committed());
+        assert!(!buffer.tool_forwarded());
     }
 
     #[test]

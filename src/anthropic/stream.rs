@@ -3532,6 +3532,30 @@ mod tests {
     }
 
     #[test]
+    fn content_length_exception_keeps_max_tokens_success_terminal() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4.8",
+            10,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_assistant_response("partial output");
+        let _ = ctx.process_kiro_event(&Event::Exception {
+            exception_type: "ContentLengthExceededException".into(),
+            message: "output limit reached".into(),
+        });
+        let events = ctx.generate_final_events();
+
+        assert!(!events.iter().any(|event| event.event == "error"));
+        assert!(events.iter().any(|event| {
+            event.event == "message_delta" && event.data["delta"]["stop_reason"] == "max_tokens"
+        }));
+        assert!(events.iter().any(|event| event.event == "message_stop"));
+    }
+
+    #[test]
     fn read_error_finalization_never_emits_success_terminal_events() {
         let mut ctx = StreamContext::new_with_thinking(
             "claude-opus-4.8",
