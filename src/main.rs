@@ -273,6 +273,75 @@ async fn main() {
         }
     };
 
+    let snapshot_policy = admin::error_snapshot_db::ErrorSnapshotPolicy::from_config(&config);
+    let error_snapshot_store = match admin::ErrorSnapshotStore::open(
+        cache_dir.join("error_snapshots.db"),
+        cache_dir.join("error-snapshot-fallback"),
+        snapshot_policy,
+    ) {
+        Ok(store) => std::sync::Arc::new(store),
+        Err(error) => {
+            tracing::error!(%error, "打开 error_snapshots.db 失败，使用内存索引和磁盘 fallback");
+            std::sync::Arc::new(
+                admin::ErrorSnapshotStore::open_in_memory_with_fallback(
+                    cache_dir.join("error-snapshot-fallback"),
+                    admin::error_snapshot_db::ErrorSnapshotPolicy::from_config(&config),
+                )
+                .expect("内存错误快照 store 初始化失败"),
+            )
+        }
+    };
+
+    // 启动时先导入数据库故障期间留下的 fallback，并补齐最近 trace 的 snapshotId 回链。
+    match error_snapshot_store.import_fallback() {
+        Ok(report) if report.imported > 0 || report.existing > 0 || report.failed > 0 => {
+            tracing::info!(
+                imported = report.imported,
+                existing = report.existing,
+                failed = report.failed,
+                "错误快照 fallback 启动导入完成"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => tracing::error!(%error, "错误快照 fallback 启动导入失败"),
+    }
+    if let Some(store) = &trace_store {
+        match error_snapshot_store
+            .recent_trace_links(chrono::Utc::now().timestamp() - 7 * 86_400)
+        {
+            Ok(links) => {
+                for (trace_id, snapshot_id) in links {
+                    store.link_snapshot(&trace_id, &snapshot_id);
+                }
+            }
+            Err(error) => tracing::error!(%error, "读取最近错误快照回链失败"),
+        }
+    }
+
+    {
+        let store = error_snapshot_store.clone();
+        let trace_store = trace_store.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            loop {
+                if let Err(error) = store.run_maintenance() {
+                    tracing::error!(%error, "错误快照维护失败");
+                }
+                if let Some(trace_store) = &trace_store {
+                    match store.recent_trace_links(chrono::Utc::now().timestamp() - 7 * 86_400) {
+                        Ok(links) => {
+                            for (trace_id, snapshot_id) in links {
+                                trace_store.link_snapshot(&trace_id, &snapshot_id);
+                            }
+                        }
+                        Err(error) => tracing::error!(%error, "错误快照回链维护失败"),
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        });
+    }
+
     // 启动后定期清理过期 usage_log 与 trace 记录
     {
         let recorder = usage_recorder.clone();
@@ -357,6 +426,7 @@ async fn main() {
         Some(usage_aggregator.clone()),
         Some(cache_meter.clone()),
         trace_store.clone(),
+        Some(error_snapshot_store.clone()),
         Some(model_mapping_manager.clone()),
         Some(model_profile_store.clone()),
     );
@@ -385,6 +455,7 @@ async fn main() {
             .with_log_governance(
                 Some(admin_trace_store.clone()),
                 Some(usage_recorder.clone()),
+                Some(error_snapshot_store.clone()),
             );
             let admin_state = admin::AdminState::new(
                 admin_key,
@@ -392,6 +463,7 @@ async fn main() {
                 client_key_manager.clone(),
                 usage_aggregator.clone(),
                 admin_trace_store,
+                error_snapshot_store.clone(),
                 group_manager.clone(),
                 model_mapping_manager.clone(),
             );

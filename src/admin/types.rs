@@ -707,10 +707,16 @@ pub struct LogGovernanceConfigResponse {
     pub trace_retention_days: u32,
     /// 用量日志保留天数
     pub usage_log_retention_days: u32,
+    pub error_snapshot_enabled: bool,
+    pub error_snapshot_retention_days: u32,
+    pub error_snapshot_max_storage_gb: u64,
+    pub error_snapshot_capture_recovered: bool,
+    pub error_snapshot_capture_bodies: bool,
+    pub error_snapshot_min_free_disk_gb: u64,
 }
 
 /// 更新日志治理配置（字段缺省表示不修改）
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetLogGovernanceConfigRequest {
     #[serde(default)]
@@ -721,6 +727,18 @@ pub struct SetLogGovernanceConfigRequest {
     /// 用量日志保留天数，1..=365
     #[serde(default)]
     pub usage_log_retention_days: Option<u32>,
+    #[serde(default)]
+    pub error_snapshot_enabled: Option<bool>,
+    #[serde(default)]
+    pub error_snapshot_retention_days: Option<u32>,
+    #[serde(default)]
+    pub error_snapshot_max_storage_gb: Option<u64>,
+    #[serde(default)]
+    pub error_snapshot_capture_recovered: Option<bool>,
+    #[serde(default)]
+    pub error_snapshot_capture_bodies: Option<bool>,
+    #[serde(default)]
+    pub error_snapshot_min_free_disk_gb: Option<u64>,
 }
 
 // ============ 代理池 ============

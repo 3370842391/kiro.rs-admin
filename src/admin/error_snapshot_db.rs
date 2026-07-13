@@ -54,6 +54,22 @@ pub struct ErrorSnapshotPolicy {
     pub min_free_disk_bytes: u64,
 }
 
+impl ErrorSnapshotPolicy {
+    pub fn from_config(config: &crate::model::config::Config) -> Self {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        Self {
+            enabled: config.error_snapshot_enabled,
+            retention_days: config.error_snapshot_retention_days,
+            max_storage_bytes: config.error_snapshot_max_storage_gb.saturating_mul(GIB),
+            capture_recovered: config.error_snapshot_capture_recovered,
+            capture_bodies: config.error_snapshot_capture_bodies,
+            min_free_disk_bytes: config
+                .error_snapshot_min_free_disk_gb
+                .saturating_mul(GIB),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotWrite {
     pub snapshot_id: String,
