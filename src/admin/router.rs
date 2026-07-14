@@ -9,21 +9,22 @@ use super::{
     handlers::{
         add_credential, add_proxy, apply_image_update, apply_model_profile_preview,
         assign_proxies_round_robin, assign_proxy_to_credential, batch_add_proxies,
-        batch_import_credentials, check_all_proxies, check_proxy, check_proxy_url,
-        check_rate_limit, check_update, cleanup_error_snapshots, clear_cache_policy_entries,
-        clear_throttle, clear_traces, complete_social_login, complete_social_relogin,
-        create_client_key, create_group, delete_client_key, delete_credential,
-        delete_error_snapshot, delete_group, delete_model_mapping, delete_model_profile_entry,
-        delete_proxy, disable_quota_exceeded, download_error_snapshot, enable_overage_all,
-        error_snapshot_storage, export_credentials, fetch_model_profile, force_refresh_token,
-        get_account_throttle_config, get_all_credentials, get_cache_hit_rate, get_cache_policy,
-        get_credential_balance, get_credential_models, get_endpoint_chains, get_error_snapshot,
-        get_error_snapshot_payload, get_global_proxy, get_image_budget, get_load_balancing_mode,
-        get_log_governance_config, get_model_profiles, get_proxy_balancing_mode, get_proxy_pool,
-        get_retry_policy, get_update_config, list_client_keys, list_error_snapshots, list_groups,
-        list_model_mappings, list_traces, patch_model_profile, pin_error_snapshot, poll_idc_login,
-        poll_idc_relogin, poll_social_login, poll_social_relogin, preview_model_profiles,
-        pull_update_image, replace_model_mappings, reset_all_success_count, reset_client_key_stats,
+        batch_import_credentials, batch_update_credentials, check_all_proxies, check_proxy,
+        check_proxy_url, check_rate_limit, check_update, cleanup_error_snapshots,
+        clear_cache_policy_entries, clear_throttle, clear_traces, complete_social_login,
+        complete_social_relogin, create_client_key, create_group, delete_client_key,
+        delete_credential, delete_error_snapshot, delete_group, delete_model_mapping,
+        delete_model_profile_entry, delete_proxy, disable_quota_exceeded, download_error_snapshot,
+        enable_overage_all, error_snapshot_storage, export_credentials, fetch_model_profile,
+        force_refresh_token, get_account_throttle_config, get_all_credentials, get_cache_hit_rate,
+        get_cache_policy, get_credential_balance, get_credential_models, get_endpoint_chains,
+        get_error_snapshot, get_error_snapshot_payload, get_global_proxy, get_image_budget,
+        get_load_balancing_mode, get_log_governance_config, get_model_profiles,
+        get_proxy_balancing_mode, get_proxy_pool, get_retry_policy, get_update_config,
+        list_client_keys, list_error_snapshots, list_groups, list_model_mappings, list_traces,
+        patch_model_profile, pin_error_snapshot, poll_idc_login, poll_idc_relogin,
+        poll_social_login, poll_social_relogin, preview_model_profiles, pull_update_image,
+        replace_model_mappings, reset_all_success_count, reset_client_key_stats,
         reset_failure_count, reset_success_count, rollback_image_update, rotate_client_key,
         set_account_throttle_config, set_cache_hit_rate, set_cache_policy, set_client_key_disabled,
         set_credential_disabled, set_credential_overage, set_credential_priority,
@@ -43,6 +44,7 @@ use super::{
 /// # 端点
 /// - `GET /credentials` - 获取所有凭据状态
 /// - `POST /credentials` - 添加新凭据
+/// - `PUT /credentials/batch` - 批量更新凭据 RPM、分组与来源渠道
 /// - `DELETE /credentials/:id` - 删除凭据
 /// - `PUT /credentials/:id` - 更新凭据可编辑字段（email、proxy 等）
 /// - `POST /credentials/:id/disabled` - 设置凭据禁用状态
@@ -78,6 +80,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_all_credentials).post(add_credential),
         )
         .route("/credentials/export", get(export_credentials))
+        .route("/credentials/batch", put(batch_update_credentials))
         .route(
             "/credentials/{id}",
             delete(delete_credential).put(update_credential),
@@ -246,4 +249,77 @@ pub fn create_admin_router(state: AdminState) -> Router {
         ));
 
     Router::new().merge(authenticated).with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode, header},
+    };
+    use tower::ServiceExt;
+
+    use crate::{
+        admin::{
+            AdminService, ClientKeyManager, ErrorSnapshotStore, GroupManager, ModelMappingManager,
+            TraceStore, UsageAggregator, error_snapshot_db::ErrorSnapshotPolicy,
+            proxy_pool::ProxyPoolManager,
+        },
+        kiro::{model::credentials::KiroCredentials, token_manager::MultiTokenManager},
+        model::config::{Config, TlsBackend},
+    };
+
+    #[tokio::test]
+    async fn batch_update_credentials_route_returns_updated_summary() {
+        let credentials = vec![KiroCredentials {
+            id: Some(1),
+            rpm_limit: 10,
+            ..Default::default()
+        }];
+        let token_manager = Arc::new(
+            MultiTokenManager::new(Config::default(), credentials, None, None, true).unwrap(),
+        );
+        let service = AdminService::new(
+            token_manager,
+            Vec::new(),
+            Arc::new(ProxyPoolManager::new(None, TlsBackend::Rustls)),
+        );
+        let config = Config::default();
+        let state = AdminState::new(
+            "test-admin-key",
+            service,
+            Arc::new(ClientKeyManager::new()),
+            Arc::new(UsageAggregator::new()),
+            Arc::new(TraceStore::open_in_memory().unwrap()),
+            Arc::new(
+                ErrorSnapshotStore::open_in_memory(ErrorSnapshotPolicy::from_config(&config))
+                    .unwrap(),
+            ),
+            Arc::new(GroupManager::new()),
+            Arc::new(ModelMappingManager::new()),
+        );
+
+        let response = create_admin_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/credentials/batch")
+                    .header("x-api-key", "test-admin-key")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"ids":[1],"rpmLimit":4}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["selected"], 1);
+        assert_eq!(json["updated"], 1);
+        assert_eq!(json["rpmSummary"]["limitedCapacity"], 4);
+    }
 }

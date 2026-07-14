@@ -1035,6 +1035,16 @@ pub(crate) struct CredentialBatchPatch {
     pub source_channel: Option<Option<String>>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CredentialBatchUpdateError {
+    #[error("批量更新包含重复的凭据 ID: {0}")]
+    DuplicateId(u64),
+    #[error("凭据不存在: {0}")]
+    NotFound(u64),
+    #[error("批量凭据更新持久化失败")]
+    Persist(#[source] anyhow::Error),
+}
+
 /// 批量账号配置更新统计。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CredentialBatchUpdateResult {
@@ -3475,21 +3485,21 @@ impl MultiTokenManager {
         &self,
         ids: &[u64],
         patch: CredentialBatchPatch,
-    ) -> anyhow::Result<CredentialBatchUpdateResult> {
+    ) -> Result<CredentialBatchUpdateResult, CredentialBatchUpdateError> {
         let result = {
             let mut entries = self.entries.lock();
 
             let mut target_ids = HashSet::with_capacity(ids.len());
             for &id in ids {
                 if !target_ids.insert(id) {
-                    bail!("批量更新包含重复的凭据 ID: {}", id);
+                    return Err(CredentialBatchUpdateError::DuplicateId(id));
                 }
             }
 
             let existing_ids: HashSet<u64> = entries.iter().map(|entry| entry.id).collect();
             for &id in ids {
                 if !existing_ids.contains(&id) {
-                    bail!("凭据不存在: {}", id);
+                    return Err(CredentialBatchUpdateError::NotFound(id));
                 }
             }
 
@@ -3554,7 +3564,8 @@ impl MultiTokenManager {
         };
 
         if result.updated > 0 {
-            self.persist_credentials()?;
+            self.persist_credentials()
+                .map_err(CredentialBatchUpdateError::Persist)?;
         }
 
         Ok(result)
@@ -5139,7 +5150,7 @@ mod tests {
                 },
             )
             .unwrap_err();
-        assert!(error.to_string().contains("999"));
+        assert!(matches!(error, CredentialBatchUpdateError::NotFound(999)));
         assert_eq!(
             serde_json::to_value(manager.clone_all_credentials()).unwrap(),
             memory_before,
@@ -5181,7 +5192,10 @@ mod tests {
                 },
             )
             .unwrap_err();
-        assert!(error.to_string().contains("重复"));
+        assert!(matches!(
+            error,
+            CredentialBatchUpdateError::DuplicateId(999)
+        ));
         assert_eq!(
             serde_json::to_value(manager.clone_all_credentials()).unwrap(),
             memory_before,

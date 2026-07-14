@@ -26,7 +26,10 @@ use crate::kiro::model::credentials::{
     normalize_import_auth_method_from_fields, validate_external_idp_endpoint,
 };
 use crate::kiro::provider::KiroProvider;
-use crate::kiro::token_manager::{MultiTokenManager, RPM_WINDOW_SECONDS};
+use crate::kiro::token_manager::{
+    CredentialBatchPatch, CredentialBatchUpdateError, CredentialEntrySnapshot,
+    CredentialGroupPatch, MultiTokenManager, RPM_WINDOW_SECONDS,
+};
 use crate::model::config::{Config, RetryMode};
 
 use super::error::AdminServiceError;
@@ -37,7 +40,8 @@ use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
     AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse,
     ApplyModelProfilesRequest, AssignProxyRequest, AssignRoundRobinResponse, AvailableModelItem,
-    AvailableModelsResponse, BalanceResponse, BatchAddProxyRequest, BatchImportEvent,
+    AvailableModelsResponse, BalanceResponse, BatchAddProxyRequest, BatchGroupMode,
+    BatchImportEvent, BatchUpdateCredentialsRequest, BatchUpdateCredentialsResponse,
     CacheHitRateResponse, CachePolicyResponse, CheckRateLimitRequest, ClearCacheResponse,
     CompleteSocialLoginRequest, CredentialResponseTestResponse, CredentialStatusItem,
     CredentialsExportResponse, CredentialsStatusResponse, EnableOverageAllResult,
@@ -236,6 +240,137 @@ fn normalize_proxy_list(raw: &str) -> Result<Option<String>, AdminServiceError> 
     }
 
     Ok(Some(candidates.join("\n")))
+}
+
+fn calculate_rpm_summary(entries: &[CredentialEntrySnapshot]) -> RpmSummary {
+    let current = entries
+        .iter()
+        .map(|entry| u64::from(entry.rpm_current))
+        .sum();
+    let enabled_limited = entries
+        .iter()
+        .filter(|entry| !entry.disabled && entry.rpm_limit > 0);
+    let limited_capacity = enabled_limited
+        .clone()
+        .map(|entry| u64::from(entry.rpm_limit))
+        .sum();
+    let remaining_limited_capacity = enabled_limited
+        .clone()
+        .map(|entry| u64::from(entry.rpm_limit).saturating_sub(u64::from(entry.rpm_current)))
+        .sum();
+    let saturated_accounts = enabled_limited
+        .filter(|entry| entry.rpm_current >= entry.rpm_limit)
+        .count() as u64;
+
+    RpmSummary {
+        window_seconds: RPM_WINDOW_SECONDS,
+        current,
+        limited_capacity,
+        remaining_limited_capacity,
+        unlimited_accounts: entries
+            .iter()
+            .filter(|entry| !entry.disabled && entry.rpm_limit == 0)
+            .count() as u64,
+        saturated_accounts,
+        enabled_accounts: entries.iter().filter(|entry| !entry.disabled).count() as u64,
+    }
+}
+
+struct NormalizedBatchUpdateRequest {
+    ids: Vec<u64>,
+    patch: CredentialBatchPatch,
+}
+
+fn normalize_batch_update_request(
+    request: BatchUpdateCredentialsRequest,
+) -> Result<NormalizedBatchUpdateRequest, AdminServiceError> {
+    if request.ids.is_empty() || request.ids.len() > 10_000 {
+        return Err(AdminServiceError::InvalidCredential(
+            "ids 数量必须在 1 到 10000 之间".to_string(),
+        ));
+    }
+
+    let mut seen_ids = HashSet::with_capacity(request.ids.len());
+    for &id in &request.ids {
+        if !seen_ids.insert(id) {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "批量更新包含重复的凭据 ID: {}",
+                id
+            )));
+        }
+    }
+
+    if request
+        .rpm_limit
+        .is_some_and(|rpm_limit| rpm_limit > 100_000)
+    {
+        return Err(AdminServiceError::InvalidCredential(
+            "rpmLimit 不能大于 100000".to_string(),
+        ));
+    }
+
+    let groups = request
+        .groups
+        .map(|groups| {
+            let mut seen = HashSet::with_capacity(groups.values.len());
+            let values = groups
+                .values
+                .into_iter()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .filter(|value| seen.insert(value.clone()))
+                .collect::<Vec<_>>();
+
+            match groups.mode {
+                BatchGroupMode::Replace => Ok(CredentialGroupPatch::Replace(values)),
+                BatchGroupMode::Add if values.is_empty() => Err(
+                    AdminServiceError::InvalidCredential("groups add 不能为空".to_string()),
+                ),
+                BatchGroupMode::Remove if values.is_empty() => Err(
+                    AdminServiceError::InvalidCredential("groups remove 不能为空".to_string()),
+                ),
+                BatchGroupMode::Add => Ok(CredentialGroupPatch::Add(values)),
+                BatchGroupMode::Remove => Ok(CredentialGroupPatch::Remove(values)),
+            }
+        })
+        .transpose()?;
+
+    let source_channel = request.source_channel.map(|source_channel| {
+        let source_channel = source_channel.trim();
+        if source_channel.is_empty() {
+            None
+        } else {
+            Some(source_channel.to_string())
+        }
+    });
+
+    let patch = CredentialBatchPatch {
+        rpm_limit: request.rpm_limit,
+        groups,
+        source_channel,
+    };
+    if patch.rpm_limit.is_none() && patch.groups.is_none() && patch.source_channel.is_none() {
+        return Err(AdminServiceError::InvalidCredential(
+            "批量更新至少需要一个修改字段".to_string(),
+        ));
+    }
+
+    Ok(NormalizedBatchUpdateRequest {
+        ids: request.ids,
+        patch,
+    })
+}
+
+fn map_batch_update_error(error: CredentialBatchUpdateError) -> AdminServiceError {
+    match error {
+        CredentialBatchUpdateError::DuplicateId(id) => {
+            AdminServiceError::InvalidCredential(format!("批量更新包含重复的凭据 ID: {}", id))
+        }
+        CredentialBatchUpdateError::NotFound(id) => AdminServiceError::NotFound { id },
+        CredentialBatchUpdateError::Persist(_) => {
+            AdminServiceError::InternalError("批量凭据更新持久化失败".to_string())
+        }
+    }
 }
 
 /// 缓存的余额条目（含时间戳）
@@ -1004,6 +1139,7 @@ impl AdminService {
     /// 获取所有凭据状态
     pub fn get_all_credentials(&self) -> CredentialsStatusResponse {
         let snapshot = self.token_manager.snapshot();
+        let rpm_summary = calculate_rpm_summary(&snapshot.entries);
         let default_endpoint = self.token_manager.config().default_endpoint.clone();
 
         // 一次性快照余额缓存，避免 N 次加锁
@@ -1066,17 +1202,27 @@ impl AdminService {
             available: snapshot.available,
             current_id: snapshot.current_id,
             credentials,
-            // Task 3 将在 AdminService 中按完整口径计算这些汇总值。
-            rpm_summary: RpmSummary {
-                window_seconds: RPM_WINDOW_SECONDS,
-                current: 0,
-                limited_capacity: 0,
-                remaining_limited_capacity: 0,
-                unlimited_accounts: 0,
-                saturated_accounts: 0,
-                enabled_accounts: 0,
-            },
+            rpm_summary,
         }
+    }
+
+    pub fn batch_update_credentials(
+        &self,
+        request: BatchUpdateCredentialsRequest,
+    ) -> Result<BatchUpdateCredentialsResponse, AdminServiceError> {
+        let normalized = normalize_batch_update_request(request)?;
+        let result = self
+            .token_manager
+            .batch_update_credentials(&normalized.ids, normalized.patch)
+            .map_err(map_batch_update_error)?;
+        let snapshot = self.token_manager.snapshot();
+
+        Ok(BatchUpdateCredentialsResponse {
+            selected: result.selected,
+            updated: result.updated,
+            unchanged: result.unchanged,
+            rpm_summary: calculate_rpm_summary(&snapshot.entries),
+        })
     }
 
     /// 导出凭据为兼容 JSON（嵌套 `Account` 格式）
@@ -4295,6 +4441,239 @@ impl AdminService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rpm_snapshot_entry(
+        id: u64,
+        rpm_limit: u32,
+        rpm_current: u32,
+        disabled: bool,
+    ) -> crate::kiro::token_manager::CredentialEntrySnapshot {
+        crate::kiro::token_manager::CredentialEntrySnapshot {
+            id,
+            priority: id as u32,
+            rpm_limit,
+            rpm_current,
+            in_flight: 0,
+            disabled,
+            failure_count: 0,
+            total_failure_count: 0,
+            auth_method: None,
+            provider: None,
+            has_profile_arn: false,
+            expires_at: None,
+            refresh_token_hash: None,
+            api_key_hash: None,
+            masked_api_key: None,
+            email: None,
+            success_count: 0,
+            last_used_at: None,
+            has_proxy: false,
+            proxy_url: None,
+            refresh_failure_count: 0,
+            disabled_reason: None,
+            throttled_remaining_secs: None,
+            rate_limited_remaining_ms: None,
+            endpoint: None,
+            groups: Vec::new(),
+            source_channel: None,
+        }
+    }
+
+    #[test]
+    fn rpm_summary_uses_documented_account_scopes() {
+        let entries = vec![
+            rpm_snapshot_entry(1, 10, 3, false),
+            rpm_snapshot_entry(2, 5, 5, false),
+            rpm_snapshot_entry(3, 2, 9, false),
+            rpm_snapshot_entry(4, 0, 4, false),
+            rpm_snapshot_entry(5, 100, 7, true),
+            rpm_snapshot_entry(6, 0, 2, true),
+        ];
+
+        let summary = calculate_rpm_summary(&entries);
+
+        assert_eq!(summary.window_seconds, RPM_WINDOW_SECONDS);
+        assert_eq!(
+            summary.current, 30,
+            "disabled accounts still contribute history"
+        );
+        assert_eq!(summary.limited_capacity, 17);
+        assert_eq!(summary.remaining_limited_capacity, 7);
+        assert_eq!(summary.unlimited_accounts, 1);
+        assert_eq!(summary.saturated_accounts, 2);
+        assert_eq!(summary.enabled_accounts, 4);
+    }
+
+    #[test]
+    fn normalize_batch_update_request_rejects_invalid_boundaries() {
+        use super::super::types::{
+            BatchGroupMode, BatchGroupsPatchRequest, BatchUpdateCredentialsRequest,
+        };
+
+        let request = |ids, rpm_limit, groups, source_channel| BatchUpdateCredentialsRequest {
+            ids,
+            rpm_limit,
+            groups,
+            source_channel,
+        };
+
+        assert!(normalize_batch_update_request(request(vec![], Some(1), None, None)).is_err());
+        assert!(
+            normalize_batch_update_request(request(vec![1; 10_001], Some(1), None, None)).is_err()
+        );
+        assert!(
+            normalize_batch_update_request(request(vec![1, 2, 1], Some(1), None, None)).is_err()
+        );
+        assert!(
+            normalize_batch_update_request(request(vec![1], Some(100_001), None, None)).is_err()
+        );
+        assert!(normalize_batch_update_request(request(vec![1], None, None, None)).is_err());
+
+        for mode in [BatchGroupMode::Add, BatchGroupMode::Remove] {
+            assert!(
+                normalize_batch_update_request(request(
+                    vec![1],
+                    None,
+                    Some(BatchGroupsPatchRequest {
+                        mode,
+                        values: vec!["  ".to_string(), String::new()],
+                    }),
+                    None,
+                ))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_batch_update_request_allows_replace_clear_and_source_clear() {
+        use super::super::types::{
+            BatchGroupMode, BatchGroupsPatchRequest, BatchUpdateCredentialsRequest,
+        };
+        use crate::kiro::token_manager::CredentialGroupPatch;
+
+        let clear = normalize_batch_update_request(BatchUpdateCredentialsRequest {
+            ids: vec![1],
+            rpm_limit: Some(0),
+            groups: Some(BatchGroupsPatchRequest {
+                mode: BatchGroupMode::Replace,
+                values: vec!["  ".to_string(), String::new()],
+            }),
+            source_channel: Some("   ".to_string()),
+        })
+        .unwrap();
+        assert_eq!(clear.ids, vec![1]);
+        assert_eq!(clear.patch.rpm_limit, Some(0));
+        assert_eq!(
+            clear.patch.groups,
+            Some(CredentialGroupPatch::Replace(Vec::new()))
+        );
+        assert_eq!(clear.patch.source_channel, Some(None));
+
+        let normalized = normalize_batch_update_request(BatchUpdateCredentialsRequest {
+            ids: vec![2],
+            rpm_limit: None,
+            groups: Some(BatchGroupsPatchRequest {
+                mode: BatchGroupMode::Replace,
+                values: vec![
+                    " alpha ".to_string(),
+                    String::new(),
+                    "beta".to_string(),
+                    "alpha".to_string(),
+                    " beta ".to_string(),
+                ],
+            }),
+            source_channel: Some(" migration ".to_string()),
+        })
+        .unwrap();
+        assert_eq!(
+            normalized.patch.groups,
+            Some(CredentialGroupPatch::Replace(vec![
+                "alpha".to_string(),
+                "beta".to_string(),
+            ]))
+        );
+        assert_eq!(
+            normalized.patch.source_channel,
+            Some(Some("migration".to_string()))
+        );
+    }
+
+    #[test]
+    fn batch_update_errors_map_to_documented_statuses_without_leaking_sources() {
+        use axum::http::StatusCode;
+
+        let duplicate = map_batch_update_error(CredentialBatchUpdateError::DuplicateId(7));
+        assert_eq!(duplicate.status_code(), StatusCode::BAD_REQUEST);
+        assert!(matches!(duplicate, AdminServiceError::InvalidCredential(_)));
+
+        let missing = map_batch_update_error(CredentialBatchUpdateError::NotFound(9));
+        assert_eq!(missing.status_code(), StatusCode::NOT_FOUND);
+        assert!(matches!(missing, AdminServiceError::NotFound { id: 9 }));
+
+        let persist = map_batch_update_error(CredentialBatchUpdateError::Persist(anyhow::anyhow!(
+            "secret-token-value"
+        )));
+        assert_eq!(persist.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!persist.to_string().contains("secret-token-value"));
+    }
+
+    #[tokio::test]
+    async fn batch_update_credentials_returns_updated_summary() {
+        use super::super::types::BatchUpdateCredentialsRequest;
+        use crate::model::config::TlsBackend;
+
+        let credentials = vec![
+            KiroCredentials {
+                id: Some(1),
+                rpm_limit: 10,
+                ..Default::default()
+            },
+            KiroCredentials {
+                id: Some(2),
+                rpm_limit: 0,
+                ..Default::default()
+            },
+        ];
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), credentials, None, None, true).unwrap(),
+        );
+        let service = AdminService::new(
+            Arc::clone(&manager),
+            Vec::new(),
+            Arc::new(ProxyPoolManager::new(None, TlsBackend::Rustls)),
+        );
+        manager.record_request(1);
+        manager.record_request(2);
+
+        let response = service
+            .batch_update_credentials(BatchUpdateCredentialsRequest {
+                ids: vec![1],
+                rpm_limit: Some(4),
+                groups: None,
+                source_channel: None,
+            })
+            .unwrap();
+
+        assert_eq!(response.selected, 1);
+        assert_eq!(response.updated, 1);
+        assert_eq!(response.unchanged, 0);
+        assert_eq!(response.rpm_summary.current, 2);
+        assert_eq!(response.rpm_summary.limited_capacity, 4);
+        assert_eq!(response.rpm_summary.remaining_limited_capacity, 3);
+        assert_eq!(response.rpm_summary.unlimited_accounts, 1);
+        assert_eq!(response.rpm_summary.saturated_accounts, 0);
+        assert_eq!(response.rpm_summary.enabled_accounts, 2);
+        assert_eq!(
+            manager
+                .clone_all_credentials()
+                .into_iter()
+                .find(|credential| credential.id == Some(1))
+                .unwrap()
+                .rpm_limit,
+            4
+        );
+    }
 
     #[test]
     fn validates_error_snapshot_governance_ranges() {
