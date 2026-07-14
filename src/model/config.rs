@@ -324,6 +324,10 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub local_ping_response: bool,
 
+    /// 是否兼容 system 非空、唯一 user 文本为空且无工具/多模态内容的请求。
+    #[serde(default)]
+    pub empty_user_message_compat: bool,
+
     /// 是否启用严格模型资料探针的本地确定性回复。
     #[serde(default = "default_true")]
     pub model_profile_exact_answers_enabled: bool,
@@ -659,6 +663,7 @@ impl Default for Config {
             extract_thinking: default_extract_thinking(),
             strict_thinking_validation: false,
             local_ping_response: default_true(),
+            empty_user_message_compat: false,
             model_profile_exact_answers_enabled: default_true(),
             tool_compatibility_mode: default_tool_compatibility_mode(),
             default_endpoint: default_endpoint(),
@@ -885,5 +890,16 @@ mod tests {
     fn strict_thinking_validation_can_be_enabled() {
         let config: Config = serde_json::from_str(r#"{"strictThinkingValidation":true}"#).unwrap();
         assert!(config.strict_thinking_validation);
+    }
+
+    #[test]
+    fn empty_user_message_compat_defaults_off_and_round_trips_in_camel_case() {
+        let defaulted: Config = serde_json::from_str("{}").unwrap();
+        assert!(!defaulted.empty_user_message_compat);
+
+        let enabled: Config = serde_json::from_str(r#"{"emptyUserMessageCompat":true}"#).unwrap();
+        assert!(enabled.empty_user_message_compat);
+        let encoded = serde_json::to_value(enabled).unwrap();
+        assert_eq!(encoded["emptyUserMessageCompat"], true);
     }
 }

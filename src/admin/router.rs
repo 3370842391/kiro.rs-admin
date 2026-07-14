@@ -17,9 +17,9 @@ use super::{
         delete_model_profile_entry, delete_proxy, disable_quota_exceeded, download_error_snapshot,
         enable_overage_all, error_snapshot_storage, export_credentials, fetch_model_profile,
         force_refresh_token, get_account_throttle_config, get_all_credentials, get_cache_hit_rate,
-        get_cache_policy, get_credential_balance, get_credential_models, get_endpoint_chains,
-        get_error_snapshot, get_error_snapshot_payload, get_global_proxy, get_image_budget,
-        get_load_balancing_mode, get_log_governance_config, get_model_profiles,
+        get_cache_policy, get_compatibility_config, get_credential_balance, get_credential_models,
+        get_endpoint_chains, get_error_snapshot, get_error_snapshot_payload, get_global_proxy,
+        get_image_budget, get_load_balancing_mode, get_log_governance_config, get_model_profiles,
         get_proxy_balancing_mode, get_proxy_pool, get_retry_policy, get_update_config,
         list_client_keys, list_error_snapshots, list_groups, list_model_mappings, list_traces,
         patch_model_profile, pin_error_snapshot, poll_idc_login, poll_idc_relogin,
@@ -27,14 +27,15 @@ use super::{
         replace_model_mappings, reset_all_success_count, reset_client_key_stats,
         reset_failure_count, reset_success_count, rollback_image_update, rotate_client_key,
         set_account_throttle_config, set_cache_hit_rate, set_cache_policy, set_client_key_disabled,
-        set_credential_disabled, set_credential_overage, set_credential_priority,
-        set_endpoint_chains, set_global_proxy, set_image_budget, set_load_balancing_mode,
-        set_log_governance_config, set_model_profile_settings, set_proxy_balancing_mode,
-        set_proxy_enabled, set_retry_policy, set_update_config, start_idc_login, start_idc_relogin,
-        start_social_login, start_social_relogin, stats_by_credential, stats_by_model,
-        stats_overview, stats_timeseries, sync_model_profiles, test_credential_response,
-        trace_failure_stats, unpin_error_snapshot, update_admin_key, update_client_key,
-        update_credential, update_group, update_refresh_token, upsert_model_mapping,
+        set_compatibility_config, set_credential_disabled, set_credential_overage,
+        set_credential_priority, set_endpoint_chains, set_global_proxy, set_image_budget,
+        set_load_balancing_mode, set_log_governance_config, set_model_profile_settings,
+        set_proxy_balancing_mode, set_proxy_enabled, set_retry_policy, set_update_config,
+        start_idc_login, start_idc_relogin, start_social_login, start_social_relogin,
+        stats_by_credential, stats_by_model, stats_overview, stats_timeseries, sync_model_profiles,
+        test_credential_response, trace_failure_stats, unpin_error_snapshot, update_admin_key,
+        update_client_key, update_credential, update_group, update_refresh_token,
+        upsert_model_mapping,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -126,6 +127,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/account-throttle",
             get(get_account_throttle_config).put(set_account_throttle_config),
+        )
+        .route(
+            "/config/compatibility",
+            get(get_compatibility_config).put(set_compatibility_config),
         )
         .route(
             "/config/retry-policy",
@@ -349,5 +354,44 @@ mod tests {
 
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         }
+    }
+
+    #[tokio::test]
+    async fn compatibility_config_route_reads_and_updates_empty_user_message_flag() {
+        let app = batch_update_test_router();
+        let get = || {
+            Request::builder()
+                .method("GET")
+                .uri("/config/compatibility")
+                .header("x-api-key", "test-admin-key")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let response = app.clone().oneshot(get()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["emptyUserMessageCompat"], false);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/config/compatibility")
+                    .header("x-api-key", "test-admin-key")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"emptyUserMessageCompat":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app.oneshot(get()).await.unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["emptyUserMessageCompat"], true);
     }
 }

@@ -17,6 +17,8 @@ import {
   setLoadBalancingMode,
   getAccountThrottleConfig,
   setAccountThrottleConfig,
+  getCompatibilityConfig,
+  setCompatibilityConfig,
   getRetryPolicy,
   setRetryPolicy,
   getEndpointChains,
@@ -231,6 +233,23 @@ export function useSetAccountThrottleConfig() {
     mutationFn: setAccountThrottleConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['accountThrottleConfig'] })
+    },
+  })
+}
+
+export function useCompatibilityConfig() {
+  return useQuery({
+    queryKey: ['compatibilityConfig'],
+    queryFn: getCompatibilityConfig,
+  })
+}
+
+export function useSetCompatibilityConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setCompatibilityConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['compatibilityConfig'] })
     },
   })
 }

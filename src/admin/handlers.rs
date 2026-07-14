@@ -28,12 +28,13 @@ use super::{
         CredentialResponseTestRequest, FetchModelProfileRequest, GlobalProxyResponse,
         PatchModelProfileRequest, PreviewModelProfilesRequest, ProxyCheckUrlRequest,
         RevisionRequest, SetAccountThrottleConfigRequest, SetCacheHitRateRequest,
-        SetCachePolicyRequest, SetDisabledRequest, SetEndpointChainsRequest, SetGlobalProxyRequest,
-        SetImageBudgetRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
-        SetModelProfileSettingsRequest, SetPriorityRequest, SetProxyBalancingModeRequest,
-        SetRetryPolicyRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
-        StartSocialLoginRequest, SuccessResponse, SyncModelProfilesRequest, UpdateAdminKeyRequest,
-        UpdateClientKeyRequest, UpdateCredentialRequest, UpdateRefreshTokenRequest,
+        SetCachePolicyRequest, SetCompatibilityConfigRequest, SetDisabledRequest,
+        SetEndpointChainsRequest, SetGlobalProxyRequest, SetImageBudgetRequest,
+        SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetModelProfileSettingsRequest,
+        SetPriorityRequest, SetProxyBalancingModeRequest, SetRetryPolicyRequest,
+        SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
+        SyncModelProfilesRequest, UpdateAdminKeyRequest, UpdateClientKeyRequest,
+        UpdateCredentialRequest, UpdateRefreshTokenRequest,
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
 };
@@ -699,6 +700,22 @@ pub async fn set_account_throttle_config(
     match state.service.set_account_throttle_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/compatibility
+pub async fn get_compatibility_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_compatibility_config())
+}
+
+/// PUT /api/admin/config/compatibility
+pub async fn set_compatibility_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetCompatibilityConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_compatibility_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
     }
 }
 

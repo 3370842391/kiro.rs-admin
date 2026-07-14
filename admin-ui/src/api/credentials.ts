@@ -647,6 +647,22 @@ export async function setAccountThrottleConfig(
   return data
 }
 
+export interface CompatibilityConfig {
+  emptyUserMessageCompat: boolean
+}
+
+export async function getCompatibilityConfig(): Promise<CompatibilityConfig> {
+  const { data } = await api.get<CompatibilityConfig>('/config/compatibility')
+  return data
+}
+
+export async function setCompatibilityConfig(
+  patch: CompatibilityConfig,
+): Promise<CompatibilityConfig> {
+  const { data } = await api.put<CompatibilityConfig>('/config/compatibility', patch)
+  return data
+}
+
 export interface LogGovernanceConfig {
   traceEnabled: boolean
   traceRetentionDays: number

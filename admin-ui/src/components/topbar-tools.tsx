@@ -33,6 +33,7 @@ import { ModelProfilesDialog } from '@/components/model-profiles-dialog'
 import { EndpointChainsDialog } from '@/components/endpoint-chains-dialog'
 import { CachePolicyDialog } from '@/components/cache-policy-dialog'
 import { ImageBudgetDialog } from '@/components/image-budget-dialog'
+import { CompatibilitySettingsDialog } from '@/components/compatibility-settings-dialog'
 
 /**
  * 顶栏右侧通用工具栏：负载均衡切换、刷新、在线更新、设置（Key 管理）。
@@ -60,6 +61,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
   const [endpointChainsOpen, setEndpointChainsOpen] = useState(false)
   const [cachePolicyOpen, setCachePolicyOpen] = useState(false)
   const [imageBudgetOpen, setImageBudgetOpen] = useState(false)
+  const [compatibilitySettingsOpen, setCompatibilitySettingsOpen] = useState(false)
   const [keyDialogOpen, setKeyDialogOpen] = useState(false)
   const [newKey, setNewKey] = useState('')
   const [showPlain, setShowPlain] = useState(false)
@@ -134,6 +136,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     openEndpointChains: () => setEndpointChainsOpen(true),
     openCachePolicy: () => setCachePolicyOpen(true),
     openImageBudget: () => setImageBudgetOpen(true),
+    openCompatibilitySettings: () => setCompatibilitySettingsOpen(true),
     openKeyDialog,
     retryPolicy,
     setRetryPolicy: (mode: RetryMode, customPolicy?: RetryPolicy | null) =>
@@ -163,6 +166,10 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
       <EndpointChainsDialog open={endpointChainsOpen} onOpenChange={setEndpointChainsOpen} />
       <CachePolicyDialog open={cachePolicyOpen} onOpenChange={setCachePolicyOpen} />
       <ImageBudgetDialog open={imageBudgetOpen} onOpenChange={setImageBudgetOpen} />
+      <CompatibilitySettingsDialog
+        open={compatibilitySettingsOpen}
+        onOpenChange={setCompatibilitySettingsOpen}
+      />
 
       <Dialog
         open={keyDialogOpen}
@@ -275,6 +282,7 @@ interface ToolControls {
   openEndpointChains: () => void
   openCachePolicy: () => void
   openImageBudget: () => void
+  openCompatibilitySettings: () => void
   openKeyDialog: () => void
   retryPolicy?: RetryPolicyConfig
   setRetryPolicy: (mode: RetryMode, customPolicy?: RetryPolicy | null) => void
@@ -304,6 +312,7 @@ function FullTools({ controls }: { controls: ToolControls }) {
         onOpenEndpointChains={controls.openEndpointChains}
         onOpenCachePolicy={controls.openCachePolicy}
         onOpenImageBudget={controls.openImageBudget}
+        onOpenCompatibilitySettings={controls.openCompatibilitySettings}
       />
     </>
   )
@@ -359,6 +368,9 @@ function CompactTools({ controls }: { controls: ToolControls }) {
         </DropdownMenuItem>
         <DropdownMenuItem onSelect={controls.openImageBudget}>
           <Images />图片总预算（历史压缩 / 超限重试）
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={controls.openCompatibilitySettings}>
+          <Settings />协议兼容设置（空 user 请求）
         </DropdownMenuItem>
         <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
         <DropdownMenuItem onSelect={controls.openKeyDialog}>
@@ -693,6 +705,7 @@ function KeySettingsMenu({
   onOpenEndpointChains,
   onOpenCachePolicy,
   onOpenImageBudget,
+  onOpenCompatibilitySettings,
 }: {
   onOpenKeyDialog: () => void
   onOpenModelMappings: () => void
@@ -700,6 +713,7 @@ function KeySettingsMenu({
   onOpenEndpointChains: () => void
   onOpenCachePolicy: () => void
   onOpenImageBudget: () => void
+  onOpenCompatibilitySettings: () => void
 }) {
   return (
     <DropdownMenu>
@@ -724,6 +738,9 @@ function KeySettingsMenu({
         </DropdownMenuItem>
         <DropdownMenuItem onSelect={onOpenImageBudget}>
           <Images />图片总预算（历史压缩 / 超限重试）
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={onOpenCompatibilitySettings}>
+          <Settings />协议兼容设置（空 user 请求）
         </DropdownMenuItem>
         <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
         <DropdownMenuItem onSelect={onOpenKeyDialog}>

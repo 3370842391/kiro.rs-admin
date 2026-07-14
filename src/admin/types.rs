@@ -618,6 +618,20 @@ pub struct SetAccountThrottleConfigRequest {
     pub cooldown_secs: Option<u64>,
 }
 
+/// 协议兼容配置响应。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompatibilityConfigResponse {
+    pub empty_user_message_compat: bool,
+}
+
+/// 更新协议兼容配置。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCompatibilityConfigRequest {
+    pub empty_user_message_compat: bool,
+}
+
 /// 普通 429 重试策略响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
