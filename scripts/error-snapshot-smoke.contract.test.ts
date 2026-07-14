@@ -17,6 +17,8 @@ describe("error snapshot smoke script", () => {
     expect(script).toContain("/error-snapshots?limit=1");
     expect(script).toContain("/error-snapshots/cleanup");
     expect(script).toContain("curl --fail --silent --show-error");
+    expect(script).toContain("command -v jq");
+    expect(script).toContain("command -v python3");
     expect(script).not.toContain('echo "${ERROR_SNAPSHOT_ADMIN_TOKEN}"');
     expect(script).not.toContain('printf "%s" "${ERROR_SNAPSHOT_ADMIN_TOKEN}"');
   });

@@ -29,16 +29,47 @@ request() {
     "${BASE_URL%/}${path}"
 }
 
+validate_json_shape() {
+  local shape="$1"
+  local payload="$2"
+  if command -v jq >/dev/null 2>&1; then
+    case "${shape}" in
+      object) jq -e 'type == "object"' >/dev/null <<<"${payload}" ;;
+      list) jq -e '(.records | type == "array") and (.total | type == "number")' >/dev/null <<<"${payload}" ;;
+      *) return 2 ;;
+    esac
+    return
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c '
+import json
+import sys
+
+shape = sys.argv[1]
+value = json.load(sys.stdin)
+valid = isinstance(value, dict)
+if shape == "list":
+    valid = valid and isinstance(value.get("records"), list) and isinstance(value.get("total"), (int, float))
+elif shape != "object":
+    valid = False
+raise SystemExit(0 if valid else 1)
+' "${shape}" <<<"${payload}"
+    return
+  fi
+  echo "jq or python3 is required to validate JSON responses" >&2
+  return 127
+}
+
 echo "Checking error snapshot storage..."
 storage_json="$(request GET /error-snapshots/storage)"
-if ! jq -e 'type == "object"' >/dev/null <<<"${storage_json}"; then
+if ! validate_json_shape object "${storage_json}"; then
   echo "storage endpoint did not return a JSON object" >&2
   exit 1
 fi
 
 echo "Checking error snapshot listing..."
 list_json="$(request GET '/error-snapshots?limit=1')"
-if ! jq -e '(.records | type == "array") and (.total | type == "number")' >/dev/null <<<"${list_json}"; then
+if ! validate_json_shape list "${list_json}"; then
   echo "list endpoint returned an unexpected response shape" >&2
   exit 1
 fi
@@ -46,7 +77,7 @@ fi
 if [[ "${ERROR_SNAPSHOT_SMOKE_MUTATE}" == "1" ]]; then
   echo "Running explicit cleanup smoke check..."
   cleanup_json="$(request POST /error-snapshots/cleanup)"
-  if ! jq -e 'type == "object"' >/dev/null <<<"${cleanup_json}"; then
+  if ! validate_json_shape object "${cleanup_json}"; then
     echo "cleanup endpoint did not return a JSON object" >&2
     exit 1
   fi
