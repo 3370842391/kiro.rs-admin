@@ -1634,6 +1634,7 @@ pub async fn list_traces(
                 "reasoningEffort": r.reasoning_effort,
                 "context1m": r.context_1m,
                 "thinking": r.thinking,
+                "emptyUserCompatApplied": r.empty_user_compat_applied,
                 "attempts": attempts,
             })
         })
