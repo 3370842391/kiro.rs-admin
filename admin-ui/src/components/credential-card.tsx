@@ -47,6 +47,7 @@ import {
   extractErrorMessage,
   overageFailureMessage,
 } from "@/lib/utils";
+import { rpmLoadState } from "@/lib/rpm-operations";
 import {
   useSetDisabled,
   useSetPriority,
@@ -402,6 +403,25 @@ export function CredentialCard({
   const reasonStyle = getDisabledReasonStyle(credential.disabledReason);
   const isThrottled = !credential.disabled && throttleRemaining > 0;
   const isRateLimited = !credential.disabled && rateLimitRemainingMs > 0;
+  const rpmCurrent = credential.rpmCurrent ?? 0;
+  const rpmLimit = credential.rpmLimit ?? 10;
+  const rpmState = rpmLoadState(rpmCurrent, rpmLimit);
+  const rpmTitle =
+    rpmState === "unlimited"
+      ? "最近60秒滚动窗口：不限速"
+      : `最近60秒滚动窗口：${rpmCurrent} / ${rpmLimit}`;
+  const rpmValueClass =
+    rpmState === "saturated"
+      ? "text-destructive"
+      : rpmState === "warning"
+        ? "text-amber-600 dark:text-amber-400"
+        : "text-muted-foreground";
+  const rpmDisplay =
+    rpmState === "unlimited"
+      ? "不限速"
+      : rpmState === "saturated"
+        ? `${rpmCurrent} / ${rpmLimit} · 已满载`
+        : `${rpmCurrent} / ${rpmLimit}`;
 
   // 卡片与列表行共用的状态描边 / 灰化（活跃 · 超额 · 冷却 · 禁用）
   const stateClasses = [
@@ -431,6 +451,11 @@ export function CredentialCard({
         />
       )}
       {credential.isCurrent && <Badge variant="success">活跃</Badge>}
+      {credential.inFlight > 0 && (
+        <Badge variant="secondary" className="tabular-nums" title="当前进行中的请求数">
+          进行中 {credential.inFlight}
+        </Badge>
+      )}
       {/* 禁用状态：合并 "已禁用" + 中文化的原因，单个 Badge 更醒目 */}
       {credential.disabled && reasonStyle && (
         <Badge variant={reasonStyle.variant}>已禁用 · {reasonStyle.label}</Badge>
@@ -768,12 +793,10 @@ export function CredentialCard({
             RPM
           </div>
           <div
-            className="mt-0.5 text-sm font-medium tabular-nums text-muted-foreground"
-            title="当前一分钟已用 / 上限（0 = 不限速）"
+            className={`mt-0.5 text-sm font-medium tabular-nums ${rpmValueClass}`}
+            title={rpmTitle}
           >
-            {credential.rpmLimit === 0
-              ? "不限"
-              : `${credential.rpmCurrent ?? 0}/${credential.rpmLimit ?? 10}`}
+            {rpmState === "saturated" ? "已满载" : rpmDisplay}
           </div>
         </div>
       </div>
@@ -1031,12 +1054,10 @@ export function CredentialCard({
                 </button>
               </dd>
             </div>
-            <div className="flex min-w-0 items-center justify-between gap-2">
-              <dt className="shrink-0 text-muted-foreground">RPM（本分钟/上限）</dt>
-              <dd className="min-w-0 truncate text-right font-medium tabular-nums">
-                {credential.rpmLimit === 0
-                  ? "不限速"
-                  : `${credential.rpmCurrent ?? 0} / ${credential.rpmLimit ?? 10}`}
+            <div className="flex min-w-0 items-center justify-between gap-2" title={rpmTitle}>
+              <dt className="shrink-0 text-muted-foreground">RPM（60秒/上限）</dt>
+              <dd className={`min-w-0 text-right font-medium tabular-nums ${rpmValueClass}`}>
+                {rpmDisplay}
               </dd>
             </div>
             <div className="flex min-w-0 items-center justify-between gap-2 border-t border-border/50 pt-2 min-[420px]:col-span-2">
