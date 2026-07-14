@@ -25,10 +25,36 @@ export function AvailableModelsDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md">
+      <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>凭据 #{credentialId} 可用模型</DialogTitle>
         </DialogHeader>
+
+        {data && (data.resolvedApiRegion || data.resolvedHost || data.kiroVersion) && (
+          <dl
+            aria-label="实际上游路由"
+            className="grid gap-2 rounded-lg border border-border/60 bg-secondary/40 p-3 text-xs sm:grid-cols-2"
+          >
+            {data.resolvedApiRegion && (
+              <div className="min-w-0">
+                <dt className="text-muted-foreground">Resolved API Region</dt>
+                <dd className="mt-0.5 break-all font-mono font-medium">{data.resolvedApiRegion}</dd>
+              </div>
+            )}
+            {data.kiroVersion && (
+              <div className="min-w-0">
+                <dt className="text-muted-foreground">Kiro Version</dt>
+                <dd className="mt-0.5 break-all font-mono font-medium">{data.kiroVersion}</dd>
+              </div>
+            )}
+            {data.resolvedHost && (
+              <div className="min-w-0 sm:col-span-2">
+                <dt className="text-muted-foreground">Resolved Host</dt>
+                <dd className="mt-0.5 break-all font-mono font-medium">{data.resolvedHost}</dd>
+              </div>
+            )}
+          </dl>
+        )}
 
         {isLoading && (
           <div className="flex items-center justify-center py-8">

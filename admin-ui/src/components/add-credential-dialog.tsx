@@ -20,6 +20,7 @@ import {
 import { useAddCredential } from '@/hooks/use-credentials'
 import { useGroupOptions } from '@/hooks/use-groups'
 import { extractErrorMessage } from '@/lib/utils'
+import { redactApiKeys } from '@/lib/api-key-import'
 import { GroupMultiSelect } from '@/components/group-select'
 
 interface AddCredentialDialogProps {
@@ -32,6 +33,7 @@ type AuthMethod = 'social' | 'idc' | 'api_key' | 'external_idp'
 export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
   const [refreshToken, setRefreshToken] = useState('')
   const [kiroApiKey, setKiroApiKey] = useState('')
+  const [nickname, setNickname] = useState('')
   const [authMethod, setAuthMethod] = useState<AuthMethod>('social')
   const [authRegion, setAuthRegion] = useState('')
   const [apiRegion, setApiRegion] = useState('')
@@ -56,6 +58,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const resetForm = () => {
     setRefreshToken('')
     setKiroApiKey('')
+    setNickname('')
     setAuthMethod('social')
     setAuthRegion('')
     setApiRegion('')
@@ -86,6 +89,14 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         toast.error('请输入 Kiro API Key')
         return
       }
+      if (!kiroApiKey.trim().startsWith('ksk_')) {
+        toast.error('Kiro API Key 必须以 ksk_ 开头')
+        return
+      }
+      if (!apiRegion) {
+        toast.error('请选择 API Region')
+        return
+      }
     } else {
       if (!refreshToken.trim()) {
         toast.error('请输入 Refresh Token')
@@ -108,8 +119,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         authMethod,
         refreshToken: isApiKey ? undefined : refreshToken.trim(),
         kiroApiKey: isApiKey ? kiroApiKey.trim() : undefined,
+        nickname: isApiKey ? nickname.trim() || undefined : undefined,
         provider: isExternalIdp ? 'AzureAD' : undefined,
-        authRegion: authRegion.trim() || undefined,
+        authRegion: isApiKey ? 'us-east-1' : authRegion.trim() || undefined,
         apiRegion: apiRegion.trim() || undefined,
         clientId: isApiKey ? undefined : clientId.trim() || undefined,
         clientSecret: isApiKey || isExternalIdp ? undefined : clientSecret.trim() || undefined,
@@ -127,12 +139,12 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       },
       {
         onSuccess: (data) => {
-          toast.success(data.message)
+          toast.success(redactApiKeys(data.message))
           onOpenChange(false)
           resetForm()
         },
         onError: (error: unknown) => {
-          toast.error(`添加失败: ${extractErrorMessage(error)}`)
+          toast.error(`添加失败: ${redactApiKeys(extractErrorMessage(error))}`)
         },
       }
     )
@@ -171,19 +183,35 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
 
             {/* Kiro API Key (API Key 模式) */}
             {isApiKey && (
-              <div className="space-y-2">
-                <label htmlFor="kiroApiKey" className="text-sm font-medium">
-                  Kiro API Key <span className="text-red-500">*</span>
-                </label>
-                <Input
-                  id="kiroApiKey"
-                  type="password"
-                  placeholder="格式: ksk_xxxxxxxx"
-                  value={kiroApiKey}
-                  onChange={(e) => setKiroApiKey(e.target.value)}
-                  disabled={isPending}
-                />
-              </div>
+              <>
+                <div className="space-y-2">
+                  <label htmlFor="nickname" className="text-sm font-medium">
+                    Nickname（可选）
+                  </label>
+                  <Input
+                    id="nickname"
+                    autoComplete="off"
+                    placeholder="用于区分账号，例如：欧洲团队"
+                    value={nickname}
+                    onChange={(e) => setNickname(e.target.value)}
+                    disabled={isPending}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label htmlFor="kiroApiKey" className="text-sm font-medium">
+                    Kiro API Key <span className="text-red-500">*</span>
+                  </label>
+                  <Input
+                    id="kiroApiKey"
+                    type="password"
+                    autoComplete="off"
+                    placeholder="格式: ksk_xxxxxxxx"
+                    value={kiroApiKey}
+                    onChange={(e) => setKiroApiKey(e.target.value)}
+                    disabled={isPending}
+                  />
+                </div>
+              </>
             )}
 
             {/* Refresh Token (OAuth 模式) */}
@@ -206,28 +234,62 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
             {/* Region 配置 */}
             <div className="space-y-2">
               <label className="text-sm font-medium">Region 配置</label>
-              <div className="grid grid-cols-2 gap-2">
-                <div>
-                  <Input
-                    id="authRegion"
-                    placeholder="Auth Region"
-                    value={authRegion}
-                    onChange={(e) => setAuthRegion(e.target.value)}
-                    disabled={isPending}
-                  />
+              <div className="grid gap-2 sm:grid-cols-2">
+                <div className="space-y-1.5">
+                  <label htmlFor="authRegion" className="text-xs text-muted-foreground">
+                    Auth Region
+                  </label>
+                  {isApiKey ? (
+                    <Input
+                      id="authRegion"
+                      value="us-east-1"
+                      readOnly
+                      aria-readonly="true"
+                      disabled={isPending}
+                    />
+                  ) : (
+                    <Input
+                      id="authRegion"
+                      placeholder="Auth Region"
+                      value={authRegion}
+                      onChange={(e) => setAuthRegion(e.target.value)}
+                      disabled={isPending}
+                    />
+                  )}
                 </div>
-                <div>
-                  <Input
-                    id="apiRegion"
-                    placeholder="API Region"
-                    value={apiRegion}
-                    onChange={(e) => setApiRegion(e.target.value)}
-                    disabled={isPending}
-                  />
+                <div className="space-y-1.5">
+                  <label htmlFor="apiRegion" className="text-xs text-muted-foreground">
+                    API Region {isApiKey && <span className="text-red-500">*</span>}
+                  </label>
+                  {isApiKey ? (
+                    <Select
+                      value={apiRegion}
+                      onValueChange={setApiRegion}
+                      disabled={isPending}
+                    >
+                      <SelectTrigger id="apiRegion" className="h-10 rounded-xl px-3.5">
+                        <SelectValue placeholder="请选择 API Region" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="us-east-1">美国（us-east-1）</SelectItem>
+                        <SelectItem value="eu-central-1">欧洲（eu-central-1）</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  ) : (
+                    <Input
+                      id="apiRegion"
+                      placeholder="API Region"
+                      value={apiRegion}
+                      onChange={(e) => setApiRegion(e.target.value)}
+                      disabled={isPending}
+                    />
+                  )}
                 </div>
               </div>
               <p className="text-xs text-muted-foreground">
-                均可留空使用全局配置。Auth Region 用于 Token 刷新，API Region 用于 API 请求
+                {isApiKey
+                  ? 'API Key 的 Auth Region 固定为 us-east-1；API Region 必须与订购区域一致。'
+                  : '均可留空使用全局配置。Auth Region 用于 Token 刷新，API Region 用于 API 请求。'}
               </p>
             </div>
 
