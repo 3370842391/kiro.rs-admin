@@ -2671,9 +2671,14 @@ fn create_early_sse_stream(
 /// Ping 事件间隔（25秒）
 const PING_INTERVAL_SECS: u64 = 25;
 
+const EARLY_CONNECTED_SSE: &[u8] = b": connected\n\n";
+const EARLY_PING_SSE: &[u8] = b"event: ping\ndata: {\"type\":\"ping\"}\n\n";
+const EARLY_PING_INTERVAL: Duration = Duration::from_secs(1);
+
 type BoxByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, Infallible>> + Send>>;
 
 enum PendingCallEvent<T> {
+    Comment(Bytes),
     Complete(anyhow::Result<T>),
 }
 
@@ -2682,7 +2687,47 @@ where
     F: Future<Output = anyhow::Result<T>> + Send + 'static,
     T: Send + 'static,
 {
-    stream::once(async move { PendingCallEvent::Complete(future.await) })
+    struct State<F> {
+        future: Pin<Box<F>>,
+        heartbeat: tokio::time::Interval,
+        connected_sent: bool,
+        completed: bool,
+    }
+
+    let heartbeat = tokio::time::interval_at(
+        TokioInstant::now() + EARLY_PING_INTERVAL,
+        EARLY_PING_INTERVAL,
+    );
+    stream::unfold(
+        State {
+            future: Box::pin(future),
+            heartbeat,
+            connected_sent: false,
+            completed: false,
+        },
+        |mut state| async move {
+            if state.completed {
+                return None;
+            }
+            if !state.connected_sent {
+                state.connected_sent = true;
+                return Some((
+                    PendingCallEvent::Comment(Bytes::from_static(EARLY_CONNECTED_SSE)),
+                    state,
+                ));
+            }
+            tokio::select! {
+                result = &mut state.future => {
+                    state.completed = true;
+                    Some((PendingCallEvent::Complete(result), state))
+                }
+                _ = state.heartbeat.tick() => Some((
+                    PendingCallEvent::Comment(Bytes::from_static(EARLY_PING_SSE)),
+                    state,
+                )),
+            }
+        },
+    )
 }
 
 fn flatten_pending_call<F, T, M>(
@@ -2697,6 +2742,9 @@ where
     pending_call_stream(future)
         .map(move |event| -> BoxByteStream {
             match event {
+                PendingCallEvent::Comment(bytes) => {
+                    Box::pin(stream::once(async move { Ok(bytes) }))
+                }
                 PendingCallEvent::Complete(result) => on_complete(result),
             }
         })
@@ -5801,23 +5849,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_call_stream_waits_silently_for_provider() {
-        let stream = pending_call_stream(future::pending::<Result<(), anyhow::Error>>());
+    async fn pending_call_stream_emits_connected_then_ping() {
+        let stream = flatten_pending_call(
+            future::pending::<Result<(), anyhow::Error>>(),
+            |_| -> BoxByteStream { Box::pin(stream::empty()) },
+        );
         futures::pin_mut!(stream);
 
+        let connected = tokio::time::timeout(Duration::from_millis(100), stream.next())
+            .await
+            .expect("connected 应立即产生")
+            .expect("connected frame")
+            .expect("connected bytes");
+        assert_eq!(connected.as_ref(), b": connected\n\n");
+        assert!(
+            !connected
+                .split(|byte| *byte == b'\n')
+                .any(|line| line.starts_with(b"data:")),
+            "connected 必须保持为 New API 忽略的 SSE 注释"
+        );
         assert!(
             tokio::time::timeout(Duration::from_millis(100), stream.next())
                 .await
                 .is_err(),
-            "message_start 前不得发送 comment 或 ping"
+            "ping 不应紧跟 connected 立即发出"
+        );
+        let ping = tokio::time::timeout(Duration::from_millis(1200), stream.next())
+            .await
+            .expect("1 秒后应产生 ping")
+            .expect("ping frame")
+            .expect("ping bytes");
+        assert_eq!(ping.as_ref(), b"event: ping\ndata: {\"type\":\"ping\"}\n\n");
+        assert!(
+            ping.split(|byte| *byte == b'\n')
+                .any(|line| line.starts_with(b"data:")),
+            "ping 必须包含 New API 可识别的 data 行"
         );
     }
 
     #[tokio::test]
-    async fn pending_call_stream_completes_without_prefix_event() {
+    async fn pending_call_stream_completes_after_connected() {
         let stream = pending_call_stream(async { Ok::<_, anyhow::Error>(7u8) });
         futures::pin_mut!(stream);
 
+        assert!(matches!(
+            stream.next().await,
+            Some(PendingCallEvent::Comment(ref bytes))
+                if bytes.as_ref() == EARLY_CONNECTED_SSE
+        ));
         assert!(matches!(
             stream.next().await,
             Some(PendingCallEvent::Complete(Ok(7)))
@@ -5826,10 +5905,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strict_pending_call_stream_emits_no_event_before_provider_completion() {
+    async fn immediate_provider_completion_does_not_insert_ping_before_result() {
         let stream = pending_call_stream(async { Ok::<_, anyhow::Error>(7u8) });
         futures::pin_mut!(stream);
 
+        assert!(matches!(
+            stream.next().await,
+            Some(PendingCallEvent::Comment(_))
+        ));
         assert!(matches!(
             stream.next().await,
             Some(PendingCallEvent::Complete(Ok(7)))
@@ -5854,11 +5937,10 @@ mod tests {
                 future::pending::<Result<(), anyhow::Error>>().await
             });
             futures::pin_mut!(stream);
-            assert!(
-                tokio::time::timeout(Duration::from_millis(10), stream.next())
-                    .await
-                    .is_err()
-            );
+            assert!(matches!(
+                stream.next().await,
+                Some(PendingCallEvent::Comment(_))
+            ));
         }
         tokio::task::yield_now().await;
         assert!(dropped.load(Ordering::SeqCst));
@@ -5886,12 +5968,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn early_stream_error_starts_with_error_without_message_start() {
+    async fn early_stream_error_sends_connected_then_error_without_message_start() {
         let stream = early_error_test_stream(anyhow::anyhow!("connection reset"), Some(502));
         futures::pin_mut!(stream);
         let first = stream.next().await.unwrap().unwrap();
-        assert!(String::from_utf8_lossy(&first).starts_with("event: error\n"));
-        assert!(!String::from_utf8_lossy(&first).contains("message_start"));
+        let second = stream.next().await.unwrap().unwrap();
+        assert_eq!(first, Bytes::from_static(EARLY_CONNECTED_SSE));
+        assert!(String::from_utf8_lossy(&second).starts_with("event: error\n"));
+        assert!(!String::from_utf8_lossy(&second).contains("message_start"));
         assert!(stream.next().await.is_none());
     }
 
@@ -5905,6 +5989,10 @@ mod tests {
         ]));
         let stream = flatten_pending_call_for_test(Ok(inner));
         futures::pin_mut!(stream);
+        assert_eq!(
+            stream.next().await.unwrap().unwrap(),
+            Bytes::from_static(EARLY_CONNECTED_SSE)
+        );
         assert!(
             String::from_utf8_lossy(&stream.next().await.unwrap().unwrap())
                 .contains("message_start")
