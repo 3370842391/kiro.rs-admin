@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 # Read-only by default. Set ERROR_SNAPSHOT_SMOKE_MUTATE=1 only when an operator
 # explicitly wants to exercise the cleanup endpoint on the isolated 8991 service.
-readonly BASE_URL="${ERROR_SNAPSHOT_BASE_URL:-http://127.0.0.1:8991/admin}"
+readonly BASE_URL="${ERROR_SNAPSHOT_BASE_URL:-http://127.0.0.1:8991/api/admin}"
 readonly ADMIN_TOKEN="${ERROR_SNAPSHOT_ADMIN_TOKEN:-}"
 export ERROR_SNAPSHOT_SMOKE_MUTATE="${ERROR_SNAPSHOT_SMOKE_MUTATE:-0}"
 
