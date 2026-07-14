@@ -111,3 +111,71 @@ pub fn create_router(
         .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
         .with_state(state)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode, header},
+    };
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn empty_user_message_returns_400_before_missing_provider_for_both_modes() {
+        let keys = Arc::new(crate::admin::ClientKeyManager::new());
+        keys.create_with_key(
+            "test".to_string(),
+            None,
+            None,
+            "csk_test-client-key".to_string(),
+        );
+        let app = create_router(
+            None,
+            true,
+            ToolCompatibilityMode::ClaudeCode,
+            Some(keys),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        for stream in [false, true] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/messages")
+                        .header("x-api-key", "csk_test-client-key")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "model": "claude-opus-4-8",
+                                "max_tokens": 64,
+                                "stream": stream,
+                                "system": "Keep answers concise.",
+                                "messages": [{"role": "user", "content": ""}]
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["error"]["type"], "invalid_request_error");
+            assert_eq!(
+                json["error"]["message"],
+                super::super::handlers::EMPTY_USER_MESSAGE_ERROR
+            );
+        }
+    }
+}

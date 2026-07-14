@@ -43,19 +43,20 @@ use super::types::{
     AvailableModelsResponse, BalanceResponse, BatchAddProxyRequest, BatchGroupMode,
     BatchImportEvent, BatchUpdateCredentialsRequest, BatchUpdateCredentialsResponse,
     CacheHitRateResponse, CachePolicyResponse, CheckRateLimitRequest, ClearCacheResponse,
-    CompleteSocialLoginRequest, CredentialResponseTestResponse, CredentialStatusItem,
-    CredentialsExportResponse, CredentialsStatusResponse, EnableOverageAllResult,
-    EndpointBucketOption, EndpointChainsResponse, ExportedAccount, ExportedCredentials,
-    FetchModelProfileRequest, GitHubRateLimitInfo, ImageBudgetResponse, ImageUpdateResponse,
-    LoadBalancingModeResponse, LogGovernanceConfigResponse, ModelProfileFieldRefResponse,
-    ModelProfileFieldResponse, ModelProfilePreviewChangeResponse, ModelProfilePreviewResponse,
-    ModelProfileSettingsResponse, ModelProfileSourceSummaryResponse, ModelProfileSyncResponse,
-    ModelProfileSyncSummaryResponse, ModelProfileViewResponse, ModelProfilesResponse,
-    PatchModelProfileRequest, PollIdcLoginResponse, PreviewModelProfilesRequest,
-    ProxyBalancingModeResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyCheckUrlRequest,
-    ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult, ResolvedModelProfileResponse,
-    RetryPolicyResponse, RevisionRequest, RpmSummary, SetAccountThrottleConfigRequest,
-    SetCacheHitRateRequest, SetCachePolicyRequest, SetEndpointChainsRequest, SetImageBudgetRequest,
+    CompatibilityConfigResponse, CompleteSocialLoginRequest, CredentialResponseTestResponse,
+    CredentialStatusItem, CredentialsExportResponse, CredentialsStatusResponse,
+    EnableOverageAllResult, EndpointBucketOption, EndpointChainsResponse, ExportedAccount,
+    ExportedCredentials, FetchModelProfileRequest, GitHubRateLimitInfo, ImageBudgetResponse,
+    ImageUpdateResponse, LoadBalancingModeResponse, LogGovernanceConfigResponse,
+    ModelProfileFieldRefResponse, ModelProfileFieldResponse, ModelProfilePreviewChangeResponse,
+    ModelProfilePreviewResponse, ModelProfileSettingsResponse, ModelProfileSourceSummaryResponse,
+    ModelProfileSyncResponse, ModelProfileSyncSummaryResponse, ModelProfileViewResponse,
+    ModelProfilesResponse, PatchModelProfileRequest, PollIdcLoginResponse,
+    PreviewModelProfilesRequest, ProxyBalancingModeResponse, ProxyCheckAllResponse,
+    ProxyCheckResponse, ProxyCheckUrlRequest, ProxyPoolEntry, ProxyPoolResponse,
+    QuotaExceededResult, ResolvedModelProfileResponse, RetryPolicyResponse, RevisionRequest,
+    RpmSummary, SetAccountThrottleConfigRequest, SetCacheHitRateRequest, SetCachePolicyRequest,
+    SetCompatibilityConfigRequest, SetEndpointChainsRequest, SetImageBudgetRequest,
     SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetModelProfileSettingsRequest,
     SetProxyBalancingModeRequest, SetRetryPolicyRequest, SetUpdateConfigRequest,
     StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse,
@@ -2651,6 +2652,24 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
 
         Ok(self.get_account_throttle_config())
+    }
+
+    /// 读取协议兼容配置。
+    pub fn get_compatibility_config(&self) -> CompatibilityConfigResponse {
+        CompatibilityConfigResponse {
+            empty_user_message_compat: self.token_manager.get_empty_user_message_compat(),
+        }
+    }
+
+    /// 更新协议兼容配置，立即作用于后续请求并持久化到 config.json。
+    pub fn set_compatibility_config(
+        &self,
+        req: SetCompatibilityConfigRequest,
+    ) -> Result<CompatibilityConfigResponse, AdminServiceError> {
+        self.token_manager
+            .set_empty_user_message_compat(req.empty_user_message_compat)
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+        Ok(self.get_compatibility_config())
     }
 
     /// 获取普通 429 重试策略

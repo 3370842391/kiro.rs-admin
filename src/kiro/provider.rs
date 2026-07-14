@@ -386,6 +386,11 @@ impl KiroProvider {
         self.token_manager.config().local_ping_response
     }
 
+    /// 是否仅对精确的空 user 请求形状启用最小上游兼容文本。
+    pub fn empty_user_message_compat(&self) -> bool {
+        self.token_manager.get_empty_user_message_compat()
+    }
+
     /// 缓存命中率整形区间（运行时读取 token_manager 原子态），返回 `(min_pct, max_pct)`。
     /// 供 anthropic handler 在 `compute_cache_usage` 产出后注入 [`CacheUsage`]，
     /// 使管理面板对区间的修改立即作用于后续请求的命中率呈现。`(0,0)` = 不整形。

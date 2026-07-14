@@ -1107,6 +1107,8 @@ pub struct MultiTokenManager {
     max_bucket_attempts_per_request: AtomicUsize,
     /// 流式空闲超时秒数（运行时可修改，0 = 关闭 idle watchdog）。
     stream_idle_timeout_secs: AtomicU64,
+    /// 空 user 请求兼容开关（运行时可修改）。
+    empty_user_message_compat: AtomicBool,
     /// 缓存命中率整形下界（百分比 0..=100，运行时可修改）。min==0 && max==0 = 关闭整形。
     cache_hit_rate_min_pct: AtomicU32,
     /// 缓存命中率整形上界（百分比 0..=100，运行时可修改）。见 cache_hit_rate_min_pct。
@@ -1341,6 +1343,7 @@ impl MultiTokenManager {
         let endpoint_chains = config.endpoint_chains.clone();
         let max_bucket_attempts = config.max_bucket_attempts_per_request;
         let stream_idle_timeout_secs = config.stream_idle_timeout_secs;
+        let empty_user_message_compat = config.empty_user_message_compat;
         let cache_hit_rate_min_pct = config.cache_hit_rate_min_pct.min(100);
         let cache_hit_rate_max_pct = config.cache_hit_rate_max_pct.min(100);
         // 构造路径不强制 min<=max（仅 admin setter 校验）。非法区间不 panic（shape_hit_rate 有防御），
@@ -1374,6 +1377,7 @@ impl MultiTokenManager {
             endpoint_chains: Mutex::new(endpoint_chains),
             max_bucket_attempts_per_request: AtomicUsize::new(max_bucket_attempts),
             stream_idle_timeout_secs: AtomicU64::new(stream_idle_timeout_secs),
+            empty_user_message_compat: AtomicBool::new(empty_user_message_compat),
             cache_hit_rate_min_pct: AtomicU32::new(cache_hit_rate_min_pct),
             cache_hit_rate_max_pct: AtomicU32::new(cache_hit_rate_max_pct),
             last_stats_save_at: Mutex::new(None),
@@ -4316,6 +4320,47 @@ impl MultiTokenManager {
         self.stream_idle_timeout_secs.load(Ordering::Relaxed)
     }
 
+    /// 读取空 user 请求兼容开关。
+    pub fn get_empty_user_message_compat(&self) -> bool {
+        self.empty_user_message_compat.load(Ordering::Relaxed)
+    }
+
+    /// 更新空 user 请求兼容开关；持久化失败时回滚运行时值。
+    pub fn set_empty_user_message_compat(&self, enabled: bool) -> anyhow::Result<()> {
+        let previous = self
+            .empty_user_message_compat
+            .swap(enabled, Ordering::Relaxed);
+        if previous == enabled {
+            return Ok(());
+        }
+        if let Err(error) = self.persist_empty_user_message_compat(enabled) {
+            self.empty_user_message_compat
+                .store(previous, Ordering::Relaxed);
+            return Err(error);
+        }
+        tracing::info!(enabled, "空 user 请求兼容配置已更新");
+        Ok(())
+    }
+
+    fn persist_empty_user_message_compat(&self, enabled: bool) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，空 user 请求兼容配置仅在当前进程生效");
+                return Ok(());
+            }
+        };
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.empty_user_message_compat = enabled;
+        config.save().with_context(|| {
+            format!("持久化空 user 请求兼容配置失败: {}", config_path.display())
+        })?;
+        Ok(())
+    }
+
     /// 设置流式空闲超时（秒，`0` = 关闭）。持久化失败时回滚内存态。
     /// 上限 3600 秒，防误配成极大值让 idle watchdog 形同虚设。
     pub fn set_stream_idle_timeout_secs(&self, secs: u64) -> anyhow::Result<()> {
@@ -4860,6 +4905,28 @@ mod tests {
         let persisted = Config::load(&config_path).unwrap();
         assert_eq!(persisted.load_balancing_mode, "balanced");
         assert_eq!(manager.get_load_balancing_mode(), "balanced");
+
+        std::fs::remove_file(&config_path).unwrap();
+    }
+
+    #[test]
+    fn empty_user_message_compat_persists_and_updates_runtime_state() {
+        let config_path = std::env::temp_dir().join(format!(
+            "kiro-empty-user-message-compat-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&config_path, "{}").unwrap();
+        let config = Config::load(&config_path).unwrap();
+        let manager = MultiTokenManager::new(config, Vec::new(), None, None, true).unwrap();
+
+        assert!(!manager.get_empty_user_message_compat());
+        manager.set_empty_user_message_compat(true).unwrap();
+        assert!(manager.get_empty_user_message_compat());
+        assert!(
+            Config::load(&config_path)
+                .unwrap()
+                .empty_user_message_compat
+        );
 
         std::fs::remove_file(&config_path).unwrap();
     }

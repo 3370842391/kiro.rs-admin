@@ -2043,6 +2043,88 @@ fn prepare_outbound_kiro_bodies(
     }
 }
 
+pub(crate) const EMPTY_USER_MESSAGE_ERROR: &str = "The only user message is empty. Add user text, a tool result, an image, or a document; or enable emptyUserMessageCompat in the admin settings.";
+
+fn has_non_empty_system(payload: &MessagesRequest) -> bool {
+    payload
+        .system
+        .as_ref()
+        .is_some_and(|blocks| blocks.iter().any(|block| !block.text.trim().is_empty()))
+}
+
+fn is_empty_text_only_content(content: &serde_json::Value) -> bool {
+    match content {
+        serde_json::Value::String(text) => text.trim().is_empty(),
+        serde_json::Value::Array(blocks) => blocks.iter().all(|block| {
+            block.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                && block
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|text| text.trim().is_empty())
+        }),
+        _ => false,
+    }
+}
+
+fn is_exact_empty_user_message_shape(payload: &MessagesRequest) -> bool {
+    has_non_empty_system(payload)
+        && payload.messages.len() == 1
+        && payload.messages[0].role == "user"
+        && is_empty_text_only_content(&payload.messages[0].content)
+        && payload.tools.as_ref().map_or(true, Vec::is_empty)
+        && payload.tool_choice.is_none()
+}
+
+/// 对精确的空 user 请求形状执行本地拒绝或最小兼容改写。
+fn apply_empty_user_message_compat(
+    payload: &mut MessagesRequest,
+    enabled: bool,
+) -> Result<bool, &'static str> {
+    if !is_exact_empty_user_message_shape(payload) {
+        return Ok(false);
+    }
+    if !enabled {
+        return Err(EMPTY_USER_MESSAGE_ERROR);
+    }
+    payload.messages[0].content = serde_json::Value::String("Continue.".to_string());
+    Ok(true)
+}
+
+fn handle_empty_user_message(
+    state: &AppState,
+    payload: &mut MessagesRequest,
+    hook: &UsageRecordHook,
+    tracer: &RequestTracer,
+) -> Option<Response> {
+    let enabled = state
+        .kiro_provider
+        .as_ref()
+        .is_some_and(|provider| provider.empty_user_message_compat());
+    match apply_empty_user_message_compat(payload, enabled) {
+        Ok(true) => {
+            tracing::info!("已为精确匹配的空 user 请求补入最小上游兼容文本");
+            None
+        }
+        Ok(false) => None,
+        Err(message) => {
+            hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            finalize_immediate_error(
+                tracer,
+                StatusCode::BAD_REQUEST,
+                "empty_user_message",
+                message,
+            );
+            Some(
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse::new("invalid_request_error", message)),
+                )
+                    .into_response(),
+            )
+        }
+    }
+}
+
 /// POST /v1/messages
 ///
 /// 创建消息（对话）
@@ -2088,6 +2170,9 @@ pub async fn post_messages(
         &headers,
         &payload,
     ));
+    if let Some(response) = handle_empty_user_message(&state, &mut payload, &hook, &tracer) {
+        return response;
+    }
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
@@ -3975,6 +4060,10 @@ pub async fn post_messages_cc(
         &payload,
     ));
 
+    if let Some(response) = handle_empty_user_message(&state, &mut payload, &hook, &tracer) {
+        return response;
+    }
+
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
@@ -4660,6 +4749,58 @@ mod tests {
     use futures::{StreamExt, future};
 
     use super::*;
+
+    fn empty_user_request(stream: bool) -> MessagesRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 64,
+            "stream": stream,
+            "system": "Keep answers concise.",
+            "messages": [{"role": "user", "content": "   "}]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn empty_user_message_is_rejected_before_upstream_for_stream_and_non_stream() {
+        for stream in [false, true] {
+            let mut request = empty_user_request(stream);
+            let error = apply_empty_user_message_compat(&mut request, false).unwrap_err();
+            assert_eq!(error, EMPTY_USER_MESSAGE_ERROR);
+            assert_eq!(request.messages[0].content, serde_json::json!("   "));
+        }
+    }
+
+    #[test]
+    fn empty_user_message_compat_injects_only_the_exact_empty_shape() {
+        for stream in [false, true] {
+            let mut request = empty_user_request(stream);
+            assert!(apply_empty_user_message_compat(&mut request, true).unwrap());
+            assert_eq!(request.messages[0].content, serde_json::json!("Continue."));
+        }
+
+        let mut ordinary = empty_user_request(false);
+        ordinary.messages[0].content = serde_json::json!("hello");
+        assert!(!apply_empty_user_message_compat(&mut ordinary, true).unwrap());
+        assert_eq!(ordinary.messages[0].content, serde_json::json!("hello"));
+
+        let mut with_tools = empty_user_request(false);
+        with_tools.tools = Some(vec![crate::anthropic::types::Tool {
+            tool_type: None,
+            name: "lookup".into(),
+            description: "lookup".into(),
+            input_schema: Default::default(),
+            max_uses: None,
+            cache_control: None,
+        }]);
+        assert!(!apply_empty_user_message_compat(&mut with_tools, true).unwrap());
+
+        for block_type in ["image", "document", "tool_result"] {
+            let mut multimodal = empty_user_request(false);
+            multimodal.messages[0].content = serde_json::json!([{"type": block_type}]);
+            assert!(!apply_empty_user_message_compat(&mut multimodal, true).unwrap());
+        }
+    }
 
     fn test_request_tracer_with_snapshot(
         trace_id: &str,
