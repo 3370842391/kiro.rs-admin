@@ -180,6 +180,8 @@ export interface AddCredentialResponse {
 
 // 更新凭据请求（字段为 undefined 表示不修改，空字符串表示清除）
 export interface UpdateCredentialRequest {
+  nickname?: string
+  apiRegion?: string
   email?: string
   proxyUrl?: string
   proxyUsername?: string

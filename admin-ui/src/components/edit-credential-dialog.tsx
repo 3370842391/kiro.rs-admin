@@ -38,6 +38,8 @@ export function EditCredentialDialog({
   onOpenChange,
   credential,
 }: EditCredentialDialogProps) {
+  const [nickname, setNickname] = useState(credential.nickname ?? '')
+  const [apiRegion, setApiRegion] = useState(credential.apiRegion ?? '')
   const [email, setEmail] = useState(credential.email ?? '')
   const [proxyUrl, setProxyUrl] = useState(credential.proxyUrl ?? '')
   const [proxyUsername, setProxyUsername] = useState('')
@@ -58,6 +60,8 @@ export function EditCredentialDialog({
   // 每次打开时重置表单为当前凭据值
   useEffect(() => {
     if (open) {
+      setNickname(credential.nickname ?? '')
+      setApiRegion(credential.apiRegion ?? '')
       setEmail(credential.email ?? '')
       setProxyUrl(credential.proxyUrl ?? '')
       setProxyUsername('')
@@ -70,14 +74,22 @@ export function EditCredentialDialog({
   }, [open, credential])
 
   const { mutate, isPending } = useUpdateCredential()
+  const isApiKey = credential.authMethod === 'api_key'
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
+
+    if (isApiKey && !apiRegion) {
+      toast.error('请选择 API Region')
+      return
+    }
 
     mutate(
       {
         id: credential.id,
         req: {
+          nickname: nickname.trim(),
+          apiRegion: isApiKey ? apiRegion : undefined,
           email: email,
           proxyUrl: proxyUrl,
           proxyUsername: proxyUsername || undefined,
@@ -112,7 +124,7 @@ export function EditCredentialDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md">
+      <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-md">
         <DialogHeader>
           <DialogTitle>
             编辑凭据 #{credential.id}
@@ -121,6 +133,60 @@ export function EditCredentialDialog({
 
         <form onSubmit={handleSubmit}>
           <div className="space-y-4 py-4">
+            <div className="space-y-2">
+              <label htmlFor="nickname" className="text-sm font-medium">
+                Nickname（可选）
+              </label>
+              <Input
+                id="nickname"
+                value={nickname}
+                onChange={(e) => setNickname(e.target.value)}
+                maxLength={128}
+                disabled={isPending}
+              />
+            </div>
+
+            {isApiKey && (
+              <div className="space-y-2">
+                <label className="text-sm font-medium">API Key Region</label>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <div className="space-y-1.5">
+                    <label htmlFor="editAuthRegion" className="text-xs text-muted-foreground">
+                      Auth Region
+                    </label>
+                    <Input
+                      id="editAuthRegion"
+                      value="us-east-1"
+                      readOnly
+                      aria-readonly="true"
+                      disabled={isPending}
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <label htmlFor="editApiRegion" className="text-xs text-muted-foreground">
+                      API Region <span className="text-red-500">*</span>
+                    </label>
+                    <Select
+                      value={apiRegion}
+                      onValueChange={setApiRegion}
+                      disabled={isPending}
+                    >
+                      <SelectTrigger id="editApiRegion" className="h-10 rounded-xl px-3.5">
+                        <SelectValue placeholder="请选择 API Region" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="us-east-1">美国（us-east-1）</SelectItem>
+                        <SelectItem value="eu-central-1">欧洲（eu-central-1）</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  修正 API Region 后，因 InvalidConfig 禁用的 API Key 会自动重新启用。
+                </p>
+              </div>
+            )}
+
             {/* 邮箱 */}
             <div className="space-y-2">
               <label htmlFor="email" className="text-sm font-medium">

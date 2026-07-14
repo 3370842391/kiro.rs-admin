@@ -85,6 +85,7 @@ fn is_invalid_add_credential_error(msg: &str) -> bool {
         || msg.contains("kiroApiKey 为空")
         || msg.contains("kiroApiKey 格式无效")
         || msg.contains("apiRegion")
+        || msg.contains("nickname")
         || msg.contains("凭证已过期或无效")
         || msg.contains("权限不足")
         || msg.contains("已被限流")
@@ -1977,6 +1978,7 @@ impl AdminService {
                 req.source_channel
                     .map(|v| if v.is_empty() { None } else { Some(v) }),
                 req.rpm_limit,
+                req.api_region,
             )
             .map_err(|e| self.classify_error(e, id))
     }
@@ -3461,6 +3463,7 @@ impl AdminService {
                 None,            // groups 不修改
                 None,            // source_channel 不修改
                 None,            // rpm_limit 不修改
+                None,            // api_region 不修改
             )
             .map_err(|e| {
                 let msg = e.to_string();
@@ -3560,6 +3563,7 @@ impl AdminService {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .is_ok()
             {
@@ -3580,6 +3584,8 @@ impl AdminService {
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
+        } else if msg.contains("apiRegion") || msg.contains("nickname") {
+            AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)
         }

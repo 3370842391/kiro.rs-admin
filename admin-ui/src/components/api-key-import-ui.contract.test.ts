@@ -42,6 +42,22 @@ describe('API Key import UI wiring', () => {
     expect(dialog).toMatch(/id="authRegion"[\s\S]*value="us-east-1"[\s\S]*readOnly/)
     expect(dialog).toContain('redactApiKeys(data.message)')
     expect(dialog).toContain('redactApiKeys(extractErrorMessage(error))')
+    expect(dialog).toMatch(/id="nickname"[\s\S]*maxLength=\{128\}/)
+  })
+
+  test('API Key edit can repair region and edit a bounded nickname', async () => {
+    const dialog = await readSource('src/components/edit-credential-dialog.tsx')
+    const types = await readSource('src/types/api.ts')
+
+    expect(dialog).toContain("credential.authMethod === 'api_key'")
+    expect(dialog).toMatch(/id="nickname"[\s\S]*maxLength=\{128\}/)
+    expect(dialog).toMatch(/id="editAuthRegion"[\s\S]*value="us-east-1"[\s\S]*readOnly/)
+    expect(dialog).toContain('<SelectItem value="us-east-1">')
+    expect(dialog).toContain('<SelectItem value="eu-central-1">')
+    expect(dialog).toContain('apiRegion: isApiKey ? apiRegion')
+    expect(dialog).toContain('nickname: nickname.trim()')
+    expect(types).toContain('nickname?: string')
+    expect(types).toContain('apiRegion?: string')
   })
 
   test('credential cards prefer nickname and show auth/API regions', async () => {

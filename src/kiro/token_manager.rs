@@ -70,6 +70,19 @@ fn mask_api_key(key: &str) -> String {
     }
 }
 
+const MAX_NICKNAME_CHARS: usize = 128;
+
+fn normalize_nickname(value: Option<String>) -> anyhow::Result<Option<String>> {
+    let value = value.map(|value| value.trim().to_string());
+    if value
+        .as_deref()
+        .is_some_and(|value| value.chars().count() > MAX_NICKNAME_CHARS)
+    {
+        bail!("nickname 最多 128 个字符");
+    }
+    Ok(value.filter(|value| !value.is_empty()))
+}
+
 /// 验证 refreshToken 的基本有效性
 pub(crate) fn validate_refresh_token(credentials: &KiroCredentials) -> anyhow::Result<()> {
     let refresh_token = credentials
@@ -3280,11 +3293,7 @@ impl MultiTokenManager {
     /// - `Ok(u64)` - 新凭据 ID
     /// - `Err(_)` - 验证失败或添加失败
     pub async fn add_credential(&self, mut new_cred: KiroCredentials) -> anyhow::Result<u64> {
-        new_cred.nickname = new_cred
-            .nickname
-            .take()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
+        new_cred.nickname = normalize_nickname(new_cred.nickname.take())?;
         if new_cred.is_api_key_credential() {
             new_cred.kiro_api_key = new_cred
                 .kiro_api_key
@@ -3502,13 +3511,22 @@ impl MultiTokenManager {
         groups: Option<Vec<String>>,
         source_channel: Option<Option<String>>,
         rpm_limit: Option<u32>,
+        api_region: Option<String>,
     ) -> anyhow::Result<()> {
+        let nickname = nickname.map(normalize_nickname).transpose()?;
+        let api_region = api_region
+            .map(|value| validate_api_region(&value).map(str::to_string))
+            .transpose()?;
+        let mut reenabled = false;
         {
             let mut entries = self.entries.lock();
             let entry = entries
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            if api_region.is_some() && !entry.credentials.is_api_key_credential() {
+                bail!("apiRegion 编辑仅支持 API Key 凭据");
+            }
 
             if let Some(v) = nickname {
                 entry.credentials.nickname = v.filter(|s| !s.is_empty());
@@ -3539,6 +3557,25 @@ impl MultiTokenManager {
             if let Some(v) = rpm_limit {
                 entry.credentials.rpm_limit = v; // 0 = 不限速
             }
+            if let Some(api_region) = api_region {
+                entry.credentials.api_region = Some(api_region);
+                if entry.credentials.is_api_key_credential() {
+                    entry.credentials.auth_region = Some(API_KEY_AUTH_REGION.to_string());
+                    let has_api_key = entry
+                        .credentials
+                        .kiro_api_key
+                        .as_deref()
+                        .is_some_and(|key| !key.trim().is_empty());
+                    if has_api_key && entry.disabled_reason == Some(DisabledReason::InvalidConfig) {
+                        entry.disabled = false;
+                        entry.disabled_reason = None;
+                        reenabled = true;
+                    }
+                }
+            }
+        }
+        if reenabled {
+            self.select_highest_priority();
         }
         self.persist_credentials()?;
         Ok(())
@@ -4772,6 +4809,56 @@ mod tests {
         assert_eq!(entry.disabled_reason.as_deref(), Some("InvalidConfig"));
     }
 
+    #[test]
+    fn api_key_invalid_config_can_be_repaired_without_restart() {
+        let cred = KiroCredentials {
+            auth_method: Some("api_key".to_string()),
+            kiro_api_key: Some(format!("{}{}", "ksk_", "unit-repair-placeholder")),
+            ..Default::default()
+        };
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap();
+
+        let error = manager
+            .update_credential(
+                1,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("ap-southeast-1".to_string()),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("apiRegion"));
+        assert!(manager.snapshot().entries[0].disabled);
+
+        manager
+            .update_credential(
+                1,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("eu-central-1".to_string()),
+            )
+            .unwrap();
+        let entry = &manager.snapshot().entries[0];
+        assert!(!entry.disabled);
+        assert_eq!(entry.disabled_reason, None);
+        assert_eq!(entry.auth_region.as_deref(), Some("us-east-1"));
+        assert_eq!(entry.api_region.as_deref(), Some("eu-central-1"));
+        assert_eq!(manager.available_count(), 1);
+        assert_eq!(manager.snapshot().current_id, 1);
+    }
+
     #[tokio::test]
     async fn add_api_key_requires_supported_api_region_and_normalizes_auth_region() {
         let manager =
@@ -4803,6 +4890,34 @@ mod tests {
         assert_eq!(
             stored.kiro_api_key.as_deref(),
             Some(format!("{}{}", "ksk_", "unit-add-placeholder").as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn add_credential_trims_nickname_and_rejects_more_than_128_unicode_chars() {
+        let manager =
+            MultiTokenManager::new(Config::default(), Vec::new(), None, None, false).unwrap();
+        let credential = |key: &str, nickname: String| KiroCredentials {
+            auth_method: Some("api_key".to_string()),
+            kiro_api_key: Some(format!("ksk_{key}")),
+            api_region: Some("us-east-1".to_string()),
+            nickname: Some(nickname),
+            ..Default::default()
+        };
+
+        let error = manager
+            .add_credential(credential("overlong", "名".repeat(129)))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("nickname"));
+
+        manager
+            .add_credential(credential("boundary", format!("  {}  ", "名".repeat(128))))
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.snapshot().entries[0].nickname.as_deref(),
+            Some("名".repeat(128).as_str())
         );
     }
 
@@ -5687,7 +5802,8 @@ mod tests {
         manager
             .update_credential(
                 1,
-                Some(Some("renamed".to_string())),
+                Some(Some("  renamed  ".to_string())),
+                None,
                 None,
                 None,
                 None,
@@ -5708,8 +5824,25 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
+
+        let overlong = manager
+            .update_credential(
+                1,
+                Some(Some("名".repeat(129))),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(overlong.to_string().contains("nickname"));
 
         let entry = manager.snapshot().entries.into_iter().next().unwrap();
         assert_eq!(entry.nickname.as_deref(), Some("renamed"));

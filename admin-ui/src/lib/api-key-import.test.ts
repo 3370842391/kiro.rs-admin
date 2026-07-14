@@ -91,6 +91,17 @@ describe('parseApiKeyLines', () => {
     })
   })
 
+  test('nickname 会 trim 且最多允许 128 个 Unicode 字符', () => {
+    const boundary = `  ${'名'.repeat(128)}  | ksk_test_nickname_boundary_12345678`
+    const overlong = `${'名'.repeat(129)} | ksk_test_nickname_overlong_12345678`
+    const result = parseApiKeyLines([boundary, overlong].join('\n'), 'us-east-1')
+
+    expect(result.entries).toHaveLength(1)
+    expect(result.entries[0]?.nickname).toBe('名'.repeat(128))
+    expect(result.errors).toHaveLength(1)
+    expect(result.errors[0]?.message).toBe('nickname 最多 128 个字符')
+  })
+
   test('错误对象与掩码预览不保留完整 Key 或原始整行', () => {
     const secret = 'ksk_test_never_expose_13572468'
     const rawLine = `unsafe-${secret} | ${secret} | invalid-region`

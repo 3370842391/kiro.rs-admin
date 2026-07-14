@@ -194,6 +194,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                     placeholder="用于区分账号，例如：欧洲团队"
                     value={nickname}
                     onChange={(e) => setNickname(e.target.value)}
+                    maxLength={128}
                     disabled={isPending}
                   />
                 </div>
