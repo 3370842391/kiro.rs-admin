@@ -248,6 +248,23 @@ impl RequestTracer {
         }
     }
 
+    pub fn record_tool_schema_failure(
+        &self,
+        failure: &super::tool_schema::ToolSchemaFailure,
+        attempt: u8,
+    ) {
+        let safe_summary = failure.safe_summary(attempt);
+        tracing::warn!(
+            attempt,
+            tool = %failure.tool_name(),
+            summary = %safe_summary,
+            "上游工具参数 Schema 校验失败（仅记录安全形状摘要）"
+        );
+        if let Some(snapshot) = &self.snapshot {
+            snapshot.record_tool_schema_failure(&safe_summary);
+        }
+    }
+
     pub fn record_local_error(&self, status: StatusCode, error_type: &str, message: &str) {
         if let Some(snapshot) = &self.snapshot {
             snapshot.record_attempt_status(0, Some(status.as_u16()), "local_error");
@@ -2417,6 +2434,21 @@ struct StreamAttemptSetup {
     strict_thinking_validation: bool,
 }
 
+fn prepare_retry_request_body(
+    request_body: &str,
+    threshold_retry_body: Option<&str>,
+    failure: Option<&super::tool_attempt::AttemptFailure>,
+    tool_name_map: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    let base = threshold_retry_body.unwrap_or(request_body);
+    match failure {
+        Some(super::tool_attempt::AttemptFailure::InvalidToolSchema { failure }) => {
+            super::tool_schema::append_tool_schema_retry_instruction(base, failure, tool_name_map)
+        }
+        _ => Some(base.to_owned()),
+    }
+}
+
 impl StreamAttemptSetup {
     fn new_context(&self) -> StreamContext {
         let mut ctx = StreamContext::new_with_constraints(
@@ -2458,14 +2490,11 @@ impl StreamAttemptSetup {
 
     async fn call_retry(
         &self,
+        request_body: &str,
         tracer: &RequestTracer,
     ) -> anyhow::Result<crate::kiro::provider::KiroCallResult> {
-        let retry_body = self
-            .threshold_retry_body
-            .as_deref()
-            .unwrap_or(&self.request_body);
         self.provider
-            .call_api_stream(retry_body, Some(tracer), self.group.as_deref())
+            .call_api_stream(request_body, Some(tracer), self.group.as_deref())
             .await
     }
 }
@@ -2876,17 +2905,22 @@ async fn run_realtime_sse_attempts(
     sender: tokio::sync::mpsc::Sender<Result<Bytes, Infallible>>,
 ) {
     let mut first_call = Some(first_call);
+    let mut retry_request_body = None;
     for attempt_index in 0_u8..=1 {
         let call_result = if let Some(call_result) = first_call.take() {
             call_result
         } else {
+            let Some(request_body) = retry_request_body.as_deref() else {
+                tracing::error!("缺少受控重试请求体，停止第二次上游调用");
+                return;
+            };
             let retry_result = tokio::select! {
                 biased;
                 _ = sender.closed() => {
                     finalize_client_disconnected(tracer.as_ref(), 0, TraceUsage::zero());
                     return;
                 },
-                result = setup.call_retry(tracer.as_ref()) => result,
+                result = setup.call_retry(request_body, tracer.as_ref()) => result,
             };
             match retry_result {
                 Ok(call_result) => call_result,
@@ -3015,12 +3049,31 @@ async fn run_realtime_sse_attempts(
 
         let final_events = ctx.generate_final_events_for(&termination);
         let visible = probation.push_all(final_events);
-        let retryable = probation.prepare_attempt_retry(
+        let attempt_failure = ctx.terminal_attempt_failure().cloned();
+        if let Some(super::tool_attempt::AttemptFailure::InvalidToolSchema { failure }) =
+            &attempt_failure
+        {
+            tracer.record_tool_schema_failure(failure, attempt_index + 1);
+        }
+        let can_retry = probation.should_retry_attempt(
             attempt_index,
             termination.clone(),
-            ctx.terminal_attempt_failure().cloned(),
+            attempt_failure.clone(),
         );
+        let prepared_retry_body = can_retry
+            .then(|| {
+                prepare_retry_request_body(
+                    &setup.request_body,
+                    setup.threshold_retry_body.as_deref(),
+                    attempt_failure.as_ref(),
+                    &setup.tool_name_map,
+                )
+            })
+            .flatten();
+        let retryable = prepared_retry_body.is_some()
+            && probation.prepare_attempt_retry(attempt_index, termination.clone(), attempt_failure);
         if retryable {
+            retry_request_body = prepared_retry_body;
             tracing::warn!(
                 attempt = attempt_index + 1,
                 "实时首轮正常 EOF 且无语义输出，丢弃整轮并重试一次"
@@ -3142,6 +3195,22 @@ struct NonStreamToolAttempt {
 enum NonStreamCollectError {
     Provider(anyhow::Error),
     Body { credential_id: u64, message: String },
+}
+
+fn non_stream_attempt_error(
+    failure: &super::tool_attempt::AttemptFailure,
+    attempt_count: u8,
+) -> (StatusCode, &'static str, String) {
+    let (error_type, mut message) = failure.public_error();
+    if attempt_count == 2
+        && matches!(
+            failure,
+            super::tool_attempt::AttemptFailure::InvalidToolSchema { .. }
+        )
+    {
+        message = format!("Upstream tool input still violated schema after one retry: {message}");
+    }
+    (StatusCode::BAD_GATEWAY, error_type, message)
 }
 
 fn normalize_and_validate_non_stream_content(
@@ -3383,7 +3452,9 @@ async fn collect_non_stream_tool_attempt(
         Err(error) => {
             tracing::warn!(tool = %error.tool_name, attempt = attempt_index + 1, "上游工具参数不满足客户端Schema");
             Some(super::tool_attempt::AttemptFailure::InvalidToolSchema {
-                message: error.to_string(),
+                failure: super::tool_schema::ToolSchemaFailure::from_error_and_blocks(
+                    error, &content,
+                ),
             })
         }
     };
@@ -3395,8 +3466,13 @@ async fn collect_non_stream_tool_attempt(
     let failure = schema_failure
         .clone()
         .or_else(|| observation.failure(tool_json_error, has_completed_tool));
-    if failure.is_some() {
-        tracer.record_upstream_body(attempt_index as u32, &body_bytes);
+    if let Some(failure) = &failure {
+        match failure {
+            super::tool_attempt::AttemptFailure::InvalidToolSchema {
+                failure: schema_failure,
+            } => tracer.record_tool_schema_failure(schema_failure, attempt_index + 1),
+            _ => tracer.record_upstream_body(attempt_index as u32, &body_bytes),
+        }
     }
     let semantic_output_started =
         has_non_tool_semantic_output || (has_completed_tool && schema_failure.is_none());
@@ -3445,14 +3521,21 @@ async fn handle_non_stream_request(
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
 ) -> Response {
-    let collection = super::tool_attempt::run_with_single_retry(
-        |attempt_index| {
+    let collection = async {
+        let mut retry_request_body = None;
+        let mut retry_failure_type = None;
+        for attempt_index in 0_u8..=1 {
             let (attempt_body, attempt_threshold_retry_body) = if attempt_index == 0 {
                 (request_body, threshold_retry_body)
             } else {
-                (threshold_retry_body.unwrap_or(request_body), None)
+                (
+                    retry_request_body
+                        .as_deref()
+                        .expect("second attempt requires a prepared retry body"),
+                    None,
+                )
             };
-            collect_non_stream_tool_attempt(
+            let attempt = collect_non_stream_tool_attempt(
                 provider.clone(),
                 attempt_body,
                 attempt_threshold_retry_body,
@@ -3466,12 +3549,30 @@ async fn handle_non_stream_request(
                 group.as_deref(),
                 attempt_index,
             )
-        },
-        |attempt, _| attempt.state.clone(),
-    )
+            .await?;
+            if attempt.state.should_retry()
+                && let Some(body) = prepare_retry_request_body(
+                    request_body,
+                    threshold_retry_body,
+                    attempt.state.failure.as_ref(),
+                    &tool_name_map,
+                )
+            {
+                retry_failure_type = attempt
+                    .state
+                    .failure
+                    .as_ref()
+                    .map(|failure| failure.public_error().0);
+                retry_request_body = Some(body);
+                continue;
+            }
+            return Ok((attempt, attempt_index + 1, retry_failure_type));
+        }
+        unreachable!("第二次工具生成 attempt 不允许继续重试")
+    }
     .await;
 
-    let (attempt, attempt_count) = match collection {
+    let (attempt, attempt_count, retry_failure_type) = match collection {
         Ok(result) => result,
         Err(NonStreamCollectError::Provider(error)) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
@@ -3509,13 +3610,14 @@ async fn handle_non_stream_request(
     };
 
     if attempt_count == 2 {
+        let retry_failure_type = retry_failure_type.unwrap_or("upstream_empty_response");
         tracing::warn!(
-            first_attempt_error = "empty_or_incomplete_upstream_response",
+            first_attempt_error = retry_failure_type,
             "非流式首轮正常 EOF 且无语义输出，已完成一次受控重试"
         );
         tracer.record_protocol_error(
-            "upstream_empty_response",
-            "the first non-stream response had no semantic output and was retried",
+            retry_failure_type,
+            "the first non-stream response was rejected before delivery and retried once",
         );
     }
 
@@ -3531,7 +3633,7 @@ async fn handle_non_stream_request(
     // 上游 attempt 失败：非流式路径尚未发送任何字节，直接回 502。
     // 显式 Error/Exception 的原始正文只保留在内部分类中，不回显给客户端。
     if let Some(failure) = state.failure {
-        let (error_type, message) = failure.public_error();
+        let (status, error_type, message) = non_stream_attempt_error(&failure, attempt_count);
         hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
         tracer.record_protocol_error(error_type, &message);
         tracer.finalize(
@@ -3541,11 +3643,7 @@ async fn handle_non_stream_request(
             None,
             TraceUsage::zero(),
         );
-        return (
-            StatusCode::BAD_GATEWAY,
-            Json(ErrorResponse::new(error_type, message)),
-        )
-            .into_response();
+        return (status, Json(ErrorResponse::new(error_type, message))).into_response();
     }
 
     let content = normalize_required_tool_content(content, &tool_choice_policy);
@@ -4397,17 +4495,22 @@ async fn run_buffered_sse_attempts(
     sender: tokio::sync::mpsc::Sender<Result<Bytes, Infallible>>,
 ) {
     let mut first_call = Some(first_call);
+    let mut retry_request_body = None;
     for attempt_index in 0_u8..=1 {
         let call_result = if let Some(call_result) = first_call.take() {
             call_result
         } else {
+            let Some(request_body) = retry_request_body.as_deref() else {
+                tracing::error!("缺少受控重试请求体，停止第二次上游调用");
+                return;
+            };
             let retry_result = tokio::select! {
                 biased;
                 _ = sender.closed() => {
                     finalize_client_disconnected(tracer.as_ref(), 0, TraceUsage::zero());
                     return;
                 },
-                result = setup.call_retry(tracer.as_ref()) => result,
+                result = setup.call_retry(request_body, tracer.as_ref()) => result,
             };
             match retry_result {
                 Ok(call_result) => call_result,
@@ -4514,12 +4617,31 @@ async fn run_buffered_sse_attempts(
         let all_events = ctx.finish_and_get_all_events_for(&termination);
         let mut probation = ProbationBuffer::default();
         let visible = probation.push_all(all_events);
-        let retryable = probation.prepare_attempt_retry(
+        let attempt_failure = ctx.terminal_attempt_failure().cloned();
+        if let Some(super::tool_attempt::AttemptFailure::InvalidToolSchema { failure }) =
+            &attempt_failure
+        {
+            tracer.record_tool_schema_failure(failure, attempt_index + 1);
+        }
+        let can_retry = probation.should_retry_attempt(
             attempt_index,
             termination.clone(),
-            ctx.terminal_attempt_failure().cloned(),
+            attempt_failure.clone(),
         );
+        let prepared_retry_body = can_retry
+            .then(|| {
+                prepare_retry_request_body(
+                    &setup.request_body,
+                    setup.threshold_retry_body.as_deref(),
+                    attempt_failure.as_ref(),
+                    &setup.tool_name_map,
+                )
+            })
+            .flatten();
+        let retryable = prepared_retry_body.is_some()
+            && probation.prepare_attempt_retry(attempt_index, termination.clone(), attempt_failure);
         if retryable {
+            retry_request_body = prepared_retry_body;
             tracing::warn!(
                 attempt = attempt_index + 1,
                 "CC 缓冲首轮正常 EOF 且无语义输出，丢弃整轮并重试一次"
@@ -4660,6 +4782,83 @@ mod tests {
     use futures::{StreamExt, future};
 
     use super::*;
+
+    #[test]
+    fn shared_stream_and_non_stream_retry_body_uses_threshold_variant_and_schema_hint() {
+        fn body(description: &str, marker: &str) -> String {
+            serde_json::json!({
+                "marker": marker,
+                "conversationState": {"currentMessage": {"userInputMessage": {
+                    "userInputMessageContext": {"tools": [{"toolSpecification": {
+                        "name": "get_weather",
+                        "description": description,
+                        "inputSchema": {"json": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"]
+                        }}
+                    }}]}
+                }}}
+            })
+            .to_string()
+        }
+        let primary = body("primary description", "primary");
+        let threshold = body("threshold description", "threshold");
+        let failure = super::super::tool_schema::ToolSchemaFailure::from_error_and_input(
+            super::super::tool_schema::ToolSchemaError {
+                tool_name: "get_weather".to_string(),
+                violations: vec![
+                    super::super::tool_schema::ToolInputViolation::MissingRequired(
+                        "$.city".to_string(),
+                    ),
+                ],
+            },
+            &serde_json::json!({}),
+        );
+        let attempt_failure =
+            super::super::tool_attempt::AttemptFailure::InvalidToolSchema { failure };
+
+        let retry = prepare_retry_request_body(
+            &primary,
+            Some(&threshold),
+            Some(&attempt_failure),
+            &std::collections::HashMap::new(),
+        )
+        .expect("schema retry body");
+        let retry: serde_json::Value = serde_json::from_str(&retry).unwrap();
+
+        assert_eq!(retry["marker"], "threshold");
+        let description = retry
+            .pointer("/conversationState/currentMessage/userInputMessage/userInputMessageContext/tools/0/toolSpecification/description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert!(description.starts_with("threshold description"));
+        assert!(description.contains("retry attempt only"));
+        assert!(description.contains("city"));
+    }
+
+    #[test]
+    fn second_non_stream_schema_failure_maps_to_explicit_502() {
+        let failure = super::super::tool_attempt::AttemptFailure::InvalidToolSchema {
+            failure: super::super::tool_schema::ToolSchemaFailure::from_error_and_input(
+                super::super::tool_schema::ToolSchemaError {
+                    tool_name: "get_weather".to_string(),
+                    violations: vec![
+                        super::super::tool_schema::ToolInputViolation::MissingRequired(
+                            "$.city".to_string(),
+                        ),
+                    ],
+                },
+                &serde_json::json!({}),
+            ),
+        };
+
+        let (status, error_type, message) = non_stream_attempt_error(&failure, 2);
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(error_type, "upstream_tool_schema_error");
+        assert!(message.contains("after one retry"));
+    }
 
     fn test_request_tracer_with_snapshot(
         trace_id: &str,
@@ -5087,7 +5286,9 @@ mod tests {
             termination: super::super::tool_attempt::AttemptTermination::Eof,
             failure: Some(
                 super::super::tool_attempt::AttemptFailure::InvalidToolSchema {
-                    message: error.to_string(),
+                    failure: super::super::tool_schema::ToolSchemaFailure::from_error_and_blocks(
+                        error, &content,
+                    ),
                 },
             ),
             semantic_output_started: non_stream_content_has_non_tool_semantic_output(&content),

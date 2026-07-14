@@ -246,6 +246,8 @@ struct SnapshotDraft {
     model: String,
     endpoint: Option<String>,
     tool_diagnostics: ToolDiagnostics,
+    /// Schema 失败只允许持久化键名/类型/违规项摘要，禁止落盘客户请求、工具值和流尾。
+    tool_schema_safe_only: bool,
 }
 
 #[derive(Clone)]
@@ -401,6 +403,7 @@ impl ErrorSnapshotContext {
                 model: request.model.clone(),
                 endpoint: None,
                 tool_diagnostics,
+                tool_schema_safe_only: false,
             }),
             finalized: AtomicBool::new(false),
         }
@@ -507,6 +510,26 @@ impl ErrorSnapshotContext {
             .push((error_type.to_string(), message.to_string()));
     }
 
+    /// 将本次快照降级为工具 Schema 安全摘要模式。
+    ///
+    /// 失败发生前可能已经采集了 Kiro 请求、响应或流尾，因此这里同时清理已采集内容；
+    /// finalize 还会再次按标志过滤，避免重试后的新 chunk 被落盘。
+    pub fn record_tool_schema_failure(&self, safe_summary: &str) {
+        let mut draft = self.draft.lock();
+        draft.tool_schema_safe_only = true;
+        draft.payloads.retain(|payload| {
+            !matches!(
+                payload.kind,
+                SnapshotPayloadKind::KiroRequest | SnapshotPayloadKind::UpstreamResponse
+            )
+        });
+        draft.stream_tail.bytes.clear();
+        draft.protocol_errors.push((
+            "upstream_tool_schema_error".to_string(),
+            safe_summary.to_string(),
+        ));
+    }
+
     pub fn record_stream_chunk(&self, chunk: &[u8]) {
         let mut draft = self.draft.lock();
         draft.stream_tail.push(chunk);
@@ -562,7 +585,8 @@ impl ErrorSnapshotContext {
         let severity = classify_severity(&error_type, recovered);
         let retention_exempt = severity == SnapshotSeverity::Critical;
         let metadata_only = self.store.capture_mode() == CaptureMode::MetadataOnly;
-        let include_bodies = policy.capture_bodies && !metadata_only;
+        let tool_schema_safe_only = draft.tool_schema_safe_only;
+        let include_bodies = policy.capture_bodies && !metadata_only && !tool_schema_safe_only;
         let mut raw_payloads = Vec::new();
         if include_bodies {
             raw_payloads.push(RawSnapshotPayload {
@@ -590,6 +614,14 @@ impl ErrorSnapshotContext {
             }))?,
         });
         for payload in &draft.payloads {
+            if tool_schema_safe_only
+                && matches!(
+                    payload.kind,
+                    SnapshotPayloadKind::KiroRequest | SnapshotPayloadKind::UpstreamResponse
+                )
+            {
+                continue;
+            }
             if include_bodies || payload.kind != SnapshotPayloadKind::KiroRequest {
                 raw_payloads.push(payload.clone());
             }
@@ -602,7 +634,7 @@ impl ErrorSnapshotContext {
                 data: serde_json::to_vec(&draft.protocol_errors)?,
             });
         }
-        if !draft.stream_tail.bytes.is_empty() {
+        if !tool_schema_safe_only && !draft.stream_tail.bytes.is_empty() {
             raw_payloads.push(RawSnapshotPayload {
                 kind: SnapshotPayloadKind::StreamTail,
                 attempt: None,
@@ -942,6 +974,57 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(store.get(&id).unwrap().is_some());
+    }
+
+    #[test]
+    fn tool_schema_failure_snapshot_keeps_only_safe_summary() {
+        let store = test_store();
+        let ctx = sample_context(store.clone(), true, true);
+        ctx.record_kiro_request(
+            0,
+            7,
+            "https://example.invalid/generate",
+            r#"{"conversationState":{"currentMessage":{"userInputMessage":{"content":"private customer prompt"}}}}"#,
+        );
+        ctx.record_upstream_body(
+            0,
+            br#"{"tool":"get_weather","input":{"city":"private customer value"}}"#,
+        );
+        ctx.record_stream_chunk(b"private streamed customer value");
+
+        ctx.record_tool_schema_failure(
+            r#"{"attempt":1,"tool":"get_weather","input":{"keys":["city"],"types":{"city":"string"}},"violations":["missing required $.unit"]}"#,
+        );
+
+        let id = ctx
+            .finalize(SnapshotFinalState::error(
+                "upstream_tool_schema_error",
+                Some(502),
+            ))
+            .unwrap()
+            .unwrap();
+        let detail = store.get(&id).unwrap().unwrap();
+        let kinds = detail
+            .payloads
+            .iter()
+            .map(|payload| payload.kind)
+            .collect::<Vec<_>>();
+
+        assert!(!kinds.contains(&SnapshotPayloadKind::ClientRequest));
+        assert!(!kinds.contains(&SnapshotPayloadKind::KiroRequest));
+        assert!(!kinds.contains(&SnapshotPayloadKind::UpstreamResponse));
+        assert!(!kinds.contains(&SnapshotPayloadKind::StreamTail));
+
+        let internal = detail
+            .payloads
+            .iter()
+            .find(|payload| payload.kind == SnapshotPayloadKind::InternalError)
+            .expect("safe schema summary payload");
+        let payload = store.read_payload(&id, internal.seq).unwrap().unwrap();
+        let text = String::from_utf8(payload.data).unwrap();
+        assert!(text.contains("get_weather"));
+        assert!(text.contains("city"));
+        assert!(!text.contains("private customer"));
     }
 
     #[test]

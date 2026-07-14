@@ -117,6 +117,20 @@ impl ProbationBuffer {
         termination: AttemptTermination,
         failure: Option<AttemptFailure>,
     ) -> bool {
+        if self.should_retry_attempt(attempt_index, termination, failure) {
+            self.pending.clear();
+            self.pending_tools.clear();
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn should_retry_attempt(
+        &self,
+        attempt_index: u8,
+        termination: AttemptTermination,
+        failure: Option<AttemptFailure>,
+    ) -> bool {
         let state = ToolAttemptState {
             attempt_index,
             termination,
@@ -124,12 +138,7 @@ impl ProbationBuffer {
             semantic_output_started: self.committed,
             tool_forwarded: self.tool_forwarded,
         };
-        if state.should_retry() {
-            self.pending.clear();
-            self.pending_tools.clear();
-            return true;
-        }
-        false
+        state.should_retry()
     }
 }
 
@@ -179,10 +188,15 @@ pub(crate) enum AttemptTermination {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AttemptFailure {
     IncompleteToolJson(ToolJsonAccumulatorError),
-    InvalidToolSchema { message: String },
+    InvalidToolSchema {
+        failure: super::tool_schema::ToolSchemaFailure,
+    },
     EmptyResponse,
     ContextWindowExceeded,
-    UpstreamError { error_type: String, message: String },
+    UpstreamError {
+        error_type: String,
+        message: String,
+    },
 }
 
 impl AttemptFailure {
@@ -190,7 +204,9 @@ impl AttemptFailure {
     pub(crate) fn public_error(&self) -> (&'static str, String) {
         match self {
             Self::IncompleteToolJson(error) => (error.error_type(), error.message()),
-            Self::InvalidToolSchema { message } => ("upstream_tool_schema_error", message.clone()),
+            Self::InvalidToolSchema { failure } => {
+                ("upstream_tool_schema_error", failure.public_message())
+            }
             Self::EmptyResponse => (
                 "upstream_empty_response",
                 "Upstream returned no assistant content after one retry".to_string(),
@@ -320,16 +336,19 @@ pub(crate) struct ToolAttemptState {
 
 impl ToolAttemptState {
     pub(crate) fn should_retry(&self) -> bool {
+        let retryable_failure = match &self.failure {
+            Some(AttemptFailure::EmptyResponse)
+            | Some(AttemptFailure::IncompleteToolJson(IncompleteJson { .. })) => true,
+            Some(AttemptFailure::InvalidToolSchema { failure }) => {
+                failure.can_retry_with_description()
+            }
+            _ => false,
+        };
         self.attempt_index == 0
             && self.termination == AttemptTermination::Eof
             && !self.semantic_output_started
             && !self.tool_forwarded
-            && matches!(
-                self.failure,
-                Some(AttemptFailure::EmptyResponse)
-                    | Some(AttemptFailure::IncompleteToolJson(IncompleteJson { .. }))
-                    | Some(AttemptFailure::InvalidToolSchema { .. })
-            )
+            && retryable_failure
     }
 }
 
@@ -381,13 +400,27 @@ mod tests {
         }
     }
 
+    fn schema_failure() -> super::super::tool_schema::ToolSchemaFailure {
+        super::super::tool_schema::ToolSchemaFailure::from_error_and_input(
+            super::super::tool_schema::ToolSchemaError {
+                tool_name: "get_weather".to_string(),
+                violations: vec![
+                    super::super::tool_schema::ToolInputViolation::MissingRequired(
+                        "$.city".to_string(),
+                    ),
+                ],
+            },
+            &serde_json::json!({}),
+        )
+    }
+
     #[test]
     fn invalid_tool_schema_retries_only_before_semantic_output_and_only_once() {
         let retryable = ToolAttemptState {
             attempt_index: 0,
             termination: AttemptTermination::Eof,
             failure: Some(AttemptFailure::InvalidToolSchema {
-                message: "tool schema mismatch".to_string(),
+                failure: schema_failure(),
             }),
             semantic_output_started: false,
             tool_forwarded: false,
@@ -405,6 +438,25 @@ mod tests {
             ..retryable
         };
         assert!(!after_text.should_retry());
+
+        let undeclared = ToolAttemptState {
+            attempt_index: 0,
+            termination: AttemptTermination::Eof,
+            failure: Some(AttemptFailure::InvalidToolSchema {
+                failure: super::super::tool_schema::ToolSchemaFailure::from_error_and_input(
+                    super::super::tool_schema::ToolSchemaError {
+                        tool_name: "undeclared".to_string(),
+                        violations: vec![
+                            super::super::tool_schema::ToolInputViolation::UndeclaredTool,
+                        ],
+                    },
+                    &serde_json::json!({}),
+                ),
+            }),
+            semantic_output_started: false,
+            tool_forwarded: false,
+        };
+        assert!(!undeclared.should_retry());
     }
 
     #[test]
@@ -611,6 +663,34 @@ mod tests {
 
         assert!(state.failure.is_none());
         assert_eq!(attempt_count, 2);
+    }
+
+    #[tokio::test]
+    async fn second_schema_failure_is_terminal_and_never_retried_a_third_time() {
+        let calls = std::cell::Cell::new(0_u8);
+
+        let (state, attempt_count) = run_with_single_retry(
+            |attempt_index| {
+                calls.set(calls.get() + 1);
+                std::future::ready(Ok::<_, ()>(ToolAttemptState {
+                    attempt_index,
+                    termination: AttemptTermination::Eof,
+                    failure: Some(AttemptFailure::InvalidToolSchema {
+                        failure: schema_failure(),
+                    }),
+                    semantic_output_started: false,
+                    tool_forwarded: false,
+                }))
+            },
+            |state, _| state.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(calls.get(), 2);
+        assert_eq!(attempt_count, 2);
+        let failure = state.failure.expect("second schema failure");
+        assert_eq!(failure.public_error().0, "upstream_tool_schema_error");
     }
 
     #[tokio::test]

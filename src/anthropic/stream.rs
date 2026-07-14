@@ -2501,7 +2501,10 @@ impl StreamContext {
                 tracing::warn!(tool = %completed.name, "上游返回了未声明工具");
                 self.terminal_attempt_failure =
                     Some(super::tool_attempt::AttemptFailure::InvalidToolSchema {
-                        message: error.to_string(),
+                        failure: super::tool_schema::ToolSchemaFailure::from_error_and_input(
+                            error,
+                            &completed.input,
+                        ),
                     });
                 self.state_manager.set_stop_reason("error");
                 return events;
@@ -2523,7 +2526,10 @@ impl StreamContext {
                     tracing::warn!(tool = %contract.client_name, "上游工具参数不满足客户端Schema");
                     self.terminal_attempt_failure =
                         Some(super::tool_attempt::AttemptFailure::InvalidToolSchema {
-                            message: error.to_string(),
+                            failure: super::tool_schema::ToolSchemaFailure::from_error_and_input(
+                                error,
+                                &completed.input,
+                            ),
                         });
                     self.state_manager.set_stop_reason("error");
                     return events;
