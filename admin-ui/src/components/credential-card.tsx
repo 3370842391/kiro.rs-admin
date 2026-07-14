@@ -421,7 +421,9 @@ export function CredentialCard({
       ? "不限速"
       : rpmState === "saturated"
         ? `${rpmCurrent} / ${rpmLimit} · 已满载`
-        : `${rpmCurrent} / ${rpmLimit}`;
+        : rpmState === "warning"
+          ? `${rpmCurrent} / ${rpmLimit} · 接近满载`
+          : `${rpmCurrent} / ${rpmLimit}`;
 
   // 卡片与列表行共用的状态描边 / 灰化（活跃 · 超额 · 冷却 · 禁用）
   const stateClasses = [
@@ -788,15 +790,15 @@ export function CredentialCard({
           </button>
         </div>
 
-        <div className="w-16 text-center">
+        <div className="w-28 min-w-0 text-center">
           <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
             RPM
           </div>
           <div
-            className={`mt-0.5 text-sm font-medium tabular-nums ${rpmValueClass}`}
+            className={`mt-0.5 break-words text-xs font-medium tabular-nums ${rpmValueClass}`}
             title={rpmTitle}
           >
-            {rpmState === "saturated" ? "已满载" : rpmDisplay}
+            {rpmDisplay}
           </div>
         </div>
       </div>

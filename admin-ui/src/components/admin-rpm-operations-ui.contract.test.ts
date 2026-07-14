@@ -29,6 +29,41 @@ describe('admin RPM operations UI wiring', () => {
     expect(catchBody).not.toContain('onOpenChange(false)')
   })
 
+  test('batch dialog exposes RPM validation inline and focuses the invalid input', async () => {
+    const dialog = await readSource('src/components/batch-edit-credential-dialog.tsx')
+
+    expect(dialog).toContain('rpmError')
+    expect(dialog).toContain('rpmInputRef')
+    expect(dialog).toContain('aria-invalid')
+    expect(dialog).toContain('aria-describedby')
+    expect(dialog).toContain('batch-rpm-limit-error')
+    expect(dialog).toContain('rpmInputRef.current?.focus()')
+  })
+
+  test('batch dialog separates HTTP failures from success callbacks', async () => {
+    const dialog = await readSource('src/components/batch-edit-credential-dialog.tsx')
+    const catchIndex = dialog.indexOf('} catch (error) {')
+    const finallyIndex = dialog.indexOf('} finally {', catchIndex)
+    const successIndex = dialog.indexOf('toast.success', catchIndex)
+    const closeIndex = dialog.indexOf('onOpenChange(false)', catchIndex)
+    const doneIndex = dialog.indexOf('onDone()', catchIndex)
+
+    expect(catchIndex).toBeGreaterThan(-1)
+    expect(finallyIndex).toBeGreaterThan(catchIndex)
+    expect(successIndex).toBeGreaterThan(finallyIndex)
+    expect(closeIndex).toBeGreaterThan(finallyIndex)
+    expect(doneIndex).toBeGreaterThan(finallyIndex)
+  })
+
+  test('batch dialog provides mobile touch targets and input metadata', async () => {
+    const dialog = await readSource('src/components/batch-edit-credential-dialog.tsx')
+
+    expect(dialog.match(/min-h-11/g)?.length ?? 0).toBeGreaterThanOrEqual(3)
+    expect(dialog).toContain('h-11 sm:h-8')
+    expect(dialog).toMatch(/name="rpmLimit"[^>]*autoComplete="off"/s)
+    expect(dialog).toMatch(/name="sourceChannel"[^>]*autoComplete="off"/s)
+  })
+
   test('dashboard derives selection and request totals from all current credentials', async () => {
     const dashboard = await readSource('src/components/dashboard.tsx')
 
@@ -52,6 +87,15 @@ describe('admin RPM operations UI wiring', () => {
     expect(status).toContain('sm:grid-cols-5')
   })
 
+  test('status bar labels unlimited aggregate capacity without contradicting finite capacity', async () => {
+    const status = await readSource('src/components/rpm-status-bar.tsx')
+
+    expect(status).toContain("hasUnlimitedCapacity ? '总容量' : '有限容量'")
+    expect(status).toContain("hasUnlimitedCapacity ? '不限速' : limitedCapacity")
+    expect(status).toContain('有限账号容量 ${limitedCapacity}')
+    expect(status).toContain('不限速账号 ${unlimitedAccounts}')
+  })
+
   test('credential cards show rolling RPM load and in-flight work', async () => {
     const card = await readSource('src/components/credential-card.tsx')
 
@@ -61,5 +105,19 @@ describe('admin RPM operations UI wiring', () => {
     expect(card).toContain('已满载')
     expect(card).toContain('不限速')
     expect(card).toContain('进行中')
+  })
+
+  test('credential cards show warning text and reserve enough list width for maximum RPM', async () => {
+    const card = await readSource('src/components/credential-card.tsx')
+    const listRpm = card.match(
+      /<div className="([^"]*)">\s*<div className="[^"]*">\s*RPM\s*<\/div>\s*<div\s*className=\{`([^`]*)`\}/,
+    )
+
+    expect(card).toContain('接近满载')
+    expect(listRpm).not.toBeNull()
+    expect(listRpm?.[1]).toMatch(/\bw-(24|28)\b/)
+    expect(listRpm?.[1]).toContain('min-w-0')
+    expect(listRpm?.[2]).toContain('text-xs')
+    expect(listRpm?.[2]).toContain('break-words')
   })
 })

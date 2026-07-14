@@ -51,13 +51,9 @@ export function RpmStatusBar({ summary, totalInFlight }: RpmStatusBarProps) {
       <div className="grid grid-cols-2 gap-x-4 gap-y-1 sm:grid-cols-5">
         <StatusItem label="最近60秒 RPM" value={current} />
         <StatusItem
-          label="有限容量"
-          value={hasUnlimitedCapacity ? '容量不限' : limitedCapacity}
-          detail={
-            hasUnlimitedCapacity
-              ? `有限 ${limitedCapacity} · 不限速 ${unlimitedAccounts}`
-              : undefined
-          }
+          label={hasUnlimitedCapacity ? '总容量' : '有限容量'}
+          value={hasUnlimitedCapacity ? '不限速' : limitedCapacity}
+          detail={`有限账号容量 ${limitedCapacity} · 不限速账号 ${unlimitedAccounts}`}
         />
         <StatusItem
           label="剩余"

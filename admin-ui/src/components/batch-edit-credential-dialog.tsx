@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { toast } from 'sonner'
 import {
   Dialog,
@@ -13,7 +13,7 @@ import { Switch } from '@/components/ui/switch'
 import { Input } from '@/components/ui/input'
 import { GroupMultiSelect } from '@/components/group-select'
 import { useBatchUpdateCredentials } from '@/hooks/use-credentials'
-import { buildBatchUpdateRequest } from '@/lib/rpm-operations'
+import { buildBatchUpdateRequest, parseRpmLimit } from '@/lib/rpm-operations'
 import { extractErrorMessage } from '@/lib/utils'
 import type { CredentialStatusItem } from '@/types/api'
 
@@ -43,6 +43,8 @@ export function BatchEditCredentialDialog({
   const batchUpdate = useBatchUpdateCredentials()
   const [editRpm, setEditRpm] = useState(false)
   const [rpmLimitDraft, setRpmLimitDraft] = useState('10')
+  const [rpmError, setRpmError] = useState('')
+  const rpmInputRef = useRef<HTMLInputElement>(null)
   const [editGroups, setEditGroups] = useState(false)
   const [mode, setMode] = useState<GroupMode>('replace')
   const [groups, setGroups] = useState<string[]>([])
@@ -54,6 +56,7 @@ export function BatchEditCredentialDialog({
     if (!open) return
     setEditRpm(false)
     setRpmLimitDraft('10')
+    setRpmError('')
     setEditGroups(false)
     setMode('replace')
     setGroups([])
@@ -65,6 +68,16 @@ export function BatchEditCredentialDialog({
   const handleApply = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (running) return
+
+    if (editRpm) {
+      const parsedRpm = parseRpmLimit(rpmLimitDraft)
+      if (!parsedRpm.ok) {
+        setRpmError(parsedRpm.message)
+        rpmInputRef.current?.focus()
+        return
+      }
+    }
+    setRpmError('')
 
     const request = buildBatchUpdateRequest({
       ids: credentials.map((credential) => credential.id),
@@ -82,16 +95,19 @@ export function BatchEditCredentialDialog({
     }
 
     setRunning(true)
+    let result
     try {
-      const result = await batchUpdate.mutateAsync(request.value)
-      toast.success(`已更新 ${result.updated} 个账号，${result.unchanged} 个未变化`)
-      onOpenChange(false)
-      onDone()
+      result = await batchUpdate.mutateAsync(request.value)
     } catch (error) {
       toast.error('批量更新失败: ' + extractErrorMessage(error))
+      return
     } finally {
       setRunning(false)
     }
+
+    toast.success(`已更新 ${result.updated} 个账号，${result.unchanged} 个未变化`)
+    onOpenChange(false)
+    onDone()
   }
 
   const rpmHint =
@@ -111,7 +127,7 @@ export function BatchEditCredentialDialog({
 
         <form onSubmit={handleApply} noValidate className="space-y-4">
           <section className="space-y-3 rounded-md border border-border/60 p-3">
-            <label htmlFor="batch-edit-rpm" className="flex items-center justify-between gap-3">
+            <label htmlFor="batch-edit-rpm" className="flex min-h-11 items-center justify-between gap-3">
               <span className="text-sm font-medium">修改 RPM 上限</span>
               <Switch
                 id="batch-edit-rpm"
@@ -126,24 +142,37 @@ export function BatchEditCredentialDialog({
                   最近60秒请求上限
                 </label>
                 <Input
+                  ref={rpmInputRef}
                   id="batch-rpm-limit"
+                  name="rpmLimit"
+                  autoComplete="off"
                   type="number"
                   inputMode="numeric"
                   min={0}
                   max={100000}
                   step={1}
                   value={rpmLimitDraft}
-                  onChange={(event) => setRpmLimitDraft(event.target.value)}
+                  onChange={(event) => {
+                    setRpmLimitDraft(event.target.value)
+                    setRpmError('')
+                  }}
+                  aria-invalid={Boolean(rpmError)}
+                  aria-describedby={rpmError ? 'batch-rpm-limit-error' : undefined}
                   disabled={running}
                   className="tabular-nums"
                 />
+                {rpmError ? (
+                  <p id="batch-rpm-limit-error" className="text-xs text-destructive" role="alert">
+                    {rpmError}
+                  </p>
+                ) : null}
                 <p className="text-xs text-muted-foreground">{rpmHint}</p>
               </div>
             ) : null}
           </section>
 
           <section className="space-y-3 rounded-md border border-border/60 p-3">
-            <label htmlFor="batch-edit-groups" className="flex items-center justify-between gap-3">
+            <label htmlFor="batch-edit-groups" className="flex min-h-11 items-center justify-between gap-3">
               <span className="text-sm font-medium">修改分组</span>
               <Switch
                 id="batch-edit-groups"
@@ -160,6 +189,7 @@ export function BatchEditCredentialDialog({
                       key={item.value}
                       type="button"
                       size="sm"
+                      className="h-11 sm:h-8"
                       variant={mode === item.value ? 'default' : 'outline'}
                       onClick={() => setMode(item.value)}
                       disabled={running}
@@ -182,7 +212,7 @@ export function BatchEditCredentialDialog({
           </section>
 
           <section className="space-y-3 rounded-md border border-border/60 p-3">
-            <label htmlFor="batch-edit-source" className="flex items-center justify-between gap-3">
+            <label htmlFor="batch-edit-source" className="flex min-h-11 items-center justify-between gap-3">
               <span className="text-sm font-medium">修改来源渠道</span>
               <Switch
                 id="batch-edit-source"
@@ -198,7 +228,9 @@ export function BatchEditCredentialDialog({
                 </label>
                 <Input
                   id="batch-source-channel"
-                  placeholder="留空以清除来源渠道"
+                  name="sourceChannel"
+                  autoComplete="off"
+                  placeholder="留空以清除来源渠道…"
                   value={sourceChannel}
                   onChange={(event) => setSourceChannel(event.target.value)}
                   disabled={running}
