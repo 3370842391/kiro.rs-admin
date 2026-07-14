@@ -3467,7 +3467,10 @@ impl MultiTokenManager {
         Ok(())
     }
 
-    /// 原子批量更新账号的 RPM、分组与来源渠道配置。
+    /// 批量更新账号的 RPM、分组与来源渠道配置。
+    ///
+    /// 所有 ID 校验与内存变更都在一次 `entries` 锁内完成，因此内存补丁是原子的。
+    /// 锁释放后才持久化；持久化失败会返回错误，但不会回滚已完成的内存变更。
     pub(crate) fn batch_update_credentials(
         &self,
         ids: &[u64],
@@ -3483,8 +3486,9 @@ impl MultiTokenManager {
                 }
             }
 
+            let existing_ids: HashSet<u64> = entries.iter().map(|entry| entry.id).collect();
             for &id in ids {
-                if !entries.iter().any(|entry| entry.id == id) {
+                if !existing_ids.contains(&id) {
                     bail!("凭据不存在: {}", id);
                 }
             }
@@ -4979,6 +4983,37 @@ mod tests {
         credential.groups = groups.iter().map(|group| (*group).to_string()).collect();
         credential.source_channel = source_channel.map(str::to_string);
         credential
+    }
+
+    #[test]
+    fn batch_update_credentials_validates_ten_thousand_ids() {
+        let credentials = (1..=10_000)
+            .map(|id| batch_test_credential(id, 10, &[], None))
+            .collect();
+        let ids: Vec<u64> = (1..=10_000).collect();
+        let manager =
+            MultiTokenManager::new(Config::default(), credentials, None, None, true).unwrap();
+
+        let result = manager
+            .batch_update_credentials(
+                &ids,
+                CredentialBatchPatch {
+                    rpm_limit: Some(7),
+                    groups: None,
+                    source_channel: None,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(result.selected, 10_000);
+        assert_eq!(result.updated, 10_000);
+        assert_eq!(result.unchanged, 0);
+        assert!(
+            manager
+                .clone_all_credentials()
+                .iter()
+                .all(|credential| credential.rpm_limit == 7)
+        );
     }
 
     #[test]
