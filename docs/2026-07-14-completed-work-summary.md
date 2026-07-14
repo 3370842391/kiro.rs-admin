@@ -149,15 +149,14 @@
 
 ## 六、Git 状态
 
-- 协议与错误快照分支已本地合并回 `master`。
-- 合并提交：`d26f6f8 merge: 合并 CCTest/Ztest 协议与错误快照优化`。
-- 状态文档提交：`909f314 docs(protocol): 更新本地合并状态`。
+- 本轮可靠性恢复、API Key 区域、工具 Schema、空 user 兼容和管理端安全门禁已本地合并回 `master`。
+- 最终运行代码提交：`fe0ad71 fix(trace): 返回空请求兼容标记`。
 - 尚未推送 GitHub。
-- 生产 `8990` 未修改。
+- 隔离公网 `8991` 已部署镜像 `kiro-rs-test:fe0ad713f9f1`。
+- 生产 `8990` 仍运行 `ghcr.io/3370842391/kiro-rs:sha-218ae0`，未修改。
 
 ## 七、尚未完成或不能仅靠本地测试确认
 
-- 尚未把当前 `master` 部署到隔离的公网 `8991`。
 - 尚未运行新的真实 CCTest/Ztest 报告，因此不能声称最终分数已经达到 98。
 - 真实 WebSearch、文本 PDF、上游 thinking 能力和检测站 fingerprint 仍需用 8991 的真实流量验收。
 - 上游本身不提供的原生 thinking 内容或 Anthropic 私钥签名，RS 无法凭空生成；当前只保证协议不会因此断流。
@@ -209,3 +208,12 @@
 - 只有首轮未交付内容且工具缺 required 字段时，可能增加一次上游调用和少量 retry-only 描述 Token。
 - 默认关闭的空 user 兼容只把原来的上游 400/502 提前为本地 400；开启后仅精确空文本请求增加一个最小输入。
 - 管理员修正 API Region 会恢复此前 `InvalidConfig` 账号；超长 nickname/sourceChannel 现在返回 400。
+
+### 18. 隔离公网 8991 验收
+
+- 部署提交/镜像：`fe0ad713f9f1509baaf9d4497d23783b1f3ba263` / `kiro-rs-test:fe0ad713f9f1`。
+- 公网 HTTPS 管理端 `https://rs-test.43-225-196-10.sslip.io/admin` 返回 200；测试卷仍为 `/opt/kiro-rs-test/data-test:/app/config`。
+- 普通非流式消息返回 200、text content 和 `end_turn`；默认空 user 在凭据调用前返回 400 `invalid_request_error`。
+- 开启 `emptyUserMessageCompat` 后，精确空文本请求返回 200；Admin trace 可读取 `emptyUserCompatApplied=true`；验收后开关已恢复为 false。
+- 10 次 SSE 首个 `data:` 均为 ping，p95 为 1004.8ms；热修复镜像复测 3 次最大 1003.7ms。
+- 测试容器日志未发现 panic/fatal；生产 8990 镜像和监听状态保持不变。
