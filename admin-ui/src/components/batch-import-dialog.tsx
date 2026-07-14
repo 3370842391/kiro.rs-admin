@@ -21,6 +21,11 @@ import {
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
 import {
+  parseApiKeyLines,
+  redactApiKeys,
+  type SupportedApiRegion,
+} from '@/lib/api-key-import'
+import {
   completeExternalIdpImportFields,
   deriveEmailFromAccessToken,
   extractErrorMessage,
@@ -33,6 +38,8 @@ interface BatchImportDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
 }
+
+type ImportMode = 'json' | 'api-key'
 
 interface CredentialInput {
   refreshToken?: string
@@ -65,6 +72,7 @@ interface CredentialInput {
   issuer_url?: string
   scopes?: string
   endpoint?: string
+  nickname?: string
   email?: string
   proxyUrl?: string
   proxy_url?: string
@@ -83,6 +91,8 @@ interface CredentialInput {
   start_url?: string
   status?: string
   groups?: string[]
+  lineNumber?: number
+  maskedApiKey?: string
 }
 
 interface VerificationResult {
@@ -90,6 +100,9 @@ interface VerificationResult {
   status: 'pending' | 'checking' | 'verifying' | 'verified' | 'imported' | 'duplicate' | 'failed' | 'skipped'
   error?: string
   usage?: string
+  nickname?: string
+  maskedApiKey?: string
+  apiRegion?: string
   email?: string
   credentialId?: number
   rollbackStatus?: 'success' | 'failed' | 'skipped'
@@ -194,6 +207,7 @@ function normalizeImportEntry(raw: unknown): CredentialInput {
     scopes: preferString(merged, 'scopes'),
     startUrl: preferString(merged, 'startUrl', 'start_url'),
     endpoint: preferString(merged, 'endpoint'),
+    nickname: preferString(merged, 'nickname'),
     email: preferString(merged, 'email') || deriveEmailFromAccessToken(accessToken),
     status: preferString(merged, 'status'),
     proxyUrl: preferString(merged, 'proxyUrl', 'proxy_url'),
@@ -252,8 +266,25 @@ function maskProxyCandidate(candidate: string): string {
   return candidate.toLowerCase() === 'direct' ? 'direct' : maskProxyUrl(candidate)
 }
 
+function toApiKeyCredentials(
+  entries: ReturnType<typeof parseApiKeyLines>['entries'],
+): CredentialInput[] {
+  return entries.map((entry) => ({
+    authMethod: 'api_key',
+    nickname: entry.nickname,
+    kiroApiKey: entry.kiroApiKey,
+    authRegion: 'us-east-1',
+    apiRegion: entry.apiRegion,
+    lineNumber: entry.lineNumber,
+    maskedApiKey: entry.maskedApiKey,
+  }))
+}
+
 export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps) {
+  const [importMode, setImportMode] = useState<ImportMode>('json')
   const [jsonInput, setJsonInput] = useState('')
+  const [apiKeyInput, setApiKeyInput] = useState('')
+  const [batchApiRegion, setBatchApiRegion] = useState<SupportedApiRegion | ''>('')
   const [importing, setImporting] = useState(false)
   const [skipErrorAccounts, setSkipErrorAccounts] = useState(true)
   const [progress, setProgress] = useState({ current: 0, total: 0 })
@@ -279,7 +310,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
   })
 
   const resetForm = () => {
+    setImportMode('json')
     setJsonInput('')
+    setApiKeyInput('')
+    setBatchApiRegion('')
     setSkipErrorAccounts(true)
     setProgress({ current: 0, total: 0 })
     setCurrentProcessing('')
@@ -339,13 +373,25 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
   }
 
   const handleBatchImport = async (verify: boolean) => {
-    // 先单独解析 JSON，给出精准的错误提示
     let credentials: CredentialInput[]
-    try {
-      credentials = parseImportEntries(JSON.parse(jsonInput)).map(normalizeImportEntry)
-    } catch (error) {
-      toast.error('JSON 格式错误: ' + extractErrorMessage(error))
-      return
+    if (importMode === 'api-key') {
+      if (!batchApiRegion) {
+        toast.error('请选择批次 API Region')
+        return
+      }
+      const parsed = parseApiKeyLines(apiKeyInput, batchApiRegion || undefined)
+      credentials = toApiKeyCredentials(parsed.entries)
+      if (parsed.errors.length > 0 && credentials.length > 0) {
+        toast.warning(`将跳过 ${parsed.errors.length} 条错误记录，仅导入有效行`)
+      }
+    } else {
+      // JSON/KAM 保持原有解析路径与错误语义。
+      try {
+        credentials = parseImportEntries(JSON.parse(jsonInput)).map(normalizeImportEntry)
+      } catch (error) {
+        toast.error('JSON 格式错误: ' + redactApiKeys(extractErrorMessage(error)))
+        return
+      }
     }
 
     if (credentials.length === 0) {
@@ -368,8 +414,11 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
       // 初始化结果
       const initialResults: VerificationResult[] = credentials.map((cred, i) => ({
-        index: i + 1,
+        index: cred.lineNumber ?? i + 1,
         status: skipErrorAccounts && isErrorStatus(cred.status) ? 'skipped' : 'pending',
+        nickname: cred.nickname,
+        maskedApiKey: cred.maskedApiKey,
+        apiRegion: cred.apiRegion,
         email: cred.email,
       }))
       setResults(initialResults)
@@ -435,6 +484,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             req: {
               authMethod: 'api_key',
               kiroApiKey: apiKey,
+              nickname: cred.nickname?.trim() || undefined,
               priority: cred.priority || 0,
               rpmLimit,
               authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
@@ -518,6 +568,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               rpmLimit,
               machineId: cred.machineId?.trim() || undefined,
               endpoint: cred.endpoint?.trim() || undefined,
+              nickname: cred.nickname?.trim() || undefined,
               email: cred.email?.trim() || undefined,
               proxyUrl: cred.proxyUrl?.trim() || undefined,
               proxyUsername: cred.proxyUsername?.trim() || undefined,
@@ -574,7 +625,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             } else {
               updateResult(orig, {
                 status: 'failed',
-                error: ev.error,
+                error: ev.error ? redactApiKeys(ev.error) : undefined,
                 rollbackStatus: ev.rolledBack ? 'success' : undefined,
               })
             }
@@ -614,7 +665,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
         toast.info('已停止导入（已完成的凭据保留）')
         await queryClient.invalidateQueries({ queryKey: ['credentials'] })
       } else {
-        toast.error('导入失败: ' + extractErrorMessage(error))
+        toast.error('导入失败: ' + redactApiKeys(extractErrorMessage(error)))
       }
     } finally {
       abortRef.current = null
@@ -676,7 +727,30 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       r.status === 'skipped'
   ).length
 
-  const { previewCredentials, parseError } = useMemo(() => {
+  const apiKeyParseResult = useMemo(
+    () => parseApiKeyLines(apiKeyInput, batchApiRegion || undefined),
+    [apiKeyInput, batchApiRegion],
+  )
+  const apiKeyPreviewRows = useMemo(
+    () => [
+      ...apiKeyParseResult.entries.map((entry) => ({
+        lineNumber: entry.lineNumber,
+        nickname: redactApiKeys(entry.nickname),
+        maskedApiKey: entry.maskedApiKey,
+        apiRegion: entry.apiRegion,
+        message: '',
+      })),
+      ...apiKeyParseResult.errors.map((error) => ({
+        lineNumber: error.lineNumber,
+        nickname: error.nickname,
+        maskedApiKey: error.maskedApiKey,
+        apiRegion: error.apiRegion,
+        message: error.message,
+      })),
+    ].sort((left, right) => left.lineNumber - right.lineNumber),
+    [apiKeyParseResult],
+  )
+  const jsonPreview = useMemo(() => {
     if (!jsonInput.trim()) return { previewCredentials: [] as CredentialInput[], parseError: '' }
     try {
       return {
@@ -687,8 +761,12 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       return { previewCredentials: [] as CredentialInput[], parseError: extractErrorMessage(error) }
     }
   }, [jsonInput])
+  const { previewCredentials, parseError } = jsonPreview
   const errorAccountCount = previewCredentials.filter((cred) => isErrorStatus(cred.status)).length
   const enabledProxyOptions = proxyPool?.proxies.filter((proxy) => proxy.enabled) ?? []
+  const hasImportInput = importMode === 'json'
+    ? Boolean(jsonInput.trim())
+    : Boolean(apiKeyInput.trim() && batchApiRegion && apiKeyParseResult.entries.length > 0)
 
   return (
     <Dialog
@@ -711,48 +789,143 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
         </DialogHeader>
 
         <div className="flex-1 overflow-y-auto space-y-4 py-4">
-          <div className="space-y-2">
-            <div className="flex items-center justify-between gap-2">
-              <label className="text-sm font-medium">
-                JSON 凭据 / Kiro Account Manager 导出
-              </label>
-              <div>
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept="application/json,.json"
-                  multiple
-                  className="hidden"
-                  onChange={handleFileSelect}
-                />
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={() => fileInputRef.current?.click()}
-                  disabled={importing}
-                >
-                  <Upload className="w-4 h-4 mr-1.5" />
-                  选择文件
-                </Button>
-              </div>
-            </div>
-            <textarea
-              placeholder={'粘贴 JSON（支持单个对象、数组，或 Kiro Account Manager 导出的 { "version": "...", "accounts": [...] }）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n企业 SSO: [{"authMethod":"external_idp","refreshToken":"...","clientId":"...","tokenEndpoint":"https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token","scopes":"...","region":"eu-central-1"}]\nKAM: {"version":"1.8.3","accounts":[{"email":"...","credentials":{"refreshToken":"...","clientId":"..."}}]}\n\n支持 region 自动映射为 authRegion，也支持多个 JSON 文件合并导入'}
-              value={jsonInput}
-              onChange={(e) => setJsonInput(e.target.value)}
+          <div
+            role="group"
+            aria-label="导入格式"
+            className="grid grid-cols-2 gap-1 rounded-xl bg-muted p-1"
+          >
+            <Button
+              type="button"
+              variant={importMode === 'json' ? 'secondary' : 'ghost'}
+              className="min-h-11"
+              aria-pressed={importMode === 'json'}
+              onClick={() => {
+                setImportMode('json')
+                setResults([])
+              }}
               disabled={importing}
-              className="flex min-h-[200px] w-full rounded-xl border border-input bg-background/60 px-3.5 py-2.5 text-sm transition-[border-color,background-color,box-shadow] duration-150 ease-apple placeholder:text-muted-foreground/70 hover:border-border focus-visible:outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/30 focus-visible:bg-background disabled:cursor-not-allowed disabled:opacity-50 font-mono"
-            />
-            <p className="text-xs text-muted-foreground">
-              💡 "开始导入并验活"会校验余额、失败自动排除；"直接导入"只落库不验活（更快）。两种模式均支持中途"停止"。
-            </p>
+            >
+              JSON / KAM
+            </Button>
+            <Button
+              type="button"
+              variant={importMode === 'api-key' ? 'secondary' : 'ghost'}
+              className="min-h-11"
+              aria-pressed={importMode === 'api-key'}
+              onClick={() => {
+                setImportMode('api-key')
+                setResults([])
+              }}
+              disabled={importing}
+            >
+              API Key 文本
+            </Button>
           </div>
 
-          {parseError && (
-            <div className="text-sm text-red-600 dark:text-red-400">解析失败: {parseError}</div>
+          {importMode === 'json' ? (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <label htmlFor="batch-json-input" className="text-sm font-medium">
+                  JSON 凭据 / Kiro Account Manager 导出
+                </label>
+                <div>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept="application/json,.json"
+                    multiple
+                    className="hidden"
+                    onChange={handleFileSelect}
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="min-h-11 sm:min-h-9"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={importing}
+                  >
+                    <Upload className="w-4 h-4 mr-1.5" />
+                    选择文件
+                  </Button>
+                </div>
+              </div>
+              <textarea
+                id="batch-json-input"
+                placeholder={'粘贴 JSON（支持单个对象、数组，或 Kiro Account Manager 导出的 { "version": "...", "accounts": [...] }）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n企业 SSO: [{"authMethod":"external_idp","refreshToken":"...","clientId":"...","tokenEndpoint":"https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token","scopes":"...","region":"eu-central-1"}]\nKAM: {"version":"1.8.3","accounts":[{"email":"...","credentials":{"refreshToken":"...","clientId":"..."}}]}\n\n支持 region 自动映射为 authRegion，也支持多个 JSON 文件合并导入'}
+                value={jsonInput}
+                onChange={(e) => setJsonInput(e.target.value)}
+                disabled={importing}
+                className="flex min-h-[200px] w-full rounded-xl border border-input bg-background/60 px-3.5 py-2.5 text-sm transition-[border-color,background-color,box-shadow] duration-150 ease-apple placeholder:text-muted-foreground/70 hover:border-border focus-visible:outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/30 focus-visible:bg-background disabled:cursor-not-allowed disabled:opacity-50 font-mono"
+              />
+            </div>
+          ) : (
+            <div className="space-y-4">
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <label htmlFor="batch-auth-region" className="text-sm font-medium">
+                    Auth Region
+                  </label>
+                  <input
+                    id="batch-auth-region"
+                    value="us-east-1"
+                    readOnly
+                    aria-readonly="true"
+                    className="h-11 w-full rounded-lg border border-input bg-muted px-3 text-sm text-muted-foreground sm:h-10"
+                  />
+                  <p className="text-xs text-muted-foreground">API Key 认证区域固定为美国区。</p>
+                </div>
+                <div className="space-y-2">
+                  <label htmlFor="batch-api-region" className="text-sm font-medium">
+                    批次 API Region <span className="text-red-500">*</span>
+                  </label>
+                  <select
+                    id="batch-api-region"
+                    value={batchApiRegion}
+                    onChange={(event) => setBatchApiRegion(event.target.value as SupportedApiRegion)}
+                    disabled={importing}
+                    aria-required="true"
+                    className="h-11 w-full rounded-lg border border-input bg-background px-3 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-50 sm:h-10"
+                  >
+                    <option value="">请选择订购区域</option>
+                    <option value="us-east-1">美国（us-east-1）</option>
+                    <option value="eu-central-1">欧洲（eu-central-1）</option>
+                  </select>
+                  <p className="text-xs text-muted-foreground">第三列可按行覆盖此选择。</p>
+                </div>
+              </div>
+              <div className="space-y-2">
+                <label htmlFor="batch-api-key-input" className="text-sm font-medium">
+                  API Key 文本
+                </label>
+                <textarea
+                  id="batch-api-key-input"
+                  value={apiKeyInput}
+                  onChange={(event) => setApiKeyInput(event.target.value)}
+                  disabled={importing}
+                  spellCheck={false}
+                  autoComplete="off"
+                  placeholder={'nickname | ksk_xxx\nnickname | ksk_xxx | eu-central-1\n# 以 # 开头的整行会被忽略'}
+                  aria-describedby="batch-api-key-format"
+                  className="flex min-h-[180px] w-full rounded-xl border border-input bg-background/60 px-3.5 py-2.5 font-mono text-sm transition-[border-color,background-color,box-shadow] duration-150 ease-apple placeholder:text-muted-foreground/70 hover:border-border focus-visible:outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/30 focus-visible:bg-background disabled:cursor-not-allowed disabled:opacity-50"
+                />
+                <p id="batch-api-key-format" className="text-xs text-muted-foreground">
+                  每行使用半角 | 分隔。支持 nickname | Key，或 nickname | Key | API Region；空行和 # 注释会被忽略。预览和错误只显示 Key 掩码。
+                </p>
+              </div>
+            </div>
           )}
-          {previewCredentials.length > 0 && !importing && results.length === 0 && (
+
+          <p className="text-xs text-muted-foreground">
+            “开始导入并验活”会校验余额、失败自动排除；“直接导入”只落库不验活（更快）。两种模式均支持中途停止。
+          </p>
+
+          {importMode === 'json' && parseError && (
+            <div role="alert" className="text-sm text-red-600 dark:text-red-400">
+              解析失败: {redactApiKeys(parseError)}
+            </div>
+          )}
+          {importMode === 'json' && previewCredentials.length > 0 && !importing && results.length === 0 && (
             <div className="space-y-2 rounded-md border bg-muted/30 p-3">
               <div className="text-sm text-muted-foreground">
                 识别到 {previewCredentials.length} 条记录
@@ -768,6 +941,54 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
                   />
                   跳过 error 状态的账号
                 </label>
+              )}
+            </div>
+          )}
+
+          {importMode === 'api-key' && apiKeyInput.trim() && !importing && results.length === 0 && (
+            <div aria-live="polite" className="space-y-3 rounded-md border bg-muted/30 p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
+                <span className="text-muted-foreground">
+                  有效 {apiKeyParseResult.entries.length} 行，错误 {apiKeyParseResult.errors.length} 行
+                </span>
+                {!batchApiRegion && (
+                  <span role="alert" className="font-medium text-red-600 dark:text-red-400">
+                    请选择批次 API Region
+                  </span>
+                )}
+              </div>
+              {apiKeyPreviewRows.length > 0 && (
+                <div className="max-w-full overflow-x-auto rounded-lg border bg-background">
+                  <table className="min-w-[640px] w-full text-left text-xs">
+                    <thead className="bg-muted/70 text-muted-foreground">
+                      <tr>
+                        <th scope="col" className="px-3 py-2 font-medium">行号</th>
+                        <th scope="col" className="px-3 py-2 font-medium">Nickname</th>
+                        <th scope="col" className="px-3 py-2 font-medium">Key 掩码</th>
+                        <th scope="col" className="px-3 py-2 font-medium">API Region</th>
+                        <th scope="col" className="px-3 py-2 font-medium">状态 / 错误</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y">
+                      {apiKeyPreviewRows.map((row) => (
+                        <tr key={row.lineNumber}>
+                          <td className="px-3 py-2 tabular-nums">{row.lineNumber}</td>
+                          <td className="max-w-40 truncate px-3 py-2 font-medium">{row.nickname}</td>
+                          <td className="px-3 py-2 font-mono">{row.maskedApiKey}</td>
+                          <td className="px-3 py-2 font-mono">{row.apiRegion}</td>
+                          <td className={`px-3 py-2 ${row.message ? 'text-red-600 dark:text-red-400' : 'text-emerald-600 dark:text-emerald-400'}`}>
+                            {row.message || '有效'}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+              {apiKeyParseResult.errors.length > 0 && apiKeyParseResult.entries.length > 0 && (
+                <p className="text-xs text-muted-foreground">
+                  提交时只导入有效行，错误行会被跳过。
+                </p>
               )}
             </div>
           )}
@@ -891,12 +1112,22 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2">
                           <span className="text-sm font-medium">
-                            {result.email || `凭据 #${result.index}`}
+                            {result.nickname || result.email || `第 ${result.index} 行`}
                           </span>
                           <span className="text-xs text-muted-foreground">
                             {getStatusText(result)}
                           </span>
                         </div>
+                        {(result.maskedApiKey || result.apiRegion) && (
+                          <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                            {result.maskedApiKey && (
+                              <span className="font-mono">{result.maskedApiKey}</span>
+                            )}
+                            {result.apiRegion && (
+                              <span>API Region: <span className="font-mono">{result.apiRegion}</span></span>
+                            )}
+                          </div>
+                        )}
                         {result.usage && (
                           <div className="text-xs text-muted-foreground mt-1">
                             用量: {result.usage}
@@ -904,12 +1135,12 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
                         )}
                         {result.error && (
                           <div className="text-xs text-red-600 dark:text-red-400 mt-1">
-                            {result.error}
+                            {redactApiKeys(result.error)}
                           </div>
                         )}
                         {result.rollbackError && (
                           <div className="text-xs text-red-600 dark:text-red-400 mt-1">
-                            回滚失败: {result.rollbackError}
+                            回滚失败: {redactApiKeys(result.rollbackError)}
                           </div>
                         )}
                       </div>
@@ -948,14 +1179,14 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
                     type="button"
                     variant="outline"
                     onClick={() => handleBatchImport(false)}
-                    disabled={!jsonInput.trim()}
+                    disabled={!hasImportInput}
                   >
                     直接导入（不验活）
                   </Button>
                   <Button
                     type="button"
                     onClick={() => handleBatchImport(true)}
-                    disabled={!jsonInput.trim()}
+                    disabled={!hasImportInput}
                   >
                     开始导入并验活
                   </Button>

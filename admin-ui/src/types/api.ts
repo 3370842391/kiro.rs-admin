@@ -35,7 +35,10 @@ export interface CredentialStatusItem {
   authMethod: string | null
   provider?: string | null
   hasProfileArn: boolean
+  nickname?: string
   email?: string
+  authRegion?: string
+  apiRegion?: string
   refreshTokenHash?: string
   apiKeyHash?: string
   maskedApiKey?: string
@@ -81,6 +84,9 @@ export interface BalanceResponse {
 export interface AvailableModelsResponse {
   id: number
   models: AvailableModelItem[]
+  resolvedApiRegion?: string
+  resolvedHost?: string
+  kiroVersion?: string
 }
 
 // 单个可用模型
@@ -158,6 +164,7 @@ export interface AddCredentialRequest {
   proxyPassword?: string
   kiroApiKey?: string
   endpoint?: string
+  nickname?: string
   email?: string
   groups?: string[]
   sourceChannel?: string

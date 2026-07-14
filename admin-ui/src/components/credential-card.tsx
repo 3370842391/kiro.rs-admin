@@ -237,7 +237,9 @@ export function CredentialCard({
   const resetSuccess = useResetSuccessCount();
   const clearThrottle = useClearThrottle();
   const queryClient = useQueryClient();
-  const displayName = credentialDisplayName(credential.email, credential.id, privacyMode);
+  const displayName =
+    credential.nickname?.trim() ||
+    credentialDisplayName(credential.email, credential.id, privacyMode);
 
   // 拖拽排序：手柄触发，整卡随拖动位移
   const {
@@ -490,6 +492,16 @@ export function CredentialCard({
         </Badge>
       )}
       {credential.authMethod && <Badge variant="secondary">{authLabel}</Badge>}
+      {(credential.authRegion || credential.apiRegion || credential.authMethod === "api_key") && (
+        <>
+          <Badge variant="outline" title="Token 刷新使用的认证区域">
+            Auth Region: {credential.authRegion || "未配置"}
+          </Badge>
+          <Badge variant="outline" title="模型、用量与生成请求使用的数据区域">
+            API Region: {credential.apiRegion || "未配置"}
+          </Badge>
+        </>
+      )}
       {/* 配置元信息合并为单个徽章，减少换行：endpoint · ARN */}
       {(credential.endpoint || credential.hasProfileArn) && (
         <Badge
