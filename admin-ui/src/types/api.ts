@@ -23,9 +23,9 @@ export interface CredentialStatusItem {
   priority: number
   inFlight: number
   /** 每分钟请求数上限（0 = 不限速） */
-  rpmLimit?: number
+  rpmLimit: number
   /** 当前滑动窗口内已用请求条数 */
-  rpmCurrent?: number
+  rpmCurrent: number
   disabled: boolean
   failureCount: number
   /** 累计失败次数（所有失败类型，只增不减，仅手动重置归零） */

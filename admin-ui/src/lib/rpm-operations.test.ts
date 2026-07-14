@@ -45,6 +45,11 @@ describe('rpmLoadState', () => {
     expect(rpmLoadState(50, Number.NaN)).toBe('unlimited')
     expect(rpmLoadState(50, -1)).toBe('unlimited')
   })
+
+  test('把正 Infinity 视为无效输入', () => {
+    expect(rpmLoadState(Number.POSITIVE_INFINITY, 100)).toBe('normal')
+    expect(rpmLoadState(50, Number.POSITIVE_INFINITY)).toBe('unlimited')
+  })
 })
 
 describe('totalInFlight', () => {
@@ -59,9 +64,68 @@ describe('totalInFlight', () => {
       ]),
     ).toBe(7)
   })
+
+  test('把正 Infinity 按 0 处理', () => {
+    expect(totalInFlight([{ inFlight: 3 }, { inFlight: Number.POSITIVE_INFINITY }])).toBe(3)
+  })
 })
 
 describe('buildBatchUpdateRequest', () => {
+  test('拒绝空 ID 集合', () => {
+    const result = buildBatchUpdateRequest({
+      ids: [],
+      editRpm: false,
+      rpmDraft: '',
+      editGroups: false,
+      groupMode: 'replace',
+      groups: [],
+      editSource: true,
+      sourceChannel: '',
+    })
+
+    expect(result).toEqual({ ok: false, message: '请至少选择一个凭据' })
+  })
+
+  test('接受 10000 个 ID 并拒绝更多 ID', () => {
+    const input = {
+      editRpm: false,
+      rpmDraft: '',
+      editGroups: false,
+      groupMode: 'replace' as const,
+      groups: [],
+      editSource: true,
+      sourceChannel: '',
+    }
+
+    expect(
+      buildBatchUpdateRequest({ ids: Array.from({ length: 10_000 }, (_, index) => index), ...input })
+        .ok,
+    ).toBe(true)
+    const overLimit = buildBatchUpdateRequest({
+      ids: Array.from({ length: 10_001 }, (_, index) => index),
+      ...input,
+    })
+    expect(overLimit.ok).toBe(false)
+    if (!overLimit.ok) {
+      expect(overLimit.message).toBe('单次最多更新 10000 个凭据')
+    }
+  })
+
+  test('拒绝重复 ID', () => {
+    expect(
+      buildBatchUpdateRequest({
+        ids: [1, 2, 1],
+        editRpm: false,
+        rpmDraft: '',
+        editGroups: false,
+        groupMode: 'replace',
+        groups: [],
+        editSource: true,
+        sourceChannel: '',
+      }),
+    ).toEqual({ ok: false, message: '凭据 ID 不能重复' })
+  })
+
   test('三个编辑开关都关闭时返回具体错误', () => {
     expect(
       buildBatchUpdateRequest({
@@ -131,6 +195,62 @@ describe('buildBatchUpdateRequest', () => {
         ids: [4, 5],
         groups: { mode, values: ['alpha', 'beta'] },
       },
+    })
+  })
+
+  test.each(['add', 'remove'] as const)('%s 模式拒绝空分组', (mode) => {
+    expect(
+      buildBatchUpdateRequest({
+        ids: [4],
+        editRpm: false,
+        rpmDraft: '',
+        editGroups: true,
+        groupMode: mode,
+        groups: [],
+        editSource: false,
+        sourceChannel: '',
+      }),
+    ).toEqual({ ok: false, message: '添加或移除分组时请至少选择一个分组' })
+  })
+
+  test('replace 模式允许空分组以清空已有分组', () => {
+    expect(
+      buildBatchUpdateRequest({
+        ids: [4],
+        editRpm: false,
+        rpmDraft: '',
+        editGroups: true,
+        groupMode: 'replace',
+        groups: [],
+        editSource: false,
+        sourceChannel: '',
+      }),
+    ).toEqual({
+      ok: true,
+      value: { ids: [4], groups: { mode: 'replace', values: [] } },
+    })
+  })
+
+  test('克隆 ID 和分组数组以隔离调用方后续修改', () => {
+    const ids = [7, 8]
+    const groups = ['alpha']
+    const result = buildBatchUpdateRequest({
+      ids,
+      editRpm: false,
+      rpmDraft: '',
+      editGroups: true,
+      groupMode: 'replace',
+      groups,
+      editSource: false,
+      sourceChannel: '',
+    })
+
+    ids.push(9)
+    groups.push('beta')
+
+    expect(result).toEqual({
+      ok: true,
+      value: { ids: [7, 8], groups: { mode: 'replace', values: ['alpha'] } },
     })
   })
 

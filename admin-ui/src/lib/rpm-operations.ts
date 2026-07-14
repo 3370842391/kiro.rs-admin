@@ -73,11 +73,21 @@ export function totalInFlight(
 export function buildBatchUpdateRequest(
   input: BatchUpdateInput,
 ): BatchUpdateRequestResult {
+  if (input.ids.length === 0) {
+    return { ok: false, message: '请至少选择一个凭据' }
+  }
+  if (input.ids.length > 10_000) {
+    return { ok: false, message: '单次最多更新 10000 个凭据' }
+  }
+  if (new Set(input.ids).size !== input.ids.length) {
+    return { ok: false, message: '凭据 ID 不能重复' }
+  }
+
   if (!input.editRpm && !input.editGroups && !input.editSource) {
     return { ok: false, message: '请至少选择一项要修改的内容' }
   }
 
-  const request: BatchUpdateCredentialsRequest = { ids: input.ids }
+  const request: BatchUpdateCredentialsRequest = { ids: [...input.ids] }
 
   if (input.editRpm) {
     const rpmLimit = parseRpmLimit(input.rpmDraft)
@@ -88,7 +98,10 @@ export function buildBatchUpdateRequest(
   }
 
   if (input.editGroups) {
-    request.groups = { mode: input.groupMode, values: input.groups }
+    if (input.groupMode !== 'replace' && input.groups.length === 0) {
+      return { ok: false, message: '添加或移除分组时请至少选择一个分组' }
+    }
+    request.groups = { mode: input.groupMode, values: [...input.groups] }
   }
 
   if (input.editSource) {
