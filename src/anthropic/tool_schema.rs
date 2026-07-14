@@ -91,11 +91,12 @@ impl ToolSchemaFailure {
     }
 
     pub(crate) fn can_retry_with_description(&self) -> bool {
-        !self
-            .error
-            .violations
-            .iter()
-            .any(|violation| matches!(violation, ToolInputViolation::UndeclaredTool))
+        !self.error.violations.is_empty()
+            && self
+                .error
+                .violations
+                .iter()
+                .all(|violation| matches!(violation, ToolInputViolation::MissingRequired(_)))
     }
 
     pub(crate) fn public_message(&self) -> String {

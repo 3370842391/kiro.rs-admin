@@ -598,6 +598,8 @@ export interface TraceRecord {
   context1m?: boolean
   /** 客户端是否请求了推理（thinking 启用 或 显式 effort）；与 reasoningEffort 独立 */
   thinking?: boolean
+  /** 是否对精确空 user 请求应用了最小兼容文本 */
+  emptyUserCompatApplied?: boolean
   attempts: TraceAttempt[]
 }
 

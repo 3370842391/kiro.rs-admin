@@ -71,6 +71,7 @@ fn mask_api_key(key: &str) -> String {
 }
 
 const MAX_NICKNAME_CHARS: usize = 128;
+const MAX_SOURCE_CHANNEL_CHARS: usize = 128;
 
 fn normalize_nickname(value: Option<String>) -> anyhow::Result<Option<String>> {
     let value = value.map(|value| value.trim().to_string());
@@ -79,6 +80,17 @@ fn normalize_nickname(value: Option<String>) -> anyhow::Result<Option<String>> {
         .is_some_and(|value| value.chars().count() > MAX_NICKNAME_CHARS)
     {
         bail!("nickname 最多 128 个字符");
+    }
+    Ok(value.filter(|value| !value.is_empty()))
+}
+
+fn normalize_source_channel(value: Option<String>) -> anyhow::Result<Option<String>> {
+    let value = value.map(|value| value.trim().to_string());
+    if value
+        .as_deref()
+        .is_some_and(|value| value.chars().count() > MAX_SOURCE_CHANNEL_CHARS)
+    {
+        bail!("来源渠道最多 128 个字符");
     }
     Ok(value.filter(|value| !value.is_empty()))
 }
@@ -3298,6 +3310,7 @@ impl MultiTokenManager {
     /// - `Err(_)` - 验证失败或添加失败
     pub async fn add_credential(&self, mut new_cred: KiroCredentials) -> anyhow::Result<u64> {
         new_cred.nickname = normalize_nickname(new_cred.nickname.take())?;
+        new_cred.source_channel = normalize_source_channel(new_cred.source_channel.take())?;
         if new_cred.is_api_key_credential() {
             new_cred.kiro_api_key = new_cred
                 .kiro_api_key
@@ -3518,6 +3531,7 @@ impl MultiTokenManager {
         api_region: Option<String>,
     ) -> anyhow::Result<()> {
         let nickname = nickname.map(normalize_nickname).transpose()?;
+        let source_channel = source_channel.map(normalize_source_channel).transpose()?;
         let api_region = api_region
             .map(|value| validate_api_region(&value).map(str::to_string))
             .transpose()?;
@@ -3555,8 +3569,7 @@ impl MultiTokenManager {
                     .collect();
             }
             if let Some(v) = source_channel {
-                entry.credentials.source_channel =
-                    v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+                entry.credentials.source_channel = v;
             }
             if let Some(v) = rpm_limit {
                 entry.credentials.rpm_limit = v; // 0 = 不限速
@@ -4956,6 +4969,11 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("nickname"));
 
+        let mut overlong_source = credential("source-overlong", "valid nickname".to_string());
+        overlong_source.source_channel = Some("渠".repeat(129));
+        let error = manager.add_credential(overlong_source).await.unwrap_err();
+        assert!(error.to_string().contains("来源渠道"));
+
         manager
             .add_credential(credential("boundary", format!("  {}  ", "名".repeat(128))))
             .await
@@ -5910,6 +5928,22 @@ mod tests {
             )
             .unwrap_err();
         assert!(overlong.to_string().contains("nickname"));
+
+        let overlong_source = manager
+            .update_credential(
+                1,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(Some("渠".repeat(129))),
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(overlong_source.to_string().contains("来源渠道"));
 
         let entry = manager.snapshot().entries.into_iter().next().unwrap();
         assert_eq!(entry.nickname.as_deref(), Some("renamed"));

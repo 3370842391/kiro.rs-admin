@@ -143,6 +143,8 @@ pub(crate) struct RequestTracer {
     context_1m: bool,
     /// 客户端是否请求了推理（thinking 启用 或 显式 effort）；与档位独立。
     thinking: bool,
+    /// 是否对精确空 user 请求应用了最小兼容文本。
+    empty_user_compat_applied: std::sync::atomic::AtomicBool,
     started_at: Instant,
     /// 首个客户端可见内容事件产出时刻（仅流式标记；取第一次）
     first_token_at: parking_lot::Mutex<Option<Instant>>,
@@ -211,6 +213,7 @@ impl RequestTracer {
             reasoning_effort: parking_lot::Mutex::new(options.reasoning_effort),
             context_1m: options.context_1m,
             thinking: options.thinking,
+            empty_user_compat_applied: std::sync::atomic::AtomicBool::new(false),
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
             upstream_first_byte_at: parking_lot::Mutex::new(None),
@@ -236,6 +239,11 @@ impl RequestTracer {
 
     pub fn set_reasoning_effort(&self, value: Option<String>) {
         *self.reasoning_effort.lock() = value;
+    }
+
+    pub fn mark_empty_user_compat_applied(&self) {
+        self.empty_user_compat_applied
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn trace_id(&self) -> &str {
@@ -355,6 +363,9 @@ impl RequestTracer {
             reasoning_effort: self.reasoning_effort.lock().clone(),
             context_1m: self.context_1m,
             thinking: self.thinking,
+            empty_user_compat_applied: self
+                .empty_user_compat_applied
+                .load(std::sync::atomic::Ordering::Relaxed),
             snapshot_id,
             attempts,
         };
@@ -2072,15 +2083,41 @@ fn has_non_empty_system(payload: &MessagesRequest) -> bool {
 fn is_empty_text_only_content(content: &serde_json::Value) -> bool {
     match content {
         serde_json::Value::String(text) => text.trim().is_empty(),
-        serde_json::Value::Array(blocks) => blocks.iter().all(|block| {
-            block.get("type").and_then(serde_json::Value::as_str) == Some("text")
-                && block
-                    .get("text")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|text| text.trim().is_empty())
-        }),
+        serde_json::Value::Array(blocks) => {
+            !blocks.is_empty()
+                && blocks.iter().all(|block| {
+                    block.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                        && block
+                            .get("text")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|text| text.trim().is_empty())
+                })
+        }
         _ => false,
     }
+}
+
+fn is_effectively_empty_user_content(content: &serde_json::Value) -> bool {
+    match content {
+        serde_json::Value::String(text) => text.trim().is_empty(),
+        serde_json::Value::Array(blocks) => {
+            blocks.is_empty()
+                || blocks.iter().all(|block| {
+                    block.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                        && block
+                            .get("text")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|text| text.trim().is_empty())
+                })
+        }
+        _ => false,
+    }
+}
+
+fn current_user_message_is_effectively_empty(payload: &MessagesRequest) -> bool {
+    payload.messages.last().is_some_and(|message| {
+        message.role == "user" && is_effectively_empty_user_content(&message.content)
+    })
 }
 
 fn is_exact_empty_user_message_shape(payload: &MessagesRequest) -> bool {
@@ -2097,14 +2134,14 @@ fn apply_empty_user_message_compat(
     payload: &mut MessagesRequest,
     enabled: bool,
 ) -> Result<bool, &'static str> {
-    if !is_exact_empty_user_message_shape(payload) {
+    if !current_user_message_is_effectively_empty(payload) {
         return Ok(false);
     }
-    if !enabled {
-        return Err(EMPTY_USER_MESSAGE_ERROR);
+    if enabled && is_exact_empty_user_message_shape(payload) {
+        payload.messages[0].content = serde_json::Value::String("Continue.".to_string());
+        return Ok(true);
     }
-    payload.messages[0].content = serde_json::Value::String("Continue.".to_string());
-    Ok(true)
+    Err(EMPTY_USER_MESSAGE_ERROR)
 }
 
 fn handle_empty_user_message(
@@ -2119,7 +2156,11 @@ fn handle_empty_user_message(
         .is_some_and(|provider| provider.empty_user_message_compat());
     match apply_empty_user_message_compat(payload, enabled) {
         Ok(true) => {
-            tracing::info!("已为精确匹配的空 user 请求补入最小上游兼容文本");
+            tracer.mark_empty_user_compat_applied();
+            tracing::info!(
+                empty_user_compat_applied = true,
+                "已为精确匹配的空 user 请求补入最小上游兼容文本"
+            );
             None
         }
         Ok(false) => None,
@@ -4983,6 +5024,34 @@ mod tests {
         assert!(!apply_empty_user_message_compat(&mut ordinary, true).unwrap());
         assert_eq!(ordinary.messages[0].content, serde_json::json!("hello"));
 
+        let mut empty_blocks = empty_user_request(false);
+        empty_blocks.messages[0].content = serde_json::json!([]);
+        assert_eq!(
+            apply_empty_user_message_compat(&mut empty_blocks, true).unwrap_err(),
+            EMPTY_USER_MESSAGE_ERROR
+        );
+
+        let mut without_system = empty_user_request(false);
+        without_system.system = None;
+        assert_eq!(
+            apply_empty_user_message_compat(&mut without_system, true).unwrap_err(),
+            EMPTY_USER_MESSAGE_ERROR
+        );
+
+        let mut multi_turn = empty_user_request(false);
+        multi_turn.messages.insert(
+            0,
+            serde_json::from_value(serde_json::json!({
+                "role": "user",
+                "content": "earlier text"
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            apply_empty_user_message_compat(&mut multi_turn, true).unwrap_err(),
+            EMPTY_USER_MESSAGE_ERROR
+        );
+
         let mut with_tools = empty_user_request(false);
         with_tools.tools = Some(vec![crate::anthropic::types::Tool {
             tool_type: None,
@@ -4992,7 +5061,10 @@ mod tests {
             max_uses: None,
             cache_control: None,
         }]);
-        assert!(!apply_empty_user_message_compat(&mut with_tools, true).unwrap());
+        assert_eq!(
+            apply_empty_user_message_compat(&mut with_tools, true).unwrap_err(),
+            EMPTY_USER_MESSAGE_ERROR
+        );
 
         for block_type in ["image", "document", "tool_result"] {
             let mut multimodal = empty_user_request(false);
@@ -5054,6 +5126,7 @@ mod tests {
                 reasoning_effort: parking_lot::Mutex::new(None),
                 context_1m: false,
                 thinking: false,
+                empty_user_compat_applied: std::sync::atomic::AtomicBool::new(false),
                 started_at: Instant::now(),
                 first_token_at: parking_lot::Mutex::new(None),
                 upstream_first_byte_at: parking_lot::Mutex::new(None),
@@ -5221,6 +5294,25 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn request_tracer_records_empty_user_compat_application() {
+        let (tracer, _snapshot_store, trace_store) =
+            test_request_tracer_with_snapshot("trace-empty-user-compat");
+        tracer.mark_empty_user_compat_applied();
+        tracer.finalize("success", None, None, None, TraceUsage::zero());
+
+        let records = trace_store.query_paged(&crate::admin::trace_db::TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        let record = records
+            .0
+            .into_iter()
+            .find(|record| record.trace_id == "trace-empty-user-compat")
+            .expect("trace record");
+        assert!(record.empty_user_compat_applied);
     }
 
     fn failure_from_events(events: &[Event]) -> super::super::tool_attempt::AttemptFailure {

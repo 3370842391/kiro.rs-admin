@@ -138,6 +138,9 @@ pub struct TraceRecord {
     /// 与 reasoning_effort 独立：请求了推理但未解析出具体档位时仍为 true。
     #[serde(default)]
     pub thinking: bool,
+    /// 是否对精确的空 user 请求应用了最小兼容文本。
+    #[serde(default)]
+    pub empty_user_compat_applied: bool,
     /// 失败请求对应的持久化错误快照 ID。
     #[serde(default)]
     pub snapshot_id: Option<String>,
@@ -293,7 +296,7 @@ impl TraceStore {
         // (列名, 定义) —— 与 SCHEMA 中新增列保持一致
         // 注意 key_source 不带 NOT NULL：老库已有行需先以 NULL 添加再回填（SQLite ALTER ADD COLUMN
         // NOT NULL 不带常量 DEFAULT 时无法对已有行赋值）。新插入永远写入合法值。
-        let columns: [(&str, &str); 12] = [
+        let columns: [(&str, &str); 13] = [
             ("input_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("output_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"),
@@ -305,6 +308,7 @@ impl TraceStore {
             ("reasoning_effort", "TEXT"),
             ("context_1m", "INTEGER NOT NULL DEFAULT 0"),
             ("thinking", "INTEGER NOT NULL DEFAULT 0"),
+            ("empty_user_compat_applied", "INTEGER NOT NULL DEFAULT 0"),
             ("snapshot_id", "TEXT"),
         ];
         let key_source_added = !existing.contains("key_source");
@@ -371,8 +375,9 @@ impl TraceStore {
                  is_stream, final_status, final_credential_id, error_type, error_message, \
                  total_attempts, duration_ms, interrupted_after_bytes, \
                  input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, \
-                 credits, first_token_ms, upstream_first_byte_ms, reasoning_effort, context_1m, thinking, snapshot_id) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",
+                 credits, first_token_ms, upstream_first_byte_ms, reasoning_effort, context_1m, thinking, \
+                 empty_user_compat_applied, snapshot_id) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26)",
                 rusqlite::params![
                     rec.trace_id,
                     rec.ts,
@@ -398,6 +403,7 @@ impl TraceStore {
                     rec.reasoning_effort,
                     rec.context_1m as i64,
                     rec.thinking as i64,
+                    rec.empty_user_compat_applied as i64,
                     rec.snapshot_id,
                 ],
             )?;
@@ -552,7 +558,7 @@ impl TraceStore {
             "SELECT trace_id, ts, key_id, key_source, model, is_stream, final_status, final_credential_id, \
              error_type, error_message, total_attempts, duration_ms, interrupted_after_bytes, \
              input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits, first_token_ms, \
-             upstream_first_byte_ms, reasoning_effort, context_1m, thinking, snapshot_id \
+             upstream_first_byte_ms, reasoning_effort, context_1m, thinking, empty_user_compat_applied, snapshot_id \
              FROM traces {} ORDER BY ts_epoch DESC LIMIT {} OFFSET {}",
             where_sql, limit, q.offset
         );
@@ -583,7 +589,8 @@ impl TraceStore {
                 reasoning_effort: row.get::<_, Option<String>>(20)?,
                 context_1m: row.get::<_, i64>(21)? != 0,
                 thinking: row.get::<_, i64>(22)? != 0,
-                snapshot_id: row.get(23)?,
+                empty_user_compat_applied: row.get::<_, i64>(23)? != 0,
+                snapshot_id: row.get(24)?,
                 attempts: Vec::new(),
             })
         })?;
@@ -801,6 +808,7 @@ CREATE TABLE IF NOT EXISTS traces (
     reasoning_effort  TEXT,
     context_1m        INTEGER NOT NULL DEFAULT 0,
     thinking          INTEGER NOT NULL DEFAULT 0,
+    empty_user_compat_applied INTEGER NOT NULL DEFAULT 0,
     snapshot_id       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_traces_ts ON traces(ts_epoch DESC);
@@ -865,6 +873,7 @@ mod tests {
             reasoning_effort: None,
             context_1m: false,
             thinking: false,
+            empty_user_compat_applied: false,
             snapshot_id: None,
             attempts: vec![
                 TraceAttempt {
@@ -928,6 +937,10 @@ mod tests {
         assert_eq!(out[0].cache_creation_tokens, 0);
         assert_eq!(out[0].first_token_ms, Some(3200));
         assert_eq!(out[0].upstream_first_byte_ms, Some(2800));
+        assert_eq!(
+            serde_json::to_value(&out[0]).unwrap()["emptyUserCompatApplied"],
+            false
+        );
     }
 
     #[test]

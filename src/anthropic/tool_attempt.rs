@@ -460,6 +460,54 @@ mod tests {
     }
 
     #[test]
+    fn schema_retry_is_limited_to_missing_required_violations() {
+        let state_for = |violations| ToolAttemptState {
+            attempt_index: 0,
+            termination: AttemptTermination::Eof,
+            failure: Some(AttemptFailure::InvalidToolSchema {
+                failure: super::super::tool_schema::ToolSchemaFailure::from_error_and_input(
+                    super::super::tool_schema::ToolSchemaError {
+                        tool_name: "get_weather".to_string(),
+                        violations,
+                    },
+                    &serde_json::json!({}),
+                ),
+            }),
+            semantic_output_started: false,
+            tool_forwarded: false,
+        };
+
+        assert!(
+            state_for(vec![
+                super::super::tool_schema::ToolInputViolation::MissingRequired(
+                    "$.city".to_string(),
+                ),
+            ])
+            .should_retry()
+        );
+        assert!(
+            !state_for(vec![
+                super::super::tool_schema::ToolInputViolation::TypeMismatch {
+                    path: "$.days".to_string(),
+                    expected: "integer".to_string(),
+                },
+            ])
+            .should_retry()
+        );
+        assert!(
+            !state_for(vec![
+                super::super::tool_schema::ToolInputViolation::MissingRequired(
+                    "$.city".to_string(),
+                ),
+                super::super::tool_schema::ToolInputViolation::AdditionalProperty(
+                    "$.unexpected".to_string(),
+                ),
+            ])
+            .should_retry()
+        );
+    }
+
+    #[test]
     fn retries_only_first_normal_eof_empty_or_incomplete_attempt() {
         let empty = empty_attempt();
         assert!(empty.should_retry());

@@ -13,5 +13,6 @@
   "usageLogRetentionDays": 31,
   "earlyStreamHandshake": false,
   "strictThinkingValidation": false,
-  "localPingResponse": true
+  "localPingResponse": true,
+  "emptyUserMessageCompat": false
 }

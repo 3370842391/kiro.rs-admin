@@ -37,12 +37,13 @@
 
 主要实现：`src/anthropic/structured_output.rs`、`src/anthropic/exact_output.rs`、`src/anthropic/types.rs`、`src/anthropic/handlers.rs`。
 
-### 4. 严格 SSE 状态机
+### 4. New API 约 1 秒可见首响应
 
-- 移除 `message_start` 之前的 `: connected` 和非标准 ping。
-- 校验 `content_block_start`、delta、`content_block_stop` 成对和顺序。
-- 校验 `message_delta` 以及唯一的 `message_stop` 终态。
-- 增加原始 SSE wire 探针，避免只解析 `data:` 而漏掉非法前导事件。
+- 在启用提前握手时立即发送 `: connected`，上游仍未响应时约 1 秒发送标准 Anthropic `event: ping`。
+- `message_start` 仍是首个正式消息事件；comment/ping 不计入模型正文或 Rust `first_token_ms`。
+- OpenAI Chat/Responses 转换器会忽略 comment/ping，不把它们转成客户正文。
+- 客户端断开会取消仍在等待的 provider future，不产生脱离请求生命周期的后台调用。
+- 由于响应头和 SSE body 已提交，后续上游错误会通过标准 SSE error 返回，无法再改写 HTTP 状态码。
 
 主要实现：`src/anthropic/stream.rs`、`src/bin/anthropic_probe.rs`。
 
@@ -161,3 +162,50 @@
 - 真实 WebSearch、文本 PDF、上游 thinking 能力和检测站 fingerprint 仍需用 8991 的真实流量验收。
 - 上游本身不提供的原生 thinking 内容或 Anthropic 私钥签名，RS 无法凭空生成；当前只保证协议不会因此断流。
 - 生产 `8990` 的升级和正式客户流量验收需在 8991 外部检测通过后再执行。
+
+## 八、本轮可靠性恢复追加
+
+### 12. API Key 批量导入、昵称和区域修复
+
+- 管理端支持 `nickname | API Key` 与 `nickname | API Key | apiRegion` 文本批量导入，逐行预览只显示掩码。
+- API Key 的 Auth Region 固定为 `us-east-1`，API Region 只允许 `us-east-1` / `eu-central-1`。
+- 模型、用量、偏好和生成请求全部按 API Key 的显式 API Region 路由；EU CodeWhisperer 使用 `q.eu-central-1.amazonaws.com`。
+- 旧 API Key 因缺 Region 被标记 `InvalidConfig` 后，可在编辑框选择正确 Region 并自动重新启用，无需重启。
+- nickname 与真实 email 分开保存；添加、文本导入和编辑均 trim，最多 128 个 Unicode 字符。
+
+### 13. 工具 Schema 定向重试与安全诊断
+
+- 首轮工具参数不合法时只保存工具名、input key、JSON 类型、违规项和 attempt，不保存参数值、客户正文或完整流尾。
+- 只有全部违规均为 `MissingRequired`、首轮尚未交付任何语义内容或工具时，才允许一次透明重试。
+- 第二轮仅增强失败工具的 description，并只列出 Schema 已公开且安全的缺失路径；不猜路径、城市、nonce 或业务值。
+- 类型错误、额外字段、未声明工具、已输出正文或已转发工具均不透明重试。
+- 第二轮仍失败时，非流式返回明确 HTTP 502；流式因 HTTP 200 已提交，通过 `upstream_tool_schema_error` SSE 事件结束，非法工具不会交付客户端。
+
+### 14. 空 user 请求兼容开关
+
+- 新增 `emptyUserMessageCompat`，默认关闭，并可在管理端“协议兼容设置”即时修改和持久化。
+- 当前 user 为空字符串、空文本块或空数组且会生成空 Kiro current message 时，会在获取凭据前本地返回清晰 400，不再消耗账号并触发模糊 `REQUEST_BODY_INVALID`。
+- 开启后仅对“单轮、非空 system、显式空文本、无工具声明/选择”的精确形状补入最小 `Continue.`；多轮、空数组、工具、图片、文档和 tool_result 不使用该兜底。
+- trace DB 增加 `emptyUserCompatApplied`，成功兼容请求可被明确检索，不需要依赖 DEBUG 正文日志。
+
+### 15. 管理端批量写盘与字段边界
+
+- 批量 RPM/分组/来源渠道更新在写盘失败时恢复内存旧值，同值重试仍会再次写盘，不再返回假成功。
+- 批量事务锁顺序固定为 `persist_lock -> entries`；只在管理员批量保存期间跨磁盘 I/O 持有，不扩大普通模型请求的持续阻塞。
+- `sourceChannel` 在批量更新、单条编辑和新增凭据路径均 trim，并限制最多 128 个 Unicode 字符。
+
+### 16. 当前集成分支验证
+
+- Rust：`anthropic_probe` 18/18，主程序 923/923，0 失败。
+- `cargo check --all-targets --locked --no-default-features -j 1`：通过；仅保留项目既有非阻塞 warning。
+- Admin UI：71/71，226 条断言；`bun run build` 通过，构建 2581 个模块。
+- `cargo fmt --all -- --check`、`git diff --check`：通过。
+- 密钥扫描仅命中测试保留域名 `example.test`，未发现完整 API Key、Bearer、Cookie 或真实客户邮箱。
+
+### 17. 客户影响结论
+
+- 正常非空对话、合法工具调用、缓存拆分和计费逻辑不变。
+- 提前握手开启时，New API 可约 1 秒收到 ping；代价是后续错误只能通过 SSE error 表达。
+- 只有首轮未交付内容且工具缺 required 字段时，可能增加一次上游调用和少量 retry-only 描述 Token。
+- 默认关闭的空 user 兼容只把原来的上游 400/502 提前为本地 400；开启后仅精确空文本请求增加一个最小输入。
+- 管理员修正 API Region 会恢复此前 `InvalidConfig` 账号；超长 nickname/sourceChannel 现在返回 400。
