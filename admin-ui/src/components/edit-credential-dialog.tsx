@@ -163,6 +163,7 @@ export function EditCredentialDialog({
                 placeholder="例: 官方, 转售商A, 采购平台X"
                 value={sourceChannel}
                 onChange={(e) => setSourceChannel(e.target.value)}
+                maxLength={128}
                 disabled={isPending}
               />
               <p className="text-xs text-muted-foreground">

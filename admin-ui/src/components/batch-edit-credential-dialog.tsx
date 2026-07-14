@@ -250,6 +250,7 @@ export function BatchEditCredentialDialog({
                   placeholder="留空以清除来源渠道…"
                   value={sourceChannel}
                   onChange={(event) => setSourceChannel(event.target.value)}
+                  maxLength={128}
                   disabled={running}
                   className="h-11 sm:h-9"
                 />

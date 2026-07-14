@@ -367,14 +367,21 @@ fn normalize_batch_update_request(
         })
         .transpose()?;
 
-    let source_channel = request.source_channel.map(|source_channel| {
-        let source_channel = source_channel.trim();
-        if source_channel.is_empty() {
-            None
-        } else {
-            Some(source_channel.to_string())
-        }
-    });
+    let source_channel = request
+        .source_channel
+        .map(|source_channel| {
+            let source_channel = source_channel.trim();
+            if source_channel.is_empty() {
+                Ok(None)
+            } else if source_channel.chars().count() > 128 {
+                Err(AdminServiceError::InvalidCredential(
+                    "来源渠道最多 128 个字符".to_string(),
+                ))
+            } else {
+                Ok(Some(source_channel.to_string()))
+            }
+        })
+        .transpose()?;
 
     let patch = CredentialBatchPatch {
         rpm_limit: request.rpm_limit,
@@ -4570,6 +4577,14 @@ mod tests {
             normalize_batch_update_request(request(vec![1], Some(100_001), None, None)).is_err()
         );
         assert!(normalize_batch_update_request(request(vec![1], None, None, None)).is_err());
+        assert!(
+            normalize_batch_update_request(request(vec![1], None, None, Some("渠".repeat(128)),))
+                .is_ok()
+        );
+        assert!(
+            normalize_batch_update_request(request(vec![1], None, None, Some("渠".repeat(129)),))
+                .is_err()
+        );
 
         for mode in [BatchGroupMode::Add, BatchGroupMode::Remove] {
             assert!(

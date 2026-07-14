@@ -4,6 +4,7 @@ import type {
 } from '@/types/api'
 
 const MAX_RPM_LIMIT = 100_000
+const MAX_SOURCE_CHANNEL_CHARS = 128
 const INVALID_RPM_MESSAGE = `RPM 上限必须是 0 到 ${MAX_RPM_LIMIT} 的整数`
 
 export type RpmLimitParseResult =
@@ -105,7 +106,11 @@ export function buildBatchUpdateRequest(
   }
 
   if (input.editSource) {
-    request.sourceChannel = input.sourceChannel.trim()
+    const sourceChannel = input.sourceChannel.trim()
+    if (Array.from(sourceChannel).length > MAX_SOURCE_CHANNEL_CHARS) {
+      return { ok: false, message: '来源渠道最多 128 个字符' }
+    }
+    request.sourceChannel = sourceChannel
   }
 
   return { ok: true, value: request }

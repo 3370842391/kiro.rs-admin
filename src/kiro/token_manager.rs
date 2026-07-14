@@ -1852,9 +1852,47 @@ impl MultiTokenManager {
     /// - `Ok(false)` - 跳过写入（非多凭据格式或无路径配置）
     /// - `Err(_)` - 写入失败
     fn persist_credentials(&self) -> anyhow::Result<bool> {
+        // 仅多凭据格式才回写
+        if !self.is_multiple_format.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+
+        if self.credentials_path.is_none() {
+            return Ok(false);
+        }
+
+        // 持 persist_lock 覆盖「快照 + 序列化 + 写盘」整个临界区：并发 persist 严格串行，
+        // 最后写盘者必在其临界区内重新快照到最新内存，杜绝陈旧快照覆盖已轮换的 token
+        // （issue #23 根因）。entries.lock 仅在快照期短暂持有、不跨磁盘 I/O，故不阻塞请求路由。
+        // 注：所有凭据持久化路径的锁顺序恒为 persist_lock → entries.lock，无死锁。
+        let _write_guard = self.persist_lock.lock();
+
+        let credentials = {
+            let entries = self.entries.lock();
+            Self::credentials_snapshot(&entries)
+        };
+        self.persist_credentials_locked(&credentials)
+    }
+
+    fn credentials_snapshot(entries: &[CredentialEntry]) -> Vec<KiroCredentials> {
+        entries
+            .iter()
+            .map(|e| {
+                let mut cred = e.credentials.clone();
+                cred.canonicalize_auth_method();
+                cred.disabled = e.disabled;
+                cred
+            })
+            .collect()
+    }
+
+    /// 将调用方准备的凭据快照写入磁盘。
+    ///
+    /// 调用方必须先持有 `persist_lock`。批量管理操作还会保持 `entries` 在写盘期间
+    /// 不变，使写盘失败时可以安全回滚，而不会覆盖并发修改。
+    fn persist_credentials_locked(&self, credentials: &[KiroCredentials]) -> anyhow::Result<bool> {
         use anyhow::Context;
 
-        // 仅多凭据格式才回写
         if !self.is_multiple_format.load(Ordering::Relaxed) {
             return Ok(false);
         }
@@ -1864,29 +1902,8 @@ impl MultiTokenManager {
             None => return Ok(false),
         };
 
-        // 持 persist_lock 覆盖「快照 + 序列化 + 写盘」整个临界区：并发 persist 严格串行，
-        // 最后写盘者必在其临界区内重新快照到最新内存，杜绝陈旧快照覆盖已轮换的 token
-        // （issue #23 根因）。entries.lock 仅在快照期短暂持有、不跨磁盘 I/O，故不阻塞请求路由。
-        // 注：persist_lock 全仓仅此一处获取，且顺序恒为 persist_lock → entries.lock，无死锁。
-        let _write_guard = self.persist_lock.lock();
-
-        // 收集所有凭据（在 persist_lock 保护下拍快照，保证与随后的写盘原子）
-        let credentials: Vec<KiroCredentials> = {
-            let entries = self.entries.lock();
-            entries
-                .iter()
-                .map(|e| {
-                    let mut cred = e.credentials.clone();
-                    cred.canonicalize_auth_method();
-                    // 同步 disabled 状态到凭据对象
-                    cred.disabled = e.disabled;
-                    cred
-                })
-                .collect()
-        };
-
         // 序列化为 pretty JSON
-        let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
+        let json = serde_json::to_string_pretty(credentials).context("序列化凭据失败")?;
 
         // 原子落盘：先写临时文件再 rename（同目录 rename 原子），避免崩溃 / 并发导致半截文件。
         let tmp = path.with_extension("json.tmp");
@@ -3529,8 +3546,8 @@ impl MultiTokenManager {
 
     /// 批量更新账号的 RPM、分组与来源渠道配置。
     ///
-    /// 所有 ID 校验与内存变更都在一次 `entries` 锁内完成，因此内存补丁是原子的。
-    /// 锁释放后才持久化；持久化失败会返回错误，但不会回滚已完成的内存变更。
+    /// 锁顺序固定为 `persist_lock -> entries`。写盘结果确定前保持两把锁，
+    /// 因而持久化失败可回滚内存补丁，且不会覆盖并发修改。
     pub(crate) fn batch_update_credentials(
         &self,
         ids: &[u64],
@@ -3542,95 +3559,106 @@ impl MultiTokenManager {
             }
             _ => None,
         };
-        let result = {
-            let mut entries = self.entries.lock();
+        let _write_guard = self.persist_lock.lock();
+        let mut entries = self.entries.lock();
 
-            let mut target_ids = HashSet::with_capacity(ids.len());
-            for &id in ids {
-                if !target_ids.insert(id) {
-                    return Err(CredentialBatchUpdateError::DuplicateId(id));
-                }
+        let mut target_ids = HashSet::with_capacity(ids.len());
+        for &id in ids {
+            if !target_ids.insert(id) {
+                return Err(CredentialBatchUpdateError::DuplicateId(id));
             }
+        }
 
-            let existing_ids: HashSet<u64> = entries.iter().map(|entry| entry.id).collect();
-            for &id in ids {
-                if !existing_ids.contains(&id) {
-                    return Err(CredentialBatchUpdateError::NotFound(id));
-                }
+        let existing_ids: HashSet<u64> = entries.iter().map(|entry| entry.id).collect();
+        for &id in ids {
+            if !existing_ids.contains(&id) {
+                return Err(CredentialBatchUpdateError::NotFound(id));
             }
+        }
 
-            let mut updated = 0;
-            for entry in entries
-                .iter_mut()
-                .filter(|entry| target_ids.contains(&entry.id))
+        let previous_credentials = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| target_ids.contains(&entry.id))
+            .map(|(index, entry)| (index, entry.credentials.clone()))
+            .collect::<Vec<_>>();
+
+        let mut updated = 0;
+        for entry in entries
+            .iter_mut()
+            .filter(|entry| target_ids.contains(&entry.id))
+        {
+            let mut changed = false;
+
+            if let Some(rpm_limit) = patch.rpm_limit
+                && entry.credentials.rpm_limit != rpm_limit
             {
-                let mut changed = false;
+                entry.credentials.rpm_limit = rpm_limit;
+                changed = true;
+            }
 
-                if let Some(rpm_limit) = patch.rpm_limit
-                    && entry.credentials.rpm_limit != rpm_limit
-                {
-                    entry.credentials.rpm_limit = rpm_limit;
-                    changed = true;
-                }
-
-                if let Some(groups_patch) = &patch.groups {
-                    match groups_patch {
-                        CredentialGroupPatch::Replace(groups) => {
-                            if entry.credentials.groups != *groups {
-                                entry.credentials.groups = groups.clone();
+            if let Some(groups_patch) = &patch.groups {
+                match groups_patch {
+                    CredentialGroupPatch::Replace(groups) => {
+                        if entry.credentials.groups != *groups {
+                            entry.credentials.groups = groups.clone();
+                            changed = true;
+                        }
+                    }
+                    CredentialGroupPatch::Add(groups) => {
+                        let mut existing_groups = entry
+                            .credentials
+                            .groups
+                            .iter()
+                            .cloned()
+                            .collect::<HashSet<_>>();
+                        for group in groups {
+                            if existing_groups.insert(group.clone()) {
+                                entry.credentials.groups.push(group.clone());
                                 changed = true;
                             }
                         }
-                        CredentialGroupPatch::Add(groups) => {
-                            let mut existing_groups = entry
-                                .credentials
-                                .groups
-                                .iter()
-                                .cloned()
-                                .collect::<HashSet<_>>();
-                            for group in groups {
-                                if existing_groups.insert(group.clone()) {
-                                    entry.credentials.groups.push(group.clone());
-                                    changed = true;
-                                }
-                            }
-                        }
-                        CredentialGroupPatch::Remove(_) => {
-                            let groups_to_remove = groups_to_remove
-                                .as_ref()
-                                .expect("remove patch membership must be prepared");
-                            let original_len = entry.credentials.groups.len();
-                            entry
-                                .credentials
-                                .groups
-                                .retain(|group| !groups_to_remove.contains(group));
-                            changed |= entry.credentials.groups.len() != original_len;
-                        }
+                    }
+                    CredentialGroupPatch::Remove(_) => {
+                        let groups_to_remove = groups_to_remove
+                            .as_ref()
+                            .expect("remove patch membership must be prepared");
+                        let original_len = entry.credentials.groups.len();
+                        entry
+                            .credentials
+                            .groups
+                            .retain(|group| !groups_to_remove.contains(group));
+                        changed |= entry.credentials.groups.len() != original_len;
                     }
                 }
-
-                if let Some(source_channel) = &patch.source_channel
-                    && entry.credentials.source_channel != *source_channel
-                {
-                    entry.credentials.source_channel = source_channel.clone();
-                    changed = true;
-                }
-
-                if changed {
-                    updated += 1;
-                }
             }
 
-            CredentialBatchUpdateResult {
-                selected: ids.len(),
-                updated,
-                unchanged: ids.len() - updated,
+            if let Some(source_channel) = &patch.source_channel
+                && entry.credentials.source_channel != *source_channel
+            {
+                entry.credentials.source_channel = source_channel.clone();
+                changed = true;
             }
+
+            if changed {
+                updated += 1;
+            }
+        }
+
+        let result = CredentialBatchUpdateResult {
+            selected: ids.len(),
+            updated,
+            unchanged: ids.len() - updated,
         };
 
         if result.updated > 0 {
-            self.persist_credentials()
-                .map_err(CredentialBatchUpdateError::Persist)?;
+            let credentials = Self::credentials_snapshot(&entries);
+            if let Err(error) = self.persist_credentials_locked(&credentials) {
+                for (index, credentials) in previous_credentials {
+                    entries[index].credentials = credentials;
+                }
+                return Err(CredentialBatchUpdateError::Persist(error));
+            }
         }
 
         Ok(result)
@@ -5420,6 +5448,55 @@ mod tests {
         for credential in persisted {
             assert_eq!(credential.groups, vec!["y".to_string(), "z".to_string()]);
         }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn batch_update_credentials_rolls_back_memory_after_persist_failure_and_can_retry() {
+        let path = tmp_creds_path("batch_update_persist_retry");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        let credentials = vec![batch_test_credential(1, 10, &["a"], Some("source-a"))];
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            credentials.clone(),
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+
+        let error = manager
+            .batch_update_credentials(
+                &[1],
+                CredentialBatchPatch {
+                    rpm_limit: Some(3),
+                    groups: None,
+                    source_channel: None,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, CredentialBatchUpdateError::Persist(_)));
+        assert_eq!(manager.clone_all_credentials()[0].rpm_limit, 10);
+
+        std::fs::remove_dir_all(&path).unwrap();
+        std::fs::write(&path, serde_json::to_vec_pretty(&credentials).unwrap()).unwrap();
+        let retried = manager
+            .batch_update_credentials(
+                &[1],
+                CredentialBatchPatch {
+                    rpm_limit: Some(3),
+                    groups: None,
+                    source_channel: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(retried.updated, 1);
+        let persisted: Vec<KiroCredentials> =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted[0].rpm_limit, 3);
 
         let _ = std::fs::remove_file(&path);
     }
