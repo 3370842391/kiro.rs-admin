@@ -27,6 +27,9 @@ use crate::kiro::model::token_refresh::{
     RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
+use crate::kiro::region::{
+    API_KEY_AUTH_REGION, KiroService, data_plane_host, rest_region_candidates, validate_api_region,
+};
 use crate::model::config::{Config, RetryMode, RetryPolicy};
 
 /// 检查 Token 是否在指定时间内过期
@@ -441,19 +444,14 @@ async fn refresh_external_idp_token(
 /// 官方 Kiro 用量 / 模型 REST 接口（getUsageLimits / ListAvailableModels /
 /// setUserPreference）仅在 `us-east-1` 与 `eu-central-1` 两个端点提供服务。
 ///
-/// 依据凭据的 SSO 区域选择主端点，并返回另一个端点作为 403 回退候选：
+/// OAuth/SSO 依据首选区域返回双区候选；API Key 只使用显式 apiRegion：
 /// - `eu-central-1` 或任何 `eu-*` 区域 → 主端点 `eu-central-1`
 /// - 其余区域 → 主端点 `us-east-1`
 ///
 /// 这样导入的 Enterprise / IAM Identity Center (IdC) 账号即使 SSO 区域不是
 /// `us-east-1`，也能命中正确的端点，避免 `403 {"message":"Invalid token"}`。
 fn rest_api_region_candidates(sso_region: &str) -> [&'static str; 2] {
-    let primary_eu = sso_region == "eu-central-1" || sso_region.starts_with("eu-");
-    if primary_eu {
-        ["eu-central-1", "us-east-1"]
-    } else {
-        ["us-east-1", "eu-central-1"]
-    }
+    crate::kiro::region::compatibility_region_candidates(sso_region)
 }
 
 /// 计算 REST 用量/模型/profile 接口的候选区域顺序。
@@ -466,14 +464,31 @@ fn rest_api_region_candidates(sso_region: &str) -> [&'static str; 2] {
 fn rest_api_region_candidates_for(
     credentials: &KiroCredentials,
     config: &Config,
-) -> [&'static str; 2] {
-    let arn_region = credentials
-        .effective_profile_arn()
-        .and_then(crate::kiro::model::credentials::region_from_profile_arn);
-    let preferred = arn_region
-        .as_deref()
-        .unwrap_or_else(|| credentials.effective_auth_region(config));
-    rest_api_region_candidates(preferred)
+) -> anyhow::Result<Vec<String>> {
+    rest_region_candidates(credentials, config)
+}
+
+fn rest_kiro_version_for(credentials: &KiroCredentials, config: &Config) -> String {
+    if credentials.is_api_key_credential() {
+        crate::kiro::kiro_version::effective(&config.kiro_version)
+    } else {
+        USAGE_API_KIRO_VERSION.to_string()
+    }
+}
+
+fn rest_profile_arn(credentials: &KiroCredentials) -> Option<&str> {
+    if credentials.is_api_key_credential() {
+        None
+    } else {
+        credentials.effective_profile_arn()
+    }
+}
+
+fn build_list_available_models_url(host: &str, profile_arn: Option<&str>) -> String {
+    let profile_arn_query = profile_arn
+        .map(|arn| format!("&profileArn={}", urlencoding::encode(arn)))
+        .unwrap_or_default();
+    format!("https://{host}/ListAvailableModels?origin=AI_EDITOR&maxResults=50{profile_arn_query}")
 }
 
 /// 获取使用额度信息
@@ -488,17 +503,15 @@ pub(crate) async fn get_usage_limits(
     // getUsageLimits 仅在 us-east-1 / eu-central-1 提供服务。
     // 候选区域优先用真实 profileArn 的区域（见 rest_api_region_candidates_for），
     // 避免端点区域与 profileArn 不一致导致 400；403 时再回退到另一个端点。
-    let candidates = rest_api_region_candidates_for(credentials, config);
+    let candidates = rest_api_region_candidates_for(credentials, config)?;
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    // 用量类接口固定用 USAGE_API_KIRO_VERSION：新版 IDE 会强制要求 profileArn，
-    // 对 Enterprise/IdC 账号失败；该版本无需 profileArn。
-    let kiro_version = USAGE_API_KIRO_VERSION;
+    // API Key 使用当前有效版本；OAuth/SSO 保留 USAGE_API_KIRO_VERSION 兼容语义。
+    let kiro_version = rest_kiro_version_for(credentials, config);
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
     // profileArn 查询串：仅发送真实 ARN，跳过 BuilderID 占位符
-    let profile_arn_query = credentials
-        .effective_profile_arn()
+    let profile_arn_query = rest_profile_arn(credentials)
         .map(|arn| format!("&profileArn={}", urlencoding::encode(arn)))
         .unwrap_or_default();
 
@@ -513,7 +526,7 @@ pub(crate) async fn get_usage_limits(
 
     let mut last_error: Option<String> = None;
     for (idx, region) in candidates.iter().enumerate() {
-        let host = format!("q.{}.amazonaws.com", region);
+        let host = data_plane_host(KiroService::Rest, region)?;
         let url = format!(
             "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true{}",
             host, profile_arn_query
@@ -575,7 +588,7 @@ pub(crate) async fn get_usage_limits(
 
 /// 获取该凭据当前可用的模型列表
 ///
-/// 上游接口：`GET https://q.{api_region}.amazonaws.com/ListAvailableModels?origin=AI_EDITOR`
+/// 上游接口：`GET https://{resolved_host}/ListAvailableModels?origin=AI_EDITOR&maxResults=50`
 /// 返回值随订阅等级不同而不同（如 FREE 账号不含 Opus）。
 /// 请求头与构造方式与 [`get_usage_limits`] 完全一致。
 pub(crate) async fn get_available_models(
@@ -589,18 +602,13 @@ pub(crate) async fn get_available_models(
     // ListAvailableModels 仅在 us-east-1 / eu-central-1 提供服务。
     // 候选区域优先用真实 profileArn 的区域（见 rest_api_region_candidates_for），
     // 避免端点区域与 profileArn 不一致导致 400；403/400 时再回退到另一个端点。
-    let candidates = rest_api_region_candidates_for(credentials, config);
+    let candidates = rest_api_region_candidates_for(credentials, config)?;
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = USAGE_API_KIRO_VERSION;
+    let kiro_version = rest_kiro_version_for(credentials, config);
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
     // profileArn 查询串：仅发送真实 ARN，跳过 BuilderID 占位符
-    let profile_arn_query = credentials
-        .effective_profile_arn()
-        .map(|arn| format!("&profileArn={}", urlencoding::encode(arn)))
-        .unwrap_or_default();
-
     // 构建 User-Agent headers（与 get_usage_limits 保持一致）
     let user_agent = format!(
         "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
@@ -612,11 +620,8 @@ pub(crate) async fn get_available_models(
 
     let mut last_error: Option<String> = None;
     for (idx, region) in candidates.iter().enumerate() {
-        let host = format!("q.{}.amazonaws.com", region);
-        let url = format!(
-            "https://{}/ListAvailableModels?origin=AI_EDITOR{}",
-            host, profile_arn_query
-        );
+        let host = data_plane_host(KiroService::Rest, region)?;
+        let url = build_list_available_models_url(&host, rest_profile_arn(credentials));
 
         let mut request = client
             .get(&url)
@@ -636,7 +641,10 @@ pub(crate) async fn get_available_models(
 
         let status = response.status();
         if status.is_success() {
-            let data: ListAvailableModelsResponse = response.json().await?;
+            let mut data: ListAvailableModelsResponse = response.json().await?;
+            data.resolved_api_region = Some(region.to_string());
+            data.resolved_host = Some(host);
+            data.kiro_version = Some(kiro_version.clone());
             return Ok(data);
         }
 
@@ -694,10 +702,9 @@ pub(crate) async fn list_available_profiles(
 ) -> anyhow::Result<ListAvailableProfilesResponse> {
     tracing::debug!("正在获取可用 profile 列表...");
 
-    let sso_region = credentials.effective_auth_region(config);
-    let candidates = rest_api_region_candidates(sso_region);
+    let candidates = rest_api_region_candidates_for(credentials, config)?;
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = USAGE_API_KIRO_VERSION;
+    let kiro_version = rest_kiro_version_for(credentials, config);
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
@@ -712,7 +719,7 @@ pub(crate) async fn list_available_profiles(
     let mut last_error: Option<String> = None;
     let mut empty_seen = false;
     for region in candidates.iter() {
-        let host = format!("q.{}.amazonaws.com", region);
+        let host = data_plane_host(KiroService::Rest, region)?;
         let url = format!("https://{}/", host);
 
         let mut request = client
@@ -780,10 +787,9 @@ pub(crate) async fn set_user_preference(
 
     // setUserPreference 仅在 us-east-1 / eu-central-1 提供服务，
     // 依据凭据 SSO 区域选择主端点，403 时回退到另一个端点。
-    let sso_region = credentials.effective_auth_region(config);
-    let candidates = rest_api_region_candidates(sso_region);
+    let candidates = rest_api_region_candidates_for(credentials, config)?;
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = USAGE_API_KIRO_VERSION;
+    let kiro_version = rest_kiro_version_for(credentials, config);
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
@@ -796,7 +802,7 @@ pub(crate) async fn set_user_preference(
     let client = build_client(proxy, 60, config.tls_backend)?;
 
     // 构建 body：仅发送真实 profileArn，跳过 BuilderID 占位符
-    let body = if let Some(profile_arn) = credentials.effective_profile_arn() {
+    let body = if let Some(profile_arn) = rest_profile_arn(credentials) {
         serde_json::json!({
             "overageConfiguration": { "overageStatus": overage_status },
             "profileArn": profile_arn,
@@ -809,7 +815,7 @@ pub(crate) async fn set_user_preference(
 
     let mut last_error: Option<String> = None;
     for (idx, region) in candidates.iter().enumerate() {
-        let host = format!("q.{}.amazonaws.com", region);
+        let host = data_plane_host(KiroService::Rest, region)?;
         let url = format!("https://{}/setUserPreference", host);
 
         let mut request = client
@@ -973,6 +979,12 @@ pub struct CredentialEntrySnapshot {
     pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
+    /// 用户自定义账号标识
+    pub nickname: Option<String>,
+    /// Token 认证区域
+    pub auth_region: Option<String>,
+    /// 数据面 API 区域
+    pub api_region: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -1270,19 +1282,29 @@ impl MultiTokenManager {
             })
             .collect();
 
-        // 校验 API Key 凭据配置完整性：authMethod=api_key 时必须提供 kiroApiKey
+        // 旧 API Key 可继续加载，但缺少有效 apiRegion 时禁止数据面调用，绝不回退全局区域。
         let mut entries = entries;
         for entry in &mut entries {
-            if entry.credentials.kiro_api_key.is_none()
-                && entry
-                    .credentials
-                    .auth_method
-                    .as_deref()
-                    .map(|m| m.eq_ignore_ascii_case("api_key") || m.eq_ignore_ascii_case("apikey"))
-                    .unwrap_or(false)
-            {
+            if !entry.credentials.is_api_key_credential() {
+                continue;
+            }
+            entry.credentials.auth_region = Some(API_KEY_AUTH_REGION.to_string());
+            let key_missing = entry
+                .credentials
+                .kiro_api_key
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default()
+                .is_empty();
+            let region_invalid = entry
+                .credentials
+                .api_region
+                .as_deref()
+                .and_then(|region| validate_api_region(region).ok())
+                .is_none();
+            if key_missing || region_invalid {
                 tracing::warn!(
-                    "凭据 #{} 配置了 authMethod=api_key 但缺少 kiroApiKey 字段，已自动禁用",
+                    "凭据 #{} 的 API Key 配置缺少 kiroApiKey 或有效 apiRegion，已禁用数据面调用",
                     entry.id
                 );
                 entry.disabled = true;
@@ -2509,6 +2531,9 @@ impl MultiTokenManager {
                         None
                     },
                     email: e.credentials.email.clone(),
+                    nickname: e.credentials.nickname.clone(),
+                    auth_region: e.credentials.auth_region.clone(),
+                    api_region: e.credentials.api_region.clone(),
                     success_count: e.success_count,
                     last_used_at: e.last_used_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
@@ -3237,7 +3262,18 @@ impl MultiTokenManager {
     /// # 返回
     /// - `Ok(u64)` - 新凭据 ID
     /// - `Err(_)` - 验证失败或添加失败
-    pub async fn add_credential(&self, new_cred: KiroCredentials) -> anyhow::Result<u64> {
+    pub async fn add_credential(&self, mut new_cred: KiroCredentials) -> anyhow::Result<u64> {
+        new_cred.nickname = new_cred
+            .nickname
+            .take()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        if new_cred.is_api_key_credential() {
+            new_cred.kiro_api_key = new_cred
+                .kiro_api_key
+                .take()
+                .map(|value| value.trim().to_string());
+        }
         // 1. 基本验证
         if new_cred.is_api_key_credential() {
             let api_key = new_cred
@@ -3247,6 +3283,15 @@ impl MultiTokenManager {
             if api_key.is_empty() {
                 anyhow::bail!("kiroApiKey 为空");
             }
+            if !api_key.starts_with("ksk_") {
+                anyhow::bail!("kiroApiKey 格式无效：必须以 ksk_ 开头");
+            }
+            let api_region = new_cred
+                .api_region
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少必填字段 apiRegion"))?;
+            new_cred.api_region = Some(validate_api_region(api_region)?.to_string());
+            new_cred.auth_region = Some(API_KEY_AUTH_REGION.to_string());
         } else {
             validate_refresh_token(&new_cred)?;
         }
@@ -3346,6 +3391,7 @@ impl MultiTokenManager {
         validated_cred.api_region = new_cred.api_region;
         validated_cred.machine_id = new_cred.machine_id;
         validated_cred.email = new_cred.email;
+        validated_cred.nickname = new_cred.nickname;
         validated_cred.proxy_url = new_cred.proxy_url;
         validated_cred.proxy_username = new_cred.proxy_username;
         validated_cred.proxy_password = new_cred.proxy_password;
@@ -3431,6 +3477,7 @@ impl MultiTokenManager {
     pub fn update_credential(
         &self,
         id: u64,
+        nickname: Option<Option<String>>,
         email: Option<Option<String>>,
         proxy_url: Option<Option<String>>,
         proxy_username: Option<Option<String>>,
@@ -3446,6 +3493,9 @@ impl MultiTokenManager {
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
 
+            if let Some(v) = nickname {
+                entry.credentials.nickname = v.filter(|s| !s.is_empty());
+            }
             if let Some(v) = email {
                 entry.credentials.email = v.filter(|s| !s.is_empty());
             }
@@ -4466,6 +4516,7 @@ mod tests {
         let mut credentials = KiroCredentials::default();
         credentials.kiro_api_key = Some("ksk_test_key_123".to_string());
         credentials.auth_method = Some("api_key".to_string());
+        credentials.api_region = Some("us-east-1".to_string());
 
         let result = refresh_token(&credentials, &config, None).await;
 
@@ -4503,6 +4554,7 @@ mod tests {
         let mut api_key_cred = KiroCredentials::default();
         api_key_cred.kiro_api_key = Some("ksk_test_key_123".to_string());
         api_key_cred.auth_method = Some("api_key".to_string());
+        api_key_cred.api_region = Some("us-east-1".to_string());
 
         let result = manager.add_credential(api_key_cred).await;
         assert!(result.is_ok());
@@ -4519,12 +4571,14 @@ mod tests {
         let mut existing = KiroCredentials::default();
         existing.kiro_api_key = Some("ksk_existing_key".to_string());
         existing.auth_method = Some("api_key".to_string());
+        existing.api_region = Some("us-east-1".to_string());
 
         let manager = MultiTokenManager::new(config, vec![existing], None, None, false).unwrap();
 
         let mut duplicate = KiroCredentials::default();
         duplicate.kiro_api_key = Some("ksk_existing_key".to_string());
         duplicate.auth_method = Some("api_key".to_string());
+        duplicate.api_region = Some("us-east-1".to_string());
 
         let result = manager.add_credential(duplicate).await;
         assert!(result.is_err());
@@ -4589,6 +4643,7 @@ mod tests {
         let mut api_key_cred = KiroCredentials::default();
         api_key_cred.kiro_api_key = Some("ksk_new_key".to_string());
         api_key_cred.auth_method = Some("api_key".to_string());
+        api_key_cred.api_region = Some("us-east-1".to_string());
 
         let result = manager.add_credential(api_key_cred).await;
         assert!(result.is_ok());
@@ -4667,10 +4722,60 @@ mod tests {
         let mut cred = KiroCredentials::default();
         cred.auth_method = Some("api_key".to_string());
         cred.kiro_api_key = Some("ksk_test123".to_string());
+        cred.api_region = Some("us-east-1".to_string());
 
         let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
         assert_eq!(manager.total_count(), 1);
         assert_eq!(manager.available_count(), 1);
+    }
+
+    #[test]
+    fn api_key_loaded_without_api_region_is_disabled_without_global_fallback() {
+        let cred = KiroCredentials {
+            auth_method: Some("api_key".to_string()),
+            kiro_api_key: Some(format!("{}{}", "ksk_", "unit-placeholder")),
+            ..Default::default()
+        };
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap();
+        let entry = manager.snapshot().entries.into_iter().next().unwrap();
+        assert!(entry.disabled);
+        assert_eq!(entry.disabled_reason.as_deref(), Some("InvalidConfig"));
+    }
+
+    #[tokio::test]
+    async fn add_api_key_requires_supported_api_region_and_normalizes_auth_region() {
+        let manager =
+            MultiTokenManager::new(Config::default(), Vec::new(), None, None, false).unwrap();
+        let base = KiroCredentials {
+            auth_method: Some("api_key".to_string()),
+            kiro_api_key: Some(format!(" {}{} ", "ksk_", "unit-add-placeholder")),
+            nickname: Some(" EU account ".to_string()),
+            auth_region: Some("eu-central-1".to_string()),
+            ..Default::default()
+        };
+
+        let missing = manager.add_credential(base.clone()).await.unwrap_err();
+        assert!(missing.to_string().contains("apiRegion"));
+
+        let mut invalid = base.clone();
+        invalid.api_region = Some("ap-southeast-1".to_string());
+        let invalid_error = manager.add_credential(invalid).await.unwrap_err();
+        assert!(invalid_error.to_string().contains("apiRegion"));
+
+        let mut valid = base;
+        valid.api_region = Some("eu-central-1".to_string());
+        manager.add_credential(valid).await.unwrap();
+        let entry = manager.snapshot().entries.into_iter().next().unwrap();
+        assert_eq!(entry.auth_region.as_deref(), Some("us-east-1"));
+        assert_eq!(entry.api_region.as_deref(), Some("eu-central-1"));
+        assert_eq!(entry.nickname.as_deref(), Some("EU account"));
+        let stored = manager.clone_all_credentials().into_iter().next().unwrap();
+        assert_eq!(
+            stored.kiro_api_key.as_deref(),
+            Some(format!("{}{}", "ksk_", "unit-add-placeholder").as_str())
+        );
     }
 
     #[test]
@@ -5004,6 +5109,7 @@ mod tests {
         credential.id = Some(id);
         credential.auth_method = Some("api_key".to_string());
         credential.kiro_api_key = Some(format!("ksk_batch_test_{id}"));
+        credential.api_region = Some("us-east-1".to_string());
         credential.machine_id = Some(format!("batch-test-machine-{id}"));
         credential.rpm_limit = rpm_limit;
         credential.groups = groups.iter().map(|group| (*group).to_string()).collect();
@@ -5492,6 +5598,47 @@ mod tests {
         assert_eq!(manager.available_count(), 2);
     }
 
+    #[test]
+    fn nickname_is_editable_and_email_updates_do_not_overwrite_it() {
+        let mut credentials = KiroCredentials::default();
+        credentials.refresh_token = Some("x".repeat(150));
+        credentials.nickname = Some("original".to_string());
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![credentials], None, None, false)
+                .unwrap();
+
+        manager
+            .update_credential(
+                1,
+                Some(Some("renamed".to_string())),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        manager
+            .update_credential(
+                1,
+                None,
+                Some(Some("real@example.test".to_string())),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let entry = manager.snapshot().entries.into_iter().next().unwrap();
+        assert_eq!(entry.nickname.as_deref(), Some("renamed"));
+        assert_eq!(entry.email.as_deref(), Some("real@example.test"));
+    }
+
     #[tokio::test]
     async fn test_multi_token_manager_acquire_context_balanced_retries_until_bad_credential_disabled()
      {
@@ -5808,8 +5955,8 @@ mod tests {
             "arn:aws:codewhisperer:eu-central-1:257752232114:profile/HDQDPR39YRV9".to_string(),
         );
         assert_eq!(
-            rest_api_region_candidates_for(&eu_arn_cred, &config),
-            ["eu-central-1", "us-east-1"],
+            rest_api_region_candidates_for(&eu_arn_cred, &config).unwrap(),
+            vec!["eu-central-1", "us-east-1"],
             "有 eu profileArn 时应优先 eu-central-1"
         );
 
@@ -5818,17 +5965,72 @@ mod tests {
         placeholder_cred.profile_arn =
             Some(crate::kiro::model::credentials::BUILDER_ID_PROFILE_ARN.to_string());
         assert_eq!(
-            rest_api_region_candidates_for(&placeholder_cred, &config),
-            ["us-east-1", "eu-central-1"],
+            rest_api_region_candidates_for(&placeholder_cred, &config).unwrap(),
+            vec!["us-east-1", "eu-central-1"],
             "占位符 ARN 应退回 SSO 区域推断"
         );
 
         // 无 ARN 的普通凭据同样退回 SSO 区域推断。
         let plain_cred = KiroCredentials::default();
         assert_eq!(
-            rest_api_region_candidates_for(&plain_cred, &config),
-            ["us-east-1", "eu-central-1"]
+            rest_api_region_candidates_for(&plain_cred, &config).unwrap(),
+            vec!["us-east-1", "eu-central-1"]
         );
+    }
+
+    #[test]
+    fn api_key_rest_strategy_uses_only_explicit_region_and_current_version() {
+        let mut config = Config::default();
+        config.kiro_version = "9.8.7".to_string();
+        let credentials = KiroCredentials {
+            auth_method: Some("api_key".to_string()),
+            api_region: Some("eu-central-1".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            rest_api_region_candidates_for(&credentials, &config).unwrap(),
+            vec!["eu-central-1"]
+        );
+        assert_eq!(
+            rest_kiro_version_for(&credentials, &config),
+            crate::kiro::kiro_version::effective(&config.kiro_version)
+        );
+        assert_eq!(rest_profile_arn(&credentials), None);
+    }
+
+    #[test]
+    fn oauth_rest_strategy_keeps_legacy_version_and_profile_arn() {
+        let config = Config::default();
+        let credentials = KiroCredentials {
+            profile_arn: Some(
+                "arn:aws:codewhisperer:eu-central-1:123456789012:profile/UNIT".to_string(),
+            ),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            rest_api_region_candidates_for(&credentials, &config).unwrap(),
+            vec!["eu-central-1", "us-east-1"]
+        );
+        assert_eq!(
+            rest_kiro_version_for(&credentials, &config),
+            USAGE_API_KIRO_VERSION
+        );
+        assert_eq!(
+            rest_profile_arn(&credentials),
+            credentials.profile_arn.as_deref()
+        );
+    }
+
+    #[test]
+    fn list_available_models_url_requests_fifty_models_without_fake_profile() {
+        let url = build_list_available_models_url("q.eu-central-1.amazonaws.com", None);
+        assert_eq!(
+            url,
+            "https://q.eu-central-1.amazonaws.com/ListAvailableModels?origin=AI_EDITOR&maxResults=50"
+        );
+        assert!(!url.contains("profileArn"));
     }
 
     #[test]
@@ -5875,6 +6077,7 @@ mod tests {
         let mut cred = KiroCredentials::default();
         cred.kiro_api_key = Some("ksk_test_migrate_key".to_string());
         cred.auth_method = Some("api_key".to_string());
+        cred.api_region = Some("us-east-1".to_string());
         let single_json = serde_json::to_string(&cred).unwrap();
         std::fs::write(&path, &single_json).unwrap();
 
@@ -5935,6 +6138,7 @@ mod tests {
         let mut cred = KiroCredentials::default();
         cred.kiro_api_key = Some("ksk_test_upgrade_key".to_string());
         cred.auth_method = Some("api_key".to_string());
+        cred.api_region = Some("us-east-1".to_string());
 
         manager.add_credential(cred).await.unwrap();
 
@@ -5959,11 +6163,13 @@ mod tests {
         cred1.id = Some(1);
         cred1.kiro_api_key = Some("ksk_existing_1".to_string());
         cred1.auth_method = Some("api_key".to_string());
+        cred1.api_region = Some("us-east-1".to_string());
 
         let mut cred2 = KiroCredentials::default();
         cred2.id = Some(2);
         cred2.kiro_api_key = Some("ksk_existing_2".to_string());
         cred2.auth_method = Some("api_key".to_string());
+        cred2.api_region = Some("us-east-1".to_string());
 
         let manager = MultiTokenManager::new(
             Config::default(),
@@ -5979,6 +6185,7 @@ mod tests {
         let mut new_cred = KiroCredentials::default();
         new_cred.kiro_api_key = Some("ksk_new_3".to_string());
         new_cred.auth_method = Some("api_key".to_string());
+        new_cred.api_region = Some("us-east-1".to_string());
 
         let new_id = manager.add_credential(new_cred).await.unwrap();
         assert_eq!(
@@ -6013,6 +6220,7 @@ mod tests {
                 let mut c = KiroCredentials::default();
                 c.kiro_api_key = Some("ksk_duplicate".to_string());
                 c.auth_method = Some("api_key".to_string());
+                c.api_region = Some("us-east-1".to_string());
                 m.add_credential(c).await
             }));
         }

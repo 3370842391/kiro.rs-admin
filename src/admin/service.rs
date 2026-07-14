@@ -74,6 +74,22 @@ const UPDATE_CHECK_TTL_SECS: i64 = 1800;
 
 const DEFAULT_RESPONSE_TEST_MODEL: &str = "claude-sonnet-4-6";
 
+fn is_invalid_add_credential_error(msg: &str) -> bool {
+    msg.contains("缺少 refreshToken")
+        || msg.contains("refreshToken 为空")
+        || msg.contains("refreshToken 已被截断")
+        || msg.contains("凭据已存在")
+        || msg.contains("refreshToken 重复")
+        || msg.contains("kiroApiKey 重复")
+        || msg.contains("缺少 kiroApiKey")
+        || msg.contains("kiroApiKey 为空")
+        || msg.contains("kiroApiKey 格式无效")
+        || msg.contains("apiRegion")
+        || msg.contains("凭证已过期或无效")
+        || msg.contains("权限不足")
+        || msg.contains("已被限流")
+}
+
 fn build_cache_policy_response(
     policy: CachePolicy,
     stats: CacheStats,
@@ -797,7 +813,7 @@ fn credential_to_export_account(cred: KiroCredentials) -> Option<ExportedAccount
     Some(ExportedAccount {
         id: uuid::Uuid::new_v4().to_string(),
         email: non_empty(cred.email).unwrap_or_default(),
-        nickname: None,
+        nickname: non_empty(cred.nickname),
         idp,
         user_id: None,
         profile_arn,
@@ -1193,6 +1209,9 @@ impl AdminService {
                     api_key_hash: entry.api_key_hash,
                     masked_api_key: entry.masked_api_key,
                     email: entry.email,
+                    nickname: entry.nickname,
+                    auth_region: entry.auth_region,
+                    api_region: entry.api_region,
                     success_count: entry.success_count,
                     last_used_at: entry.last_used_at.clone(),
                     has_proxy: entry.has_proxy,
@@ -1448,6 +1467,9 @@ impl AdminService {
             .await
             .map_err(|e| self.classify_balance_error(e, id))?;
 
+        let resolved_api_region = resp.resolved_api_region.unwrap_or_default();
+        let resolved_host = resp.resolved_host.unwrap_or_default();
+        let kiro_version = resp.kiro_version.unwrap_or_default();
         let models = resp
             .models
             .into_iter()
@@ -1459,7 +1481,13 @@ impl AdminService {
             })
             .collect();
 
-        Ok(AvailableModelsResponse { id, models })
+        Ok(AvailableModelsResponse {
+            id,
+            models,
+            resolved_api_region,
+            resolved_host,
+            kiro_version,
+        })
     }
 
     /// 使用指定凭据发送一次 hello，验证模型响应和耗时。
@@ -1801,6 +1829,7 @@ impl AdminService {
             api_region: req.api_region,
             machine_id: req.machine_id,
             email: email.clone(),
+            nickname: req.nickname,
             subscription_title: None, // 将在首次获取使用额度时自动更新
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,
@@ -1929,6 +1958,8 @@ impl AdminService {
         self.token_manager
             .update_credential(
                 id,
+                req.nickname
+                    .map(|v| if v.is_empty() { None } else { Some(v) }),
                 req.email.map(|v| if v.is_empty() { None } else { Some(v) }),
                 proxy_url,
                 req.proxy_username
@@ -3415,6 +3446,7 @@ impl AdminService {
         self.token_manager
             .update_credential(
                 credential_id,
+                None,            // nickname 不修改
                 None,            // email 不修改
                 Some(proxy_url), // 设置或清除 proxy_url（Some(None) = 清除，Some(Some(url)) = 设置）
                 None,            // proxy_username 不修改
@@ -3514,6 +3546,7 @@ impl AdminService {
                 .update_credential(
                     *cred_id,
                     None,
+                    None,
                     Some(Some(url)),
                     None,
                     None,
@@ -3601,17 +3634,7 @@ impl AdminService {
         let msg = e.to_string();
 
         // 凭据验证失败（refreshToken 无效、格式错误等）
-        let is_invalid_credential = msg.contains("缺少 refreshToken")
-            || msg.contains("refreshToken 为空")
-            || msg.contains("refreshToken 已被截断")
-            || msg.contains("凭据已存在")
-            || msg.contains("refreshToken 重复")
-            || msg.contains("kiroApiKey 重复")
-            || msg.contains("缺少 kiroApiKey")
-            || msg.contains("kiroApiKey 为空")
-            || msg.contains("凭证已过期或无效")
-            || msg.contains("权限不足")
-            || msg.contains("已被限流");
+        let is_invalid_credential = is_invalid_add_credential_error(&msg);
 
         if is_invalid_credential {
             AdminServiceError::InvalidCredential(msg)
@@ -4481,6 +4504,9 @@ mod tests {
             api_key_hash: None,
             masked_api_key: None,
             email: None,
+            nickname: None,
+            auth_region: None,
+            api_region: None,
             success_count: 0,
             last_used_at: None,
             has_proxy: false,
@@ -4787,6 +4813,19 @@ mod tests {
         assert_eq!(response.default_ttl_secs, 1800);
         assert_eq!(response.usage_pct, 25.0);
         assert_eq!(response.max_pct, 95);
+    }
+
+    #[test]
+    fn api_region_validation_errors_are_classified_as_invalid_credentials() {
+        assert!(is_invalid_add_credential_error(
+            "API Key 凭据缺少必填字段 apiRegion"
+        ));
+        assert!(is_invalid_add_credential_error(
+            "不支持的 apiRegion: ap-southeast-1"
+        ));
+        assert!(is_invalid_add_credential_error(
+            "kiroApiKey 格式无效：必须以 ksk_ 开头"
+        ));
     }
 
     #[test]

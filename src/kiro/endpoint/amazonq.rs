@@ -15,6 +15,7 @@ use uuid::Uuid;
 use super::ide::inject_profile_arn;
 use super::{KiroEndpoint, RequestContext};
 use crate::kiro::kiro_version;
+use crate::kiro::region::{KiroService, data_plane_host};
 
 /// Kiro AmazonQ 端点名称
 pub const AMAZONQ_ENDPOINT_NAME: &str = "amazonq";
@@ -35,7 +36,8 @@ impl AmazonQEndpoint {
     }
 
     fn host(&self, ctx: &RequestContext<'_>) -> String {
-        format!("q.{}.amazonaws.com", self.api_region(ctx))
+        data_plane_host(KiroService::AmazonQ, self.api_region(ctx))
+            .expect("API region must be validated before building Amazon Q requests")
     }
 
     fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
@@ -86,14 +88,11 @@ impl KiroEndpoint for AmazonQEndpoint {
     }
 
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!(
-            "https://q.{}.amazonaws.com/generateAssistantResponse",
-            self.api_region(ctx)
-        )
+        format!("https://{}/generateAssistantResponse", self.host(ctx))
     }
 
     fn mcp_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!("https://q.{}.amazonaws.com/mcp", self.api_region(ctx))
+        format!("https://{}/mcp", self.host(ctx))
     }
 
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
