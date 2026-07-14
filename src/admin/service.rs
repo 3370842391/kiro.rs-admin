@@ -85,6 +85,7 @@ fn is_invalid_add_credential_error(msg: &str) -> bool {
         || msg.contains("kiroApiKey 为空")
         || msg.contains("kiroApiKey 格式无效")
         || msg.contains("apiRegion")
+        || msg.contains("nickname")
         || msg.contains("凭证已过期或无效")
         || msg.contains("权限不足")
         || msg.contains("已被限流")
@@ -367,14 +368,21 @@ fn normalize_batch_update_request(
         })
         .transpose()?;
 
-    let source_channel = request.source_channel.map(|source_channel| {
-        let source_channel = source_channel.trim();
-        if source_channel.is_empty() {
-            None
-        } else {
-            Some(source_channel.to_string())
-        }
-    });
+    let source_channel = request
+        .source_channel
+        .map(|source_channel| {
+            let source_channel = source_channel.trim();
+            if source_channel.is_empty() {
+                Ok(None)
+            } else if source_channel.chars().count() > 128 {
+                Err(AdminServiceError::InvalidCredential(
+                    "来源渠道最多 128 个字符".to_string(),
+                ))
+            } else {
+                Ok(Some(source_channel.to_string()))
+            }
+        })
+        .transpose()?;
 
     let patch = CredentialBatchPatch {
         rpm_limit: request.rpm_limit,
@@ -1970,6 +1978,7 @@ impl AdminService {
                 req.source_channel
                     .map(|v| if v.is_empty() { None } else { Some(v) }),
                 req.rpm_limit,
+                req.api_region,
             )
             .map_err(|e| self.classify_error(e, id))
     }
@@ -3454,6 +3463,7 @@ impl AdminService {
                 None,            // groups 不修改
                 None,            // source_channel 不修改
                 None,            // rpm_limit 不修改
+                None,            // api_region 不修改
             )
             .map_err(|e| {
                 let msg = e.to_string();
@@ -3553,6 +3563,7 @@ impl AdminService {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .is_ok()
             {
@@ -3573,6 +3584,8 @@ impl AdminService {
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
+        } else if msg.contains("apiRegion") || msg.contains("nickname") {
+            AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)
         }
@@ -4570,6 +4583,14 @@ mod tests {
             normalize_batch_update_request(request(vec![1], Some(100_001), None, None)).is_err()
         );
         assert!(normalize_batch_update_request(request(vec![1], None, None, None)).is_err());
+        assert!(
+            normalize_batch_update_request(request(vec![1], None, None, Some("渠".repeat(128)),))
+                .is_ok()
+        );
+        assert!(
+            normalize_batch_update_request(request(vec![1], None, None, Some("渠".repeat(129)),))
+                .is_err()
+        );
 
         for mode in [BatchGroupMode::Add, BatchGroupMode::Remove] {
             assert!(

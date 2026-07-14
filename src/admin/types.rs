@@ -295,6 +295,9 @@ pub struct UpdateCredentialRequest {
     /// 用户自定义账号标识（空字符串表示清除）
     #[serde(default, alias = "name")]
     pub nickname: Option<String>,
+    /// API Key 数据面区域；仅允许 us-east-1 或 eu-central-1。
+    #[serde(default, alias = "api_region")]
+    pub api_region: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
     /// 凭据级代理 URL（空字符串表示清除）
@@ -1788,6 +1791,18 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(aliased.nickname.as_deref(), Some("legacy-name"));
+    }
+
+    #[test]
+    fn update_credential_request_accepts_api_region_and_nickname() {
+        let request: UpdateCredentialRequest = serde_json::from_value(serde_json::json!({
+            "nickname": "  repaired account  ",
+            "apiRegion": "eu-central-1"
+        }))
+        .unwrap();
+
+        assert_eq!(request.nickname.as_deref(), Some("  repaired account  "));
+        assert_eq!(request.api_region.as_deref(), Some("eu-central-1"));
     }
 
     #[test]

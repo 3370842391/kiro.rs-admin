@@ -1,4 +1,5 @@
 export const SUPPORTED_API_REGIONS = ['us-east-1', 'eu-central-1'] as const
+const MAX_NICKNAME_CHARS = 128
 
 export type SupportedApiRegion = (typeof SUPPORTED_API_REGIONS)[number]
 
@@ -85,7 +86,11 @@ export function parseApiKeyLines(
     let supportedApiRegion: SupportedApiRegion | undefined
     const messages: string[] = []
 
-    if (!nickname) messages.push('nickname 不能为空')
+    if (!nickname) {
+      messages.push('nickname 不能为空')
+    } else if (Array.from(nickname).length > MAX_NICKNAME_CHARS) {
+      messages.push('nickname 最多 128 个字符')
+    }
     if (!kiroApiKey) {
       messages.push('API Key 不能为空')
     } else if (!kiroApiKey.startsWith('ksk_')) {

@@ -268,4 +268,22 @@ describe('buildBatchUpdateRequest', () => {
       }),
     ).toEqual({ ok: true, value: { ids: [6], sourceChannel: '' } })
   })
+
+  test('来源渠道最多允许 128 个 Unicode 字符', () => {
+    const base = {
+      ids: [6],
+      editRpm: false,
+      rpmDraft: '',
+      editGroups: false,
+      groupMode: 'replace' as const,
+      groups: [],
+      editSource: true,
+    }
+
+    expect(buildBatchUpdateRequest({ ...base, sourceChannel: '渠'.repeat(128) }).ok).toBe(true)
+    expect(buildBatchUpdateRequest({ ...base, sourceChannel: '渠'.repeat(129) })).toEqual({
+      ok: false,
+      message: '来源渠道最多 128 个字符',
+    })
+  })
 })
