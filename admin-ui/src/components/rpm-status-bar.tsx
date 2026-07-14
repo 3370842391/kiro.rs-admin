@@ -56,7 +56,7 @@ export function RpmStatusBar({ summary, totalInFlight }: RpmStatusBarProps) {
           detail={`有限账号容量 ${limitedCapacity} · 不限速账号 ${unlimitedAccounts}`}
         />
         <StatusItem
-          label="剩余"
+          label={hasUnlimitedCapacity ? '有限账号剩余' : '剩余'}
           value={remainingLimitedCapacity}
           tone={remainingLimitedCapacity === 0 && limitedCapacity > 0 ? 'warning' : 'default'}
         />

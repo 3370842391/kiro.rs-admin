@@ -157,16 +157,22 @@ export function BatchEditCredentialDialog({
                     setRpmError('')
                   }}
                   aria-invalid={Boolean(rpmError)}
-                  aria-describedby={rpmError ? 'batch-rpm-limit-error' : undefined}
+                  aria-describedby={
+                    rpmError
+                      ? 'batch-rpm-limit-hint batch-rpm-limit-error'
+                      : 'batch-rpm-limit-hint'
+                  }
                   disabled={running}
-                  className="tabular-nums"
+                  className="h-11 sm:h-9 tabular-nums"
                 />
                 {rpmError ? (
                   <p id="batch-rpm-limit-error" className="text-xs text-destructive" role="alert">
                     {rpmError}
                   </p>
                 ) : null}
-                <p className="text-xs text-muted-foreground">{rpmHint}</p>
+                <p id="batch-rpm-limit-hint" className="text-xs text-muted-foreground">
+                  {rpmHint}
+                </p>
               </div>
             ) : null}
           </section>
@@ -183,13 +189,22 @@ export function BatchEditCredentialDialog({
             </label>
             {editGroups ? (
               <>
-                <div className="grid grid-cols-3 gap-2">
+                <p id="batch-group-mode-label" className="text-xs font-medium text-muted-foreground">
+                  分组修改方式
+                </p>
+                <div
+                  role="group"
+                  aria-labelledby="batch-group-mode-label"
+                  aria-describedby="batch-group-mode-description"
+                  className="grid grid-cols-3 gap-2"
+                >
                   {MODE_LABELS.map((item) => (
                     <Button
                       key={item.value}
                       type="button"
                       size="sm"
                       className="h-11 sm:h-8"
+                      aria-pressed={mode === item.value}
                       variant={mode === item.value ? 'default' : 'outline'}
                       onClick={() => setMode(item.value)}
                       disabled={running}
@@ -198,15 +213,17 @@ export function BatchEditCredentialDialog({
                     </Button>
                   ))}
                 </div>
-                <p className="text-xs text-muted-foreground">
+                <p id="batch-group-mode-description" className="text-xs text-muted-foreground">
                   {MODE_LABELS.find((item) => item.value === mode)?.desc}
                 </p>
-                <GroupMultiSelect
-                  value={groups}
-                  options={groupOptions}
-                  onChange={setGroups}
-                  disabled={running}
-                />
+                <div className="min-h-11 [&_button]:h-11 sm:[&_button]:h-9">
+                  <GroupMultiSelect
+                    value={groups}
+                    options={groupOptions}
+                    onChange={setGroups}
+                    disabled={running}
+                  />
+                </div>
               </>
             ) : null}
           </section>
@@ -234,6 +251,7 @@ export function BatchEditCredentialDialog({
                   value={sourceChannel}
                   onChange={(event) => setSourceChannel(event.target.value)}
                   disabled={running}
+                  className="h-11 sm:h-9"
                 />
               </div>
             ) : null}
@@ -243,13 +261,13 @@ export function BatchEditCredentialDialog({
             <Button
               type="button"
               variant="outline"
-              className="w-full sm:w-auto"
+              className="w-full h-11 sm:h-9 sm:w-auto"
               onClick={() => onOpenChange(false)}
               disabled={running}
             >
               取消
             </Button>
-            <Button type="submit" className="w-full sm:w-auto" disabled={running}>
+            <Button type="submit" className="w-full h-11 sm:h-9 sm:w-auto" disabled={running}>
               {running ? '应用中…' : '应用'}
             </Button>
           </DialogFooter>
