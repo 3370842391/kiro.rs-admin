@@ -26,7 +26,7 @@ use crate::kiro::model::credentials::{
     normalize_import_auth_method_from_fields, validate_external_idp_endpoint,
 };
 use crate::kiro::provider::KiroProvider;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{MultiTokenManager, RPM_WINDOW_SECONDS};
 use crate::model::config::{Config, RetryMode};
 
 use super::error::AdminServiceError;
@@ -50,8 +50,8 @@ use super::types::{
     PatchModelProfileRequest, PollIdcLoginResponse, PreviewModelProfilesRequest,
     ProxyBalancingModeResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyCheckUrlRequest,
     ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult, ResolvedModelProfileResponse,
-    RetryPolicyResponse, RevisionRequest, SetAccountThrottleConfigRequest, SetCacheHitRateRequest,
-    SetCachePolicyRequest, SetEndpointChainsRequest, SetImageBudgetRequest,
+    RetryPolicyResponse, RevisionRequest, RpmSummary, SetAccountThrottleConfigRequest,
+    SetCacheHitRateRequest, SetCachePolicyRequest, SetEndpointChainsRequest, SetImageBudgetRequest,
     SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetModelProfileSettingsRequest,
     SetProxyBalancingModeRequest, SetRetryPolicyRequest, SetUpdateConfigRequest,
     StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse,
@@ -1028,6 +1028,7 @@ impl AdminService {
                     priority: entry.priority,
                     rpm_limit: entry.rpm_limit,
                     rpm_current: entry.rpm_current,
+                    in_flight: entry.in_flight,
                     disabled: entry.disabled,
                     failure_count: entry.failure_count,
                     total_failure_count: entry.total_failure_count,
@@ -1065,6 +1066,16 @@ impl AdminService {
             available: snapshot.available,
             current_id: snapshot.current_id,
             credentials,
+            // Task 3 将在 AdminService 中按完整口径计算这些汇总值。
+            rpm_summary: RpmSummary {
+                window_seconds: RPM_WINDOW_SECONDS,
+                current: 0,
+                limited_capacity: 0,
+                remaining_limited_capacity: 0,
+                unlimited_accounts: 0,
+                saturated_accounts: 0,
+                enabled_accounts: 0,
+            },
         }
     }
 

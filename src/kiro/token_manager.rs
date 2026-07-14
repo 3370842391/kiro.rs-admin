@@ -949,6 +949,8 @@ pub struct CredentialEntrySnapshot {
     pub rpm_limit: u32,
     /// 当前滑动窗口内已用请求条数（前端展示 "rpm_current / rpm_limit"）
     pub rpm_current: u32,
+    /// 当前正在使用该凭据的请求数
+    pub in_flight: u32,
     /// 是否被禁用
     pub disabled: bool,
     /// 连续失败次数
@@ -1134,8 +1136,9 @@ fn credential_matches_request(
     group_matches(&credentials.groups, group)
 }
 
-/// RPM 滑动窗口长度：60 秒。
-const RPM_WINDOW: StdDuration = StdDuration::from_secs(60);
+/// RPM 滑动窗口长度（秒）。
+pub(crate) const RPM_WINDOW_SECONDS: u64 = 60;
+const RPM_WINDOW: StdDuration = StdDuration::from_secs(RPM_WINDOW_SECONDS);
 
 /// 统计 entry 在 [now-60s, now] 窗口内的请求条数（只读，不修改队列）。
 ///
@@ -2428,6 +2431,7 @@ impl MultiTokenManager {
                     priority: e.credentials.priority,
                     rpm_limit: e.credentials.rpm_limit,
                     rpm_current: rpm_window_count(e, now),
+                    in_flight: e.in_flight,
                     disabled: e.disabled,
                     failure_count: e.failure_count,
                     total_failure_count: e.total_failure_count,
@@ -4879,6 +4883,27 @@ mod tests {
         let guard = manager.in_flight_guard(ctx.id);
         drop(guard);
         assert_eq!(in_flight_of(1), 0, "guard drop 后 in_flight 应归零");
+    }
+
+    #[tokio::test]
+    async fn snapshot_exposes_in_flight() {
+        let manager = std::sync::Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![grouped_cred("t1", &[])],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+
+        let context = manager.acquire_context(None, None).await.unwrap();
+        let guard = manager.in_flight_guard(context.id);
+        assert_eq!(manager.snapshot().entries[0].in_flight, 1);
+
+        drop(guard);
+        assert_eq!(manager.snapshot().entries[0].in_flight, 0);
     }
 
     #[tokio::test]
