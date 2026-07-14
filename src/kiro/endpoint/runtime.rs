@@ -19,6 +19,7 @@ use uuid::Uuid;
 use super::ide::inject_profile_arn;
 use super::{KiroEndpoint, RequestContext};
 use crate::kiro::kiro_version;
+use crate::kiro::region::{KiroService, data_plane_host};
 
 /// Kiro Runtime 端点名称
 pub const RUNTIME_ENDPOINT_NAME: &str = "runtime";
@@ -36,7 +37,8 @@ impl RuntimeEndpoint {
     }
 
     fn host(&self, ctx: &RequestContext<'_>) -> String {
-        format!("runtime.{}.kiro.dev", self.api_region(ctx))
+        data_plane_host(KiroService::Runtime, self.api_region(ctx))
+            .expect("API region must be validated before building runtime requests")
     }
 
     fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
@@ -88,14 +90,11 @@ impl KiroEndpoint for RuntimeEndpoint {
     }
 
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!(
-            "https://runtime.{}.kiro.dev/generateAssistantResponse",
-            self.api_region(ctx)
-        )
+        format!("https://{}/generateAssistantResponse", self.host(ctx))
     }
 
     fn mcp_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!("https://runtime.{}.kiro.dev/mcp", self.api_region(ctx))
+        format!("https://{}/mcp", self.host(ctx))
     }
 
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {

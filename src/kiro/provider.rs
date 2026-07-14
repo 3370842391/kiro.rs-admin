@@ -769,6 +769,13 @@ impl KiroProvider {
     /// 根据凭据选择 endpoint 实现
 
     fn endpoint_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
+        if credentials.is_api_key_credential() {
+            let api_region = credentials
+                .api_region
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少必填字段 apiRegion"))?;
+            crate::kiro::region::validate_api_region(api_region)?;
+        }
         let name = credentials
             .endpoint
             .as_deref()

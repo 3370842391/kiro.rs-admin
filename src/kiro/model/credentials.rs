@@ -112,6 +112,10 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
 
+    /// 用户自定义账号标识；与上游返回的真实邮箱相互独立。
+    #[serde(default, alias = "name", skip_serializing_if = "Option::is_none")]
+    pub nickname: Option<String>,
+
     /// 订阅等级（KIRO PRO+ / KIRO FREE 等）
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
@@ -208,6 +212,7 @@ impl std::fmt::Debug for KiroCredentials {
             .field("api_region", &self.api_region)
             .field("machine_id", &fmt_redacted(&self.machine_id))
             .field("email", &self.email)
+            .field("nickname", &self.nickname)
             .field("subscription_title", &self.subscription_title)
             .field("proxy_url", &self.proxy_url)
             .field("proxy_username", &self.proxy_username)
@@ -976,6 +981,7 @@ mod tests {
             api_region: None,
             machine_id: None,
             email: None,
+            nickname: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
@@ -1216,6 +1222,7 @@ mod tests {
             api_region: None,
             machine_id: None,
             email: None,
+            nickname: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
@@ -1255,6 +1262,7 @@ mod tests {
             api_region: None,
             machine_id: None,
             email: None,
+            nickname: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
@@ -1377,6 +1385,7 @@ mod tests {
             api_region: None,
             machine_id: Some("c".repeat(64)),
             email: None,
+            nickname: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
@@ -1476,6 +1485,23 @@ mod tests {
         assert_eq!(creds.region, Some("us-east-1".to_string()));
         assert_eq!(creds.auth_region, None);
         assert_eq!(creds.api_region, None);
+    }
+
+    #[test]
+    fn test_nickname_backward_compatible_and_roundtrip_with_name_alias() {
+        let legacy = KiroCredentials::from_json(r#"{"refreshToken":"legacy"}"#).unwrap();
+        assert_eq!(legacy.nickname, None);
+
+        let aliased =
+            KiroCredentials::from_json(r#"{"refreshToken":"current","name":"EU account"}"#)
+                .unwrap();
+        assert_eq!(aliased.nickname.as_deref(), Some("EU account"));
+
+        let json = aliased.to_pretty_json().unwrap();
+        assert!(json.contains("nickname"));
+        assert!(!json.contains("\"name\""));
+        let parsed = KiroCredentials::from_json(&json).unwrap();
+        assert_eq!(parsed.nickname, aliased.nickname);
     }
 
     // ============ effective_auth_region / effective_api_region 优先级测试 ============

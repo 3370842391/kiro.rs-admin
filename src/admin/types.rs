@@ -74,6 +74,12 @@ pub struct CredentialStatusItem {
     pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
+    /// 用户自定义账号标识（与真实邮箱分开保存）
+    pub nickname: Option<String>,
+    /// Token 认证区域
+    pub auth_region: Option<String>,
+    /// 数据面 API 区域
+    pub api_region: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -225,6 +231,10 @@ pub struct AddCredentialRequest {
     /// 用户邮箱（可选，用于前端显示）
     pub email: Option<String>,
 
+    /// 用户自定义账号标识；兼容第三方导入格式中的 `name`。
+    #[serde(default, alias = "name")]
+    pub nickname: Option<String>,
+
     /// 凭据级代理 URL（可选，特殊值 "direct" 表示不使用代理）
     #[serde(alias = "proxy_url")]
     pub proxy_url: Option<String>,
@@ -282,6 +292,9 @@ pub struct UpdateRefreshTokenRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateCredentialRequest {
+    /// 用户自定义账号标识（空字符串表示清除）
+    #[serde(default, alias = "name")]
+    pub nickname: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
     /// 凭据级代理 URL（空字符串表示清除）
@@ -465,6 +478,9 @@ pub struct AvailableModelsResponse {
     pub id: u64,
     /// 该凭据（按订阅等级）当前可用的模型
     pub models: Vec<AvailableModelItem>,
+    pub resolved_api_region: String,
+    pub resolved_host: String,
+    pub kiro_version: String,
 }
 
 /// 单个可用模型
@@ -1753,6 +1769,25 @@ mod tests {
         assert_eq!(req.machine_id.as_deref(), Some("machine"));
         assert_eq!(req.proxy_url.as_deref(), Some("direct"));
         assert_eq!(req.kiro_api_key.as_deref(), Some("ksk_test"));
+    }
+
+    #[test]
+    fn add_credential_request_accepts_nickname_and_name_alias() {
+        let direct: AddCredentialRequest = serde_json::from_value(serde_json::json!({
+            "authMethod": "api_key",
+            "nickname": "primary",
+            "apiRegion": "us-east-1"
+        }))
+        .unwrap();
+        assert_eq!(direct.nickname.as_deref(), Some("primary"));
+
+        let aliased: AddCredentialRequest = serde_json::from_value(serde_json::json!({
+            "authMethod": "api_key",
+            "name": "legacy-name",
+            "apiRegion": "eu-central-1"
+        }))
+        .unwrap();
+        assert_eq!(aliased.nickname.as_deref(), Some("legacy-name"));
     }
 
     #[test]

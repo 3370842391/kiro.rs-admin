@@ -15,6 +15,7 @@ use uuid::Uuid;
 use super::ide::inject_profile_arn;
 use super::{KiroEndpoint, RequestContext};
 use crate::kiro::kiro_version;
+use crate::kiro::region::{KiroService, data_plane_host};
 
 /// Kiro CodeWhisperer 端点名称
 pub const CODEWHISPERER_ENDPOINT_NAME: &str = "codewhisperer";
@@ -36,7 +37,8 @@ impl CodeWhispererEndpoint {
     }
 
     fn host(&self, ctx: &RequestContext<'_>) -> String {
-        format!("codewhisperer.{}.amazonaws.com", self.api_region(ctx))
+        data_plane_host(KiroService::CodeWhisperer, self.api_region(ctx))
+            .expect("API region must be validated before building CodeWhisperer requests")
     }
 
     fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
@@ -86,17 +88,11 @@ impl KiroEndpoint for CodeWhispererEndpoint {
     }
 
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!(
-            "https://codewhisperer.{}.amazonaws.com/generateAssistantResponse",
-            self.api_region(ctx)
-        )
+        format!("https://{}/generateAssistantResponse", self.host(ctx))
     }
 
     fn mcp_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!(
-            "https://codewhisperer.{}.amazonaws.com/mcp",
-            self.api_region(ctx)
-        )
+        format!("https://{}/mcp", self.host(ctx))
     }
 
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
@@ -167,5 +163,28 @@ mod tests {
             "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse"
         );
         assert_eq!(endpoint.host(&ctx), "codewhisperer.us-east-1.amazonaws.com");
+    }
+
+    #[test]
+    fn test_eu_codewhisperer_uses_q_host() {
+        let endpoint = CodeWhispererEndpoint::new();
+        let config = Config::default();
+        let creds = KiroCredentials {
+            auth_method: Some("api_key".to_string()),
+            api_region: Some("eu-central-1".to_string()),
+            ..Default::default()
+        };
+        let ctx = RequestContext {
+            credentials: &creds,
+            token: "redacted",
+            machine_id: "machine",
+            config: &config,
+        };
+
+        assert_eq!(
+            endpoint.api_url(&ctx),
+            "https://q.eu-central-1.amazonaws.com/generateAssistantResponse"
+        );
+        assert_eq!(endpoint.host(&ctx), "q.eu-central-1.amazonaws.com");
     }
 }

@@ -549,6 +549,9 @@ mod tests {
                     max_input_tokens: Some(1_000_000),
                 }),
             }],
+            resolved_api_region: None,
+            resolved_host: None,
+            kiro_version: None,
         };
         let candidates = candidates_from_kiro(&response);
         assert_eq!(candidates.len(), 1);

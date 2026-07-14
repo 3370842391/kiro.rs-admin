@@ -9,4 +9,5 @@ pub mod model;
 pub mod model_capabilities;
 pub mod parser;
 pub mod provider;
+pub mod region;
 pub mod token_manager;
