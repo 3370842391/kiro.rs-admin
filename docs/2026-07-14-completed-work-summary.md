@@ -94,6 +94,19 @@
 
 主要实现：`admin-ui/src/components/error-snapshot-page.tsx`、`admin-ui/src/components/error-snapshot-dialog.tsx`、`admin-ui/src/hooks/use-error-snapshots.ts`。
 
+### 11. 管理端批量 RPM 与运行容量可视化
+
+- 新增 `PUT /api/admin/credentials/batch`，一次请求批量修改 RPM、分组和来源渠道。
+- 服务端先校验全部 ID 和补丁，再在单次账号写锁内修改；不存在或重复 ID 时零修改，成功批次最多持久化一次。
+- 单批最多 10000 个账号；RPM 范围为 `0..=100000`，其中 `0` 表示不限速。
+- 分组支持 replace/add/remove；分组值最多 100 个，每个名称最多 64 个 Unicode 字符，成员判断使用集合避免大批量退化。
+- 凭据状态响应新增最近 60 秒 RPM 汇总和 `inFlight`；已发生负载包含禁用账号尚未过期的窗口记录，容量只统计启用账号。
+- 管理端状态条显示最近 60 秒 RPM、有限容量/不限速、有限账号剩余、满载账号和进行中请求，不新增独立轮询。
+- 批量编辑改为单个服务端请求；失败时保留弹窗和选择，成功后才刷新并清空选择。
+- RPM 输入支持内联校验、错误焦点和 ARIA 关联；分组模式暴露当前 pressed 状态；320px 页面和弹窗无横向溢出。
+
+主要实现：`src/kiro/token_manager.rs`、`src/admin/types.rs`、`src/admin/service.rs`、`src/admin/handlers.rs`、`src/admin/router.rs`、`admin-ui/src/lib/rpm-operations.ts`、`admin-ui/src/components/batch-edit-credential-dialog.tsx`、`admin-ui/src/components/rpm-status-bar.tsx`。
+
 ## 四、客户可感知影响
 
 | 改动 | 客户影响 | Token/计费影响 |
@@ -105,6 +118,7 @@
 | 严格 SSE | 慢上游在 `message_start` 前不再发送非标准 ping，首个响应字节可能稍晚 | 无变化 |
 | Thinking 签名 | 只改变无原生签名时的 signature 字段，不改变正文 | 无变化 |
 | 错误快照 | 失败路径增加脱敏、压缩和磁盘写入；正常成功请求不写大型正文 | 不改变模型 Token、缓存拆分或计费 |
+| 批量 RPM 与容量展示 | 只影响管理端配置和只读指标；降低 RPM 后账号会在滚动窗口自然回落前暂停接收新请求 | 不改变模型 Token、缓存拆分或计费 |
 
 本轮没有重新注入大型 system prompt，没有硬编码检测站 nonce/答案，也没有修改缓存命中整形、Token 总量或计费拆分。
 
@@ -119,6 +133,18 @@
 - Admin UI `bun test`：19/19 通过。
 - Admin UI `bun run build`：通过，构建 2577 个模块。
 - 错误快照 smoke 脚本契约测试：2/2 通过。
+
+本轮批量 RPM 功能在功能分支上的最终验证结果：
+
+- `cargo test -j 2 --bin kiro-rs --locked --no-default-features`：885/885 通过，0 失败。
+- `cargo check --all-targets --locked --no-default-features`：通过；仅保留项目已有的 14 条非阻塞 warning。
+- `cargo fmt -- --check`：通过。
+- Admin UI `bun test`：57/57 通过，共 148 条断言。
+- Admin UI `bun run build`：通过，生产构建处理 2579 个模块。
+- `git diff --check`：通过。
+- 隔离本地浏览器验收：320px 和 1280px 均无横向溢出；空 RPM 会保持弹窗、聚焦错误字段并暴露 ARIA 错误关联；`rpmLimit=0`、有限账号剩余和分组模式 pressed 状态显示符合协议。
+
+本地合并回 `master` 后仍需对合并结果重新运行 Rust 全量测试、Admin UI 测试与生产构建，不能用分支结果替代合并后验证。
 
 ## 六、Git 状态
 
