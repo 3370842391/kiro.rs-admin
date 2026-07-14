@@ -1,8 +1,19 @@
 // 凭据状态响应
+export interface RpmSummary {
+  windowSeconds: number
+  current: number
+  limitedCapacity: number
+  remainingLimitedCapacity: number
+  unlimitedAccounts: number
+  saturatedAccounts: number
+  enabledAccounts: number
+}
+
 export interface CredentialsStatusResponse {
   total: number
   available: number
   currentId: number
+  rpmSummary: RpmSummary
   credentials: CredentialStatusItem[]
 }
 
@@ -10,6 +21,7 @@ export interface CredentialsStatusResponse {
 export interface CredentialStatusItem {
   id: number
   priority: number
+  inFlight: number
   /** 每分钟请求数上限（0 = 不限速） */
   rpmLimit?: number
   /** 当前滑动窗口内已用请求条数 */
@@ -171,6 +183,25 @@ export interface UpdateCredentialRequest {
   sourceChannel?: string
   /** 每分钟请求数上限（undefined 表示不修改，0 表示不限速） */
   rpmLimit?: number
+}
+
+export interface BatchCredentialGroupPatch {
+  mode: 'replace' | 'add' | 'remove'
+  values: string[]
+}
+
+export interface BatchUpdateCredentialsRequest {
+  ids: number[]
+  rpmLimit?: number
+  groups?: BatchCredentialGroupPatch
+  sourceChannel?: string
+}
+
+export interface BatchUpdateCredentialsResponse {
+  selected: number
+  updated: number
+  unchanged: number
+  rpmSummary: RpmSummary
 }
 
 // 更新 refreshToken 请求
