@@ -272,8 +272,7 @@ mod tests {
         model::config::{Config, TlsBackend},
     };
 
-    #[tokio::test]
-    async fn batch_update_credentials_route_returns_updated_summary() {
+    fn batch_update_test_router() -> Router {
         let credentials = vec![KiroCredentials {
             id: Some(1),
             rpm_limit: 10,
@@ -302,7 +301,12 @@ mod tests {
             Arc::new(ModelMappingManager::new()),
         );
 
-        let response = create_admin_router(state)
+        create_admin_router(state)
+    }
+
+    #[tokio::test]
+    async fn batch_update_credentials_route_returns_updated_summary() {
+        let response = batch_update_test_router()
             .oneshot(
                 Request::builder()
                     .method("PUT")
@@ -321,5 +325,29 @@ mod tests {
         assert_eq!(json["selected"], 1);
         assert_eq!(json["updated"], 1);
         assert_eq!(json["rpmSummary"]["limitedCapacity"], 4);
+    }
+
+    #[tokio::test]
+    async fn batch_update_credentials_route_rejects_missing_or_invalid_admin_key() {
+        for admin_key in [None, Some("wrong-admin-key")] {
+            let mut request = Request::builder()
+                .method("PUT")
+                .uri("/credentials/batch")
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(admin_key) = admin_key {
+                request = request.header("x-api-key", admin_key);
+            }
+
+            let response = batch_update_test_router()
+                .oneshot(
+                    request
+                        .body(Body::from(r#"{"ids":[1],"rpmLimit":4}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
     }
 }

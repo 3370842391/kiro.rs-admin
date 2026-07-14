@@ -3486,6 +3486,12 @@ impl MultiTokenManager {
         ids: &[u64],
         patch: CredentialBatchPatch,
     ) -> Result<CredentialBatchUpdateResult, CredentialBatchUpdateError> {
+        let groups_to_remove = match &patch.groups {
+            Some(CredentialGroupPatch::Remove(groups)) => {
+                Some(groups.iter().cloned().collect::<HashSet<_>>())
+            }
+            _ => None,
+        };
         let result = {
             let mut entries = self.entries.lock();
 
@@ -3526,19 +3532,28 @@ impl MultiTokenManager {
                             }
                         }
                         CredentialGroupPatch::Add(groups) => {
+                            let mut existing_groups = entry
+                                .credentials
+                                .groups
+                                .iter()
+                                .cloned()
+                                .collect::<HashSet<_>>();
                             for group in groups {
-                                if !entry.credentials.groups.contains(group) {
+                                if existing_groups.insert(group.clone()) {
                                     entry.credentials.groups.push(group.clone());
                                     changed = true;
                                 }
                             }
                         }
-                        CredentialGroupPatch::Remove(groups) => {
+                        CredentialGroupPatch::Remove(_) => {
+                            let groups_to_remove = groups_to_remove
+                                .as_ref()
+                                .expect("remove patch membership must be prepared");
                             let original_len = entry.credentials.groups.len();
                             entry
                                 .credentials
                                 .groups
-                                .retain(|group| !groups.contains(group));
+                                .retain(|group| !groups_to_remove.contains(group));
                             changed |= entry.credentials.groups.len() != original_len;
                         }
                     }

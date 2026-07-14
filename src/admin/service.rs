@@ -312,14 +312,30 @@ fn normalize_batch_update_request(
     let groups = request
         .groups
         .map(|groups| {
-            let mut seen = HashSet::with_capacity(groups.values.len());
-            let values = groups
-                .values
-                .into_iter()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-                .filter(|value| seen.insert(value.clone()))
-                .collect::<Vec<_>>();
+            let capacity = groups.values.len().min(100);
+            let mut seen = HashSet::with_capacity(capacity);
+            let mut values = Vec::with_capacity(capacity);
+            for value in groups.values {
+                let value = value.trim();
+                if value.is_empty() {
+                    continue;
+                }
+                if value.chars().count() > 64 {
+                    return Err(AdminServiceError::InvalidCredential(
+                        "分组名过长（最多 64 字符）".to_string(),
+                    ));
+                }
+
+                let value = value.to_string();
+                if seen.insert(value.clone()) {
+                    if values.len() == 100 {
+                        return Err(AdminServiceError::InvalidCredential(
+                            "groups 最多包含 100 个去重后非空分组".to_string(),
+                        ));
+                    }
+                    values.push(value);
+                }
+            }
 
             match groups.mode {
                 BatchGroupMode::Replace => Ok(CredentialGroupPatch::Replace(values)),
@@ -4543,6 +4559,51 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn normalize_batch_update_request_enforces_group_boundaries() {
+        use super::super::types::{
+            BatchGroupMode, BatchGroupsPatchRequest, BatchUpdateCredentialsRequest,
+        };
+        use axum::http::StatusCode;
+
+        let request = |values| BatchUpdateCredentialsRequest {
+            ids: vec![1],
+            rpm_limit: None,
+            groups: Some(BatchGroupsPatchRequest {
+                mode: BatchGroupMode::Replace,
+                values,
+            }),
+            source_channel: None,
+        };
+
+        let mut maximum_groups = (0..100)
+            .map(|index| format!("group-{index}"))
+            .collect::<Vec<_>>();
+        maximum_groups.extend([" group-0 ".to_string(), "  ".to_string()]);
+        let normalized = normalize_batch_update_request(request(maximum_groups)).unwrap();
+        assert_eq!(
+            normalized.patch.groups,
+            Some(CredentialGroupPatch::Replace(
+                (0..100).map(|index| format!("group-{index}")).collect()
+            ))
+        );
+
+        let too_many = normalize_batch_update_request(request(
+            (0..101).map(|index| format!("group-{index}")).collect(),
+        ))
+        .err()
+        .expect("101 个去重后非空分组必须被拒绝");
+        assert_eq!(too_many.status_code(), StatusCode::BAD_REQUEST);
+
+        let maximum_unicode_name = "组".repeat(64);
+        assert!(normalize_batch_update_request(request(vec![maximum_unicode_name])).is_ok());
+
+        let overlong = normalize_batch_update_request(request(vec!["组".repeat(65)]))
+            .err()
+            .expect("65 个 Unicode 字符的分组名必须被拒绝");
+        assert_eq!(overlong.status_code(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
