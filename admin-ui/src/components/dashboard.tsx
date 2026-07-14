@@ -74,6 +74,7 @@ import { CredentialCard } from "@/components/credential-card";
 import { AddCredentialDialog } from "@/components/add-credential-dialog";
 import { BatchImportDialog } from "@/components/batch-import-dialog";
 import { BatchEditCredentialDialog } from "@/components/batch-edit-credential-dialog";
+import { RpmStatusBar } from "@/components/rpm-status-bar";
 import { IdcLoginDialog } from "@/components/idc-login-dialog";
 import { SocialLoginDialog } from "@/components/social-login-dialog";
 import {
@@ -98,6 +99,7 @@ import { useUpdateCheck } from "@/hooks/use-update-check";
 import { useFailureStats } from "@/hooks/use-traces";
 import { useGroupOptions } from "@/hooks/use-groups";
 import { useRectSelect } from "@/hooks/use-rect-select";
+import { totalInFlight } from "@/lib/rpm-operations";
 import {
   Select,
   SelectContent,
@@ -255,6 +257,11 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const { data: updateCheck } = useUpdateCheck();
   const { data: failureStatsMap } = useFailureStats();
   const groupOptions = useGroupOptions();
+  const selectedCredentials = (data?.credentials ?? []).filter((credential) =>
+    selectedIds.has(credential.id),
+  );
+  const selectedCount = selectedCredentials.length;
+  const inFlightRequestCount = data ? totalInFlight(data.credentials) : 0;
 
   // 分组筛选：'' = 全部；'__none__' = 仅显示未分组；其他 = 按分组名筛选
   const [groupFilter, setGroupFilter] = useState<string>("");
@@ -524,11 +531,11 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   };
 
   const handleBatchDelete = async () => {
-    if (selectedIds.size === 0) {
+    if (selectedCount === 0) {
       toast.error("请先选择要删除的凭据");
       return;
     }
-    const ids = Array.from(selectedIds);
+    const ids = selectedCredentials.map((credential) => credential.id);
     if (
       !(await confirm({
         title: "批量删除凭据",
@@ -562,14 +569,13 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   };
 
   const handleBatchResetFailure = async () => {
-    if (selectedIds.size === 0) {
+    if (selectedCount === 0) {
       toast.error("请先选择要恢复的凭据");
       return;
     }
-    const failedIds = Array.from(selectedIds).filter((id) => {
-      const c = data?.credentials.find((x) => x.id === id);
-      return c && c.failureCount > 0;
-    });
+    const failedIds = selectedCredentials
+      .filter((credential) => credential.failureCount > 0)
+      .map((credential) => credential.id);
     if (failedIds.length === 0) {
       toast.error("选中的凭据中没有失败的凭据");
       return;
@@ -603,14 +609,13 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   };
 
   const handleBatchForceRefresh = async () => {
-    if (selectedIds.size === 0) {
+    if (selectedCount === 0) {
       toast.error("请先选择要刷新的凭据");
       return;
     }
-    const enabledIds = Array.from(selectedIds).filter((id) => {
-      const c = data?.credentials.find((x) => x.id === id);
-      return c && !c.disabled;
-    });
+    const enabledIds = selectedCredentials
+      .filter((credential) => !credential.disabled)
+      .map((credential) => credential.id);
     if (enabledIds.length === 0) {
       toast.error("选中的凭据中没有启用的凭据");
       return;
@@ -760,13 +765,13 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   };
 
   const handleBatchVerify = async () => {
-    if (selectedIds.size === 0) {
+    if (selectedCount === 0) {
       toast.error("请先选择要验活的凭据");
       return;
     }
     setVerifying(true);
     cancelVerifyRef.current = false;
-    const ids = Array.from(selectedIds);
+    const ids = selectedCredentials.map((credential) => credential.id);
     setVerifyProgress({ current: 0, total: ids.length });
 
     // id → email，便于结果列表直接看到是哪个账号
@@ -1083,11 +1088,11 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     });
 
   const handleExportCredentials = async (format: ExportFormat) => {
-    if (selectedIds.size === 0) {
+    if (selectedCount === 0) {
       toast.info("请先勾选要导出的凭据");
       return;
     }
-    const ids = Array.from(selectedIds);
+    const ids = selectedCredentials.map((credential) => credential.id);
     setExportingFormat(format);
     try {
       const exportData = await exportKamCredentials(ids);
@@ -1390,9 +1395,9 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   : `全选所有页 (${filteredCredentials.length})`}
               </Button>
             )}
-            {selectedIds.size > 0 && (
+            {selectedCount > 0 && (
               <>
-                <Badge variant="default">已选 {selectedIds.size}</Badge>
+                <Badge variant="default">已选 {selectedCount}</Badge>
                 <Button
                   onClick={deselectAll}
                   size="sm"
@@ -1560,23 +1565,24 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
 
             {/* 操作 — 右（移动端整宽两列网格，桌面端右对齐内联） */}
             <div className="ml-auto grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto sm:flex-wrap sm:items-center">
-              {selectedIds.size > 0 && (
+              {selectedCount > 0 && (
                 <>
                   <Button
                     onClick={() => setBatchEditDialogOpen(true)}
                     size="sm"
                     variant="outline"
-                    title="批量编辑分组 / 来源渠道"
+                    title="批量编辑 RPM / 分组 / 来源渠道"
+                    aria-label="批量编辑 RPM、分组和来源渠道"
                   >
                     <Tags className="h-3.5 w-3.5" />
-                    分组/来源
+                    批量编辑
                   </Button>
                   <Button
                     onClick={handleBatchDelete}
                     size="sm"
                     variant="destructive"
                     className="w-full sm:w-auto"
-                    disabled={selectedIds.size === 0}
+                    disabled={selectedCount === 0}
                   >
                     <Trash2 className="h-3.5 w-3.5" />
                     删除
@@ -1677,14 +1683,18 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   <DropdownMenuLabel>批量操作</DropdownMenuLabel>
                   <DropdownMenuItem
                     onSelect={handleBatchVerify}
-                    disabled={selectedIds.size === 0}
+                    disabled={selectedCount === 0}
                   >
                     <CheckCircle2 />
                     批量验活
                   </DropdownMenuItem>
                   <DropdownMenuItem
-                    onSelect={() => openResponseTest(Array.from(selectedIds))}
-                    disabled={selectedIds.size === 0}
+                    onSelect={() =>
+                      openResponseTest(
+                        selectedCredentials.map((credential) => credential.id),
+                      )
+                    }
+                    disabled={selectedCount === 0}
                   >
                     <Activity />
                     测试响应
@@ -1694,7 +1704,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                       e.preventDefault();
                       handleBatchForceRefresh();
                     }}
-                    disabled={selectedIds.size === 0 || batchRefreshing}
+                    disabled={selectedCount === 0 || batchRefreshing}
                   >
                     <RefreshCw
                       className={batchRefreshing ? "animate-spin" : ""}
@@ -1705,7 +1715,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   </DropdownMenuItem>
                   <DropdownMenuItem
                     onSelect={handleBatchResetFailure}
-                    disabled={selectedIds.size === 0}
+                    disabled={selectedCount === 0}
                   >
                     <RotateCcw />
                     恢复异常
@@ -1813,6 +1823,11 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
             </div>
           </div>
         </div>
+
+        <RpmStatusBar
+          summary={data ? data.rpmSummary : undefined}
+          totalInFlight={inFlightRequestCount}
+        />
 
         {/* 列表 */}
         {data?.credentials.length === 0 ? (
@@ -1951,9 +1966,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       <BatchEditCredentialDialog
         open={batchEditDialogOpen}
         onOpenChange={setBatchEditDialogOpen}
-        credentials={(data?.credentials ?? []).filter((c) =>
-          selectedIds.has(c.id),
-        )}
+        credentials={selectedCredentials}
         groupOptions={groupOptions}
         onDone={deselectAll}
       />

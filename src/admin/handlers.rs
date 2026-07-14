@@ -23,17 +23,17 @@ use super::{
     types::{
         AddCredentialRequest, AddProxyRequest, ApplyModelProfilesRequest, AssignProxyRequest,
         AssignRoundRobinRequest, BatchAddProxyRequest, BatchImportEvent, BatchImportRequest,
-        BatchImportSummary, ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest,
-        CreateClientKeyRequest, CreateClientKeyResponse, CredentialResponseTestRequest,
-        FetchModelProfileRequest, GlobalProxyResponse, PatchModelProfileRequest,
-        PreviewModelProfilesRequest, ProxyCheckUrlRequest, RevisionRequest,
-        SetAccountThrottleConfigRequest, SetCacheHitRateRequest, SetCachePolicyRequest,
-        SetDisabledRequest, SetEndpointChainsRequest, SetGlobalProxyRequest, SetImageBudgetRequest,
-        SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetModelProfileSettingsRequest,
-        SetPriorityRequest, SetProxyBalancingModeRequest, SetRetryPolicyRequest,
-        SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
-        SyncModelProfilesRequest, UpdateAdminKeyRequest, UpdateClientKeyRequest,
-        UpdateCredentialRequest, UpdateRefreshTokenRequest,
+        BatchImportSummary, BatchUpdateCredentialsRequest, ClientKeyItem, ClientKeysResponse,
+        CompleteSocialLoginRequest, CreateClientKeyRequest, CreateClientKeyResponse,
+        CredentialResponseTestRequest, FetchModelProfileRequest, GlobalProxyResponse,
+        PatchModelProfileRequest, PreviewModelProfilesRequest, ProxyCheckUrlRequest,
+        RevisionRequest, SetAccountThrottleConfigRequest, SetCacheHitRateRequest,
+        SetCachePolicyRequest, SetDisabledRequest, SetEndpointChainsRequest, SetGlobalProxyRequest,
+        SetImageBudgetRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
+        SetModelProfileSettingsRequest, SetPriorityRequest, SetProxyBalancingModeRequest,
+        SetRetryPolicyRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
+        StartSocialLoginRequest, SuccessResponse, SyncModelProfilesRequest, UpdateAdminKeyRequest,
+        UpdateClientKeyRequest, UpdateCredentialRequest, UpdateRefreshTokenRequest,
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
 };
@@ -126,6 +126,18 @@ pub async fn set_model_profile_settings(
 pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoResponse {
     let response = state.service.get_all_credentials();
     Json(response)
+}
+
+/// PUT /api/admin/credentials/batch
+/// 批量更新凭据的 RPM、分组与来源渠道
+pub async fn batch_update_credentials(
+    State(state): State<AdminState>,
+    Json(request): Json<BatchUpdateCredentialsRequest>,
+) -> impl IntoResponse {
+    match state.service.batch_update_credentials(request) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
 }
 
 /// GET /api/admin/credentials/export

@@ -18,6 +18,21 @@ pub struct CredentialsStatusResponse {
     pub current_id: u64,
     /// 各凭据状态列表
     pub credentials: Vec<CredentialStatusItem>,
+    /// 当前 RPM 容量汇总
+    pub rpm_summary: RpmSummary,
+}
+
+/// 当前 RPM 容量汇总
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpmSummary {
+    pub window_seconds: u64,
+    pub current: u64,
+    pub limited_capacity: u64,
+    pub remaining_limited_capacity: u64,
+    pub unlimited_accounts: u64,
+    pub saturated_accounts: u64,
+    pub enabled_accounts: u64,
 }
 
 /// 单个凭据的状态信息
@@ -32,6 +47,8 @@ pub struct CredentialStatusItem {
     pub rpm_limit: u32,
     /// 当前滑动窗口内已用请求条数
     pub rpm_current: u32,
+    /// 当前正在使用该凭据的请求数
+    pub in_flight: u32,
     /// 是否被禁用
     pub disabled: bool,
     /// 连续失败次数
@@ -282,6 +299,46 @@ pub struct UpdateCredentialRequest {
     /// 每分钟请求数上限（None 表示不修改，0 表示不限速）
     #[serde(default)]
     pub rpm_limit: Option<u32>,
+}
+
+/// 批量分组修改模式
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BatchGroupMode {
+    Replace,
+    Add,
+    Remove,
+}
+
+/// 批量分组修改请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchGroupsPatchRequest {
+    pub mode: BatchGroupMode,
+    pub values: Vec<String>,
+}
+
+/// 批量修改凭据请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchUpdateCredentialsRequest {
+    pub ids: Vec<u64>,
+    #[serde(default)]
+    pub rpm_limit: Option<u32>,
+    #[serde(default)]
+    pub groups: Option<BatchGroupsPatchRequest>,
+    #[serde(default)]
+    pub source_channel: Option<String>,
+}
+
+/// 批量修改凭据响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchUpdateCredentialsResponse {
+    pub selected: usize,
+    pub updated: usize,
+    pub unchanged: usize,
+    pub rpm_summary: RpmSummary,
 }
 
 /// 添加凭据成功响应
@@ -1713,5 +1770,26 @@ mod tests {
         assert_eq!(req.proxy_url.as_deref(), Some("direct"));
         assert_eq!(req.rpm_limit, Some(3));
         assert_eq!(req.credentials.len(), 1);
+    }
+
+    #[test]
+    fn batch_update_request_deserializes_camel_case() {
+        let request: BatchUpdateCredentialsRequest = serde_json::from_value(serde_json::json!({
+            "ids": [3, 7],
+            "rpmLimit": 0,
+            "groups": {
+                "mode": "add",
+                "values": ["team-a", "team-b"]
+            },
+            "sourceChannel": "migration"
+        }))
+        .unwrap();
+
+        assert_eq!(request.ids, vec![3, 7]);
+        assert_eq!(request.rpm_limit, Some(0));
+        let groups = request.groups.unwrap();
+        assert_eq!(groups.mode, BatchGroupMode::Add);
+        assert_eq!(groups.values, vec!["team-a", "team-b"]);
+        assert_eq!(request.source_channel.as_deref(), Some("migration"));
     }
 }

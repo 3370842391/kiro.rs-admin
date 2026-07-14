@@ -1,6 +1,7 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   getCredentials,
+  batchUpdateCredentials,
   setCredentialDisabled,
   setCredentialPriority,
   resetCredentialFailure,
@@ -38,6 +39,16 @@ export function useCredentials() {
     queryKey: ['credentials'],
     queryFn: getCredentials,
     refetchInterval: 30000, // 每 30 秒刷新一次
+  })
+}
+
+export function useBatchUpdateCredentials() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: batchUpdateCredentials,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
   })
 }
 

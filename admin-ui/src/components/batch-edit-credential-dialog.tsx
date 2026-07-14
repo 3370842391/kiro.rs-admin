@@ -1,6 +1,5 @@
-import { useState, useEffect } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { toast } from 'sonner'
-import { useQueryClient } from '@tanstack/react-query'
 import {
   Dialog,
   DialogContent,
@@ -13,7 +12,9 @@ import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
 import { Input } from '@/components/ui/input'
 import { GroupMultiSelect } from '@/components/group-select'
-import { updateCredential } from '@/api/credentials'
+import { useBatchUpdateCredentials } from '@/hooks/use-credentials'
+import { buildBatchUpdateRequest, parseRpmLimit } from '@/lib/rpm-operations'
+import { extractErrorMessage } from '@/lib/utils'
 import type { CredentialStatusItem } from '@/types/api'
 
 type GroupMode = 'replace' | 'add' | 'remove'
@@ -21,18 +22,15 @@ type GroupMode = 'replace' | 'add' | 'remove'
 interface BatchEditCredentialDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
-  /** 选中的账号对象（add/remove 模式需读各自当前 groups） */
   credentials: CredentialStatusItem[]
-  /** 现有分组选项（去重聚合） */
   groupOptions: string[]
-  /** 完成后回调（清空选择等） */
   onDone: () => void
 }
 
 const MODE_LABELS: { value: GroupMode; label: string; desc: string }[] = [
-  { value: 'replace', label: '替换', desc: '用所选分组覆盖各账号原有分组（不选=清除分组）' },
-  { value: 'add', label: '追加', desc: '把所选分组并入各账号原有分组（去重）' },
-  { value: 'remove', label: '移除', desc: '从各账号分组里移除所选分组' },
+  { value: 'replace', label: '替换', desc: '用所选分组覆盖原分组；不选则清除分组。' },
+  { value: 'add', label: '追加', desc: '将所选分组加入原分组。' },
+  { value: 'remove', label: '移除', desc: '从原分组中移除所选分组。' },
 ]
 
 export function BatchEditCredentialDialog({
@@ -42,141 +40,238 @@ export function BatchEditCredentialDialog({
   groupOptions,
   onDone,
 }: BatchEditCredentialDialogProps) {
-  const queryClient = useQueryClient()
-
+  const batchUpdate = useBatchUpdateCredentials()
+  const [editRpm, setEditRpm] = useState(false)
+  const [rpmLimitDraft, setRpmLimitDraft] = useState('10')
+  const [rpmError, setRpmError] = useState('')
+  const rpmInputRef = useRef<HTMLInputElement>(null)
   const [editGroups, setEditGroups] = useState(false)
   const [mode, setMode] = useState<GroupMode>('replace')
   const [groups, setGroups] = useState<string[]>([])
-
   const [editSource, setEditSource] = useState(false)
   const [sourceChannel, setSourceChannel] = useState('')
-
   const [running, setRunning] = useState(false)
-  const [progress, setProgress] = useState({ current: 0, total: 0 })
 
   useEffect(() => {
-    if (open) {
-      setEditGroups(false)
-      setMode('replace')
-      setGroups([])
-      setEditSource(false)
-      setSourceChannel('')
-      setRunning(false)
-      setProgress({ current: 0, total: 0 })
-    }
+    if (!open) return
+    setEditRpm(false)
+    setRpmLimitDraft('10')
+    setRpmError('')
+    setEditGroups(false)
+    setMode('replace')
+    setGroups([])
+    setEditSource(false)
+    setSourceChannel('')
+    setRunning(false)
   }, [open])
 
-  const computeGroups = (current: string[]): string[] => {
-    if (mode === 'replace') return groups
-    if (mode === 'add') return Array.from(new Set([...current, ...groups]))
-    // remove
-    return current.filter((g) => !groups.includes(g))
-  }
+  const handleApply = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (running) return
 
-  const handleApply = async () => {
-    if (!editGroups && !editSource) {
-      toast.error('请至少开启一项要修改的字段')
+    if (editRpm) {
+      const parsedRpm = parseRpmLimit(rpmLimitDraft)
+      if (!parsedRpm.ok) {
+        setRpmError(parsedRpm.message)
+        rpmInputRef.current?.focus()
+        return
+      }
+    }
+    setRpmError('')
+
+    const request = buildBatchUpdateRequest({
+      ids: credentials.map((credential) => credential.id),
+      editRpm,
+      rpmDraft: rpmLimitDraft,
+      editGroups,
+      groupMode: mode,
+      groups,
+      editSource,
+      sourceChannel,
+    })
+    if (!request.ok) {
+      toast.error(request.message)
       return
     }
+
     setRunning(true)
-    setProgress({ current: 0, total: credentials.length })
-    let ok = 0
-    let fail = 0
-    for (let i = 0; i < credentials.length; i++) {
-      const c = credentials[i]
-      const req: Record<string, unknown> = {}
-      if (editGroups) req.groups = computeGroups(c.groups ?? [])
-      if (editSource) req.sourceChannel = sourceChannel.trim()
-      try {
-        await updateCredential(c.id, req)
-        ok++
-      } catch {
-        fail++
-      }
-      setProgress({ current: i + 1, total: credentials.length })
+    let result
+    try {
+      result = await batchUpdate.mutateAsync(request.value)
+    } catch (error) {
+      toast.error('批量更新失败: ' + extractErrorMessage(error))
+      return
+    } finally {
+      setRunning(false)
     }
-    await queryClient.invalidateQueries({ queryKey: ['credentials'] })
-    setRunning(false)
-    if (fail === 0) toast.success(`已更新 ${ok} 个账号`)
-    else toast.warning(`成功 ${ok} 个，失败 ${fail} 个`)
+
+    toast.success(`已更新 ${result.updated} 个账号，${result.unchanged} 个未变化`)
     onOpenChange(false)
     onDone()
   }
 
+  const rpmHint =
+    rpmLimitDraft.trim() === '0'
+      ? '不限速'
+      : `最近60秒上限：${rpmLimitDraft.trim() || '—'} 次`
+
   return (
-    <Dialog open={open} onOpenChange={(o) => !running && onOpenChange(o)}>
-      <DialogContent className="sm:max-w-md">
+    <Dialog open={open} onOpenChange={(nextOpen) => !running && onOpenChange(nextOpen)}>
+      <DialogContent className="max-h-[calc(100dvh-2rem)] overflow-y-auto p-4 sm:p-6 sm:max-w-md">
         <DialogHeader>
           <DialogTitle>批量编辑（{credentials.length} 个账号）</DialogTitle>
           <DialogDescription>
-            仅修改下方开启的字段，未开启的字段保持不变。
+            仅修改已开启的字段，未开启的字段保持不变。
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-5 py-2">
-          {/* 分组区 */}
-          <div className="space-y-3 rounded-xl border border-border/60 p-3">
-            <label className="flex items-center justify-between">
-              <span className="text-sm font-medium">修改分组</span>
-              <Switch checked={editGroups} onCheckedChange={setEditGroups} disabled={running} />
+        <form onSubmit={handleApply} noValidate className="space-y-4">
+          <section className="space-y-3 rounded-md border border-border/60 p-3">
+            <label htmlFor="batch-edit-rpm" className="flex min-h-11 items-center justify-between gap-3">
+              <span className="text-sm font-medium">修改 RPM 上限</span>
+              <Switch
+                id="batch-edit-rpm"
+                checked={editRpm}
+                onCheckedChange={setEditRpm}
+                disabled={running}
+              />
             </label>
-            {editGroups && (
+            {editRpm ? (
+              <div className="space-y-2">
+                <label htmlFor="batch-rpm-limit" className="block text-xs font-medium text-muted-foreground">
+                  最近60秒请求上限
+                </label>
+                <Input
+                  ref={rpmInputRef}
+                  id="batch-rpm-limit"
+                  name="rpmLimit"
+                  autoComplete="off"
+                  type="number"
+                  inputMode="numeric"
+                  min={0}
+                  max={100000}
+                  step={1}
+                  value={rpmLimitDraft}
+                  onChange={(event) => {
+                    setRpmLimitDraft(event.target.value)
+                    setRpmError('')
+                  }}
+                  aria-invalid={Boolean(rpmError)}
+                  aria-describedby={
+                    rpmError
+                      ? 'batch-rpm-limit-hint batch-rpm-limit-error'
+                      : 'batch-rpm-limit-hint'
+                  }
+                  disabled={running}
+                  className="h-11 sm:h-9 tabular-nums"
+                />
+                {rpmError ? (
+                  <p id="batch-rpm-limit-error" className="text-xs text-destructive" role="alert">
+                    {rpmError}
+                  </p>
+                ) : null}
+                <p id="batch-rpm-limit-hint" className="text-xs text-muted-foreground">
+                  {rpmHint}
+                </p>
+              </div>
+            ) : null}
+          </section>
+
+          <section className="space-y-3 rounded-md border border-border/60 p-3">
+            <label htmlFor="batch-edit-groups" className="flex min-h-11 items-center justify-between gap-3">
+              <span className="text-sm font-medium">修改分组</span>
+              <Switch
+                id="batch-edit-groups"
+                checked={editGroups}
+                onCheckedChange={setEditGroups}
+                disabled={running}
+              />
+            </label>
+            {editGroups ? (
               <>
-                <div className="flex gap-2">
-                  {MODE_LABELS.map((m) => (
+                <p id="batch-group-mode-label" className="text-xs font-medium text-muted-foreground">
+                  分组修改方式
+                </p>
+                <div
+                  role="group"
+                  aria-labelledby="batch-group-mode-label"
+                  aria-describedby="batch-group-mode-description"
+                  className="grid grid-cols-3 gap-2"
+                >
+                  {MODE_LABELS.map((item) => (
                     <Button
-                      key={m.value}
+                      key={item.value}
                       type="button"
                       size="sm"
-                      variant={mode === m.value ? 'default' : 'outline'}
-                      onClick={() => setMode(m.value)}
+                      className="h-11 sm:h-8"
+                      aria-pressed={mode === item.value}
+                      variant={mode === item.value ? 'default' : 'outline'}
+                      onClick={() => setMode(item.value)}
                       disabled={running}
                     >
-                      {m.label}
+                      {item.label}
                     </Button>
                   ))}
                 </div>
-                <p className="text-[11px] text-muted-foreground">
-                  {MODE_LABELS.find((m) => m.value === mode)?.desc}
+                <p id="batch-group-mode-description" className="text-xs text-muted-foreground">
+                  {MODE_LABELS.find((item) => item.value === mode)?.desc}
                 </p>
-                <GroupMultiSelect
-                  value={groups}
-                  options={groupOptions}
-                  onChange={setGroups}
-                  disabled={running}
-                />
+                <div className="min-h-11 [&_button]:h-11 sm:[&_button]:h-9">
+                  <GroupMultiSelect
+                    value={groups}
+                    options={groupOptions}
+                    onChange={setGroups}
+                    disabled={running}
+                  />
+                </div>
               </>
-            )}
-          </div>
+            ) : null}
+          </section>
 
-          {/* 来源渠道区 */}
-          <div className="space-y-3 rounded-xl border border-border/60 p-3">
-            <label className="flex items-center justify-between">
+          <section className="space-y-3 rounded-md border border-border/60 p-3">
+            <label htmlFor="batch-edit-source" className="flex min-h-11 items-center justify-between gap-3">
               <span className="text-sm font-medium">修改来源渠道</span>
-              <Switch checked={editSource} onCheckedChange={setEditSource} disabled={running} />
+              <Switch
+                id="batch-edit-source"
+                checked={editSource}
+                onCheckedChange={setEditSource}
+                disabled={running}
+              />
             </label>
-            {editSource && (
-              <>
+            {editSource ? (
+              <div className="space-y-2">
+                <label htmlFor="batch-source-channel" className="block text-xs font-medium text-muted-foreground">
+                  来源渠道
+                </label>
                 <Input
-                  placeholder="应用到所有选中账号（留空 = 清除）"
+                  id="batch-source-channel"
+                  name="sourceChannel"
+                  autoComplete="off"
+                  placeholder="留空以清除来源渠道…"
                   value={sourceChannel}
-                  onChange={(e) => setSourceChannel(e.target.value)}
+                  onChange={(event) => setSourceChannel(event.target.value)}
                   disabled={running}
+                  className="h-11 sm:h-9"
                 />
-                <p className="text-[11px] text-muted-foreground">纯备注，标记账号来源/渠道。</p>
-              </>
-            )}
-          </div>
-        </div>
+              </div>
+            ) : null}
+          </section>
 
-        <DialogFooter>
-          <Button type="button" variant="outline" onClick={() => onOpenChange(false)} disabled={running}>
-            取消
-          </Button>
-          <Button type="button" onClick={handleApply} disabled={running}>
-            {running ? `应用中… ${progress.current}/${progress.total}` : '应用'}
-          </Button>
-        </DialogFooter>
+          <DialogFooter className="pt-1">
+            <Button
+              type="button"
+              variant="outline"
+              className="w-full h-11 sm:h-9 sm:w-auto"
+              onClick={() => onOpenChange(false)}
+              disabled={running}
+            >
+              取消
+            </Button>
+            <Button type="submit" className="w-full h-11 sm:h-9 sm:w-auto" disabled={running}>
+              {running ? '应用中…' : '应用'}
+            </Button>
+          </DialogFooter>
+        </form>
       </DialogContent>
     </Dialog>
   )

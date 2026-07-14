@@ -12,6 +12,8 @@ import type {
   AddCredentialRequest,
   AddCredentialResponse,
   UpdateCredentialRequest,
+  BatchUpdateCredentialsRequest,
+  BatchUpdateCredentialsResponse,
   UpdateRefreshTokenRequest,
   ProxyPoolEntry,
   ProxyPoolResponse,
@@ -61,6 +63,15 @@ api.interceptors.request.use((config) => {
 // 获取所有凭据状态
 export async function getCredentials(): Promise<CredentialsStatusResponse> {
   const { data } = await api.get<CredentialsStatusResponse>('/credentials')
+  return data
+}
+
+export async function batchUpdateCredentials(
+  req: BatchUpdateCredentialsRequest
+): Promise<BatchUpdateCredentialsResponse> {
+  const { data } = await api.put<BatchUpdateCredentialsResponse>('/credentials/batch', req, {
+    timeout: 30_000,
+  })
   return data
 }
 

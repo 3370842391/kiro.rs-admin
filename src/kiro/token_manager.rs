@@ -949,6 +949,8 @@ pub struct CredentialEntrySnapshot {
     pub rpm_limit: u32,
     /// 当前滑动窗口内已用请求条数（前端展示 "rpm_current / rpm_limit"）
     pub rpm_current: u32,
+    /// 当前正在使用该凭据的请求数
+    pub in_flight: u32,
     /// 是否被禁用
     pub disabled: bool,
     /// 连续失败次数
@@ -1014,6 +1016,41 @@ pub struct ManagerSnapshot {
     pub total: usize,
     /// 可用凭据数量
     pub available: usize,
+}
+
+/// 批量修改账号分组的操作。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CredentialGroupPatch {
+    Replace(Vec<String>),
+    Add(Vec<String>),
+    Remove(Vec<String>),
+}
+
+/// 批量账号配置补丁。字段为 `None` 时保持原值不变。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CredentialBatchPatch {
+    pub rpm_limit: Option<u32>,
+    pub groups: Option<CredentialGroupPatch>,
+    /// 外层 `None` 表示不修改，`Some(None)` 表示清除来源渠道。
+    pub source_channel: Option<Option<String>>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CredentialBatchUpdateError {
+    #[error("批量更新包含重复的凭据 ID: {0}")]
+    DuplicateId(u64),
+    #[error("凭据不存在: {0}")]
+    NotFound(u64),
+    #[error("批量凭据更新持久化失败")]
+    Persist(#[source] anyhow::Error),
+}
+
+/// 批量账号配置更新统计。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CredentialBatchUpdateResult {
+    pub selected: usize,
+    pub updated: usize,
+    pub unchanged: usize,
 }
 
 /// 多凭据 Token 管理器
@@ -1134,8 +1171,9 @@ fn credential_matches_request(
     group_matches(&credentials.groups, group)
 }
 
-/// RPM 滑动窗口长度：60 秒。
-const RPM_WINDOW: StdDuration = StdDuration::from_secs(60);
+/// RPM 滑动窗口长度（秒）。
+pub(crate) const RPM_WINDOW_SECONDS: u64 = 60;
+const RPM_WINDOW: StdDuration = StdDuration::from_secs(RPM_WINDOW_SECONDS);
 
 /// 统计 entry 在 [now-60s, now] 窗口内的请求条数（只读，不修改队列）。
 ///
@@ -2428,6 +2466,7 @@ impl MultiTokenManager {
                     priority: e.credentials.priority,
                     rpm_limit: e.credentials.rpm_limit,
                     rpm_current: rpm_window_count(e, now),
+                    in_flight: e.in_flight,
                     disabled: e.disabled,
                     failure_count: e.failure_count,
                     total_failure_count: e.total_failure_count,
@@ -3436,6 +3475,115 @@ impl MultiTokenManager {
         }
         self.persist_credentials()?;
         Ok(())
+    }
+
+    /// 批量更新账号的 RPM、分组与来源渠道配置。
+    ///
+    /// 所有 ID 校验与内存变更都在一次 `entries` 锁内完成，因此内存补丁是原子的。
+    /// 锁释放后才持久化；持久化失败会返回错误，但不会回滚已完成的内存变更。
+    pub(crate) fn batch_update_credentials(
+        &self,
+        ids: &[u64],
+        patch: CredentialBatchPatch,
+    ) -> Result<CredentialBatchUpdateResult, CredentialBatchUpdateError> {
+        let groups_to_remove = match &patch.groups {
+            Some(CredentialGroupPatch::Remove(groups)) => {
+                Some(groups.iter().cloned().collect::<HashSet<_>>())
+            }
+            _ => None,
+        };
+        let result = {
+            let mut entries = self.entries.lock();
+
+            let mut target_ids = HashSet::with_capacity(ids.len());
+            for &id in ids {
+                if !target_ids.insert(id) {
+                    return Err(CredentialBatchUpdateError::DuplicateId(id));
+                }
+            }
+
+            let existing_ids: HashSet<u64> = entries.iter().map(|entry| entry.id).collect();
+            for &id in ids {
+                if !existing_ids.contains(&id) {
+                    return Err(CredentialBatchUpdateError::NotFound(id));
+                }
+            }
+
+            let mut updated = 0;
+            for entry in entries
+                .iter_mut()
+                .filter(|entry| target_ids.contains(&entry.id))
+            {
+                let mut changed = false;
+
+                if let Some(rpm_limit) = patch.rpm_limit
+                    && entry.credentials.rpm_limit != rpm_limit
+                {
+                    entry.credentials.rpm_limit = rpm_limit;
+                    changed = true;
+                }
+
+                if let Some(groups_patch) = &patch.groups {
+                    match groups_patch {
+                        CredentialGroupPatch::Replace(groups) => {
+                            if entry.credentials.groups != *groups {
+                                entry.credentials.groups = groups.clone();
+                                changed = true;
+                            }
+                        }
+                        CredentialGroupPatch::Add(groups) => {
+                            let mut existing_groups = entry
+                                .credentials
+                                .groups
+                                .iter()
+                                .cloned()
+                                .collect::<HashSet<_>>();
+                            for group in groups {
+                                if existing_groups.insert(group.clone()) {
+                                    entry.credentials.groups.push(group.clone());
+                                    changed = true;
+                                }
+                            }
+                        }
+                        CredentialGroupPatch::Remove(_) => {
+                            let groups_to_remove = groups_to_remove
+                                .as_ref()
+                                .expect("remove patch membership must be prepared");
+                            let original_len = entry.credentials.groups.len();
+                            entry
+                                .credentials
+                                .groups
+                                .retain(|group| !groups_to_remove.contains(group));
+                            changed |= entry.credentials.groups.len() != original_len;
+                        }
+                    }
+                }
+
+                if let Some(source_channel) = &patch.source_channel
+                    && entry.credentials.source_channel != *source_channel
+                {
+                    entry.credentials.source_channel = source_channel.clone();
+                    changed = true;
+                }
+
+                if changed {
+                    updated += 1;
+                }
+            }
+
+            CredentialBatchUpdateResult {
+                selected: ids.len(),
+                updated,
+                unchanged: ids.len() - updated,
+            }
+        };
+
+        if result.updated > 0 {
+            self.persist_credentials()
+                .map_err(CredentialBatchUpdateError::Persist)?;
+        }
+
+        Ok(result)
     }
 
     /// 列出所有凭据当前引用的分组名（去重排序）。
@@ -4846,6 +4994,375 @@ mod tests {
         assert_eq!(KiroCredentials::default().rpm_limit, 0);
     }
 
+    fn batch_test_credential(
+        id: u64,
+        rpm_limit: u32,
+        groups: &[&str],
+        source_channel: Option<&str>,
+    ) -> KiroCredentials {
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(id);
+        credential.auth_method = Some("api_key".to_string());
+        credential.kiro_api_key = Some(format!("ksk_batch_test_{id}"));
+        credential.machine_id = Some(format!("batch-test-machine-{id}"));
+        credential.rpm_limit = rpm_limit;
+        credential.groups = groups.iter().map(|group| (*group).to_string()).collect();
+        credential.source_channel = source_channel.map(str::to_string);
+        credential
+    }
+
+    #[test]
+    fn batch_update_credentials_validates_ten_thousand_ids() {
+        let credentials = (1..=10_000)
+            .map(|id| batch_test_credential(id, 10, &[], None))
+            .collect();
+        let ids: Vec<u64> = (1..=10_000).collect();
+        let manager =
+            MultiTokenManager::new(Config::default(), credentials, None, None, true).unwrap();
+
+        let result = manager
+            .batch_update_credentials(
+                &ids,
+                CredentialBatchPatch {
+                    rpm_limit: Some(7),
+                    groups: None,
+                    source_channel: None,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(result.selected, 10_000);
+        assert_eq!(result.updated, 10_000);
+        assert_eq!(result.unchanged, 0);
+        assert!(
+            manager
+                .clone_all_credentials()
+                .iter()
+                .all(|credential| credential.rpm_limit == 7)
+        );
+    }
+
+    #[test]
+    fn batch_update_credentials_updates_all_targets_and_persists() {
+        let path = tmp_creds_path("batch_update_all_targets");
+        let _ = std::fs::remove_file(&path);
+        let credentials = vec![
+            batch_test_credential(1, 10, &["old-a"], Some("legacy-a")),
+            batch_test_credential(2, 20, &["old-b"], None),
+        ];
+        std::fs::write(&path, serde_json::to_vec_pretty(&credentials).unwrap()).unwrap();
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            credentials,
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+
+        let result = manager
+            .batch_update_credentials(
+                &[1, 2],
+                CredentialBatchPatch {
+                    rpm_limit: Some(0),
+                    groups: None,
+                    source_channel: Some(Some("batch-import".to_string())),
+                },
+            )
+            .unwrap();
+        assert_eq!(result.selected, 2);
+        assert_eq!(result.updated, 2);
+        assert_eq!(result.unchanged, 0);
+
+        let unchanged = manager
+            .batch_update_credentials(
+                &[1, 2],
+                CredentialBatchPatch {
+                    rpm_limit: Some(0),
+                    groups: None,
+                    source_channel: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(unchanged.selected, 2);
+        assert_eq!(unchanged.updated, 0);
+        assert_eq!(unchanged.unchanged, 2);
+
+        let cleared = manager
+            .batch_update_credentials(
+                &[2],
+                CredentialBatchPatch {
+                    rpm_limit: None,
+                    groups: None,
+                    source_channel: Some(None),
+                },
+            )
+            .unwrap();
+        assert_eq!(cleared.updated, 1);
+
+        let memory = manager.clone_all_credentials();
+        let first = memory
+            .iter()
+            .find(|credential| credential.id == Some(1))
+            .unwrap();
+        let second = memory
+            .iter()
+            .find(|credential| credential.id == Some(2))
+            .unwrap();
+        assert_eq!(first.rpm_limit, 0, "0 必须保留不限速语义");
+        assert_eq!(second.rpm_limit, 0, "所有目标都应被更新");
+        assert_eq!(first.source_channel.as_deref(), Some("batch-import"));
+        assert_eq!(second.source_channel, None, "Some(None) 应清除来源渠道");
+
+        let persisted: Vec<KiroCredentials> =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let persisted_first = persisted
+            .iter()
+            .find(|credential| credential.id == Some(1))
+            .unwrap();
+        let persisted_second = persisted
+            .iter()
+            .find(|credential| credential.id == Some(2))
+            .unwrap();
+        assert_eq!(persisted_first.rpm_limit, 0);
+        assert_eq!(
+            persisted_first.source_channel.as_deref(),
+            Some("batch-import")
+        );
+        assert_eq!(persisted_second.rpm_limit, 0);
+        assert_eq!(persisted_second.source_channel, None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn batch_update_credentials_missing_id_is_fail_closed() {
+        let path = tmp_creds_path("batch_update_missing_id");
+        let _ = std::fs::remove_file(&path);
+        let credentials = vec![
+            batch_test_credential(1, 10, &["a"], Some("source-a")),
+            batch_test_credential(2, 20, &["b"], Some("source-b")),
+        ];
+        std::fs::write(&path, serde_json::to_vec_pretty(&credentials).unwrap()).unwrap();
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            credentials,
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+        let memory_before = serde_json::to_value(manager.clone_all_credentials()).unwrap();
+        let disk_before = std::fs::read(&path).unwrap();
+
+        let error = manager
+            .batch_update_credentials(
+                &[1, 999],
+                CredentialBatchPatch {
+                    rpm_limit: Some(3),
+                    groups: Some(CredentialGroupPatch::Replace(vec!["new".to_string()])),
+                    source_channel: Some(None),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, CredentialBatchUpdateError::NotFound(999)));
+        assert_eq!(
+            serde_json::to_value(manager.clone_all_credentials()).unwrap(),
+            memory_before,
+            "任一 ID 缺失时内存不得部分更新"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            disk_before,
+            "任一 ID 缺失时磁盘不得部分更新"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn batch_update_credentials_rejects_duplicate_ids() {
+        let path = tmp_creds_path("batch_update_duplicate_ids");
+        let _ = std::fs::remove_file(&path);
+        let credentials = vec![batch_test_credential(1, 10, &["a"], Some("source-a"))];
+        std::fs::write(&path, serde_json::to_vec_pretty(&credentials).unwrap()).unwrap();
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            credentials,
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+        let memory_before = serde_json::to_value(manager.clone_all_credentials()).unwrap();
+        let disk_before = std::fs::read(&path).unwrap();
+
+        let error = manager
+            .batch_update_credentials(
+                &[1, 999, 999],
+                CredentialBatchPatch {
+                    rpm_limit: Some(1),
+                    groups: Some(CredentialGroupPatch::Remove(vec!["a".to_string()])),
+                    source_channel: Some(None),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CredentialBatchUpdateError::DuplicateId(999)
+        ));
+        assert_eq!(
+            serde_json::to_value(manager.clone_all_credentials()).unwrap(),
+            memory_before,
+            "重复 ID 不得导致内存修改"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            disk_before,
+            "重复 ID 不得导致磁盘修改"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn batch_update_credentials_supports_replace_add_remove() {
+        let path = tmp_creds_path("batch_update_group_operations");
+        let _ = std::fs::remove_file(&path);
+        let credentials = vec![
+            batch_test_credential(1, 10, &["a", "b"], None),
+            batch_test_credential(2, 10, &["b", "c"], None),
+        ];
+        std::fs::write(&path, serde_json::to_vec_pretty(&credentials).unwrap()).unwrap();
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            credentials,
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+
+        let replaced = manager
+            .batch_update_credentials(
+                &[1, 2],
+                CredentialBatchPatch {
+                    rpm_limit: None,
+                    groups: Some(CredentialGroupPatch::Replace(vec![
+                        "x".to_string(),
+                        "y".to_string(),
+                    ])),
+                    source_channel: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(replaced.updated, 2);
+
+        let added = manager
+            .batch_update_credentials(
+                &[1, 2],
+                CredentialBatchPatch {
+                    rpm_limit: None,
+                    groups: Some(CredentialGroupPatch::Add(vec![
+                        "y".to_string(),
+                        "z".to_string(),
+                        "z".to_string(),
+                    ])),
+                    source_channel: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(added.updated, 2);
+
+        let duplicate_add = manager
+            .batch_update_credentials(
+                &[1, 2],
+                CredentialBatchPatch {
+                    rpm_limit: None,
+                    groups: Some(CredentialGroupPatch::Add(vec![
+                        "y".to_string(),
+                        "z".to_string(),
+                        "z".to_string(),
+                    ])),
+                    source_channel: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(duplicate_add.updated, 0);
+        assert_eq!(duplicate_add.unchanged, 2);
+
+        let removed = manager
+            .batch_update_credentials(
+                &[1, 2],
+                CredentialBatchPatch {
+                    rpm_limit: None,
+                    groups: Some(CredentialGroupPatch::Remove(vec![
+                        "x".to_string(),
+                        "missing".to_string(),
+                    ])),
+                    source_channel: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(removed.updated, 2);
+
+        for credential in manager.clone_all_credentials() {
+            assert_eq!(credential.groups, vec!["y".to_string(), "z".to_string()]);
+        }
+        let persisted: Vec<KiroCredentials> =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for credential in persisted {
+            assert_eq!(credential.groups, vec!["y".to_string(), "z".to_string()]);
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn batch_update_credentials_keeps_recent_request_window_when_lowering_limit() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![batch_test_credential(1, 10, &[], None)],
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        let now = Instant::now();
+        let recent_requests_before = {
+            let mut entries = manager.entries.lock();
+            let entry = entries.iter_mut().find(|entry| entry.id == 1).unwrap();
+            entry
+                .recent_requests
+                .push_back(now - StdDuration::from_secs(5));
+            entry
+                .recent_requests
+                .push_back(now - StdDuration::from_secs(2));
+            entry.recent_requests.push_back(now);
+            entry.in_flight = 4;
+            entry.recent_requests.clone()
+        };
+
+        let result = manager
+            .batch_update_credentials(
+                &[1],
+                CredentialBatchPatch {
+                    rpm_limit: Some(2),
+                    groups: None,
+                    source_channel: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(result.updated, 1);
+
+        let entries = manager.entries.lock();
+        let entry = entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert_eq!(entry.credentials.rpm_limit, 2);
+        assert_eq!(entry.recent_requests, recent_requests_before);
+        assert_eq!(entry.in_flight, 4);
+        assert!(is_rpm_exceeded(entry, Instant::now()));
+    }
+
     #[tokio::test]
     async fn test_in_flight_increment_and_guard_decrement() {
         let manager = std::sync::Arc::new(
@@ -4879,6 +5396,27 @@ mod tests {
         let guard = manager.in_flight_guard(ctx.id);
         drop(guard);
         assert_eq!(in_flight_of(1), 0, "guard drop 后 in_flight 应归零");
+    }
+
+    #[tokio::test]
+    async fn snapshot_exposes_in_flight() {
+        let manager = std::sync::Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![grouped_cred("t1", &[])],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+
+        let context = manager.acquire_context(None, None).await.unwrap();
+        let guard = manager.in_flight_guard(context.id);
+        assert_eq!(manager.snapshot().entries[0].in_flight, 1);
+
+        drop(guard);
+        assert_eq!(manager.snapshot().entries[0].in_flight, 0);
     }
 
     #[tokio::test]
