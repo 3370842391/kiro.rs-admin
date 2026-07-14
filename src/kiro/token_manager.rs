@@ -920,6 +920,11 @@ struct CredentialEntry {
     disabled_reason: Option<DisabledReason>,
     /// API 调用成功次数
     success_count: u64,
+    /// 负载均衡使用的内部累计次数。
+    ///
+    /// 与对外展示的 success_count 分离，允许新凭据按同组基线参与 balanced 调度，
+    /// 同时保证管理端看到的真实成功次数从 0 开始。
+    balance_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
     /// 临时冷却到期时间（账号级 429 风控触发后短期跳过该凭据）
@@ -959,6 +964,9 @@ enum DisabledReason {
 #[derive(Serialize, Deserialize)]
 struct StatsEntry {
     success_count: u64,
+    /// 旧版统计文件没有该字段；加载时回退到 success_count，保持升级前的调度顺序。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    balance_count: Option<u64>,
     #[serde(default)]
     total_failure_count: u64,
     last_used_at: Option<String>,
@@ -1300,6 +1308,7 @@ impl MultiTokenManager {
                         None
                     },
                     success_count: 0,
+                    balance_count: 0,
                     last_used_at: None,
                     throttled_until: None,
                     rate_limited_until: None,
@@ -1550,11 +1559,12 @@ impl MultiTokenManager {
 
         match mode {
             "balanced" => {
-                // Least-Used 策略：选择成功次数最少的凭据
+                // Least-Used 策略：选择内部调度次数最少的凭据。
+                // balance_count 与展示用 success_count 分离，避免新增凭据显示伪历史。
                 // 平局时按优先级排序（数字越小优先级越高）
                 let entry = available
                     .iter()
-                    .min_by_key(|e| (e.success_count, e.credentials.priority))?;
+                    .min_by_key(|e| (e.balance_count, e.credentials.priority))?;
 
                 Some((entry.id, entry.credentials.clone()))
             }
@@ -1564,7 +1574,7 @@ impl MultiTokenManager {
                 // 平局按优先级（数字小者优先），再平按累计成功数（在空闲均势下更均衡）。
                 let entry = available
                     .iter()
-                    .min_by_key(|e| (e.in_flight, e.credentials.priority, e.success_count))?;
+                    .min_by_key(|e| (e.in_flight, e.credentials.priority, e.balance_count))?;
 
                 Some((entry.id, entry.credentials.clone()))
             }
@@ -2104,6 +2114,7 @@ impl MultiTokenManager {
         for entry in entries.iter_mut() {
             if let Some(s) = stats.get(&entry.id.to_string()) {
                 entry.success_count = s.success_count;
+                entry.balance_count = s.balance_count.unwrap_or(s.success_count);
                 entry.total_failure_count = s.total_failure_count;
                 entry.last_used_at = s.last_used_at.clone();
             }
@@ -2129,6 +2140,7 @@ impl MultiTokenManager {
                         e.id.to_string(),
                         StatsEntry {
                             success_count: e.success_count,
+                            balance_count: Some(e.balance_count),
                             total_failure_count: e.total_failure_count,
                             last_used_at: e.last_used_at.clone(),
                         },
@@ -2224,6 +2236,7 @@ impl MultiTokenManager {
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
                 entry.success_count += 1;
+                entry.balance_count += 1;
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
                 // 成功 = 风控已解除，提前结束冷却
                 entry.throttled_until = None;
@@ -3465,15 +3478,15 @@ impl MultiTokenManager {
                 }
             }
 
-            // balanced（Least-Used）模式下，新凭据若从 success_count=0 起步，会被
-            // 持续独占直到追平其它账号——尤其当它频繁吃普通 429 时 success_count 停在
+            // balanced（Least-Used）模式下，新凭据若从 balance_count=0 起步，会被
+            // 持续独占直到追平其它账号——尤其当它频繁吃普通 429 时 balance_count 停在
             // 0，导致"反复选中→反复 429"的死循环，老凭据反而闲置。
-            // 因此把新凭据的成功数对齐到"与它同组的现有可用凭据"的最小值，使其一加入
-            // 就以公平基线参与轮转，而非被无限优先。多组凭据取所有重叠组中的最小值，
-            // 保证它在任一分组内都不会抢跑。无分组（全局可用）时取全局可用凭据的最小值。
-            // priority 模式不读 success_count，不受此影响。
+            // 因此只把内部调度计数对齐到"与它同组的现有可用凭据"的最小值，使其一加入
+            // 就以公平基线参与轮转，而对外 success_count 仍从真实的 0 开始。多组凭据取
+            // 所有重叠组中的最小值，保证它在任一分组内都不会抢跑。无分组（全局可用）
+            // 时取全局可用凭据的最小值。priority 模式不读 balance_count，不受此影响。
             let new_groups = &validated_cred.groups;
-            let baseline_success = entries
+            let baseline_balance = entries
                 .iter()
                 .filter(|e| {
                     if e.disabled {
@@ -3484,7 +3497,7 @@ impl MultiTokenManager {
                         || e.credentials.groups.is_empty()
                         || e.credentials.groups.iter().any(|g| new_groups.contains(g))
                 })
-                .map(|e| e.success_count)
+                .map(|e| e.balance_count)
                 .min()
                 .unwrap_or(0);
 
@@ -3496,7 +3509,8 @@ impl MultiTokenManager {
                 refresh_failure_count: 0,
                 disabled: false,
                 disabled_reason: None,
-                success_count: baseline_success,
+                success_count: 0,
+                balance_count: baseline_balance,
                 last_used_at: None,
                 throttled_until: None,
                 rate_limited_until: None,
@@ -4685,6 +4699,124 @@ mod tests {
         assert!(id > 0);
         assert_eq!(manager.total_count(), 1);
         assert_eq!(manager.available_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn add_credential_starts_with_zero_visible_success_count() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut existing = KiroCredentials::default();
+        existing.id = Some(1);
+        existing.kiro_api_key = Some("ksk_existing".to_string());
+        existing.auth_method = Some("api_key".to_string());
+        existing.api_region = Some("us-east-1".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![existing], None, None, true).unwrap();
+        manager.report_success(1);
+        manager.report_success(1);
+        manager.report_success(1);
+
+        let mut added_credential = KiroCredentials::default();
+        added_credential.kiro_api_key = Some("ksk_added".to_string());
+        added_credential.auth_method = Some("api_key".to_string());
+        added_credential.api_region = Some("us-east-1".to_string());
+
+        let new_id = manager.add_credential(added_credential).await.unwrap();
+        let added = manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == new_id)
+            .unwrap();
+
+        assert_eq!(
+            added.success_count, 0,
+            "新凭据不应继承仅供 balanced 调度使用的成功数基线"
+        );
+        let entries = manager.entries.lock();
+        let added_internal = entries.iter().find(|entry| entry.id == new_id).unwrap();
+        assert_eq!(
+            added_internal.balance_count, 3,
+            "新凭据仍应继承同组内部调度基线，避免长期独占流量"
+        );
+    }
+
+    #[test]
+    fn legacy_stats_use_success_count_as_balance_count() {
+        let dir = std::env::temp_dir().join(format!(
+            "kiro-legacy-balance-stats-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let credentials_path = dir.join("credentials.json");
+        std::fs::write(&credentials_path, "[]").unwrap();
+        std::fs::write(
+            dir.join("kiro_stats.json"),
+            r#"{"1":{"success_count":7,"total_failure_count":0,"last_used_at":null}}"#,
+        )
+        .unwrap();
+
+        let mut existing = KiroCredentials::default();
+        existing.id = Some(1);
+        existing.kiro_api_key = Some("ksk_legacy_stats".to_string());
+        existing.auth_method = Some("api_key".to_string());
+        existing.api_region = Some("us-east-1".to_string());
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![existing],
+            None,
+            Some(credentials_path),
+            true,
+        )
+        .unwrap();
+        let entries = manager.entries.lock();
+        let entry = entries.iter().find(|entry| entry.id == 1).unwrap();
+
+        assert_eq!(entry.success_count, 7);
+        assert_eq!(
+            entry.balance_count, 7,
+            "旧统计没有 balance_count 时应沿用 success_count，避免升级后调度突变"
+        );
+        drop(entries);
+        drop(manager);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stats_persist_balance_count_separately() {
+        let dir = std::env::temp_dir().join(format!(
+            "kiro-persist-balance-stats-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let credentials_path = dir.join("credentials.json");
+        std::fs::write(&credentials_path, "[]").unwrap();
+
+        let mut existing = KiroCredentials::default();
+        existing.id = Some(1);
+        existing.kiro_api_key = Some("ksk_persist_stats".to_string());
+        existing.auth_method = Some("api_key".to_string());
+        existing.api_region = Some("us-east-1".to_string());
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![existing],
+            None,
+            Some(credentials_path),
+            true,
+        )
+        .unwrap();
+        manager.report_success(1);
+
+        let stats: HashMap<String, StatsEntry> =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("kiro_stats.json")).unwrap())
+                .unwrap();
+        assert_eq!(stats.get("1").unwrap().balance_count, Some(1));
+
+        drop(manager);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
+import { ListPlus } from 'lucide-react'
 import {
   Dialog,
   DialogContent,
@@ -26,11 +27,16 @@ import { GroupMultiSelect } from '@/components/group-select'
 interface AddCredentialDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
+  onBatchApiKeyImport?: () => void
 }
 
 type AuthMethod = 'social' | 'idc' | 'api_key' | 'external_idp'
 
-export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
+export function AddCredentialDialog({
+  open,
+  onOpenChange,
+  onBatchApiKeyImport,
+}: AddCredentialDialogProps) {
   const [refreshToken, setRefreshToken] = useState('')
   const [kiroApiKey, setKiroApiKey] = useState('')
   const [nickname, setNickname] = useState('')
@@ -212,6 +218,31 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                     disabled={isPending}
                   />
                 </div>
+                {onBatchApiKeyImport && (
+                  <div className="flex flex-col gap-2 rounded-xl border border-dashed bg-muted/30 p-3 sm:flex-row sm:items-center sm:justify-between">
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium">有多个 API Key？</p>
+                      <p className="text-xs text-muted-foreground">
+                        支持逐行粘贴、区域校验和导入前脱敏预览。
+                      </p>
+                    </div>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="shrink-0"
+                      disabled={isPending}
+                      onClick={() => {
+                        resetForm()
+                        onOpenChange(false)
+                        onBatchApiKeyImport()
+                      }}
+                    >
+                      <ListPlus className="h-4 w-4" />
+                      批量添加 API Key
+                    </Button>
+                  </div>
+                )}
               </>
             )}
 

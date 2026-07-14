@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { CheckCircle2, XCircle, AlertCircle, Loader2, Upload } from 'lucide-react'
@@ -34,12 +34,13 @@ import {
   sha256Hex,
 } from '@/lib/utils'
 
+type ImportMode = 'json' | 'api-key'
+
 interface BatchImportDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
+  initialMode?: ImportMode
 }
-
-type ImportMode = 'json' | 'api-key'
 
 interface CredentialInput {
   refreshToken?: string
@@ -280,8 +281,12 @@ function toApiKeyCredentials(
   }))
 }
 
-export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps) {
-  const [importMode, setImportMode] = useState<ImportMode>('json')
+export function BatchImportDialog({
+  open,
+  onOpenChange,
+  initialMode = 'json',
+}: BatchImportDialogProps) {
+  const [importMode, setImportMode] = useState<ImportMode>(initialMode)
   const [jsonInput, setJsonInput] = useState('')
   const [apiKeyInput, setApiKeyInput] = useState('')
   const [batchApiRegion, setBatchApiRegion] = useState<SupportedApiRegion | ''>('')
@@ -301,6 +306,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
   // 服务端在下次写回事件时检测到接收端关闭即停止处理剩余凭据。
   const abortRef = useRef<AbortController | null>(null)
 
+  useEffect(() => {
+    if (open) setImportMode(initialMode)
+  }, [open, initialMode])
+
   const { data: existingCredentials } = useCredentials()
   const queryClient = useQueryClient()
   const { data: proxyPool } = useQuery({
@@ -310,7 +319,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
   })
 
   const resetForm = () => {
-    setImportMode('json')
+    setImportMode(initialMode)
     setJsonInput('')
     setApiKeyInput('')
     setBatchApiRegion('')

@@ -172,6 +172,13 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const confirm = useConfirm();
   const [addDialogOpen, setAddDialogOpen] = useState(false);
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false);
+  const [batchImportInitialMode, setBatchImportInitialMode] = useState<
+    "json" | "api-key"
+  >("json");
+  const openBatchImport = (mode: "json" | "api-key") => {
+    setBatchImportInitialMode(mode);
+    setBatchImportDialogOpen(true);
+  };
   const [batchEditDialogOpen, setBatchEditDialogOpen] = useState(false);
   const [idcLoginDialogOpen, setIdcLoginDialogOpen] = useState(false);
   const [enterpriseLoginDialogOpen, setEnterpriseLoginDialogOpen] =
@@ -1642,10 +1649,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   <DropdownMenuSeparator />
                   <DropdownMenuLabel>导入</DropdownMenuLabel>
                   <DropdownMenuItem
-                    onSelect={() => setBatchImportDialogOpen(true)}
+                    onSelect={() => openBatchImport("json")}
                   >
                     <Upload />
-                    导入凭据 / Kiro Account Manager
+                    批量导入凭据 / API Key / KAM
                   </DropdownMenuItem>
                   <DropdownMenuItem
                     onSelect={() => handleExportCredentials("generic")}
@@ -1958,10 +1965,12 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       <AddCredentialDialog
         open={addDialogOpen}
         onOpenChange={setAddDialogOpen}
+        onBatchApiKeyImport={() => openBatchImport("api-key")}
       />
       <BatchImportDialog
         open={batchImportDialogOpen}
         onOpenChange={setBatchImportDialogOpen}
+        initialMode={batchImportInitialMode}
       />
       <BatchEditCredentialDialog
         open={batchEditDialogOpen}

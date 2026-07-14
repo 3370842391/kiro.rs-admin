@@ -45,6 +45,20 @@ describe('API Key import UI wiring', () => {
     expect(dialog).toMatch(/id="nickname"[\s\S]*maxLength=\{128\}/)
   })
 
+  test('single API Key add routes directly to batch text import mode', async () => {
+    const addDialog = await readSource('src/components/add-credential-dialog.tsx')
+    const batchDialog = await readSource('src/components/batch-import-dialog.tsx')
+    const dashboard = await readSource('src/components/dashboard.tsx')
+
+    expect(addDialog).toContain('onBatchApiKeyImport')
+    expect(addDialog).toContain('批量添加 API Key')
+    expect(batchDialog).toContain('initialMode?: ImportMode')
+    expect(batchDialog).toContain("initialMode = 'json'")
+    expect(dashboard).toContain('initialMode={batchImportInitialMode}')
+    expect(dashboard).toContain('openBatchImport("api-key")')
+    expect(dashboard).toContain('批量导入凭据 / API Key / KAM')
+  })
+
   test('API Key edit can repair region and edit a bounded nickname', async () => {
     const dialog = await readSource('src/components/edit-credential-dialog.tsx')
     const types = await readSource('src/types/api.ts')

@@ -4,6 +4,20 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### 🔧 修复 — 凭据成功统计与 balanced 调度解耦
+
+- **新凭据成功次数从 0 开始**：管理端展示的 `successCount` 只记录该凭据实际完成的成功请求，不再继承同组账号的调度基线，避免刚添加账号就显示数百或数千次成功。
+- **调度公平性保持不变**：新增内部 `balance_count` 专供 balanced / least_conn 平局调度使用；新凭据仍按同组账号的最小基线加入轮转，不会因从 0 起步而长期独占流量。
+- **旧统计无损兼容**：旧版 `kiro_stats.json` 没有 `balance_count` 时自动沿用历史 `success_count` 作为内部基线；新格式独立持久化两个计数。管理端“清零成功次数”只清理展示统计，不改变正在运行的账号负载分配。
+
+### ✨ 优化 — API Key 批量导入入口
+
+- **单条添加弹窗可直达批量模式**：选择 API Key 后会显示“批量添加 API Key”，一键进入现有的文本批量导入器，继续复用逐行解析、Region 校验、Key 脱敏预览、验活与回滚能力。
+- **导入菜单文案更明确**：入口改为“批量导入凭据 / API Key / KAM”，不再需要猜测 API Key 是否支持批量导入。
+- **客户端无感**：本次只修正管理端统计口径与入口，不改变客户端 API、对话内容、Token 刷新或模型请求协议。
+
 ## [0.6.9] - 2026-07-06
 
 主题：**Tool Call 全链路加固、tool inputSchema 规范化、CCH 缓存计量与 Thinking effort 修复、凭据持久化原子落盘，并回退 v0.6.7 的远程部署 Social 登录**。本版汇总 0.6.8 以来累积的多项 Rust 侧健壮性加固与一处回退：工具调用改为按 `tool_use_id` 缓冲后整体解析并显式暴露非法 JSON、Claude Code 内置工具名双向映射与 `<tool_use>` XML 泄漏过滤；规范化 MCP 工具 schema 以规避 Bedrock `TOOL_SCHEMA_INVALID` 400；修正主 Key 缓存计量口径并放宽原生 Thinking effort 下发范围；凭据回写改为 tmp+rename 原子落盘并锁定整个「快照 + 写盘」临界区（issue #23）；同时因 Kiro 收紧 OAuth 回调白名单，回退 v0.6.7 的远程部署 Social 登录（`redirect_uri` 恢复为本机 `127.0.0.1`，远程访问保留手动粘贴兜底）。多数改动参考 `Kiro-RS-Tool` 定位并移植 / 优化。
