@@ -129,6 +129,30 @@ class CheckpointTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "第 2 行"):
                 CheckpointStore(path)
 
+    def test_recovery_repairs_truncated_tail_before_next_append(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "result.jsonl"
+            path.write_text("{", encoding="utf-8")
+            store = CheckpointStore(path)
+            store.append(
+                RunRecord(
+                    run_id="run-after-crash",
+                    line_number=2,
+                    account_hash="hash",
+                    account_masked="us***@example.com",
+                    mode=LoginMode.MICROSOFT,
+                    status=ResultStatus.SUCCESS,
+                    stage="done",
+                    attempts=1,
+                    timestamp="2026-07-15T00:00:00Z",
+                )
+            )
+
+            reopened = CheckpointStore(path)
+            self.assertFalse(
+                reopened.should_run(2, "hash", LoginMode.MICROSOFT, resume=True)
+            )
+
     def test_exit_codes_match_contract(self):
         self.assertEqual(
             0,
