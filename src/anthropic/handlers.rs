@@ -3170,11 +3170,76 @@ struct NonStreamToolAttempt {
 
 enum NonStreamCollectError {
     Provider(anyhow::Error),
-    Body { credential_id: u64, message: String },
+    Body {
+        credential_id: u64,
+        message: String,
+        received_bytes: u64,
+    },
+    IdleTimeout {
+        credential_id: u64,
+        idle_timeout_secs: u64,
+        received_bytes: u64,
+    },
 }
 
 fn should_retry_non_stream_collect_error(attempt_index: u8, error: &NonStreamCollectError) -> bool {
-    attempt_index == 0 && matches!(error, NonStreamCollectError::Body { .. })
+    attempt_index == 0
+        && matches!(
+            error,
+            NonStreamCollectError::Body { .. } | NonStreamCollectError::IdleTimeout { .. }
+        )
+}
+
+fn non_stream_collect_error_type(error: &NonStreamCollectError) -> Option<&'static str> {
+    match error {
+        NonStreamCollectError::Body { .. } => Some("stream_read_error"),
+        NonStreamCollectError::IdleTimeout { .. } => Some("stream_idle_timeout"),
+        NonStreamCollectError::Provider(_) => None,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum NonStreamBodyReadFailure {
+    Read {
+        message: String,
+        received_bytes: u64,
+    },
+    IdleTimeout {
+        received_bytes: u64,
+    },
+}
+
+async fn collect_body_stream_with_idle_timeout<S, E>(
+    stream: S,
+    idle_timeout: Option<Duration>,
+) -> Result<Bytes, NonStreamBodyReadFailure>
+where
+    S: Stream<Item = Result<Bytes, E>>,
+    E: std::fmt::Display,
+{
+    futures::pin_mut!(stream);
+    let mut body = bytes::BytesMut::new();
+    loop {
+        let next = if let Some(timeout) = idle_timeout {
+            tokio::time::timeout(timeout, stream.next())
+                .await
+                .map_err(|_| NonStreamBodyReadFailure::IdleTimeout {
+                    received_bytes: body.len() as u64,
+                })?
+        } else {
+            stream.next().await
+        };
+        match next {
+            Some(Ok(chunk)) => body.extend_from_slice(&chunk),
+            Some(Err(error)) => {
+                return Err(NonStreamBodyReadFailure::Read {
+                    message: error.to_string(),
+                    received_bytes: body.len() as u64,
+                });
+            }
+            None => return Ok(body.freeze()),
+        }
+    }
 }
 
 fn non_stream_attempt_error(
@@ -3267,14 +3332,27 @@ async fn collect_non_stream_tool_attempt(
         .await
         .map_err(NonStreamCollectError::Provider)?;
     let credential_id = call_result.credential_id;
+    let idle_timeout_secs = provider.stream_idle_timeout_secs();
+    let idle_timeout = (idle_timeout_secs > 0).then(|| Duration::from_secs(idle_timeout_secs));
     let body_bytes =
-        call_result
-            .response
-            .bytes()
+        collect_body_stream_with_idle_timeout(call_result.response.bytes_stream(), idle_timeout)
             .await
-            .map_err(|error| NonStreamCollectError::Body {
-                credential_id,
-                message: error.to_string(),
+            .map_err(|failure| match failure {
+                NonStreamBodyReadFailure::Read {
+                    message,
+                    received_bytes,
+                } => NonStreamCollectError::Body {
+                    credential_id,
+                    message,
+                    received_bytes,
+                },
+                NonStreamBodyReadFailure::IdleTimeout { received_bytes } => {
+                    NonStreamCollectError::IdleTimeout {
+                        credential_id,
+                        idle_timeout_secs,
+                        received_bytes,
+                    }
+                }
             })?;
 
     let mut decoder = EventStreamDecoder::new();
@@ -3536,10 +3614,12 @@ async fn handle_non_stream_request(
             {
                 Ok(attempt) => attempt,
                 Err(error) if should_retry_non_stream_collect_error(attempt_index, &error) => {
-                    retry_failure_type = Some("stream_read_error");
+                    let error_type = non_stream_collect_error_type(&error)
+                        .expect("retryable body errors have a stable type");
+                    retry_failure_type = Some(error_type);
                     retry_request_body = Some(request_body.to_owned());
                     tracer.record_protocol_error(
-                        "stream_read_error",
+                        error_type,
                         "the first non-stream response body ended before delivery; retrying once",
                     );
                     continue;
@@ -3584,14 +3664,15 @@ async fn handle_non_stream_request(
         Err(NonStreamCollectError::Body {
             credential_id,
             message,
+            received_bytes,
         }) => {
-            tracing::error!(%message, "读取非流式响应体失败");
+            tracing::error!(%message, received_bytes, "读取非流式响应体失败");
             hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
             tracer.finalize(
                 "interrupted",
                 Some(outcome::STREAM_INTERRUPTED),
                 Some(&message),
-                None,
+                Some(received_bytes),
                 TraceUsage::zero(),
             );
             return (
@@ -3600,6 +3681,28 @@ async fn handle_non_stream_request(
                     "api_error",
                     format!("读取响应失败: {message}"),
                 )),
+            )
+                .into_response();
+        }
+        Err(NonStreamCollectError::IdleTimeout {
+            credential_id,
+            idle_timeout_secs,
+            received_bytes,
+        }) => {
+            let message = format!("stream idle timeout after {idle_timeout_secs}s");
+            tracing::error!(idle_timeout_secs, received_bytes, "非流式响应体空闲超时");
+            hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
+            tracer.record_protocol_error("stream_idle_timeout", &message);
+            tracer.finalize(
+                "interrupted",
+                Some("stream_idle_timeout"),
+                Some(&message),
+                Some(received_bytes),
+                TraceUsage::zero(),
+            );
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse::new("api_error", message)),
             )
                 .into_response();
         }
@@ -5489,12 +5592,38 @@ mod tests {
         let error = NonStreamCollectError::Body {
             credential_id: 7,
             message: "connection reset".to_string(),
+            received_bytes: 0,
         };
         assert!(should_retry_non_stream_collect_error(0, &error));
         assert!(!should_retry_non_stream_collect_error(1, &error));
 
         let provider_error = NonStreamCollectError::Provider(anyhow::anyhow!("upstream 500"));
         assert!(!should_retry_non_stream_collect_error(0, &provider_error));
+    }
+
+    #[tokio::test]
+    async fn non_stream_body_idle_watchdog_resets_per_chunk_and_reports_safe_progress() {
+        use futures::stream;
+
+        let complete = stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(b"ab")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"cd")),
+        ]);
+        let bytes =
+            collect_body_stream_with_idle_timeout(complete, Some(Duration::from_millis(20)))
+                .await
+                .expect("complete response body");
+        assert_eq!(bytes, Bytes::from_static(b"abcd"));
+
+        let stalled = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"ab"))])
+            .chain(stream::pending());
+        let error = collect_body_stream_with_idle_timeout(stalled, Some(Duration::from_millis(20)))
+            .await
+            .expect_err("the application watchdog must stop a stalled body");
+        assert!(matches!(
+            error,
+            NonStreamBodyReadFailure::IdleTimeout { received_bytes: 2 }
+        ));
     }
 
     #[test]
