@@ -47,6 +47,10 @@ fn prepare_round_bodies(
     prepare_kiro_bodies(request, policy)
 }
 
+fn round_idle_timeout(timeout_secs: u64) -> Option<std::time::Duration> {
+    (timeout_secs > 0).then(|| std::time::Duration::from_secs(timeout_secs))
+}
+
 async fn next_stream_item_with_idle_timeout<S>(
     stream: &mut S,
     idle_timeout: Option<std::time::Duration>,
@@ -359,8 +363,7 @@ async fn run_round(
         call_result.response,
         context_window_size,
         &conversion.tool_name_map,
-        (provider.stream_idle_timeout_secs() > 0)
-            .then(|| std::time::Duration::from_secs(provider.stream_idle_timeout_secs())),
+        round_idle_timeout(provider.stream_idle_timeout_secs()),
     )
     .await;
     // Carry the declared tool names (original + shortened) so the flush step can run the
@@ -1168,6 +1171,15 @@ mod tests {
         )
         .await;
         assert!(timed_out.is_err());
+    }
+
+    #[test]
+    fn websearch_round_idle_timeout_zero_disables_watchdog() {
+        assert_eq!(round_idle_timeout(0), None);
+        assert_eq!(
+            round_idle_timeout(3),
+            Some(std::time::Duration::from_secs(3))
+        );
     }
 
     fn tu(name: &str) -> CompletedToolUse {
