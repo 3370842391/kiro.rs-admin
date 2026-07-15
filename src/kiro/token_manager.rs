@@ -509,11 +509,86 @@ fn rest_profile_arn(credentials: &KiroCredentials) -> Option<&str> {
     }
 }
 
-fn build_list_available_models_url(host: &str, profile_arn: Option<&str>) -> String {
-    let profile_arn_query = profile_arn
-        .map(|arn| format!("&profileArn={}", urlencoding::encode(arn)))
-        .unwrap_or_default();
-    format!("https://{host}/ListAvailableModels?origin=AI_EDITOR&maxResults=50{profile_arn_query}")
+fn build_list_available_models_url(
+    host: &str,
+    profile_arn: Option<&str>,
+    next_token: Option<&str>,
+) -> anyhow::Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(&format!("https://{host}/ListAvailableModels"))?;
+    {
+        let mut query = url.query_pairs_mut();
+        query
+            .append_pair("origin", "AI_EDITOR")
+            .append_pair("maxResults", "50");
+        if let Some(profile_arn) = profile_arn {
+            query.append_pair("profileArn", profile_arn);
+        }
+        if let Some(next_token) = next_token {
+            query.append_pair("nextToken", next_token);
+        }
+    }
+    Ok(url)
+}
+
+const LIST_AVAILABLE_MODELS_MAX_PAGES: usize = 10;
+const LIST_AVAILABLE_MODELS_MAX_MODELS: usize = LIST_AVAILABLE_MODELS_MAX_PAGES * 50;
+
+#[derive(Debug, thiserror::Error)]
+enum ListAvailableModelsPageError {
+    #[error("ListAvailableModels 请求失败: {0}")]
+    Request(String),
+    #[error("ListAvailableModels HTTP {status}: {body}")]
+    Http {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+    #[error("ListAvailableModels 协议错误: {0}")]
+    Protocol(String),
+}
+
+async fn collect_available_model_pages<F, Fut>(
+    mut fetch_page: F,
+) -> Result<Vec<crate::kiro::model::available_models::UpstreamModel>, ListAvailableModelsPageError>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: std::future::Future<
+            Output = Result<ListAvailableModelsResponse, ListAvailableModelsPageError>,
+        >,
+{
+    let mut models = Vec::new();
+    let mut next_token = None;
+    let mut seen_tokens = HashSet::new();
+
+    for page_number in 1..=LIST_AVAILABLE_MODELS_MAX_PAGES {
+        let mut page = fetch_page(next_token.clone()).await?;
+        models.append(&mut page.models);
+        if models.len() > LIST_AVAILABLE_MODELS_MAX_MODELS {
+            return Err(ListAvailableModelsPageError::Protocol(format!(
+                "模型数量超过 {} 个",
+                LIST_AVAILABLE_MODELS_MAX_MODELS
+            )));
+        }
+
+        let Some(token) = page.next_token else {
+            return Ok(models);
+        };
+        if token.trim().is_empty() {
+            return Ok(models);
+        }
+        if !seen_tokens.insert(token.clone()) {
+            return Err(ListAvailableModelsPageError::Protocol(format!(
+                "重复 nextToken: {token}"
+            )));
+        }
+        if page_number == LIST_AVAILABLE_MODELS_MAX_PAGES {
+            return Err(ListAvailableModelsPageError::Protocol(
+                "分页超过 10 页".to_string(),
+            ));
+        }
+        next_token = Some(token);
+    }
+
+    unreachable!("分页循环只能返回完整目录或错误")
 }
 
 /// 获取使用额度信息
@@ -616,6 +691,46 @@ pub(crate) async fn get_usage_limits(
 /// 上游接口：`GET https://{resolved_host}/ListAvailableModels?origin=AI_EDITOR&maxResults=50`
 /// 返回值随订阅等级不同而不同（如 FREE 账号不含 Opus）。
 /// 请求头与构造方式与 [`get_usage_limits`] 完全一致。
+async fn fetch_available_models_page(
+    client: &reqwest::Client,
+    host: &str,
+    profile_arn: Option<&str>,
+    token: &str,
+    token_type: Option<&str>,
+    user_agent: &str,
+    amz_user_agent: &str,
+    next_token: Option<String>,
+) -> Result<ListAvailableModelsResponse, ListAvailableModelsPageError> {
+    let url = build_list_available_models_url(host, profile_arn, next_token.as_deref())
+        .map_err(|error| ListAvailableModelsPageError::Request(error.to_string()))?;
+    let mut request = client
+        .get(url)
+        .header("x-amz-user-agent", amz_user_agent)
+        .header("user-agent", user_agent)
+        .header("host", host)
+        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=1")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Connection", "close");
+    if let Some(token_type) = token_type {
+        request = request.header("tokentype", token_type);
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|error| ListAvailableModelsPageError::Request(error.to_string()))?;
+    let status = response.status();
+    if status.is_success() {
+        return response
+            .json()
+            .await
+            .map_err(|error| ListAvailableModelsPageError::Request(error.to_string()));
+    }
+    let body = response.text().await.unwrap_or_default();
+    Err(ListAvailableModelsPageError::Http { status, body })
+}
+
 pub(crate) async fn get_available_models(
     credentials: &KiroCredentials,
     config: &Config,
@@ -624,87 +739,64 @@ pub(crate) async fn get_available_models(
 ) -> anyhow::Result<ListAvailableModelsResponse> {
     tracing::debug!("正在获取可用模型列表...");
 
-    // ListAvailableModels 仅在 us-east-1 / eu-central-1 提供服务。
-    // 候选区域优先用真实 profileArn 的区域（见 rest_api_region_candidates_for），
-    // 避免端点区域与 profileArn 不一致导致 400；403/400 时再回退到另一个端点。
     let candidates = rest_api_region_candidates_for(credentials, config)?;
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     let kiro_version = rest_kiro_version_for(credentials, config);
-    let os_name = &config.system_version;
-    let node_version = &config.node_version;
-
-    // profileArn 查询串：仅发送真实 ARN，跳过 BuilderID 占位符
-    // 构建 User-Agent headers（与 get_usage_limits 保持一致）
     let user_agent = format!(
         "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
-        os_name, node_version, kiro_version, machine_id
+        config.system_version, config.node_version, kiro_version, machine_id
     );
     let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
-
     let client = build_client(proxy, 60, config.tls_backend)?;
+    let profile_arn = rest_profile_arn(credentials);
+    let token_type = credentials.token_type_header();
+    let mut last_error = None;
 
-    let mut last_error: Option<String> = None;
     for (idx, region) in candidates.iter().enumerate() {
         let host = data_plane_host(KiroService::Rest, region)?;
-        let url = build_list_available_models_url(&host, rest_profile_arn(credentials));
+        let result = collect_available_model_pages(|next_token| {
+            fetch_available_models_page(
+                &client,
+                &host,
+                profile_arn,
+                token,
+                token_type,
+                &user_agent,
+                &amz_user_agent,
+                next_token,
+            )
+        })
+        .await;
 
-        let mut request = client
-            .get(&url)
-            .header("x-amz-user-agent", &amz_user_agent)
-            .header("user-agent", &user_agent)
-            .header("host", &host)
-            .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
-            .header("amz-sdk-request", "attempt=1; max=1")
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Connection", "close");
-
-        if let Some(token_type) = credentials.token_type_header() {
-            request = request.header("tokentype", token_type);
+        match result {
+            Ok(models) => {
+                return Ok(ListAvailableModelsResponse {
+                    models,
+                    next_token: None,
+                    resolved_api_region: Some(region.to_string()),
+                    resolved_host: Some(host),
+                    kiro_version: Some(kiro_version.clone()),
+                });
+            }
+            Err(error @ ListAvailableModelsPageError::Http { status, .. })
+                if matches!(status.as_u16(), 400 | 403) && idx + 1 < candidates.len() =>
+            {
+                tracing::debug!(
+                    "ListAvailableModels region {} returned {}, trying {}",
+                    region,
+                    status.as_u16(),
+                    candidates[idx + 1]
+                );
+                last_error = Some(error.to_string());
+            }
+            Err(error) => return Err(anyhow::anyhow!(error.to_string())),
         }
-
-        let response = request.send().await?;
-
-        let status = response.status();
-        if status.is_success() {
-            let mut data: ListAvailableModelsResponse = response.json().await?;
-            data.resolved_api_region = Some(region.to_string());
-            data.resolved_host = Some(host);
-            data.kiro_version = Some(kiro_version.clone());
-            return Ok(data);
-        }
-
-        let body_text = response.text().await.unwrap_or_default();
-
-        // 403/400 且仍有备用端点时，尝试下一个区域端点。
-        // 403：Enterprise/IdC 跨区兼容；400：profileArn 区域与端点不一致（Improperly
-        // formed request），换到另一个区域端点即可对齐。
-        if (status.as_u16() == 403 || status.as_u16() == 400) && idx + 1 < candidates.len() {
-            tracing::debug!(
-                "ListAvailableModels 在 {} 返回 {}，尝试备用端点 {}",
-                region,
-                status.as_u16(),
-                candidates[idx + 1]
-            );
-            last_error = Some(format!("{} {}", status, body_text));
-            continue;
-        }
-
-        let error_msg = match status.as_u16() {
-            400 => "请求格式错误（profileArn 区域可能与端点不一致）",
-            401 => "认证失败，Token 无效或已过期",
-            403 => "权限不足，无法获取可用模型",
-            429 => "请求过于频繁，已被限流",
-            500..=599 => "服务器错误，AWS 服务暂时不可用",
-            _ => "获取可用模型失败",
-        };
-        bail!("{}: {} {}", error_msg, status, body_text);
     }
 
-    // 所有候选端点均失败（理论上循环内已 return / bail，此处为兜底）
-    bail!(
-        "权限不足，无法获取可用模型: {}",
-        last_error.unwrap_or_else(|| "无可用端点".to_string())
-    );
+    Err(anyhow::anyhow!(
+        "ListAvailableModels all regions failed: {}",
+        last_error.unwrap_or_else(|| "no available endpoint".to_string())
+    ))
 }
 
 /// 获取该凭据可用的真实 profileArn 列表（`ListAvailableProfiles`）。
@@ -6468,12 +6560,94 @@ mod tests {
 
     #[test]
     fn list_available_models_url_requests_fifty_models_without_fake_profile() {
-        let url = build_list_available_models_url("q.eu-central-1.amazonaws.com", None);
+        let url =
+            build_list_available_models_url("q.eu-central-1.amazonaws.com", None, None).unwrap();
         assert_eq!(
-            url,
+            url.as_str(),
             "https://q.eu-central-1.amazonaws.com/ListAvailableModels?origin=AI_EDITOR&maxResults=50"
         );
-        assert!(!url.contains("profileArn"));
+        assert!(!url.as_str().contains("profileArn"));
+    }
+
+    #[test]
+    fn list_available_models_url_encodes_profile_and_next_token_query_parameters() {
+        let profile_arn = "arn:aws:codewhisperer:eu-central-1:123/profile/UNIT";
+        let next_token = "page / two?cursor=3";
+        let url = build_list_available_models_url(
+            "q.eu-central-1.amazonaws.com",
+            Some(profile_arn),
+            Some(next_token),
+        )
+        .unwrap();
+        let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(query.get("origin").map(String::as_str), Some("AI_EDITOR"));
+        assert_eq!(query.get("maxResults").map(String::as_str), Some("50"));
+        assert_eq!(
+            query.get("profileArn").map(String::as_str),
+            Some(profile_arn)
+        );
+        assert_eq!(query.get("nextToken").map(String::as_str), Some(next_token));
+        assert!(!url.as_str().contains("page / two"));
+    }
+
+    fn available_models_page(next_token: Option<&str>) -> ListAvailableModelsResponse {
+        ListAvailableModelsResponse {
+            models: vec![crate::kiro::model::available_models::UpstreamModel {
+                model_id: "claude-sonnet-4.5".to_string(),
+                model_name: None,
+                description: None,
+                token_limits: None,
+            }],
+            next_token: next_token.map(str::to_string),
+            resolved_api_region: None,
+            resolved_host: None,
+            kiro_version: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn pagination_rejects_repeated_next_token() {
+        let mut calls = Vec::new();
+        let result = collect_available_model_pages(|next_token| {
+            calls.push(next_token.clone());
+            async { Ok::<_, ListAvailableModelsPageError>(available_models_page(Some("same"))) }
+        })
+        .await;
+
+        let error = result.expect_err("repeated nextToken must be a protocol error");
+        assert!(error.to_string().contains("重复 nextToken"));
+        assert_eq!(calls, vec![None, Some("same".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn pagination_stops_on_blank_next_token() {
+        let mut calls = 0;
+        let models = collect_available_model_pages(|_| {
+            calls += 1;
+            async { Ok::<_, ListAvailableModelsPageError>(available_models_page(Some(" \t "))) }
+        })
+        .await
+        .expect("blank nextToken must end pagination");
+
+        assert_eq!(calls, 1);
+        assert_eq!(models.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pagination_rejects_more_than_ten_pages_without_partial_models() {
+        let mut calls = 0;
+        let result = collect_available_model_pages(|_| {
+            calls += 1;
+            let next_token = format!("page-{calls}");
+            async move {
+                Ok::<_, ListAvailableModelsPageError>(available_models_page(Some(&next_token)))
+            }
+        })
+        .await;
+
+        let error = result.expect_err("an eleventh page must be rejected");
+        assert!(error.to_string().contains("超过 10 页"));
+        assert_eq!(calls, 10);
     }
 
     #[test]
