@@ -350,10 +350,43 @@
 6. 对声明 PNG 但实际损坏、实际 JPEG、特殊 PNG 三类图片分别验证：损坏图本地清晰拒绝，可解码图标准化后通过。
 7. 部署到 8991 后连续观察至少 30 分钟，再与同等流量窗口逐类对比，不能只比较总错误数。
 
-## 9. 本轮明确未做的事情
+## 9. 初始分析阶段明确未做的事情
 
 - 未修改任何 Rust/前端代码。
 - 未修改 8991 或 8990 配置。
 - 未重启、构建或部署容器。
 - 未推送 GitHub。
 - 未读取或写入明文 API Key、Authorization 和客户正文。
+
+## 10. 2026-07-16 实施结果
+
+上述 P0/P1 代码项已经在隔离集成分支完成，尚未以本节替代 8991 实网验收结论：
+
+- 结构化输出：显式 JSON Schema 请求可从围栏或说明文字中提取唯一完整 JSON，并再次使用客户原 Schema 严格验证；多 JSON、缺字段、类型错误和额外字段继续拒绝。
+- 图片预算：`imageTotalBase64BudgetBytes` 改为软压缩目标；新增默认 8 MiB 的 `imageHardBase64LimitBytes`。普通体未超硬上限时继续发送，普通体超硬而激进体未超硬时直接使用激进体，两体均超硬才本地 400。
+- 图片预检：所有普通图片及 `tool_result` 图片先校验 Base64、magic bytes 和完整解码；错标格式按真实格式修正，特殊静态 PNG 做像素无损归一化，标准 JPEG/PNG/GIF/WebP 和当前轮标准图片字节保持不变。
+- 工具 Schema：已声明工具的缺字段、类型错误、额外字段、enum/const 错误在尚未交付正文或工具时最多安全重试一次；不猜 `path/file_path`，不复制客户参数值，未声明工具和第二轮错误不继续重试。
+- 120 秒竞态：业务 reqwest Client 不再复用应用 watchdog 的同一 read timeout；实时流、缓冲流和非流式响应体都由应用层空闲截止负责。首轮零语义 ReadError/IdleTimeout 最多重试一次，已交付正文/工具、第二轮和客户端断开不重放。
+- 诊断：DEBUG 保留 RS 业务日志并默认把 `h2/hyper/reqwest` 降到 info；管理端区分已恢复、客户端断开和最终失败；图片硬上限记录 `image_budget_exceeded` 及 count/history/current/before/after/soft/hard，不记录 Base64 或正文。
+
+### 10.1 客户影响
+
+- 普通文本、合法工具、缓存拆分、Token 总量和计费逻辑没有改变。
+- 长图片会话更少被 800 KiB 软值误拒绝；每张图片会多一次完整解码预检，可能增加少量 CPU、内存和预处理延迟。
+- 特殊 PNG 归一化会移除元数据或色彩配置并输出 RGBA8 PNG，但像素回归测试一致，且不会转成有损 JPEG。
+- 只有异常零输出、非法工具 Schema 等恢复路径会增加最多一次上游调用，因此该类失败请求可能增加延迟与用量；已交付任何正文或完整工具时不会透明重试。
+- 非流式响应体增加逐块空闲 watchdog，避免移除 reqwest read timeout 后极端等待放大到 720 秒。
+
+### 10.2 本地发布门禁
+
+- `cargo fmt --all -- --check`：通过。
+- `cargo test -j 1 --bin kiro-rs --locked --no-default-features`：1018/1018 通过。
+- `cargo check --all-targets --locked --no-default-features`：通过。
+- Admin UI `bun test`：78/78 通过。
+- Admin UI `bun run build`：通过，生产构建处理 2582 个模块。
+- `git diff --check`、凭据形状扫描和异常长新增行扫描：通过。
+
+### 10.3 仍待完成
+
+- 将本地集成提交部署到隔离公网 8991，执行真实结构化 JSON、图片、损坏图片、工具和 1 秒 ping 验收。
+- 部署后观察错误快照和容器日志至少 30 分钟；生产 8990 在用户另行授权前保持不变。
