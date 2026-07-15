@@ -144,18 +144,21 @@ impl DynamicModelCatalog {
             return Err(ModelCatalogError::NoAvailableCredentials);
         }
 
-        let results = stream::iter(credential_ids.into_iter().map(|credential_id| {
-            let fetch = fetch.clone();
-            async move { (credential_id, fetch(credential_id).await) }
-        }))
+        let mut results = stream::iter(credential_ids.into_iter().enumerate().map(
+            |(position, credential_id)| {
+                let fetch = fetch.clone();
+                async move { (position, credential_id, fetch(credential_id).await) }
+            },
+        ))
         .buffer_unordered(self.query_concurrency)
         .collect::<Vec<_>>()
         .await;
+        results.sort_by_key(|(position, _, _)| *position);
 
         let mut successful_models = Vec::new();
         let mut successes = 0;
         let mut failures = 0;
-        for (credential_id, result) in results {
+        for (_, credential_id, result) in results {
             match result {
                 Ok(response) => {
                     successes += 1;
@@ -478,5 +481,39 @@ mod tests {
             .unwrap();
 
         assert_eq!(observed_peak.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn merged_metadata_follows_candidate_order_not_completion_order() {
+        let catalog = DynamicModelCatalog::default();
+        let models = catalog
+            .models_for_at(
+                None,
+                vec![1, 2],
+                Instant::now(),
+                |credential_id| async move {
+                    if credential_id == 1 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        Ok(response(vec![model(
+                            "gpt-5.6-sol",
+                            Some("Preferred First Credential Name"),
+                            None,
+                        )]))
+                    } else {
+                        Ok(response(vec![model(
+                            "gpt-5.6-sol",
+                            Some("Faster Second Credential Name"),
+                            None,
+                        )]))
+                    }
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            models[0].model_name.as_deref(),
+            Some("Preferred First Credential Name")
+        );
     }
 }
