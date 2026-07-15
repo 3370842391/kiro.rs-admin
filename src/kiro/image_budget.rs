@@ -102,12 +102,16 @@ pub enum ImageBudgetError {
     #[error("图片预算配置无效: {0}")]
     InvalidPolicy(String),
     #[error(
-        "图片总量在历史图片压缩后仍超过预算: count={count}, total={total} bytes, budget={budget} bytes"
+        "图片总量在历史图片压缩后仍超过硬上限: count={count}, history={history_count}, current={current_count}, before={before} bytes, after={after} bytes, soft={soft_limit} bytes, hard={hard_limit} bytes"
     )]
     Exceeded {
         count: usize,
-        total: usize,
-        budget: usize,
+        history_count: usize,
+        current_count: usize,
+        before: usize,
+        after: usize,
+        soft_limit: usize,
+        hard_limit: usize,
     },
     #[error("Kiro 请求序列化失败: {0}")]
     Serialization(String),
@@ -175,8 +179,12 @@ pub fn apply_image_budget(
     if policy.enabled && stats.after_base64_bytes > policy.hard_base64_limit_bytes {
         return Err(ImageBudgetError::Exceeded {
             count: stats.image_count,
-            total: stats.after_base64_bytes,
-            budget: policy.hard_base64_limit_bytes,
+            history_count: stats.history_image_count,
+            current_count: stats.current_image_count,
+            before: stats.before_base64_bytes,
+            after: stats.after_base64_bytes,
+            soft_limit: policy.total_base64_budget_bytes,
+            hard_limit: policy.hard_base64_limit_bytes,
         });
     }
     Ok(stats)
@@ -288,8 +296,12 @@ pub fn prepare_kiro_bodies(
         .min(retry_stats.after_base64_bytes);
     Err(ImageBudgetError::Exceeded {
         count: primary_stats.image_count,
-        total: smallest,
-        budget: policy.hard_base64_limit_bytes,
+        history_count: primary_stats.history_image_count,
+        current_count: primary_stats.current_image_count,
+        before: primary_stats.before_base64_bytes,
+        after: smallest,
+        soft_limit: policy.total_base64_budget_bytes,
+        hard_limit: policy.hard_base64_limit_bytes,
     })
 }
 
@@ -532,9 +544,21 @@ mod tests {
             ..ImageBudgetPolicy::default()
         };
 
+        let error = prepare_kiro_bodies(&request, policy).unwrap_err();
         assert!(matches!(
-            prepare_kiro_bodies(&request, policy),
-            Err(ImageBudgetError::Exceeded { budget, .. }) if budget == 256 * 1024
+            error,
+            ImageBudgetError::Exceeded {
+                count: 1,
+                history_count: 0,
+                current_count: 1,
+                before,
+                after,
+                soft_limit,
+                hard_limit,
+            } if soft_limit == 256 * 1024
+                && hard_limit == 256 * 1024
+                && before >= after
+                && after > 256 * 1024
         ));
     }
 

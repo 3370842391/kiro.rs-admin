@@ -1851,10 +1851,64 @@ async fn prepare_request(
     convert_request_with_mode(payload, mode).map_err(PrepareRequestError::Conversion)
 }
 
+fn conversion_error_trace_type(error: &ConversionError) -> &'static str {
+    if matches!(error, ConversionError::InvalidImage { .. }) {
+        "image_validation_error"
+    } else {
+        "request_conversion_error"
+    }
+}
+
+struct ImageBudgetFailureDetails {
+    status: StatusCode,
+    error_type: &'static str,
+    safe_message: String,
+    client_error_type: &'static str,
+    client_message: &'static str,
+}
+
+fn image_budget_failure_details(error: &ImageBudgetError) -> ImageBudgetFailureDetails {
+    match error {
+        ImageBudgetError::Exceeded {
+            count,
+            history_count,
+            current_count,
+            before,
+            after,
+            soft_limit,
+            hard_limit,
+        } => ImageBudgetFailureDetails {
+            status: StatusCode::BAD_REQUEST,
+            error_type: "image_budget_exceeded",
+            safe_message: format!(
+                "image budget exceeded: count={count}, history={history_count}, current={current_count}, before={before}, after={after}, soft={soft_limit}, hard={hard_limit}"
+            ),
+            client_error_type: "invalid_request_error",
+            client_message: "Image payload exceeds the configured upstream hard limit after compressing historical images. Reduce images or start a new conversation.",
+        },
+        ImageBudgetError::InvalidPolicy(_) | ImageBudgetError::Serialization(_) => {
+            ImageBudgetFailureDetails {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                error_type: "request_body_error",
+                safe_message: "failed to prepare the upstream image request body".to_string(),
+                client_error_type: "internal_error",
+                client_message: "Failed to prepare the upstream request body.",
+            }
+        }
+    }
+}
+
+struct OutboundKiroBodyError {
+    response: Response,
+    status: StatusCode,
+    error_type: &'static str,
+    safe_message: String,
+}
+
 fn prepare_outbound_kiro_bodies(
     request: &KiroRequest,
     provider: &crate::kiro::provider::KiroProvider,
-) -> Result<PreparedKiroBodies, Response> {
+) -> Result<PreparedKiroBodies, OutboundKiroBodyError> {
     match prepare_kiro_bodies(request, provider.image_budget_policy()) {
         Ok(prepared) => {
             tracing::info!(
@@ -1872,36 +1926,31 @@ fn prepare_outbound_kiro_bodies(
             );
             Ok(prepared)
         }
-        Err(ImageBudgetError::Exceeded {
-            count,
-            total,
-            budget,
-        }) => {
-            tracing::warn!(
-                image_count = count,
-                image_b64_bytes = total,
-                budget_bytes = budget,
-                "图片总量预检失败"
-            );
-            Err((
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(
-                    "invalid_request_error",
-                    "Image payload exceeds the configured upstream budget after compressing historical images. Reduce images or start a new conversation.",
-                )),
-            )
-                .into_response())
-        }
         Err(error) => {
-            tracing::error!(%error, "准备 Kiro 图片预算请求体失败");
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
+            let details = image_budget_failure_details(&error);
+            if details.status.is_client_error() {
+                tracing::warn!(
+                    error_type = details.error_type,
+                    diagnostic = %details.safe_message,
+                    "图片总量预检失败"
+                );
+            } else {
+                tracing::error!(%error, "准备 Kiro 图片预算请求体失败");
+            }
+            let response = (
+                details.status,
                 Json(ErrorResponse::new(
-                    "internal_error",
-                    "Failed to prepare the upstream request body.",
+                    details.client_error_type,
+                    details.client_message,
                 )),
             )
-                .into_response())
+                .into_response();
+            Err(OutboundKiroBodyError {
+                response,
+                status: details.status,
+                error_type: details.error_type,
+                safe_message: details.safe_message,
+            })
         }
     }
 }
@@ -2247,7 +2296,7 @@ pub async fn post_messages(
             finalize_immediate_error(
                 &tracer,
                 StatusCode::BAD_REQUEST,
-                "request_conversion_error",
+                conversion_error_trace_type(&e),
                 &message,
             );
             return (
@@ -2268,10 +2317,10 @@ pub async fn post_messages(
 
     let prepared_bodies = match prepare_outbound_kiro_bodies(&kiro_request, provider.as_ref()) {
         Ok(prepared) => prepared,
-        Err(response) => {
+        Err(error) => {
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            finalize_immediate_response(&tracer, &response, "request_body_error");
-            return response;
+            finalize_immediate_error(&tracer, error.status, error.error_type, &error.safe_message);
+            return error.response;
         }
     };
     let request_body = &prepared_bodies.primary_body;
@@ -4360,7 +4409,7 @@ pub async fn post_messages_cc(
             finalize_immediate_error(
                 &tracer,
                 StatusCode::BAD_REQUEST,
-                "request_conversion_error",
+                conversion_error_trace_type(&e),
                 &message,
             );
             return (
@@ -4381,10 +4430,10 @@ pub async fn post_messages_cc(
 
     let prepared_bodies = match prepare_outbound_kiro_bodies(&kiro_request, provider.as_ref()) {
         Ok(prepared) => prepared,
-        Err(response) => {
+        Err(error) => {
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            finalize_immediate_response(&tracer, &response, "request_body_error");
-            return response;
+            finalize_immediate_error(&tracer, error.status, error.error_type, &error.safe_message);
+            return error.response;
         }
     };
     let request_body = &prepared_bodies.primary_body;
@@ -6649,6 +6698,45 @@ mod tests {
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[0]["text"], "native thinking fallback");
+    }
+
+    #[test]
+    fn image_budget_failure_uses_specific_safe_trace_type_and_stats() {
+        let error = ImageBudgetError::Exceeded {
+            count: 12,
+            history_count: 11,
+            current_count: 1,
+            before: 1_993_000,
+            after: 944_788,
+            soft_limit: 819_200,
+            hard_limit: 900_000,
+        };
+        let details = image_budget_failure_details(&error);
+        assert_eq!(details.status, StatusCode::BAD_REQUEST);
+        assert_eq!(details.error_type, "image_budget_exceeded");
+        assert!(details.safe_message.contains("history=11"));
+        assert!(details.safe_message.contains("current=1"));
+        assert!(details.safe_message.contains("before=1993000"));
+        assert!(details.safe_message.contains("after=944788"));
+        assert!(details.safe_message.contains("soft=819200"));
+        assert!(details.safe_message.contains("hard=900000"));
+        assert!(!details.safe_message.contains("base64"));
+    }
+
+    #[test]
+    fn invalid_image_conversion_has_a_specific_trace_type() {
+        let error = ConversionError::InvalidImage {
+            location: "current_message.images[0]".to_string(),
+            source: crate::image_resize::ImageValidationError::DecodeFailed,
+        };
+        assert_eq!(
+            conversion_error_trace_type(&error),
+            "image_validation_error"
+        );
+        assert_eq!(
+            conversion_error_trace_type(&ConversionError::EmptyMessages),
+            "request_conversion_error"
+        );
     }
 
     #[test]
