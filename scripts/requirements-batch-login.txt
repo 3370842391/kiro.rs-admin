@@ -1,2 +1,4 @@
 httpx>=0.28,<1
 playwright>=1.50,<2
+cryptography>=46,<47
+curl_cffi>=0.13,<1

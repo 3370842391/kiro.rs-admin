@@ -46,7 +46,7 @@ class BatchLoginApp:
         self.output_template_var = tk.StringVar(value=self.form.output_template)
         self.mode_var = tk.StringVar(value=self.form.mode.value)
         self.start_url_var = tk.StringVar()
-        self.new_password_var = tk.StringVar()
+        self.password_vault_path_var = tk.StringVar()
         self.region_var = tk.StringVar(value="us-east-1")
         self.headless_var = tk.BooleanVar(value=False)
         self.timeout_var = tk.DoubleVar(value=180)
@@ -246,12 +246,11 @@ class BatchLoginApp:
         self.start_url_entry = self._entry_row(
             frame, 1, "Start URL", self.start_url_var
         )
-        self.new_password_entry = self._entry_row(
+        self.password_vault_entry = self._entry_row(
             frame,
             2,
-            "新密码（需要改密时）",
-            self.new_password_var,
-            show="•",
+            "密码保险库（自动生成密码）",
+            self.password_vault_path_var,
         )
         self._entry_row(frame, 3, "Region", self.region_var)
         self._entry_row(
@@ -268,19 +267,19 @@ class BatchLoginApp:
             self.checkpoint_path_var,
             browse=self._choose_checkpoint_path,
         )
-        headless = ttk.Checkbutton(
+        self.headless_toggle = ttk.Checkbutton(
             frame,
             text="无头浏览器",
             variable=self.headless_var,
         )
-        headless.grid(row=8, column=0, sticky="w", pady=(5, 0))
+        self.headless_toggle.grid(row=8, column=0, sticky="w", pady=(5, 0))
         resume = ttk.Checkbutton(
             frame,
             text="恢复运行",
             variable=self.resume_var,
         )
         resume.grid(row=8, column=1, sticky="w", pady=(5, 0))
-        self.run_sensitive.extend([headless, resume])
+        self.run_sensitive.extend([self.headless_toggle, resume])
         ttk.Label(frame, text="结果方式").grid(
             row=9, column=0, sticky="w", pady=(5, 0)
         )
@@ -391,10 +390,12 @@ class BatchLoginApp:
     def _apply_mode_visibility(self) -> None:
         if self.mode_var.get() == LoginMode.ENTERPRISE.value:
             self.start_url_entry.grid()
-            self._set_row_visible(self.new_password_entry, True)
+            self._set_row_visible(self.password_vault_entry, True)
+            self.headless_toggle.grid_remove()
         else:
             self.start_url_entry.grid_remove()
-            self._set_row_visible(self.new_password_entry, False)
+            self._set_row_visible(self.password_vault_entry, False)
+            self.headless_toggle.grid()
         import_mode = (
             self.result_mode_var.get() == ResultMode.SAVE_AND_IMPORT.value
         )
@@ -562,7 +563,7 @@ class BatchLoginApp:
             input_template=self.input_template_var.get(),
             output_template=self.output_template_var.get(),
             start_url=self.start_url_var.get(),
-            new_password=self.new_password_var.get(),
+            password_vault_path=self.password_vault_path_var.get(),
             region=self.region_var.get(),
             headless=self.headless_var.get(),
             timeout_seconds=self.timeout_var.get(),
@@ -669,11 +670,14 @@ class BatchLoginApp:
             )
         elif event.kind == "browser_stage":
             labels = {
+                "oidc_register": "注册企业 OIDC 客户端",
                 "portal_init": "初始化企业登录门户",
                 "device_authorization": "确认设备授权码",
+                "workflow_init": "初始化 AWS 登录工作流",
                 "username": "提交用户名",
                 "password": "提交一次性密码",
                 "password_reset": "设置新密码",
+                "sso_token": "获取企业 SSO Token",
                 "complete": "登录流程完成",
             }
             stage = str(payload.get("stage") or "")

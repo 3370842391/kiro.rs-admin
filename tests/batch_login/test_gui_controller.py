@@ -2,6 +2,7 @@ import asyncio
 import sys
 import threading
 import unittest
+from unittest.mock import AsyncMock, patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -75,15 +76,13 @@ class GuiControllerTests(unittest.TestCase):
 
         self.assertIn("企业模式必须填写 Start URL", form.validate())
 
-    def test_enterprise_new_password_is_passed_to_run_settings(self):
-        form = valid_form(new_password="New-Password-42!")
+    def test_enterprise_password_vault_defaults_next_to_credential_json(self):
+        form = valid_form(password_vault_path="")
 
         self.assertEqual(
-            "New-Password-42!",
-            form.to_run_settings().new_password,
+            Path("credentials.json.passwords.sqlite3"),
+            form.to_run_settings().password_vault_path,
         )
-        self.assertNotIn("New-Password-42!", repr(form))
-        self.assertNotIn("New-Password-42!", repr(form.to_run_settings()))
 
     def test_direct_remote_plain_http_is_rejected(self):
         form = valid_form(
@@ -160,6 +159,11 @@ class GuiControllerTests(unittest.TestCase):
 
         self.assertIn("完整凭据 JSON 不能覆盖账号输入文件", errors)
 
+    def test_password_vault_cannot_overwrite_credential_json(self):
+        form = valid_form(password_vault_path="credentials.json")
+
+        self.assertIn("密码保险库不能覆盖完整凭据 JSON", form.validate())
+
 
 class FakeResource:
     def __init__(self, name, calls, *, error=None):
@@ -178,6 +182,30 @@ class FakeResource:
 
 
 class GuiRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_enterprise_runtime_does_not_start_playwright(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            form = valid_form(
+                credential_path=str(Path(tmp) / "credentials.json"),
+                checkpoint_path=str(Path(tmp) / "checkpoint.jsonl"),
+                password_vault_path=str(Path(tmp) / "passwords.sqlite3"),
+            )
+            runtime = GuiRuntime(form, lambda _event: None)
+            with patch(
+                "batch_login.gui_runtime.async_playwright",
+                side_effect=AssertionError("enterprise must not start Playwright"),
+            ), patch(
+                "batch_login.gui_runtime.LocalBatchRunner.run",
+                new=AsyncMock(return_value=None),
+            ):
+                await runtime.run([])
+
+            self.assertIsNone(runtime.playwright)
+            self.assertIsNone(runtime.browser)
+            self.assertIsNotNone(runtime.enterprise_transport)
+            await runtime.close()
+
     async def test_runner_importer_defers_rs_connection_until_import_stage(self):
         form = valid_form(
             result_mode=ResultMode.SAVE_AND_IMPORT,
@@ -216,12 +244,20 @@ class GuiRuntimeTests(unittest.IsolatedAsyncioTestCase):
         runtime.http = FakeResource("http", calls)
         runtime.importer = FakeResource("importer", calls)
         runtime.tunnel = FakeResource("tunnel", calls)
+        runtime.enterprise_transport = FakeResource("enterprise_transport", calls)
 
         with self.assertRaisesRegex(RuntimeError, "browser close failed"):
             await runtime.close()
 
         self.assertEqual(
-            ["browser", "playwright", "http", "importer", "tunnel"],
+            [
+                "browser",
+                "playwright",
+                "http",
+                "enterprise_transport",
+                "importer",
+                "tunnel",
+            ],
             calls,
         )
 

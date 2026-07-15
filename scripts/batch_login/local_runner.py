@@ -6,6 +6,7 @@ from uuid import uuid4
 
 from .browser_flows import BrowserFlowError
 from .credential_models import CredentialRecord
+from .enterprise_http import EnterpriseHttpError
 from .local_auth import (
     EnterpriseSettings,
     LocalAuthError,
@@ -105,7 +106,7 @@ class LocalBatchRunner:
                             },
                         )
                     )
-                except (LocalAuthError, BrowserFlowError) as error:
+                except (LocalAuthError, BrowserFlowError, EnterpriseHttpError) as error:
                     self._record_failure(
                         summary,
                         entry,
@@ -132,7 +133,6 @@ class LocalBatchRunner:
                 EnterpriseSettings(
                     settings.start_url or "",
                     settings.region,
-                    settings.new_password,
                 ),
             )
         return await self.microsoft.login(
@@ -176,7 +176,7 @@ class LocalBatchRunner:
         summary: BatchSummary,
         entry: AccountEntry,
         settings: LocalRunSettings,
-        error: LocalAuthError | BrowserFlowError,
+        error: LocalAuthError | BrowserFlowError | EnterpriseHttpError,
     ) -> None:
         manual = error.code in {"mfa_timeout", "captcha_required"}
         status = "manual_required" if manual else "failed"

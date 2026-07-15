@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import queue
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -31,8 +31,8 @@ class GuiFormState:
     input_path: str = ""
     credential_path: str = ""
     checkpoint_path: str = ""
+    password_vault_path: str = ""
     resume: bool = False
-    new_password: str = field(default="", repr=False)
     rs_url: str = ""
     admin_key: str = ""
     use_ssh: bool = False
@@ -61,6 +61,8 @@ class GuiFormState:
             errors.append("必须选择完整凭据 JSON 路径")
         if self._paths_collide():
             errors.append("完整凭据 JSON 不能覆盖账号输入文件")
+        if self._vault_overwrites_credentials():
+            errors.append("密码保险库不能覆盖完整凭据 JSON")
         if self.result_mode is ResultMode.SAVE_AND_IMPORT:
             self._validate_import(errors)
         return errors
@@ -71,6 +73,14 @@ class GuiFormState:
         return Path(self.input_path).resolve() == Path(
             self.credential_path
         ).resolve()
+
+    def _vault_overwrites_credentials(self) -> bool:
+        if not self.credential_path.strip():
+            return False
+        vault = self.password_vault_path.strip() or (
+            self.credential_path.strip() + ".passwords.sqlite3"
+        )
+        return Path(vault).resolve() == Path(self.credential_path).resolve()
 
     def _validate_import(self, errors: list[str]) -> None:
         if not self.admin_key.strip():
@@ -101,6 +111,9 @@ class GuiFormState:
         checkpoint = self.checkpoint_path.strip() or (
             self.credential_path.strip() + ".checkpoint.jsonl"
         )
+        password_vault = self.password_vault_path.strip() or (
+            self.credential_path.strip() + ".passwords.sqlite3"
+        )
         return LocalRunSettings(
             mode=self.mode,
             region=self.region.strip(),
@@ -111,8 +124,8 @@ class GuiFormState:
             result_mode=self.result_mode,
             credential_path=Path(self.credential_path),
             checkpoint_path=Path(checkpoint),
+            password_vault_path=Path(password_vault),
             resume=self.resume,
-            new_password=self.new_password,
         )
 
 

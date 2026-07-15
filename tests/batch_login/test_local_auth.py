@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from batch_login.credential_models import CredentialRecord
+from batch_login.enterprise_http import EnterpriseHttpResult
 from batch_login.local_auth import (
     EnterpriseSettings,
     LocalEnterpriseAuth,
@@ -39,6 +40,19 @@ class FakeIdc:
 
     async def poll(self, _session):
         return IdcToken("access", "refresh", 3600)
+
+
+class FakeEnterpriseProtocol:
+    async def login(self, account, password, settings):
+        self.received = (account, password, settings)
+        return EnterpriseHttpResult(
+            directory_id="d-123",
+            client_id="client",
+            client_secret="secret",
+            access_token="access",
+            refresh_token="refresh",
+            expires_in=3600,
+        )
 
 
 class FakePage:
@@ -138,20 +152,20 @@ class FakeMicrosoft:
 
 class LocalAuthTests(unittest.IsolatedAsyncioTestCase):
     async def test_enterprise_returns_complete_idc_record(self):
-        browser = FakeBrowser()
-        record = await LocalEnterpriseAuth(FakeIdc(), browser, now=lambda: NOW).login(
+        protocol = FakeEnterpriseProtocol()
+        record = await LocalEnterpriseAuth(protocol, now=lambda: NOW).login(
             AccountEntry(1, "admin-user", "password"),
             EnterpriseSettings(
-                "https://example.awsapps.com/start",
+                "https://d-123.awsapps.com/start",
                 "us-east-1",
-                "New-Password-42!",
             ),
         )
         self.assertEqual("idc", record.auth_method)
         self.assertEqual("client", record.client_id)
         self.assertEqual("2026-07-15T01:00:00Z", record.expires_at)
-        self.assertEqual(("https://verify", "admin-user", "password", "CODE"), browser.enterprise)
-        self.assertEqual("New-Password-42!", browser.new_password)
+        self.assertEqual("admin-user", protocol.received[0])
+        self.assertEqual("password", protocol.received[1])
+        self.assertEqual("https://d-123.awsapps.com/start", protocol.received[2].start_url)
 
     async def test_microsoft_external_reuses_one_context(self):
         browser = FakeBrowser([
@@ -182,24 +196,6 @@ class LocalAuthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("social", record.auth_method)
         self.assertEqual(["/"], browser.paths)
         self.assertEqual(("portal-code", "v"), protocol.social_exchange)
-
-    async def test_enterprise_token_success_cancels_still_running_browser_flow(self):
-        browser = FakeBrowser(block_enterprise=True)
-        backend = LocalEnterpriseAuth(FakeIdc(), browser, now=lambda: NOW)
-
-        record = await asyncio.wait_for(
-            backend.login(
-                AccountEntry(1, "admin-user", "password"),
-                EnterpriseSettings(
-                    "https://example.awsapps.com/start",
-                    "us-east-1",
-                ),
-            ),
-            timeout=0.1,
-        )
-
-        self.assertEqual("idc", record.auth_method)
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -14,6 +14,8 @@ def dependency_errors() -> list[str]:
     try:
         import httpx  # noqa: F401
         import playwright  # noqa: F401
+        import cryptography  # noqa: F401
+        import curl_cffi  # noqa: F401
     except ImportError:
         errors.append("请安装 scripts/requirements-batch-login.txt")
     if shutil.which("ssh") is None:

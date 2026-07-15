@@ -745,7 +745,7 @@ python -m playwright install chromium
 
 ### 桌面批量登录助手
 
-先检查 Tkinter、HTTP、Playwright 和 OpenSSH 依赖，再启动桌面界面：
+先检查 Tkinter、HTTP、加密、Playwright 和 OpenSSH 依赖，再启动桌面界面：
 
 ```powershell
 python scripts/kiro_batch_login_gui.py --check
@@ -758,13 +758,29 @@ python scripts/kiro_batch_login_gui.py
 - 默认识别 `login = {account} / onetime password = {password}`；密码中的空格、
   斜杠、反斜杠、`< > # $` 等字符原样保留。
 - 预览默认遮罩密码，可复制或保存统一格式的账号 TXT。
-- 企业账号使用 AWS IAM Identity Center 设备授权；Microsoft 账号支持 Kiro Portal
-  social 和 Microsoft Entra external IdP 两段登录。
-- 企业模式可填写“新密码（需要改密时）”。首次登录遇到 AWS 强制改密页面时，助手会
-  填写新密码和确认密码；已经完成改密的账号会自动跳过该页面。新密码只在内存中传给
-  当前浏览器，不写入凭据 JSON 或 checkpoint。
-- 遇到 AWS `Authorization requested` 页面时，助手会核对页面验证码与当前设备码，
-  一致后自动点击 `Confirm and continue`；验证码不一致会关闭当前账号并继续下一项。
+- 企业账号使用纯 HTTP AWS IAM Identity Center 状态机，不启动浏览器；Microsoft 账号
+  继续使用 Kiro Portal social 和 Microsoft Entra external IdP 浏览器登录。
+- 企业首次登录需要改密时，助手使用密码学安全随机数自动生成每账号独立强密码。新密码
+  必须先写入 SQLite 密码保险库、由当前 Windows 用户 DPAPI 加密、以 `synchronous=FULL`
+  提交并重新解密校验成功，随后才允许发送 AWS 改密请求；任何保存失败都会禁止改密。
+- 密码保险库默认位于完整凭据 JSON 旁边的 `<凭据文件>.passwords.sqlite3`。改密请求结果
+  分为 `prepared`、`confirmed`、`rejected`、`uncertain`；网络结果未知时保留同一个候选
+  密码，恢复运行会先验证该密码，不会盲目生成第二个密码。
+- 企业 HTTP 流程实现 OIDC 设备码、Portal、D2C、AWS signin 指纹/XXTEA、JWE 密码、
+  SSO token、`accept_user_code` 和 `associate_token`，未知 MFA/CAPTCHA 步骤会明确失败并
+  继续下一账号，不会静默当作成功。
+
+需要查看或备份自动生成的密码时，必须显式导出明文恢复文件：
+
+```powershell
+python scripts/kiro_password_vault.py `
+  --vault .\credentials.json.passwords.sqlite3 `
+  --output .\enterprise-passwords.json `
+  --confirm-plaintext
+```
+
+导出的 JSON 含明文密码；使用后应转移到密码管理器并安全删除。日常批量登录只使用 DPAPI
+加密的 SQLite 保险库，不会把新密码写入普通日志、checkpoint 或 token 凭据 JSON。
 - “仅保存完整 JSON”完全不要求 RS URL、Admin Key 或 SSH，适合先在本机验证是否能
   登录并取得完整可导入 JSON。
 - “保存并导入 RS”严格先原子保存凭据 JSON，再连接 RS；RS/SSH 连接失败不会破坏

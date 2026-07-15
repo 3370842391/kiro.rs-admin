@@ -7,13 +7,14 @@ from playwright.async_api import async_playwright
 
 from .browser_flows import BrowserFlows
 from .credential_store import CredentialStore
+from .enterprise_http import CurlCffiTransport, EnterpriseHttpClient
 from .gui_controller import GuiController, GuiFormState
 from .local_auth import LocalEnterpriseAuth, LocalMicrosoftAuth
 from .local_checkpoint import LocalCheckpointStore
-from .local_idc import LocalIdcClient
 from .local_microsoft import MicrosoftProtocol
 from .local_runner import LocalBatchRunner
-from .models import AccountEntry
+from .models import AccountEntry, LoginMode
+from .password_vault import PasswordVault
 from .rs_import import RsImportClient
 from .ssh_tunnel import SshTunnel, SshTunnelSettings
 from .worker_events import ResultMode, WorkerEvent
@@ -39,6 +40,7 @@ class GuiRuntime:
         self.browser = None
         self.importer: RsImportClient | None = None
         self.tunnel: SshTunnel | None = None
+        self.enterprise_transport: CurlCffiTransport | None = None
 
     async def _connect_importer(self) -> RsImportClient | None:
         if self.form.result_mode is ResultMode.SAVE_ONLY:
@@ -77,32 +79,54 @@ class GuiRuntime:
         checkpoint = LocalCheckpointStore(
             self.form.to_run_settings().checkpoint_path
         )
-        self.http = httpx.AsyncClient(timeout=30)
-        self.playwright = await async_playwright().start()
-        self.browser = await self.playwright.chromium.launch(
-            headless=self.form.headless
-        )
-
         def emit_browser_event(raw_event):
             event = dict(raw_event)
             kind = str(event.pop("kind", "browser_event"))
             self.emit(WorkerEvent(kind, event))
-
-        browser_flows = BrowserFlows(
-            self.browser,
-            timeout_seconds=self.form.timeout_seconds,
-            mfa_timeout_seconds=self.form.mfa_timeout_seconds,
-            event_sink=emit_browser_event,
-        )
-        runner = LocalBatchRunner(
-            enterprise=LocalEnterpriseAuth(
-                LocalIdcClient(self.http),
-                browser_flows,
-            ),
-            microsoft=LocalMicrosoftAuth(
+        if self.form.mode is LoginMode.ENTERPRISE:
+            vault_path = self.form.to_run_settings().password_vault_path
+            self.emit(
+                WorkerEvent(
+                    "security_warning",
+                    {
+                        "message": (
+                            "企业新密码会先使用 Windows DPAPI 加密并可靠保存到："
+                            f"{vault_path}"
+                        )
+                    },
+                )
+            )
+            self.enterprise_transport = CurlCffiTransport(
+                timeout=self.form.timeout_seconds
+            )
+            enterprise = LocalEnterpriseAuth(
+                EnterpriseHttpClient(
+                    self.enterprise_transport,
+                    vault=PasswordVault(vault_path),
+                    event_sink=emit_browser_event,
+                )
+            )
+            microsoft = None
+        else:
+            self.http = httpx.AsyncClient(timeout=30)
+            self.playwright = await async_playwright().start()
+            self.browser = await self.playwright.chromium.launch(
+                headless=self.form.headless
+            )
+            browser_flows = BrowserFlows(
+                self.browser,
+                timeout_seconds=self.form.timeout_seconds,
+                mfa_timeout_seconds=self.form.mfa_timeout_seconds,
+                event_sink=emit_browser_event,
+            )
+            enterprise = None
+            microsoft = LocalMicrosoftAuth(
                 MicrosoftProtocol(self.http),
                 browser_flows,
-            ),
+            )
+        runner = LocalBatchRunner(
+            enterprise=enterprise,
+            microsoft=microsoft,
             store=store,
             checkpoint=checkpoint,
             importer=self.runner_importer(),
@@ -141,6 +165,7 @@ class GuiRuntime:
             ("browser", "close"),
             ("playwright", "stop"),
             ("http", "aclose"),
+            ("enterprise_transport", "close"),
             ("importer", "aclose"),
             ("tunnel", "stop"),
         )

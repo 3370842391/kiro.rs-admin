@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -30,8 +30,8 @@ class LocalRunSettings:
     result_mode: ResultMode
     credential_path: Path
     checkpoint_path: Path
+    password_vault_path: Path = Path("enterprise-passwords.sqlite3")
     resume: bool = False
-    new_password: str = field(default="", repr=False)
 
 
 @dataclass(slots=True)
