@@ -12,6 +12,7 @@ pub(crate) enum ToolInputViolation {
     ConstMismatch { path: String },
     EnumMismatch { path: String },
     AdditionalProperty(String),
+    ConstraintViolation { path: String, keyword: &'static str },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -188,6 +189,9 @@ fn display_violation(violation: &ToolInputViolation) -> String {
         }
         ToolInputViolation::EnumMismatch { path } => format!("{path} is outside enum"),
         ToolInputViolation::AdditionalProperty(path) => format!("unexpected property {path}"),
+        ToolInputViolation::ConstraintViolation { path, keyword } => {
+            format!("{path} violates {keyword}")
+        }
     }
 }
 
@@ -244,8 +248,43 @@ pub(crate) fn append_tool_schema_retry_instruction(
             missing_paths.join(", ")
         )
     };
+    let constraint_paths = failure
+        .violations()
+        .iter()
+        .filter_map(|violation| {
+            let (path, keyword) = match violation {
+                ToolInputViolation::TypeMismatch { path, .. } => (path.as_str(), "type"),
+                ToolInputViolation::ConstMismatch { path } => (path.as_str(), "const"),
+                ToolInputViolation::EnumMismatch { path } => (path.as_str(), "enum"),
+                ToolInputViolation::AdditionalProperty(path) => {
+                    (path.as_str(), "additionalProperties")
+                }
+                ToolInputViolation::ConstraintViolation { path, keyword } => {
+                    (path.as_str(), *keyword)
+                }
+                ToolInputViolation::UndeclaredTool | ToolInputViolation::MissingRequired(_) => {
+                    return None;
+                }
+            };
+            let path = safe_retry_schema_path(path)?;
+            serde_json::to_string(&serde_json::json!({
+                "path": bounded_chars(path, MAX_SAFE_INPUT_KEY_CHARS),
+                "constraint": keyword,
+            }))
+            .ok()
+        })
+        .take(16)
+        .collect::<Vec<_>>();
+    let constraints = if constraint_paths.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Schema constraint violations: {}.",
+            constraint_paths.join(", ")
+        )
+    };
     let suffix = format!(
-        "\n[Schema retry attempt only] The previous input for this tool did not satisfy its declared inputSchema. Return one complete JSON object that exactly matches inputSchema; include required properties and use the declared JSON types.{missing} Do not invent placeholder values."
+        "\n[Schema retry attempt only] The previous input for this tool did not satisfy its declared inputSchema. Return one complete JSON object that exactly matches inputSchema; include required properties and use the declared JSON types.{missing}{constraints} Do not invent placeholder values."
     );
     let keep_chars = MAX_TOOL_DESCRIPTION_CHARS.saturating_sub(suffix.chars().count());
     let mut updated = bounded_chars(&description, keep_chars);
@@ -281,6 +320,9 @@ impl std::fmt::Display for ToolSchemaError {
                 }
                 ToolInputViolation::AdditionalProperty(path) => {
                     write!(formatter, "unexpected property {path}")
+                }
+                ToolInputViolation::ConstraintViolation { path, keyword } => {
+                    write!(formatter, "{path} violates {keyword}")
                 }
             }?;
         }
@@ -398,22 +440,224 @@ fn validate_composite(
     repairs: &mut Vec<String>,
     violations: &mut Vec<ToolInputViolation>,
 ) {
-    if let Some(object) = value.as_object_mut() {
+    validate_all_of(schema, value, path, repairs, violations);
+
+    if let Some(text) = value.as_str() {
+        validate_string_constraints(schema, text, path, violations);
+    } else if value.is_number() {
+        validate_numeric_constraints(schema, value, path, violations);
+    } else if let Some(object) = value.as_object_mut() {
         validate_object(schema, object, path, repairs, violations);
-    } else if let Some(array) = value.as_array_mut()
-        && let Some(items) = schema.get("items")
-    {
-        for (index, item) in array.iter_mut().enumerate() {
-            validate_value(
-                items,
-                item,
-                &format!("{path}[{index}]"),
-                false,
-                repairs,
-                violations,
-            );
+    } else if let Some(array) = value.as_array_mut() {
+        validate_array_constraints(schema, array.len(), path, violations);
+        if let Some(items) = schema.get("items") {
+            for (index, item) in array.iter_mut().enumerate() {
+                validate_value(
+                    items,
+                    item,
+                    &format!("{path}[{index}]"),
+                    false,
+                    repairs,
+                    violations,
+                );
+            }
         }
     }
+}
+
+fn validate_all_of(
+    schema: &serde_json::Value,
+    value: &mut serde_json::Value,
+    path: &str,
+    repairs: &mut Vec<String>,
+    violations: &mut Vec<ToolInputViolation>,
+) {
+    let Some(all_of) = schema.get("allOf") else {
+        return;
+    };
+    let Some(subschemas) = all_of.as_array() else {
+        push_constraint_violation(violations, path, "allOf");
+        return;
+    };
+    for subschema in subschemas {
+        match subschema {
+            serde_json::Value::Bool(true) => {}
+            serde_json::Value::Object(_) => {
+                validate_value(subschema, value, path, false, repairs, violations);
+            }
+            _ => {
+                push_constraint_violation(violations, path, "allOf");
+            }
+        }
+    }
+}
+
+fn validate_string_constraints(
+    schema: &serde_json::Value,
+    value: &str,
+    path: &str,
+    violations: &mut Vec<ToolInputViolation>,
+) {
+    let length = value.chars().count() as u64;
+    if let Some(minimum) = schema.get("minLength") {
+        match minimum.as_u64() {
+            Some(minimum) if length < minimum => {
+                push_constraint_violation(violations, path, "minLength");
+            }
+            Some(_) => {}
+            None => push_constraint_violation(violations, path, "minLength"),
+        }
+    }
+    if let Some(maximum) = schema.get("maxLength") {
+        match maximum.as_u64() {
+            Some(maximum) if length > maximum => {
+                push_constraint_violation(violations, path, "maxLength");
+            }
+            Some(_) => {}
+            None => push_constraint_violation(violations, path, "maxLength"),
+        }
+    }
+    if let Some(pattern) = schema.get("pattern") {
+        match pattern
+            .as_str()
+            .and_then(|pattern| regex::Regex::new(pattern).ok())
+        {
+            Some(regex) if !regex.is_match(value) => {
+                push_constraint_violation(violations, path, "pattern");
+            }
+            Some(_) => {}
+            None => push_constraint_violation(violations, path, "pattern"),
+        }
+    }
+}
+
+fn validate_numeric_constraints(
+    schema: &serde_json::Value,
+    value: &serde_json::Value,
+    path: &str,
+    violations: &mut Vec<ToolInputViolation>,
+) {
+    if schema
+        .get("minimum")
+        .is_some_and(|minimum| violates_minimum(value, minimum, false))
+    {
+        push_constraint_violation(violations, path, "minimum");
+    }
+    if schema
+        .get("maximum")
+        .is_some_and(|maximum| violates_maximum(value, maximum, false))
+    {
+        push_constraint_violation(violations, path, "maximum");
+    }
+    if schema
+        .get("exclusiveMinimum")
+        .is_some_and(|minimum| violates_minimum(value, minimum, true))
+    {
+        push_constraint_violation(violations, path, "exclusiveMinimum");
+    }
+    if schema
+        .get("exclusiveMaximum")
+        .is_some_and(|maximum| violates_maximum(value, maximum, true))
+    {
+        push_constraint_violation(violations, path, "exclusiveMaximum");
+    }
+}
+
+fn violates_minimum(
+    value: &serde_json::Value,
+    minimum: &serde_json::Value,
+    exclusive: bool,
+) -> bool {
+    match compare_json_numbers(value, minimum) {
+        Some(std::cmp::Ordering::Less) => true,
+        Some(std::cmp::Ordering::Equal) => exclusive,
+        Some(std::cmp::Ordering::Greater) => false,
+        None => true,
+    }
+}
+
+fn violates_maximum(
+    value: &serde_json::Value,
+    maximum: &serde_json::Value,
+    exclusive: bool,
+) -> bool {
+    match compare_json_numbers(value, maximum) {
+        Some(std::cmp::Ordering::Greater) => true,
+        Some(std::cmp::Ordering::Equal) => exclusive,
+        Some(std::cmp::Ordering::Less) => false,
+        None => true,
+    }
+}
+
+fn compare_json_numbers(
+    left: &serde_json::Value,
+    right: &serde_json::Value,
+) -> Option<std::cmp::Ordering> {
+    let left = left.as_number()?;
+    let right = right.as_number()?;
+
+    if left.is_i64() && right.is_i64() {
+        return left.as_i64()?.partial_cmp(&right.as_i64()?);
+    }
+    if left.is_u64() && right.is_u64() {
+        return left.as_u64()?.partial_cmp(&right.as_u64()?);
+    }
+    if left.is_i64() && right.is_u64() {
+        let left = left.as_i64()?;
+        return Some(if left < 0 {
+            std::cmp::Ordering::Less
+        } else {
+            (left as u64).cmp(&right.as_u64()?)
+        });
+    }
+    if left.is_u64() && right.is_i64() {
+        let right = right.as_i64()?;
+        return Some(if right < 0 {
+            std::cmp::Ordering::Greater
+        } else {
+            left.as_u64()?.cmp(&(right as u64))
+        });
+    }
+
+    left.as_f64()?.partial_cmp(&right.as_f64()?)
+}
+
+fn validate_array_constraints(
+    schema: &serde_json::Value,
+    length: usize,
+    path: &str,
+    violations: &mut Vec<ToolInputViolation>,
+) {
+    let length = length as u64;
+    if let Some(minimum) = schema.get("minItems") {
+        match minimum.as_u64() {
+            Some(minimum) if length < minimum => {
+                push_constraint_violation(violations, path, "minItems");
+            }
+            Some(_) => {}
+            None => push_constraint_violation(violations, path, "minItems"),
+        }
+    }
+    if let Some(maximum) = schema.get("maxItems") {
+        match maximum.as_u64() {
+            Some(maximum) if length > maximum => {
+                push_constraint_violation(violations, path, "maxItems");
+            }
+            Some(_) => {}
+            None => push_constraint_violation(violations, path, "maxItems"),
+        }
+    }
+}
+
+fn push_constraint_violation(
+    violations: &mut Vec<ToolInputViolation>,
+    path: &str,
+    keyword: &'static str,
+) {
+    violations.push(ToolInputViolation::ConstraintViolation {
+        path: path.to_string(),
+        keyword,
+    });
 }
 
 fn validate_object(
@@ -622,6 +866,260 @@ mod tests {
             validate_and_repair(&schema, &mut input),
             ToolInputOutcome::Valid
         );
+    }
+
+    #[test]
+    fn rejects_string_length_and_pattern_constraints_without_copying_values() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "short": {"type": "string", "minLength": 3},
+                "long": {"type": "string", "maxLength": 4},
+                "code": {"type": "string", "pattern": "^[A-Z]{2}[0-9]{2}$"}
+            },
+            "required": ["short", "long", "code"]
+        });
+        let original = serde_json::json!({
+            "short": "x",
+            "long": "private-customer-long-value",
+            "code": "private-customer-code"
+        });
+        let mut input = original.clone();
+
+        let ToolInputOutcome::Invalid { violations } = validate_and_repair(&schema, &mut input)
+        else {
+            panic!("string constraints must reject the invalid input");
+        };
+        let rendered = violations
+            .iter()
+            .map(display_violation)
+            .collect::<Vec<_>>()
+            .join("; ");
+
+        assert!(rendered.contains("$.short"));
+        assert!(rendered.contains("minLength"));
+        assert!(rendered.contains("$.long"));
+        assert!(rendered.contains("maxLength"));
+        assert!(rendered.contains("$.code"));
+        assert!(rendered.contains("pattern"));
+        assert!(!rendered.contains("private-customer-long-value"));
+        assert!(!rendered.contains("private-customer-code"));
+        assert_eq!(input, original);
+    }
+
+    #[test]
+    fn rejects_number_and_integer_bound_constraints() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "minimum": {"type": "number", "minimum": 10},
+                "maximum": {"type": "number", "maximum": 20},
+                "exclusive_minimum": {"type": "number", "exclusiveMinimum": 0},
+                "exclusive_maximum": {"type": "number", "exclusiveMaximum": 5},
+                "integer_minimum": {"type": "integer", "minimum": 2}
+            },
+            "required": [
+                "minimum",
+                "maximum",
+                "exclusive_minimum",
+                "exclusive_maximum",
+                "integer_minimum"
+            ]
+        });
+        let mut input = serde_json::json!({
+            "minimum": 9,
+            "maximum": 21,
+            "exclusive_minimum": 0,
+            "exclusive_maximum": 5,
+            "integer_minimum": 1
+        });
+
+        let ToolInputOutcome::Invalid { violations } = validate_and_repair(&schema, &mut input)
+        else {
+            panic!("numeric constraints must reject the invalid input");
+        };
+        let rendered = violations
+            .iter()
+            .map(display_violation)
+            .collect::<Vec<_>>()
+            .join("; ");
+
+        assert!(rendered.contains("$.minimum"));
+        assert!(rendered.contains("minimum"));
+        assert!(rendered.contains("$.maximum"));
+        assert!(rendered.contains("maximum"));
+        assert!(rendered.contains("$.exclusive_minimum"));
+        assert!(rendered.contains("exclusiveMinimum"));
+        assert!(rendered.contains("$.exclusive_maximum"));
+        assert!(rendered.contains("exclusiveMaximum"));
+        assert!(rendered.contains("$.integer_minimum"));
+    }
+
+    #[test]
+    fn compares_large_integer_bounds_without_f64_precision_loss() {
+        let schema = serde_json::json!({
+            "type": "integer",
+            "maximum": 9_007_199_254_740_992_u64
+        });
+        let mut input = serde_json::json!(9_007_199_254_740_993_u64);
+
+        assert!(matches!(
+            validate_and_repair(&schema, &mut input),
+            ToolInputOutcome::Invalid { violations }
+                if violations.iter().any(|violation| {
+                    display_violation(violation).contains("maximum")
+                })
+        ));
+    }
+
+    #[test]
+    fn rejects_array_length_constraints() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "too_short": {"type": "array", "minItems": 2},
+                "too_long": {"type": "array", "maxItems": 1}
+            },
+            "required": ["too_short", "too_long"]
+        });
+        let mut input = serde_json::json!({"too_short": [], "too_long": [1, 2]});
+
+        let ToolInputOutcome::Invalid { violations } = validate_and_repair(&schema, &mut input)
+        else {
+            panic!("array constraints must reject the invalid input");
+        };
+        let rendered = violations
+            .iter()
+            .map(display_violation)
+            .collect::<Vec<_>>()
+            .join("; ");
+
+        assert!(rendered.contains("$.too_short"));
+        assert!(rendered.contains("minItems"));
+        assert!(rendered.contains("$.too_long"));
+        assert!(rendered.contains("maxItems"));
+    }
+
+    #[test]
+    fn malformed_supported_constraint_keywords_fail_closed() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "minLength": -1, "pattern": 7},
+                "items": {"type": "array", "minItems": "2"}
+            },
+            "required": ["name", "items"]
+        });
+        let mut input = serde_json::json!({"name": "valid", "items": [1, 2]});
+
+        let ToolInputOutcome::Invalid { violations } = validate_and_repair(&schema, &mut input)
+        else {
+            panic!("malformed supported constraints must fail closed");
+        };
+        let rendered = violations
+            .iter()
+            .map(display_violation)
+            .collect::<Vec<_>>()
+            .join("; ");
+
+        assert!(rendered.contains("minLength"));
+        assert!(rendered.contains("pattern"));
+        assert!(rendered.contains("minItems"));
+    }
+
+    #[test]
+    fn all_of_requires_every_subschema_to_match() {
+        let schema = serde_json::json!({
+            "allOf": [
+                {
+                    "type": "object",
+                    "properties": {"name": {"type": "string", "minLength": 3}},
+                    "required": ["name"]
+                },
+                {
+                    "type": "object",
+                    "properties": {"enabled": {"type": "boolean"}},
+                    "required": ["enabled"]
+                }
+            ]
+        });
+        let mut invalid = serde_json::json!({"name": "x", "enabled": true});
+        let mut valid = serde_json::json!({"name": "valid", "enabled": true});
+
+        assert!(matches!(
+            validate_and_repair(&schema, &mut invalid),
+            ToolInputOutcome::Invalid { .. }
+        ));
+        assert_eq!(
+            validate_and_repair(&schema, &mut valid),
+            ToolInputOutcome::Valid
+        );
+    }
+
+    #[test]
+    fn all_of_false_subschema_fails_closed() {
+        let schema = serde_json::json!({"allOf": [true, false]});
+        let mut input = serde_json::json!({"safe": true});
+
+        assert!(matches!(
+            validate_and_repair(&schema, &mut input),
+            ToolInputOutcome::Invalid { violations }
+                if violations.iter().any(|violation| {
+                    display_violation(violation).contains("allOf")
+                })
+        ));
+    }
+
+    #[test]
+    fn constraint_failure_and_retry_description_never_copy_customer_values() {
+        let contracts = std::collections::HashMap::from([(
+            "submit_token".to_string(),
+            ToolContract {
+                client_name: "submit_token".to_string(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"token": {"type": "string", "maxLength": 3}},
+                    "required": ["token"]
+                }),
+            },
+        )]);
+        let private_value = "private-customer-token-value";
+        let mut blocks = vec![serde_json::json!({
+            "type": "tool_use",
+            "id": "toolu_private",
+            "name": "submit_token",
+            "input": {"token": private_value}
+        })];
+
+        let error = validate_tool_use_blocks(&contracts, &mut blocks)
+            .expect_err("maxLength must reject the private value");
+        let failure = ToolSchemaFailure::from_error_and_input(
+            error,
+            &serde_json::json!({"token": private_value}),
+        );
+        let request = serde_json::json!({
+            "conversationState": {"currentMessage": {"userInputMessage": {
+                "userInputMessageContext": {"tools": [{"toolSpecification": {
+                    "name": "submit_token",
+                    "description": "Submit one token.",
+                    "inputSchema": {"json": contracts["submit_token"].schema}
+                }}]}
+            }}}
+        });
+        let retry = append_tool_schema_retry_instruction(
+            &request.to_string(),
+            &failure,
+            &std::collections::HashMap::new(),
+        )
+        .expect("constraint retry description");
+        let public = failure.public_message();
+        let summary = failure.safe_summary(1);
+
+        for safe_output in [&public, &summary, &retry] {
+            assert!(safe_output.contains("$.token"));
+            assert!(safe_output.contains("maxLength"));
+            assert!(!safe_output.contains(private_value));
+        }
     }
 
     #[test]

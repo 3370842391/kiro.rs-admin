@@ -1047,7 +1047,8 @@ fn build_tool_contracts(
             .entry(tool.name.clone())
             .or_insert_with(|| super::tool_schema::ToolContract {
                 client_name: tool.name.clone(),
-                schema: normalize_json_schema(serde_json::json!(tool.input_schema)),
+                // 响应交付校验必须保留客户原始契约；下发 Kiro 的兼容降级由 convert_tools 单独处理。
+                schema: serde_json::json!(tool.input_schema),
             });
     }
     contracts
@@ -4282,7 +4283,7 @@ mod tests {
     }
 
     #[test]
-    fn conversion_retains_normalized_client_tool_contract_without_description_injection() {
+    fn conversion_retains_client_tool_contract_without_description_injection() {
         use std::collections::BTreeMap;
 
         let req = MessagesRequest {
@@ -4325,6 +4326,59 @@ mod tests {
         assert_eq!(contract.schema["type"], "object");
         assert_eq!(contract.schema["properties"]["unit"]["enum"][0], "celsius");
         assert!(!contract.schema.to_string().contains("customer description"));
+    }
+
+    #[test]
+    fn conversion_keeps_original_constraints_in_client_tool_contract() {
+        use std::collections::BTreeMap;
+
+        let req = MessagesRequest {
+            force_web_search_loop: false,
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 256,
+            messages: vec![super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::json!("score"),
+            }],
+            stream: false,
+            system: None,
+            tools: Some(vec![super::super::types::Tool {
+                tool_type: None,
+                name: "submit_score".to_string(),
+                description: "Submit score".to_string(),
+                input_schema: BTreeMap::from([
+                    ("type".to_string(), serde_json::json!("object")),
+                    (
+                        "properties".to_string(),
+                        serde_json::json!({
+                            "score": {
+                                "type": "number",
+                                "exclusiveMinimum": 0
+                            }
+                        }),
+                    ),
+                    (
+                        "allOf".to_string(),
+                        serde_json::json!([{"required": ["score"]}]),
+                    ),
+                ]),
+                max_uses: None,
+                cache_control: None,
+            }]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let converted = convert_request(&req).unwrap();
+        let contract = converted.tool_contracts.get("submit_score").unwrap();
+
+        assert_eq!(
+            contract.schema["properties"]["score"]["exclusiveMinimum"],
+            0
+        );
+        assert_eq!(contract.schema["allOf"][0]["required"][0], "score");
     }
 
     #[test]

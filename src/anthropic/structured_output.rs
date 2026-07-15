@@ -133,6 +133,25 @@ mod tests {
     }
 
     #[test]
+    fn rejects_extended_constraints_through_the_shared_validator() {
+        let format = OutputFormat {
+            format_type: "json_schema".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string", "minLength": 3},
+                    "score": {"type": "number", "minimum": 10},
+                    "items": {"type": "array", "minItems": 2}
+                },
+                "required": ["label", "score", "items"],
+                "allOf": [{"properties": {"label": {"pattern": "^[A-Z]+$"}}}]
+            }),
+        };
+
+        assert!(validate_output_json(r#"{"label":"x","score":9,"items":[]}"#, &format).is_err());
+    }
+
+    #[test]
     fn extracted_candidate_still_requires_the_original_schema() {
         assert!(validate_output_json("result: {\"answer\":42}", &format()).is_err());
         assert!(
