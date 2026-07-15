@@ -121,6 +121,39 @@ mod tests {
     };
     use tower::ServiceExt;
 
+    fn provider_with_grouped_credential(group: &str) -> Arc<KiroProvider> {
+        use std::collections::HashMap;
+
+        use crate::kiro::{
+            endpoint::{IdeEndpoint, KiroEndpoint},
+            model::credentials::KiroCredentials,
+            token_manager::MultiTokenManager,
+        };
+
+        let mut credential = KiroCredentials::default();
+        credential.access_token = Some("test-access-token".to_string());
+        credential.groups = vec![group.to_string()];
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                crate::model::config::Config::default(),
+                vec![credential],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint::new()));
+        Arc::new(KiroProvider::with_proxy(
+            manager,
+            None,
+            endpoints,
+            "ide".to_string(),
+            None,
+        ))
+    }
+
     #[tokio::test]
     async fn empty_user_message_returns_400_before_missing_provider_for_both_modes() {
         let keys = Arc::new(crate::admin::ClientKeyManager::new());
@@ -177,5 +210,100 @@ mod tests {
                 super::super::handlers::EMPTY_USER_MESSAGE_ERROR
             );
         }
+    }
+
+    #[tokio::test]
+    async fn models_route_without_provider_returns_stable_503() {
+        let keys = Arc::new(crate::admin::ClientKeyManager::new());
+        keys.create_with_key(
+            "models".to_string(),
+            None,
+            None,
+            "csk_models-test".to_string(),
+        );
+        let app = create_router(
+            None,
+            false,
+            ToolCompatibilityMode::ClaudeCode,
+            Some(keys),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .header("x-api-key", "csk_models-test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["type"], "no_available_credentials");
+    }
+
+    #[tokio::test]
+    async fn models_route_uses_authenticated_key_group_and_returns_dynamic_gpt() {
+        let provider = provider_with_grouped_credential("gpt-group");
+        provider.seed_model_catalog_for_test(
+            Some("gpt-group"),
+            vec![crate::kiro::model::available_models::UpstreamModel {
+                model_id: "gpt-5.6-sol".to_string(),
+                model_name: Some("GPT Sol".to_string()),
+                description: None,
+                token_limits: None,
+            }],
+        );
+        let keys = Arc::new(crate::admin::ClientKeyManager::new());
+        keys.create_with_key(
+            "gpt".to_string(),
+            None,
+            Some("gpt-group".to_string()),
+            "csk_gpt-models".to_string(),
+        );
+        let app = create_router(
+            Some(provider),
+            false,
+            ToolCompatibilityMode::ClaudeCode,
+            Some(keys),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .header("x-api-key", "csk_gpt-models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["object"], "list");
+        assert!(
+            json["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|model| model["id"] == "gpt-5.6-sol")
+        );
     }
 }
