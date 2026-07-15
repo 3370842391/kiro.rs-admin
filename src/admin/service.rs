@@ -42,26 +42,26 @@ use super::types::{
     ApplyModelProfilesRequest, AssignProxyRequest, AssignRoundRobinResponse, AvailableModelItem,
     AvailableModelsResponse, BalanceResponse, BatchAddProxyRequest, BatchGroupMode,
     BatchImportEvent, BatchUpdateCredentialsRequest, BatchUpdateCredentialsResponse,
-    CacheHitRateResponse, CachePolicyResponse, CheckRateLimitRequest, ClearCacheResponse,
-    CompatibilityConfigResponse, CompleteSocialLoginRequest, CredentialResponseTestResponse,
-    CredentialStatusItem, CredentialsExportResponse, CredentialsStatusResponse,
-    EnableOverageAllResult, EndpointBucketOption, EndpointChainsResponse, ExportedAccount,
-    ExportedCredentials, FetchModelProfileRequest, GitHubRateLimitInfo, ImageBudgetResponse,
-    ImageUpdateResponse, LoadBalancingModeResponse, LogGovernanceConfigResponse,
-    ModelProfileFieldRefResponse, ModelProfileFieldResponse, ModelProfilePreviewChangeResponse,
-    ModelProfilePreviewResponse, ModelProfileSettingsResponse, ModelProfileSourceSummaryResponse,
-    ModelProfileSyncResponse, ModelProfileSyncSummaryResponse, ModelProfileViewResponse,
-    ModelProfilesResponse, PatchModelProfileRequest, PollIdcLoginResponse,
-    PreviewModelProfilesRequest, ProxyBalancingModeResponse, ProxyCheckAllResponse,
-    ProxyCheckResponse, ProxyCheckUrlRequest, ProxyPoolEntry, ProxyPoolResponse,
-    QuotaExceededResult, ResolvedModelProfileResponse, RetryPolicyResponse, RevisionRequest,
-    RpmSummary, SetAccountThrottleConfigRequest, SetCacheHitRateRequest, SetCachePolicyRequest,
-    SetCompatibilityConfigRequest, SetEndpointChainsRequest, SetImageBudgetRequest,
-    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetModelProfileSettingsRequest,
-    SetProxyBalancingModeRequest, SetRetryPolicyRequest, SetUpdateConfigRequest,
-    StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse,
-    SyncModelProfilesRequest, UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest,
-    UpdateRefreshTokenRequest,
+    CacheHitRateResponse, CachePolicyResponse, CancelLoginResponse, CheckRateLimitRequest,
+    ClearCacheResponse, CompatibilityConfigResponse, CompleteSocialLoginRequest,
+    CredentialResponseTestResponse, CredentialStatusItem, CredentialsExportResponse,
+    CredentialsStatusResponse, EnableOverageAllResult, EndpointBucketOption,
+    EndpointChainsResponse, ExportedAccount, ExportedCredentials, FetchModelProfileRequest,
+    GitHubRateLimitInfo, ImageBudgetResponse, ImageUpdateResponse, LoadBalancingModeResponse,
+    LogGovernanceConfigResponse, ModelProfileFieldRefResponse, ModelProfileFieldResponse,
+    ModelProfilePreviewChangeResponse, ModelProfilePreviewResponse, ModelProfileSettingsResponse,
+    ModelProfileSourceSummaryResponse, ModelProfileSyncResponse, ModelProfileSyncSummaryResponse,
+    ModelProfileViewResponse, ModelProfilesResponse, PatchModelProfileRequest,
+    PollIdcLoginResponse, PreviewModelProfilesRequest, ProxyBalancingModeResponse,
+    ProxyCheckAllResponse, ProxyCheckResponse, ProxyCheckUrlRequest, ProxyPoolEntry,
+    ProxyPoolResponse, QuotaExceededResult, ResolvedModelProfileResponse, RetryPolicyResponse,
+    RevisionRequest, RpmSummary, SetAccountThrottleConfigRequest, SetCacheHitRateRequest,
+    SetCachePolicyRequest, SetCompatibilityConfigRequest, SetEndpointChainsRequest,
+    SetImageBudgetRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
+    SetModelProfileSettingsRequest, SetProxyBalancingModeRequest, SetRetryPolicyRequest,
+    SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
+    StartSocialLoginResponse, SyncModelProfilesRequest, UpdateCheckInfo, UpdateConfigResponse,
+    UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -3680,12 +3680,27 @@ impl AdminService {
         }
     }
 
+    /// 幂等取消 IdC 登录会话。
+    pub fn cancel_idc_login(&self, session_id: &str) -> CancelLoginResponse {
+        CancelLoginResponse {
+            cancelled: self.idc_sessions.lock().remove(session_id).is_some(),
+        }
+    }
+
+    /// 幂等取消 Social 登录会话；移除会话时释放本地回调服务器。
+    pub fn cancel_social_login(&self, session_id: &str) -> CancelLoginResponse {
+        CancelLoginResponse {
+            cancelled: self.social_sessions.lock().remove(session_id).is_some(),
+        }
+    }
+
     // ── Social 登录（Portal PKCE OAuth）────────────────────────────────────────
 
     /// 发起 Social 登录，返回 portal URL 供用户在浏览器打开
     ///
     /// 始终在服务端本机启动临时 TCP 回调服务器，redirect_uri 为 `http://127.0.0.1:{port}`。
     /// 本机浏览器授权后自动完成；远程访问时用户从地址栏复制回调 URL，经 `complete_social_login` 手动完成。
+
     pub async fn start_social_login(
         &self,
         req: StartSocialLoginRequest,
@@ -4524,6 +4539,69 @@ impl AdminService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn auth_test_service() -> AdminService {
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), Vec::new(), None, None, true).unwrap(),
+        );
+        AdminService::new(
+            manager,
+            Vec::<String>::new(),
+            Arc::new(ProxyPoolManager::new(
+                None,
+                crate::model::config::TlsBackend::Rustls,
+            )),
+        )
+    }
+
+    #[test]
+    fn cancel_idc_login_is_idempotent() {
+        let service = auth_test_service();
+        service.idc_sessions.lock().insert(
+            "session-1".to_string(),
+            IdcAuthSession {
+                region: "us-east-1".to_string(),
+                client_id: "client".to_string(),
+                client_secret: "secret".to_string(),
+                device_code: "device".to_string(),
+                expires_at: Utc::now() + Duration::minutes(5),
+                poll_interval: 5,
+                cred_template: KiroCredentials::default(),
+                proxy: None,
+                relogin_target_id: None,
+            },
+        );
+
+        assert!(service.cancel_idc_login("session-1").cancelled);
+        assert!(!service.cancel_idc_login("session-1").cancelled);
+    }
+
+    #[test]
+    fn cancel_social_login_removes_session_and_drops_server_handle() {
+        let service = auth_test_service();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (_port, handle) = social::start_callback_server(tx).unwrap();
+        let (_callback_tx, callback_rx) = tokio::sync::mpsc::channel(1);
+        service.social_sessions.lock().insert(
+            "social-1".to_string(),
+            SocialAuthSession {
+                auth_endpoint: social::KIRO_AUTH_ENDPOINT.to_string(),
+                state: "state".to_string(),
+                code_verifier: "verifier".to_string(),
+                redirect_uri: "http://127.0.0.1:1".to_string(),
+                expires_at: Utc::now() + Duration::minutes(5),
+                callback_rx: tokio::sync::Mutex::new(callback_rx),
+                external_idp: None,
+                cred_template: KiroCredentials::default(),
+                proxy: None,
+                _server_handle: handle,
+                relogin_target_id: None,
+            },
+        );
+
+        assert!(service.cancel_social_login("social-1").cancelled);
+        assert!(!service.social_sessions.lock().contains_key("social-1"));
+    }
 
     fn rpm_snapshot_entry(
         id: u64,

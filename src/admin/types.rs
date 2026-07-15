@@ -1188,6 +1188,12 @@ pub struct StartIdcLoginResponse {
     pub poll_interval: i64,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelLoginResponse {
+    pub cancelled: bool,
+}
+
 /// 轮询 IdC 登录状态响应
 ///
 /// `rename_all_fields = "camelCase"` 不可省略：enum 上的 `rename_all` 只重命名变体名，

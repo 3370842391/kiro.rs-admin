@@ -867,6 +867,15 @@ pub async fn poll_idc_login(
     }
 }
 
+/// DELETE /api/admin/auth/idc/:session_id
+/// 取消 IdC 登录会话；重复取消返回 cancelled=false。
+pub async fn cancel_idc_login(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    Json(state.service.cancel_idc_login(&session_id))
+}
+
 /// POST /api/admin/auth/social/start
 /// 发起 Social 登录，返回 portal URL
 pub async fn start_social_login(
@@ -889,6 +898,15 @@ pub async fn poll_social_login(
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
+}
+
+/// DELETE /api/admin/auth/social/:session_id
+/// 取消 Social 登录会话并释放本地回调服务器。
+pub async fn cancel_social_login(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    Json(state.service.cancel_social_login(&session_id))
 }
 
 /// POST /api/admin/auth/social/complete/:session_id
