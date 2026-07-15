@@ -460,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_retry_is_limited_to_missing_required_violations() {
+    fn schema_retry_accepts_declared_tool_violations_without_guessing_values() {
         let state_for = |violations| ToolAttemptState {
             attempt_index: 0,
             termination: AttemptTermination::Eof,
@@ -486,7 +486,7 @@ mod tests {
             .should_retry()
         );
         assert!(
-            !state_for(vec![
+            state_for(vec![
                 super::super::tool_schema::ToolInputViolation::TypeMismatch {
                     path: "$.days".to_string(),
                     expected: "integer".to_string(),
@@ -495,7 +495,7 @@ mod tests {
             .should_retry()
         );
         assert!(
-            !state_for(vec![
+            state_for(vec![
                 super::super::tool_schema::ToolInputViolation::MissingRequired(
                     "$.city".to_string(),
                 ),
@@ -844,6 +844,29 @@ mod tests {
         )
     }
 
+    fn schema_stream_context() -> crate::anthropic::stream::StreamContext {
+        let mut ctx = crate::anthropic::stream::StreamContext::new_with_thinking(
+            "claude-test",
+            10,
+            false,
+            std::collections::HashMap::new(),
+            ["custom_tool".to_string()].into_iter().collect(),
+        );
+        ctx.set_tool_contracts(std::collections::HashMap::from([(
+            "custom_tool".to_string(),
+            super::super::tool_schema::ToolContract {
+                client_name: "custom_tool".to_string(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                    "additionalProperties": false
+                }),
+            },
+        )]));
+        ctx
+    }
+
     #[test]
     fn realtime_probation_discards_first_incomplete_attempt_before_commit() {
         let mut buffer = ProbationBuffer::default();
@@ -1033,6 +1056,136 @@ mod tests {
                 && event.data["content_block"]["type"] == "tool_use"
         }));
         assert!(visible.iter().any(|event| event.event == "message_stop"));
+    }
+
+    #[test]
+    fn schema_retry_discards_wrong_type_first_attempt_and_exposes_valid_tool_once() {
+        let mut first_ctx = schema_stream_context();
+        let mut first = ProbationBuffer::default();
+        assert!(
+            first
+                .push_all(first_ctx.generate_initial_events())
+                .is_empty()
+        );
+        assert!(
+            first
+                .push_all(first_ctx.process_kiro_event(&kiro_tool(
+                    "tool_1",
+                    r#"{"path":123}"#,
+                    true,
+                )))
+                .is_empty()
+        );
+        assert!(first.push_all(first_ctx.generate_final_events()).is_empty());
+        let first_failure = first_ctx
+            .terminal_attempt_failure()
+            .cloned()
+            .expect("wrong type schema failure");
+        assert!(first.prepare_attempt_retry(0, AttemptTermination::Eof, Some(first_failure),));
+        assert!(first.take_pending().is_empty());
+
+        let mut second_ctx = schema_stream_context();
+        let mut second = ProbationBuffer::default();
+        let mut visible = second.push_all(second_ctx.generate_initial_events());
+        visible.extend(second.push_all(second_ctx.process_kiro_event(&kiro_tool(
+            "tool_2",
+            r#"{"path":"/tmp/a"}"#,
+            true,
+        ))));
+        visible.extend(second.push_all(second_ctx.generate_final_events()));
+        visible.extend(second.take_pending());
+
+        assert!(second_ctx.terminal_attempt_failure().is_none());
+        assert_eq!(
+            visible
+                .iter()
+                .filter(|event| event.event == "message_start")
+                .count(),
+            1
+        );
+        assert_eq!(
+            visible
+                .iter()
+                .filter(|event| {
+                    event.event == "content_block_start"
+                        && event.data["content_block"]["type"] == "tool_use"
+                })
+                .count(),
+            1
+        );
+        assert!(!visible.iter().any(|event| event.event == "error"));
+    }
+
+    #[test]
+    fn schema_failure_after_text_is_never_retried() {
+        let mut ctx = schema_stream_context();
+        let mut probation = ProbationBuffer::default();
+        assert!(probation.push_all(ctx.generate_initial_events()).is_empty());
+        let mut response = AssistantResponseEvent::default();
+        response.content = "already visible".to_string();
+        assert!(
+            !probation
+                .push_all(ctx.process_kiro_event(&Event::AssistantResponse(response)))
+                .is_empty()
+        );
+        let _ = probation.push_all(ctx.process_kiro_event(&kiro_tool(
+            "tool_1",
+            r#"{"path":123}"#,
+            true,
+        )));
+        let _ = probation.push_all(ctx.generate_final_events());
+        let failure = ctx
+            .terminal_attempt_failure()
+            .cloned()
+            .expect("schema failure after visible text");
+
+        assert!(!probation.prepare_attempt_retry(0, AttemptTermination::Eof, Some(failure),));
+    }
+
+    #[test]
+    fn second_schema_failure_emits_one_error_and_never_a_tool() {
+        let mut first_ctx = schema_stream_context();
+        let mut first = ProbationBuffer::default();
+        let _ = first.push_all(first_ctx.generate_initial_events());
+        let _ = first.push_all(first_ctx.process_kiro_event(&kiro_tool(
+            "tool_1",
+            r#"{"path":123}"#,
+            true,
+        )));
+        let _ = first.push_all(first_ctx.generate_final_events());
+        let first_failure = first_ctx
+            .terminal_attempt_failure()
+            .cloned()
+            .expect("first schema failure");
+        assert!(first.prepare_attempt_retry(0, AttemptTermination::Eof, Some(first_failure),));
+
+        let mut second_ctx = schema_stream_context();
+        let mut second = ProbationBuffer::default();
+        let _ = second.push_all(second_ctx.generate_initial_events());
+        let _ = second.push_all(second_ctx.process_kiro_event(&kiro_tool(
+            "tool_2",
+            r#"{"unexpected":true}"#,
+            true,
+        )));
+        let _ = second.push_all(second_ctx.generate_final_events());
+        let second_failure = second_ctx
+            .terminal_attempt_failure()
+            .cloned()
+            .expect("second schema failure");
+        assert!(!second.prepare_attempt_retry(1, AttemptTermination::Eof, Some(second_failure),));
+        let visible = second.take_pending();
+
+        assert_eq!(
+            visible
+                .iter()
+                .filter(|event| event.event == "error")
+                .count(),
+            1
+        );
+        assert!(!visible.iter().any(|event| {
+            event.event == "content_block_start"
+                && event.data["content_block"]["type"] == "tool_use"
+        }));
     }
 
     #[test]

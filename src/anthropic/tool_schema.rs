@@ -96,7 +96,7 @@ impl ToolSchemaFailure {
                 .error
                 .violations
                 .iter()
-                .all(|violation| matches!(violation, ToolInputViolation::MissingRequired(_)))
+                .all(|violation| !matches!(violation, ToolInputViolation::UndeclaredTool))
     }
 
     pub(crate) fn public_message(&self) -> String {
@@ -922,6 +922,43 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("private customer prompt")
         );
+    }
+
+    #[test]
+    fn retry_instruction_handles_type_mismatch_without_copying_attempt_values() {
+        let original = serde_json::json!({
+            "conversationState": {"currentMessage": {"userInputMessage": {
+                "userInputMessageContext": {"tools": [{"toolSpecification": {
+                    "name": "get_weather",
+                    "description": "Weather lookup.",
+                    "inputSchema": {"json": {
+                        "type": "object",
+                        "properties": {"days": {"type": "integer"}},
+                        "required": ["days"]
+                    }}
+                }}]}
+            }}}
+        });
+        let failure = ToolSchemaFailure::from_error_and_input(
+            ToolSchemaError {
+                tool_name: "get_weather".to_string(),
+                violations: vec![ToolInputViolation::TypeMismatch {
+                    path: "$.days".to_string(),
+                    expected: "integer".to_string(),
+                }],
+            },
+            &serde_json::json!({"days": "private customer value"}),
+        );
+
+        let updated = append_tool_schema_retry_instruction(
+            &original.to_string(),
+            &failure,
+            &std::collections::HashMap::new(),
+        )
+        .expect("type mismatch retry body");
+
+        assert!(updated.contains("retry attempt only"));
+        assert!(!updated.contains("private customer value"));
     }
 
     #[test]
