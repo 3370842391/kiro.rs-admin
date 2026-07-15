@@ -344,8 +344,17 @@ impl ToolAttemptState {
             }
             _ => false,
         };
+        let retryable_termination = self.termination == AttemptTermination::Eof
+            || matches!(
+                self.termination,
+                AttemptTermination::ReadError(_) | AttemptTermination::IdleTimeout
+            ) && matches!(
+                self.failure,
+                Some(AttemptFailure::EmptyResponse)
+                    | Some(AttemptFailure::IncompleteToolJson(IncompleteJson { .. }))
+            );
         self.attempt_index == 0
-            && self.termination == AttemptTermination::Eof
+            && retryable_termination
             && !self.semantic_output_started
             && !self.tool_forwarded
             && retryable_failure
@@ -508,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn retries_only_first_normal_eof_empty_or_incomplete_attempt() {
+    fn retries_only_first_uncommitted_empty_or_incomplete_attempt() {
         let empty = empty_attempt();
         assert!(empty.should_retry());
         assert!(
@@ -522,20 +531,6 @@ mod tests {
         assert!(
             !ToolAttemptState {
                 attempt_index: 1,
-                ..empty.clone()
-            }
-            .should_retry()
-        );
-        assert!(
-            !ToolAttemptState {
-                termination: AttemptTermination::ReadError("connection reset".into()),
-                ..empty.clone()
-            }
-            .should_retry()
-        );
-        assert!(
-            !ToolAttemptState {
-                termination: AttemptTermination::IdleTimeout,
                 ..empty.clone()
             }
             .should_retry()
@@ -575,6 +570,54 @@ mod tests {
                     message: "invalid request".into(),
                 }),
                 ..empty
+            }
+            .should_retry()
+        );
+    }
+
+    #[test]
+    fn retries_first_zero_output_transport_interruption_only() {
+        let first_read_error = ToolAttemptState {
+            attempt_index: 0,
+            termination: AttemptTermination::ReadError("connection reset".into()),
+            failure: Some(AttemptFailure::EmptyResponse),
+            semantic_output_started: false,
+            tool_forwarded: false,
+        };
+        assert!(first_read_error.should_retry());
+        assert!(
+            ToolAttemptState {
+                termination: AttemptTermination::IdleTimeout,
+                ..first_read_error.clone()
+            }
+            .should_retry()
+        );
+
+        assert!(
+            !ToolAttemptState {
+                attempt_index: 1,
+                ..first_read_error.clone()
+            }
+            .should_retry()
+        );
+        assert!(
+            !ToolAttemptState {
+                semantic_output_started: true,
+                ..first_read_error.clone()
+            }
+            .should_retry()
+        );
+        assert!(
+            !ToolAttemptState {
+                tool_forwarded: true,
+                ..first_read_error.clone()
+            }
+            .should_retry()
+        );
+        assert!(
+            !ToolAttemptState {
+                termination: AttemptTermination::ClientClosed,
+                ..first_read_error
             }
             .should_retry()
         );

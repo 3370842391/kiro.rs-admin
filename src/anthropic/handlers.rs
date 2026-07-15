@@ -3051,7 +3051,8 @@ async fn run_realtime_sse_attempts(
             retry_request_body = prepared_retry_body;
             tracing::warn!(
                 attempt = attempt_index + 1,
-                "实时首轮正常 EOF 且无语义输出，丢弃整轮并重试一次"
+                termination = ?termination,
+                "实时首轮未提交语义输出，丢弃整轮并重试一次"
             );
             continue;
         }
@@ -3170,6 +3171,10 @@ struct NonStreamToolAttempt {
 enum NonStreamCollectError {
     Provider(anyhow::Error),
     Body { credential_id: u64, message: String },
+}
+
+fn should_retry_non_stream_collect_error(attempt_index: u8, error: &NonStreamCollectError) -> bool {
+    attempt_index == 0 && matches!(error, NonStreamCollectError::Body { .. })
 }
 
 fn non_stream_attempt_error(
@@ -3512,7 +3517,7 @@ async fn handle_non_stream_request(
                     None,
                 )
             };
-            let attempt = collect_non_stream_tool_attempt(
+            let attempt = match collect_non_stream_tool_attempt(
                 provider.clone(),
                 attempt_body,
                 attempt_threshold_retry_body,
@@ -3527,7 +3532,20 @@ async fn handle_non_stream_request(
                 attempt_index,
                 identity_normalization,
             )
-            .await?;
+            .await
+            {
+                Ok(attempt) => attempt,
+                Err(error) if should_retry_non_stream_collect_error(attempt_index, &error) => {
+                    retry_failure_type = Some("stream_read_error");
+                    retry_request_body = Some(request_body.to_owned());
+                    tracer.record_protocol_error(
+                        "stream_read_error",
+                        "the first non-stream response body ended before delivery; retrying once",
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             if attempt.state.should_retry()
                 && let Some(body) = prepare_retry_request_body(
                     request_body,
@@ -3591,7 +3609,7 @@ async fn handle_non_stream_request(
         let retry_failure_type = retry_failure_type.unwrap_or("upstream_empty_response");
         tracing::warn!(
             first_attempt_error = retry_failure_type,
-            "非流式首轮正常 EOF 且无语义输出，已完成一次受控重试"
+            "非流式首轮未交付响应，已完成一次受控重试"
         );
         tracer.record_protocol_error(
             retry_failure_type,
@@ -4638,7 +4656,8 @@ async fn run_buffered_sse_attempts(
             retry_request_body = prepared_retry_body;
             tracing::warn!(
                 attempt = attempt_index + 1,
-                "CC 缓冲首轮正常 EOF 且无语义输出，丢弃整轮并重试一次"
+                termination = ?termination,
+                "CC 缓冲首轮未提交语义输出，丢弃整轮并重试一次"
             );
             continue;
         }
@@ -5463,6 +5482,19 @@ mod tests {
         };
 
         assert!(!state.should_retry());
+    }
+
+    #[test]
+    fn non_stream_body_read_error_retries_only_before_second_attempt() {
+        let error = NonStreamCollectError::Body {
+            credential_id: 7,
+            message: "connection reset".to_string(),
+        };
+        assert!(should_retry_non_stream_collect_error(0, &error));
+        assert!(!should_retry_non_stream_collect_error(1, &error));
+
+        let provider_error = NonStreamCollectError::Provider(anyhow::anyhow!("upstream 500"));
+        assert!(!should_retry_non_stream_collect_error(0, &provider_error));
     }
 
     #[test]
