@@ -7,6 +7,7 @@ pub mod kiro_version;
 pub mod machine_id;
 pub mod model;
 pub mod model_capabilities;
+pub mod model_catalog;
 pub mod parser;
 pub mod provider;
 pub mod region;

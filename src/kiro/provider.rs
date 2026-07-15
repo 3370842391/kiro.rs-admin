@@ -27,7 +27,8 @@ use crate::kiro::model::requests::conversation::{
     ConversationState, CurrentMessage, UserInputMessage,
 };
 use crate::kiro::model::requests::kiro::KiroRequest;
-use crate::kiro::model_capabilities::{ModelAvailability, ModelAvailabilityCache};
+use crate::kiro::model_capabilities::ModelAvailability;
+use crate::kiro::model_catalog::{DynamicModelCatalog, ModelCatalogError};
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::{RetryMode, RetryPolicy, TlsBackend};
@@ -223,7 +224,7 @@ pub struct KiroProvider {
     /// `ListAvailableProfiles`。命中真实 ARN 的账号会把 ARN 持久化进凭据，之后
     /// 通过 `streaming_profile_arn()` 直接命中，不再进入解析路径。
     profile_resolution_attempted: Mutex<HashSet<u64>>,
-    model_availability: Mutex<ModelAvailabilityCache>,
+    model_catalog: DynamicModelCatalog,
     image_budget_policy: RwLock<ImageBudgetPolicy>,
 }
 
@@ -281,7 +282,7 @@ impl KiroProvider {
             default_endpoint,
             proxy_pool,
             profile_resolution_attempted: Mutex::new(HashSet::new()),
-            model_availability: Mutex::new(ModelAvailabilityCache::new(Duration::from_secs(300))),
+            model_catalog: DynamicModelCatalog::default(),
             image_budget_policy: RwLock::new(image_budget_policy),
         }
     }
@@ -295,12 +296,34 @@ impl KiroProvider {
         Ok(())
     }
 
+    /// 按客户端 Key 分组汇总未禁用凭据真实可用的模型目录。
+    pub async fn available_models(
+        &self,
+        group: Option<&str>,
+    ) -> Result<Vec<crate::kiro::model::available_models::UpstreamModel>, ModelCatalogError> {
+        let credential_ids = self.token_manager.enabled_credential_ids_in_group(group);
+        let manager = Arc::clone(&self.token_manager);
+        self.model_catalog
+            .models_for(group, credential_ids, move |credential_id| {
+                let manager = Arc::clone(&manager);
+                async move { manager.get_available_models_for(credential_id).await }
+            })
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_model_catalog_for_test(
+        &self,
+        group: Option<&str>,
+        models: Vec<crate::kiro::model::available_models::UpstreamModel>,
+    ) {
+        self.model_catalog
+            .seed_for_test(group, models, Instant::now());
+    }
+
     async fn model_availability_for(&self, credential_id: u64, model: &str) -> ModelAvailability {
         let now = Instant::now();
-        let cached = self
-            .model_availability
-            .lock()
-            .availability(credential_id, model, now);
+        let cached = self.model_catalog.availability(credential_id, model, now);
         if cached != ModelAvailability::Unknown {
             return cached;
         }
@@ -311,15 +334,9 @@ impl KiroProvider {
             .await
         {
             Ok(response) => {
-                let ids: Vec<String> = response
-                    .models
-                    .into_iter()
-                    .map(|entry| entry.model_id)
-                    .collect();
-                let available = ids.iter().any(|id| id == model);
-                self.model_availability
-                    .lock()
-                    .insert(credential_id, ids, now);
+                let available = response.models.iter().any(|entry| entry.model_id == model);
+                self.model_catalog
+                    .record_credential_models(credential_id, &response.models, now);
                 if available {
                     ModelAvailability::Available
                 } else {

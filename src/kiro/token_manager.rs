@@ -1599,6 +1599,18 @@ impl MultiTokenManager {
             .count()
     }
 
+    /// 返回模型目录查询可使用的未禁用凭据 ID。
+    ///
+    /// 模型权限不受临时 429、RPM 窗口或当前在途数影响。
+    pub fn enabled_credential_ids_in_group(&self, group: Option<&str>) -> Vec<u64> {
+        self.entries
+            .lock()
+            .iter()
+            .filter(|entry| !entry.disabled && group_matches(&entry.credentials.groups, group))
+            .map(|entry| entry.id)
+            .collect()
+    }
+
     /// 获取可用凭据数量
     pub fn available_count(&self) -> usize {
         let now = Instant::now();
@@ -7477,6 +7489,31 @@ mod tests {
         assert_eq!(manager.total_count_in_group(Some("g2")), 1); // B
         assert_eq!(manager.total_count_in_group(None), 3); // 全部
         assert_eq!(manager.total_count_in_group(Some("none")), 0);
+    }
+
+    #[test]
+    fn enabled_credential_ids_in_group_ignore_runtime_throttle_but_not_disabled() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                grouped_cred("a", &["g1"]),
+                grouped_cred("b", &["g1", "g2"]),
+                grouped_cred("c", &[]),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.report_rate_limited(1, StdDuration::from_secs(60));
+        manager.set_disabled(2, true).unwrap();
+
+        assert_eq!(manager.enabled_credential_ids_in_group(Some("g1")), vec![1]);
+        assert_eq!(
+            manager.enabled_credential_ids_in_group(Some("g2")),
+            Vec::<u64>::new()
+        );
+        assert_eq!(manager.enabled_credential_ids_in_group(None), vec![1, 3]);
     }
 
     #[test]
