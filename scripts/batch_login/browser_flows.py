@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from urllib.parse import urlsplit
+from typing import Any
 
 from playwright.async_api import (
     Browser,
@@ -32,12 +34,14 @@ class BrowserFlows:
         *,
         timeout_seconds: float,
         mfa_timeout_seconds: float,
+        event_sink: Callable[[dict[str, Any]], None] | None = None,
     ):
         if timeout_seconds <= 0 or mfa_timeout_seconds <= 0:
             raise ValueError("浏览器超时必须大于 0")
         self.browser = browser
         self.timeout_seconds = timeout_seconds
         self.mfa_timeout_seconds = mfa_timeout_seconds
+        self.event_sink = event_sink
 
     @asynccontextmanager
     async def account_context(self):
@@ -49,6 +53,7 @@ class BrowserFlows:
                 page,
                 timeout_seconds=self.timeout_seconds,
                 mfa_timeout_seconds=self.mfa_timeout_seconds,
+                event_sink=self.event_sink,
             )
         finally:
             await context.close()
@@ -88,11 +93,17 @@ class AccountBrowserSession:
         *,
         timeout_seconds: float,
         mfa_timeout_seconds: float,
+        event_sink: Callable[[dict[str, Any]], None] | None = None,
     ):
         self.context = context
         self.page = page
         self.timeout_ms = int(timeout_seconds * 1000)
         self.mfa_timeout_ms = int(mfa_timeout_seconds * 1000)
+        self.event_sink = event_sink
+
+    def _emit(self, kind: str, **payload: Any) -> None:
+        if self.event_sink is not None:
+            self.event_sink({"kind": kind, **payload})
 
     async def _first_visible(self, locators):
         for locator in locators:
@@ -169,11 +180,15 @@ class AccountBrowserSession:
             return ""
 
     async def _wait_for_manual_step(self, body: str, code: str) -> None:
-        print("检测到 MFA/验证码，请在当前浏览器窗口中完成人工验证。")
+        self._emit(
+            "manual_action_required",
+            manualKind="captcha" if code == "captcha_required" else "mfa",
+            message="请在当前浏览器窗口完成验证",
+        )
         try:
             await self.page.wait_for_function(
                 "previous => document.body.innerText !== previous",
-                body,
+                arg=body,
                 timeout=self.mfa_timeout_ms,
             )
         except PlaywrightError as error:
@@ -259,6 +274,7 @@ class AccountBrowserSession:
         url: str,
         account: str,
         password: str,
+        user_code: str | None = None,
     ) -> None:
         try:
             await self.page.goto(
@@ -266,6 +282,8 @@ class AccountBrowserSession:
                 wait_until="domcontentloaded",
                 timeout=self.timeout_ms,
             )
+            if user_code:
+                await self._fill_device_code(user_code)
             await self._drive_login(account, password)
         except BrowserFlowError:
             raise
@@ -276,6 +294,25 @@ class AccountBrowserSession:
                 True,
                 "无法打开登录页面",
             ) from error
+
+    async def _fill_device_code(self, user_code: str) -> bool:
+        locator = await self._first_visible(
+            [
+                self.page.get_by_label(
+                    re.compile(r"设备码|用户码|device code|user code", re.I)
+                ),
+                self.page.locator(
+                    "input[name='userCode'], input[name='user_code'], "
+                    "input[autocomplete='one-time-code']"
+                ),
+            ]
+        )
+        if locator is None:
+            return False
+        await locator.fill(user_code)
+        await self._click_primary(False)
+        await asyncio.sleep(0.2)
+        return True
 
     async def capture_callback(
         self,

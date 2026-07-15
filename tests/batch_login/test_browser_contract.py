@@ -15,6 +15,16 @@ from batch_login.browser_flows import BrowserFlowError, BrowserFlows
 
 
 PAGES = {
+    "/device-code": """
+      <form action='/enterprise'>
+        <label>User code <input name='userCode' autocomplete='one-time-code'></label>
+        <button>Continue</button>
+      </form>
+    """,
+    "/mfa": """
+      <p>verification code required</p>
+      <script>setTimeout(() => document.body.innerText = 'approved', 100)</script>
+    """,
     "/enterprise": """
       <form action='/password'>
         <label>用户名 <input name='username'></label>
@@ -107,6 +117,35 @@ class BrowserContractTests(unittest.IsolatedAsyncioTestCase):
                 "secret",
             )
             self.assertIn("/done", session.page.url)
+
+    async def test_enterprise_can_fill_device_code_before_credentials(self):
+        async with self.driver.account_context() as session:
+            await session.complete_enterprise(
+                self.base_url + "/device-code",
+                "alice",
+                "secret",
+                "ABCD-EFGH",
+            )
+            self.assertIn("/done", session.page.url)
+
+    async def test_manual_step_reports_structured_safe_event(self):
+        events = []
+        driver = BrowserFlows(
+            self.browser,
+            timeout_seconds=1,
+            mfa_timeout_seconds=1,
+            event_sink=events.append,
+        )
+        async with driver.account_context() as session:
+            await session.page.goto(self.base_url + "/mfa")
+            await session._wait_for_manual_step(
+                "verification code required",
+                "mfa_timeout",
+            )
+
+        self.assertEqual("manual_action_required", events[0]["kind"])
+        self.assertEqual("mfa", events[0]["manualKind"])
+        self.assertNotIn("verification code required", str(events[0]))
 
     async def test_loopback_connection_failure_still_yields_callback_url(self):
         async with self.driver.account_context() as session:
