@@ -152,6 +152,13 @@ class BrowserContractTests(unittest.IsolatedAsyncioTestCase):
         self.server.server_close()
 
     async def test_enterprise_fills_username_then_password(self):
+        events = []
+        self.driver = BrowserFlows(
+            self.browser,
+            timeout_seconds=5,
+            mfa_timeout_seconds=1,
+            event_sink=events.append,
+        )
         async with self.driver.account_context() as session:
             await session.complete_enterprise(
                 self.base_url + "/enterprise",
@@ -159,6 +166,10 @@ class BrowserContractTests(unittest.IsolatedAsyncioTestCase):
                 "secret",
             )
             self.assertIn("/done", session.page.url)
+        self.assertEqual(
+            ["portal_init", "username", "password", "complete"],
+            [event["stage"] for event in events if event["kind"] == "browser_stage"],
+        )
 
     async def test_enterprise_can_fill_device_code_before_credentials(self):
         async with self.driver.account_context() as session:
@@ -280,6 +291,31 @@ class BrowserContractTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             self.assertEqual("device_code_mismatch", raised.exception.code)
+
+    async def test_enterprise_emits_safe_workflow_stages(self):
+        events = []
+        driver = BrowserFlows(
+            self.browser,
+            timeout_seconds=5,
+            mfa_timeout_seconds=1,
+            event_sink=events.append,
+        )
+        async with driver.account_context() as session:
+            await session.complete_enterprise(
+                self.base_url + "/reset-enterprise",
+                "alice",
+                "one-time",
+                new_password="New-Password-42!",
+            )
+
+        stages = [event["stage"] for event in events if event["kind"] == "browser_stage"]
+        self.assertEqual(
+            ["portal_init", "username", "password_reset", "complete"],
+            stages,
+        )
+        self.assertNotIn("alice", str(events))
+        self.assertNotIn("one-time", str(events))
+        self.assertNotIn("New-Password-42!", str(events))
 
     async def test_microsoft_two_stage_flow_reuses_one_browser_context(self):
         async with self.driver.account_context() as session:

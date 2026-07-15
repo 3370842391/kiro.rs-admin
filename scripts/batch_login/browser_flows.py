@@ -127,6 +127,10 @@ class AccountBrowserSession:
         if self.event_sink is not None:
             self.event_sink({"kind": kind, **payload})
 
+    def _emit_stage(self, stage: str) -> None:
+        """Emit a safe workflow stage without exposing authentication data."""
+        self._emit("browser_stage", stage=stage)
+
     async def _first_visible(self, locators):
         for locator in locators:
             try:
@@ -175,6 +179,7 @@ class AccountBrowserSession:
         )
 
     async def _fill_password_reset(self, new_password: str) -> bool:
+        self._emit_stage("password_reset")
         new_locator = await self._first_visible(
             [
                 self.page.get_by_label(
@@ -230,6 +235,7 @@ class AccountBrowserSession:
         body = await self._body_text()
         if not self.AUTHORIZATION_TEXT.search(body):
             return False
+        self._emit_stage("device_authorization")
         displayed = self.DEVICE_CODE_TEXT.search(body)
         if displayed is None:
             raise BrowserFlowError(
@@ -385,6 +391,7 @@ class AccountBrowserSession:
                 and callback_future is None
                 and self.SUCCESS_TEXT.search(body)
             ):
+                self._emit_stage("complete")
                 return
 
             manual_code = (
@@ -399,12 +406,14 @@ class AccountBrowserSession:
                 continue
 
             if not account_filled and await self._fill_account(account):
+                self._emit_stage("username")
                 account_filled = True
                 await self._click_primary(False)
                 await asyncio.sleep(0.2)
                 continue
 
             if not password_filled and await self._fill_password(password):
+                self._emit_stage("password")
                 password_filled = True
                 await asyncio.sleep(self.PASSWORD_SUBMIT_PAUSE_SECONDS)
                 await self._click_primary(True)
@@ -436,6 +445,7 @@ class AccountBrowserSession:
         new_password: str | None = None,
     ) -> None:
         try:
+            self._emit_stage("portal_init")
             await self.page.goto(
                 url,
                 wait_until="domcontentloaded",
@@ -473,6 +483,7 @@ class AccountBrowserSession:
         )
         if locator is None:
             return False
+        self._emit_stage("device_authorization")
         await locator.fill(user_code)
         await self._click_primary(False)
         await asyncio.sleep(0.2)

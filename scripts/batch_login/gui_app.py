@@ -667,6 +667,19 @@ class BatchLoginApp:
             self.status_var.set(
                 f"正在处理 {payload['accountMasked']}（{index}/{total}）"
             )
+        elif event.kind == "browser_stage":
+            labels = {
+                "portal_init": "初始化企业登录门户",
+                "device_authorization": "确认设备授权码",
+                "username": "提交用户名",
+                "password": "提交一次性密码",
+                "password_reset": "设置新密码",
+                "complete": "登录流程完成",
+            }
+            stage = str(payload.get("stage") or "")
+            message = labels.get(stage, f"登录阶段：{stage}")
+            self.status_var.set(message)
+            self._append_log(message)
         elif event.kind == "manual_action_required":
             self.status_var.set(
                 str(payload.get("message") or "等待人工验证")
