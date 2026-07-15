@@ -2462,16 +2462,19 @@ struct StreamAttemptSetup {
 
 fn prepare_retry_request_body(
     request_body: &str,
-    threshold_retry_body: Option<&str>,
+    _threshold_retry_body: Option<&str>,
     failure: Option<&super::tool_attempt::AttemptFailure>,
     tool_name_map: &std::collections::HashMap<String, String>,
 ) -> Option<String> {
-    let base = threshold_retry_body.unwrap_or(request_body);
     match failure {
         Some(super::tool_attempt::AttemptFailure::InvalidToolSchema { failure }) => {
-            super::tool_schema::append_tool_schema_retry_instruction(base, failure, tool_name_map)
+            super::tool_schema::append_tool_schema_retry_instruction(
+                request_body,
+                failure,
+                tool_name_map,
+            )
         }
-        _ => Some(base.to_owned()),
+        _ => Some(request_body.to_owned()),
     }
 }
 
@@ -5027,7 +5030,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_stream_and_non_stream_retry_body_uses_threshold_variant_and_schema_hint() {
+    fn handler_retries_keep_primary_body_for_empty_transport_and_schema_failures() {
         fn body(description: &str, marker: &str) -> String {
             serde_json::json!({
                 "marker": marker,
@@ -5045,8 +5048,45 @@ mod tests {
             })
             .to_string()
         }
-        let primary = body("primary description", "primary");
-        let threshold = body("threshold description", "threshold");
+        let primary = body("primary description", "marker_primary");
+        let threshold = body("threshold description", "marker_threshold");
+
+        let transport_cases = [
+            (
+                "empty response",
+                super::super::tool_attempt::AttemptTermination::Eof,
+            ),
+            (
+                "read error",
+                super::super::tool_attempt::AttemptTermination::ReadError(
+                    "connection reset".to_string(),
+                ),
+            ),
+            (
+                "idle timeout",
+                super::super::tool_attempt::AttemptTermination::IdleTimeout,
+            ),
+        ];
+        for (case, termination) in transport_cases {
+            let state = super::super::tool_attempt::ToolAttemptState {
+                attempt_index: 0,
+                termination,
+                failure: Some(super::super::tool_attempt::AttemptFailure::EmptyResponse),
+                semantic_output_started: false,
+                tool_forwarded: false,
+            };
+            assert!(state.should_retry(), "{case} should enter handler retry");
+            let retry = prepare_retry_request_body(
+                &primary,
+                Some(&threshold),
+                state.failure.as_ref(),
+                &std::collections::HashMap::new(),
+            )
+            .expect("transport retry body");
+            assert!(retry.contains("marker_primary"), "{case}");
+            assert!(!retry.contains("marker_threshold"), "{case}");
+        }
+
         let failure = super::super::tool_schema::ToolSchemaFailure::from_error_and_input(
             super::super::tool_schema::ToolSchemaError {
                 tool_name: "get_weather".to_string(),
@@ -5060,22 +5100,33 @@ mod tests {
         );
         let attempt_failure =
             super::super::tool_attempt::AttemptFailure::InvalidToolSchema { failure };
+        let state = super::super::tool_attempt::ToolAttemptState {
+            attempt_index: 0,
+            termination: super::super::tool_attempt::AttemptTermination::Eof,
+            failure: Some(attempt_failure),
+            semantic_output_started: false,
+            tool_forwarded: false,
+        };
+        assert!(
+            state.should_retry(),
+            "schema failure should enter handler retry"
+        );
 
         let retry = prepare_retry_request_body(
             &primary,
             Some(&threshold),
-            Some(&attempt_failure),
+            state.failure.as_ref(),
             &std::collections::HashMap::new(),
         )
         .expect("schema retry body");
         let retry: serde_json::Value = serde_json::from_str(&retry).unwrap();
 
-        assert_eq!(retry["marker"], "threshold");
+        assert_eq!(retry["marker"], "marker_primary");
         let description = retry
             .pointer("/conversationState/currentMessage/userInputMessage/userInputMessageContext/tools/0/toolSpecification/description")
             .and_then(serde_json::Value::as_str)
             .unwrap();
-        assert!(description.starts_with("threshold description"));
+        assert!(description.starts_with("primary description"));
         assert!(description.contains("retry attempt only"));
         assert!(description.contains("city"));
     }
