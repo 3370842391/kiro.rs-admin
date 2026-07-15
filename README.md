@@ -728,9 +728,10 @@ Admin 还提供：
 <a id="batch-enterprise-microsoft-login"></a>
 ## 批量企业与 Microsoft 登录
 
-仓库提供独立的 Python 3.11+ / Playwright 命令行工具。浏览器由 Python
-进程启动，RS 只负责创建登录会话、兑换 token、验证凭据和写入账号池；账号密码不会
-上传给 RS，也不会写入 checkpoint。账号固定串行处理，每个账号使用独立的浏览器
+仓库同时提供独立的 Python 3.11+ / Tkinter 桌面助手和 Playwright 命令行工具。
+桌面助手在本机完成协议交换，可不连接 RS 而直接保存完整凭据 JSON；原有命令行工具
+则由 RS 创建登录会话、兑换 token、验证凭据并写入账号池。两种方式都不会把明文密码
+上传给 RS 或写入 checkpoint；导入凭据时会按需发送账号标识和 token。账号固定串行处理，每个账号使用独立的浏览器
 Context，避免 Cookie 和登录状态串号。
 
 ### 安装
@@ -742,9 +743,57 @@ python -m pip install -r scripts/requirements-batch-login.txt
 python -m playwright install chromium
 ```
 
+### 桌面批量登录助手
+
+先检查 Tkinter、HTTP、Playwright 和 OpenSSH 依赖，再启动桌面界面：
+
+```powershell
+python scripts/kiro_batch_login_gui.py --check
+python scripts/kiro_batch_login_gui.py
+```
+
+桌面助手支持以下完整流程：
+
+- 粘贴原始账号文本，按自定义 `{account}` / `{password}` 模板解析并预览。
+- 默认识别 `login = {account} / onetime password = {password}`；密码中的空格、
+  斜杠、反斜杠、`< > # $` 等字符原样保留。
+- 预览默认遮罩密码，可复制或保存统一格式的账号 TXT。
+- 企业账号使用 AWS IAM Identity Center 设备授权；Microsoft 账号支持 Kiro Portal
+  social 和 Microsoft Entra external IdP 两段登录。
+- “仅保存完整 JSON”完全不要求 RS URL、Admin Key 或 SSH，适合先在本机验证是否能
+  登录并取得完整可导入 JSON。
+- “保存并导入 RS”严格先原子保存凭据 JSON，再连接 RS；RS/SSH 连接失败不会破坏
+  已保存文件。
+- 可以直接选择已有完整凭据 JSON 导入，无需再次打开浏览器登录。
+
+完整凭据 JSON 已包含 `accessToken`、`refreshToken`，企业模式还可能包含
+`clientSecret`。这是高敏感文件：不要发送、截图、上传网盘或提交 Git。助手会尽力将
+文件权限限制为仅当前用户可读写，但仍建议检查 Windows ACL 或 Unix 文件权限。
+
+#### 桌面助手连接 RS
+
+直接连接远程 RS 时必须填写 HTTPS 根地址，例如 `https://rs.example.com`；只有
+`127.0.0.1`、`localhost`、`::1` 允许明文 HTTP。Admin Key 可在界面遮罩输入，也可先
+通过环境变量预填：
+
+```powershell
+$env:KIRO_RS_ADMIN_KEY = "你的 Admin Key"
+python scripts/kiro_batch_login_gui.py
+```
+
+若 RS 只监听服务器回环地址，选择“使用 SSH 隧道”，填写 SSH 主机、用户、端口、
+可选私钥，以及 RS 的远端主机和端口。助手使用系统 OpenSSH 的参数列表启动
+`ssh -N -L`，自动选择本地端口，并在结束或取消后只清理自己启动的进程。
+
+运行中检测到 MFA 或 CAPTCHA 时，状态栏会提示在当前浏览器中人工完成。取消后，已
+成功保存的凭据不会回滚；再次勾选“恢复运行”会按账号、模式和登录作用域跳过已保存
+项目，输入文本重新排序也不会失去恢复记录。
+
+下面的命令行工具是原有的 RS 绑定流程，适合希望登录后立即由 RS 落库的场景。
+
 ### 账号文件与自定义分隔规则
 
-默认每行格式为 `{account}----{password}`：
+命令行工具默认每行格式为 `{account}----{password}`：
 
 ```text
 # 空行和以 # 开头的行会被忽略
@@ -752,8 +801,9 @@ user1@example.com----Password-1
 user2@example.com----Password----With----Separator
 ```
 
-密码中的后续 `----` 会被保留。也可以通过 `--format` 指定只包含一次
-`{account}`、一次 `{password}` 和一个非空字面分隔符的模板。例如密码在前：
+密码中的后续 `----` 会被保留。也可以通过 `--format` 指定恰好包含一次
+`{account}` 和一次 `{password}` 的整行模板；固定前缀、后缀及字面花括号均受支持。
+例如密码在前：
 
 ```powershell
 --format "{password}####{account}"
