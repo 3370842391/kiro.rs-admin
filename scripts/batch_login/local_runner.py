@@ -129,7 +129,11 @@ class LocalBatchRunner:
         if settings.mode is LoginMode.ENTERPRISE:
             return await self.enterprise.login(
                 entry,
-                EnterpriseSettings(settings.start_url or "", settings.region),
+                EnterpriseSettings(
+                    settings.start_url or "",
+                    settings.region,
+                    settings.new_password,
+                ),
             )
         return await self.microsoft.login(
             entry,

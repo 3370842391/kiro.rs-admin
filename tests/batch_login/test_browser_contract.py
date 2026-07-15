@@ -89,6 +89,26 @@ PAGES = {
         );
       </script>
     """,
+    "/reset-enterprise": """
+      <form action='/reset-password'>
+        <label>用户名 <input name='username'></label>
+        <button>下一步</button>
+      </form>
+    """,
+    "/reset-password": """
+      <form action='/reset-done'>
+        <label>新密码 <input name='newPassword' type='password'></label>
+        <label>确认密码 <input name='confirmPassword' type='password'></label>
+        <button>设置新密码</button>
+      </form>
+    """,
+    "/reset-done": "<h1>授权成功</h1>",
+    "/authorization": """
+      <p>Authorization requested</p>
+      <p>Confirm this code matches the one given to you.</p>
+      <strong>CHCQ-THMN</strong>
+      <form action='/enterprise'><button>Confirm and continue</button></form>
+    """,
 }
 
 
@@ -214,6 +234,52 @@ class BrowserContractTests(unittest.IsolatedAsyncioTestCase):
             value = await session.page.locator("input[name='password']").input_value()
             self.assertGreaterEqual(event_count, len(password))
             self.assertEqual(password, value)
+
+    async def test_password_reset_page_uses_fixed_new_password(self):
+        async with self.driver.account_context() as session:
+            await session.complete_enterprise(
+                self.base_url + "/reset-enterprise",
+                "alice",
+                "one-time",
+                new_password="New-Password-42!",
+            )
+
+            self.assertIn("/reset-done", session.page.url)
+
+    async def test_password_reset_without_configured_new_password_is_classified(self):
+        async with self.driver.account_context() as session:
+            with self.assertRaises(BrowserFlowError) as raised:
+                await session.complete_enterprise(
+                    self.base_url + "/reset-enterprise",
+                    "alice",
+                    "one-time",
+                )
+
+            self.assertEqual("new_password_required", raised.exception.code)
+            self.assertFalse(raised.exception.retryable)
+
+    async def test_authorization_code_is_verified_before_continue(self):
+        async with self.driver.account_context() as session:
+            await session.complete_enterprise(
+                self.base_url + "/authorization",
+                "alice",
+                "secret",
+                user_code="CHCQ-THMN",
+            )
+
+            self.assertIn("/done", session.page.url)
+
+    async def test_authorization_code_mismatch_is_rejected(self):
+        async with self.driver.account_context() as session:
+            with self.assertRaises(BrowserFlowError) as raised:
+                await session.complete_enterprise(
+                    self.base_url + "/authorization",
+                    "alice",
+                    "secret",
+                    user_code="DIFF-CODE",
+                )
+
+            self.assertEqual("device_code_mismatch", raised.exception.code)
 
     async def test_microsoft_two_stage_flow_reuses_one_browser_context(self):
         async with self.driver.account_context() as session:

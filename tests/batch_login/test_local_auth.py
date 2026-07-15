@@ -45,8 +45,16 @@ class FakePage:
     def __init__(self, owner):
         self.owner = owner
 
-    async def complete_enterprise(self, url, account, password, user_code=None):
+    async def complete_enterprise(
+        self,
+        url,
+        account,
+        password,
+        user_code=None,
+        new_password=None,
+    ):
         self.owner.enterprise = (url, account, password, user_code)
+        self.owner.new_password = new_password
         if self.owner.block_enterprise:
             await asyncio.Future()
 
@@ -62,6 +70,7 @@ class FakeBrowser:
         self.paths = []
         self.contexts = 0
         self.enterprise = None
+        self.new_password = None
 
     @asynccontextmanager
     async def account_context(self):
@@ -132,12 +141,17 @@ class LocalAuthTests(unittest.IsolatedAsyncioTestCase):
         browser = FakeBrowser()
         record = await LocalEnterpriseAuth(FakeIdc(), browser, now=lambda: NOW).login(
             AccountEntry(1, "admin-user", "password"),
-            EnterpriseSettings("https://example.awsapps.com/start", "us-east-1"),
+            EnterpriseSettings(
+                "https://example.awsapps.com/start",
+                "us-east-1",
+                "New-Password-42!",
+            ),
         )
         self.assertEqual("idc", record.auth_method)
         self.assertEqual("client", record.client_id)
         self.assertEqual("2026-07-15T01:00:00Z", record.expires_at)
         self.assertEqual(("https://verify", "admin-user", "password", "CODE"), browser.enterprise)
+        self.assertEqual("New-Password-42!", browser.new_password)
 
     async def test_microsoft_external_reuses_one_context(self):
         browser = FakeBrowser([

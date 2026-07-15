@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -31,6 +31,7 @@ class LocalRunSettings:
     credential_path: Path
     checkpoint_path: Path
     resume: bool = False
+    new_password: str = field(default="", repr=False)
 
 
 @dataclass(slots=True)

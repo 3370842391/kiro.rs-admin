@@ -760,6 +760,11 @@ python scripts/kiro_batch_login_gui.py
 - 预览默认遮罩密码，可复制或保存统一格式的账号 TXT。
 - 企业账号使用 AWS IAM Identity Center 设备授权；Microsoft 账号支持 Kiro Portal
   social 和 Microsoft Entra external IdP 两段登录。
+- 企业模式可填写“新密码（需要改密时）”。首次登录遇到 AWS 强制改密页面时，助手会
+  填写新密码和确认密码；已经完成改密的账号会自动跳过该页面。新密码只在内存中传给
+  当前浏览器，不写入凭据 JSON 或 checkpoint。
+- 遇到 AWS `Authorization requested` 页面时，助手会核对页面验证码与当前设备码，
+  一致后自动点击 `Confirm and continue`；验证码不一致会关闭当前账号并继续下一项。
 - “仅保存完整 JSON”完全不要求 RS URL、Admin Key 或 SSH，适合先在本机验证是否能
   登录并取得完整可导入 JSON。
 - “保存并导入 RS”严格先原子保存凭据 JSON，再连接 RS；RS/SSH 连接失败不会破坏

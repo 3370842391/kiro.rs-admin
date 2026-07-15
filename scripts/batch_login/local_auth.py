@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from .credential_models import CredentialRecord
@@ -13,6 +13,7 @@ from .models import AccountEntry
 class EnterpriseSettings:
     start_url: str
     region: str
+    new_password: str = field(default="", repr=False)
 
 
 @dataclass(slots=True, frozen=True)
@@ -35,6 +36,7 @@ class LocalEnterpriseAuth:
                     entry.account,
                     entry.password,
                     session.user_code,
+                    new_password=settings.new_password or None,
                 )
             )
             token_task = asyncio.create_task(self.idc.poll(session))

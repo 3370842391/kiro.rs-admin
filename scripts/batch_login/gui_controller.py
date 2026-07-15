@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import queue
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -32,6 +32,7 @@ class GuiFormState:
     credential_path: str = ""
     checkpoint_path: str = ""
     resume: bool = False
+    new_password: str = field(default="", repr=False)
     rs_url: str = ""
     admin_key: str = ""
     use_ssh: bool = False
@@ -111,6 +112,7 @@ class GuiFormState:
             credential_path=Path(self.credential_path),
             checkpoint_path=Path(checkpoint),
             resume=self.resume,
+            new_password=self.new_password,
         )
 
 

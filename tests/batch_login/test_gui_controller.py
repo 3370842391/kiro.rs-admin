@@ -75,6 +75,16 @@ class GuiControllerTests(unittest.TestCase):
 
         self.assertIn("企业模式必须填写 Start URL", form.validate())
 
+    def test_enterprise_new_password_is_passed_to_run_settings(self):
+        form = valid_form(new_password="New-Password-42!")
+
+        self.assertEqual(
+            "New-Password-42!",
+            form.to_run_settings().new_password,
+        )
+        self.assertNotIn("New-Password-42!", repr(form))
+        self.assertNotIn("New-Password-42!", repr(form.to_run_settings()))
+
     def test_direct_remote_plain_http_is_rejected(self):
         form = valid_form(
             result_mode=ResultMode.SAVE_AND_IMPORT,

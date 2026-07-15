@@ -46,6 +46,7 @@ class BatchLoginApp:
         self.output_template_var = tk.StringVar(value=self.form.output_template)
         self.mode_var = tk.StringVar(value=self.form.mode.value)
         self.start_url_var = tk.StringVar()
+        self.new_password_var = tk.StringVar()
         self.region_var = tk.StringVar(value="us-east-1")
         self.headless_var = tk.BooleanVar(value=False)
         self.timeout_var = tk.DoubleVar(value=180)
@@ -245,17 +246,24 @@ class BatchLoginApp:
         self.start_url_entry = self._entry_row(
             frame, 1, "Start URL", self.start_url_var
         )
-        self._entry_row(frame, 2, "Region", self.region_var)
+        self.new_password_entry = self._entry_row(
+            frame,
+            2,
+            "新密码（需要改密时）",
+            self.new_password_var,
+            show="•",
+        )
+        self._entry_row(frame, 3, "Region", self.region_var)
         self._entry_row(
             frame,
-            3,
+            4,
             "完整凭据 JSON",
             self.credential_path_var,
             browse=self._choose_credential_path,
         )
         self._entry_row(
             frame,
-            4,
+            5,
             "Checkpoint",
             self.checkpoint_path_var,
             browse=self._choose_checkpoint_path,
@@ -265,16 +273,16 @@ class BatchLoginApp:
             text="无头浏览器",
             variable=self.headless_var,
         )
-        headless.grid(row=5, column=0, sticky="w", pady=(5, 0))
+        headless.grid(row=8, column=0, sticky="w", pady=(5, 0))
         resume = ttk.Checkbutton(
             frame,
             text="恢复运行",
             variable=self.resume_var,
         )
-        resume.grid(row=5, column=1, sticky="w", pady=(5, 0))
+        resume.grid(row=8, column=1, sticky="w", pady=(5, 0))
         self.run_sensitive.extend([headless, resume])
         ttk.Label(frame, text="结果方式").grid(
-            row=6, column=0, sticky="w", pady=(5, 0)
+            row=9, column=0, sticky="w", pady=(5, 0)
         )
         result = ttk.Combobox(
             frame,
@@ -285,7 +293,7 @@ class BatchLoginApp:
                 ResultMode.SAVE_AND_IMPORT.value,
             ],
         )
-        result.grid(row=6, column=1, sticky="ew", pady=(5, 0))
+        result.grid(row=9, column=1, sticky="ew", pady=(5, 0))
         result.bind(
             "<<ComboboxSelected>>",
             lambda _event: self._apply_mode_visibility(),
@@ -383,8 +391,10 @@ class BatchLoginApp:
     def _apply_mode_visibility(self) -> None:
         if self.mode_var.get() == LoginMode.ENTERPRISE.value:
             self.start_url_entry.grid()
+            self._set_row_visible(self.new_password_entry, True)
         else:
             self.start_url_entry.grid_remove()
+            self._set_row_visible(self.new_password_entry, False)
         import_mode = (
             self.result_mode_var.get() == ResultMode.SAVE_AND_IMPORT.value
         )
@@ -552,6 +562,7 @@ class BatchLoginApp:
             input_template=self.input_template_var.get(),
             output_template=self.output_template_var.get(),
             start_url=self.start_url_var.get(),
+            new_password=self.new_password_var.get(),
             region=self.region_var.get(),
             headless=self.headless_var.get(),
             timeout_seconds=self.timeout_var.get(),

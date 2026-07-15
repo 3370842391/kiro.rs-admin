@@ -87,6 +87,18 @@ class AccountBrowserSession:
         re.I,
     )
     LOCKED_TEXT = re.compile(r"账号.*锁定|account.*locked", re.I)
+    PASSWORD_RESET_TEXT = re.compile(
+        r"设置新密码|新密码|set new password|new password|change password",
+        re.I,
+    )
+    AUTHORIZATION_TEXT = re.compile(
+        r"authorization requested|confirm this code matches|授权请求|确认此代码",
+        re.I,
+    )
+    DEVICE_CODE_TEXT = re.compile(
+        r"\b[A-Z0-9]{4,}(?:-[A-Z0-9]{4,})+\b",
+        re.I,
+    )
     SUCCESS_TEXT = re.compile(
         r"授权成功|请求已批准|可以关闭此窗口|"
         r"authorization (?:was )?successful|request approved|"
@@ -152,11 +164,110 @@ class AccountBrowserSession:
         )
         if locator is None:
             return False
+        await self._type_value(locator, password)
+        return True
+
+    async def _type_value(self, locator, value: str) -> None:
         await locator.fill("")
         await locator.press_sequentially(
-            password,
+            value,
             delay=self.PASSWORD_KEY_DELAY_MS,
         )
+
+    async def _fill_password_reset(self, new_password: str) -> bool:
+        new_locator = await self._first_visible(
+            [
+                self.page.get_by_label(
+                    re.compile(r"新密码|new password", re.I)
+                ),
+                self.page.locator(
+                    "input[name='newPassword'], input[name='new_password']"
+                ),
+            ]
+        )
+        confirm_locator = await self._first_visible(
+            [
+                self.page.get_by_label(
+                    re.compile(r"确认密码|confirm password|re-enter", re.I)
+                ),
+                self.page.locator(
+                    "input[name='confirmPassword'], "
+                    "input[name='confirmation'], "
+                    "input[name='confirm_password']"
+                ),
+            ]
+        )
+        if new_locator is None or confirm_locator is None:
+            password_inputs = self.page.locator("input[type='password']")
+            if await password_inputs.count() < 2:
+                return False
+            new_locator = password_inputs.nth(0)
+            confirm_locator = password_inputs.nth(1)
+        await self._type_value(new_locator, new_password)
+        await self._type_value(confirm_locator, new_password)
+        return True
+
+    async def _click_password_reset(self) -> bool:
+        locator = await self._first_visible(
+            [
+                self.page.get_by_role(
+                    "button",
+                    name=re.compile(
+                        r"设置新密码|set new password|change password|"
+                        r"继续|continue",
+                        re.I,
+                    ),
+                ),
+                self.page.locator("button[type='submit'], input[type='submit']"),
+            ]
+        )
+        if locator is None:
+            return False
+        await locator.click()
+        return True
+
+    async def _confirm_device_authorization(self, user_code: str) -> bool:
+        body = await self._body_text()
+        if not self.AUTHORIZATION_TEXT.search(body):
+            return False
+        displayed = self.DEVICE_CODE_TEXT.search(body)
+        if displayed is None:
+            raise BrowserFlowError(
+                "device_code_missing",
+                "device_authorization",
+                False,
+                "授权确认页未显示设备码",
+            )
+        expected_code = re.sub(r"[-\s]", "", user_code).upper()
+        actual_code = re.sub(r"[-\s]", "", displayed.group(0)).upper()
+        if expected_code != actual_code:
+            raise BrowserFlowError(
+                "device_code_mismatch",
+                "device_authorization",
+                False,
+                "授权确认页设备码不匹配",
+            )
+        locator = await self._first_visible(
+            [
+                self.page.get_by_role(
+                    "button",
+                    name=re.compile(
+                        r"Confirm and continue|确认并继续|确认",
+                        re.I,
+                    ),
+                ),
+                self.page.locator("button[type='submit'], input[type='submit']"),
+            ]
+        )
+        if locator is None:
+            raise BrowserFlowError(
+                "authorization_confirm_missing",
+                "device_authorization",
+                False,
+                "授权确认页缺少继续按钮",
+            )
+        await locator.click()
+        await asyncio.sleep(0.2)
         return True
 
     async def _click_primary(self, password_stage: bool) -> bool:
@@ -218,10 +329,12 @@ class AccountBrowserSession:
         account: str,
         password: str,
         callback_future=None,
+        new_password: str | None = None,
     ) -> None:
         deadline = asyncio.get_running_loop().time() + self.timeout_ms / 1000
         account_filled = False
         password_filled = False
+        password_reset_handled = False
         while asyncio.get_running_loop().time() < deadline:
             if callback_future is not None and callback_future.done():
                 return
@@ -241,8 +354,34 @@ class AccountBrowserSession:
                     False,
                     "账号已锁定",
                 )
+            if self.PASSWORD_RESET_TEXT.search(body) and not password_reset_handled:
+                if not new_password:
+                    raise BrowserFlowError(
+                        "new_password_required",
+                        "password_reset",
+                        False,
+                        "账号要求设置新密码，但未配置新密码",
+                    )
+                if not await self._fill_password_reset(new_password):
+                    raise BrowserFlowError(
+                        "password_reset_page_unknown",
+                        "password_reset",
+                        False,
+                        "无法识别设置新密码页面",
+                    )
+                password_reset_handled = True
+                await asyncio.sleep(self.PASSWORD_SUBMIT_PAUSE_SECONDS)
+                if not await self._click_password_reset():
+                    raise BrowserFlowError(
+                        "password_reset_submit_missing",
+                        "password_reset",
+                        False,
+                        "设置新密码页面缺少提交按钮",
+                    )
+                await asyncio.sleep(0.2)
+                continue
             if (
-                password_filled
+                (password_filled or password_reset_handled)
                 and callback_future is None
                 and self.SUCCESS_TEXT.search(body)
             ):
@@ -294,6 +433,7 @@ class AccountBrowserSession:
         account: str,
         password: str,
         user_code: str | None = None,
+        new_password: str | None = None,
     ) -> None:
         try:
             await self.page.goto(
@@ -302,8 +442,13 @@ class AccountBrowserSession:
                 timeout=self.timeout_ms,
             )
             if user_code:
-                await self._fill_device_code(user_code)
-            await self._drive_login(account, password)
+                if not await self._fill_device_code(user_code):
+                    await self._confirm_device_authorization(user_code)
+            await self._drive_login(
+                account,
+                password,
+                new_password=new_password,
+            )
         except BrowserFlowError:
             raise
         except PlaywrightError as error:
