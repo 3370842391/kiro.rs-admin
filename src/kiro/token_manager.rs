@@ -591,6 +591,52 @@ where
     unreachable!("分页循环只能返回完整目录或错误")
 }
 
+async fn collect_available_models_across_regions<F, Fut>(
+    region_count: usize,
+    mut fetch_page: F,
+) -> Result<
+    (
+        usize,
+        Vec<crate::kiro::model::available_models::UpstreamModel>,
+    ),
+    ListAvailableModelsPageError,
+>
+where
+    F: FnMut(usize, Option<String>) -> Fut,
+    Fut: std::future::Future<
+            Output = Result<ListAvailableModelsResponse, ListAvailableModelsPageError>,
+        >,
+{
+    if region_count == 0 {
+        return Err(ListAvailableModelsPageError::Protocol(
+            "没有可用的模型目录区域端点".to_string(),
+        ));
+    }
+
+    let mut last_error = None;
+    for region_index in 0..region_count {
+        match collect_available_model_pages(|next_token| fetch_page(region_index, next_token)).await
+        {
+            Ok(models) => return Ok((region_index, models)),
+            Err(error @ ListAvailableModelsPageError::Http { status, .. })
+                if matches!(status.as_u16(), 400 | 403) && region_index + 1 < region_count =>
+            {
+                tracing::debug!(
+                    region_index,
+                    status = status.as_u16(),
+                    "ListAvailableModels 完整分页失败，重新从备用区域第一页开始"
+                );
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        ListAvailableModelsPageError::Protocol("全部模型目录区域端点均失败".to_string())
+    }))
+}
+
 /// 获取使用额度信息
 pub(crate) async fn get_usage_limits(
     credentials: &KiroCredentials,
@@ -748,16 +794,18 @@ pub(crate) async fn get_available_models(
     );
     let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
     let client = build_client(proxy, 60, config.tls_backend)?;
+    let hosts = candidates
+        .iter()
+        .map(|region| data_plane_host(KiroService::Rest, region))
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let profile_arn = rest_profile_arn(credentials);
     let token_type = credentials.token_type_header();
-    let mut last_error = None;
 
-    for (idx, region) in candidates.iter().enumerate() {
-        let host = data_plane_host(KiroService::Rest, region)?;
-        let result = collect_available_model_pages(|next_token| {
+    let (region_index, models) =
+        collect_available_models_across_regions(hosts.len(), |region_index, next_token| {
             fetch_available_models_page(
                 &client,
-                &host,
+                &hosts[region_index],
                 profile_arn,
                 token,
                 token_type,
@@ -766,37 +814,16 @@ pub(crate) async fn get_available_models(
                 next_token,
             )
         })
-        .await;
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
 
-        match result {
-            Ok(models) => {
-                return Ok(ListAvailableModelsResponse {
-                    models,
-                    next_token: None,
-                    resolved_api_region: Some(region.to_string()),
-                    resolved_host: Some(host),
-                    kiro_version: Some(kiro_version.clone()),
-                });
-            }
-            Err(error @ ListAvailableModelsPageError::Http { status, .. })
-                if matches!(status.as_u16(), 400 | 403) && idx + 1 < candidates.len() =>
-            {
-                tracing::debug!(
-                    "ListAvailableModels region {} returned {}, trying {}",
-                    region,
-                    status.as_u16(),
-                    candidates[idx + 1]
-                );
-                last_error = Some(error.to_string());
-            }
-            Err(error) => return Err(anyhow::anyhow!(error.to_string())),
-        }
-    }
-
-    Err(anyhow::anyhow!(
-        "ListAvailableModels all regions failed: {}",
-        last_error.unwrap_or_else(|| "no available endpoint".to_string())
-    ))
+    Ok(ListAvailableModelsResponse {
+        models,
+        next_token: None,
+        resolved_api_region: Some(candidates[region_index].to_string()),
+        resolved_host: Some(hosts[region_index].clone()),
+        kiro_version: Some(kiro_version),
+    })
 }
 
 /// 获取该凭据可用的真实 profileArn 列表（`ListAvailableProfiles`）。
@@ -6631,6 +6658,104 @@ mod tests {
 
         assert_eq!(calls, 1);
         assert_eq!(models.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pagination_merges_two_complete_pages() {
+        let mut calls = 0;
+        let models = collect_available_model_pages(|_| {
+            calls += 1;
+            let mut page = available_models_page((calls == 1).then_some("page-2"));
+            page.models[0].model_id = format!("model-{calls}");
+            async move { Ok::<_, ListAvailableModelsPageError>(page) }
+        })
+        .await
+        .expect("two complete pages must be merged");
+
+        assert_eq!(calls, 2);
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.model_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["model-1", "model-2"]
+        );
+    }
+
+    #[tokio::test]
+    async fn pagination_second_page_failure_never_returns_partial_models() {
+        let mut calls = 0;
+        let result = collect_available_model_pages(|_| {
+            calls += 1;
+            async move {
+                if calls == 1 {
+                    Ok(available_models_page(Some("page-2")))
+                } else {
+                    Err(ListAvailableModelsPageError::Request(
+                        "simulated second-page failure".to_string(),
+                    ))
+                }
+            }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(calls, 2);
+    }
+
+    #[tokio::test]
+    async fn pagination_rejects_more_than_five_hundred_models() {
+        let result = collect_available_model_pages(|_| async {
+            let mut page = available_models_page(None);
+            page.models = (0..=LIST_AVAILABLE_MODELS_MAX_MODELS)
+                .map(
+                    |index| crate::kiro::model::available_models::UpstreamModel {
+                        model_id: format!("model-{index}"),
+                        model_name: None,
+                        description: None,
+                        token_limits: None,
+                    },
+                )
+                .collect();
+            Ok::<_, ListAvailableModelsPageError>(page)
+        })
+        .await;
+
+        let error = result.expect_err("more than 500 models must be rejected");
+        assert!(error.to_string().contains("超过 500 个"));
+    }
+
+    #[tokio::test]
+    async fn pagination_region_fallback_restarts_from_the_first_page() {
+        let mut calls = Vec::new();
+        let (region_index, models) =
+            collect_available_models_across_regions(2, |current_region, next_token| {
+                calls.push((current_region, next_token.clone()));
+                async move {
+                    match (current_region, next_token.as_deref()) {
+                        (0, None) => Ok(available_models_page(Some("region-0-page-2"))),
+                        (0, Some("region-0-page-2")) => Err(ListAvailableModelsPageError::Http {
+                            status: reqwest::StatusCode::BAD_REQUEST,
+                            body: "retry alternate region".to_string(),
+                        }),
+                        (1, None) => Ok(available_models_page(None)),
+                        unexpected => panic!("unexpected region/page request: {unexpected:?}"),
+                    }
+                }
+            })
+            .await
+            .expect("400 on a later page must restart the alternate region");
+
+        assert_eq!(region_index, 1);
+        assert_eq!(models.len(), 1);
+        assert_eq!(
+            calls,
+            vec![
+                (0, None),
+                (0, Some("region-0-page-2".to_string())),
+                (1, None),
+            ]
+        );
     }
 
     #[tokio::test]
