@@ -1,4 +1,5 @@
 import hashlib
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -7,7 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from batch_login.input_parser import parse_accounts
+from batch_login.input_parser import compile_format, parse_accounts, render_accounts
 from batch_login.models import AccountEntry, LoginMode, ResultStatus, RunRecord
 
 
@@ -64,6 +65,18 @@ class ModelTests(unittest.TestCase):
 
 
 class InputParserTests(unittest.TestCase):
+    def test_full_line_template_parses_literal_prefix_suffix_and_special_password(self):
+        password = r"^_S!Ibq1xcU*EwBD$\_AsY8/Oo)"
+        result = parse_accounts(
+            f"login = admin-user30 / onetime password = {password}\n",
+            "login = {account} / onetime password = {password}",
+            LoginMode.ENTERPRISE,
+        )
+
+        self.assertEqual([], result.issues)
+        self.assertEqual("admin-user30", result.entries[0].account)
+        self.assertEqual(password, result.entries[0].password)
+
     def test_default_format_splits_once_and_preserves_password_separator(self):
         result = parse_accounts(
             "user@example.com----abc----123\n",
@@ -147,20 +160,70 @@ class InputParserTests(unittest.TestCase):
             [(issue.line_number, issue.code) for issue in result.issues],
         )
 
-    def test_template_allows_only_two_placeholders_and_a_literal_separator(self):
+    def test_compiled_format_stores_a_compiled_pattern(self):
+        compiled = compile_format("{account}----{password}")
+
+        self.assertIsInstance(compiled.pattern, re.Pattern)
+
+    def test_template_requires_each_placeholder_exactly_once(self):
         invalid_templates = [
             "{account}",
-            "{account}{password}",
+            "{password}",
             "{account}|{account}|{password}",
-            "prefix{account}|{password}",
-            "{account}|{password}suffix",
-            "{account}{other}{password}",
+            "{account}|{password}|{password}",
         ]
 
         for template in invalid_templates:
             with self.subTest(template=template):
                 with self.assertRaises(ValueError):
                     parse_accounts("a|b", template, LoginMode.ENTERPRISE)
+
+    def test_template_allows_fixed_text_adjacent_placeholders_and_literal_braces(self):
+        cases = [
+            ("prefix:{account}|{password}:suffix", "prefix:user|pw:suffix", "user", "pw"),
+            ("{account}{password}", "", "", ""),
+            (
+                "login={{account={account}}}; password=<{password}>!",
+                "login={{account=enterprise-user}}; password=<pw>!",
+                "enterprise-user",
+                "pw",
+            ),
+        ]
+
+        for template, line, expected_account, expected_password in cases:
+            with self.subTest(template=template):
+                compiled = compile_format(template)
+                match = compiled.pattern.fullmatch(line)
+                self.assertIsNotNone(match)
+                self.assertEqual(expected_account, match.group("account"))
+                self.assertEqual(expected_password, match.group("password"))
+
+    def test_render_accounts_preserves_special_password_text_and_joins_with_newlines(self):
+        entries = [
+            AccountEntry(1, "first@example.com", "/ # < > {account} {password}"),
+            AccountEntry(2, "second@example.com", "trailing\\"),
+        ]
+
+        rendered = render_accounts(entries, "{account}----{password}")
+
+        self.assertEqual(
+            "first@example.com----/ # < > {account} {password}\n"
+            "second@example.com----trailing\\",
+            rendered,
+        )
+
+    def test_render_accounts_validates_required_placeholders(self):
+        invalid_templates = [
+            "{account}",
+            "{password}",
+            "{account}|{account}|{password}",
+            "{account}|{password}|{password}",
+        ]
+
+        for template in invalid_templates:
+            with self.subTest(template=template):
+                with self.assertRaises(ValueError):
+                    render_accounts([], template)
 
 
 if __name__ == "__main__":

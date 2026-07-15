@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from .models import AccountEntry, LoginMode, ParseIssue, ParseResult
 
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+PLACEHOLDER_RE = re.compile(r"{(?:account|password)}")
 
 
 @dataclass(frozen=True, slots=True)
 class CompiledFormat:
-    separator: str
-    account_first: bool
+    pattern: re.Pattern[str]
 
 
 def compile_format(template: str) -> CompiledFormat:
@@ -22,20 +23,29 @@ def compile_format(template: str) -> CompiledFormat:
     account_index = template.index("{account}")
     password_index = template.index("{password}")
     if account_index < password_index:
-        separator = template[account_index + len("{account}") : password_index]
         prefix = template[:account_index]
+        separator = template[account_index + len("{account}") : password_index]
         suffix = template[password_index + len("{password}") :]
-        account_first = True
+        expression = (
+            re.escape(prefix)
+            + r"(?P<account>.*?)"
+            + re.escape(separator)
+            + r"(?P<password>.*)"
+            + re.escape(suffix)
+        )
     else:
-        separator = template[password_index + len("{password}") : account_index]
         prefix = template[:password_index]
+        separator = template[password_index + len("{password}") : account_index]
         suffix = template[account_index + len("{account}") :]
-        account_first = False
+        expression = (
+            re.escape(prefix)
+            + r"(?P<password>.*)"
+            + re.escape(separator)
+            + r"(?P<account>.*?)"
+            + re.escape(suffix)
+        )
 
-    if prefix or suffix or not separator or "{" in separator or "}" in separator:
-        raise ValueError("格式模板只允许两个占位符和一个非空字面分隔符")
-
-    return CompiledFormat(separator=separator, account_first=account_first)
+    return CompiledFormat(pattern=re.compile(r"\A" + expression + r"\Z"))
 
 
 def parse_accounts(text: str, template: str, mode: LoginMode) -> ParseResult:
@@ -48,16 +58,13 @@ def parse_accounts(text: str, template: str, mode: LoginMode) -> ParseResult:
         line = raw_line.lstrip("\ufeff") if line_number == 1 else raw_line
         if not line.strip() or line.lstrip().startswith("#"):
             continue
-        if compiled.separator not in line:
+        match = compiled.pattern.fullmatch(line)
+        if match is None:
             issues.append(ParseIssue(line_number, "format_mismatch", "缺少格式分隔符"))
             continue
 
-        if compiled.account_first:
-            account, password = line.split(compiled.separator, 1)
-        else:
-            password, account = line.rsplit(compiled.separator, 1)
-
-        account = account.strip()
+        account = match.group("account").strip()
+        password = match.group("password")
         if not account:
             issues.append(ParseIssue(line_number, "empty_account", "账号为空"))
             continue
@@ -76,3 +83,15 @@ def parse_accounts(text: str, template: str, mode: LoginMode) -> ParseResult:
         entries.append(AccountEntry(line_number=line_number, account=account, password=password))
 
     return ParseResult(entries=entries, issues=issues)
+
+
+def render_accounts(entries: Iterable[AccountEntry], template: str) -> str:
+    compile_format(template)
+
+    def render_entry(entry: AccountEntry) -> str:
+        return PLACEHOLDER_RE.sub(
+            lambda match: entry.account if match.group() == "{account}" else entry.password,
+            template,
+        )
+
+    return "\n".join(render_entry(entry) for entry in entries)
