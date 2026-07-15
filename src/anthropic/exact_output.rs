@@ -1047,7 +1047,8 @@ mod tests {
 
     #[test]
     fn exact_json_extraction_keeps_the_8kib_candidate_limit() {
-        let large = format!(r#"{{\"value\":\"{}\"}}"#, "x".repeat(8 * 1024));
+        let large = format!(r#"{{"value":"{}"}}"#, "x".repeat(8 * 1024));
+        assert!(serde_json::from_str::<serde_json::Value>(&large).is_ok());
         assert!(extract_single_json(&large).is_none());
     }
 
