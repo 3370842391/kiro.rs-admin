@@ -16,6 +16,8 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, types::Type};
 use serde::{Deserialize, Serialize};
 
+use super::client_keys::ClientResponseMode;
+
 /// trace 记录默认保留天数
 const DEFAULT_RETENTION_DAYS: u64 = 7;
 /// 上游错误体片段最大长度（字节）
@@ -89,6 +91,9 @@ pub struct TraceRecord {
     pub key_id: u64,
     /// 入口 Key 类型，区分管理员API密钥与创建的客户端 Key。
     pub key_source: TraceKeySource,
+    /// 鉴权时捕获的回复模式，不随 Key 后续编辑变化。
+    #[serde(default)]
+    pub response_mode: ClientResponseMode,
     /// 模型名
     pub model: String,
     /// 是否流式
@@ -296,7 +301,7 @@ impl TraceStore {
         // (列名, 定义) —— 与 SCHEMA 中新增列保持一致
         // 注意 key_source 不带 NOT NULL：老库已有行需先以 NULL 添加再回填（SQLite ALTER ADD COLUMN
         // NOT NULL 不带常量 DEFAULT 时无法对已有行赋值）。新插入永远写入合法值。
-        let columns: [(&str, &str); 13] = [
+        let columns: [(&str, &str); 14] = [
             ("input_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("output_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"),
@@ -305,6 +310,7 @@ impl TraceStore {
             ("first_token_ms", "INTEGER"),
             ("upstream_first_byte_ms", "INTEGER"),
             ("key_source", "TEXT"),
+            ("response_mode", "TEXT NOT NULL DEFAULT 'detection'"),
             ("reasoning_effort", "TEXT"),
             ("context_1m", "INTEGER NOT NULL DEFAULT 0"),
             ("thinking", "INTEGER NOT NULL DEFAULT 0"),
@@ -371,19 +377,20 @@ impl TraceStore {
             .unwrap_or_else(|_| Utc::now().timestamp());
         let res = (|| -> rusqlite::Result<()> {
             tx.execute(
-                "INSERT OR REPLACE INTO traces (trace_id, ts, ts_epoch, key_id, key_source, model, \
+                "INSERT OR REPLACE INTO traces (trace_id, ts, ts_epoch, key_id, key_source, response_mode, model, \
                  is_stream, final_status, final_credential_id, error_type, error_message, \
                  total_attempts, duration_ms, interrupted_after_bytes, \
                  input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, \
                  credits, first_token_ms, upstream_first_byte_ms, reasoning_effort, context_1m, thinking, \
                  empty_user_compat_applied, snapshot_id) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26)",
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27)",
                 rusqlite::params![
                     rec.trace_id,
                     rec.ts,
                     ts_epoch,
                     rec.key_id as i64,
                     rec.key_source.as_str(),
+                    rec.response_mode.as_str(),
                     rec.model,
                     rec.is_stream as i64,
                     rec.final_status,
@@ -555,7 +562,7 @@ impl TraceStore {
             q.limit
         };
         let sql = format!(
-            "SELECT trace_id, ts, key_id, key_source, model, is_stream, final_status, final_credential_id, \
+            "SELECT trace_id, ts, key_id, key_source, response_mode, model, is_stream, final_status, final_credential_id, \
              error_type, error_message, total_attempts, duration_ms, interrupted_after_bytes, \
              input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits, first_token_ms, \
              upstream_first_byte_ms, reasoning_effort, context_1m, thinking, empty_user_compat_applied, snapshot_id \
@@ -570,27 +577,31 @@ impl TraceStore {
                 ts: row.get(1)?,
                 key_id: row.get::<_, i64>(2)? as u64,
                 key_source: TraceKeySource::from_db(row.get::<_, String>(3)?.as_str(), 3)?,
-                model: row.get(4)?,
-                is_stream: row.get::<_, i64>(5)? != 0,
-                final_status: row.get(6)?,
-                final_credential_id: row.get::<_, i64>(7)? as u64,
-                error_type: row.get(8)?,
-                error_message: row.get(9)?,
-                total_attempts: row.get::<_, i64>(10)? as u32,
-                duration_ms: row.get::<_, i64>(11)? as u64,
-                interrupted_after_bytes: row.get::<_, Option<i64>>(12)?.map(|v| v as u64),
-                input_tokens: row.get::<_, i64>(13)? as u64,
-                output_tokens: row.get::<_, i64>(14)? as u64,
-                cache_creation_tokens: row.get::<_, i64>(15)? as u64,
-                cache_read_tokens: row.get::<_, i64>(16)? as u64,
-                credits: row.get::<_, f64>(17)?,
-                first_token_ms: row.get::<_, Option<i64>>(18)?.map(|v| v as u64),
-                upstream_first_byte_ms: row.get::<_, Option<i64>>(19)?.map(|v| v as u64),
-                reasoning_effort: row.get::<_, Option<String>>(20)?,
-                context_1m: row.get::<_, i64>(21)? != 0,
-                thinking: row.get::<_, i64>(22)? != 0,
-                empty_user_compat_applied: row.get::<_, i64>(23)? != 0,
-                snapshot_id: row.get(24)?,
+                response_mode: row
+                    .get::<_, String>(4)?
+                    .parse()
+                    .unwrap_or(ClientResponseMode::Detection),
+                model: row.get(5)?,
+                is_stream: row.get::<_, i64>(6)? != 0,
+                final_status: row.get(7)?,
+                final_credential_id: row.get::<_, i64>(8)? as u64,
+                error_type: row.get(9)?,
+                error_message: row.get(10)?,
+                total_attempts: row.get::<_, i64>(11)? as u32,
+                duration_ms: row.get::<_, i64>(12)? as u64,
+                interrupted_after_bytes: row.get::<_, Option<i64>>(13)?.map(|v| v as u64),
+                input_tokens: row.get::<_, i64>(14)? as u64,
+                output_tokens: row.get::<_, i64>(15)? as u64,
+                cache_creation_tokens: row.get::<_, i64>(16)? as u64,
+                cache_read_tokens: row.get::<_, i64>(17)? as u64,
+                credits: row.get::<_, f64>(18)?,
+                first_token_ms: row.get::<_, Option<i64>>(19)?.map(|v| v as u64),
+                upstream_first_byte_ms: row.get::<_, Option<i64>>(20)?.map(|v| v as u64),
+                reasoning_effort: row.get::<_, Option<String>>(21)?,
+                context_1m: row.get::<_, i64>(22)? != 0,
+                thinking: row.get::<_, i64>(23)? != 0,
+                empty_user_compat_applied: row.get::<_, i64>(24)? != 0,
+                snapshot_id: row.get(25)?,
                 attempts: Vec::new(),
             })
         })?;
@@ -789,6 +800,7 @@ CREATE TABLE IF NOT EXISTS traces (
     ts_epoch          INTEGER NOT NULL,
     key_id            INTEGER NOT NULL,
     key_source        TEXT,
+    response_mode     TEXT NOT NULL DEFAULT 'detection',
     model             TEXT NOT NULL,
     is_stream         INTEGER NOT NULL,
     final_status      TEXT NOT NULL,
@@ -846,6 +858,7 @@ mod tests {
             ts: Utc::now().to_rfc3339(),
             key_id: 1,
             key_source: TraceKeySource::ClientKey,
+            response_mode: crate::admin::client_keys::ClientResponseMode::KiroNative,
             model: input.model.to_string(),
             is_stream: true,
             final_status: input.status.to_string(),
@@ -930,6 +943,14 @@ mod tests {
         assert_eq!(out[0].attempts.len(), 2);
         assert_eq!(out[0].attempts[0].outcome, outcome::ACCOUNT_THROTTLED);
         assert_eq!(out[0].key_source, TraceKeySource::ClientKey);
+        assert_eq!(
+            out[0].response_mode,
+            crate::admin::client_keys::ClientResponseMode::KiroNative
+        );
+        assert_eq!(
+            serde_json::to_value(&out[0]).unwrap()["responseMode"],
+            "kiro_native"
+        );
         // token 分项往返
         assert_eq!(out[0].input_tokens, 1093);
         assert_eq!(out[0].output_tokens, 779);
@@ -941,6 +962,50 @@ mod tests {
             serde_json::to_value(&out[0]).unwrap()["emptyUserCompatApplied"],
             false
         );
+    }
+
+    #[test]
+    fn response_mode_migrates_old_trace_rows_to_detection() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE traces (
+                trace_id TEXT PRIMARY KEY,
+                ts TEXT NOT NULL,
+                ts_epoch INTEGER NOT NULL,
+                key_id INTEGER NOT NULL,
+                model TEXT NOT NULL,
+                is_stream INTEGER NOT NULL,
+                final_status TEXT NOT NULL,
+                final_credential_id INTEGER NOT NULL,
+                total_attempts INTEGER NOT NULL,
+                duration_ms INTEGER NOT NULL
+            );
+            CREATE TABLE trace_attempts (
+                trace_id TEXT NOT NULL,
+                attempt INTEGER NOT NULL,
+                credential_id INTEGER NOT NULL,
+                endpoint TEXT NOT NULL,
+                http_status INTEGER,
+                outcome TEXT NOT NULL,
+                error_snippet TEXT,
+                duration_ms INTEGER NOT NULL,
+                PRIMARY KEY (trace_id, attempt)
+            );
+            INSERT INTO traces (
+                trace_id, ts, ts_epoch, key_id, model, is_stream,
+                final_status, final_credential_id, total_attempts, duration_ms
+            ) VALUES ('legacy', '2026-07-15T00:00:00Z', 1, 1, 'm', 0, 'success', 1, 0, 1);",
+        )
+        .unwrap();
+        TraceStore::migrate(&conn).unwrap();
+        let value: String = conn
+            .query_row(
+                "SELECT response_mode FROM traces WHERE trace_id = 'legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, "detection");
     }
 
     #[test]
@@ -1181,6 +1246,31 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn response_mode_unknown_disk_value_falls_back_to_detection() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO traces (trace_id, ts, ts_epoch, key_id, key_source, response_mode, model, is_stream, \
+             final_status, final_credential_id, total_attempts, duration_ms) \
+             VALUES ('future-mode','2020',1,1,'clientKey','future_mode','m',1,'success',1,1,1)",
+            [],
+        )
+        .unwrap();
+
+        let (records, total) = TraceStore::query_inner(
+            &conn,
+            &TraceQuery {
+                limit: 50,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(total, 1);
+        assert_eq!(records[0].response_mode, ClientResponseMode::Detection);
     }
 
     #[test]

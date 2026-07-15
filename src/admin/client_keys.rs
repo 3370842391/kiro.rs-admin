@@ -10,9 +10,11 @@
 //! 持久化为 `client_api_keys.json`（与 `credentials.json` 同目录）。
 
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use atomicwrites::{AllowOverwrite, AtomicFile};
 use chrono::Utc;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -20,6 +22,69 @@ use subtle::ConstantTimeEq;
 
 /// 客户端 Key 前缀（区分上游 `ksk_`）
 pub const CLIENT_KEY_PREFIX: &str = "csk_";
+
+fn write_client_key_file_atomic<F>(
+    path: &Path,
+    write: F,
+) -> Result<(), atomicwrites::Error<std::io::Error>>
+where
+    F: FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+{
+    AtomicFile::new(path, AllowOverwrite).write(write)
+}
+
+/// 客户端 Key 对应的助手回复档位。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientResponseMode {
+    KiroNative,
+    /// 旧文件缺失字段或包含未来未知值时，保守保持当前检测兼容行为。
+    #[serde(other)]
+    Detection,
+}
+
+impl Default for ClientResponseMode {
+    fn default() -> Self {
+        Self::Detection
+    }
+}
+
+impl ClientResponseMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Detection => "detection",
+            Self::KiroNative => "kiro_native",
+        }
+    }
+
+    pub const fn allows_detection_shortcuts(self) -> bool {
+        matches!(self, Self::Detection)
+    }
+
+    pub const fn allows_identity_normalization(self) -> bool {
+        matches!(self, Self::Detection)
+    }
+}
+
+impl std::str::FromStr for ClientResponseMode {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "detection" => Ok(Self::Detection),
+            "kiro_native" => Ok(Self::KiroNative),
+            _ => Err("responseMode 必须是 detection 或 kiro_native"),
+        }
+    }
+}
+
+/// 数据面鉴权成功时的一次性不可变快照。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedClientKey {
+    pub id: u64,
+    pub group: Option<String>,
+    pub response_mode: ClientResponseMode,
+}
 
 /// 单条客户端 Key
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +120,9 @@ pub struct ClientKey {
     /// None 表示不绑定分组，可使用全部账号（与 master apiKey 行为一致）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// 助手回复模式；旧数据默认保持当前检测兼容行为。
+    #[serde(default)]
+    pub response_mode: ClientResponseMode,
     /// 系统 Key（由 config.json apiKey bootstrap 生成，不可删除 / 不可轮换）。
     /// 老数据无此字段，默认 false。
     #[serde(default, skip_serializing_if = "is_false")]
@@ -124,20 +192,20 @@ impl ClientKeyManager {
         })
     }
 
-    fn save_locked(&self, inner: &Inner) {
-        let path = match &self.path {
-            Some(p) => p,
-            None => return,
+    fn try_save_locked(&self, inner: &Inner) -> anyhow::Result<()> {
+        let Some(path) = &self.path else {
+            return Ok(());
         };
         let mut list: Vec<&ClientKey> = inner.entries.values().collect();
         list.sort_by_key(|k| k.id);
-        match serde_json::to_string_pretty(&list) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(path, json) {
-                    tracing::warn!("写入客户端 Key 文件失败: {}", e);
-                }
-            }
-            Err(e) => tracing::warn!("序列化客户端 Key 失败: {}", e),
+        let json = serde_json::to_string_pretty(&list)?;
+        write_client_key_file_atomic(path, |file| file.write_all(json.as_bytes()))?;
+        Ok(())
+    }
+
+    fn save_locked(&self, inner: &Inner) {
+        if let Err(error) = self.try_save_locked(inner) {
+            tracing::warn!("写入客户端 Key 文件失败: {}", error);
         }
     }
 
@@ -156,7 +224,40 @@ impl ClientKeyManager {
         description: Option<String>,
         group: Option<String>,
     ) -> ClientKey {
-        self.create_with_key(name, description, group, generate_client_key())
+        self.create_with_mode(name, description, group, ClientResponseMode::Detection)
+    }
+
+    pub fn create_with_mode(
+        &self,
+        name: String,
+        description: Option<String>,
+        group: Option<String>,
+        response_mode: ClientResponseMode,
+    ) -> ClientKey {
+        self.create_with_key_and_mode(
+            name,
+            description,
+            group,
+            generate_client_key(),
+            response_mode,
+        )
+    }
+
+    /// 创建并持久化新 Key；落盘失败时回滚内存索引与 id 分配。
+    pub fn try_create_with_mode(
+        &self,
+        name: String,
+        description: Option<String>,
+        group: Option<String>,
+        response_mode: ClientResponseMode,
+    ) -> anyhow::Result<ClientKey> {
+        self.try_create_with_key_and_mode(
+            name,
+            description,
+            group,
+            generate_client_key(),
+            response_mode,
+        )
     }
 
     /// 用指定明文创建 Key（仅供首次启动 bootstrap 用，把 config.json apiKey 直接导入为第一条分发密钥）。
@@ -168,6 +269,23 @@ impl ClientKeyManager {
         group: Option<String>,
         plaintext: String,
     ) -> ClientKey {
+        self.create_with_key_and_mode(
+            name,
+            description,
+            group,
+            plaintext,
+            ClientResponseMode::Detection,
+        )
+    }
+
+    fn create_with_key_and_mode(
+        &self,
+        name: String,
+        description: Option<String>,
+        group: Option<String>,
+        plaintext: String,
+        response_mode: ClientResponseMode,
+    ) -> ClientKey {
         let mut inner = self.inner.write();
         // 防止 bootstrap 重复导入同一明文
         if let Some(&id) = inner.by_key.get(&plaintext) {
@@ -177,6 +295,60 @@ impl ClientKeyManager {
                 .cloned()
                 .expect("by_key 与 entries 应一致");
         }
+        let entry = Self::insert_new_locked(
+            &mut inner,
+            name,
+            description,
+            group,
+            plaintext,
+            response_mode,
+        );
+        self.save_locked(&inner);
+        entry
+    }
+
+    fn try_create_with_key_and_mode(
+        &self,
+        name: String,
+        description: Option<String>,
+        group: Option<String>,
+        plaintext: String,
+        response_mode: ClientResponseMode,
+    ) -> anyhow::Result<ClientKey> {
+        let mut inner = self.inner.write();
+        if let Some(&id) = inner.by_key.get(&plaintext) {
+            return Ok(inner
+                .entries
+                .get(&id)
+                .cloned()
+                .expect("by_key 与 entries 应一致"));
+        }
+        let previous_next_id = inner.next_id;
+        let entry = Self::insert_new_locked(
+            &mut inner,
+            name,
+            description,
+            group,
+            plaintext,
+            response_mode,
+        );
+        if let Err(error) = self.try_save_locked(&inner) {
+            inner.by_key.remove(&entry.key);
+            inner.entries.remove(&entry.id);
+            inner.next_id = previous_next_id;
+            return Err(error);
+        }
+        Ok(entry)
+    }
+
+    fn insert_new_locked(
+        inner: &mut Inner,
+        name: String,
+        description: Option<String>,
+        group: Option<String>,
+        plaintext: String,
+        response_mode: ClientResponseMode,
+    ) -> ClientKey {
         let id = inner.next_id;
         inner.next_id += 1;
         let entry = ClientKey {
@@ -194,11 +366,11 @@ impl ClientKeyManager {
             total_cache_read_tokens: 0,
             total_credits: 0.0,
             group: group.filter(|g| !g.trim().is_empty()),
+            response_mode,
             is_system: false,
         };
         inner.by_key.insert(plaintext, id);
         inner.entries.insert(id, entry.clone());
-        self.save_locked(&inner);
         entry
     }
 
@@ -267,6 +439,7 @@ impl ClientKeyManager {
                     total_cache_read_tokens: 0,
                     total_credits: 0.0,
                     group: None,
+                    response_mode: ClientResponseMode::Detection,
                     is_system: true,
                 };
                 inner.by_key.insert(plaintext, id);
@@ -316,36 +489,33 @@ impl ClientKeyManager {
         name: Option<String>,
         description: Option<Option<String>>,
         group: Option<Option<String>>,
-    ) -> bool {
+        response_mode: Option<ClientResponseMode>,
+    ) -> anyhow::Result<Option<ClientKey>> {
         let mut inner = self.inner.write();
-        let updated = match inner.entries.get_mut(&id) {
-            Some(e) => {
-                if let Some(n) = name {
-                    e.name = n;
-                }
-                if let Some(d) = description {
-                    e.description = d;
-                }
-                if let Some(g) = group {
-                    e.group = g.filter(|s| !s.trim().is_empty());
-                }
-                true
-            }
-            None => false,
+        let Some(previous) = inner.entries.get(&id).cloned() else {
+            return Ok(None);
         };
-        if updated {
-            self.save_locked(&inner);
+        let updated = {
+            let entry = inner.entries.get_mut(&id).expect("entry existed above");
+            if let Some(value) = name {
+                entry.name = value;
+            }
+            if let Some(value) = description {
+                entry.description = value;
+            }
+            if let Some(value) = group {
+                entry.group = value.filter(|item| !item.trim().is_empty());
+            }
+            if let Some(value) = response_mode {
+                entry.response_mode = value;
+            }
+            entry.clone()
+        };
+        if let Err(error) = self.try_save_locked(&inner) {
+            inner.entries.insert(id, previous);
+            return Err(error);
         }
-        updated
-    }
-
-    /// 返回指定 Key 绑定的分组名（None 表示未绑定或 Key 不存在）
-    pub fn group_of(&self, id: u64) -> Option<String> {
-        self.inner
-            .read()
-            .entries
-            .get(&id)
-            .and_then(|e| e.group.clone())
+        Ok(Some(updated))
     }
 
     /// 列出所有当前被引用的分组名（仅去重，不带计数）。
@@ -421,18 +591,35 @@ impl ClientKeyManager {
     /// 命中且替换成功返回新条目（含新明文）；id 不存在返回 None。
     /// 注意：系统 Key 轮换后调用方需把新明文同步写回 config.json apiKey，避免下次启动重复导入。
     pub fn rotate(&self, id: u64) -> Option<ClientKey> {
+        match self.try_rotate(id) {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(key_id = id, %error, "轮换客户端 Key 持久化失败");
+                None
+            }
+        }
+    }
+
+    /// 轮换并持久化 Key；落盘失败时恢复旧明文及双索引。
+    pub fn try_rotate(&self, id: u64) -> anyhow::Result<Option<ClientKey>> {
         let new_key = generate_client_key();
         let mut inner = self.inner.write();
-        // 取出旧条目并从 by_key 索引摘除
-        let old_key = inner.entries.get(&id).map(|e| e.key.clone())?;
-        inner.by_key.remove(&old_key);
+        let Some(previous) = inner.entries.get(&id).cloned() else {
+            return Ok(None);
+        };
+        inner.by_key.remove(&previous.key);
         // 写入新明文 + 索引（is_system 等其余字段保留不变）
-        let entry = inner.entries.get_mut(&id)?;
+        let entry = inner.entries.get_mut(&id).expect("entry existed above");
         entry.key = new_key.clone();
         let snapshot = entry.clone();
-        inner.by_key.insert(new_key, id);
-        self.save_locked(&inner);
-        Some(snapshot)
+        inner.by_key.insert(new_key.clone(), id);
+        if let Err(error) = self.try_save_locked(&inner) {
+            inner.by_key.remove(&new_key);
+            inner.by_key.insert(previous.key.clone(), id);
+            inner.entries.insert(id, previous);
+            return Err(error);
+        }
+        Ok(Some(snapshot))
     }
 
     /// 重置计数（保留 Key 与名称）
@@ -460,7 +647,7 @@ impl ClientKeyManager {
     ///
     /// 用 `ConstantTimeEq` 对所有 active Key 做常量时间比对，防止时序攻击；
     /// 之前的 HashMap 直接 lookup 仅作快速短路（命中后还会再做一次常量时间比较）。
-    pub fn verify_and_touch(&self, presented: &str) -> Option<u64> {
+    pub fn verify_and_touch_context(&self, presented: &str) -> Option<AuthorizedClientKey> {
         if !presented.starts_with(CLIENT_KEY_PREFIX) {
             return None;
         }
@@ -477,12 +664,20 @@ impl ClientKeyManager {
             }
         }
         let id = hit_id?;
-        if let Some(entry) = inner.entries.get_mut(&id) {
-            entry.total_calls += 1;
-            entry.last_used_at = Some(Utc::now().to_rfc3339());
-        }
+        let entry = inner.entries.get_mut(&id)?;
+        entry.total_calls += 1;
+        entry.last_used_at = Some(Utc::now().to_rfc3339());
         // 不在每次请求都落盘（高频写入），由 record_usage / 定期 flush 持久化
-        Some(id)
+        Some(AuthorizedClientKey {
+            id,
+            group: entry.group.clone(),
+            response_mode: entry.response_mode,
+        })
+    }
+
+    pub fn verify_and_touch(&self, presented: &str) -> Option<u64> {
+        self.verify_and_touch_context(presented)
+            .map(|authorized| authorized.id)
     }
 
     /// 在请求结束时累计 Token 用量并落盘
@@ -668,5 +863,218 @@ mod tests {
         mgr.ensure_system_key("默认密钥".into(), None, "sk-kiro-abc".into());
         assert!(!mgr.delete(0), "系统密钥 id=0 不可删除");
         assert!(mgr.is_system(0));
+    }
+
+    #[test]
+    fn response_mode_legacy_json_defaults_to_detection() {
+        let raw = r#"[{
+            "id": 7,
+            "key": "csk_legacy",
+            "name": "legacy",
+            "createdAt": "2026-07-15T00:00:00Z"
+        }]"#;
+        let keys: Vec<ClientKey> = serde_json::from_str(raw).unwrap();
+        assert_eq!(keys[0].response_mode, ClientResponseMode::Detection);
+    }
+
+    #[test]
+    fn response_mode_explicit_native_round_trips() {
+        let mut key = ClientKey {
+            id: 8,
+            key: "csk_native".into(),
+            name: "native".into(),
+            description: None,
+            disabled: false,
+            created_at: "2026-07-15T00:00:00Z".into(),
+            last_used_at: None,
+            total_calls: 0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_cache_creation_tokens: 0,
+            total_cache_read_tokens: 0,
+            total_credits: 0.0,
+            group: Some("team-a".into()),
+            is_system: false,
+            response_mode: ClientResponseMode::KiroNative,
+        };
+        let json = serde_json::to_value(&key).unwrap();
+        assert_eq!(json["responseMode"], "kiro_native");
+        key = serde_json::from_value(json).unwrap();
+        assert_eq!(key.response_mode, ClientResponseMode::KiroNative);
+    }
+
+    #[test]
+    fn response_mode_unknown_persisted_value_fails_closed_to_detection() {
+        let raw = r#"{
+            "id": 9,
+            "key": "csk_unknown",
+            "name": "unknown",
+            "createdAt": "2026-07-15T00:00:00Z",
+            "responseMode": "misspelled"
+        }"#;
+        let key: ClientKey = serde_json::from_str(raw).unwrap();
+        assert_eq!(key.response_mode, ClientResponseMode::Detection);
+    }
+
+    #[test]
+    fn response_mode_authorization_returns_one_atomic_snapshot() {
+        let manager = ClientKeyManager::new();
+        let entry = manager.create_with_mode(
+            "native".into(),
+            None,
+            Some("team-a".into()),
+            ClientResponseMode::KiroNative,
+        );
+        let authorized = manager
+            .verify_and_touch_context(&entry.key)
+            .expect("key must authorize");
+        assert_eq!(authorized.id, entry.id);
+        assert_eq!(authorized.group.as_deref(), Some("team-a"));
+        assert_eq!(authorized.response_mode, ClientResponseMode::KiroNative);
+    }
+
+    #[test]
+    fn response_mode_rotation_preserves_mode_and_stats() {
+        let manager = ClientKeyManager::new();
+        let entry =
+            manager.create_with_mode("native".into(), None, None, ClientResponseMode::KiroNative);
+        manager.record_usage(entry.id, 10, 5, 3, 2, 1.5);
+        let rotated = manager.rotate(entry.id).unwrap();
+        assert_eq!(rotated.response_mode, ClientResponseMode::KiroNative);
+        assert_eq!(rotated.total_input_tokens, 10);
+        assert_eq!(rotated.total_output_tokens, 5);
+        assert_ne!(rotated.key, entry.key);
+    }
+
+    #[test]
+    fn response_mode_policy_only_detection_allows_detection_behavior() {
+        assert!(ClientResponseMode::Detection.allows_detection_shortcuts());
+        assert!(ClientResponseMode::Detection.allows_identity_normalization());
+        assert!(!ClientResponseMode::KiroNative.allows_detection_shortcuts());
+        assert!(!ClientResponseMode::KiroNative.allows_identity_normalization());
+    }
+
+    #[test]
+    fn response_mode_failed_persistence_rolls_back_update() {
+        let root = std::env::temp_dir().join(format!(
+            "kiro-rs-response-mode-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("client_api_keys.json");
+        let manager = ClientKeyManager::load(&path).unwrap();
+        let entry = manager.create("key".into(), None, None);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        let result = manager.update_meta(
+            entry.id,
+            None,
+            None,
+            None,
+            Some(ClientResponseMode::KiroNative),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            manager.list()[0].response_mode,
+            ClientResponseMode::Detection
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn response_mode_update_returns_saved_snapshot_and_preserves_omitted_mode() {
+        let manager = ClientKeyManager::new();
+        let entry = manager.create_with_mode(
+            "native".into(),
+            None,
+            Some("team-a".into()),
+            ClientResponseMode::KiroNative,
+        );
+
+        let updated = manager
+            .update_meta(entry.id, Some("renamed".into()), None, None, None)
+            .unwrap()
+            .expect("key must exist");
+
+        assert_eq!(updated.name, "renamed");
+        assert_eq!(updated.group.as_deref(), Some("team-a"));
+        assert_eq!(updated.response_mode, ClientResponseMode::KiroNative);
+    }
+
+    #[test]
+    fn response_mode_failed_persistence_rolls_back_create() {
+        let root = std::env::temp_dir().join(format!(
+            "kiro-rs-response-mode-create-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("client_api_keys.json");
+        let manager = ClientKeyManager::load(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        let result = manager.try_create_with_mode(
+            "native".into(),
+            None,
+            None,
+            ClientResponseMode::KiroNative,
+        );
+
+        assert!(result.is_err());
+        assert!(manager.list().is_empty());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn response_mode_failed_persistence_rolls_back_rotation() {
+        let root = std::env::temp_dir().join(format!(
+            "kiro-rs-response-mode-rotate-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("client_api_keys.json");
+        let manager = ClientKeyManager::load(&path).unwrap();
+        let entry = manager.create_with_mode(
+            "native".into(),
+            None,
+            Some("team-a".into()),
+            ClientResponseMode::KiroNative,
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        let result = manager.try_rotate(entry.id);
+
+        assert!(result.is_err());
+        let current = manager.list().into_iter().next().unwrap();
+        assert_eq!(current.key, entry.key);
+        assert_eq!(current.group, entry.group);
+        assert_eq!(current.response_mode, ClientResponseMode::KiroNative);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn atomic_key_file_write_preserves_previous_contents_on_callback_error() {
+        use std::io::Write as _;
+
+        let root = std::env::temp_dir().join(format!(
+            "kiro-rs-client-key-atomic-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("client_api_keys.json");
+        std::fs::write(&path, b"original").unwrap();
+
+        let result = write_client_key_file_atomic(&path, |file| {
+            file.write_all(b"partial")?;
+            Err(std::io::Error::other("injected write failure"))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

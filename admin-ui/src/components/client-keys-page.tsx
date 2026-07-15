@@ -8,6 +8,9 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import {
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+} from '@/components/ui/select'
+import {
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem,
 } from '@/components/ui/dropdown-menu'
 import {
@@ -20,7 +23,15 @@ import {
 } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
 import { GroupSingleSelect } from '@/components/group-select'
-import type { ClientKeyItem, CreateClientKeyResponse } from '@/types/api'
+import type {
+  ClientKeyItem, ClientResponseMode, CreateClientKeyResponse,
+} from '@/types/api'
+import {
+  DEFAULT_CLIENT_RESPONSE_MODE,
+  responseModeDescription,
+  responseModeLabel,
+  responseModeSwitchWarning,
+} from '@/lib/client-key-response-mode'
 import { extractErrorMessage } from '@/lib/utils'
 import { useConfirm } from '@/components/ui/confirm-dialog'
 
@@ -56,6 +67,9 @@ export function ClientKeysPage() {
   const [createName, setCreateName] = useState('')
   const [createDesc, setCreateDesc] = useState('')
   const [createGroup, setCreateGroup] = useState('')
+  const [createResponseMode, setCreateResponseMode] = useState<ClientResponseMode>(
+    DEFAULT_CLIENT_RESPONSE_MODE,
+  )
   const [createdKey, setCreatedKey] = useState<CreateClientKeyResponse | null>(null)
   const [showCreatedPlain, setShowCreatedPlain] = useState(true)
 
@@ -64,6 +78,9 @@ export function ClientKeysPage() {
   const [editName, setEditName] = useState('')
   const [editDesc, setEditDesc] = useState('')
   const [editGroup, setEditGroup] = useState('')
+  const [editResponseMode, setEditResponseMode] = useState<ClientResponseMode>(
+    DEFAULT_CLIENT_RESPONSE_MODE,
+  )
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -77,12 +94,14 @@ export function ClientKeysPage() {
         name,
         description: createDesc.trim() || undefined,
         group: createGroup.trim() || undefined,
+        responseMode: createResponseMode,
       })
       setCreatedKey(res)
       setCreateOpen(false)
       setCreateName('')
       setCreateDesc('')
       setCreateGroup('')
+      setCreateResponseMode(DEFAULT_CLIENT_RESPONSE_MODE)
       setShowCreatedPlain(true)
     } catch (err) {
       toast.error('创建失败：' + extractErrorMessage(err))
@@ -164,18 +183,32 @@ export function ClientKeysPage() {
     setEditName(item.name)
     setEditDesc(item.description ?? '')
     setEditGroup(item.group ?? '')
+    setEditResponseMode(item.responseMode)
     setEditOpen(true)
   }
 
   const handleEditSave = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!editTarget) return
+    const warning = responseModeSwitchWarning(
+      editTarget.responseMode,
+      editResponseMode,
+    )
     try {
       await updateKey.mutateAsync({
         id: editTarget.id,
-        req: { name: editName.trim(), description: editDesc.trim(), group: editGroup.trim() },
+        req: {
+          name: editName.trim(),
+          description: editDesc.trim(),
+          group: editGroup.trim(),
+          responseMode: editResponseMode,
+        },
       })
-      toast.success('已更新')
+      if (warning) {
+        toast.warning(warning)
+      } else {
+        toast.success('已更新')
+      }
       setEditOpen(false)
     } catch (err) {
       toast.error('更新失败：' + extractErrorMessage(err))
@@ -223,13 +256,14 @@ export function ClientKeysPage() {
       ) : (
         <Card>
           <CardContent className="overflow-x-auto p-0">
-            <table className="w-full min-w-[920px] text-sm">
+            <table className="w-full min-w-[1040px] text-sm">
               <thead className="text-[12px] text-muted-foreground border-b border-border/60">
                 <tr className="whitespace-nowrap">
                   <th className="text-left font-medium px-4 py-3">ID</th>
                   <th className="text-left font-medium px-4 py-3">名称</th>
                   <th className="text-left font-medium px-4 py-3">Key</th>
                   <th className="text-left font-medium px-4 py-3">分组</th>
+                  <th className="text-left font-medium px-4 py-3">回复模式</th>
                   <th className="text-left font-medium px-4 py-3">状态</th>
                   <th className="text-right font-medium px-4 py-3">总调用</th>
                   <th className="text-right font-medium px-4 py-3">输入</th>
@@ -286,6 +320,11 @@ export function ClientKeysPage() {
                       )}
                     </td>
                     <td className="px-4 py-3">
+                      <Badge variant={k.responseMode === 'kiro_native' ? 'outline' : 'secondary'}>
+                        {responseModeLabel(k.responseMode)}
+                      </Badge>
+                    </td>
+                    <td className="px-4 py-3">
                       {k.disabled ? (
                         <Badge variant="destructive">已禁用</Badge>
                       ) : (
@@ -305,7 +344,7 @@ export function ClientKeysPage() {
                           variant="ghost"
                           className="h-7 w-7"
                           onClick={() => startEdit(k)}
-                          title="改名"
+                          title="编辑"
                         >
                           <Pencil className="h-3.5 w-3.5" />
                         </Button>
@@ -390,6 +429,25 @@ export function ClientKeysPage() {
                 绑定后该 Key 仅会使用含此分组的账号（严格隔离，分组内无可用账号时请求会失败）。
               </p>
             </div>
+            <div>
+              <label className="text-[12px] text-muted-foreground">回复模式</label>
+              <Select
+                value={createResponseMode}
+                onValueChange={(value) => setCreateResponseMode(value as ClientResponseMode)}
+                disabled={createKey.isPending}
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="detection">Claude 兼容</SelectItem>
+                  <SelectItem value="kiro_native">Kiro 原生</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                {responseModeDescription(createResponseMode)}
+              </p>
+            </div>
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setCreateOpen(false)} disabled={createKey.isPending}>
                 取消
@@ -448,6 +506,14 @@ export function ClientKeysPage() {
             <p className="text-[11px] text-muted-foreground">
               客户端调用 <code>/v1/messages</code> 时，把它放在 <code>x-api-key</code> 或 <code>Authorization: Bearer</code> 头中。
             </p>
+            {createdKey && (
+              <div className="flex items-center gap-2 text-[12px] text-muted-foreground">
+                <span>回复模式</span>
+                <Badge variant={createdKey.responseMode === 'kiro_native' ? 'outline' : 'secondary'}>
+                  {responseModeLabel(createdKey.responseMode)}
+                </Badge>
+              </div>
+            )}
           </div>
           <DialogFooter>
             <Button onClick={() => setCreatedKey(null)}>我已保存好</Button>
@@ -460,7 +526,7 @@ export function ClientKeysPage() {
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle>编辑 Key</DialogTitle>
-            <DialogDescription>修改名称与描述（不影响 Key 值与统计）</DialogDescription>
+            <DialogDescription>修改名称、描述、分组与回复模式（不影响 Key 值与统计）</DialogDescription>
           </DialogHeader>
           <form onSubmit={handleEditSave} className="space-y-3 py-2">
             <div>
@@ -482,6 +548,25 @@ export function ClientKeysPage() {
               />
               <p className="mt-1 text-[11px] text-muted-foreground">
                 绑定后仅调度该分组内账号（严格隔离）。选「不绑定」表示解除绑定。
+              </p>
+            </div>
+            <div>
+              <label className="text-[12px] text-muted-foreground">回复模式</label>
+              <Select
+                value={editResponseMode}
+                onValueChange={(value) => setEditResponseMode(value as ClientResponseMode)}
+                disabled={updateKey.isPending}
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="detection">Claude 兼容</SelectItem>
+                  <SelectItem value="kiro_native">Kiro 原生</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                {responseModeDescription(editResponseMode)}
               </p>
             </div>
             <DialogFooter>

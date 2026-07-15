@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::error_snapshot::{EncodedPayloadPart, SnapshotPayloadKind};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const DEFAULT_QUERY_LIMIT: usize = 50;
 const MAX_QUERY_LIMIT: usize = 1000;
 
@@ -78,6 +78,8 @@ pub struct SnapshotWrite {
     pub is_stream: bool,
     pub key_id: u64,
     pub key_source: crate::admin::trace_db::TraceKeySource,
+    #[serde(default)]
+    pub response_mode: crate::admin::client_keys::ClientResponseMode,
     pub final_credential_id: u64,
     pub endpoint: Option<String>,
     pub http_status: Option<u16>,
@@ -166,6 +168,7 @@ pub struct SnapshotSummary {
     pub is_stream: bool,
     pub key_id: u64,
     pub key_source: crate::admin::trace_db::TraceKeySource,
+    pub response_mode: crate::admin::client_keys::ClientResponseMode,
     pub final_credential_id: u64,
     pub endpoint: Option<String>,
     pub http_status: Option<u16>,
@@ -375,12 +378,12 @@ impl ErrorSnapshotStore {
         tx.execute(
             "INSERT INTO error_snapshots (
                 snapshot_id, trace_id, ts, ts_epoch, model, is_stream, key_id, key_source,
-                final_credential_id, endpoint, http_status, final_status, error_type, severity,
+                response_mode, final_credential_id, endpoint, http_status, final_status, error_type, severity,
                 error_message, recovered, pinned, retention_exempt, omitted_due_to_disk_pressure,
                 payload_count, original_bytes, compressed_bytes, created_at, updated_at
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
+                ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25
              )",
             params![
                 write.snapshot_id,
@@ -391,6 +394,7 @@ impl ErrorSnapshotStore {
                 write.is_stream,
                 to_i64(write.key_id, "key_id")?,
                 write.key_source.as_str(),
+                write.response_mode.as_str(),
                 to_i64(write.final_credential_id, "final_credential_id")?,
                 write.endpoint,
                 write.http_status.map(i64::from),
@@ -970,6 +974,20 @@ fn path_tree_bytes(path: &std::path::Path) -> std::io::Result<u64> {
     })
 }
 
+fn ensure_response_mode_column(conn: &Connection) -> rusqlite::Result<()> {
+    let mut statement = conn.prepare("PRAGMA table_info(error_snapshots)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !columns.iter().any(|name| name == "response_mode") {
+        conn.execute_batch(
+            "ALTER TABLE error_snapshots
+             ADD COLUMN response_mode TEXT NOT NULL DEFAULT 'detection';",
+        )?;
+    }
+    Ok(())
+}
+
 fn initialize_connection(conn: &Connection, is_new: bool) -> rusqlite::Result<()> {
     conn.busy_timeout(std::time::Duration::from_secs(2))?;
     conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;")?;
@@ -983,6 +1001,7 @@ fn initialize_connection(conn: &Connection, is_new: bool) -> rusqlite::Result<()
         )));
     }
     conn.execute_batch(SCHEMA)?;
+    ensure_response_mode_column(conn)?;
     if version < SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
@@ -992,7 +1011,7 @@ fn initialize_connection(conn: &Connection, is_new: bool) -> rusqlite::Result<()
 
 fn summary_select() -> &'static str {
     "SELECT snapshot_id, trace_id, ts, model, is_stream, key_id, key_source,
-            final_credential_id, endpoint, http_status, final_status, error_type, severity,
+            response_mode, final_credential_id, endpoint, http_status, final_status, error_type, severity,
             error_message, recovered, pinned, retention_exempt, omitted_due_to_disk_pressure,
             payload_count, original_bytes, compressed_bytes, created_at, updated_at
      FROM error_snapshots"
@@ -1007,30 +1026,34 @@ fn summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SnapshotSummary
         is_stream: row.get(4)?,
         key_id: from_u64(row.get::<_, i64>(5)?, 5)?,
         key_source: key_source_from_db(&row.get::<_, String>(6)?, 6)?,
-        final_credential_id: from_u64(row.get::<_, i64>(7)?, 7)?,
-        endpoint: row.get(8)?,
+        response_mode: row
+            .get::<_, String>(7)?
+            .parse()
+            .unwrap_or(crate::admin::client_keys::ClientResponseMode::Detection),
+        final_credential_id: from_u64(row.get::<_, i64>(8)?, 8)?,
+        endpoint: row.get(9)?,
         http_status: row
-            .get::<_, Option<i64>>(9)?
-            .map(|value| u16::try_from(value).map_err(sql_range_error(9)))
+            .get::<_, Option<i64>>(10)?
+            .map(|value| u16::try_from(value).map_err(sql_range_error(10)))
             .transpose()?,
-        final_status: row.get(10)?,
-        error_type: row.get(11)?,
-        severity: SnapshotSeverity::from_db(&row.get::<_, String>(12)?).map_err(|error| {
+        final_status: row.get(11)?,
+        error_type: row.get(12)?,
+        severity: SnapshotSeverity::from_db(&row.get::<_, String>(13)?).map_err(|error| {
             sql_decode_error(
-                12,
+                13,
                 std::io::Error::new(std::io::ErrorKind::InvalidData, error),
             )
         })?,
-        error_message: row.get(13)?,
-        recovered: row.get(14)?,
-        pinned: row.get(15)?,
-        retention_exempt: row.get(16)?,
-        omitted_due_to_disk_pressure: row.get(17)?,
-        payload_count: from_u32(row.get::<_, i64>(18)?, 18)?,
-        original_bytes: from_u64(row.get::<_, i64>(19)?, 19)?,
-        compressed_bytes: from_u64(row.get::<_, i64>(20)?, 20)?,
-        created_at: row.get(21)?,
-        updated_at: row.get(22)?,
+        error_message: row.get(14)?,
+        recovered: row.get(15)?,
+        pinned: row.get(16)?,
+        retention_exempt: row.get(17)?,
+        omitted_due_to_disk_pressure: row.get(18)?,
+        payload_count: from_u32(row.get::<_, i64>(19)?, 19)?,
+        original_bytes: from_u64(row.get::<_, i64>(20)?, 20)?,
+        compressed_bytes: from_u64(row.get::<_, i64>(21)?, 21)?,
+        created_at: row.get(22)?,
+        updated_at: row.get(23)?,
     })
 }
 
@@ -1187,6 +1210,7 @@ CREATE TABLE IF NOT EXISTS error_snapshots (
   is_stream INTEGER NOT NULL,
   key_id INTEGER NOT NULL,
   key_source TEXT NOT NULL,
+  response_mode TEXT NOT NULL DEFAULT 'detection',
   final_credential_id INTEGER NOT NULL,
   endpoint TEXT,
   http_status INTEGER,
@@ -1293,6 +1317,7 @@ mod tests {
             is_stream: true,
             key_id: 7,
             key_source: crate::admin::trace_db::TraceKeySource::ClientKey,
+            response_mode: crate::admin::client_keys::ClientResponseMode::KiroNative,
             final_credential_id: 9,
             endpoint: Some("ide".to_string()),
             http_status: Some(502),
@@ -1354,6 +1379,10 @@ mod tests {
         assert_eq!(page.total, 1);
         assert_eq!(page.records[0].snapshot_id, "snap-1");
         assert_eq!(page.records[0].payload_count, 2);
+        assert_eq!(
+            page.records[0].response_mode,
+            crate::admin::client_keys::ClientResponseMode::KiroNative
+        );
 
         let detail = store.get("snap-1").unwrap().unwrap();
         assert_eq!(detail.payloads.len(), 2);
@@ -1362,6 +1391,74 @@ mod tests {
         let payload = store.read_payload("snap-1", 0).unwrap().unwrap();
         assert_eq!(payload.meta.content_type, "application/json");
         assert_eq!(payload.data, r#"{"request":"完整"}"#.as_bytes());
+    }
+
+    #[test]
+    fn response_mode_migrates_v1_snapshot_schema_to_detection() {
+        let conn = Connection::open_in_memory().unwrap();
+        let legacy_schema =
+            SCHEMA.replace("  response_mode TEXT NOT NULL DEFAULT 'detection',\n", "");
+        assert_ne!(legacy_schema, SCHEMA);
+        conn.execute_batch(&legacy_schema).unwrap();
+        conn.execute(
+            "INSERT INTO error_snapshots (
+                snapshot_id, trace_id, ts, ts_epoch, model, is_stream, key_id, key_source,
+                final_credential_id, endpoint, http_status, final_status, error_type, severity,
+                error_message, recovered, pinned, retention_exempt, omitted_due_to_disk_pressure,
+                payload_count, original_bytes, compressed_bytes, created_at, updated_at
+             ) VALUES (
+                'legacy-snapshot', 'legacy-trace', '2026-07-15T00:00:00Z', 1, 'm', 0, 7,
+                'clientKey', 9, NULL, 500, 'error', 'legacy_error', 'error', NULL, 0, 0, 0,
+                0, 0, 0, 0, 1, 1
+             )",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        initialize_connection(&conn, false).unwrap();
+
+        let columns = conn
+            .prepare("PRAGMA table_info(error_snapshots)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(columns.iter().any(|name| name == "response_mode"));
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        let response_mode: String = conn
+            .query_row(
+                "SELECT response_mode FROM error_snapshots WHERE snapshot_id = 'legacy-snapshot'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(response_mode, "detection");
+    }
+
+    #[test]
+    fn response_mode_unknown_disk_value_falls_back_to_detection() {
+        let store = ErrorSnapshotStore::open_in_memory(test_policy()).unwrap();
+        store
+            .insert(&sample_write("snap-unknown-mode", "trace-unknown-mode"))
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .execute(
+                "UPDATE error_snapshots SET response_mode = 'future_mode' WHERE snapshot_id = 'snap-unknown-mode'",
+                [],
+            )
+            .unwrap();
+
+        let detail = store.get("snap-unknown-mode").unwrap().unwrap();
+        assert_eq!(
+            detail.summary.response_mode,
+            crate::admin::client_keys::ClientResponseMode::Detection
+        );
     }
 
     #[test]
@@ -1494,5 +1591,19 @@ mod tests {
         assert!(store.get("snap-fallback").unwrap().is_some());
 
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_fallback_snapshot_without_response_mode_defaults_to_detection() {
+        let write = sample_write("snap-legacy-mode", "trace-legacy-mode");
+        let mut value = serde_json::to_value(write).unwrap();
+        value.as_object_mut().unwrap().remove("response_mode");
+
+        let restored: SnapshotWrite = serde_json::from_value(value).unwrap();
+
+        assert_eq!(
+            restored.response_mode,
+            crate::admin::client_keys::ClientResponseMode::Detection
+        );
     }
 }

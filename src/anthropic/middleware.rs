@@ -29,6 +29,8 @@ pub struct KeyContext {
     pub group: Option<String>,
     /// 命中的入口 Key 类型。
     pub key_source: TraceKeySource,
+    /// 本轮请求在鉴权时捕获的回复模式；在途请求不随后台编辑变化。
+    pub response_mode: crate::admin::client_keys::ClientResponseMode,
 }
 
 /// 应用共享状态
@@ -154,12 +156,12 @@ pub async fn auth_middleware(
 
     // 所有 Key 统一走客户端 Key 管理器校验
     if let Some(mgr) = &state.client_keys {
-        if let Some(id) = mgr.verify_and_touch(&presented) {
-            let group = mgr.group_of(id);
+        if let Some(authorized) = mgr.verify_and_touch_context(&presented) {
             request.extensions_mut().insert(KeyContext {
-                key_id: id,
-                group,
+                key_id: authorized.id,
+                group: authorized.group,
                 key_source: TraceKeySource::ClientKey,
+                response_mode: authorized.response_mode,
             });
             return next.run(request).await;
         }
@@ -185,4 +187,62 @@ pub fn cors_layer() -> tower_http::cors::CorsLayer {
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn response_mode_middleware_injects_native_snapshot() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use axum::middleware;
+        use axum::routing::get;
+        use axum::{Extension, Json, Router};
+        use std::sync::Arc;
+        use tower::ServiceExt;
+
+        async fn show_mode(Extension(context): Extension<KeyContext>) -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "keyId": context.key_id,
+                "responseMode": context.response_mode.as_str()
+            }))
+        }
+
+        let keys = Arc::new(crate::admin::ClientKeyManager::new());
+        let key = keys.create_with_mode(
+            "native".into(),
+            None,
+            None,
+            crate::admin::client_keys::ClientResponseMode::KiroNative,
+        );
+        let state = AppState::new(
+            false,
+            crate::model::config::ToolCompatibilityMode::ClaudeCode,
+        )
+        .with_usage(Some(keys), None, None);
+        let app = Router::new()
+            .route("/", get(show_mode))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ))
+            .with_state(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("x-api-key", key.key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["responseMode"], "kiro_native");
+    }
 }

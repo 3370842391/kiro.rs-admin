@@ -431,6 +431,8 @@ export type PollSocialLoginResponse = PollIdcLoginResponse
 
 // ============ 客户端 API Key 分发 ============
 
+export type ClientResponseMode = 'detection' | 'kiro_native'
+
 export interface ClientKeyItem {
   id: number
   /** 脱敏后的 Key（仅展示） */
@@ -447,6 +449,7 @@ export interface ClientKeyItem {
   totalCacheReadTokens: number
   /** 绑定的账号分组（未绑定时为 undefined） */
   group?: string
+  responseMode: ClientResponseMode
   /** 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换） */
   isSystem: boolean
 }
@@ -460,6 +463,7 @@ export interface CreateClientKeyRequest {
   name: string
   description?: string
   group?: string
+  responseMode?: ClientResponseMode
 }
 
 /** 创建响应：明文 Key 仅在此处返回一次 */
@@ -468,12 +472,14 @@ export interface CreateClientKeyResponse {
   key: string
   name: string
   createdAt: string
+  responseMode: ClientResponseMode
 }
 
 export interface UpdateClientKeyRequest {
   name?: string
   description?: string
   group?: string
+  responseMode?: ClientResponseMode
 }
 
 // ============ 用量统计 ============
@@ -562,6 +568,7 @@ export interface TraceRecord {
   keySource: 'masterApiKey' | 'clientKey'
   /** 发起请求的客户端 Key 名称（master 表示主 apiKey；管理员业务 Key 可为 null） */
   keyName?: string | null
+  responseMode: ClientResponseMode
   model: string
   isStream: boolean
   /** success / error / interrupted */
@@ -644,6 +651,7 @@ export interface ErrorSnapshotSummary {
   isStream: boolean
   keyId: number
   keySource: 'masterApiKey' | 'clientKey'
+  responseMode: ClientResponseMode
   finalCredentialId: number
   endpoint: string | null
   httpStatus: number | null
