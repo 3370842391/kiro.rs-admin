@@ -4554,8 +4554,8 @@ mod tests {
         )
     }
 
-    #[test]
-    fn cancel_idc_login_is_idempotent() {
+    #[tokio::test]
+    async fn cancel_idc_login_is_idempotent() {
         let service = auth_test_service();
         service.idc_sessions.lock().insert(
             "session-1".to_string(),
@@ -4576,8 +4576,8 @@ mod tests {
         assert!(!service.cancel_idc_login("session-1").cancelled);
     }
 
-    #[test]
-    fn cancel_social_login_removes_session_and_drops_server_handle() {
+    #[tokio::test]
+    async fn cancel_social_login_removes_session_and_drops_server_handle() {
         let service = auth_test_service();
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let (_port, handle) = social::start_callback_server(tx).unwrap();
