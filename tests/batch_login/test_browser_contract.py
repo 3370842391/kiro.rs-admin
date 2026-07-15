@@ -67,6 +67,28 @@ PAGES = {
       </form>
     """,
     "/invalid": "<p>incorrect password</p>",
+    "/invalid-enterprise": """
+      <form action='/invalid-password'>
+        <label>用户名 <input name='username'></label>
+        <button>下一步</button>
+      </form>
+    """,
+    "/invalid-password": """
+      <form action='/invalid-zh'>
+        <label>密码 <input name='password' type='password'></label>
+        <button>登录</button>
+      </form>
+    """,
+    "/invalid-zh": "<p>我们无法验证您的登录凭证。请重试。</p>",
+    "/password-events": """
+      <label>密码 <input name='password' type='password'></label>
+      <script>
+        window.inputEventCount = 0;
+        document.querySelector("input[name='password']").addEventListener(
+          "input", () => window.inputEventCount += 1
+        );
+      </script>
+    """,
 }
 
 
@@ -168,6 +190,30 @@ class BrowserContractTests(unittest.IsolatedAsyncioTestCase):
                 )
             self.assertEqual("invalid_credentials", raised.exception.code)
             self.assertFalse(raised.exception.retryable)
+
+    async def test_aws_chinese_invalid_credentials_close_current_account(self):
+        async with self.driver.account_context() as session:
+            with self.assertRaises(BrowserFlowError) as raised:
+                await session.complete_enterprise(
+                    self.base_url + "/invalid-enterprise",
+                    "alice",
+                    "wrong",
+                )
+
+            self.assertEqual("invalid_credentials", raised.exception.code)
+            self.assertFalse(raised.exception.retryable)
+
+    async def test_password_is_entered_sequentially(self):
+        async with self.driver.account_context() as session:
+            await session.page.goto(self.base_url + "/password-events")
+            password = r"p<ass>\word$#^&*()!?"
+
+            self.assertTrue(await session._fill_password(password))
+
+            event_count = await session.page.evaluate("window.inputEventCount")
+            value = await session.page.locator("input[name='password']").input_value()
+            self.assertGreaterEqual(event_count, len(password))
+            self.assertEqual(password, value)
 
     async def test_microsoft_two_stage_flow_reuses_one_browser_context(self):
         async with self.driver.account_context() as session:

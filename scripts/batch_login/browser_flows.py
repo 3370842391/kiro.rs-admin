@@ -81,10 +81,20 @@ class AccountBrowserSession:
         re.I,
     )
     INVALID_TEXT = re.compile(
-        r"密码不正确|账号或密码错误|incorrect password|invalid credentials",
+        r"密码不正确|账号或密码错误|无法验证.*登录凭证|"
+        r"incorrect password|invalid credentials|"
+        r"couldn.t verify.*sign-in credentials",
         re.I,
     )
     LOCKED_TEXT = re.compile(r"账号.*锁定|account.*locked", re.I)
+    SUCCESS_TEXT = re.compile(
+        r"授权成功|请求已批准|可以关闭此窗口|"
+        r"authorization (?:was )?successful|request approved|"
+        r"you (?:can|may) close (?:this )?window",
+        re.I,
+    )
+    PASSWORD_KEY_DELAY_MS = 35
+    PASSWORD_SUBMIT_PAUSE_SECONDS = 0.8
 
     def __init__(
         self,
@@ -142,7 +152,11 @@ class AccountBrowserSession:
         )
         if locator is None:
             return False
-        await locator.fill(password)
+        await locator.fill("")
+        await locator.press_sequentially(
+            password,
+            delay=self.PASSWORD_KEY_DELAY_MS,
+        )
         return True
 
     async def _click_primary(self, password_stage: bool) -> bool:
@@ -227,6 +241,12 @@ class AccountBrowserSession:
                     False,
                     "账号已锁定",
                 )
+            if (
+                password_filled
+                and callback_future is None
+                and self.SUCCESS_TEXT.search(body)
+            ):
+                return
 
             manual_code = (
                 "captcha_required"
@@ -247,6 +267,7 @@ class AccountBrowserSession:
 
             if not password_filled and await self._fill_password(password):
                 password_filled = True
+                await asyncio.sleep(self.PASSWORD_SUBMIT_PAUSE_SECONDS)
                 await self._click_primary(True)
                 await asyncio.sleep(0.2)
                 continue
@@ -258,8 +279,6 @@ class AccountBrowserSession:
                 await asyncio.sleep(0.2)
                 continue
 
-            if password_filled and callback_future is None:
-                return
             await asyncio.sleep(0.2)
 
         raise BrowserFlowError(
