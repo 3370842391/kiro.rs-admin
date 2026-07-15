@@ -79,6 +79,38 @@ class RedactionTests(unittest.TestCase):
         self.assertNotIn("user@example.com", decoded)
         self.assertIn("us***@example.com", decoded)
 
+    def test_redact_text_masks_percent_encoded_email_inside_url_query(self):
+        redacted = redact_text(
+            "https://example.com/callback?login_hint=user%40example.com"
+        )
+
+        decoded = unquote(redacted)
+        self.assertNotIn("user@example.com", decoded)
+        self.assertIn("us***@example.com", decoded)
+
+    def test_run_record_json_redacts_sensitive_values_with_quoted_keys(self):
+        record = RunRecord(
+            run_id="run-quoted-keys",
+            line_number=8,
+            account_hash="sha256-hash",
+            account_masked="us***@example.com",
+            mode=LoginMode.MICROSOFT,
+            status=ResultStatus.FAILED,
+            stage="callback",
+            attempts=1,
+            timestamp="2026-07-15T00:00:00Z",
+            message=(
+                '{"password": "plain-secret", '
+                '"access_token": "access-secret"}'
+            ),
+        )
+
+        serialized = json.dumps(record.as_json(), ensure_ascii=False)
+
+        self.assertNotIn("plain-secret", serialized)
+        self.assertNotIn("access-secret", serialized)
+        self.assertIn("<redacted>", serialized)
+
     def test_run_record_json_redacts_accidentally_supplied_sensitive_text(self):
         record = RunRecord(
             run_id="run-1",
