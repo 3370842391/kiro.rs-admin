@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use axum::http::StatusCode;
 use chrono::{DateTime, Duration, Timelike, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -534,6 +535,8 @@ pub struct AdminService {
     idc_sessions: Arc<Mutex<HashMap<String, IdcAuthSession>>>,
     /// 进行中的 Social 登录会话
     social_sessions: Arc<Mutex<HashMap<String, SocialAuthSession>>>,
+    /// 串行化登录身份查重与入库，避免不同 refresh token 的同一身份并发重复创建。
+    login_credential_lock: tokio::sync::Mutex<()>,
     /// 请求链路追踪存储（用于日志治理：开关 + 保留天数运行时可改）
     trace_store: Option<crate::admin::trace_db::SharedTraceStore>,
     /// 用量日志记录器（用于日志治理：保留天数运行时可改）
@@ -597,6 +600,27 @@ struct IdcAuthSession {
     proxy: Option<ProxyConfig>,
     /// 重新登录时更新此凭据的 Token（非 None 时更新已有凭据而非创建新凭据）
     relogin_target_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoginCredentialResult {
+    Added(u64),
+    Existing(u64),
+}
+
+impl LoginCredentialResult {
+    fn response(self) -> PollIdcLoginResponse {
+        match self {
+            Self::Added(credential_id) => PollIdcLoginResponse::Success {
+                credential_id,
+                duplicate: false,
+            },
+            Self::Existing(credential_id) => PollIdcLoginResponse::Success {
+                credential_id,
+                duplicate: true,
+            },
+        }
+    }
 }
 
 /// 解析自动更新触发时间（`HH:MM`，本地 24 小时制）。允许 `H:M` 简写，
@@ -922,6 +946,7 @@ impl AdminService {
             update_check_cache: Mutex::new(None),
             idc_sessions: Arc::new(Mutex::new(HashMap::new())),
             social_sessions: Arc::new(Mutex::new(HashMap::new())),
+            login_credential_lock: tokio::sync::Mutex::new(()),
             trace_store: None,
             usage_recorder: None,
             error_snapshot_store: None,
@@ -3680,6 +3705,33 @@ impl AdminService {
         }
     }
 
+    async fn add_login_credential(
+        &self,
+        credential: KiroCredentials,
+    ) -> Result<LoginCredentialResult, AdminServiceError> {
+        let _login_guard = self.login_credential_lock.lock().await;
+        if let Some(id) = self
+            .token_manager
+            .find_existing_login_credential_id(&credential)
+        {
+            return Ok(LoginCredentialResult::Existing(id));
+        }
+
+        let retry_candidate = credential.clone();
+        match self.token_manager.add_credential(credential).await {
+            Ok(id) => Ok(LoginCredentialResult::Added(id)),
+            Err(error) => {
+                if let Some(id) = self
+                    .token_manager
+                    .find_existing_login_credential_id(&retry_candidate)
+                {
+                    return Ok(LoginCredentialResult::Existing(id));
+                }
+                Err(self.classify_add_error(error))
+            }
+        }
+    }
+
     /// 幂等取消 IdC 登录会话。
     pub fn cancel_idc_login(&self, session_id: &str) -> CancelLoginResponse {
         CancelLoginResponse {
@@ -3866,12 +3918,16 @@ impl AdminService {
             }
             if !callback.state.is_empty() && callback.state != s.state {
                 tracing::warn!(
-                    "企业 SSO 中间链接 state 不匹配（期望 {}, 收到 {}），已拒绝",
-                    s.state,
-                    callback.state
+                    "认证回调拒绝：code=state_mismatch session={}",
+                    session_id.chars().take(8).collect::<String>()
                 );
-                return Err(AdminServiceError::InternalError(
-                    "OAuth state 不匹配，请重新发起登录".to_string(),
+                return Err(AdminServiceError::auth(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "state_mismatch",
+                    "social_callback",
+                    false,
+                    "OAuth state 不匹配，请重新发起登录",
                 ));
             }
             if let Some(existing) = &s.external_idp {
@@ -3922,8 +3978,13 @@ impl AdminService {
         callback: social::OAuthCallbackData,
     ) -> Result<PollIdcLoginResponse, AdminServiceError> {
         if callback.code.trim().is_empty() {
-            return Err(AdminServiceError::InternalError(
-                "OAuth 回调缺少 code".to_string(),
+            return Err(AdminServiceError::auth(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "callback_invalid",
+                "social_callback",
+                false,
+                "OAuth 回调缺少 code",
             ));
         }
 
@@ -3937,12 +3998,16 @@ impl AdminService {
             }
             if callback.state != s.state {
                 tracing::warn!(
-                    "Social 登录 state 不匹配（期望 {}, 收到 {}），已拒绝",
-                    s.state,
-                    callback.state
+                    "认证回调拒绝：code=state_mismatch session={}",
+                    session_id.chars().take(8).collect::<String>()
                 );
-                return Err(AdminServiceError::InternalError(
-                    "OAuth state 不匹配，请重新发起登录".to_string(),
+                return Err(AdminServiceError::auth(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "state_mismatch",
+                    "social_callback",
+                    false,
+                    "OAuth state 不匹配，请重新发起登录",
                 ));
             }
         }
@@ -3976,7 +4041,16 @@ impl AdminService {
             session.proxy.as_ref(),
         )
         .await
-        .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        .map_err(|error| {
+            AdminServiceError::auth(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                "upstream_error",
+                "token_exchange",
+                true,
+                error.to_string(),
+            )
+        })?;
 
         // 重新登录模式：更新已有凭据而非创建新凭据
         if let Some(target_id) = session.relogin_target_id {
@@ -4005,23 +4079,21 @@ impl AdminService {
         if let Some(arn) = token.profile_arn {
             new_cred.profile_arn = Some(arn);
         }
-
-        let credential_id = self
-            .token_manager
-            .add_credential(new_cred)
-            .await
-            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
-
-        // 主动刷新余额（含订阅等级 / 邮箱）并写入缓存，登录后立即可见
-        if let Err(e) = self.get_balance(credential_id).await {
-            tracing::warn!("Social 登录后刷新余额失败（不影响登录）: {}", e);
+        if !callback.login_option.trim().is_empty() {
+            new_cred.provider = Some(callback.login_option.trim().to_string());
         }
 
-        tracing::info!("Social 登录成功，已添加凭据 #{}", credential_id);
-        Ok(PollIdcLoginResponse::Success {
-            credential_id,
-            duplicate: false,
-        })
+        let result = self.add_login_credential(new_cred).await?;
+
+        // 主动刷新余额（含订阅等级 / 邮箱）并写入缓存，登录后立即可见
+        if let LoginCredentialResult::Added(credential_id) = result {
+            if let Err(e) = self.get_balance(credential_id).await {
+                tracing::warn!("Social 登录后刷新余额失败（不影响登录）: {}", e);
+            }
+            tracing::info!("Social 登录成功，已添加凭据 #{}", credential_id);
+        }
+
+        Ok(result.response())
     }
 
     async fn finish_external_idp_login(
@@ -4030,8 +4102,13 @@ impl AdminService {
         callback: social::OAuthCallbackData,
     ) -> Result<PollIdcLoginResponse, AdminServiceError> {
         if callback.code.trim().is_empty() {
-            return Err(AdminServiceError::InternalError(
-                "External IdP 回调缺少 code".to_string(),
+            return Err(AdminServiceError::auth(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "callback_invalid",
+                "social_callback",
+                false,
+                "OAuth 回调缺少 code",
             ));
         }
 
@@ -4044,18 +4121,27 @@ impl AdminService {
                 return Ok(PollIdcLoginResponse::Expired);
             }
             let external_idp = s.external_idp.clone().ok_or_else(|| {
-                AdminServiceError::InternalError(
-                    "尚未收到企业 SSO 中间链接，请先粘贴第一段回调 URL".to_string(),
+                AdminServiceError::auth(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "callback_invalid",
+                    "social_callback",
+                    false,
+                    "尚未收到企业 SSO 中间链接，请先提交第一段回调",
                 )
             })?;
             if callback.state != external_idp.state {
                 tracing::warn!(
-                    "External IdP 登录 state 不匹配（期望 {}, 收到 {}），已拒绝",
-                    external_idp.state,
-                    callback.state
+                    "认证回调拒绝：code=state_mismatch session={}",
+                    session_id.chars().take(8).collect::<String>()
                 );
-                return Err(AdminServiceError::InternalError(
-                    "External IdP state 不匹配，请重新发起登录".to_string(),
+                return Err(AdminServiceError::auth(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "state_mismatch",
+                    "social_callback",
+                    false,
+                    "OAuth state 不匹配，请重新发起登录",
                 ));
             }
             let session = sessions
@@ -4076,7 +4162,16 @@ impl AdminService {
             session.proxy.as_ref(),
         )
         .await
-        .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        .map_err(|error| {
+            AdminServiceError::auth(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                "upstream_error",
+                "token_exchange",
+                true,
+                error.to_string(),
+            )
+        })?;
 
         if let Some(target_id) = session.relogin_target_id {
             self.do_external_idp_relogin_update(target_id, token, external_idp)
@@ -4114,21 +4209,16 @@ impl AdminService {
             new_cred.email = social::extract_email_from_jwt(&token.access_token);
         }
 
-        let credential_id = self
-            .token_manager
-            .add_credential(new_cred)
-            .await
-            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        let result = self.add_login_credential(new_cred).await?;
 
-        if let Err(e) = self.get_balance(credential_id).await {
-            tracing::warn!("External IdP 登录后刷新余额失败（不影响登录）: {}", e);
+        if let LoginCredentialResult::Added(credential_id) = result {
+            if let Err(e) = self.get_balance(credential_id).await {
+                tracing::warn!("External IdP 登录后刷新余额失败（不影响登录）: {}", e);
+            }
+            tracing::info!("External IdP 登录成功，已添加凭据 #{}", credential_id);
         }
 
-        tracing::info!("External IdP 登录成功，已添加凭据 #{}", credential_id);
-        Ok(PollIdcLoginResponse::Success {
-            credential_id,
-            duplicate: false,
-        })
+        Ok(result.response())
     }
 
     /// 手动完成 Social 登录：远程访问时从浏览器地址栏粘贴的回调 URL 中提取参数，直接完成 token 兑换
@@ -4346,22 +4436,17 @@ impl AdminService {
                     new_cred.expires_at = Some((Utc::now() + Duration::seconds(secs)).to_rfc3339());
                 }
 
-                let credential_id = self
-                    .token_manager
-                    .add_credential(new_cred)
-                    .await
-                    .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+                let result = self.add_login_credential(new_cred).await?;
 
                 // 主动刷新余额（含订阅等级 / 邮箱）并写入缓存，登录后立即可见
-                if let Err(e) = self.get_balance(credential_id).await {
-                    tracing::warn!("IdC 登录后刷新余额失败（不影响登录）: {}", e);
+                if let LoginCredentialResult::Added(credential_id) = result {
+                    if let Err(e) = self.get_balance(credential_id).await {
+                        tracing::warn!("IdC 登录后刷新余额失败（不影响登录）: {}", e);
+                    }
+                    tracing::info!("IdC 设备授权登录成功，已添加凭据 #{}", credential_id);
                 }
 
-                tracing::info!("IdC 设备授权登录成功，已添加凭据 #{}", credential_id);
-                Ok(PollIdcLoginResponse::Success {
-                    credential_id,
-                    duplicate: false,
-                })
+                Ok(result.response())
             }
         }
     }
@@ -4539,6 +4624,24 @@ impl AdminService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_credential_result_maps_duplicate_flag() {
+        assert_eq!(
+            LoginCredentialResult::Added(3).response(),
+            PollIdcLoginResponse::Success {
+                credential_id: 3,
+                duplicate: false,
+            }
+        );
+        assert_eq!(
+            LoginCredentialResult::Existing(7).response(),
+            PollIdcLoginResponse::Success {
+                credential_id: 7,
+                duplicate: true,
+            }
+        );
+    }
 
     fn auth_test_service() -> AdminService {
         let manager = Arc::new(
