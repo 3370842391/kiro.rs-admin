@@ -13,6 +13,17 @@ from batch_login.redaction import mask_account, redact_text, redact_url
 
 
 class RedactionTests(unittest.TestCase):
+    def test_redact_text_masks_camel_case_token_assignments(self):
+        redacted = redact_text(
+            'refreshToken="refresh-secret" accessToken=access-secret '
+            'clientSecret="client-secret" codeVerifier=verifier-secret'
+        )
+
+        self.assertNotIn("refresh-secret", redacted)
+        self.assertNotIn("access-secret", redacted)
+        self.assertNotIn("client-secret", redacted)
+        self.assertNotIn("verifier-secret", redacted)
+
     def test_masks_email_and_plain_username(self):
         self.assertEqual("us***@example.com", mask_account("user@example.com"))
         self.assertEqual("ad***", mask_account("admin"))

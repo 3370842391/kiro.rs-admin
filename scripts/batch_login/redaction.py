@@ -17,7 +17,7 @@ SENSITIVE_QUERY_KEYS = {
 BEARER_RE = re.compile(r"(?i)\bBearer\s+[^\s,;]+")
 TOKEN_ASSIGNMENT_RE = re.compile(
     r"(?i)(?P<quote>[\"']?)\b"
-    r"(?P<key>access_token|refresh_token|id_token|client_secret|code_verifier|token|password)"
+    r"(?P<key>access_?token|refresh_?token|id_?token|client_?secret|code_?verifier|token|password)"
     r"\b(?P=quote)\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
 )
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
