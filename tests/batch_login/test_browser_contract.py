@@ -38,6 +38,24 @@ PAGES = {
         <button>继续</button>
       </form>
     """,
+    "/portal-cookie": """
+      <script>document.cookie = 'portalPhase=complete; Path=/'</script>
+      <form action='http://127.0.0.1:9/signin/callback'>
+        <input type='hidden' name='login_option' value='external_idp'>
+        <input type='hidden' name='issuer_url' value='https://login.microsoftonline.com/t/v2.0'>
+        <input type='hidden' name='client_id' value='client'>
+        <input type='hidden' name='state' value='portal-state'>
+        <label>电子邮件 <input name='email' type='email'></label>
+        <button>继续</button>
+      </form>
+    """,
+    "/microsoft": """
+      <form action='http://127.0.0.1:9/oauth/callback'>
+        <input type='hidden' name='code' value='final-code'>
+        <input type='hidden' name='state' value='final-state'>
+        <button>继续</button>
+      </form>
+    """,
     "/invalid": "<p>incorrect password</p>",
 }
 
@@ -46,6 +64,7 @@ def start_fixture_server(pages):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             path = urlsplit(self.path).path
+            self.server.seen_requests.append((path, self.headers.get("cookie", "")))
             body = pages.get(path, "<h1>not found</h1>").encode("utf-8")
             self.send_response(200 if path in pages else 404)
             self.send_header("content-type", "text/html; charset=utf-8")
@@ -57,6 +76,7 @@ def start_fixture_server(pages):
             return
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.seen_requests = []
     Thread(target=server.serve_forever, daemon=True).start()
     host, port = server.server_address
     return server, f"http://{host}:{port}"
@@ -109,6 +129,31 @@ class BrowserContractTests(unittest.IsolatedAsyncioTestCase):
                 )
             self.assertEqual("invalid_credentials", raised.exception.code)
             self.assertFalse(raised.exception.retryable)
+
+    async def test_microsoft_two_stage_flow_reuses_one_browser_context(self):
+        async with self.driver.account_context() as session:
+            first = await session.capture_callback(
+                self.base_url + "/portal-cookie",
+                "user@example.com",
+                "secret",
+                expected_path="/signin/callback",
+            )
+            second = await session.capture_callback(
+                self.base_url + "/microsoft",
+                "user@example.com",
+                "secret",
+                expected_path="/oauth/callback",
+            )
+
+        self.assertIn("login_option=external_idp", first)
+        self.assertIn("code=final-code", second)
+        microsoft_cookies = [
+            cookie
+            for path, cookie in self.server.seen_requests
+            if path == "/microsoft"
+        ]
+        self.assertTrue(microsoft_cookies)
+        self.assertIn("portalPhase=complete", microsoft_cookies[-1])
 
 
 if __name__ == "__main__":
