@@ -235,3 +235,16 @@ Admin API 收到未知模式时返回 `400 invalid_request`，原记录保持不
 5. 工具、thinking、PDF 提取、strict JSON、重试、缓存、计费、日志和 1 秒 SSE 首响应不因模式分流而退化。
 6. 管理端可在创建和编辑 Key 时明确选择模式，并显示实际持久化结果。
 7. 未提供客户端临时覆盖入口，单次请求始终使用鉴权时确定的模式快照。
+
+## 实施结果（2026-07-15）
+
+- 已实现 `detection` / `kiro_native` 两种 Key 级回复模式，旧 Key 和未知持久化值均安全降级为 `detection`。
+- 已把鉴权时的模式快照贯穿 `/v1/messages`、`/cc/v1/messages`、trace 和错误快照；未增加 Header 或其他单请求覆盖入口。
+- `kiro_native` 只关闭身份归一化和检测型本地短路；工具、thinking、PDF 提取、WebSearch、strict JSON、重试、缓存、计费和早期 SSE 仍走共享路径。
+- 管理端已支持创建、编辑和展示模式，保存失败时不做乐观更新。
+- 规格复核后补齐了 trace Admin API 的 `responseMode`、Key 文件原子替换写入，以及旧版 fallback 快照缺字段时的 `detection` 兼容。
+- 本地验证：`cargo check -j 1 --all-targets` 通过；`cargo test -j 1 --all-targets` 共通过 994 项（`anthropic_probe` 18 项、主程序 976 项）；管理端 `bun test` 通过 75 项，`bun run build` 成功。
+- 设计与计划提交：`09a96d9`、`099abfd`；功能实现由本次后续本地提交保存。
+- 尚未执行隔离公网 8991 的双 Key 实测，因此没有测试 Key ID，也没有线上首响应实测值；1 秒目标目前仅由既有 early SSE/ping 路径未被门控及本地回归测试证明未发生代码级回退。
+- 已知上游限制保持不变：Kiro 未产生真实 thinking、返回空 assistant 或中途截断工具 JSON 时，RS 仍只能按现有降级、重试和错误响应处理。
+- 未推送 GitHub，未部署隔离 8991，也未修改生产 8990。

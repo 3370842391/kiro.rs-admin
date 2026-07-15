@@ -5,7 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Instant;
 
-use crate::admin::client_keys::SharedClientKeyManager;
+use crate::admin::client_keys::{ClientResponseMode, SharedClientKeyManager};
 use crate::admin::trace_db::{
     SharedTraceStore, TraceAttempt, TraceDiagnosticEvent, TraceKeySource, TraceRecord, TraceSink,
     outcome,
@@ -42,6 +42,14 @@ use super::types::{
     OutputConfig, Thinking,
 };
 use super::websearch;
+
+fn detection_only<T>(mode: ClientResponseMode, action: impl FnOnce() -> Option<T>) -> Option<T> {
+    mode.allows_detection_shortcuts().then(action).flatten()
+}
+
+fn effective_identity_normalization(globally_enabled: bool, mode: ClientResponseMode) -> bool {
+    globally_enabled && mode.allows_identity_normalization()
+}
 
 /// 请求结束时记录用量的钩子
 ///
@@ -135,6 +143,7 @@ pub(crate) struct RequestTracer {
     ts: String,
     key_id: u64,
     key_source: TraceKeySource,
+    response_mode: ClientResponseMode,
     model: String,
     is_stream: bool,
     /// 本次请求实际下发的思考档位（low/medium/high/xhigh/max）；未启用/不支持为 None。
@@ -208,6 +217,7 @@ impl RequestTracer {
             ts: Utc::now().to_rfc3339(),
             key_id: options.key_ctx.key_id,
             key_source: options.key_ctx.key_source,
+            response_mode: options.key_ctx.response_mode,
             model: options.model,
             is_stream: options.is_stream,
             reasoning_effort: parking_lot::Mutex::new(options.reasoning_effort),
@@ -344,6 +354,7 @@ impl RequestTracer {
             ts: self.ts.clone(),
             key_id: self.key_id,
             key_source: self.key_source,
+            response_mode: self.response_mode,
             model: self.model.clone(),
             is_stream: self.is_stream,
             final_status: final_status.to_string(),
@@ -873,6 +884,7 @@ async fn collect_buffered_attempt(
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
     attempt_index: usize,
+    identity_normalization: bool,
 ) -> anyhow::Result<BufferedAttempt> {
     let call_result = provider
         .call_api_with_content_length_retry(
@@ -906,7 +918,7 @@ async fn collect_buffered_attempt(
     );
     context.set_context_window_size(context_window_size);
     context.set_cache_usage(cache_usage);
-    if provider.identity_normalization() {
+    if identity_normalization {
         context.enable_identity_filter();
     }
     for result in decoder.decode_iter() {
@@ -1021,6 +1033,7 @@ async fn handle_strict_json_request(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    identity_normalization: bool,
 ) -> Response {
     let structured_format = payload
         .output_config
@@ -1082,6 +1095,7 @@ async fn handle_strict_json_request(
                     tracer,
                     group,
                     attempt_index,
+                    identity_normalization,
                 )
                 .await
             }
@@ -2073,35 +2087,41 @@ pub async fn post_messages(
                 .into_response();
         }
     };
+    let identity_normalization =
+        effective_identity_normalization(provider.identity_normalization(), key_ctx.response_mode);
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
-    if let Some(response) =
+    if let Some(response) = detection_only(key_ctx.response_mode, || {
         try_local_model_profile_response(&state, provider.as_ref(), &payload, &hook)
-    {
+    }) {
         finalize_immediate_response(&tracer, &response, "model_profile_error");
         return response;
     }
 
-    if let Some(response) = try_local_exact_system_response(
-        &state,
-        provider.as_ref(),
-        &payload,
-        &hook,
-        state.tool_compatibility_mode,
-    ) {
+    if let Some(response) = detection_only(key_ctx.response_mode, || {
+        try_local_exact_system_response(
+            &state,
+            provider.as_ref(),
+            &payload,
+            &hook,
+            state.tool_compatibility_mode,
+        )
+    }) {
         finalize_immediate_response(&tracer, &response, "exact_system_error");
         return response;
     }
 
-    if let Some(response) = try_local_exact_user_response(
-        &state,
-        provider.as_ref(),
-        &payload,
-        &hook,
-        state.tool_compatibility_mode,
-    ) {
+    if let Some(response) = detection_only(key_ctx.response_mode, || {
+        try_local_exact_user_response(
+            &state,
+            provider.as_ref(),
+            &payload,
+            &hook,
+            state.tool_compatibility_mode,
+        )
+    }) {
         finalize_immediate_response(&tracer, &response, "exact_user_error");
         return response;
     }
@@ -2126,14 +2146,16 @@ pub async fn post_messages(
             return response;
         }
     };
-    if let Some(response) = try_local_document_identifier_response(
-        &state,
-        provider.as_ref(),
-        &payload,
-        &document_expansion,
-        &hook,
-        state.tool_compatibility_mode,
-    ) {
+    if let Some(response) = detection_only(key_ctx.response_mode, || {
+        try_local_document_identifier_response(
+            &state,
+            provider.as_ref(),
+            &payload,
+            &document_expansion,
+            &hook,
+            state.tool_compatibility_mode,
+        )
+    }) {
         finalize_immediate_response(&tracer, &response, "document_identifier_error");
         return response;
     }
@@ -2306,6 +2328,7 @@ pub async fn post_messages(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            identity_normalization,
         )
         .await;
     }
@@ -2331,6 +2354,7 @@ pub async fn post_messages(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            identity_normalization,
         )
         .await
     } else {
@@ -2356,6 +2380,7 @@ pub async fn post_messages(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            identity_normalization,
         )
         .await
     }
@@ -2461,6 +2486,7 @@ async fn handle_stream_request(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    identity_normalization: bool,
 ) -> Response {
     if provider.early_stream_handshake() {
         let idle_timeout_secs = provider.stream_idle_timeout_secs();
@@ -2481,6 +2507,7 @@ async fn handle_stream_request(
             tracer,
             group,
             idle_timeout_secs,
+            identity_normalization,
         );
         return Response::builder()
             .status(StatusCode::OK)
@@ -2529,7 +2556,7 @@ async fn handle_stream_request(
         tool_choice_policy,
         cache_usage,
         group,
-        identity_normalization: provider.identity_normalization(),
+        identity_normalization,
         strict_thinking_validation: provider.strict_thinking_validation(),
     };
 
@@ -2572,6 +2599,7 @@ fn create_early_sse_stream(
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
     idle_timeout_secs: u64,
+    identity_normalization: bool,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let tracer_for_call = tracer.clone();
     let provider_for_call = provider.clone();
@@ -2603,7 +2631,7 @@ fn create_early_sse_stream(
             tool_choice_policy,
             cache_usage,
             group,
-            identity_normalization: provider.identity_normalization(),
+            identity_normalization,
             strict_thinking_validation: provider.strict_thinking_validation(),
         },
         hook,
@@ -3221,6 +3249,7 @@ async fn collect_non_stream_tool_attempt(
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<&str>,
     attempt_index: u8,
+    identity_normalization: bool,
 ) -> Result<NonStreamToolAttempt, NonStreamCollectError> {
     let call_result = provider
         .call_api_with_content_length_retry(
@@ -3369,7 +3398,7 @@ async fn collect_non_stream_tool_attempt(
     }
 
     let text_content = crate::kiro::model::events::strip_tool_use_xml_leaks(&text_content);
-    let text_content = if provider.identity_normalization() {
+    let text_content = if identity_normalization {
         super::identity::normalize_identity_text(&text_content)
     } else {
         text_content
@@ -3466,6 +3495,7 @@ async fn handle_non_stream_request(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    identity_normalization: bool,
 ) -> Response {
     let collection = async {
         let mut retry_request_body = None;
@@ -3494,6 +3524,7 @@ async fn handle_non_stream_request(
                 tracer.clone(),
                 group.as_deref(),
                 attempt_index,
+                identity_normalization,
             )
             .await?;
             if attempt.state.should_retry()
@@ -4045,35 +4076,41 @@ pub async fn post_messages_cc(
                 .into_response();
         }
     };
+    let identity_normalization =
+        effective_identity_normalization(provider.identity_normalization(), key_ctx.response_mode);
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
-    if let Some(response) =
+    if let Some(response) = detection_only(key_ctx.response_mode, || {
         try_local_model_profile_response(&state, provider.as_ref(), &payload, &hook)
-    {
+    }) {
         finalize_immediate_response(&tracer, &response, "model_profile_error");
         return response;
     }
 
-    if let Some(response) = try_local_exact_system_response(
-        &state,
-        provider.as_ref(),
-        &payload,
-        &hook,
-        state.tool_compatibility_mode,
-    ) {
+    if let Some(response) = detection_only(key_ctx.response_mode, || {
+        try_local_exact_system_response(
+            &state,
+            provider.as_ref(),
+            &payload,
+            &hook,
+            state.tool_compatibility_mode,
+        )
+    }) {
         finalize_immediate_response(&tracer, &response, "exact_system_error");
         return response;
     }
 
-    if let Some(response) = try_local_exact_user_response(
-        &state,
-        provider.as_ref(),
-        &payload,
-        &hook,
-        state.tool_compatibility_mode,
-    ) {
+    if let Some(response) = detection_only(key_ctx.response_mode, || {
+        try_local_exact_user_response(
+            &state,
+            provider.as_ref(),
+            &payload,
+            &hook,
+            state.tool_compatibility_mode,
+        )
+    }) {
         finalize_immediate_response(&tracer, &response, "exact_user_error");
         return response;
     }
@@ -4098,14 +4135,16 @@ pub async fn post_messages_cc(
             return response;
         }
     };
-    if let Some(response) = try_local_document_identifier_response(
-        &state,
-        provider.as_ref(),
-        &payload,
-        &document_expansion,
-        &hook,
-        state.tool_compatibility_mode,
-    ) {
+    if let Some(response) = detection_only(key_ctx.response_mode, || {
+        try_local_document_identifier_response(
+            &state,
+            provider.as_ref(),
+            &payload,
+            &document_expansion,
+            &hook,
+            state.tool_compatibility_mode,
+        )
+    }) {
         finalize_immediate_response(&tracer, &response, "document_identifier_error");
         return response;
     }
@@ -4276,6 +4315,7 @@ pub async fn post_messages_cc(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            identity_normalization,
         )
         .await;
     }
@@ -4301,6 +4341,7 @@ pub async fn post_messages_cc(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            identity_normalization,
         )
         .await
     } else {
@@ -4326,6 +4367,7 @@ pub async fn post_messages_cc(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            identity_normalization,
         )
         .await
     }
@@ -4351,6 +4393,7 @@ async fn handle_stream_request_buffered(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    identity_normalization: bool,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
@@ -4389,7 +4432,7 @@ async fn handle_stream_request_buffered(
         tool_choice_policy,
         cache_usage,
         group,
-        identity_normalization: provider.identity_normalization(),
+        identity_normalization,
         strict_thinking_validation: provider.strict_thinking_validation(),
     };
 
@@ -4731,7 +4774,75 @@ mod tests {
 
     use futures::{StreamExt, future};
 
+    use crate::admin::client_keys::ClientResponseMode;
+
     use super::*;
+
+    #[test]
+    fn response_mode_native_does_not_execute_detection_shortcut() {
+        let called = std::cell::Cell::new(false);
+        let result = detection_only(ClientResponseMode::KiroNative, || {
+            called.set(true);
+            Some("local")
+        });
+        assert_eq!(result, None);
+        assert!(!called.get());
+    }
+
+    #[test]
+    fn response_mode_detection_executes_detection_shortcut() {
+        let called = std::cell::Cell::new(false);
+        let result = detection_only(ClientResponseMode::Detection, || {
+            called.set(true);
+            Some("local")
+        });
+        assert_eq!(result, Some("local"));
+        assert!(called.get());
+    }
+
+    #[test]
+    fn response_mode_identity_requires_global_and_key_opt_in() {
+        assert!(effective_identity_normalization(
+            true,
+            ClientResponseMode::Detection
+        ));
+        assert!(!effective_identity_normalization(
+            false,
+            ClientResponseMode::Detection
+        ));
+        assert!(!effective_identity_normalization(
+            true,
+            ClientResponseMode::KiroNative
+        ));
+    }
+
+    fn response_mode_exact_system_request() -> MessagesRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hello"}],
+            "system": "Return exactly the single word 'READY' and nothing else. No explanation."
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn response_mode_native_bypasses_real_exact_system_output() {
+        let request = response_mode_exact_system_request();
+        let output = detection_only(ClientResponseMode::KiroNative, || {
+            local_exact_system_output(&request, crate::model::config::ToolCompatibilityMode::Raw)
+        });
+        assert!(output.is_none());
+    }
+
+    #[test]
+    fn response_mode_detection_keeps_real_exact_system_output() {
+        let request = response_mode_exact_system_request();
+        let output = detection_only(ClientResponseMode::Detection, || {
+            local_exact_system_output(&request, crate::model::config::ToolCompatibilityMode::Raw)
+        });
+        assert_eq!(output.unwrap().as_str(), "READY");
+    }
 
     #[test]
     fn shared_stream_and_non_stream_retry_body_uses_threshold_variant_and_schema_hint() {
@@ -4917,6 +5028,7 @@ mod tests {
             key_id: 3,
             group: None,
             key_source: TraceKeySource::ClientKey,
+            response_mode: crate::admin::client_keys::ClientResponseMode::Detection,
         };
         let request: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model": "claude-opus-4-8",
@@ -4941,6 +5053,7 @@ mod tests {
                 ts: Utc::now().to_rfc3339(),
                 key_id: key.key_id,
                 key_source: key.key_source,
+                response_mode: key.response_mode,
                 model: request.model.clone(),
                 is_stream: true,
                 reasoning_effort: parking_lot::Mutex::new(None),

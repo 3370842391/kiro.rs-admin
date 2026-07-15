@@ -16,7 +16,7 @@ use sha2::Digest as _;
 use std::sync::Arc;
 
 use super::{
-    client_keys::mask_client_key,
+    client_keys::{ClientResponseMode, mask_client_key},
     error_snapshot_db::{SnapshotQuery, SnapshotSeverity},
     middleware::AdminState,
     trace_db::TraceQuery,
@@ -34,7 +34,7 @@ use super::{
         SetPriorityRequest, SetProxyBalancingModeRequest, SetRetryPolicyRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         SyncModelProfilesRequest, UpdateAdminKeyRequest, UpdateClientKeyRequest,
-        UpdateCredentialRequest, UpdateRefreshTokenRequest,
+        UpdateClientKeyResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
 };
@@ -1094,6 +1094,12 @@ pub async fn update_admin_key(
 
 // ============ 客户端 API Key 分发 ============
 
+fn parse_client_response_mode(
+    value: Option<&str>,
+) -> Result<Option<ClientResponseMode>, &'static str> {
+    value.map(str::parse).transpose()
+}
+
 fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
     ClientKeyItem {
         id: k.id,
@@ -1108,6 +1114,7 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         total_output_tokens: k.total_output_tokens,
         total_cache_creation_tokens: k.total_cache_creation_tokens,
         total_cache_read_tokens: k.total_cache_read_tokens,
+        response_mode: k.response_mode,
         group: k.group.clone(),
         is_system: k.is_system,
     }
@@ -1139,7 +1146,18 @@ pub async fn create_client_key(
         )
             .into_response();
     }
-    let entry = state.client_keys.create(
+    let response_mode = match parse_client_response_mode(payload.response_mode.as_deref()) {
+        Ok(Some(value)) => value,
+        Ok(None) => ClientResponseMode::Detection,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(super::types::AdminErrorResponse::invalid_request(message)),
+            )
+                .into_response();
+        }
+    };
+    let entry = match state.client_keys.try_create_with_mode(
         name.to_string(),
         payload
             .description
@@ -1149,12 +1167,26 @@ pub async fn create_client_key(
             .group
             .map(|g| g.trim().to_string())
             .filter(|g| !g.is_empty()),
-    );
+        response_mode,
+    ) {
+        Ok(entry) => entry,
+        Err(error) => {
+            tracing::error!(%error, "持久化新客户端 Key 失败");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(super::types::AdminErrorResponse::internal_error(
+                    "Key 创建未保存，请稍后重试",
+                )),
+            )
+                .into_response();
+        }
+    };
     Json(CreateClientKeyResponse {
         id: entry.id,
         key: entry.key,
         name: entry.name,
         created_at: entry.created_at,
+        response_mode: entry.response_mode,
     })
     .into_response()
 }
@@ -1206,20 +1238,45 @@ pub async fn update_client_key(
             Some(t.to_string())
         }
     });
-    if state
+    let response_mode = match parse_client_response_mode(payload.response_mode.as_deref()) {
+        Ok(value) => value,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(super::types::AdminErrorResponse::invalid_request(message)),
+            )
+                .into_response();
+        }
+    };
+    match state
         .client_keys
-        .update_meta(id, payload.name, description, group)
+        .update_meta(id, payload.name, description, group, response_mode)
     {
-        Json(SuccessResponse::new(format!("Key #{} 已更新", id))).into_response()
-    } else {
-        (
+        Ok(Some(entry)) => Json(UpdateClientKeyResponse {
+            success: true,
+            message: format!("Key #{} 已更新", id),
+            id,
+            response_mode: entry.response_mode,
+        })
+        .into_response(),
+        Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(super::types::AdminErrorResponse::not_found(format!(
                 "Key #{} 不存在",
                 id
             ))),
         )
-            .into_response()
+            .into_response(),
+        Err(error) => {
+            tracing::error!(key_id = id, %error, "持久化客户端 Key 更新失败");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(super::types::AdminErrorResponse::internal_error(
+                    "Key 更新未保存，请稍后重试",
+                )),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -1274,8 +1331,8 @@ pub async fn rotate_client_key(
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     use axum::http::StatusCode;
-    match state.client_keys.rotate(id) {
-        Some(entry) => {
+    match state.client_keys.try_rotate(id) {
+        Ok(Some(entry)) => {
             // 系统密钥轮换后明文变了，需同步写回 config.json apiKey，
             // 否则下次启动 ensure_system_key 会因旧 apiKey 不在列表而重复导入。
             if entry.is_system {
@@ -1286,10 +1343,11 @@ pub async fn rotate_client_key(
                 key: entry.key,
                 name: entry.name,
                 created_at: entry.created_at,
+                response_mode: entry.response_mode,
             })
             .into_response()
         }
-        None => (
+        Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(super::types::AdminErrorResponse::not_found(format!(
                 "Key #{} 不存在",
@@ -1297,6 +1355,16 @@ pub async fn rotate_client_key(
             ))),
         )
             .into_response(),
+        Err(error) => {
+            tracing::error!(key_id = id, %error, "持久化客户端 Key 轮换失败");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(super::types::AdminErrorResponse::internal_error(
+                    "Key 轮换未保存，请稍后重试",
+                )),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -1513,6 +1581,63 @@ pub async fn stats_by_credential(
 /// 查询请求链路追踪记录（含每跳明细）。
 /// query 参数：status / errorType / credentialId / keyId / group / model / onlyFailed / limit / offset
 /// 返回：{ records: [...], total: N }
+fn trace_record_to_admin_json(
+    r: crate::admin::trace_db::TraceRecord,
+    key_name: String,
+    final_email: Option<String>,
+    email_map: &HashMap<u64, Option<String>>,
+) -> serde_json::Value {
+    let attempts: Vec<serde_json::Value> = r
+        .attempts
+        .iter()
+        .map(|a| {
+            let email = email_map.get(&a.credential_id).cloned().flatten();
+            serde_json::json!({
+                "attempt": a.attempt,
+                "credentialId": a.credential_id,
+                "email": email,
+                "endpoint": a.endpoint,
+                "httpStatus": a.http_status,
+                "outcome": a.outcome,
+                "errorSnippet": a.error_snippet,
+                "durationMs": a.duration_ms,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "traceId": r.trace_id,
+        "ts": r.ts,
+        "keyId": r.key_id,
+        "keySource": r.key_source,
+        "responseMode": r.response_mode,
+        "keyName": key_name,
+        "model": r.model,
+        "isStream": r.is_stream,
+        "finalStatus": r.final_status,
+        "finalCredentialId": r.final_credential_id,
+        "finalEmail": final_email,
+        "errorType": r.error_type,
+        "errorMessage": r.error_message,
+        "snapshotId": r.snapshot_id,
+        "totalAttempts": r.total_attempts,
+        "durationMs": r.duration_ms,
+        "interruptedAfterBytes": r.interrupted_after_bytes,
+        "inputTokens": r.input_tokens,
+        "outputTokens": r.output_tokens,
+        "cacheCreationTokens": r.cache_creation_tokens,
+        "cacheReadTokens": r.cache_read_tokens,
+        "totalTokens": r.input_tokens + r.output_tokens + r.cache_creation_tokens + r.cache_read_tokens,
+        "credits": r.credits,
+        "firstTokenMs": r.first_token_ms,
+        "upstreamFirstByteMs": r.upstream_first_byte_ms,
+        "reasoningEffort": r.reasoning_effort,
+        "context1m": r.context_1m,
+        "thinking": r.thinking,
+        "emptyUserCompatApplied": r.empty_user_compat_applied,
+        "attempts": attempts,
+    })
+}
+
 pub async fn list_traces(
     State(state): State<AdminState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
@@ -1588,55 +1713,7 @@ pub async fn list_traces(
         .map(|r| {
             let final_email = email_map.get(&r.final_credential_id).cloned().flatten();
             let key_name = key_label(r.key_id);
-            // attempts 里每跳也附 email
-            let attempts: Vec<serde_json::Value> = r
-                .attempts
-                .iter()
-                .map(|a| {
-                    let email = email_map.get(&a.credential_id).cloned().flatten();
-                    serde_json::json!({
-                        "attempt": a.attempt,
-                        "credentialId": a.credential_id,
-                        "email": email,
-                        "endpoint": a.endpoint,
-                        "httpStatus": a.http_status,
-                        "outcome": a.outcome,
-                        "errorSnippet": a.error_snippet,
-                        "durationMs": a.duration_ms,
-                    })
-                })
-                .collect();
-            serde_json::json!({
-                "traceId": r.trace_id,
-                "ts": r.ts,
-                "keyId": r.key_id,
-                "keySource": r.key_source,
-                "keyName": key_name,
-                "model": r.model,
-                "isStream": r.is_stream,
-                "finalStatus": r.final_status,
-                "finalCredentialId": r.final_credential_id,
-                "finalEmail": final_email,
-                "errorType": r.error_type,
-                "errorMessage": r.error_message,
-                "snapshotId": r.snapshot_id,
-                "totalAttempts": r.total_attempts,
-                "durationMs": r.duration_ms,
-                "interruptedAfterBytes": r.interrupted_after_bytes,
-                "inputTokens": r.input_tokens,
-                "outputTokens": r.output_tokens,
-                "cacheCreationTokens": r.cache_creation_tokens,
-                "cacheReadTokens": r.cache_read_tokens,
-                "totalTokens": r.input_tokens + r.output_tokens + r.cache_creation_tokens + r.cache_read_tokens,
-                "credits": r.credits,
-                "firstTokenMs": r.first_token_ms,
-                "upstreamFirstByteMs": r.upstream_first_byte_ms,
-                "reasoningEffort": r.reasoning_effort,
-                "context1m": r.context_1m,
-                "thinking": r.thinking,
-                "emptyUserCompatApplied": r.empty_user_compat_applied,
-                "attempts": attempts,
-            })
+            trace_record_to_admin_json(r, key_name, final_email, &email_map)
         })
         .collect();
     Json(serde_json::json!({ "records": enriched, "total": total }))
@@ -2241,5 +2318,64 @@ mod tests {
                 .contains("attachment")
         );
         assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+    }
+
+    #[test]
+    fn client_response_mode_parser_rejects_unknown_values() {
+        use crate::admin::client_keys::ClientResponseMode;
+
+        assert_eq!(
+            parse_client_response_mode(Some("detection")).unwrap(),
+            Some(ClientResponseMode::Detection)
+        );
+        assert_eq!(
+            parse_client_response_mode(Some("kiro_native")).unwrap(),
+            Some(ClientResponseMode::KiroNative)
+        );
+        assert!(parse_client_response_mode(Some("native")).is_err());
+        assert_eq!(parse_client_response_mode(None).unwrap(), None);
+    }
+
+    #[test]
+    fn trace_admin_json_includes_response_mode_snapshot() {
+        let record = crate::admin::trace_db::TraceRecord {
+            trace_id: "trace-native".into(),
+            ts: "2026-07-15T00:00:00Z".into(),
+            key_id: 7,
+            key_source: crate::admin::trace_db::TraceKeySource::ClientKey,
+            response_mode: crate::admin::client_keys::ClientResponseMode::KiroNative,
+            model: "claude-opus-4-8".into(),
+            is_stream: true,
+            final_status: "success".into(),
+            final_credential_id: 9,
+            error_type: None,
+            error_message: None,
+            total_attempts: 0,
+            duration_ms: 10,
+            interrupted_after_bytes: None,
+            input_tokens: 2,
+            output_tokens: 3,
+            cache_creation_tokens: 4,
+            cache_read_tokens: 5,
+            credits: 0.5,
+            first_token_ms: Some(1),
+            upstream_first_byte_ms: Some(1),
+            reasoning_effort: None,
+            context_1m: false,
+            thinking: false,
+            empty_user_compat_applied: false,
+            snapshot_id: None,
+            attempts: Vec::new(),
+        };
+
+        let value = trace_record_to_admin_json(
+            record,
+            "native-key".into(),
+            Some("account@example.com".into()),
+            &std::collections::HashMap::new(),
+        );
+
+        assert_eq!(value["responseMode"], "kiro_native");
+        assert_eq!(value["keyName"], "native-key");
     }
 }

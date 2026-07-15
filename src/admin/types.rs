@@ -4,6 +4,8 @@ use crate::admin::proxy_pool::ProxyHealth;
 use crate::model::config::RetryPolicy;
 use serde::{Deserialize, Serialize};
 
+use super::client_keys::ClientResponseMode;
+
 // ============ 凭据状态 ============
 
 /// 所有凭据状态响应
@@ -1112,6 +1114,7 @@ pub struct ClientKeyItem {
     pub total_output_tokens: u64,
     pub total_cache_creation_tokens: u64,
     pub total_cache_read_tokens: u64,
+    pub response_mode: ClientResponseMode,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     /// 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换）
@@ -1136,6 +1139,8 @@ pub struct CreateClientKeyRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub group: Option<String>,
+    #[serde(default)]
+    pub response_mode: Option<String>,
 }
 
 /// 创建客户端 Key 响应（明文 Key 仅在此处返回一次）
@@ -1146,6 +1151,7 @@ pub struct CreateClientKeyResponse {
     pub key: String,
     pub name: String,
     pub created_at: String,
+    pub response_mode: ClientResponseMode,
 }
 
 /// 更新客户端 Key 元数据
@@ -1156,6 +1162,18 @@ pub struct UpdateClientKeyRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub group: Option<String>,
+    #[serde(default)]
+    pub response_mode: Option<String>,
+}
+
+/// 更新客户端 Key 响应；保留原成功响应字段，并返回实际持久化的模式。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateClientKeyResponse {
+    pub success: bool,
+    pub message: String,
+    pub id: u64,
+    pub response_mode: ClientResponseMode,
 }
 
 // ============ IdC 设备授权登录 ============
@@ -1855,5 +1873,36 @@ mod tests {
         assert_eq!(groups.mode, BatchGroupMode::Add);
         assert_eq!(groups.values, vec!["team-a", "team-b"]);
         assert_eq!(request.source_channel.as_deref(), Some("migration"));
+    }
+
+    #[test]
+    fn client_key_requests_use_camel_case_response_mode() {
+        let create: CreateClientKeyRequest = serde_json::from_value(serde_json::json!({
+            "name": "native",
+            "responseMode": "kiro_native"
+        }))
+        .unwrap();
+        assert_eq!(create.response_mode.as_deref(), Some("kiro_native"));
+
+        let update: UpdateClientKeyRequest = serde_json::from_value(serde_json::json!({
+            "responseMode": "detection"
+        }))
+        .unwrap();
+        assert_eq!(update.response_mode.as_deref(), Some("detection"));
+    }
+
+    #[test]
+    fn update_client_key_response_returns_saved_mode() {
+        let response = UpdateClientKeyResponse {
+            success: true,
+            message: "updated".into(),
+            id: 7,
+            response_mode: ClientResponseMode::KiroNative,
+        };
+        let value = serde_json::to_value(response).unwrap();
+
+        assert_eq!(value["success"], true);
+        assert_eq!(value["id"], 7);
+        assert_eq!(value["responseMode"], "kiro_native");
     }
 }

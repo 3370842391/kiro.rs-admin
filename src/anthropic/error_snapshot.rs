@@ -227,6 +227,7 @@ pub struct ErrorSnapshotContext {
     snapshot_id: String,
     key_id: u64,
     key_source: TraceKeySource,
+    response_mode: crate::admin::client_keys::ClientResponseMode,
     is_stream: bool,
     ts: String,
     ts_epoch: i64,
@@ -388,6 +389,7 @@ impl ErrorSnapshotContext {
             snapshot_id: format!("snap_{}", uuid::Uuid::new_v4().simple()),
             key_id: key.key_id,
             key_source: key.key_source,
+            response_mode: key.response_mode,
             is_stream: request.stream,
             ts: now.to_rfc3339(),
             ts_epoch: now.timestamp(),
@@ -671,6 +673,7 @@ impl ErrorSnapshotContext {
             is_stream: self.is_stream,
             key_id: self.key_id,
             key_source: self.key_source,
+            response_mode: self.response_mode,
             final_credential_id: draft.final_credential_id,
             endpoint: draft.endpoint.clone(),
             http_status,
@@ -851,6 +854,7 @@ mod tests {
             key_id: 7,
             group: None,
             key_source: crate::admin::trace_db::TraceKeySource::ClientKey,
+            response_mode: crate::admin::client_keys::ClientResponseMode::Detection,
         };
         let request: crate::anthropic::types::MessagesRequest =
             serde_json::from_value(serde_json::json!({
@@ -977,6 +981,44 @@ mod tests {
     }
 
     #[test]
+    fn response_mode_is_frozen_when_snapshot_context_is_created() {
+        let store = test_store();
+        let mut key = crate::anthropic::middleware::KeyContext {
+            key_id: 7,
+            group: None,
+            key_source: crate::admin::trace_db::TraceKeySource::ClientKey,
+            response_mode: crate::admin::client_keys::ClientResponseMode::KiroNative,
+        };
+        let request: crate::anthropic::types::MessagesRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": false
+            }))
+            .unwrap();
+        let ctx = ErrorSnapshotContext::new(
+            store.clone(),
+            "trace-response-mode-snapshot".to_string(),
+            &key,
+            &axum::http::HeaderMap::new(),
+            &request,
+        );
+
+        key.response_mode = crate::admin::client_keys::ClientResponseMode::Detection;
+        let id = ctx
+            .finalize(SnapshotFinalState::error("upstream_error", Some(502)))
+            .unwrap()
+            .unwrap();
+        let detail = store.get(&id).unwrap().unwrap();
+
+        assert_eq!(
+            detail.summary.response_mode,
+            crate::admin::client_keys::ClientResponseMode::KiroNative
+        );
+    }
+
+    #[test]
     fn tool_schema_failure_snapshot_keeps_only_safe_summary() {
         let store = test_store();
         let ctx = sample_context(store.clone(), true, true);
@@ -1089,6 +1131,7 @@ mod tests {
             key_id: 7,
             group: None,
             key_source: crate::admin::trace_db::TraceKeySource::ClientKey,
+            response_mode: crate::admin::client_keys::ClientResponseMode::Detection,
         };
         let request: crate::anthropic::types::MessagesRequest =
             serde_json::from_value(serde_json::json!({
