@@ -3975,6 +3975,7 @@ impl AdminService {
             tracing::info!("Social 重新登录成功，凭据 #{} Token 已更新", target_id);
             return Ok(PollIdcLoginResponse::Success {
                 credential_id: target_id,
+                duplicate: false,
             });
         }
 
@@ -4002,7 +4003,10 @@ impl AdminService {
         }
 
         tracing::info!("Social 登录成功，已添加凭据 #{}", credential_id);
-        Ok(PollIdcLoginResponse::Success { credential_id })
+        Ok(PollIdcLoginResponse::Success {
+            credential_id,
+            duplicate: false,
+        })
     }
 
     async fn finish_external_idp_login(
@@ -4068,6 +4072,7 @@ impl AdminService {
             );
             return Ok(PollIdcLoginResponse::Success {
                 credential_id: target_id,
+                duplicate: false,
             });
         }
 
@@ -4105,7 +4110,10 @@ impl AdminService {
         }
 
         tracing::info!("External IdP 登录成功，已添加凭据 #{}", credential_id);
-        Ok(PollIdcLoginResponse::Success { credential_id })
+        Ok(PollIdcLoginResponse::Success {
+            credential_id,
+            duplicate: false,
+        })
     }
 
     /// 手动完成 Social 登录：远程访问时从浏览器地址栏粘贴的回调 URL 中提取参数，直接完成 token 兑换
@@ -4311,6 +4319,7 @@ impl AdminService {
                     tracing::info!("IdC 重新登录成功，凭据 #{} Token 已更新", target_id);
                     return Ok(PollIdcLoginResponse::Success {
                         credential_id: target_id,
+                        duplicate: false,
                     });
                 }
 
@@ -4334,7 +4343,10 @@ impl AdminService {
                 }
 
                 tracing::info!("IdC 设备授权登录成功，已添加凭据 #{}", credential_id);
-                Ok(PollIdcLoginResponse::Success { credential_id })
+                Ok(PollIdcLoginResponse::Success {
+                    credential_id,
+                    duplicate: false,
+                })
             }
         }
     }

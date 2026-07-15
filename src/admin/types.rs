@@ -1195,7 +1195,7 @@ pub struct StartIdcLoginResponse {
 /// snake_case（`credential_id`/`next_url`），而前端读 `credentialId`/`nextUrl` →
 /// 得到 `undefined`（Kiro Hosted 登录成功 toast 显示"已添加凭据 #undefined"，
 /// 二段登录 `nextUrl` 链接也拿不到）。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, PartialEq, Eq)]
 #[serde(
     rename_all = "camelCase",
     rename_all_fields = "camelCase",
@@ -1207,7 +1207,11 @@ pub enum PollIdcLoginResponse {
     #[serde(rename = "continue")]
     Continue { next_url: String },
     #[serde(rename = "success")]
-    Success { credential_id: u64 },
+    Success {
+        credential_id: u64,
+        #[serde(default, skip_serializing_if = "is_false")]
+        duplicate: bool,
+    },
     #[serde(rename = "expired")]
     Expired,
 }
@@ -1388,6 +1392,16 @@ pub struct AdminError {
     #[serde(rename = "type")]
     pub error_type: String,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl AdminErrorResponse {
@@ -1396,6 +1410,27 @@ impl AdminErrorResponse {
             error: AdminError {
                 error_type: error_type.into(),
                 message: message.into(),
+                code: None,
+                stage: None,
+                retryable: None,
+            },
+        }
+    }
+
+    pub fn structured(
+        error_type: impl Into<String>,
+        message: impl Into<String>,
+        code: impl Into<String>,
+        stage: impl Into<String>,
+        retryable: bool,
+    ) -> Self {
+        Self {
+            error: AdminError {
+                error_type: error_type.into(),
+                message: message.into(),
+                code: Some(code.into()),
+                stage: Some(stage.into()),
+                retryable: Some(retryable),
             },
         }
     }
@@ -1695,6 +1730,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn structured_admin_error_keeps_legacy_fields_and_adds_auth_metadata() {
+        let value = serde_json::to_value(AdminErrorResponse::structured(
+            "invalid_request",
+            "OAuth state 不匹配",
+            "state_mismatch",
+            "social_callback",
+            false,
+        ))
+        .unwrap();
+
+        assert_eq!(value["error"]["type"], "invalid_request");
+        assert_eq!(value["error"]["message"], "OAuth state 不匹配");
+        assert_eq!(value["error"]["code"], "state_mismatch");
+        assert_eq!(value["error"]["stage"], "social_callback");
+        assert_eq!(value["error"]["retryable"], false);
+
+        let legacy = serde_json::to_value(AdminErrorResponse::invalid_request("bad")).unwrap();
+        assert!(legacy["error"].get("code").is_none());
+        assert!(legacy["error"].get("stage").is_none());
+        assert!(legacy["error"].get("retryable").is_none());
+    }
+
+    #[test]
     fn cache_policy_patch_is_partial_and_camel_case() {
         let patch: SetCachePolicyRequest = serde_json::from_value(serde_json::json!({
             "defaultTtlSecs": 300,
@@ -1735,12 +1793,25 @@ mod tests {
     /// enum 上仅 `rename_all` 不会重命名 struct variant 内部字段——必须叠加
     /// `rename_all_fields`，否则前端拿到 undefined（toast 显示"已添加凭据 #undefined"）。
     #[test]
-    fn poll_login_response_serializes_fields_as_camel_case() {
-        let success =
-            serde_json::to_value(PollIdcLoginResponse::Success { credential_id: 7 }).unwrap();
-        assert_eq!(success["status"], "success");
-        assert_eq!(success["credentialId"], 7);
-        assert!(success.get("credential_id").is_none());
+    fn poll_success_uses_camel_case_and_omits_false_duplicate() {
+        assert!(PollIdcLoginResponse::Pending == PollIdcLoginResponse::Pending);
+
+        let added = serde_json::to_value(PollIdcLoginResponse::Success {
+            credential_id: 7,
+            duplicate: false,
+        })
+        .unwrap();
+        assert_eq!(added["status"], "success");
+        assert_eq!(added["credentialId"], 7);
+        assert!(added.get("credential_id").is_none());
+        assert!(added.get("duplicate").is_none());
+
+        let existing = serde_json::to_value(PollIdcLoginResponse::Success {
+            credential_id: 7,
+            duplicate: true,
+        })
+        .unwrap();
+        assert_eq!(existing["duplicate"], true);
 
         let cont = serde_json::to_value(PollIdcLoginResponse::Continue {
             next_url: "https://example.com/next".to_string(),

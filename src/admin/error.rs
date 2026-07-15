@@ -9,6 +9,16 @@ use super::types::AdminErrorResponse;
 /// Admin 服务错误类型
 #[derive(Debug)]
 pub enum AdminServiceError {
+    /// 认证流程中的结构化错误
+    Auth {
+        status: StatusCode,
+        error_type: &'static str,
+        code: &'static str,
+        stage: &'static str,
+        retryable: bool,
+        message: String,
+    },
+
     /// 凭据不存在
     NotFound { id: u64 },
 
@@ -31,6 +41,7 @@ pub enum AdminServiceError {
 impl fmt::Display for AdminServiceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            AdminServiceError::Auth { message, .. } => write!(f, "{}", message),
             AdminServiceError::NotFound { id } => {
                 write!(f, "凭据不存在: {}", id)
             }
@@ -46,9 +57,28 @@ impl fmt::Display for AdminServiceError {
 impl std::error::Error for AdminServiceError {}
 
 impl AdminServiceError {
+    pub fn auth(
+        status: StatusCode,
+        error_type: &'static str,
+        code: &'static str,
+        stage: &'static str,
+        retryable: bool,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::Auth {
+            status,
+            error_type,
+            code,
+            stage,
+            retryable,
+            message: message.into(),
+        }
+    }
+
     /// 获取对应的 HTTP 状态码
     pub fn status_code(&self) -> StatusCode {
         match self {
+            AdminServiceError::Auth { status, .. } => *status,
             AdminServiceError::NotFound { .. } => StatusCode::NOT_FOUND,
             AdminServiceError::UpstreamError(_) => StatusCode::BAD_GATEWAY,
             AdminServiceError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -61,6 +91,14 @@ impl AdminServiceError {
     /// 转换为 API 错误响应
     pub fn into_response(self) -> AdminErrorResponse {
         match &self {
+            AdminServiceError::Auth {
+                error_type,
+                code,
+                stage,
+                retryable,
+                message,
+                ..
+            } => AdminErrorResponse::structured(*error_type, message, *code, *stage, *retryable),
             AdminServiceError::NotFound { .. } => AdminErrorResponse::not_found(self.to_string()),
             AdminServiceError::UpstreamError(_) => AdminErrorResponse::api_error(self.to_string()),
             AdminServiceError::InternalError(_) => {
@@ -73,5 +111,31 @@ impl AdminServiceError {
                 AdminErrorResponse::invalid_request(self.to_string())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_error_preserves_status_code_and_structured_fields() {
+        let error = AdminServiceError::auth(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "state_mismatch",
+            "social_callback",
+            false,
+            "OAuth state 不匹配",
+        );
+        assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(error.to_string(), "OAuth state 不匹配");
+
+        let value = serde_json::to_value(error.into_response()).unwrap();
+        assert_eq!(value["error"]["type"], "invalid_request");
+        assert_eq!(value["error"]["message"], "OAuth state 不匹配");
+        assert_eq!(value["error"]["code"], "state_mismatch");
+        assert_eq!(value["error"]["stage"], "social_callback");
+        assert_eq!(value["error"]["retryable"], false);
     }
 }
