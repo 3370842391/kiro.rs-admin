@@ -5,6 +5,8 @@ services:
       dockerfile: Dockerfile.test
     image: kiro-rs-test:${TEST_IMAGE_TAG:-latest}
     container_name: kiro-rs-test
+    environment:
+      RUST_LOG: ${TEST_RUST_LOG:-debug}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
