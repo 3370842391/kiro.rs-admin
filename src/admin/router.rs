@@ -9,22 +9,22 @@ use super::{
     handlers::{
         add_credential, add_proxy, apply_image_update, apply_model_profile_preview,
         assign_proxies_round_robin, assign_proxy_to_credential, batch_add_proxies,
-        batch_import_credentials, batch_update_credentials, check_all_proxies, check_proxy,
-        check_proxy_url, check_rate_limit, check_update, cleanup_error_snapshots,
-        clear_cache_policy_entries, clear_throttle, clear_traces, complete_social_login,
-        complete_social_relogin, create_client_key, create_group, delete_client_key,
-        delete_credential, delete_error_snapshot, delete_group, delete_model_mapping,
-        delete_model_profile_entry, delete_proxy, disable_quota_exceeded, download_error_snapshot,
-        enable_overage_all, error_snapshot_storage, export_credentials, fetch_model_profile,
-        force_refresh_token, get_account_throttle_config, get_all_credentials, get_cache_hit_rate,
-        get_cache_policy, get_compatibility_config, get_credential_balance, get_credential_models,
-        get_endpoint_chains, get_error_snapshot, get_error_snapshot_payload, get_global_proxy,
-        get_image_budget, get_load_balancing_mode, get_log_governance_config, get_model_profiles,
-        get_proxy_balancing_mode, get_proxy_pool, get_retry_policy, get_update_config,
-        list_client_keys, list_error_snapshots, list_groups, list_model_mappings, list_traces,
-        patch_model_profile, pin_error_snapshot, poll_idc_login, poll_idc_relogin,
-        poll_social_login, poll_social_relogin, preview_model_profiles, pull_update_image,
-        replace_model_mappings, reset_all_success_count, reset_client_key_stats,
+        batch_import_credentials, batch_update_credentials, cancel_idc_login, cancel_social_login,
+        check_all_proxies, check_proxy, check_proxy_url, check_rate_limit, check_update,
+        cleanup_error_snapshots, clear_cache_policy_entries, clear_throttle, clear_traces,
+        complete_social_login, complete_social_relogin, create_client_key, create_group,
+        delete_client_key, delete_credential, delete_error_snapshot, delete_group,
+        delete_model_mapping, delete_model_profile_entry, delete_proxy, disable_quota_exceeded,
+        download_error_snapshot, enable_overage_all, error_snapshot_storage, export_credentials,
+        fetch_model_profile, force_refresh_token, get_account_throttle_config, get_all_credentials,
+        get_cache_hit_rate, get_cache_policy, get_compatibility_config, get_credential_balance,
+        get_credential_models, get_endpoint_chains, get_error_snapshot, get_error_snapshot_payload,
+        get_global_proxy, get_image_budget, get_load_balancing_mode, get_log_governance_config,
+        get_model_profiles, get_proxy_balancing_mode, get_proxy_pool, get_retry_policy,
+        get_update_config, list_client_keys, list_error_snapshots, list_groups,
+        list_model_mappings, list_traces, patch_model_profile, pin_error_snapshot, poll_idc_login,
+        poll_idc_relogin, poll_social_login, poll_social_relogin, preview_model_profiles,
+        pull_update_image, replace_model_mappings, reset_all_success_count, reset_client_key_stats,
         reset_failure_count, reset_success_count, rollback_image_update, rotate_client_key,
         set_account_throttle_config, set_cache_hit_rate, set_cache_policy, set_client_key_disabled,
         set_compatibility_config, set_credential_disabled, set_credential_overage,
@@ -176,8 +176,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/system/update/rate-limit", post(check_rate_limit))
         .route("/auth/idc/start", post(start_idc_login))
         .route("/auth/idc/poll/{session_id}", post(poll_idc_login))
+        .route("/auth/idc/{session_id}", delete(cancel_idc_login))
         .route("/auth/social/start", post(start_social_login))
         .route("/auth/social/poll/{session_id}", post(poll_social_login))
+        .route("/auth/social/{session_id}", delete(cancel_social_login))
         .route(
             "/auth/social/complete/{session_id}",
             post(complete_social_login),
@@ -393,5 +395,40 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["emptyUserMessageCompat"], true);
+    }
+
+    #[tokio::test]
+    async fn cancel_auth_sessions_require_admin_key_and_are_idempotent() {
+        for path in ["/auth/idc/missing", "/auth/social/missing"] {
+            let unauthorized = batch_update_test_router()
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+            let authorized = batch_update_test_router()
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(path)
+                        .header("x-api-key", "test-admin-key")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(authorized.status(), StatusCode::OK);
+            let body = to_bytes(authorized.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()["cancelled"],
+                false
+            );
+        }
     }
 }

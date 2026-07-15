@@ -3439,6 +3439,81 @@ impl MultiTokenManager {
         .await
     }
 
+    /// 按稳定登录身份查找已有凭据，避免 refresh token 轮换后重复入库。
+    pub fn find_existing_login_credential_id(&self, candidate: &KiroCredentials) -> Option<u64> {
+        use crate::kiro::model::credentials::{
+            SOCIAL_PROFILE_ARN, canonicalize_auth_method_value, is_placeholder_profile_arn,
+        };
+
+        fn normalized(value: Option<&str>) -> Option<String> {
+            value
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.trim_end_matches('/').to_ascii_lowercase())
+        }
+
+        fn real_profile_arn(value: Option<&str>) -> Option<&str> {
+            value.map(str::trim).filter(|arn| {
+                !arn.is_empty() && !is_placeholder_profile_arn(arn) && *arn != SOCIAL_PROFILE_ARN
+            })
+        }
+
+        fn identity_scope(method: &str, credentials: &KiroCredentials) -> Option<String> {
+            if method == "external_idp" {
+                normalized(credentials.issuer_url.as_deref())
+            } else if method == "idc" {
+                normalized(credentials.start_url.as_deref())
+            } else if method == "social" {
+                normalized(credentials.provider.as_deref()).filter(|provider| provider != "social")
+            } else {
+                None
+            }
+        }
+
+        let candidate_method = candidate
+            .auth_method
+            .as_deref()
+            .map(canonicalize_auth_method_value)
+            .unwrap_or("idc");
+        let candidate_profile = real_profile_arn(candidate.profile_arn.as_deref());
+        let candidate_email = normalized(candidate.email.as_deref());
+        let candidate_scope = identity_scope(candidate_method, candidate);
+        let candidate_refresh_hash = candidate.refresh_token.as_deref().map(sha256_hex);
+
+        self.entries.lock().iter().find_map(|entry| {
+            let existing = &entry.credentials;
+            let existing_method = existing
+                .auth_method
+                .as_deref()
+                .map(canonicalize_auth_method_value)
+                .unwrap_or("idc");
+            if existing_method != candidate_method {
+                return None;
+            }
+
+            if let (Some(left), Some(right)) = (
+                candidate_profile,
+                real_profile_arn(existing.profile_arn.as_deref()),
+            ) && left == right
+            {
+                return Some(entry.id);
+            }
+
+            let existing_refresh_hash = existing.refresh_token.as_deref().map(sha256_hex);
+            if candidate_refresh_hash.is_some() && candidate_refresh_hash == existing_refresh_hash {
+                return Some(entry.id);
+            }
+
+            let existing_email = normalized(existing.email.as_deref());
+            let existing_scope = identity_scope(existing_method, existing);
+            (candidate_email.is_some()
+                && candidate_email == existing_email
+                && candidate_scope.is_some()
+                && candidate_scope == existing_scope)
+                .then_some(entry.id)
+        })
+    }
+
     /// 添加新凭据（Admin API）
     ///
     /// # 流程
@@ -4708,6 +4783,103 @@ impl Drop for MultiTokenManager {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn find_existing_login_credential_respects_tenant_scope() {
+        let mut existing = KiroCredentials::default();
+        existing.id = Some(9);
+        existing.auth_method = Some("external_idp".to_string());
+        existing.email = Some("User@Example.com".to_string());
+        existing.issuer_url = Some("https://login.microsoftonline.com/tenant-a/v2.0".to_string());
+        existing.refresh_token = Some("existing-refresh-token-value".repeat(5));
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![existing], None, None, false).unwrap();
+
+        let mut same = KiroCredentials::default();
+        same.auth_method = Some("m365".to_string());
+        same.email = Some("user@example.com".to_string());
+        same.issuer_url = Some("https://login.microsoftonline.com/tenant-a/v2.0/".to_string());
+        same.refresh_token = Some("new-refresh-token-value".repeat(5));
+        assert_eq!(manager.find_existing_login_credential_id(&same), Some(9));
+
+        same.issuer_url = Some("https://login.microsoftonline.com/tenant-b/v2.0".to_string());
+        assert_eq!(manager.find_existing_login_credential_id(&same), None);
+    }
+
+    #[test]
+    fn find_existing_login_credential_prefers_real_profile_arn() {
+        let mut existing = KiroCredentials::default();
+        existing.id = Some(4);
+        existing.auth_method = Some("social".to_string());
+        existing.profile_arn = Some("arn:aws:codewhisperer:us-east-1:1:profile/real".to_string());
+        existing.refresh_token = Some("first-refresh-token-value".repeat(5));
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![existing], None, None, false).unwrap();
+        let mut candidate = KiroCredentials::default();
+        candidate.auth_method = Some("social".to_string());
+        candidate.profile_arn = Some("arn:aws:codewhisperer:us-east-1:1:profile/real".to_string());
+        candidate.refresh_token = Some("second-refresh-token-value".repeat(5));
+
+        assert_eq!(
+            manager.find_existing_login_credential_id(&candidate),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn find_existing_login_credential_ignores_shared_social_profile_arn() {
+        let mut existing = KiroCredentials::default();
+        existing.id = Some(2);
+        existing.auth_method = Some("social".to_string());
+        existing.profile_arn =
+            Some(crate::kiro::model::credentials::SOCIAL_PROFILE_ARN.to_string());
+        existing.email = Some("first@example.com".to_string());
+        existing.refresh_token = Some("first-social-refresh-token".repeat(5));
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![existing], None, None, false).unwrap();
+
+        let mut candidate = KiroCredentials::default();
+        candidate.auth_method = Some("social".to_string());
+        candidate.profile_arn =
+            Some(crate::kiro::model::credentials::SOCIAL_PROFILE_ARN.to_string());
+        candidate.email = Some("second@example.com".to_string());
+        candidate.refresh_token = Some("second-social-refresh-token".repeat(5));
+
+        assert_eq!(manager.find_existing_login_credential_id(&candidate), None);
+        candidate.email = Some("FIRST@example.com".to_string());
+        assert_eq!(
+            manager.find_existing_login_credential_id(&candidate),
+            None,
+            "没有真实 profile ARN 或 provider 范围时不能只按邮箱去重"
+        );
+    }
+
+    #[test]
+    fn find_existing_social_login_matches_email_only_with_same_provider() {
+        let mut existing = KiroCredentials::default();
+        existing.id = Some(6);
+        existing.auth_method = Some("social".to_string());
+        existing.provider = Some("Microsoft".to_string());
+        existing.email = Some("user@example.com".to_string());
+        existing.refresh_token = Some("first-provider-refresh-token".repeat(5));
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![existing], None, None, false).unwrap();
+
+        let mut candidate = KiroCredentials::default();
+        candidate.auth_method = Some("social".to_string());
+        candidate.provider = Some("microsoft".to_string());
+        candidate.email = Some("USER@example.com".to_string());
+        candidate.refresh_token = Some("second-provider-refresh-token".repeat(5));
+        assert_eq!(
+            manager.find_existing_login_credential_id(&candidate),
+            Some(6)
+        );
+
+        candidate.provider = Some("github".to_string());
+        assert_eq!(manager.find_existing_login_credential_id(&candidate), None);
+    }
 
     #[test]
     fn test_is_token_expired_with_expired_token() {

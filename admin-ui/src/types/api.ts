@@ -398,7 +398,7 @@ export interface StartIdcLoginResponse {
 export type PollIdcLoginResponse =
   | { status: 'pending' }
   | { status: 'continue'; nextUrl: string }
-  | { status: 'success'; credentialId: number }
+  | { status: 'success'; credentialId: number; duplicate?: boolean }
   | { status: 'expired' }
 
 // Social 登录（Portal PKCE OAuth）

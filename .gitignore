@@ -43,3 +43,7 @@ demo/
 /model_mappings.json
 # 内部任务分析文档（含生产服务器 IP 等私密信息，不公开）
 /docs/
+/batch-login-*.jsonl
+/scripts/__pycache__/
+/scripts/batch_login/__pycache__/
+/tests/batch_login/__pycache__/

@@ -24,6 +24,7 @@ AIP中转:https://apiv2.52codeflow.top/
 - [图片处理](#images)
 - [用量、缓存与日志](#usage-cache-logs)
 - [Admin UI](#admin-ui)
+- [批量企业与 Microsoft 登录](#batch-enterprise-microsoft-login)
 - [代理和 Region](#proxy-region)
 - [负载均衡与故障转移](#load-balancing-failover)
 - [在线更新和发布](#updates-release)
@@ -723,6 +724,113 @@ Admin 还提供：
 - 凭据负载均衡、代理负载均衡、普通 429 重试策略、账号级风控故障转移配置。
 - trace / usage log 保留策略。
 - 在线更新、自动更新和回退。
+
+<a id="batch-enterprise-microsoft-login"></a>
+## 批量企业与 Microsoft 登录
+
+仓库提供独立的 Python 3.11+ / Playwright 命令行工具。浏览器由 Python
+进程启动，RS 只负责创建登录会话、兑换 token、验证凭据和写入账号池；账号密码不会
+上传给 RS，也不会写入 checkpoint。账号固定串行处理，每个账号使用独立的浏览器
+Context，避免 Cookie 和登录状态串号。
+
+### 安装
+
+在仓库根目录执行：
+
+```powershell
+python -m pip install -r scripts/requirements-batch-login.txt
+python -m playwright install chromium
+```
+
+### 账号文件与自定义分隔规则
+
+默认每行格式为 `{account}----{password}`：
+
+```text
+# 空行和以 # 开头的行会被忽略
+user1@example.com----Password-1
+user2@example.com----Password----With----Separator
+```
+
+密码中的后续 `----` 会被保留。也可以通过 `--format` 指定只包含一次
+`{account}`、一次 `{password}` 和一个非空字面分隔符的模板。例如密码在前：
+
+```powershell
+--format "{password}####{account}"
+```
+
+Microsoft 模式要求账号是邮箱；重复账号按大小写不敏感规则在打开浏览器前去重。
+
+### Enterprise / AWS IAM Identity Center
+
+Admin Key 只能通过环境变量提供，不能写在命令行参数中：
+
+```powershell
+$env:KIRO_RS_ADMIN_KEY = "你的 Admin Key"
+python scripts/kiro_batch_login.py enterprise `
+  --input .\enterprise-accounts.txt `
+  --rs-url https://rs.example.com `
+  --start-url https://example.awsapps.com/start `
+  --region us-east-1 `
+  --result .\batch-enterprise.jsonl
+```
+
+### Microsoft Entra ID / Azure AD
+
+```powershell
+$env:KIRO_RS_ADMIN_KEY = "你的 Admin Key"
+python scripts/kiro_batch_login.py microsoft `
+  --input .\microsoft-accounts.txt `
+  --rs-url https://rs.example.com `
+  --result .\batch-microsoft.jsonl
+```
+
+Microsoft 登录会在同一个 BrowserContext 内依次完成 Kiro Portal descriptor 回调和
+Entra OAuth 最终回调。工具会自动填写可识别的账号、密码、继续、同意和“不保持登录”
+控件。
+
+### 通过 SSH 安全访问远程 RS
+
+远程 RS 必须使用 HTTPS。如果 RS 只监听服务器本机，可以先建立 SSH 本地转发；CLI
+只允许 loopback 地址使用明文 HTTP：
+
+```powershell
+ssh -N -L 18080:127.0.0.1:8080 user@rs-host
+```
+
+然后在另一个终端使用：
+
+```powershell
+$env:KIRO_RS_ADMIN_KEY = "你的 Admin Key"
+python scripts/kiro_batch_login.py microsoft `
+  --input .\accounts.txt `
+  --rs-url http://127.0.0.1:18080
+```
+
+### MFA、恢复与退出码
+
+默认打开可见 Chromium。检测到 MFA、Authenticator 或验证码时，工具会等待你在当前
+浏览器中人工完成；`--mfa-timeout` 控制等待秒数。只有确认账号无需人工验证时才建议
+使用 `--headless`。
+
+每个账号完成后会立即 `flush` + `fsync` 一条 JSONL checkpoint。中断后用相同
+`--result` 并增加 `--resume`：成功和重复凭据会跳过，可重试失败会重跑，明确不可重试
+的失败会保留并跳过。
+
+- `0`：全部执行项成功或已存在。
+- `1`：参数、输入、预检或启动失败。
+- `2`：批次完成，但至少一个账号失败或需要人工处理。
+- `130`：用户按 Ctrl+C；当前 RS 会话会先取消，浏览器随后关闭。
+
+### 安全说明
+
+- 输入文件含明文密码，请限制文件权限，使用后安全删除，绝对不要提交到 Git。
+- checkpoint 只记录账号哈希、掩码、状态、稳定错误码和凭据 ID，不记录密码、token、
+  OAuth code、Admin Key 或完整 callback URL；结果文件仍可能包含运维元数据，应妥善保管。
+- 工具默认不截图、不录制视频、不保存 HAR。排障时不要随意开启这些采集；如确需采集，
+  必须先脱敏并在完成后删除。
+- 日志只显示掩码账号。不要把 Admin Key、账号文件内容或浏览器地址栏回调复制到 issue、
+  聊天记录或共享终端。
 
 <a id="proxy-region"></a>
 ## 代理和 Region
