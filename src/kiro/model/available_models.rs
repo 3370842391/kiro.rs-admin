@@ -15,6 +15,8 @@ pub struct ListAvailableModelsResponse {
     #[serde(default)]
     pub models: Vec<UpstreamModel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_api_region: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_host: Option<String>,
@@ -99,6 +101,13 @@ mod tests {
         // 缺少 models 字段时回退为空数组
         let resp: ListAvailableModelsResponse = serde_json::from_str(r#"{}"#).unwrap();
         assert!(resp.models.is_empty());
+    }
+
+    #[test]
+    fn deserialize_next_token() {
+        let resp: ListAvailableModelsResponse =
+            serde_json::from_str(r#"{"models":[],"nextToken":"page / two"}"#).unwrap();
+        assert_eq!(resp.next_token.as_deref(), Some("page / two"));
     }
 
     #[test]

@@ -549,6 +549,7 @@ mod tests {
                     max_input_tokens: Some(1_000_000),
                 }),
             }],
+            next_token: None,
             resolved_api_region: None,
             resolved_host: None,
             kiro_version: None,

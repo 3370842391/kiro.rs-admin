@@ -3634,6 +3634,7 @@ impl AdminService {
 
         // 3. 上游服务错误特征：HTTP 响应错误或网络错误
         let is_upstream_error = msg.contains("获取使用额度失败") ||
+            msg.contains("ListAvailableModels") ||
             // HTTP 响应错误（来自 refresh_*_token 的错误消息）
             msg.contains("凭证已过期或无效") ||
             msg.contains("权限不足") ||
@@ -4576,6 +4577,35 @@ mod tests {
         assert_eq!(summary.unlimited_accounts, 1);
         assert_eq!(summary.saturated_accounts, 2);
         assert_eq!(summary.enabled_accounts, 4);
+    }
+
+    #[tokio::test]
+    async fn list_available_models_failures_remain_upstream_errors() {
+        use crate::model::config::TlsBackend;
+
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), Vec::new(), None, None, true).unwrap(),
+        );
+        let service = AdminService::new(
+            manager,
+            Vec::new(),
+            Arc::new(ProxyPoolManager::new(None, TlsBackend::Rustls)),
+        );
+
+        for message in [
+            "ListAvailableModels HTTP 401 Unauthorized: ",
+            "ListAvailableModels HTTP 429 Too Many Requests: ",
+            "ListAvailableModels HTTP 503 Service Unavailable: ",
+            "ListAvailableModels 协议错误: 重复 nextToken",
+        ] {
+            assert!(
+                matches!(
+                    service.classify_balance_error(anyhow::anyhow!(message), 7),
+                    AdminServiceError::UpstreamError(_)
+                ),
+                "model catalog failure must stay upstream-classified: {message}"
+            );
+        }
     }
 
     #[test]
