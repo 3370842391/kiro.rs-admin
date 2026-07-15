@@ -61,6 +61,25 @@ fn transport_read_timeout_secs(_stream_idle_timeout_secs: u64) -> Option<u64> {
     None
 }
 
+async fn await_response_headers<T, E, F>(future: F, timeout: Option<Duration>) -> anyhow::Result<T>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+    E: Into<anyhow::Error>,
+{
+    if let Some(timeout) = timeout {
+        return tokio::time::timeout(timeout, future)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "upstream response header timeout after {} ms",
+                    timeout.as_millis()
+                )
+            })?
+            .map_err(Into::into);
+    }
+    future.await.map_err(Into::into)
+}
+
 fn is_content_length_threshold_error(error: &anyhow::Error) -> bool {
     error
         .to_string()
@@ -614,7 +633,10 @@ impl KiroProvider {
                 tracing::debug!("  header {}: {}", k, v.to_str().unwrap_or("<binary>"));
             }
         }
-        match client.execute(request).await {
+        let header_timeout_secs = self.stream_idle_timeout_secs();
+        let header_timeout =
+            (header_timeout_secs > 0).then(|| Duration::from_secs(header_timeout_secs));
+        match await_response_headers(client.execute(request), header_timeout).await {
             Ok(response) => Ok(response),
             Err(error) => {
                 if let Some(sink) = sink {
@@ -753,7 +775,10 @@ impl KiroProvider {
                 .header("content-type", endpoint.content_type())
                 .header("Connection", "keep-alive");
             let request = endpoint.decorate_mcp(base, &rctx);
-            match request.send().await {
+            let header_timeout_secs = self.stream_idle_timeout_secs();
+            let header_timeout =
+                (header_timeout_secs > 0).then(|| Duration::from_secs(header_timeout_secs));
+            match await_response_headers(request.send(), header_timeout).await {
                 Ok(response) => {
                     let status = response.status();
                     if should_try_next_proxy(status) {
@@ -2065,6 +2090,25 @@ mod tests {
         assert_eq!(transport_read_timeout_secs(0), None);
         assert_eq!(transport_read_timeout_secs(120), None);
         assert_eq!(transport_read_timeout_secs(600), None);
+    }
+
+    #[tokio::test]
+    async fn response_header_watchdog_bounds_send_without_touching_body_reads() {
+        let timeout = await_response_headers(
+            std::future::pending::<Result<(), std::io::Error>>(),
+            Some(Duration::from_millis(20)),
+        )
+        .await
+        .unwrap_err();
+        assert!(timeout.to_string().contains("response header timeout"));
+
+        let ready = await_response_headers(
+            async { Ok::<_, std::io::Error>(7_u8) },
+            Some(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ready, 7);
     }
 
     fn string_header(name: &str, value: &str) -> Vec<u8> {
