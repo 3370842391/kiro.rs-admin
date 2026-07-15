@@ -846,6 +846,7 @@ where
             .then(|| {
                 if require_exact_json {
                     visible_text_from_events(&attempt.events)
+                        .and_then(|text| super::structured_output::extract_output_json(&text))
                 } else {
                     strict_json_from_events(&attempt.events)
                 }
@@ -6001,7 +6002,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn structured_output_recovery_retries_markdown_wrapped_json() {
+    async fn structured_output_normalizes_markdown_wrapped_json_without_retry() {
         let format = super::super::types::OutputFormat {
             format_type: "json_schema".into(),
             schema: serde_json::json!({
@@ -6024,10 +6025,8 @@ mod tests {
             terminal_error: None,
             attempt_failure: None,
         };
-        let mut attempts = std::collections::VecDeque::from([
-            attempt("```json\n{\"answer\":42}\n```"),
-            attempt("{\"answer\":42}"),
-        ]);
+        let mut attempts =
+            std::collections::VecDeque::from([attempt("```json\n{\"answer\":42}\n```")]);
         let mut calls = 0;
         let recovered = recover_strict_json_attempts_with_validator(
             |_| {
@@ -6040,7 +6039,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(calls, 2);
+        assert_eq!(calls, 1);
         assert_eq!(recovered.json, "{\"answer\":42}");
     }
 

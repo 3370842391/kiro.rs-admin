@@ -1,3 +1,4 @@
+use super::exact_output::extract_single_json_bounded;
 use super::types::OutputFormat;
 
 const MAX_STRUCTURED_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -35,11 +36,8 @@ pub(crate) fn validate_output_json(
             format.format_type.clone(),
         ));
     }
-    if text.len() > MAX_STRUCTURED_OUTPUT_BYTES {
-        return Err(StructuredOutputError::InvalidJson);
-    }
-
-    let value = serde_json::from_str::<serde_json::Value>(text)
+    let candidate = extract_output_json(text).ok_or(StructuredOutputError::InvalidJson)?;
+    let value = serde_json::from_str::<serde_json::Value>(&candidate)
         .map_err(|_| StructuredOutputError::InvalidJson)?;
     let mut candidate = value.clone();
     match super::tool_schema::validate_and_repair(&format.schema, &mut candidate) {
@@ -51,11 +49,25 @@ pub(crate) fn validate_output_json(
     }
 }
 
+pub(crate) fn extract_output_json(text: &str) -> Option<String> {
+    if text.len() > MAX_STRUCTURED_OUTPUT_BYTES {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+        return serde_json::to_string(&value).ok();
+    }
+    extract_single_json_bounded(
+        text,
+        MAX_STRUCTURED_OUTPUT_BYTES,
+        MAX_STRUCTURED_OUTPUT_BYTES,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use super::validate_output_json;
+    use super::{extract_single_json_bounded, validate_output_json};
     use crate::anthropic::types::OutputFormat;
 
     fn format() -> OutputFormat {
@@ -92,21 +104,56 @@ mod tests {
     }
 
     #[test]
-    fn rejects_markdown_prose_and_multiple_json_values() {
-        assert!(
+    fn accepts_markdown_fenced_json() {
+        let value =
             validate_output_json("```json\n{\"answer\":42,\"label\":\"ok\"}\n```", &format())
-                .is_err()
-        );
-        assert!(
-            validate_output_json("result: {\"answer\":42,\"label\":\"ok\"}", &format()).is_err()
-        );
+                .expect("fenced JSON should be recovered");
+        assert_eq!(value, json!({"answer": 42, "label": "ok"}));
+    }
+
+    #[test]
+    fn accepts_explanation_around_one_json_value() {
+        let value = validate_output_json(
+            "Here is the result:\n{\"answer\":42,\"label\":\"ok\"}\nThanks!",
+            &format(),
+        )
+        .expect("the unique JSON value should be recovered");
+        assert_eq!(value["answer"], 42);
+    }
+
+    #[test]
+    fn rejects_multiple_json_values_even_when_each_matches_schema() {
         assert!(
             validate_output_json(
-                "{\"answer\":42,\"label\":\"a\"} {\"answer\":43,\"label\":\"b\"}",
+                "first {\"answer\":42,\"label\":\"a\"} second {\"answer\":43,\"label\":\"b\"}",
                 &format(),
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn extracted_candidate_still_requires_the_original_schema() {
+        assert!(validate_output_json("result: {\"answer\":42}", &format()).is_err());
+        assert!(
+            validate_output_json("result: {\"answer\":\"42\",\"label\":\"ok\"}", &format(),)
+                .is_err()
+        );
+        assert!(
+            validate_output_json(
+                "result: {\"answer\":42,\"label\":\"ok\",\"unexpected\":true}",
+                &format(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn bounded_extractor_enforces_text_and_candidate_limits() {
+        let text = "prefix {\"a\":1} suffix";
+        assert!(extract_single_json_bounded(text, text.len(), 7).is_some());
+        assert!(extract_single_json_bounded(text, text.len() - 1, 7).is_none());
+        assert!(extract_single_json_bounded(text, text.len(), 6).is_none());
     }
 
     #[test]

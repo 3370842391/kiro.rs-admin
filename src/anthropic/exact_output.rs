@@ -258,7 +258,15 @@ pub(crate) fn strict_json_requested(req: &MessagesRequest) -> bool {
 }
 
 pub(crate) fn extract_single_json(text: &str) -> Option<String> {
-    if text.len() > MAX_JSON_BYTES.saturating_mul(4) {
+    extract_single_json_bounded(text, MAX_JSON_BYTES.saturating_mul(4), MAX_JSON_BYTES)
+}
+
+pub(crate) fn extract_single_json_bounded(
+    text: &str,
+    max_text_bytes: usize,
+    max_json_bytes: usize,
+) -> Option<String> {
+    if text.len() > max_text_bytes || max_json_bytes == 0 {
         return None;
     }
 
@@ -309,7 +317,7 @@ pub(crate) fn extract_single_json(text: &str) -> Option<String> {
             return None;
         };
         let candidate = &text[start..end];
-        if candidate.len() <= MAX_JSON_BYTES {
+        if candidate.len() <= max_json_bytes {
             if serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
                 values.push(minify_json_preserving_order(candidate));
                 if values.len() > 1 {
@@ -1035,6 +1043,12 @@ mod tests {
         );
         assert_eq!(extract_single_json("{\"a\":1"), None);
         assert_eq!(extract_single_json("{\"a\":1} {\"b\":2}"), None);
+    }
+
+    #[test]
+    fn exact_json_extraction_keeps_the_8kib_candidate_limit() {
+        let large = format!(r#"{{\"value\":\"{}\"}}"#, "x".repeat(8 * 1024));
+        assert!(extract_single_json(&large).is_none());
     }
 
     #[test]
