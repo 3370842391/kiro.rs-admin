@@ -22,7 +22,7 @@
 use std::io::Cursor;
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use image::{ImageFormat, ImageReader, imageops::FilterType};
+use image::{ImageError, ImageFormat, ImageReader, Limits, imageops::FilterType};
 use tracing::{debug, warn};
 
 /// 经过上游兼容性预检的图片。
@@ -45,6 +45,19 @@ pub enum ImageValidationError {
     UnsupportedFormat,
     #[error("image decode failed")]
     DecodeFailed,
+    #[error("image exceeds safe decode limits")]
+    ResourceLimit,
+}
+
+const MAX_UPSTREAM_IMAGE_DIMENSION: u32 = 8_192;
+const MAX_UPSTREAM_IMAGE_DECODE_ALLOC: u64 = 128 * 1024 * 1024;
+
+fn classify_validation_decode_error(error: ImageError) -> ImageValidationError {
+    if matches!(error, ImageError::Limits(_)) {
+        ImageValidationError::ResourceLimit
+    } else {
+        ImageValidationError::DecodeFailed
+    }
 }
 
 /// 在图片进入 Kiro 请求前校验完整 base64、magic bytes 与像素可解码性。
@@ -59,8 +72,13 @@ pub fn validate_image_for_upstream(
         .decode(data_base64)
         .map_err(|_| ImageValidationError::InvalidBase64)?;
     let actual = image::guess_format(&raw).map_err(|_| ImageValidationError::UnsupportedFormat)?;
-    let decoded = image::load_from_memory_with_format(&raw, actual)
-        .map_err(|_| ImageValidationError::DecodeFailed)?;
+    let mut reader = ImageReader::with_format(Cursor::new(raw.as_slice()), actual);
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_UPSTREAM_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_UPSTREAM_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_UPSTREAM_IMAGE_DECODE_ALLOC);
+    reader.limits(limits);
+    let decoded = reader.decode().map_err(classify_validation_decode_error)?;
 
     let supported = match actual {
         ImageFormat::Png => Some("png"),
@@ -537,6 +555,15 @@ mod tests {
         assert_eq!(validated.format, "png");
         assert_eq!(validated.data_base64, png);
         assert!(!validated.normalized);
+    }
+
+    #[test]
+    fn rejects_images_above_the_safe_decode_dimensions() {
+        let oversized = make_png(9_000, 1);
+        assert_eq!(
+            validate_image_for_upstream("png", &oversized).unwrap_err(),
+            ImageValidationError::ResourceLimit
+        );
     }
 
     #[test]
