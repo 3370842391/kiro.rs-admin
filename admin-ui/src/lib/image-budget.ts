@@ -4,9 +4,19 @@ export function validateImageBudget(value: ImageBudgetConfig): string | null {
   if (
     !Number.isInteger(value.totalBase64BudgetBytes) ||
     value.totalBase64BudgetBytes < 256 * 1024 ||
-    value.totalBase64BudgetBytes > 8 * 1024 * 1024
+    value.totalBase64BudgetBytes > 32 * 1024 * 1024
   ) {
-    return '图片总预算必须在 256 KiB–8 MiB 之间'
+    return '图片软压缩目标必须在 256 KiB–32 MiB 之间'
+  }
+  if (
+    !Number.isInteger(value.hardBase64LimitBytes) ||
+    value.hardBase64LimitBytes < 256 * 1024 ||
+    value.hardBase64LimitBytes > 32 * 1024 * 1024
+  ) {
+    return '图片硬上限必须在 256 KiB–32 MiB 之间'
+  }
+  if (value.totalBase64BudgetBytes > value.hardBase64LimitBytes) {
+    return '图片软压缩目标不能大于硬上限'
   }
   if (
     !Number.isInteger(value.historyMaxDimension) ||

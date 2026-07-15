@@ -2237,6 +2237,10 @@ pub async fn post_messages(
                 ConversionError::InvalidToolChoice(reason) => {
                     ("invalid_request_error", format!("工具选择无效: {}", reason))
                 }
+                ConversionError::InvalidImage { location, source } => (
+                    "invalid_request_error",
+                    format!("图片 {location} 无效: {source}"),
+                ),
             };
             tracing::warn!("请求转换失败: {}", e);
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
@@ -4346,6 +4350,10 @@ pub async fn post_messages_cc(
                 ConversionError::InvalidToolChoice(reason) => {
                     ("invalid_request_error", format!("工具选择无效: {}", reason))
                 }
+                ConversionError::InvalidImage { location, source } => (
+                    "invalid_request_error",
+                    format!("图片 {location} 无效: {source}"),
+                ),
             };
             tracing::warn!("请求转换失败: {}", e);
             hook.record(0, 0, 0, 0, 0, 0.0, "error");

@@ -927,6 +927,7 @@ export interface UpdateGroupRequest {
 export interface ImageBudgetConfig {
   enabled: boolean
   totalBase64BudgetBytes: number
+  hardBase64LimitBytes: number
   historyMaxDimension: number
   historyJpegQuality: number
   retryHistoryMaxDimension: number

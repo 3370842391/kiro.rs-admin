@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::image_resize::{ImageValidationError, validate_image_for_upstream};
 use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
     HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
@@ -707,6 +708,10 @@ pub enum ConversionError {
     UnsupportedToolMapping(String),
     InvalidToolChoice(String),
     InvalidToolHistory(String),
+    InvalidImage {
+        location: String,
+        source: ImageValidationError,
+    },
 }
 
 impl std::fmt::Display for ConversionError {
@@ -722,6 +727,9 @@ impl std::fmt::Display for ConversionError {
             }
             ConversionError::InvalidToolChoice(reason) => {
                 write!(f, "工具选择无效: {}", reason)
+            }
+            ConversionError::InvalidImage { location, source } => {
+                write!(f, "图片 {location} 无效: {source}")
             }
         }
     }
@@ -936,12 +944,13 @@ pub fn convert_request_with_mode(
     let current_message = CurrentMessage::new(user_input);
 
     // 13. 构建 ConversationState
-    let conversation_state = ConversationState::new(conversation_id)
+    let mut conversation_state = ConversationState::new(conversation_id)
         .with_agent_continuation_id(agent_continuation_id)
         .with_agent_task_type("vibe")
         .with_chat_trigger_type(chat_trigger_type)
         .with_current_message(current_message)
         .with_history(history);
+    validate_conversation_images(&mut conversation_state)?;
 
     if !tool_name_map.is_empty() {
         tracing::info!("工具名称映射: {} 个超长名称已缩短", tool_name_map.len());
@@ -963,6 +972,58 @@ pub fn convert_request_with_mode(
         additional_model_request_fields,
         tool_choice_policy,
     })
+}
+
+fn validate_conversation_images(
+    conversation_state: &mut ConversationState,
+) -> Result<(), ConversionError> {
+    for (message_index, message) in conversation_state.history.iter_mut().enumerate() {
+        let Message::User(user) = message else {
+            continue;
+        };
+        for (image_index, image) in user.user_input_message.images.iter_mut().enumerate() {
+            validate_kiro_image(
+                image,
+                format!("history[{message_index}].images[{image_index}]"),
+            )?;
+        }
+    }
+    for (image_index, image) in conversation_state
+        .current_message
+        .user_input_message
+        .images
+        .iter_mut()
+        .enumerate()
+    {
+        validate_kiro_image(image, format!("current_message.images[{image_index}]"))?;
+    }
+    Ok(())
+}
+
+fn validate_kiro_image(image: &mut KiroImage, location: String) -> Result<(), ConversionError> {
+    let declared = image.format.clone();
+    let original_base64_bytes = image.source.bytes.len();
+    let validated =
+        validate_image_for_upstream(&declared, &image.source.bytes).map_err(|source| {
+            ConversionError::InvalidImage {
+                location: location.clone(),
+                source,
+            }
+        })?;
+    if declared != validated.format || validated.normalized {
+        tracing::info!(
+            image_location = %location,
+            declared_format = %declared,
+            actual_format = %validated.format,
+            normalized = validated.normalized,
+            original_base64_bytes,
+            final_base64_bytes = validated.data_base64.len(),
+            "图片格式预检已修正上游载荷"
+        );
+    }
+    image.format = validated.format;
+    image.source.bytes = validated.data_base64;
+    Ok(())
 }
 
 fn build_tool_contracts(
@@ -1092,9 +1153,15 @@ fn get_image_format(media_type: &str) -> Option<String> {
 /// budgeting runs after the complete Kiro request has been assembled, preventing double JPEG
 /// encoding and ensuring the current turn is never modified.
 fn extract_kiro_image(source: &ImageSource, images: &mut Vec<KiroImage>) {
-    let Some(format) = get_image_format(&source.media_type) else {
-        return;
-    };
+    let format = get_image_format(&source.media_type).unwrap_or_else(|| {
+        source
+            .media_type
+            .rsplit_once('/')
+            .map(|(_, subtype)| subtype)
+            .filter(|subtype| !subtype.is_empty())
+            .unwrap_or("unknown")
+            .to_ascii_lowercase()
+    });
     images.push(KiroImage::from_base64(format, source.data.clone()));
 }
 
@@ -4712,7 +4779,7 @@ mod tests {
     }
 
     // base64 of a 1x1 PNG (valid PNG header, so resize just passes it through)
-    const TINY_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+    const TINY_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
 
     #[test]
     fn test_repeated_history_images_are_preserved() {
@@ -4815,6 +4882,95 @@ mod tests {
     }
 
     #[test]
+    fn test_converter_corrects_declared_format_from_magic_bytes() {
+        use super::super::types::Message as AnthropicMessage;
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+        use image::{ImageFormat, Rgb, RgbImage};
+        use std::io::Cursor;
+
+        let mut bytes = Vec::new();
+        RgbImage::from_pixel(4, 4, Rgb([1, 2, 3]))
+            .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Jpeg)
+            .unwrap();
+        let jpeg = BASE64.encode(bytes);
+        let mut req = minimal_request_with_output_config("claude-sonnet-4.5");
+        req.output_config = None;
+        req.messages = vec![AnthropicMessage {
+            role: "user".to_string(),
+            content: serde_json::json!([{
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": jpeg}
+            }]),
+        }];
+
+        let converted = convert_request(&req).unwrap();
+        let image = &converted
+            .conversation_state
+            .current_message
+            .user_input_message
+            .images[0];
+        assert_eq!(image.format, "jpeg");
+        assert_eq!(image.source.bytes, jpeg);
+    }
+
+    #[test]
+    fn test_converter_uses_magic_bytes_for_nonstandard_declared_media_type() {
+        use super::super::types::Message as AnthropicMessage;
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+        use image::{ImageFormat, Rgb, RgbImage};
+        use std::io::Cursor;
+
+        let mut bytes = Vec::new();
+        RgbImage::from_pixel(4, 4, Rgb([4, 5, 6]))
+            .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
+            .unwrap();
+        let png = BASE64.encode(bytes);
+        let mut req = minimal_request_with_output_config("claude-sonnet-4.5");
+        req.output_config = None;
+        req.messages = vec![AnthropicMessage {
+            role: "user".to_string(),
+            content: serde_json::json!([{
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/x-special", "data": png}
+            }]),
+        }];
+
+        let converted = convert_request(&req).unwrap();
+        let images = &converted
+            .conversation_state
+            .current_message
+            .user_input_message
+            .images;
+        assert_eq!(
+            images.len(),
+            1,
+            "magic-valid images must not be silently dropped"
+        );
+        assert_eq!(images[0].format, "png");
+        assert_eq!(images[0].source.bytes, png);
+    }
+
+    #[test]
+    fn test_converter_rejects_corrupt_current_image_with_safe_location() {
+        use super::super::types::Message as AnthropicMessage;
+        let mut req = minimal_request_with_output_config("claude-sonnet-4.5");
+        req.output_config = None;
+        req.messages = vec![AnthropicMessage {
+            role: "user".to_string(),
+            content: serde_json::json!([{
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": "not-base64"}
+            }]),
+        }];
+
+        assert!(matches!(
+            convert_request(&req),
+            Err(ConversionError::InvalidImage { location, source: crate::image_resize::ImageValidationError::InvalidBase64 })
+                if location == "current_message.images[0]"
+        ));
+    }
+
+    #[test]
     fn test_tool_result_image_lifts_to_top_level() {
         use super::super::types::Message as AnthropicMessage;
 
@@ -4873,6 +5029,51 @@ mod tests {
             Some("here is the screen"),
             "tool_result content should keep the text and contain no base64"
         );
+    }
+
+    #[test]
+    fn test_tool_result_nested_corrupt_image_uses_same_validation() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            force_web_search_loop: false,
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("take a screenshot"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([{
+                        "type": "tool_use", "id": "tool-1", "name": "screenshot", "input": {}
+                    }]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([{
+                        "type": "tool_result", "tool_use_id": "tool-1", "content": [{
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": "image/png", "data": "%%%"}
+                        }]
+                    }]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        assert!(matches!(
+            convert_request(&req),
+            Err(ConversionError::InvalidImage { location, source: crate::image_resize::ImageValidationError::InvalidBase64 })
+                if location == "current_message.images[0]"
+        ));
     }
 
     #[test]

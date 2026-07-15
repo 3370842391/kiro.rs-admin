@@ -268,6 +268,7 @@ impl KiroProvider {
         let configured_image_budget = ImageBudgetPolicy {
             enabled: token_manager.config().image_budget_enabled,
             total_base64_budget_bytes: token_manager.config().image_total_base64_budget_bytes,
+            hard_base64_limit_bytes: token_manager.config().image_hard_base64_limit_bytes,
             history_max_dimension: token_manager.config().image_history_max_dimension,
             history_jpeg_quality: token_manager.config().image_history_jpeg_quality,
             retry_history_max_dimension: token_manager.config().image_retry_history_max_dimension,

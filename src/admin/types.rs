@@ -729,6 +729,7 @@ pub struct SetCacheHitRateRequest {
 pub struct ImageBudgetResponse {
     pub enabled: bool,
     pub total_base64_budget_bytes: usize,
+    pub hard_base64_limit_bytes: usize,
     pub history_max_dimension: u32,
     pub history_jpeg_quality: u8,
     pub retry_history_max_dimension: u32,
@@ -740,10 +741,16 @@ pub struct ImageBudgetResponse {
 pub struct SetImageBudgetRequest {
     pub enabled: bool,
     pub total_base64_budget_bytes: usize,
+    #[serde(default = "default_image_hard_base64_limit_bytes")]
+    pub hard_base64_limit_bytes: usize,
     pub history_max_dimension: u32,
     pub history_jpeg_quality: u8,
     pub retry_history_max_dimension: u32,
     pub retry_history_jpeg_quality: u8,
+}
+
+fn default_image_hard_base64_limit_bytes() -> usize {
+    8 * 1024 * 1024
 }
 
 #[derive(Debug, Serialize)]
@@ -1774,6 +1781,47 @@ mod tests {
         assert!(legacy["error"].get("code").is_none());
         assert!(legacy["error"].get("stage").is_none());
         assert!(legacy["error"].get("retryable").is_none());
+    }
+
+    #[test]
+    fn image_budget_admin_contract_uses_camel_case_hard_limit() {
+        let request: SetImageBudgetRequest = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "totalBase64BudgetBytes": 819200,
+            "hardBase64LimitBytes": 8388608,
+            "historyMaxDimension": 1280,
+            "historyJpegQuality": 72,
+            "retryHistoryMaxDimension": 960,
+            "retryHistoryJpegQuality": 60
+        }))
+        .unwrap();
+        assert_eq!(request.hard_base64_limit_bytes, 8 * 1024 * 1024);
+
+        let response = serde_json::to_value(ImageBudgetResponse {
+            enabled: request.enabled,
+            total_base64_budget_bytes: request.total_base64_budget_bytes,
+            hard_base64_limit_bytes: request.hard_base64_limit_bytes,
+            history_max_dimension: request.history_max_dimension,
+            history_jpeg_quality: request.history_jpeg_quality,
+            retry_history_max_dimension: request.retry_history_max_dimension,
+            retry_history_jpeg_quality: request.retry_history_jpeg_quality,
+        })
+        .unwrap();
+        assert_eq!(response["hardBase64LimitBytes"], 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn image_budget_admin_contract_defaults_hard_limit_for_older_clients() {
+        let request: SetImageBudgetRequest = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "totalBase64BudgetBytes": 819200,
+            "historyMaxDimension": 1280,
+            "historyJpegQuality": 72,
+            "retryHistoryMaxDimension": 960,
+            "retryHistoryJpegQuality": 60
+        }))
+        .unwrap();
+        assert_eq!(request.hard_base64_limit_bytes, 8 * 1024 * 1024);
     }
 
     #[test]

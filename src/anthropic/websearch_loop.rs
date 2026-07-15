@@ -256,6 +256,10 @@ async fn run_round(
                     "invalid_request_error",
                     format!("invalid tool choice: {}", reason),
                 ),
+                ConversionError::InvalidImage { location, source } => (
+                    "invalid_request_error",
+                    format!("invalid image at {location}: {source}"),
+                ),
             };
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
             return Err(

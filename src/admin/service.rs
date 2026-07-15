@@ -127,6 +127,7 @@ fn build_image_budget_response(policy: ImageBudgetPolicy) -> ImageBudgetResponse
     ImageBudgetResponse {
         enabled: policy.enabled,
         total_base64_budget_bytes: policy.total_base64_budget_bytes,
+        hard_base64_limit_bytes: policy.hard_base64_limit_bytes,
         history_max_dimension: policy.history_max_dimension,
         history_jpeg_quality: policy.history_jpeg_quality,
         retry_history_max_dimension: policy.retry_history_max_dimension,
@@ -2897,6 +2898,7 @@ impl AdminService {
         let policy = ImageBudgetPolicy {
             enabled: req.enabled,
             total_base64_budget_bytes: req.total_base64_budget_bytes,
+            hard_base64_limit_bytes: req.hard_base64_limit_bytes,
             history_max_dimension: req.history_max_dimension,
             history_jpeg_quality: req.history_jpeg_quality,
             retry_history_max_dimension: req.retry_history_max_dimension,
@@ -2912,6 +2914,7 @@ impl AdminService {
             .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
         config.image_budget_enabled = policy.enabled;
         config.image_total_base64_budget_bytes = policy.total_base64_budget_bytes;
+        config.image_hard_base64_limit_bytes = policy.hard_base64_limit_bytes;
         config.image_history_max_dimension = policy.history_max_dimension;
         config.image_history_jpeg_quality = policy.history_jpeg_quality;
         config.image_retry_history_max_dimension = policy.retry_history_max_dimension;
