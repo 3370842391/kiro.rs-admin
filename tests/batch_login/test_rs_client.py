@@ -82,6 +82,124 @@ class CallbackParserTests(unittest.TestCase):
 
 
 class RsClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_side_effecting_post_does_not_retry_ambiguous_network_failure(self):
+        calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            raise httpx.ReadError("response lost after submit", request=request)
+
+        async with RsClient(
+            "https://rs.example",
+            "key",
+            transport=httpx.MockTransport(handler),
+            retry_delays=(0, 0),
+        ) as client:
+            with self.assertRaises(RsApiError) as raised:
+                await client.start_social(email="user@example.com")
+
+        self.assertEqual(1, calls)
+        self.assertFalse(raised.exception.retryable)
+
+    async def test_retry_policy_honors_structured_retryable(self):
+        calls = 0
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            return httpx.Response(
+                500,
+                json={"error": {"code": "terminal", "retryable": False}},
+            )
+
+        async with RsClient(
+            "https://rs.example",
+            "key",
+            transport=httpx.MockTransport(handler),
+            retry_delays=(0, 0),
+        ) as client:
+            with self.assertRaises(RsApiError):
+                await client.preflight()
+
+        self.assertEqual(1, calls)
+
+    async def test_structured_retryable_response_can_retry_post(self):
+        calls = 0
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return httpx.Response(
+                    429,
+                    json={"error": {"code": "busy", "retryable": True}},
+                )
+            return httpx.Response(200, json={"sessionId": "created"})
+
+        async with RsClient(
+            "https://rs.example",
+            "key",
+            transport=httpx.MockTransport(handler),
+            retry_delays=(0, 0),
+        ) as client:
+            result = await client.start_social(email="user@example.com")
+
+        self.assertEqual("created", result["sessionId"])
+        self.assertEqual(2, calls)
+
+    async def test_rejects_redirect_and_non_object_success_responses(self):
+        replies = iter(
+            [
+                httpx.Response(302, headers={"location": "/login"}),
+                httpx.Response(200, content=b""),
+                httpx.Response(200, text="<html>not json</html>"),
+                httpx.Response(200, json=None),
+                httpx.Response(200, json=["not", "an", "object"]),
+            ]
+        )
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return next(replies)
+
+        async with RsClient(
+            "https://rs.example",
+            "key",
+            transport=httpx.MockTransport(handler),
+            retry_delays=(),
+        ) as client:
+            for _ in range(5):
+                with self.assertRaises(RsApiError) as raised:
+                    await client._request("GET", "/invalid")
+                self.assertEqual("invalid_rs_response", raised.exception.code)
+
+    async def test_server_error_message_cannot_echo_sensitive_values(self):
+        secret = "oauth-secret-code"
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "code": "invalid_code",
+                        "stage": "social_callback",
+                        "message": f"authorization code {secret} rejected",
+                    }
+                },
+            )
+
+        async with RsClient(
+            "https://rs.example",
+            "admin-secret",
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            with self.assertRaises(RsApiError) as raised:
+                await client._request("POST", "/callback", {"code": secret})
+
+        self.assertNotIn(secret, str(raised.exception))
+        self.assertNotIn(secret, raised.exception.message)
+        self.assertNotIn("admin-secret", str(raised.exception))
+
     async def test_structured_error_fields_are_normalized(self):
         def handler(_request: httpx.Request) -> httpx.Response:
             return httpx.Response(
@@ -110,7 +228,7 @@ class RsClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("social_callback", error.stage)
         self.assertFalse(error.retryable)
         self.assertEqual(400, error.status_code)
-        self.assertEqual("state did not match", error.message)
+        self.assertEqual("RS 请求失败", error.message)
         self.assertIn("state_mismatch", str(error))
         self.assertIn("social_callback", str(error))
         self.assertNotIn("admin-secret", str(error))
@@ -193,7 +311,7 @@ class RsClientTests(unittest.IsolatedAsyncioTestCase):
             retry_delays=(0, 0),
         ) as client:
             with self.assertRaises(RsApiError) as raised:
-                await client._request("POST", "/network", {"callback": "secret-callback"})
+                await client._request("GET", "/network", {"callback": "secret-callback"})
 
         error = raised.exception
         self.assertEqual(3, calls)
@@ -268,6 +386,44 @@ class RsClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("login_option", callback_payload)
         self.assertNotIn(admin_key, repr(callback_payload))
         self.assertNotIn(callback_url, repr(callback_payload))
+
+    async def test_base_url_validation_and_prefix_normalization(self):
+        invalid = [
+            "ftp://rs.example",
+            "https://user:pass@rs.example",
+            "https://rs.example?tenant=a",
+            "https://rs.example#fragment",
+            "rs.example",
+        ]
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                RsClient(value, "key")
+
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json={})
+
+        async with RsClient(
+            "https://rs.example/prefix/",
+            "key",
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            await client.preflight()
+        self.assertEqual("/prefix/api/admin/credentials", requests[0].url.path)
+
+    async def test_session_id_cannot_escape_path_segment(self):
+        async with RsClient(
+            "https://rs.example",
+            "key",
+            transport=httpx.MockTransport(
+                lambda _request: httpx.Response(200, json={})
+            ),
+        ) as client:
+            for session_id in ("../credentials", "id?dump=1", "id#fragment", ""):
+                with self.subTest(session_id=session_id), self.assertRaises(ValueError):
+                    await client.cancel_social(session_id)
 
 
 if __name__ == "__main__":

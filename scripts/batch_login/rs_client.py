@@ -1,11 +1,45 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass
 from typing import Any, Iterable
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 import httpx
+
+
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _normalize_base_url(raw_url: str) -> str:
+    try:
+        parts = urlsplit(raw_url.strip())
+        _ = parts.port
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError("无效的 RS URL") from error
+    if (
+        parts.scheme not in {"http", "https"}
+        or not parts.hostname
+        or parts.username is not None
+        or parts.password is not None
+        or parts.query
+        or parts.fragment
+    ):
+        raise ValueError("RS URL 必须是无凭据、query 和 fragment 的 HTTP(S) 地址")
+
+    path = "/" + "/".join(segment for segment in parts.path.split("/") if segment)
+    if path == "/":
+        path = ""
+    if not path.endswith("/api/admin"):
+        path += "/api/admin"
+    return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+
+
+def _session_path(session_id: str) -> str:
+    if not isinstance(session_id, str) or not SESSION_ID_RE.fullmatch(session_id):
+        raise ValueError("无效的登录会话 ID")
+    return session_id
 
 
 @dataclass(slots=True)
@@ -67,10 +101,7 @@ class RsClient:
         transport: httpx.AsyncBaseTransport | None = None,
         retry_delays: Iterable[float] = (0.5, 1.0),
     ):
-        normalized_base = base_url.strip().rstrip("/")
-        if not normalized_base.endswith("/api/admin"):
-            normalized_base += "/api/admin"
-        self.base_url = normalized_base
+        self.base_url = _normalize_base_url(base_url)
         self.retry_delays = tuple(retry_delays)[:2]
         self.client = httpx.AsyncClient(
             headers={"x-api-key": admin_key, "accept": "application/json"},
@@ -89,7 +120,11 @@ class RsClient:
         method: str,
         path: str,
         json: dict[str, Any] | None = None,
+        *,
+        retry_safe: bool | None = None,
     ) -> dict[str, Any]:
+        if retry_safe is None:
+            retry_safe = method.upper() in {"GET", "HEAD", "OPTIONS", "DELETE"}
         for attempt in range(len(self.retry_delays) + 1):
             try:
                 response = await self.client.request(
@@ -98,23 +133,48 @@ class RsClient:
                     json=json,
                 )
             except httpx.RequestError as error:
-                if attempt < len(self.retry_delays):
+                if retry_safe and attempt < len(self.retry_delays):
                     await asyncio.sleep(self.retry_delays[attempt])
                     continue
                 raise RsApiError(
                     code="network_error",
                     stage="rs_request",
-                    retryable=True,
+                    retryable=retry_safe,
                     status_code=0,
-                    message=str(error),
+                    message="RS 网络请求失败",
                 ) from error
 
-            if response.status_code < 400:
-                return response.json() if response.content else {}
+            if 200 <= response.status_code < 300:
+                if response.status_code == 204:
+                    return {}
+                try:
+                    response_body = response.json()
+                except ValueError as error:
+                    raise RsApiError(
+                        "invalid_rs_response",
+                        "rs_response",
+                        False,
+                        response.status_code,
+                        "RS 响应格式无效",
+                    ) from error
+                if not isinstance(response_body, dict):
+                    raise RsApiError(
+                        "invalid_rs_response",
+                        "rs_response",
+                        False,
+                        response.status_code,
+                        "RS 响应格式无效",
+                    )
+                return response_body
 
-            if response.status_code >= 500 and attempt < len(self.retry_delays):
-                await asyncio.sleep(self.retry_delays[attempt])
-                continue
+            if 300 <= response.status_code < 400:
+                raise RsApiError(
+                    "invalid_rs_response",
+                    "rs_response",
+                    False,
+                    response.status_code,
+                    "RS 响应格式无效",
+                )
 
             try:
                 response_body = response.json()
@@ -123,6 +183,20 @@ class RsClient:
             error_body = response_body.get("error", {}) if isinstance(response_body, dict) else {}
             if not isinstance(error_body, dict):
                 error_body = {}
+
+            raw_retryable = error_body.get("retryable")
+            declared_retryable = raw_retryable if isinstance(raw_retryable, bool) else None
+            should_retry = (
+                declared_retryable is True
+                or (
+                    declared_retryable is None
+                    and retry_safe
+                    and response.status_code >= 500
+                )
+            )
+            if should_retry and attempt < len(self.retry_delays):
+                await asyncio.sleep(self.retry_delays[attempt])
+                continue
 
             code = error_body.get("code")
             if not code:
@@ -133,18 +207,16 @@ class RsClient:
                 else:
                     code = "rs_internal_error"
 
-            message = error_body.get("message")
-            if not isinstance(message, str) or not message:
-                message = f"RS HTTP {response.status_code}"
-
             raise RsApiError(
                 code=str(code),
                 stage=str(error_body.get("stage") or "rs_request"),
-                retryable=bool(
-                    error_body.get("retryable", response.status_code >= 500)
+                retryable=(
+                    declared_retryable
+                    if declared_retryable is not None
+                    else retry_safe and response.status_code >= 500
                 ),
                 status_code=response.status_code,
-                message=message,
+                message="RS 请求失败",
             )
 
         raise AssertionError("unreachable")
@@ -160,7 +232,11 @@ class RsClient:
         )
 
     async def poll_idc(self, session_id: str) -> dict[str, Any]:
-        return await self._request("POST", f"/auth/idc/poll/{session_id}")
+        return await self._request(
+            "POST",
+            f"/auth/idc/poll/{_session_path(session_id)}",
+            retry_safe=True,
+        )
 
     async def start_social(self, *, email: str) -> dict[str, Any]:
         return await self._request("POST", "/auth/social/start", {"email": email})
@@ -169,12 +245,12 @@ class RsClient:
         callback = parse_callback_url(callback_url)
         return await self._request(
             "POST",
-            f"/auth/social/complete/{session_id}",
+            f"/auth/social/complete/{_session_path(session_id)}",
             callback,
         )
 
     async def cancel_idc(self, session_id: str) -> dict[str, Any]:
-        return await self._request("DELETE", f"/auth/idc/{session_id}")
+        return await self._request("DELETE", f"/auth/idc/{_session_path(session_id)}")
 
     async def cancel_social(self, session_id: str) -> dict[str, Any]:
-        return await self._request("DELETE", f"/auth/social/{session_id}")
+        return await self._request("DELETE", f"/auth/social/{_session_path(session_id)}")
