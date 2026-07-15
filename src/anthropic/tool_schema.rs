@@ -34,6 +34,8 @@ const MAX_SAFE_INPUT_KEY_CHARS: usize = 128;
 const MAX_SAFE_VIOLATIONS: usize = 32;
 const MAX_SAFE_VIOLATION_CHARS: usize = 256;
 const MAX_TOOL_DESCRIPTION_CHARS: usize = 10_000;
+const MAX_SCHEMA_PATTERN_BYTES: usize = 4 * 1024;
+const MAX_SCHEMA_REGEX_SIZE_BYTES: usize = 512 * 1024;
 
 /// 工具 Schema 失败的安全副本。
 ///
@@ -520,8 +522,13 @@ fn validate_string_constraints(
     if let Some(pattern) = schema.get("pattern") {
         match pattern
             .as_str()
-            .and_then(|pattern| regex::Regex::new(pattern).ok())
-        {
+            .filter(|pattern| pattern.len() <= MAX_SCHEMA_PATTERN_BYTES)
+            .and_then(|pattern| {
+                regex::RegexBuilder::new(pattern)
+                    .size_limit(MAX_SCHEMA_REGEX_SIZE_BYTES)
+                    .build()
+                    .ok()
+            }) {
             Some(regex) if !regex.is_match(value) => {
                 push_constraint_violation(violations, path, "pattern");
             }
@@ -1025,6 +1032,23 @@ mod tests {
         assert!(rendered.contains("minLength"));
         assert!(rendered.contains("pattern"));
         assert!(rendered.contains("minItems"));
+    }
+
+    #[test]
+    fn oversized_pattern_fails_closed_before_regex_compilation() {
+        let schema = serde_json::json!({
+            "type": "string",
+            "pattern": "a{0}".repeat(1_025)
+        });
+        let mut input = serde_json::json!("");
+
+        assert!(matches!(
+            validate_and_repair(&schema, &mut input),
+            ToolInputOutcome::Invalid { violations }
+                if violations.iter().any(|violation| {
+                    display_violation(violation).contains("pattern")
+                })
+        ));
     }
 
     #[test]
