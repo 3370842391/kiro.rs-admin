@@ -160,6 +160,8 @@ Microsoft 模式在本地实现 Kiro Portal PKCE 状态机：
 mode + accountHash + startUrl/issuerUrl
 ```
 
+企业模式在开始前已知 `startUrl`，因此使用规范化后的 Start URL。Microsoft 模式的 issuer 只有完成第一段 Portal 回调后才能获知，登录前恢复检查使用固定逻辑作用域 `microsoft`；完整凭据文件成功落盘后的去重仍使用实际 `issuerUrl`。这样无需为了判断是否需要登录而提前启动一次登录流程。
+
 记录字段包括批次 ID、原始行号、账号哈希、账号掩码、模式、状态、阶段、时间、错误码、是否可重试和导入结果。不得包含密码或任何 token。
 
 恢复时：
