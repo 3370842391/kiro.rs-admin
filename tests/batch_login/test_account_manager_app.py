@@ -31,10 +31,13 @@ class FakeVar:
 
 
 class FakeTree:
-    def __init__(self, selected=(), row="", column="#2"):
+    def __init__(self, selected=(), row="", column="#2", rows=None):
         self.selected = tuple(str(item) for item in selected)
         self.row = str(row) if row else ""
         self.column = column
+        self.rows = tuple(
+            str(item) for item in (rows if rows is not None else selected)
+        )
         self.values = {}
 
     def selection(self):
@@ -47,7 +50,7 @@ class FakeTree:
         return self.column
 
     def get_children(self):
-        return self.selected
+        return self.rows
 
     def set(self, item, column, value):
         self.values[(str(item), column)] = value
@@ -88,7 +91,6 @@ class AccountManagerAppTests(unittest.TestCase):
     def test_main_table_contains_management_columns(self):
         self.assertEqual(
             (
-                "checked",
                 "account",
                 "password",
                 "start_url",
@@ -207,7 +209,7 @@ class AccountManagerAppTests(unittest.TestCase):
         self.assertEqual({11, 12, 13}, select_range_ids(rows, "13", "11"))
         self.assertEqual(set(), select_range_ids(rows, "missing", "11"))
 
-    def test_tree_focus_does_not_discard_checked_accounts(self):
+    def test_tree_focus_does_not_change_selection_before_double_click(self):
         app = object.__new__(AccountManagerApp)
         app.tree = FakeTree(selected=(2,))
         app.service = FakeSelectionService(selected=(1, 2))
@@ -219,33 +221,86 @@ class AccountManagerAppTests(unittest.TestCase):
         self.assertEqual({1, 2}, app.service.selected_ids)
         self.assertEqual("已选择 2 个账号", app.selected_count_var.get())
 
-    def test_double_click_adds_row_without_clearing_existing_checks(self):
+    def test_plain_double_click_selects_only_target_and_sets_anchor(self):
         app = object.__new__(AccountManagerApp)
-        app.tree = FakeTree(selected=(1,), row=2)
-        app.service = FakeSelectionService(selected=(1,))
+        app.tree = FakeTree(selected=(1, 2), row=2, rows=(1, 2, 3, 4))
+        app.service = FakeSelectionService(selected=(1, 2))
+        app.selection_anchor = "1"
         refreshed = []
         app.refresh = lambda: refreshed.append(True)
 
-        result = app._tree_double_click(type("Event", (), {"y": 10})())
+        result = app._tree_double_click(
+            type("Event", (), {"y": 10, "state": 0})()
+        )
 
         self.assertEqual("break", result)
-        self.assertEqual({1, 2}, app.service.selected_ids)
+        self.assertEqual({2}, app.service.selected_ids)
+        self.assertEqual("2", app.selection_anchor)
         self.assertEqual([True], refreshed)
 
-    def test_double_click_on_checked_row_removes_only_that_row(self):
+    def test_ctrl_double_click_toggles_only_target(self):
         app = object.__new__(AccountManagerApp)
-        app.tree = FakeTree(selected=(1, 2), row=2)
-        app.service = FakeSelectionService(selected=(1, 2))
+        app.tree = FakeTree(selected=(1,), row=2, rows=(1, 2, 3, 4))
+        app.service = FakeSelectionService(selected=(1,))
+        app.selection_anchor = "1"
         app.refresh = lambda: None
 
-        app._tree_double_click(type("Event", (), {"y": 10})())
+        app._tree_double_click(
+            type(
+                "Event",
+                (),
+                {"y": 10, "state": AccountManagerApp.CONTROL_MASK},
+            )()
+        )
 
-        self.assertEqual({1}, app.service.selected_ids)
+        self.assertEqual({1, 2}, app.service.selected_ids)
+        self.assertEqual("2", app.selection_anchor)
 
-    def test_checkbox_click_stops_native_selection_from_readding_row(self):
+    def test_shift_double_click_selects_contiguous_anchor_range(self):
         app = object.__new__(AccountManagerApp)
-        app.tree = FakeTree(selected=(2,), row=2, column="#1")
+        app.tree = FakeTree(selected=(2,), row=4, rows=(1, 2, 3, 4, 5))
         app.service = FakeSelectionService(selected=(2,))
+        app.selection_anchor = "2"
+        app.refresh = lambda: None
+
+        app._tree_double_click(
+            type(
+                "Event",
+                (),
+                {"y": 10, "state": AccountManagerApp.SHIFT_MASK},
+            )()
+        )
+
+        self.assertEqual({2, 3, 4}, app.service.selected_ids)
+        self.assertEqual("2", app.selection_anchor)
+
+    def test_ctrl_shift_double_click_adds_range_to_existing_selection(self):
+        app = object.__new__(AccountManagerApp)
+        app.tree = FakeTree(selected=(1, 2), row=4, rows=(1, 2, 3, 4, 5))
+        app.service = FakeSelectionService(selected=(1, 2))
+        app.selection_anchor = "2"
+        app.refresh = lambda: None
+
+        app._tree_double_click(
+            type(
+                "Event",
+                (),
+                {
+                    "y": 10,
+                    "state": (
+                        AccountManagerApp.CONTROL_MASK
+                        | AccountManagerApp.SHIFT_MASK
+                    ),
+                },
+            )()
+        )
+
+        self.assertEqual({1, 2, 3, 4}, app.service.selected_ids)
+
+    def test_single_click_does_not_select_until_double_click(self):
+        app = object.__new__(AccountManagerApp)
+        app.tree = FakeTree(selected=(), row=2, column="#1", rows=(1, 2))
+        app.service = FakeSelectionService(selected=())
         app.drag_anchor = ""
         refreshed = []
         app.refresh = lambda: refreshed.append(True)
@@ -255,7 +310,7 @@ class AccountManagerAppTests(unittest.TestCase):
 
         self.assertEqual("break", result)
         self.assertEqual(set(), app.service.selected_ids)
-        self.assertEqual([True], refreshed)
+        self.assertEqual([], refreshed)
 
     def test_action_ids_use_all_checked_accounts_not_blue_focus(self):
         app = object.__new__(AccountManagerApp)
@@ -265,7 +320,7 @@ class AccountManagerAppTests(unittest.TestCase):
         self.assertEqual([1, 2], app._selected_action_ids())
         self.assertEqual({1, 2}, app.service.selected_ids)
 
-    def test_right_click_adds_target_to_existing_checked_batch(self):
+    def test_right_click_unselected_target_replaces_current_selection(self):
         app = object.__new__(AccountManagerApp)
         app.tree = FakeTree(selected=(1,), row=3)
         app.service = FakeSelectionService(selected=(1, 2))
@@ -280,7 +335,7 @@ class AccountManagerAppTests(unittest.TestCase):
         result = app._tree_context_menu(event)
 
         self.assertEqual("break", result)
-        self.assertEqual({1, 2, 3}, app.service.selected_ids)
+        self.assertEqual({3}, app.service.selected_ids)
         self.assertEqual([(100, 200)], app.context_menu.popup_calls)
         self.assertTrue(app.context_menu.released)
 

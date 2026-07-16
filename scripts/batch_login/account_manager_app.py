@@ -62,8 +62,9 @@ def select_range_ids(
 
 
 class AccountManagerApp:
+    SHIFT_MASK = 0x0001
+    CONTROL_MASK = 0x0004
     TABLE_COLUMNS = (
-        "checked",
         "account",
         "password",
         "start_url",
@@ -127,7 +128,7 @@ class AccountManagerApp:
         self.status_var = tk.StringVar(value="准备就绪")
         self.selected_count_var = tk.StringVar(value="已选择 0 个账号")
         self.visible_ids: list[int] = []
-        self.drag_anchor = ""
+        self.selection_anchor = ""
         self._refreshing_tree = False
         self.root.title("Kiro 账号管理器")
         self.root.geometry("1420x820")
@@ -141,7 +142,10 @@ class AccountManagerApp:
         ttk.Label(outer, text="Kiro 账号管理器", font=("Microsoft YaHei UI", 16, "bold")).pack(anchor="w")
         ttk.Label(
             outer,
-            text="双击整行或点击复选框可多选；右键对全部勾选账号批量操作",
+            text=(
+                "双击单选；Ctrl+双击追加/取消；Shift+双击连续选择；"
+                "右键对全部高亮账号操作"
+            ),
             foreground="#475569",
         ).pack(anchor="w", pady=(2, 8))
         toolbar = ttk.Frame(outer)
@@ -183,19 +187,18 @@ class AccountManagerApp:
 
         self.tree = ttk.Treeview(outer, columns=self.TABLE_COLUMNS, show="headings", selectmode="extended")
         headings = {
-            "checked": "选择", "account": "账号", "password": "当前密码",
+            "account": "账号", "password": "当前密码",
             "start_url": "Start URL", "login_status": "登录状态",
             "credential_status": "凭据状态", "lifecycle_status": "销售状态",
             "note": "备注", "updated_at": "更新时间",
         }
-        widths = {"checked": 55, "account": 170, "password": 100, "start_url": 260, "login_status": 85, "credential_status": 85, "lifecycle_status": 85, "note": 170, "updated_at": 155}
+        widths = {"account": 190, "password": 110, "start_url": 280, "login_status": 90, "credential_status": 90, "lifecycle_status": 90, "note": 180, "updated_at": 165}
         for column in self.TABLE_COLUMNS:
             self.tree.heading(column, text=headings[column])
             self.tree.column(column, width=widths[column], anchor="w")
         self.tree.pack(fill="both", expand=True)
-        self.tree.bind("<Button-1>", self._tree_click, add="+")
+        self.tree.bind("<Button-1>", self._tree_click)
         self.tree.bind("<Button-3>", self._tree_context_menu)
-        self.tree.bind("<B1-Motion>", self._tree_drag, add="+")
         self.tree.bind("<<TreeviewSelect>>", self._tree_selection, add="+")
         self.tree.bind("<Double-1>", self._tree_double_click)
         self.context_menu = tk.Menu(self.root, tearoff=False)
@@ -237,8 +240,7 @@ class AccountManagerApp:
             self.tree.delete(*self.tree.get_children())
             for item in accounts:
                 self.tree.insert("", "end", iid=str(item.id), values=(
-                    "☑" if item.id in selected else "☐", item.account,
-                    password_cell_text(item), item.start_url or "",
+                    item.account, password_cell_text(item), item.start_url or "",
                     item.login_status.value, item.credential_status.value,
                     "已售出" if item.lifecycle_status is LifecycleStatus.SOLD else "管理中",
                     item.note, item.updated_at,
@@ -254,39 +256,35 @@ class AccountManagerApp:
         row = self.tree.identify_row(event.y)
         if not row:
             return
-        self.drag_anchor = row
-        if self.tree.identify_column(event.x) == "#1":
-            self.service.toggle_selected(int(row))
-            self.refresh()
-            return "break"
-
-    def _tree_drag(self, event) -> None:
-        current = self.tree.identify_row(event.y)
-        if not self.drag_anchor or not current:
-            return
-        ids = select_range_ids(list(self.tree.get_children()), self.drag_anchor, current)
-        self.service.select_visible(ids)
-        self.refresh()
+        return "break"
 
     def _tree_selection(self, _event=None) -> None:
         if self._refreshing_tree:
             return
         self._update_selected_count()
 
-    def _update_tree_selection_markers(self) -> None:
-        selected = self.service.selected_ids
-        for item in self.tree.get_children():
-            self.tree.set(
-                item,
-                "checked",
-                "☑" if int(item) in selected else "☐",
-            )
-
     def _tree_double_click(self, event):
         row = self.tree.identify_row(event.y)
         if not row:
             return "break"
-        self.service.toggle_selected(int(row))
+        state = int(getattr(event, "state", 0))
+        shift_pressed = bool(state & self.SHIFT_MASK)
+        control_pressed = bool(state & self.CONTROL_MASK)
+        if shift_pressed and self.selection_anchor:
+            range_ids = select_range_ids(
+                list(self.tree.get_children()),
+                self.selection_anchor,
+                row,
+            )
+            if control_pressed:
+                range_ids.update(self.service.selected_ids)
+            self.service.set_selected(range_ids)
+        elif control_pressed:
+            self.service.toggle_selected(int(row))
+            self.selection_anchor = row
+        else:
+            self.service.set_selected([int(row)])
+            self.selection_anchor = row
         self.refresh()
         return "break"
 
@@ -295,7 +293,8 @@ class AccountManagerApp:
         if not row:
             return "break"
         if int(row) not in self.service.selected_ids:
-            self.service.toggle_selected(int(row))
+            self.service.set_selected([int(row)])
+            self.selection_anchor = row
             self.refresh()
         try:
             self.context_menu.tk_popup(event.x_root, event.y_root)
@@ -310,7 +309,8 @@ class AccountManagerApp:
         self.selected_count_var.set(f"已选择 {len(self.service.selected_ids)} 个账号")
 
     def select_all(self) -> None:
-        self.service.select_visible(self.visible_ids)
+        self.service.set_selected(self.visible_ids)
+        self.selection_anchor = str(self.visible_ids[0]) if self.visible_ids else ""
         self.refresh()
 
     def invert_selection(self) -> None:
@@ -319,6 +319,7 @@ class AccountManagerApp:
 
     def clear_selection(self) -> None:
         self.service.clear_selected()
+        self.selection_anchor = ""
         self.refresh()
 
     def open_start_url_manager(self) -> None:
