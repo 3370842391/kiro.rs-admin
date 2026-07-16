@@ -27,4 +27,18 @@ describe('admin credential observability UI wiring', () => {
     expect(status).toContain('sm:grid-cols-3')
     expect(status).toContain('xl:grid-cols-6')
   })
+
+  test('credential identity badges wrap without clipping', async () => {
+    const card = await readSource('src/components/credential-card.tsx')
+    const badgeRow = card.match(
+      /<div className="([^"]*\[&>\*\]:shrink-0[^"]*)">\s*\{badges\}/,
+    )?.[1]
+
+    expect(badgeRow).toBeDefined()
+    expect(badgeRow).toContain('flex-wrap')
+    expect(badgeRow).toContain('gap-x-1')
+    expect(badgeRow).toContain('gap-y-1')
+    expect(badgeRow).not.toContain('overflow-hidden')
+    expect(card).toContain('truncate text-sm font-medium leading-5')
+  })
 })
