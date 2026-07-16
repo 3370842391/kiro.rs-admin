@@ -13,6 +13,10 @@ describe('one-command release contract', () => {
     expect(script).toContain("status', '--porcelain', '--untracked-files=no")
     expect(script).toContain("remote', 'get-url', '--push', 'deploy")
     expect(script).toContain('3370842391/kiro.rs-admin.git')
+    expect(script).toContain(
+      "fetch', '--tags', 'deploy', '+refs/heads/master:refs/remotes/deploy/master'",
+    )
+    expect(script).not.toContain("fetch', '--tags', '--prune', 'deploy'")
     expect(script).toContain('git merge-base --is-ancestor refs/remotes/deploy/master HEAD')
     expect(script).toContain('Read-Host "输入 RELEASE 确认发布')
     expect(script).toContain("$answer -cne 'RELEASE'")

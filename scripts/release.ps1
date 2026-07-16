@@ -218,7 +218,7 @@ function Invoke-Release {
         throw "deploy push URL 不正确，拒绝发布：$remoteUrl"
     }
 
-    Invoke-Git -Arguments @('fetch', '--tags', '--prune', 'deploy', '+master:refs/remotes/deploy/master')
+    Invoke-Git -Arguments @('fetch', '--tags', 'deploy', '+refs/heads/master:refs/remotes/deploy/master')
     & git merge-base --is-ancestor refs/remotes/deploy/master HEAD
     if ($LASTEXITCODE -eq 1) {
         throw 'deploy/master 不是当前 HEAD 的祖先，请先同步远端再发布'
