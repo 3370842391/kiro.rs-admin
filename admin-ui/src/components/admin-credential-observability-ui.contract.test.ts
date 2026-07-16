@@ -41,4 +41,19 @@ describe('admin credential observability UI wiring', () => {
     expect(badgeRow).not.toContain('overflow-hidden')
     expect(card).toContain('truncate text-sm font-medium leading-5')
   })
+
+  test('failure dialog groups records and exposes the complete endpoint chain', async () => {
+    const dialog = await readSource('src/components/credential-failures-dialog.tsx')
+
+    expect(dialog).toContain('records.map((rec)')
+    expect(dialog).toContain('sortTraceAttempts')
+    expect(dialog).toContain('failureDisposition')
+    expect(dialog).toContain('failureDispositionLabel')
+    expect(dialog).toContain('compactAttemptLabel')
+    expect(dialog).toContain('客户端 Key：')
+    expect(dialog).toContain('端点：')
+    expect(dialog).toContain('耗时')
+    expect(dialog).not.toContain('failedHops')
+    expect(dialog).not.toContain('本次请求最终由其他凭据成功')
+  })
 })
