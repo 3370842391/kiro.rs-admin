@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import shutil
+import asyncio
+import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -68,6 +70,7 @@ class AccountManagerApp:
         "updated_at",
     )
     DEFAULT_EXPORT_TEMPLATE = "{account}----{password}----{start_url}"
+    PRIMARY_ACTION_LABEL = "一键登录导出 JSON"
     INPUT_TEMPLATE = "{account}|{password}|{start_url}"
     STATUS_VALUES = {
         "管理中": "managed",
@@ -78,9 +81,11 @@ class AccountManagerApp:
         "已售出": "sold",
     }
 
-    def __init__(self, root: tk.Tk, service: AccountManagerService):
+    def __init__(self, root: tk.Tk, service: AccountManagerService, coordinator=None):
         self.root = root
         self.service = service
+        self.coordinator = coordinator
+        self.login_running = False
         self.query_var = tk.StringVar()
         self.filter_var = tk.StringVar(value="管理中")
         self.status_var = tk.StringVar(value="准备就绪")
@@ -107,6 +112,7 @@ class AccountManagerApp:
         status.bind("<<ComboboxSelected>>", lambda _event: self.refresh())
         for text, command in (
             ("粘贴并识别", self.open_import_dialog),
+            (self.PRIMARY_ACTION_LABEL, self.start_login_export),
             ("全选", self.select_all),
             ("反选", self.invert_selection),
             ("取消选择", self.clear_selection),
@@ -335,6 +341,58 @@ class AccountManagerApp:
     def open_legacy_login(self) -> None:
         window = tk.Toplevel(self.root)
         BatchLoginApp(window, build_default_controller(), ssh_available=shutil.which("ssh") is not None)
+
+    def start_login_export(self) -> None:
+        if self.login_running:
+            messagebox.showinfo("一键登录", "已有登录任务正在运行", parent=self.root)
+            return
+        ids = sorted(self.service.selected_ids)
+        if not ids:
+            messagebox.showinfo("一键登录", "请先选择账号", parent=self.root)
+            return
+        if self.coordinator is None:
+            messagebox.showerror("一键登录", "登录协调器未初始化", parent=self.root)
+            return
+        choice = messagebox.askyesnocancel(
+            "一键登录导出 JSON",
+            "选择“是”将强制重新登录全部账号；选择“否”将复用已有有效凭据。",
+            parent=self.root,
+        )
+        if choice is None:
+            return
+        self.login_running = True
+        self.status_var.set(f"正在处理 {len(ids)} 个账号…")
+
+        def worker():
+            try:
+                report = asyncio.run(
+                    self.coordinator.run(ids, force_relogin=bool(choice))
+                )
+            except Exception as error:
+                self.root.after(
+                    0, lambda captured=error: self._login_finished(error=captured)
+                )
+                return
+            self.root.after(0, lambda: self._login_finished(report=report))
+
+        threading.Thread(
+            target=worker,
+            name="kiro-account-manager-login",
+            daemon=False,
+        ).start()
+
+    def _login_finished(self, *, report=None, error=None) -> None:
+        self.login_running = False
+        if error is not None:
+            self._error(error)
+            self.refresh()
+            self.status_var.set("一键登录导出失败")
+            return
+        self.service.clear_selected()
+        self.refresh()
+        self.status_var.set(
+            f"完成：登录 {report.logged_in}，复用 {report.reused}，失败 {report.failed}，导出 {report.exported}"
+        )
 
     def _copy(self, text: str) -> None:
         self.root.clipboard_clear(); self.root.clipboard_append(text)

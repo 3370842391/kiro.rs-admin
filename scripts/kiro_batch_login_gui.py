@@ -44,18 +44,22 @@ def main(argv=None, *, checker=dependency_errors) -> int:
 
     from batch_login.account_manager_app import AccountManagerApp
     from batch_login.account_manager_service import AccountManagerService
+    from batch_login.account_login_coordinator import AccountLoginCoordinator
     from batch_login.account_repository import (
         AccountRepository,
         default_account_db_path,
     )
     from batch_login.password_vault import WindowsDpapiProtector
+    from batch_login.gui_settings import GuiSettingsStore
 
     root = tk.Tk()
     repository = AccountRepository(
         default_account_db_path(),
         protector=WindowsDpapiProtector(),
     )
-    AccountManagerApp(root, AccountManagerService(repository))
+    service = AccountManagerService(repository)
+    coordinator = AccountLoginCoordinator(repository, GuiSettingsStore())
+    AccountManagerApp(root, service, coordinator)
     root.mainloop()
     return 0
 

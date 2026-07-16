@@ -47,6 +47,9 @@ class AccountManagerAppTests(unittest.TestCase):
             "{account}----{password}----{start_url}",
             AccountManagerApp.DEFAULT_EXPORT_TEMPLATE,
         )
+        self.assertEqual(
+            "一键登录导出 JSON", AccountManagerApp.PRIMARY_ACTION_LABEL
+        )
 
     def test_password_dialog_clear_removes_both_plaintext_values(self):
         initial = FakeVar("one-time-secret")

@@ -138,10 +138,20 @@ class AccountLoginCoordinator:
                     for index, item in enumerate(batch, start=1)
                 ]
                 runtime = self.runtime_factory(form, self.emit)
+                runtime_error = None
                 try:
                     await runtime.run(entries)
+                except Exception as error:
+                    runtime_error = error
                 finally:
                     await runtime.close()
+                if runtime_error is not None:
+                    for item in batch:
+                        self.repository.mark_login_failed(
+                            item.id, "runtime_failed", "automatic_login"
+                        )
+                    failed += len(batch)
+                    continue
                 records = CredentialStore(Path(form.credential_path)).load()
                 by_key = {
                     (record.email.casefold(), (record.start_url or "").rstrip("/").casefold()): record
