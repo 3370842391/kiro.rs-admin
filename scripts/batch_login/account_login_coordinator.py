@@ -18,6 +18,7 @@ from .gui_settings import GuiSavedSettings, GuiSettingsStore
 from .models import AccountEntry, LoginMode
 from .oidc_exporter import OidcCredentialExporter, OidcExportMode
 from .password_vault import PasswordStatus, PasswordVault
+from .redaction import mask_account
 from .worker_events import ResultMode
 
 
@@ -28,6 +29,18 @@ class LoginExportReport:
     logged_in: int
     failed: int
     exported: int
+
+
+@dataclass(frozen=True, slots=True)
+class LoginProgressEvent:
+    account_id: int
+    index: int
+    total: int
+    completed: int
+    status: str
+    account_masked: str
+    code: str | None = None
+    stage: str | None = None
 
 
 def form_from_saved_settings(
@@ -103,7 +116,12 @@ class AccountLoginCoordinator:
         return self._sync_confirmed_passwords(Path(vault_path), accounts)
 
     async def run(
-        self, account_ids: list[int], *, force_relogin: bool = False
+        self,
+        account_ids: list[int],
+        *,
+        force_relogin: bool = False,
+        progress=None,
+        event_sink=None,
     ) -> LoginExportReport:
         saved = self.settings_store.load()
         if saved is None:
@@ -117,6 +135,35 @@ class AccountLoginCoordinator:
         if any(item.lifecycle_status is LifecycleStatus.SOLD for item in accounts):
             raise ValueError("已售出账号请先恢复管理")
 
+        progress_sink = progress or (lambda _event: None)
+        runtime_event_sink = event_sink or self.emit
+        total = len(accounts)
+        completed = 0
+        positions = {
+            account.id: index
+            for index, account in enumerate(accounts, start=1)
+        }
+
+        def notify(account, status, *, code=None, stage=None, terminal=False):
+            nonlocal completed
+            if terminal:
+                completed += 1
+            progress_sink(
+                LoginProgressEvent(
+                    account_id=account.id,
+                    index=positions[account.id],
+                    total=total,
+                    completed=completed,
+                    status=status,
+                    account_masked=mask_account(account.account),
+                    code=code,
+                    stage=stage,
+                )
+            )
+
+        for account in accounts:
+            notify(account, "waiting")
+
         reusable = []
         pending = []
         for account in accounts:
@@ -127,6 +174,7 @@ class AccountLoginCoordinator:
                 and credential is not None
             ):
                 reusable.append((account, credential))
+                notify(account, "reused", terminal=True)
             else:
                 pending.append(account)
 
@@ -137,6 +185,8 @@ class AccountLoginCoordinator:
             if not batch:
                 continue
             self.repository.mark_login_running([item.id for item in batch])
+            for item in batch:
+                notify(item, "running")
             with tempfile.TemporaryDirectory(prefix="kiro-login-") as tmp:
                 root = Path(tmp)
                 form = form_from_saved_settings(
@@ -154,7 +204,7 @@ class AccountLoginCoordinator:
                     )
                     for index, item in enumerate(batch, start=1)
                 ]
-                runtime = self.runtime_factory(form, self.emit)
+                runtime = self.runtime_factory(form, runtime_event_sink)
                 runtime_error = None
                 try:
                     await runtime.run(entries)
@@ -176,6 +226,13 @@ class AccountLoginCoordinator:
                         self.repository.mark_login_failed(
                             item.id, "runtime_failed", "automatic_login"
                         )
+                        notify(
+                            item,
+                            "failed",
+                            code="runtime_failed",
+                            stage="automatic_login",
+                            terminal=True,
+                        )
                     failed += len(batch)
                     continue
                 records = CredentialStore(Path(form.credential_path)).load()
@@ -193,10 +250,18 @@ class AccountLoginCoordinator:
                         self.repository.mark_login_failed(
                             item.id, "login_failed", "automatic_login"
                         )
+                        notify(
+                            item,
+                            "failed",
+                            code="login_failed",
+                            stage="automatic_login",
+                            terminal=True,
+                        )
                         failed += 1
                         continue
                     self.repository.save_credential(item.id, credential)
                     new_credentials.append((item, credential))
+                    notify(item, "success", terminal=True)
 
         all_credentials = [item[1] for item in reusable + new_credentials]
         output_directory = Path(saved.oidc_export_directory) if saved.oidc_export_directory else Path(saved.credential_path).resolve().parent

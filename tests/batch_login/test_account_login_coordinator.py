@@ -1,6 +1,7 @@
 import sys
 import tempfile
 import unittest
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -8,13 +9,17 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from batch_login.account_login_coordinator import AccountLoginCoordinator
+from batch_login.account_login_coordinator import (
+    AccountLoginCoordinator,
+    LoginProgressEvent,
+)
 from batch_login.account_repository import AccountRepository, LifecycleStatus
 from batch_login.credential_models import CredentialRecord
 from batch_login.credential_store import CredentialStore
 from batch_login.gui_settings import GuiSavedSettings
 from batch_login.models import AccountEntry, LoginMode
 from batch_login.password_vault import PasswordStatus
+from batch_login.worker_events import WorkerEvent
 
 
 class Protector:
@@ -60,6 +65,7 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
             credential_path=str(self.root / "complete.json"),
             password_vault_path=str(self.root / "passwords.sqlite3"),
             oidc_export_directory=str(self.root / "exports"),
+            admin_key="admin-key-secret",
         )
 
     async def asyncTearDown(self): self.temp.cleanup()
@@ -87,6 +93,210 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(2, report.logged_in)
         self.assertEqual(2, report.exported)
         self.assertEqual("refresh-first", self.repo.load_credential(self.accounts[0].id).refresh_token)
+
+    async def test_progress_covers_reused_success_and_failed_accounts_once(self):
+        third = self.repo.upsert_entries(
+            [
+                AccountEntry(
+                    3,
+                    "third-secret-account",
+                    "never-log-this-password",
+                    "https://portal/three",
+                )
+            ],
+            login_mode=LoginMode.ENTERPRISE,
+            region="us-east-1",
+        )[0]
+        self.repo.save_credential(
+            self.accounts[0].id,
+            CredentialRecord(
+                email="first",
+                auth_method="idc",
+                provider="Enterprise",
+                refresh_token="existing-refresh-secret",
+                access_token="existing-access-secret",
+                client_secret="existing-client-secret",
+            ),
+        )
+
+        class PartialRuntime:
+            def __init__(self, form, _emit):
+                self.form = form
+
+            async def run(self, entries):
+                successful = next(
+                    item for item in entries if item.account == "second"
+                )
+                CredentialStore(Path(self.form.credential_path)).append(
+                    CredentialRecord(
+                        email=successful.account,
+                        auth_method="idc",
+                        provider="Enterprise",
+                        refresh_token="new-refresh-secret",
+                        start_url=successful.start_url,
+                        region="us-east-1",
+                    )
+                )
+
+            async def close(self):
+                pass
+
+        progress: list[LoginProgressEvent] = []
+        coordinator = AccountLoginCoordinator(
+            self.repo,
+            SettingsStore(self.settings),
+            exporter=Exporter(),
+            runtime_factory=PartialRuntime,
+        )
+
+        report = await coordinator.run(
+            [self.accounts[0].id, self.accounts[1].id, third.id],
+            progress=progress.append,
+        )
+
+        statuses = {
+            account_id: [
+                event.status
+                for event in progress
+                if event.account_id == account_id
+            ]
+            for account_id in (
+                self.accounts[0].id,
+                self.accounts[1].id,
+                third.id,
+            )
+        }
+        self.assertEqual(
+            ["waiting", "reused"], statuses[self.accounts[0].id]
+        )
+        self.assertEqual(
+            ["waiting", "running", "success"],
+            statuses[self.accounts[1].id],
+        )
+        self.assertEqual(
+            ["waiting", "running", "failed"], statuses[third.id]
+        )
+        terminal = [
+            event
+            for event in progress
+            if event.status in {"reused", "success", "failed"}
+        ]
+        self.assertEqual([1, 2, 3], [event.completed for event in terminal])
+        self.assertTrue(all(event.total == 3 for event in progress))
+        self.assertEqual(3, terminal[-1].completed)
+        self.assertEqual("login_failed", terminal[-1].code)
+        self.assertEqual(1, report.reused)
+        self.assertEqual(1, report.logged_in)
+        self.assertEqual(1, report.failed)
+
+        serialized = repr([asdict(event) for event in progress])
+        for secret in (
+            "third-secret-account",
+            "never-log-this-password",
+            "existing-refresh-secret",
+            "existing-access-secret",
+            "existing-client-secret",
+            "new-refresh-secret",
+            "admin-key-secret",
+        ):
+            self.assertNotIn(secret, serialized)
+
+    async def test_runtime_batch_failure_continues_with_next_login_mode(self):
+        microsoft = self.repo.upsert_entries(
+            [
+                AccountEntry(
+                    3,
+                    "microsoft-user@example.com",
+                    "microsoft-password-secret",
+                )
+            ],
+            login_mode=LoginMode.MICROSOFT,
+            region="us-east-1",
+        )[0]
+        calls = []
+
+        class ModeRuntime:
+            def __init__(self, form, _emit):
+                self.form = form
+
+            async def run(self, entries):
+                calls.append(self.form.mode)
+                if self.form.mode is LoginMode.ENTERPRISE:
+                    raise RuntimeError(
+                        "password=enterprise-password-secret "
+                        "refreshToken=enterprise-refresh-secret"
+                    )
+                for entry in entries:
+                    CredentialStore(Path(self.form.credential_path)).append(
+                        CredentialRecord(
+                            email=entry.account,
+                            auth_method="social",
+                            provider="Google",
+                            refresh_token="microsoft-refresh-secret",
+                            region="us-east-1",
+                        )
+                    )
+
+            async def close(self):
+                pass
+
+        progress: list[LoginProgressEvent] = []
+        runtime_events = []
+        coordinator = AccountLoginCoordinator(
+            self.repo,
+            SettingsStore(self.settings),
+            exporter=Exporter(),
+            runtime_factory=ModeRuntime,
+        )
+
+        report = await coordinator.run(
+            [self.accounts[0].id, microsoft.id],
+            progress=progress.append,
+            event_sink=runtime_events.append,
+        )
+
+        self.assertEqual(
+            [LoginMode.ENTERPRISE, LoginMode.MICROSOFT], calls
+        )
+        self.assertEqual(1, report.failed)
+        self.assertEqual(1, report.logged_in)
+        terminal = [
+            event
+            for event in progress
+            if event.status in {"reused", "success", "failed"}
+        ]
+        self.assertEqual([1, 2], [event.completed for event in terminal])
+        self.assertEqual("failed", terminal[0].status)
+        self.assertEqual("runtime_failed", terminal[0].code)
+        self.assertEqual("automatic_login", terminal[0].stage)
+        self.assertEqual("success", terminal[1].status)
+        self.assertEqual([], runtime_events)
+
+    async def test_runtime_worker_events_are_forwarded_to_explicit_sink(self):
+        emitted = WorkerEvent("browser_stage", {"stage": "portal_init"})
+        received = []
+
+        class EventRuntime(Runtime):
+            def __init__(self, form, emit):
+                super().__init__(form, emit, [])
+                self.emit = emit
+
+            async def run(self, entries):
+                self.emit(emitted)
+                await super().run(entries)
+
+        coordinator = AccountLoginCoordinator(
+            self.repo,
+            SettingsStore(self.settings),
+            exporter=Exporter(),
+            runtime_factory=EventRuntime,
+        )
+
+        await coordinator.run(
+            [self.accounts[0].id], event_sink=received.append
+        )
+
+        self.assertEqual([emitted], received)
 
     async def test_sold_account_is_rejected(self):
         self.repo.mark_sold([self.accounts[0].id], "客户")

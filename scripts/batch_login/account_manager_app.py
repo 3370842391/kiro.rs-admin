@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import queue
 import shutil
 import asyncio
 import threading
@@ -9,16 +10,18 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from uuid import uuid4
 
+from .account_login_coordinator import LoginProgressEvent
 from .account_manager_service import (
     AccountManagerService,
     AccountManagerServiceError,
     ImportPreview,
 )
-from .account_repository import LifecycleStatus
+from .account_repository import CredentialStatus, LifecycleStatus, LoginStatus
 from .gui_app import BatchLoginApp
 from .gui_runtime import build_default_controller
 from .models import LoginMode
 from .redaction import redact_text
+from .worker_events import WorkerEvent
 
 
 def atomic_write_text(path: Path, text: str) -> None:
@@ -47,29 +50,72 @@ def password_cell_text(account) -> str:
     return "••••••" if account.has_current_password else "未设置"
 
 
-def select_range_ids(
-    row_ids: list[str] | tuple[str, ...],
-    anchor: str,
-    current: str,
-) -> set[int]:
-    try:
-        start = row_ids.index(anchor)
-        end = row_ids.index(current)
-    except ValueError:
-        return set()
-    low, high = sorted((start, end))
-    return {int(item) for item in row_ids[low : high + 1]}
+def json_status_text(account, live_status: str | None = None) -> str:
+    if live_status:
+        return live_status
+    if account.credential_status is CredentialStatus.VALID:
+        return "成功"
+    if account.login_status is LoginStatus.RUNNING:
+        return "处理中"
+    if account.login_status is LoginStatus.FAILED:
+        code = redact_text(str(account.last_error_code or "未知错误"))
+        return f"失败：{code}"
+    return "未获取"
+
+
+def format_worker_event(event: WorkerEvent) -> str:
+    payload = event.payload
+    if event.kind == "browser_stage":
+        labels = {
+            "oidc_register": "注册企业 OIDC 客户端",
+            "portal_init": "初始化企业登录门户",
+            "device_authorization": "确认设备授权码",
+            "workflow_init": "初始化 AWS 登录工作流",
+            "username": "提交用户名",
+            "password": "提交一次性密码",
+            "password_reset": "设置新密码",
+            "sso_token": "获取企业 SSO Token",
+            "complete": "登录流程完成",
+        }
+        stage = str(payload.get("stage") or "")
+        return labels.get(stage, f"登录阶段：{redact_text(stage)}")
+    if event.kind == "security_warning":
+        return redact_text(str(payload.get("message") or "安全提示"))
+    if event.kind == "account_started":
+        return (
+            f"开始登录 {payload.get('accountMasked', '***')} "
+            f"({payload.get('index', 0)}/{payload.get('total', 0)})"
+        )
+    if event.kind == "account_finished":
+        parts = [f"登录结果：{payload.get('status', 'unknown')}"]
+        if payload.get("code"):
+            parts.append(f"代码={redact_text(str(payload['code']))}")
+        if payload.get("stage"):
+            parts.append(f"阶段={redact_text(str(payload['stage']))}")
+        return "，".join(parts)
+    if event.kind == "batch_started":
+        return f"登录批次开始，共 {int(payload.get('total', 0))} 个账号"
+    if event.kind in {"batch_finished", "batch_cancelled"}:
+        return (
+            f"登录批次{'完成' if event.kind == 'batch_finished' else '取消'}："
+            f"成功 {int(payload.get('succeeded', 0))}，"
+            f"失败 {int(payload.get('failed', 0))}"
+        )
+    if event.kind == "import_event":
+        return (
+            f"RS 导入：状态={redact_text(str(payload.get('status', 'unknown')))}"
+        )
+    return f"运行事件：{redact_text(event.kind)}"
 
 
 class AccountManagerApp:
-    SHIFT_MASK = 0x0001
-    CONTROL_MASK = 0x0004
     TABLE_COLUMNS = (
         "account",
         "password",
         "start_url",
         "login_status",
         "credential_status",
+        "json_status",
         "lifecycle_status",
         "note",
         "updated_at",
@@ -127,14 +173,19 @@ class AccountManagerApp:
         self.filter_var = tk.StringVar(value="管理中")
         self.status_var = tk.StringVar(value="准备就绪")
         self.selected_count_var = tk.StringVar(value="已选择 0 个账号")
+        self.login_progress_var = tk.DoubleVar(value=0)
+        self.login_progress_text_var = tk.StringVar(value="JSON 进度：0/0")
+        self.login_event_queue: queue.Queue = queue.Queue()
+        self.json_status_by_id: dict[int, str] = {}
+        self.active_login_ids: list[int] = []
         self.visible_ids: list[int] = []
-        self.selection_anchor = ""
         self._refreshing_tree = False
         self.root.title("Kiro 账号管理器")
         self.root.geometry("1420x820")
         self.root.minsize(1080, 640)
         self._build()
         self.refresh()
+        self.root.after(80, self._poll_login_events)
 
     def _build(self) -> None:
         outer = ttk.Frame(self.root, padding=12)
@@ -143,7 +194,7 @@ class AccountManagerApp:
         ttk.Label(
             outer,
             text=(
-                "双击单选；Ctrl+双击追加/取消；Shift+双击连续选择；"
+                "单击单选；Ctrl+单击追加/取消；Shift+单击连续选择；"
                 "右键对全部高亮账号操作"
             ),
             foreground="#475569",
@@ -185,22 +236,41 @@ class AccountManagerApp:
                 side="left", padx=2
             )
 
-        self.tree = ttk.Treeview(outer, columns=self.TABLE_COLUMNS, show="headings", selectmode="extended")
+        table_frame = ttk.Frame(outer)
+        table_frame.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(
+            table_frame,
+            columns=self.TABLE_COLUMNS,
+            show="headings",
+            selectmode="extended",
+        )
         headings = {
             "account": "账号", "password": "当前密码",
             "start_url": "Start URL", "login_status": "登录状态",
-            "credential_status": "凭据状态", "lifecycle_status": "销售状态",
+            "credential_status": "凭据状态", "json_status": "JSON 状态",
+            "lifecycle_status": "销售状态",
             "note": "备注", "updated_at": "更新时间",
         }
-        widths = {"account": 190, "password": 110, "start_url": 280, "login_status": 90, "credential_status": 90, "lifecycle_status": 90, "note": 180, "updated_at": 165}
+        widths = {"account": 190, "password": 110, "start_url": 280, "login_status": 90, "credential_status": 90, "json_status": 150, "lifecycle_status": 90, "note": 180, "updated_at": 165}
         for column in self.TABLE_COLUMNS:
             self.tree.heading(column, text=headings[column])
             self.tree.column(column, width=widths[column], anchor="w")
-        self.tree.pack(fill="both", expand=True)
-        self.tree.bind("<Button-1>", self._tree_click)
+        vertical = ttk.Scrollbar(
+            table_frame, orient="vertical", command=self.tree.yview
+        )
+        horizontal = ttk.Scrollbar(
+            table_frame, orient="horizontal", command=self.tree.xview
+        )
+        self.tree.configure(
+            yscrollcommand=vertical.set, xscrollcommand=horizontal.set
+        )
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vertical.grid(row=0, column=1, sticky="ns")
+        horizontal.grid(row=1, column=0, sticky="ew")
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
         self.tree.bind("<Button-3>", self._tree_context_menu)
         self.tree.bind("<<TreeviewSelect>>", self._tree_selection, add="+")
-        self.tree.bind("<Double-1>", self._tree_double_click)
         self.context_menu = tk.Menu(self.root, tearoff=False)
         context_commands = (
             self.start_login_export,
@@ -219,6 +289,39 @@ class AccountManagerApp:
             if index in {4, 7}:
                 self.context_menu.add_separator()
             self.context_menu.add_command(label=label, command=command)
+
+        login_panel = ttk.LabelFrame(outer, text="JSON 获取进度", padding=8)
+        login_panel.pack(fill="x", pady=(8, 0))
+        progress_row = ttk.Frame(login_panel)
+        progress_row.pack(fill="x")
+        ttk.Progressbar(
+            progress_row,
+            variable=self.login_progress_var,
+            maximum=100,
+            mode="determinate",
+        ).pack(side="left", fill="x", expand=True)
+        ttk.Label(
+            progress_row,
+            textvariable=self.login_progress_text_var,
+            width=18,
+            anchor="e",
+        ).pack(side="right", padx=(8, 0))
+        log_frame = ttk.Frame(login_panel)
+        log_frame.pack(fill="x", pady=(6, 0))
+        self.login_log_text = tk.Text(
+            log_frame,
+            height=6,
+            wrap="word",
+            state="disabled",
+            font=("Consolas", 9),
+        )
+        log_scroll = ttk.Scrollbar(
+            log_frame, orient="vertical", command=self.login_log_text.yview
+        )
+        self.login_log_text.configure(yscrollcommand=log_scroll.set)
+        self.login_log_text.pack(side="left", fill="both", expand=True)
+        log_scroll.pack(side="right", fill="y")
+
         footer = ttk.Frame(outer)
         footer.pack(fill="x", pady=(6, 0))
         ttk.Label(footer, textvariable=self.selected_count_var).pack(side="left")
@@ -242,6 +345,9 @@ class AccountManagerApp:
                 self.tree.insert("", "end", iid=str(item.id), values=(
                     item.account, password_cell_text(item), item.start_url or "",
                     item.login_status.value, item.credential_status.value,
+                    json_status_text(
+                        item, self.json_status_by_id.get(item.id)
+                    ),
                     "已售出" if item.lifecycle_status is LifecycleStatus.SOLD else "管理中",
                     item.note, item.updated_at,
                 ))
@@ -252,50 +358,22 @@ class AccountManagerApp:
         self._update_selected_count()
         self.status_var.set(f"显示 {len(accounts)} 个账号")
 
-    def _tree_click(self, event) -> None:
-        row = self.tree.identify_row(event.y)
-        if not row:
-            return
-        return "break"
-
     def _tree_selection(self, _event=None) -> None:
         if self._refreshing_tree:
             return
+        self.service.set_selected(int(item) for item in self.tree.selection())
         self._update_selected_count()
-
-    def _tree_double_click(self, event):
-        row = self.tree.identify_row(event.y)
-        if not row:
-            return "break"
-        state = int(getattr(event, "state", 0))
-        shift_pressed = bool(state & self.SHIFT_MASK)
-        control_pressed = bool(state & self.CONTROL_MASK)
-        if shift_pressed and self.selection_anchor:
-            range_ids = select_range_ids(
-                list(self.tree.get_children()),
-                self.selection_anchor,
-                row,
-            )
-            if control_pressed:
-                range_ids.update(self.service.selected_ids)
-            self.service.set_selected(range_ids)
-        elif control_pressed:
-            self.service.toggle_selected(int(row))
-            self.selection_anchor = row
-        else:
-            self.service.set_selected([int(row)])
-            self.selection_anchor = row
-        self.refresh()
-        return "break"
 
     def _tree_context_menu(self, event):
         row = self.tree.identify_row(event.y)
         if not row:
             return "break"
-        if int(row) not in self.service.selected_ids:
-            self.service.set_selected([int(row)])
-            self.selection_anchor = row
-            self.refresh()
+        highlighted = {int(item) for item in self.tree.selection()}
+        if int(row) not in highlighted:
+            self.tree.selection_set(row)
+            highlighted = {int(row)}
+        self.service.set_selected(highlighted)
+        self._update_selected_count()
         try:
             self.context_menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -310,7 +388,6 @@ class AccountManagerApp:
 
     def select_all(self) -> None:
         self.service.set_selected(self.visible_ids)
-        self.selection_anchor = str(self.visible_ids[0]) if self.visible_ids else ""
         self.refresh()
 
     def invert_selection(self) -> None:
@@ -319,7 +396,6 @@ class AccountManagerApp:
 
     def clear_selection(self) -> None:
         self.service.clear_selected()
-        self.selection_anchor = ""
         self.refresh()
 
     def open_start_url_manager(self) -> None:
@@ -662,6 +738,69 @@ class AccountManagerApp:
         window = tk.Toplevel(self.root)
         BatchLoginApp(window, build_default_controller(), ssh_available=shutil.which("ssh") is not None)
 
+    def _append_login_log(self, message: str) -> None:
+        safe_message = redact_text(str(message))
+        self.login_log_text.configure(state="normal")
+        self.login_log_text.insert("end", safe_message + "\n")
+        self.login_log_text.see("end")
+        self.login_log_text.configure(state="disabled")
+
+    def _prepare_login_progress(self, ids: list[int]) -> None:
+        self.active_login_ids = list(ids)
+        for account_id in ids:
+            self.json_status_by_id[account_id] = "等待中"
+            if self.tree.exists(str(account_id)):
+                self.tree.set(str(account_id), "json_status", "等待中")
+        self.login_progress_var.set(0)
+        self.login_progress_text_var.set(f"JSON 进度：0/{len(ids)}")
+        self._append_login_log(f"开始获取 {len(ids)} 个账号的 JSON")
+
+    def _apply_login_progress(self, event: LoginProgressEvent) -> None:
+        labels = {
+            "waiting": "等待中",
+            "running": "处理中",
+            "reused": "复用成功",
+            "success": "成功",
+        }
+        if event.status == "failed":
+            code = redact_text(str(event.code or "未知错误"))
+            status = f"失败：{code}"
+        else:
+            status = labels.get(event.status, redact_text(event.status))
+        self.json_status_by_id[event.account_id] = status
+        if self.tree.exists(str(event.account_id)):
+            self.tree.set(str(event.account_id), "json_status", status)
+        self.login_progress_var.set(
+            event.completed * 100 / max(event.total, 1)
+        )
+        self.login_progress_text_var.set(
+            f"JSON 进度：{event.completed}/{event.total}"
+        )
+        if event.status != "waiting":
+            self._append_login_log(
+                f"[{event.index}/{event.total}] {event.account_masked}：{status}"
+            )
+
+    def _apply_worker_event(self, event: WorkerEvent) -> None:
+        self._append_login_log(format_worker_event(event))
+
+    def _poll_login_events(self) -> None:
+        while True:
+            try:
+                event = self.login_event_queue.get_nowait()
+            except queue.Empty:
+                break
+            if isinstance(event, LoginProgressEvent):
+                self._apply_login_progress(event)
+            elif isinstance(event, WorkerEvent):
+                self._apply_worker_event(event)
+            elif isinstance(event, tuple) and event[:1] == ("finished",):
+                self._login_finished(report=event[1], error=event[2])
+        try:
+            self.root.after(80, self._poll_login_events)
+        except tk.TclError:
+            pass
+
     def start_login_export(self) -> None:
         if self.login_running:
             messagebox.showinfo("一键登录", "已有登录任务正在运行", parent=self.root)
@@ -681,19 +820,23 @@ class AccountManagerApp:
         if choice is None:
             return
         self.login_running = True
+        self._prepare_login_progress(ids)
         self.status_var.set(f"正在处理 {len(ids)} 个账号…")
 
         def worker():
             try:
                 report = asyncio.run(
-                    self.coordinator.run(ids, force_relogin=bool(choice))
+                    self.coordinator.run(
+                        ids,
+                        force_relogin=bool(choice),
+                        progress=self.login_event_queue.put,
+                        event_sink=self.login_event_queue.put,
+                    )
                 )
             except Exception as error:
-                self.root.after(
-                    0, lambda captured=error: self._login_finished(error=captured)
-                )
+                self.login_event_queue.put(("finished", None, error))
                 return
-            self.root.after(0, lambda: self._login_finished(report=report))
+            self.login_event_queue.put(("finished", report, None))
 
         threading.Thread(
             target=worker,
@@ -704,12 +847,26 @@ class AccountManagerApp:
     def _login_finished(self, *, report=None, error=None) -> None:
         self.login_running = False
         if error is not None:
+            for account_id in self.active_login_ids:
+                if self.json_status_by_id.get(account_id) in {
+                    "等待中",
+                    "处理中",
+                }:
+                    self.json_status_by_id[account_id] = "失败：任务异常"
+            total = len(self.active_login_ids)
+            self.login_progress_var.set(100 if total else 0)
+            self.login_progress_text_var.set(f"JSON 进度：{total}/{total}")
+            self._append_login_log("JSON 获取任务异常结束")
             self._error(error)
             self.refresh()
             self.status_var.set("一键登录导出失败")
             return
         self.service.clear_selected()
         self.refresh()
+        self._append_login_log(
+            f"任务完成：登录 {report.logged_in}，复用 {report.reused}，"
+            f"失败 {report.failed}，导出 {report.exported}"
+        )
         self.status_var.set(
             f"完成：登录 {report.logged_in}，复用 {report.reused}，失败 {report.failed}，导出 {report.exported}"
         )

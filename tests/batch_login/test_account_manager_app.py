@@ -10,12 +10,22 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import batch_login.account_manager_app as account_manager_module
 from batch_login.account_manager_app import (
     AccountManagerApp,
     atomic_write_text,
     clear_secret_vars,
     password_cell_text,
-    select_range_ids,
+)
+from batch_login.account_login_coordinator import LoginProgressEvent
+from batch_login.account_repository import CredentialStatus, LoginStatus
+from batch_login.worker_events import WorkerEvent
+
+format_worker_event = getattr(
+    account_manager_module, "format_worker_event", lambda _event: ""
+)
+json_status_text = getattr(
+    account_manager_module, "json_status_text", lambda *_args: ""
 )
 
 
@@ -39,9 +49,15 @@ class FakeTree:
             str(item) for item in (rows if rows is not None else selected)
         )
         self.values = {}
+        self.selection_set_calls = []
 
     def selection(self):
         return self.selected
+
+    def selection_set(self, item):
+        item = str(item)
+        self.selected = (item,)
+        self.selection_set_calls.append(item)
 
     def identify_row(self, _y):
         return self.row
@@ -54,6 +70,25 @@ class FakeTree:
 
     def set(self, item, column, value):
         self.values[(str(item), column)] = value
+
+    def exists(self, item):
+        return str(item) in self.rows
+
+
+class FakeText:
+    def __init__(self):
+        self.content = ""
+        self.states = []
+        self.seen = []
+
+    def configure(self, **kwargs):
+        self.states.append(kwargs)
+
+    def insert(self, _position, text):
+        self.content += text
+
+    def see(self, position):
+        self.seen.append(position)
 
 
 class FakeSelectionService:
@@ -96,6 +131,7 @@ class AccountManagerAppTests(unittest.TestCase):
                 "start_url",
                 "login_status",
                 "credential_status",
+                "json_status",
                 "lifecycle_status",
                 "note",
                 "updated_at",
@@ -164,6 +200,75 @@ class AccountManagerAppTests(unittest.TestCase):
         self.assertEqual("未设置", password_cell_text(without_password))
         self.assertEqual("••••••", password_cell_text(with_password))
 
+    def test_json_status_uses_live_override_then_persisted_account_state(self):
+        failed = SimpleNamespace(
+            credential_status=CredentialStatus.MISSING,
+            login_status=LoginStatus.FAILED,
+            last_error_code="http_error",
+        )
+        valid = SimpleNamespace(
+            credential_status=CredentialStatus.VALID,
+            login_status=LoginStatus.SUCCESS,
+            last_error_code=None,
+        )
+
+        self.assertEqual("等待中", json_status_text(failed, "等待中"))
+        self.assertEqual("失败：http_error", json_status_text(failed))
+        self.assertEqual("成功", json_status_text(valid))
+
+    def test_progress_event_updates_json_row_progress_and_redacted_log(self):
+        app = object.__new__(AccountManagerApp)
+        app.json_status_by_id = {}
+        app.login_progress_var = FakeVar(0)
+        app.login_progress_text_var = FakeVar("")
+        app.tree = FakeTree(rows=(7,))
+        app.login_log_text = FakeText()
+
+        app._apply_login_progress(
+            LoginProgressEvent(
+                account_id=7,
+                index=2,
+                total=4,
+                completed=2,
+                status="failed",
+                account_masked="ac***",
+                code="password=raw-secret",
+                stage="automatic_login",
+            )
+        )
+
+        self.assertEqual("失败：password=<redacted>", app.json_status_by_id[7])
+        self.assertEqual(
+            "失败：password=<redacted>",
+            app.tree.values[("7", "json_status")],
+        )
+        self.assertEqual(50, app.login_progress_var.get())
+        self.assertEqual("JSON 进度：2/4", app.login_progress_text_var.get())
+        self.assertIn("ac***", app.login_log_text.content)
+        self.assertNotIn("raw-secret", app.login_log_text.content)
+        self.assertEqual(["end"], app.login_log_text.seen)
+
+    def test_worker_event_log_formatter_only_uses_safe_whitelisted_fields(self):
+        text = format_worker_event(
+            WorkerEvent(
+                "account_finished",
+                {
+                    "status": "failed",
+                    "code": "http_error",
+                    "stage": "password",
+                    "message": "unlabelled-password-secret",
+                    "refreshToken": "refresh-secret",
+                    "adminKey": "admin-secret",
+                },
+            )
+        )
+
+        self.assertIn("http_error", text)
+        self.assertIn("password", text)
+        self.assertNotIn("unlabelled-password-secret", text)
+        self.assertNotIn("refresh-secret", text)
+        self.assertNotIn("admin-secret", text)
+
     def test_password_view_recovers_confirmed_password_when_missing(self):
         missing = SimpleNamespace(current_password=None)
         recovered = SimpleNamespace(current_password="recovered-password")
@@ -202,115 +307,29 @@ class AccountManagerAppTests(unittest.TestCase):
         )
         self.assertIn('summary.set("解析失败")', parse_source)
 
-    def test_drag_range_selection_is_order_independent(self):
-        rows = ["10", "11", "12", "13"]
-
-        self.assertEqual({11, 12, 13}, select_range_ids(rows, "11", "13"))
-        self.assertEqual({11, 12, 13}, select_range_ids(rows, "13", "11"))
-        self.assertEqual(set(), select_range_ids(rows, "missing", "11"))
-
-    def test_tree_focus_does_not_change_selection_before_double_click(self):
+    def test_tree_selection_syncs_native_highlights_to_service(self):
         app = object.__new__(AccountManagerApp)
-        app.tree = FakeTree(selected=(2,))
-        app.service = FakeSelectionService(selected=(1, 2))
+        app.tree = FakeTree(selected=(2, 3))
+        app.service = FakeSelectionService(selected=(1,))
         app.selected_count_var = FakeVar("")
         app._refreshing_tree = False
 
         app._tree_selection()
 
-        self.assertEqual({1, 2}, app.service.selected_ids)
+        self.assertEqual({2, 3}, app.service.selected_ids)
         self.assertEqual("已选择 2 个账号", app.selected_count_var.get())
 
-    def test_plain_double_click_selects_only_target_and_sets_anchor(self):
+    def test_tree_selection_is_ignored_while_refreshing(self):
         app = object.__new__(AccountManagerApp)
-        app.tree = FakeTree(selected=(1, 2), row=2, rows=(1, 2, 3, 4))
-        app.service = FakeSelectionService(selected=(1, 2))
-        app.selection_anchor = "1"
-        refreshed = []
-        app.refresh = lambda: refreshed.append(True)
-
-        result = app._tree_double_click(
-            type("Event", (), {"y": 10, "state": 0})()
-        )
-
-        self.assertEqual("break", result)
-        self.assertEqual({2}, app.service.selected_ids)
-        self.assertEqual("2", app.selection_anchor)
-        self.assertEqual([True], refreshed)
-
-    def test_ctrl_double_click_toggles_only_target(self):
-        app = object.__new__(AccountManagerApp)
-        app.tree = FakeTree(selected=(1,), row=2, rows=(1, 2, 3, 4))
+        app.tree = FakeTree(selected=(2, 3))
         app.service = FakeSelectionService(selected=(1,))
-        app.selection_anchor = "1"
-        app.refresh = lambda: None
+        app.selected_count_var = FakeVar("unchanged")
+        app._refreshing_tree = True
 
-        app._tree_double_click(
-            type(
-                "Event",
-                (),
-                {"y": 10, "state": AccountManagerApp.CONTROL_MASK},
-            )()
-        )
+        app._tree_selection()
 
-        self.assertEqual({1, 2}, app.service.selected_ids)
-        self.assertEqual("2", app.selection_anchor)
-
-    def test_shift_double_click_selects_contiguous_anchor_range(self):
-        app = object.__new__(AccountManagerApp)
-        app.tree = FakeTree(selected=(2,), row=4, rows=(1, 2, 3, 4, 5))
-        app.service = FakeSelectionService(selected=(2,))
-        app.selection_anchor = "2"
-        app.refresh = lambda: None
-
-        app._tree_double_click(
-            type(
-                "Event",
-                (),
-                {"y": 10, "state": AccountManagerApp.SHIFT_MASK},
-            )()
-        )
-
-        self.assertEqual({2, 3, 4}, app.service.selected_ids)
-        self.assertEqual("2", app.selection_anchor)
-
-    def test_ctrl_shift_double_click_adds_range_to_existing_selection(self):
-        app = object.__new__(AccountManagerApp)
-        app.tree = FakeTree(selected=(1, 2), row=4, rows=(1, 2, 3, 4, 5))
-        app.service = FakeSelectionService(selected=(1, 2))
-        app.selection_anchor = "2"
-        app.refresh = lambda: None
-
-        app._tree_double_click(
-            type(
-                "Event",
-                (),
-                {
-                    "y": 10,
-                    "state": (
-                        AccountManagerApp.CONTROL_MASK
-                        | AccountManagerApp.SHIFT_MASK
-                    ),
-                },
-            )()
-        )
-
-        self.assertEqual({1, 2, 3, 4}, app.service.selected_ids)
-
-    def test_single_click_does_not_select_until_double_click(self):
-        app = object.__new__(AccountManagerApp)
-        app.tree = FakeTree(selected=(), row=2, column="#1", rows=(1, 2))
-        app.service = FakeSelectionService(selected=())
-        app.drag_anchor = ""
-        refreshed = []
-        app.refresh = lambda: refreshed.append(True)
-        event = type("Event", (), {"x": 5, "y": 10})()
-
-        result = app._tree_click(event)
-
-        self.assertEqual("break", result)
-        self.assertEqual(set(), app.service.selected_ids)
-        self.assertEqual([], refreshed)
+        self.assertEqual({1}, app.service.selected_ids)
+        self.assertEqual("unchanged", app.selected_count_var.get())
 
     def test_action_ids_use_all_checked_accounts_not_blue_focus(self):
         app = object.__new__(AccountManagerApp)
@@ -320,12 +339,12 @@ class AccountManagerAppTests(unittest.TestCase):
         self.assertEqual([1, 2], app._selected_action_ids())
         self.assertEqual({1, 2}, app.service.selected_ids)
 
-    def test_right_click_unselected_target_replaces_current_selection(self):
+    def test_right_click_unhighlighted_target_replaces_current_selection(self):
         app = object.__new__(AccountManagerApp)
-        app.tree = FakeTree(selected=(1,), row=3)
+        app.tree = FakeTree(selected=(1,), row=2)
         app.service = FakeSelectionService(selected=(1, 2))
+        app.selected_count_var = FakeVar("")
         app.context_menu = FakeMenu()
-        app.refresh = lambda: None
         event = type(
             "Event",
             (),
@@ -335,7 +354,29 @@ class AccountManagerAppTests(unittest.TestCase):
         result = app._tree_context_menu(event)
 
         self.assertEqual("break", result)
-        self.assertEqual({3}, app.service.selected_ids)
+        self.assertEqual({2}, app.service.selected_ids)
+        self.assertEqual(["2"], app.tree.selection_set_calls)
+        self.assertEqual("已选择 1 个账号", app.selected_count_var.get())
+        self.assertEqual([(100, 200)], app.context_menu.popup_calls)
+        self.assertTrue(app.context_menu.released)
+
+    def test_right_click_highlighted_target_preserves_extended_selection(self):
+        app = object.__new__(AccountManagerApp)
+        app.tree = FakeTree(selected=(1, 2), row=2)
+        app.service = FakeSelectionService(selected=(1,))
+        app.selected_count_var = FakeVar("")
+        app.context_menu = FakeMenu()
+        event = type(
+            "Event",
+            (),
+            {"y": 10, "x_root": 100, "y_root": 200},
+        )()
+
+        result = app._tree_context_menu(event)
+
+        self.assertEqual("break", result)
+        self.assertEqual({1, 2}, app.service.selected_ids)
+        self.assertEqual([], app.tree.selection_set_calls)
         self.assertEqual([(100, 200)], app.context_menu.popup_calls)
         self.assertTrue(app.context_menu.released)
 
