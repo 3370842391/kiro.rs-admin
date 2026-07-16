@@ -94,7 +94,10 @@ def base_responses(password_result):
         response({"deviceCode": "device", "userCode": "ABCD-EFGH"}),
         response(
             {
-                "redirectUrl": "https://us-east-1.signin.aws/login?workflowStateHandle=wh-1",
+                "redirectUrl": (
+                    "https://us-east-1.signin.aws/platform/d-123/login"
+                    "?workflowStateHandle=wh-1"
+                ),
                 "csrfToken": "csrf",
             }
         ),
@@ -148,6 +151,54 @@ class EnterpriseHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("client", result.client_id)
         self.assertEqual("d-123", result.directory_id)
         self.assertEqual([], transport.responses)
+
+    async def test_new_sso_instance_portal_discovers_directory_and_signin_endpoint(self):
+        portal_url = (
+            "https://ssoins-7223a15405d7b4ec.portal.us-east-1.app.aws/"
+        )
+        responses = base_responses(
+            {
+                "stepId": "end-of-workflow-success",
+                "redirect": {
+                    "url": portal_url
+                    + "?workflowResultHandle=auth&state=state"
+                },
+            }
+        )
+        responses[2] = response(
+            {
+                "redirectUrl": (
+                    "https://us-east-1.sso.signin.aws/platform/d-9066772d19/login"
+                    "?workflowStateHandle=wh-1"
+                ),
+                "csrfToken": "csrf",
+            }
+        )
+        client, transport = self.make_client(responses + tail_responses())
+
+        result = await client.login(
+            "admin-user",
+            "existing-password",
+            EnterpriseHttpSettings(portal_url, "us-east-1"),
+        )
+
+        self.assertEqual("d-9066772d19", result.directory_id)
+        self.assertEqual(
+            "https://oidc.us-east-1.api.aws/client/register",
+            transport.requests[0][1],
+        )
+        self.assertIn(
+            "portal.sso.us-east-1.api.aws/login",
+            transport.requests[2][1],
+        )
+        self.assertIn(
+            "idc_instance_id=ssoins-7223a15405d7b4ec",
+            transport.requests[2][1],
+        )
+        self.assertIn(
+            "us-east-1.sso.signin.aws/platform/d-9066772d19/api/execute",
+            transport.requests[4][1],
+        )
 
     async def test_resume_tries_saved_unresolved_password_before_input_password(self):
         redirect = {

@@ -49,9 +49,11 @@ class FakeAuth:
     def __init__(self, results):
         self.results = list(results)
         self.accounts = []
+        self.settings = []
 
-    async def login(self, entry, _settings):
+    async def login(self, entry, settings):
         self.accounts.append(entry.account)
+        self.settings.append(settings)
         value = self.results.pop(0)
         if isinstance(value, BaseException):
             raise value
@@ -73,10 +75,12 @@ class FakeStore:
 class FakeCheckpoint:
     def __init__(self, *, should_run=True):
         self.run = should_run
+        self.should_run_calls = []
         self.records = []
         self.import_records = []
 
-    def should_run(self, **_kwargs):
+    def should_run(self, **kwargs):
+        self.should_run_calls.append(kwargs)
         return self.run
 
     def append(self, record):
@@ -105,6 +109,44 @@ class FakeImporter:
 
 
 class LocalRunnerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_enterprise_uses_each_accounts_effective_start_url(self):
+        per_account_url = "https://ssoins-example.portal.us-west-2.app.aws/"
+        auth = FakeAuth([credential(), credential("fallback-user")])
+        checkpoint = FakeCheckpoint()
+        runner = LocalBatchRunner(
+            enterprise=auth,
+            microsoft=auth,
+            store=FakeStore(),
+            checkpoint=checkpoint,
+        )
+
+        await runner.run(
+            [
+                AccountEntry(
+                    1,
+                    "per-account-user",
+                    "one-time-password",
+                    start_url=per_account_url,
+                ),
+                AccountEntry(2, "fallback-user", "one-time-password"),
+            ],
+            settings_for(ResultMode.SAVE_ONLY),
+        )
+
+        global_url = "https://example.awsapps.com/start"
+        self.assertEqual(
+            [per_account_url, global_url],
+            [item.start_url for item in auth.settings],
+        )
+        self.assertEqual(
+            [per_account_url, global_url],
+            [item["scope"] for item in checkpoint.should_run_calls],
+        )
+        self.assertEqual(
+            [per_account_url.rstrip("/"), global_url],
+            [item.scope for item in checkpoint.records],
+        )
+
     async def test_credentials_are_saved_before_import_starts(self):
         calls = []
         checkpoint = FakeCheckpoint()
@@ -166,6 +208,40 @@ class LocalRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, summary.failed)
         self.assertEqual(1, summary.succeeded)
         self.assertEqual(["failed", "success"], [r.status for r in checkpoint.records])
+
+    async def test_enterprise_failure_checkpoint_uses_account_start_url(self):
+        per_account_url = "https://ssoins-example.portal.us-west-2.app.aws/"
+        auth = FakeAuth(
+            [
+                LocalAuthError(
+                    "invalid_credentials",
+                    "enterprise_login",
+                    False,
+                    "登录失败",
+                )
+            ]
+        )
+        checkpoint = FakeCheckpoint()
+        runner = LocalBatchRunner(
+            enterprise=auth,
+            microsoft=auth,
+            store=FakeStore(),
+            checkpoint=checkpoint,
+        )
+
+        await runner.run(
+            [
+                AccountEntry(
+                    1,
+                    "failed-user",
+                    "bad-password",
+                    start_url=per_account_url,
+                )
+            ],
+            settings_for(ResultMode.SAVE_ONLY),
+        )
+
+        self.assertEqual(per_account_url.rstrip("/"), checkpoint.records[0].scope)
 
     async def test_manual_browser_error_is_recorded_for_resume(self):
         error = BrowserFlowError("captcha_required", "mfa", False, "等待人工验证")

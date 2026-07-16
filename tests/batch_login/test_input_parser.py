@@ -65,6 +65,58 @@ class ModelTests(unittest.TestCase):
 
 
 class InputParserTests(unittest.TestCase):
+    def test_enterprise_pipe_format_parses_account_password_and_portal_url(self):
+        portal = "https://ssoins-7223a15405d7b4ec.portal.us-east-1.app.aws/"
+        result = parse_accounts(
+            "mary.smith.bo4y|w77Vs>JO_SqL|" + portal,
+            "{account}|{password}|{start_url}",
+            LoginMode.ENTERPRISE,
+        )
+
+        self.assertEqual([], result.issues)
+        self.assertEqual("mary.smith.bo4y", result.entries[0].account)
+        self.assertEqual("w77Vs>JO_SqL", result.entries[0].password)
+        self.assertEqual(portal, result.entries[0].start_url)
+
+    def test_pipe_format_keeps_separator_characters_inside_password(self):
+        portal = "https://ssoins-abc.portal.us-east-1.app.aws/"
+        result = parse_accounts(
+            "admin-user|part|two|" + portal,
+            "{account}|{password}|{start_url}",
+            LoginMode.ENTERPRISE,
+        )
+
+        self.assertEqual("part|two", result.entries[0].password)
+        self.assertEqual(portal, result.entries[0].start_url)
+
+    def test_start_url_placeholder_rejects_non_https_portal(self):
+        result = parse_accounts(
+            "admin-user|password|http://portal.example/",
+            "{account}|{password}|{start_url}",
+            LoginMode.ENTERPRISE,
+        )
+
+        self.assertEqual("invalid_start_url", result.issues[0].code)
+
+    def test_start_url_placeholder_rejects_embedded_credentials(self):
+        result = parse_accounts(
+            "admin-user|password|https://name:secret@portal.example/",
+            "{account}|{password}|{start_url}",
+            LoginMode.ENTERPRISE,
+        )
+
+        self.assertEqual("invalid_start_url", result.issues[0].code)
+
+    def test_render_accounts_includes_per_account_start_url(self):
+        portal = "https://ssoins-example.portal.us-east-1.app.aws/"
+
+        rendered = render_accounts(
+            [AccountEntry(1, "admin-user", "part|two", portal)],
+            "{account}|{password}|{start_url}",
+        )
+
+        self.assertEqual(f"admin-user|part|two|{portal}", rendered)
+
     def test_full_line_template_parses_literal_prefix_suffix_and_special_password(self):
         password = r"^_S!Ibq1xcU*EwBD$\_AsY8/Oo)"
         result = parse_accounts(

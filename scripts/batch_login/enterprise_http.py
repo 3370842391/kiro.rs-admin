@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 import secrets
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -42,6 +43,15 @@ class EnterpriseHttpError(Exception):
 class EnterpriseHttpSettings:
     start_url: str
     region: str
+
+
+@dataclass(slots=True, frozen=True)
+class _PortalTarget:
+    start_url: str
+    origin: str
+    region: str
+    directory_id: str | None = None
+    instance_id: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -120,6 +130,10 @@ class EnterpriseHttpClient:
         self._account = ""
         self._directory_id = ""
         self._region = ""
+        self._portal_target: _PortalTarget | None = None
+        self._signin_base_url = ""
+        self._oidc_base_url = ""
+        self._portal_api_base_url = ""
         self._fingerprint_identity = None
         self._fingerprint_context = None
         self._fingerprint_config = None
@@ -137,10 +151,30 @@ class EnterpriseHttpClient:
         settings: EnterpriseHttpSettings,
     ) -> EnterpriseHttpResult:
         self._account = account
-        self._region = self._validate_region(settings.region)
-        self._directory_id = self._directory_from_start_url(settings.start_url)
+        target = self._parse_portal_target(settings.start_url, settings.region)
+        self._portal_target = target
+        self._region = target.region
+        self._directory_id = target.directory_id or ""
+        self._signin_base_url = (
+            f"https://{self._region}.signin.aws" if target.directory_id else ""
+        )
+        self._oidc_base_url = (
+            f"https://oidc.{self._region}.api.aws"
+            if target.instance_id
+            else f"https://oidc.{self._region}.amazonaws.com"
+        )
+        self._portal_api_base_url = (
+            f"https://portal.sso.{self._region}.api.aws"
+            if target.instance_id
+            else f"https://portal.sso.{self._region}.amazonaws.com"
+        )
         self._workflow_handle = ""
         self._visitor_id = self._new_visitor_id()
+        client_id, client_secret, device_code, user_code = await self._start_device(
+            settings.start_url
+        )
+        csrf = await self._portal_init()
+        await self._refresh_fingerprint_config()
         scope = f"{self._region}/{self._directory_id}"
         try:
             unresolved = self.vault.unresolved(account, scope=scope)
@@ -149,14 +183,9 @@ class EnterpriseHttpClient:
         login_password = (
             unresolved.password if unresolved is not None else password
         )
-
-        await self._refresh_fingerprint_config()
-        client_id, client_secret, device_code, user_code = await self._start_device(
-            settings.start_url
-        )
         used_fallback = False
         try:
-            redirect, password_changed, csrf = await self._signin_attempt(
+            redirect, password_changed = await self._signin_after_portal(
                 account, login_password
             )
         except EnterpriseHttpError as error:
@@ -171,7 +200,9 @@ class EnterpriseHttpClient:
             used_fallback = True
             self._workflow_handle = ""
             self._visitor_id = self._new_visitor_id()
-            redirect, password_changed, csrf = await self._signin_attempt(
+            csrf = await self._portal_init()
+            await self._refresh_fingerprint_config()
+            redirect, password_changed = await self._signin_after_portal(
                 account, password
             )
         if unresolved is not None and not password_changed:
@@ -198,21 +229,20 @@ class EnterpriseHttpClient:
             expires_in=self._optional_int(token, "expiresIn", "oidc_token"),
         )
 
-    async def _signin_attempt(
+    async def _signin_after_portal(
         self, account: str, password: str
-    ) -> tuple[str, bool, str]:
-        csrf = await self._portal_init()
+    ) -> tuple[str, bool]:
         await self._d2c_init()
         await self._workflow_init()
         encryption_context = await self._submit_username(account)
         redirect, password_changed = await self._submit_password(
             account, password, encryption_context
         )
-        return redirect, password_changed, csrf
+        return redirect, password_changed
 
     async def _start_device(self, start_url: str) -> tuple[str, str, str, str]:
         self._emit("oidc_register")
-        base = f"https://oidc.{self._region}.amazonaws.com"
+        base = self._oidc_base()
         registered = await self._json_request(
             "POST",
             base + "/client/register",
@@ -249,27 +279,36 @@ class EnterpriseHttpClient:
 
     async def _portal_init(self) -> str:
         self._emit("portal_init")
+        if self._portal_target is None:
+            raise EnterpriseHttpError(
+                "invalid_start_url", "config", False, "企业门户尚未初始化"
+            )
         self._set_cookie("awsccc", self._awsccc())
-        portal = f"https://portal.sso.{self._region}.amazonaws.com/login"
-        start = f"https://{self._directory_id}.awsapps.com/start"
-        url = portal + "?" + urlencode(
-            {
-                "directory_id": self._directory_id,
-                "redirect_url": start + "/#/",
+        target = self._portal_target
+        if target.instance_id:
+            query = {
+                "idc_instance_id": target.instance_id,
+                "redirect_url": target.start_url,
             }
-        )
+        else:
+            query = {
+                "directory_id": self._directory_id,
+                "redirect_url": target.start_url.rstrip("/") + "/#/",
+            }
+        url = self._portal_api_base() + "/login?" + urlencode(query)
         data = await self._json_request(
             "GET",
             url,
             stage="portal_init",
             headers={
                 "Accept": "application/json, text/plain, */*",
-                "Origin": f"https://{self._directory_id}.awsapps.com",
-                "Referer": start + "/",
+                "Origin": target.origin,
+                "Referer": target.start_url,
                 "User-Agent": self._user_agent(),
             },
         )
         redirect = self._required_string(data, "redirectUrl", "portal_init")
+        self._apply_signin_redirect(redirect)
         self._workflow_handle = self._query_value(redirect, "workflowStateHandle")
         csrf = self._required_string(data, "csrfToken", "portal_init")
         self._set_cookie("loginCsrfToken", csrf)
@@ -502,8 +541,12 @@ class EnterpriseHttpClient:
 
     async def _exchange_sso(self, auth_code: str, state: str, csrf: str) -> str:
         self._emit("sso_token")
-        origin = f"https://{self._directory_id}.awsapps.com"
-        url = f"https://portal.sso.{self._region}.amazonaws.com/auth/sso-token"
+        if self._portal_target is None:
+            raise EnterpriseHttpError(
+                "invalid_start_url", "config", False, "企业门户尚未初始化"
+            )
+        origin = self._portal_target.origin
+        url = self._portal_api_base() + "/auth/sso-token"
         headers = {
             "Accept": "application/json, text/plain, */*",
             "Content-Type": "application/x-www-form-urlencoded",
@@ -554,7 +597,7 @@ class EnterpriseHttpClient:
         )
 
     async def _associate_device(self, user_code: str, sso_token: str) -> None:
-        base = f"https://oidc.{self._region}.amazonaws.com/device_authorization"
+        base = self._oidc_base() + "/device_authorization"
         accepted = await self._json_request(
             "POST",
             base + "/accept_user_code",
@@ -591,7 +634,7 @@ class EnterpriseHttpClient:
         client_secret: str,
         device_code: str,
     ) -> dict[str, object]:
-        url = f"https://oidc.{self._region}.amazonaws.com/token"
+        url = self._oidc_base() + "/token"
         interval = 2.0
         payload = {
             "clientId": client_id,
@@ -748,7 +791,7 @@ class EnterpriseHttpClient:
         try:
             response = await self.transport.request(
                 "GET",
-                "https://us-east-1.signin.aws/assets/js/app.js",
+                self._signin_base() + "/assets/js/app.js",
                 headers={"Accept": "*/*", "User-Agent": self._user_agent()},
             )
             if response.status_code == 200 and isinstance(response.data, str):
@@ -824,7 +867,20 @@ class EnterpriseHttpClient:
         }
 
     def _signin_base(self) -> str:
-        return f"https://{self._region}.signin.aws"
+        if not self._signin_base_url:
+            raise EnterpriseHttpError(
+                "invalid_signin_redirect",
+                "portal_init",
+                False,
+                "企业门户尚未返回 signin 地址",
+            )
+        return self._signin_base_url
+
+    def _oidc_base(self) -> str:
+        return self._oidc_base_url
+
+    def _portal_api_base(self) -> str:
+        return self._portal_api_base_url
 
     def _user_agent(self) -> str:
         value = getattr(self._fingerprint_identity, "user_agent", None)
@@ -917,25 +973,76 @@ class EnterpriseHttpClient:
             raise EnterpriseHttpError("invalid_region", "config", False, "Region 格式无效")
         return region
 
-    @staticmethod
-    def _directory_from_start_url(start_url: str) -> str:
+    @classmethod
+    def _parse_portal_target(
+        cls, start_url: str, configured_region: str
+    ) -> _PortalTarget:
         parts = urlsplit(start_url.strip())
-        if parts.scheme != "https" or not parts.hostname:
+        if (
+            parts.scheme != "https"
+            or not parts.hostname
+            or parts.username is not None
+            or parts.password is not None
+        ):
             raise EnterpriseHttpError(
                 "invalid_start_url", "config", False, "企业 Start URL 必须是 HTTPS"
             )
         hostname = parts.hostname.lower()
-        suffix = ".awsapps.com"
-        if not hostname.endswith(suffix):
-            raise EnterpriseHttpError(
-                "invalid_start_url", "config", False, "企业 Start URL 域名无效"
+        old_match = re.fullmatch(r"(d-[a-z0-9]+)\.awsapps\.com", hostname)
+        if old_match:
+            region = cls._validate_region(configured_region)
+            origin = f"https://{hostname}"
+            return _PortalTarget(
+                start_url=start_url.strip(),
+                origin=origin,
+                region=region,
+                directory_id=old_match.group(1),
             )
-        directory_id = hostname[: -len(suffix)]
-        if not directory_id.startswith("d-") or "." in directory_id:
-            raise EnterpriseHttpError(
-                "invalid_start_url", "config", False, "Start URL 缺少企业目录 ID"
+        new_match = re.fullmatch(
+            r"(ssoins-[a-z0-9]+)\.portal\.([a-z0-9-]+)\.app\.aws",
+            hostname,
+        )
+        if new_match:
+            region = cls._validate_region(new_match.group(2))
+            origin = f"https://{hostname}"
+            normalized = start_url.strip()
+            if not parts.path:
+                normalized += "/"
+            return _PortalTarget(
+                start_url=normalized,
+                origin=origin,
+                region=region,
+                instance_id=new_match.group(1),
             )
-        return directory_id
+        raise EnterpriseHttpError(
+            "invalid_start_url", "config", False, "企业门户 URL 域名无效"
+        )
+
+    def _apply_signin_redirect(self, redirect: str) -> None:
+        parts = urlsplit(redirect)
+        hostname = (parts.hostname or "").lower()
+        allowed_hosts = {
+            f"{self._region}.signin.aws",
+            f"{self._region}.sso.signin.aws",
+        }
+        match = re.fullmatch(r"/platform/(d-[a-z0-9]+)/login", parts.path)
+        if parts.scheme != "https" or hostname not in allowed_hosts or match is None:
+            raise EnterpriseHttpError(
+                "invalid_signin_redirect",
+                "portal_init",
+                False,
+                "企业门户返回了不可信的 signin 地址",
+            )
+        discovered = match.group(1)
+        if self._directory_id and self._directory_id != discovered:
+            raise EnterpriseHttpError(
+                "directory_mismatch",
+                "portal_init",
+                False,
+                "企业门户返回的目录 ID 不匹配",
+            )
+        self._directory_id = discovered
+        self._signin_base_url = f"https://{hostname}"
 
     def _set_cookie(self, name: str, value: str) -> None:
         cookies = getattr(self.transport, "cookies", None)

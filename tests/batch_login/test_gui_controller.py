@@ -9,8 +9,9 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from batch_login.gui_controller import GuiController, GuiFormState
+from batch_login.gui_app import BatchLoginApp
 from batch_login.gui_runtime import GuiRuntime
-from batch_login.models import AccountEntry, LoginMode
+from batch_login.models import AccountEntry, LoginMode, ParseResult
 from batch_login.worker_events import ResultMode
 
 
@@ -58,6 +59,39 @@ class FakeRuntime:
         self.closed.set()
 
 
+class FakeVar:
+    def __init__(self, value=None):
+        self.value = value
+
+    def get(self):
+        return self.value
+
+    def set(self, value):
+        self.value = value
+
+
+class FakeText:
+    def __init__(self, value):
+        self.value = value
+
+    def get(self, _start, _end):
+        return self.value
+
+
+class FakePreview:
+    def __init__(self):
+        self.rows = []
+
+    def get_children(self):
+        return ()
+
+    def delete(self, *_items):
+        self.rows.clear()
+
+    def insert(self, _parent, _index, *, values):
+        self.rows.append(values)
+
+
 class GuiControllerTests(unittest.TestCase):
     def tearDown(self):
         controller = getattr(self, "controller", None)
@@ -75,6 +109,50 @@ class GuiControllerTests(unittest.TestCase):
         form = valid_form(start_url="")
 
         self.assertIn("企业模式必须填写 Start URL", form.validate())
+
+    def test_enterprise_validation_can_defer_start_url_to_entries(self):
+        form = valid_form(start_url="")
+
+        self.assertNotIn(
+            "企业模式必须填写 Start URL",
+            form.validate(require_start_url=False),
+        )
+
+    def test_start_allows_missing_global_url_when_every_entry_has_one(self):
+        runtime = FakeRuntime()
+        self.controller = GuiController(
+            runtime_factory=lambda _form, _emit: runtime
+        )
+        entries = [
+            AccountEntry(
+                1,
+                "admin-user",
+                "one-time-password",
+                "https://ssoins-example.portal.us-east-1.app.aws/",
+            )
+        ]
+
+        self.controller.start(entries, valid_form(start_url=""))
+        self.controller.thread.join(timeout=1)
+
+        self.assertTrue(runtime.started.is_set())
+
+    def test_start_requires_global_url_when_any_entry_has_no_url(self):
+        self.controller = GuiController(
+            runtime_factory=lambda _form, _emit: FakeRuntime()
+        )
+        entries = [
+            AccountEntry(
+                1,
+                "admin-user",
+                "one-time-password",
+                "https://ssoins-example.portal.us-east-1.app.aws/",
+            ),
+            AccountEntry(2, "admin-user-2", "one-time-password-2"),
+        ]
+
+        with self.assertRaisesRegex(ValueError, "Start URL"):
+            self.controller.start(entries, valid_form(start_url=""))
 
     def test_enterprise_password_vault_defaults_next_to_credential_json(self):
         form = valid_form(password_vault_path="")
@@ -149,6 +227,24 @@ class GuiControllerTests(unittest.TestCase):
         self.assertTrue(runtime.imported)
         self.assertTrue(runtime.closed.is_set())
 
+    def test_import_existing_does_not_require_enterprise_start_url(self):
+        runtime = FakeRuntime()
+        self.controller = GuiController(
+            runtime_factory=lambda _form, _emit: runtime
+        )
+        form = valid_form(
+            start_url="",
+            result_mode=ResultMode.SAVE_AND_IMPORT,
+            rs_url="https://rs.example",
+            admin_key="admin-key",
+        )
+
+        self.controller.import_existing(form)
+        self.controller.thread.join(timeout=1)
+
+        self.assertTrue(runtime.imported)
+        self.assertTrue(runtime.closed.is_set())
+
     def test_input_and_credential_paths_must_differ(self):
         path = str(Path("same-file.txt").resolve())
 
@@ -163,6 +259,75 @@ class GuiControllerTests(unittest.TestCase):
         form = valid_form(password_vault_path="credentials.json")
 
         self.assertIn("密码保险库不能覆盖完整凭据 JSON", form.validate())
+
+
+class BatchLoginAppTests(unittest.TestCase):
+    def make_app(self, text, *, start_url=""):
+        app = BatchLoginApp.__new__(BatchLoginApp)
+        app.input_text = FakeText(text)
+        app.input_template_var = FakeVar("{account}|{password}|{start_url}")
+        app.mode_var = FakeVar(LoginMode.ENTERPRISE.value)
+        app.start_url_var = FakeVar(start_url)
+        app.status_var = FakeVar("")
+        app.show_password_var = FakeVar(False)
+        app.preview = FakePreview()
+        app.last_result = ParseResult([], [])
+        app.entries = []
+        return app
+
+    def test_three_field_format_is_available_as_a_preset(self):
+        self.assertIn(
+            "{account}|{password}|{start_url}",
+            BatchLoginApp.INPUT_FORMAT_PRESETS,
+        )
+
+    def test_preview_masks_password_and_displays_enterprise_portal(self):
+        app = self.make_app("")
+        password = "secret-password"
+        portal = "https://ssoins-example.portal.us-east-1.app.aws/"
+
+        app._render_preview(
+            ParseResult(
+                [AccountEntry(1, "admin-user", password, portal)],
+                [],
+            )
+        )
+
+        values = app.preview.rows[0]
+        self.assertNotIn(password, values)
+        self.assertEqual(portal, values[3])
+
+    def test_convert_preview_fills_unique_per_entry_portal(self):
+        portal = "https://ssoins-example.portal.us-east-1.app.aws/"
+        app = self.make_app(f"admin-user|secret-password|{portal}")
+
+        app._convert_preview()
+
+        self.assertEqual(portal, app.start_url_var.get())
+        self.assertNotIn("secret-password", app.status_var.get())
+
+    def test_convert_preview_keeps_global_url_for_multiple_portals(self):
+        first = "https://ssoins-first.portal.us-east-1.app.aws/"
+        second = "https://ssoins-second.portal.us-east-1.app.aws/"
+        app = self.make_app(
+            "\n".join(
+                [
+                    f"admin-user|secret-one|{first}",
+                    f"admin-user-2|secret-two|{second}",
+                ]
+            ),
+            start_url="https://global.example/start",
+        )
+
+        app._convert_preview()
+
+        self.assertEqual(
+            "https://global.example/start",
+            app.start_url_var.get(),
+        )
+        self.assertIn("按每行企业门户登录", app.status_var.get())
+        self.assertNotIn("secret-one", app.status_var.get())
+        self.assertNotIn("secret-two", app.status_var.get())
 
 
 class FakeResource:

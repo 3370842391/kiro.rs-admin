@@ -15,6 +15,11 @@ from .worker_events import ResultMode, WorkerEvent
 
 class BatchLoginApp:
     POLL_MS = 100
+    INPUT_FORMAT_PRESETS = (
+        "login = {account} / onetime password = {password}",
+        "{account}----{password}",
+        "{account}|{password}|{start_url}",
+    )
 
     def __init__(
         self,
@@ -112,10 +117,7 @@ class BatchLoginApp:
         input_format = ttk.Combobox(
             frame,
             textvariable=self.input_template_var,
-            values=(
-                "login = {account} / onetime password = {password}",
-                "{account}----{password}",
-            ),
+            values=self.INPUT_FORMAT_PRESETS,
         )
         input_format.grid(row=0, column=0, sticky="ew", padx=(0, 6))
         output_format = ttk.Entry(
@@ -158,7 +160,14 @@ class BatchLoginApp:
         )
         self.input_text.pack(fill="both", expand=True)
         self.run_sensitive.append(self.input_text)
-        columns = ("line", "account", "password", "status", "reason")
+        columns = (
+            "line",
+            "account",
+            "password",
+            "start_url",
+            "status",
+            "reason",
+        )
         self.preview = ttk.Treeview(
             right,
             columns=columns,
@@ -169,6 +178,7 @@ class BatchLoginApp:
             ("line", "行", 48),
             ("account", "账号", 180),
             ("password", "密码", 150),
+            ("start_url", "企业门户", 260),
             ("status", "状态", 85),
             ("reason", "原因", 180),
         ):
@@ -483,6 +493,7 @@ class BatchLoginApp:
                     line_number,
                     entry.account if entry else "",
                     password,
+                    entry.start_url if entry else "",
                     "有效" if entry else issue.code,
                     "" if issue is None else issue.message,
                 ),
@@ -503,8 +514,17 @@ class BatchLoginApp:
         self.last_result = result
         self.entries = result.entries
         self._render_preview(result)
+        per_entry_urls = {
+            entry.start_url for entry in result.entries if entry.start_url
+        }
+        portal_status = ""
+        if len(per_entry_urls) == 1:
+            self.start_url_var.set(next(iter(per_entry_urls)))
+        elif len(per_entry_urls) > 1:
+            portal_status = "，按每行企业门户登录"
         self.status_var.set(
             f"已解析 {len(result.entries)} 个账号，{len(result.issues)} 个提示"
+            f"{portal_status}"
         )
 
     def _render_last_preview(self) -> None:

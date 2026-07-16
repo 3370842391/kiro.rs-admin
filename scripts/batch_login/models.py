@@ -24,6 +24,7 @@ class AccountEntry:
     line_number: int
     account: str
     password: str = field(repr=False)
+    start_url: str | None = None
 
     @property
     def account_hash(self) -> str:

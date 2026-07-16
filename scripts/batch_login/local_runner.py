@@ -54,7 +54,7 @@ class LocalBatchRunner:
         self.emit(WorkerEvent("batch_started", {"total": len(entries)}))
         try:
             for index, entry in enumerate(entries, start=1):
-                scope = self._scope(settings)
+                scope = self._scope(settings, entry)
                 if not self.checkpoint.should_run(
                     account=entry.account,
                     mode=settings.mode.value,
@@ -131,7 +131,7 @@ class LocalBatchRunner:
             return await self.enterprise.login(
                 entry,
                 EnterpriseSettings(
-                    settings.start_url or "",
+                    entry.start_url or settings.start_url or "",
                     settings.region,
                 ),
             )
@@ -189,7 +189,7 @@ class LocalBatchRunner:
             line_number=entry.line_number,
             account=entry.account,
             mode=settings.mode.value,
-            scope=self._scope(settings),
+            scope=self._scope(settings, entry),
             status=status,
             stage=error.stage,
             retryable=error.retryable,
@@ -210,7 +210,12 @@ class LocalBatchRunner:
         )
 
     @staticmethod
-    def _scope(settings: LocalRunSettings) -> str:
+    def _scope(
+        settings: LocalRunSettings,
+        entry: AccountEntry | None = None,
+    ) -> str:
         if settings.mode is LoginMode.MICROSOFT:
             return "microsoft"
+        if entry is not None and entry.start_url:
+            return entry.start_url
         return settings.start_url or ""

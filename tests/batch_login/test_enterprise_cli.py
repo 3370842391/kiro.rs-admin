@@ -34,8 +34,10 @@ def credential(account="admin-user"):
 class FakeAuth:
     def __init__(self, results):
         self.results = list(results)
+        self.settings = []
 
     async def login(self, entry, settings):
+        self.settings.append(settings)
         result = self.results.pop(0)
         if isinstance(result, BaseException):
             raise result
@@ -52,6 +54,18 @@ class FakeStore:
 
 
 class EnterpriseCliTests(unittest.IsolatedAsyncioTestCase):
+    def test_parser_allows_per_account_start_urls_without_global_start_url(self):
+        args = build_parser().parse_args(
+            [
+                "--input",
+                "accounts.txt",
+                "--output",
+                "credentials.json",
+            ]
+        )
+
+        self.assertEqual("", args.start_url)
+
     def test_parser_defaults_password_vault_next_to_output(self):
         args = build_parser().parse_args(
             [
@@ -111,6 +125,65 @@ class EnterpriseCliTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("good-user", store.records[0].email)
         self.assertNotIn("bad-password", str(events))
         self.assertNotIn("good-password", str(events))
+
+    async def test_per_account_start_url_overrides_global_and_falls_back(self):
+        auth = FakeAuth([credential("first-user"), credential("second-user")])
+
+        summary = await process_entries(
+            [
+                AccountEntry(
+                    1,
+                    "first-user",
+                    "first-password",
+                    "https://ssoins-first.portal.us-east-1.app.aws/",
+                ),
+                AccountEntry(2, "second-user", "second-password"),
+            ],
+            auth,
+            FakeStore(),
+            start_url="https://d-global.awsapps.com/start",
+            region="us-east-1",
+        )
+
+        self.assertEqual({"total": 2, "succeeded": 2, "failed": 0}, summary)
+        self.assertEqual(
+            [
+                "https://ssoins-first.portal.us-east-1.app.aws/",
+                "https://d-global.awsapps.com/start",
+            ],
+            [settings.start_url for settings in auth.settings],
+        )
+
+    async def test_missing_start_url_fails_only_that_account_and_continues(self):
+        auth = FakeAuth([credential("good-user")])
+        events = []
+
+        summary = await process_entries(
+            [
+                AccountEntry(1, "bad-user", "never-log-this-password"),
+                AccountEntry(
+                    2,
+                    "good-user",
+                    "also-secret",
+                    "https://ssoins-good.portal.us-east-1.app.aws/",
+                ),
+            ],
+            auth,
+            FakeStore(),
+            start_url="",
+            region="us-east-1",
+            emit=events.append,
+        )
+
+        self.assertEqual({"total": 2, "succeeded": 1, "failed": 1}, summary)
+        self.assertEqual(
+            ["https://ssoins-good.portal.us-east-1.app.aws/"],
+            [settings.start_url for settings in auth.settings],
+        )
+        self.assertEqual("missing_start_url", events[1]["code"])
+        self.assertEqual("configuration", events[1]["stage"])
+        self.assertNotIn("never-log-this-password", str(events))
+        self.assertNotIn("also-secret", str(events))
 
 
 if __name__ == "__main__":

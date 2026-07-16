@@ -3,12 +3,14 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 from .models import AccountEntry, LoginMode, ParseIssue, ParseResult
 
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-PLACEHOLDER_RE = re.compile(r"{(?:account|password)}")
+PLACEHOLDER_RE = re.compile(r"{(?:account|password|start_url)}")
+PLACEHOLDER_TOKEN_RE = re.compile(r"{(?P<name>account|password|start_url)}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,31 +21,22 @@ class CompiledFormat:
 def compile_format(template: str) -> CompiledFormat:
     if template.count("{account}") != 1 or template.count("{password}") != 1:
         raise ValueError("格式模板必须恰好包含一次 {account} 和一次 {password}")
+    if template.count("{start_url}") > 1:
+        raise ValueError("格式模板最多包含一次 {start_url}")
 
-    account_index = template.index("{account}")
-    password_index = template.index("{password}")
-    if account_index < password_index:
-        prefix = template[:account_index]
-        separator = template[account_index + len("{account}") : password_index]
-        suffix = template[password_index + len("{password}") :]
-        expression = (
-            re.escape(prefix)
-            + r"(?P<account>.*?)"
-            + re.escape(separator)
-            + r"(?P<password>.*)"
-            + re.escape(suffix)
-        )
-    else:
-        prefix = template[:password_index]
-        separator = template[password_index + len("{password}") : account_index]
-        suffix = template[account_index + len("{account}") :]
-        expression = (
-            re.escape(prefix)
-            + r"(?P<password>.*)"
-            + re.escape(separator)
-            + r"(?P<account>.*?)"
-            + re.escape(suffix)
-        )
+    matches = list(PLACEHOLDER_TOKEN_RE.finditer(template))
+    expression_parts: list[str] = []
+    cursor = 0
+    for match in matches:
+        expression_parts.append(re.escape(template[cursor : match.start()]))
+        name = match.group("name")
+        # Password is greedy so a separator character inside the password is
+        # preserved and the final delimiter before the next field is used.
+        quantifier = ".*" if name == "password" else ".*?"
+        expression_parts.append(f"(?P<{name}>{quantifier})")
+        cursor = match.end()
+    expression_parts.append(re.escape(template[cursor:]))
+    expression = "".join(expression_parts)
 
     return CompiledFormat(pattern=re.compile(r"\A" + expression + r"\Z"))
 
@@ -65,12 +58,31 @@ def parse_accounts(text: str, template: str, mode: LoginMode) -> ParseResult:
 
         account = match.group("account").strip()
         password = match.group("password")
+        start_url = match.groupdict().get("start_url")
+        if start_url is not None:
+            start_url = start_url.strip()
         if not account:
             issues.append(ParseIssue(line_number, "empty_account", "账号为空"))
             continue
         if password == "":
             issues.append(ParseIssue(line_number, "empty_password", "密码为空"))
             continue
+        if start_url is not None:
+            try:
+                parts = urlsplit(start_url)
+                valid_url = (
+                    parts.scheme == "https"
+                    and bool(parts.hostname)
+                    and parts.username is None
+                    and parts.password is None
+                )
+            except ValueError:
+                valid_url = False
+            if not valid_url:
+                issues.append(
+                    ParseIssue(line_number, "invalid_start_url", "企业门户 URL 必须是 HTTPS")
+                )
+                continue
         if mode is LoginMode.MICROSOFT and not EMAIL_RE.fullmatch(account):
             issues.append(ParseIssue(line_number, "invalid_account", "Microsoft 模式要求邮箱账号"))
             continue
@@ -80,7 +92,14 @@ def parse_accounts(text: str, template: str, mode: LoginMode) -> ParseResult:
             issues.append(ParseIssue(line_number, "duplicate_input", "输入中账号重复"))
             continue
         seen.add(key)
-        entries.append(AccountEntry(line_number=line_number, account=account, password=password))
+        entries.append(
+            AccountEntry(
+                line_number=line_number,
+                account=account,
+                password=password,
+                start_url=start_url,
+            )
+        )
 
     return ParseResult(entries=entries, issues=issues)
 
@@ -89,9 +108,11 @@ def render_accounts(entries: Iterable[AccountEntry], template: str) -> str:
     compile_format(template)
 
     def render_entry(entry: AccountEntry) -> str:
-        return PLACEHOLDER_RE.sub(
-            lambda match: entry.account if match.group() == "{account}" else entry.password,
-            template,
-        )
+        values = {
+            "{account}": entry.account,
+            "{password}": entry.password,
+            "{start_url}": entry.start_url or "",
+        }
+        return PLACEHOLDER_RE.sub(lambda match: values[match.group()], template)
 
     return "\n".join(render_entry(entry) for entry in entries)

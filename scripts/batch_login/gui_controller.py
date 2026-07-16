@@ -44,14 +44,18 @@ class GuiFormState:
     remote_port: int = 8990
     local_port: int | None = None
 
-    def validate(self) -> list[str]:
+    def validate(self, *, require_start_url: bool = True) -> list[str]:
         errors: list[str] = []
         try:
             compile_format(self.input_template)
             compile_format(self.output_template)
         except ValueError as error:
             errors.append(str(error))
-        if self.mode is LoginMode.ENTERPRISE and not self.start_url.strip():
+        if (
+            self.mode is LoginMode.ENTERPRISE
+            and require_start_url
+            and not self.start_url.strip()
+        ):
             errors.append("企业模式必须填写 Start URL")
         if not self.region.strip():
             errors.append("Region 不能为空")
@@ -142,17 +146,28 @@ class GuiController:
         entries: list[AccountEntry],
         form: GuiFormState,
     ) -> None:
-        self._validate_start(form)
+        has_per_entry_urls = bool(entries) and all(
+            entry.start_url and entry.start_url.strip() for entry in entries
+        )
+        self._validate_start(
+            form,
+            require_start_url=not has_per_entry_urls,
+        )
         self._start_thread("run", entries, form)
 
     def import_existing(self, form: GuiFormState) -> None:
-        self._validate_start(form)
+        self._validate_start(form, require_start_url=False)
         if form.result_mode is not ResultMode.SAVE_AND_IMPORT:
             raise ValueError("导入已有 JSON 必须选择保存并导入 RS")
         self._start_thread("import", [], form)
 
-    def _validate_start(self, form: GuiFormState) -> None:
-        errors = form.validate()
+    def _validate_start(
+        self,
+        form: GuiFormState,
+        *,
+        require_start_url: bool = True,
+    ) -> None:
+        errors = form.validate(require_start_url=require_start_url)
         if errors:
             raise ValueError("\n".join(errors))
         if self.thread is not None and self.thread.is_alive():

@@ -28,7 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--input", required=True, help="账号文件；- 表示从 stdin 读取")
     parser.add_argument("--format", default=DEFAULT_FORMAT, help="账号密码解析模板")
-    parser.add_argument("--start-url", required=True, help="企业 AWS apps Start URL")
+    parser.add_argument("--start-url", default="", help="企业 AWS apps Start URL")
     parser.add_argument("--region", default="us-east-1")
     parser.add_argument("--output", required=True, type=Path, help="完整凭据 JSON")
     parser.add_argument(
@@ -74,7 +74,6 @@ async def process_entries(
     emit=lambda _event: None,
 ) -> dict[str, int]:
     summary = {"total": len(entries), "succeeded": 0, "failed": 0}
-    settings = EnterpriseSettings(start_url, region)
     for index, entry in enumerate(entries, start=1):
         emit(
             {
@@ -85,6 +84,15 @@ async def process_entries(
             }
         )
         try:
+            effective_start_url = entry.start_url or start_url
+            if not effective_start_url.strip():
+                raise EnterpriseHttpError(
+                    "missing_start_url",
+                    "configuration",
+                    False,
+                    "企业 Start URL 不能为空",
+                )
+            settings = EnterpriseSettings(effective_start_url, region)
             record = await auth.login(entry, settings)
             store.append(record)
             summary["succeeded"] += 1
