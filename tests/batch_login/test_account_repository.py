@@ -17,6 +17,7 @@ from batch_login.account_repository import (
     LoginStatus,
 )
 from batch_login.models import AccountEntry, LoginMode
+from batch_login.credential_models import CredentialRecord
 
 
 class FakeProtector:
@@ -197,6 +198,44 @@ class AccountRepositoryTests(unittest.TestCase):
             self.assertNotIn("current-secret", serialized)
             self.assertIn("password_updated", serialized)
             self.assertIn("marked_sold", serialized)
+
+    def test_credential_is_encrypted_and_round_trips_with_success_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self.make_repo(tmp)
+            item = repo.upsert_entries(
+                [entry()], login_mode=LoginMode.ENTERPRISE, region="us-east-1"
+            )[0]
+            credential = CredentialRecord(
+                email="admin-user", auth_method="idc", provider="Enterprise",
+                refresh_token="refresh-secret", client_secret="client-secret",
+                start_url="https://portal.example/start",
+            )
+
+            repo.save_credential(item.id, credential)
+            restored = repo.load_credential(item.id)
+            account = repo.get(item.id)
+
+            self.assertEqual(credential.as_add_request(), restored.as_add_request())
+            self.assertIs(CredentialStatus.VALID, account.credential_status)
+            self.assertIs(LoginStatus.SUCCESS, account.login_status)
+            raw = repo.path.read_bytes()
+            self.assertNotIn(b"refresh-secret", raw)
+            self.assertNotIn(b"client-secret", raw)
+
+    def test_login_failure_stores_only_safe_diagnostics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self.make_repo(tmp)
+            item = repo.upsert_entries(
+                [entry()], login_mode=LoginMode.ENTERPRISE, region="us-east-1"
+            )[0]
+
+            repo.mark_login_running([item.id])
+            repo.mark_login_failed(item.id, "invalid_credentials", "password")
+
+            failed = repo.get(item.id)
+            self.assertIs(LoginStatus.FAILED, failed.login_status)
+            self.assertEqual("invalid_credentials", failed.last_error_code)
+            self.assertEqual("password", failed.last_error_stage)
 
 
 if __name__ == "__main__":

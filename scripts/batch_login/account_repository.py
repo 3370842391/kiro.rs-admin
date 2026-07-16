@@ -11,6 +11,7 @@ from enum import Enum
 from pathlib import Path
 
 from .models import AccountEntry, LoginMode
+from .credential_models import CredentialRecord
 from .password_vault import SecretProtector, WindowsDpapiProtector
 
 
@@ -298,6 +299,112 @@ class AccountRepository:
         except sqlite3.Error as error:
             raise AccountRepositoryError("账号导出状态更新失败") from error
         return len(ids)
+
+    def save_credential(
+        self, account_id: int, credential: CredentialRecord
+    ) -> None:
+        try:
+            raw = json.dumps(
+                credential.as_add_request(), ensure_ascii=False
+            ).encode("utf-8")
+            encrypted = self.protector.protect(raw)
+        except Exception as error:
+            raise AccountRepositoryError("账号凭据加密失败") from error
+        now = self._utc_now()
+        try:
+            with self._transaction() as connection:
+                self._require_ids(connection, [account_id])
+                connection.execute(
+                    """
+                    INSERT INTO credentials(account_id, credential_ciphertext, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(account_id) DO UPDATE SET
+                        credential_ciphertext = excluded.credential_ciphertext,
+                        updated_at = excluded.updated_at
+                    """,
+                    (account_id, encrypted, now),
+                )
+                connection.execute(
+                    """
+                    UPDATE accounts SET credential_status = ?, login_status = ?,
+                        last_error_code = NULL, last_error_stage = NULL,
+                        last_login_at = ?, updated_at = ? WHERE id = ?
+                    """,
+                    (
+                        CredentialStatus.VALID.value,
+                        LoginStatus.SUCCESS.value,
+                        now,
+                        now,
+                        account_id,
+                    ),
+                )
+                self._append_history(
+                    connection, account_id, "credential_saved", {}, now
+                )
+        except AccountRepositoryError:
+            raise
+        except sqlite3.Error as error:
+            raise AccountRepositoryError("账号凭据保存失败") from error
+
+    def load_credential(self, account_id: int) -> CredentialRecord | None:
+        try:
+            with closing(self._connect()) as connection:
+                row = connection.execute(
+                    "SELECT credential_ciphertext FROM credentials WHERE account_id = ?",
+                    (account_id,),
+                ).fetchone()
+            if row is None:
+                return None
+            raw = self.protector.unprotect(bytes(row[0]))
+            payload = json.loads(raw.decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("invalid credential")
+            return CredentialRecord.from_add_request(payload)
+        except Exception as error:
+            if isinstance(error, AccountRepositoryError):
+                raise
+            raise AccountRepositoryError("账号凭据读取失败") from error
+
+    def mark_login_running(self, account_ids: Sequence[int]) -> int:
+        ids = self._unique_ids(account_ids)
+        now = self._utc_now()
+        try:
+            with self._transaction() as connection:
+                self._require_ids(connection, ids)
+                for account_id in ids:
+                    connection.execute(
+                        "UPDATE accounts SET login_status = ?, updated_at = ? WHERE id = ?",
+                        (LoginStatus.RUNNING.value, now, account_id),
+                    )
+        except AccountRepositoryError:
+            raise
+        except sqlite3.Error as error:
+            raise AccountRepositoryError("登录状态更新失败") from error
+        return len(ids)
+
+    def mark_login_failed(self, account_id: int, code: str, stage: str) -> None:
+        now = self._utc_now()
+        try:
+            with self._transaction() as connection:
+                self._require_ids(connection, [account_id])
+                connection.execute(
+                    """
+                    UPDATE accounts SET login_status = ?, last_error_code = ?,
+                        last_error_stage = ?, updated_at = ? WHERE id = ?
+                    """,
+                    (LoginStatus.FAILED.value, code, stage, now, account_id),
+                )
+                self._append_history(
+                    connection,
+                    account_id,
+                    "login_failed",
+                    {"code": code, "stage": stage},
+                    now,
+                )
+        except AccountRepositoryError:
+            raise
+        except sqlite3.Error as error:
+            raise AccountRepositoryError("登录失败状态保存失败") from error
 
     def _update_lifecycle(
         self,
