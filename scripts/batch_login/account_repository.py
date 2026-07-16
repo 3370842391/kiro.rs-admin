@@ -248,6 +248,57 @@ class AccountRepository:
             operation="restored_managed",
         )
 
+    def record_exported(
+        self,
+        account_ids: Sequence[int],
+        *,
+        note: str,
+        mark_sold: bool,
+    ) -> int:
+        ids = self._unique_ids(account_ids)
+        now = self._utc_now()
+        try:
+            with self._transaction() as connection:
+                self._require_ids(connection, ids)
+                for account_id in ids:
+                    if mark_sold:
+                        connection.execute(
+                            """
+                            UPDATE accounts
+                            SET last_exported_at = ?, lifecycle_status = ?,
+                                note = ?, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                now,
+                                LifecycleStatus.SOLD.value,
+                                note.strip(),
+                                now,
+                                account_id,
+                            ),
+                        )
+                    else:
+                        connection.execute(
+                            """
+                            UPDATE accounts
+                            SET last_exported_at = ?, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (now, now, account_id),
+                        )
+                    self._append_history(
+                        connection,
+                        account_id,
+                        "account_exported",
+                        {"markedSold": mark_sold},
+                        now,
+                    )
+        except AccountRepositoryError:
+            raise
+        except sqlite3.Error as error:
+            raise AccountRepositoryError("账号导出状态更新失败") from error
+        return len(ids)
+
     def _update_lifecycle(
         self,
         account_ids: Sequence[int],
