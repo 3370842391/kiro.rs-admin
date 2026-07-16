@@ -155,6 +155,7 @@ class RsImportClient:
         verify: bool = True,
         concurrency: int = 8,
     ) -> dict[str, Any]:
+        credential_list = list(credentials)
         summary: dict[str, Any] | None = None
         buffer = ""
         try:
@@ -163,7 +164,7 @@ class RsImportClient:
                 self.base_url + "/credentials/batch-import",
                 headers={"accept": "text/event-stream"},
                 json={
-                    "credentials": list(credentials),
+                    "credentials": credential_list,
                     "verify": verify,
                     "concurrency": concurrency,
                 },
@@ -184,11 +185,70 @@ class RsImportClient:
                                 summary = candidate
                         else:
                             on_event(sanitized)
-        except RsApiError:
+        except RsApiError as error:
+            if error.status_code in {404, 405}:
+                return await self._legacy_single_import(
+                    credential_list,
+                    on_event,
+                )
             raise
         except httpx.RequestError as error:
             raise _network_error(stage="batch_import") from error
 
         if summary is None:
             raise _protocol_error("RS 导入响应缺少 summary")
+        return summary
+
+    async def _legacy_single_import(
+        self,
+        credentials: list[dict[str, Any]],
+        on_event: Callable[[dict[str, Any]], None],
+    ) -> dict[str, Any]:
+        summary = {
+            "total": len(credentials),
+            "imported": 0,
+            "verified": 0,
+            "duplicate": 0,
+            "failed": 0,
+            "rolledBack": 0,
+        }
+        for index, credential in enumerate(credentials):
+            event: dict[str, Any] = {
+                "index": index,
+                "credentialId": None,
+                "email": credential.get("email"),
+                "compatibilityMode": "legacy-single-add",
+            }
+            try:
+                response = await self.client.post(
+                    self.base_url + "/credentials",
+                    headers={"accept": "application/json"},
+                    json=credential,
+                )
+            except httpx.RequestError:
+                event.update(status="failed", error="RS 单条导入网络请求失败")
+                summary["failed"] += 1
+            else:
+                if response.status_code in {401, 403}:
+                    raise _http_error(response, stage="batch_import")
+                if 200 <= response.status_code < 300:
+                    try:
+                        data = response.json()
+                    except ValueError:
+                        data = {}
+                    if isinstance(data, dict):
+                        event["credentialId"] = data.get("credentialId")
+                        event["email"] = data.get("email") or event["email"]
+                    event["status"] = "imported"
+                    summary["imported"] += 1
+                elif response.status_code == 409:
+                    event.update(status="duplicate", error="RS 已存在该凭据")
+                    summary["duplicate"] += 1
+                else:
+                    event.update(
+                        status="failed",
+                        error=f"RS 单条导入失败（HTTP {response.status_code}）",
+                    )
+                    summary["failed"] += 1
+            on_event(_sanitize_event_value(event))
         return summary

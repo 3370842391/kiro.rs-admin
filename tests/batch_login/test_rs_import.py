@@ -43,6 +43,69 @@ class BlockingStream(httpx.AsyncByteStream):
 
 
 class RsImportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_405_batch_endpoint_falls_back_to_legacy_single_add(self):
+        requests = []
+        credentials = [
+            {"email": "first@example.com", "refreshToken": "first-secret"},
+            {"email": "second@example.com", "refreshToken": "second-secret"},
+        ]
+
+        async def handler(request):
+            requests.append(request)
+            if request.method == "GET":
+                return httpx.Response(200, json={"credentials": []})
+            if request.url.path.endswith("/credentials/batch-import"):
+                return httpx.Response(405, text="method not allowed")
+            body = json.loads(request.content)
+            if body["email"] == "first@example.com":
+                return httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "credentialId": 41,
+                        "email": "first@example.com",
+                    },
+                )
+            return httpx.Response(409, json={"error": "duplicate"})
+
+        events = []
+        async with RsImportClient(
+            "https://rs.example",
+            "admin-key",
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            await client.preflight()
+            try:
+                summary = await client.batch_import(credentials, events.append)
+            except RsApiError as error:
+                self.fail(f"旧版 RS 的 405 必须自动回退逐条导入：{error}")
+
+        self.assertEqual(
+            [
+                ("GET", "/api/admin/credentials"),
+                ("POST", "/api/admin/credentials/batch-import"),
+                ("POST", "/api/admin/credentials"),
+                ("POST", "/api/admin/credentials"),
+            ],
+            [(request.method, request.url.path) for request in requests],
+        )
+        self.assertEqual(
+            {
+                "total": 2,
+                "imported": 1,
+                "verified": 0,
+                "duplicate": 1,
+                "failed": 0,
+                "rolledBack": 0,
+            },
+            summary,
+        )
+        self.assertEqual(["imported", "duplicate"], [event["status"] for event in events])
+        self.assertEqual(41, events[0]["credentialId"])
+        self.assertEqual("fi***@example.com", events[0]["email"])
+        self.assertNotIn("first-secret", repr(events))
+        self.assertNotIn("second-secret", repr(events))
+
     async def test_preflight_then_batch_import_parses_split_sse_as_dict_events(self):
         requests = []
         stream = ChunkedStream(
