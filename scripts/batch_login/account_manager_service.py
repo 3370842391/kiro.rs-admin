@@ -145,15 +145,25 @@ class AccountManagerService:
         except AccountRepositoryError as error:
             raise AccountManagerServiceError(str(error)) from error
 
-    def export_text(
-        self,
-        ids: Sequence[int],
-        *,
-        template: str,
-        writer: Callable[[str], object],
-        note: str,
-        mark_sold: bool,
-    ) -> TextExportReport:
+    def mark_sold(self, ids: Sequence[int], note: str) -> int:
+        accounts = self._load_managed(ids, include_secrets=False)
+        try:
+            return self.repository.mark_sold(
+                [item.id for item in accounts], note
+            )
+        except AccountRepositoryError as error:
+            raise AccountManagerServiceError(str(error)) from error
+
+    def restore_managed(self, ids: Sequence[int]) -> int:
+        unique_ids = list(dict.fromkeys(int(item) for item in ids))
+        if not unique_ids:
+            raise AccountManagerServiceError("必须选择至少一个账号")
+        try:
+            return self.repository.restore_managed(unique_ids)
+        except AccountRepositoryError as error:
+            raise AccountManagerServiceError(str(error)) from error
+
+    def render_text(self, ids: Sequence[int], template: str) -> str:
         self._validate_export_template(template)
         accounts = self._load_managed(ids, include_secrets=True)
         missing = [item.account for item in accounts if not item.current_password]
@@ -170,7 +180,19 @@ class AccountManagerService:
             )
             for index, item in enumerate(accounts, start=1)
         ]
-        text = render_accounts(entries, template)
+        return render_accounts(entries, template)
+
+    def export_text(
+        self,
+        ids: Sequence[int],
+        *,
+        template: str,
+        writer: Callable[[str], object],
+        note: str,
+        mark_sold: bool,
+    ) -> TextExportReport:
+        accounts = self._load_managed(ids, include_secrets=False)
+        text = self.render_text(ids, template)
         try:
             writer(text)
         except Exception as error:

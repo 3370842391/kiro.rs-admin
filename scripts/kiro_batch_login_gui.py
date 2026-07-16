@@ -42,16 +42,20 @@ def main(argv=None, *, checker=dependency_errors) -> int:
 
     import tkinter as tk
 
-    from batch_login.gui_app import BatchLoginApp
-    from batch_login.gui_runtime import build_default_controller
+    from batch_login.account_manager_app import AccountManagerApp
+    from batch_login.account_manager_service import AccountManagerService
+    from batch_login.account_repository import (
+        AccountRepository,
+        default_account_db_path,
+    )
+    from batch_login.password_vault import WindowsDpapiProtector
 
     root = tk.Tk()
-    controller = build_default_controller()
-    BatchLoginApp(
-        root,
-        controller,
-        ssh_available=shutil.which("ssh") is not None,
+    repository = AccountRepository(
+        default_account_db_path(),
+        protector=WindowsDpapiProtector(),
     )
+    AccountManagerApp(root, AccountManagerService(repository))
     root.mainloop()
     return 0
 
