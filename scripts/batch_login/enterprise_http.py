@@ -34,6 +34,7 @@ class EnterpriseHttpError(Exception):
     stage: str
     retryable: bool
     message: str
+    status_code: int | None = None
 
     def __str__(self) -> str:
         return self.message
@@ -732,6 +733,7 @@ class EnterpriseHttpClient:
                 stage,
                 response.status_code >= 500 or response.status_code == 429,
                 f"{stage} 请求失败（HTTP {response.status_code}）",
+                status_code=response.status_code,
             )
         return self._object(response.data, stage)
 

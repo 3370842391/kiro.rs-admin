@@ -10,6 +10,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from batch_login.browser_flows import BrowserFlowError
 from batch_login.credential_models import CredentialRecord
 from batch_login.credential_store import CredentialStoreError
+from batch_login.enterprise_http import EnterpriseHttpError
 from batch_login.local_auth import LocalAuthError
 from batch_login.local_runner import LocalBatchRunner
 from batch_login.models import AccountEntry, LoginMode
@@ -109,6 +110,37 @@ class FakeImporter:
 
 
 class LocalRunnerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_enterprise_failure_event_exposes_only_safe_diagnostics(self):
+        error = EnterpriseHttpError(
+            "http_error",
+            "signin_execute",
+            False,
+            "signin_execute 请求失败（HTTP 400）",
+            status_code=400,
+        )
+        events = []
+        runner = LocalBatchRunner(
+            enterprise=FakeAuth([error]),
+            microsoft=FakeAuth([]),
+            store=FakeStore(),
+            checkpoint=FakeCheckpoint(),
+            emit=events.append,
+        )
+
+        await runner.run(
+            [AccountEntry(1, "admin-user", "never-log-this-password")],
+            settings_for(ResultMode.SAVE_ONLY),
+        )
+
+        finished = next(event for event in events if event.kind == "account_finished")
+        self.assertEqual("signin_execute", finished.payload.get("stage"))
+        self.assertEqual(
+            "signin_execute 请求失败（HTTP 400）",
+            finished.payload.get("message"),
+        )
+        self.assertEqual(400, finished.payload.get("httpStatus"))
+        self.assertNotIn("never-log-this-password", json.dumps(finished.payload))
+
     async def test_enterprise_uses_each_accounts_effective_start_url(self):
         per_account_url = "https://ssoins-example.portal.us-west-2.app.aws/"
         auth = FakeAuth([credential(), credential("fallback-user")])

@@ -13,7 +13,7 @@ from batch_login.enterprise_http import (
     EnterpriseHttpError,
 )
 from batch_login.input_parser import parse_accounts
-from batch_login.local_auth import EnterpriseSettings, LocalEnterpriseAuth
+from batch_login.local_auth import EnterpriseSettings, IsolatedEnterpriseAuth
 from batch_login.models import AccountEntry, LoginMode
 from batch_login.password_vault import PasswordVault
 from batch_login.redaction import mask_account, redact_text
@@ -142,23 +142,23 @@ async def async_main(args) -> int:
     def emit(event):
         print(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
 
-    transport = CurlCffiTransport(timeout=args.timeout)
-    try:
-        protocol = EnterpriseHttpClient(
+    vault = PasswordVault(args.password_vault)
+    auth = IsolatedEnterpriseAuth(
+        lambda: CurlCffiTransport(timeout=args.timeout),
+        lambda transport: EnterpriseHttpClient(
             transport,
-            vault=PasswordVault(args.password_vault),
+            vault=vault,
             event_sink=emit,
-        )
-        summary = await process_entries(
-            entries,
-            LocalEnterpriseAuth(protocol),
-            store,
-            start_url=args.start_url,
-            region=args.region,
-            emit=emit,
-        )
-    finally:
-        await transport.close()
+        ),
+    )
+    summary = await process_entries(
+        entries,
+        auth,
+        store,
+        start_url=args.start_url,
+        region=args.region,
+        emit=emit,
+    )
     emit({"kind": "batch_finished", **summary})
     return 0 if summary["failed"] == 0 else 1
 

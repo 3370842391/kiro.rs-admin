@@ -9,6 +9,7 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import batch_login.local_auth as local_auth_module
 from batch_login.credential_models import CredentialRecord
 from batch_login.enterprise_http import EnterpriseHttpResult
 from batch_login.local_auth import (
@@ -151,6 +152,52 @@ class FakeMicrosoft:
 
 
 class LocalAuthTests(unittest.IsolatedAsyncioTestCase):
+    async def test_isolated_enterprise_auth_creates_and_closes_one_session_per_account(self):
+        auth_type = getattr(local_auth_module, "IsolatedEnterpriseAuth", None)
+        self.assertIsNotNone(
+            auth_type,
+            "企业批量登录必须提供账号级 HTTP 会话隔离",
+        )
+        transports = []
+        protocols = []
+
+        class FakeTransport:
+            def __init__(self):
+                self.closed = False
+
+            async def close(self):
+                self.closed = True
+
+        def transport_factory():
+            transport = FakeTransport()
+            transports.append(transport)
+            return transport
+
+        def protocol_factory(transport):
+            protocol = FakeEnterpriseProtocol()
+            protocol.transport = transport
+            protocols.append(protocol)
+            return protocol
+
+        auth = auth_type(
+            transport_factory,
+            protocol_factory,
+            now=lambda: NOW,
+        )
+        settings = EnterpriseSettings(
+            "https://d-123.awsapps.com/start",
+            "us-east-1",
+        )
+
+        await auth.login(AccountEntry(1, "first-user", "password-1"), settings)
+        await auth.login(AccountEntry(2, "second-user", "password-2"), settings)
+
+        self.assertEqual(2, len(transports))
+        self.assertIsNot(transports[0], transports[1])
+        self.assertTrue(all(transport.closed for transport in transports))
+        self.assertIs(protocols[0].transport, transports[0])
+        self.assertIs(protocols[1].transport, transports[1])
+
     async def test_enterprise_returns_complete_idc_record(self):
         protocol = FakeEnterpriseProtocol()
         record = await LocalEnterpriseAuth(protocol, now=lambda: NOW).login(

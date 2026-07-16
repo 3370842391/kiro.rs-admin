@@ -129,6 +129,25 @@ class EnterpriseHttpTests(unittest.IsolatedAsyncioTestCase):
         )
         return client, transport
 
+    async def test_http_error_preserves_safe_status_code(self):
+        responses = base_responses({"unused": True})
+        responses[5] = response({"message": "request rejected"}, status=400)
+        client, _transport = self.make_client(responses)
+
+        with self.assertRaises(EnterpriseHttpError) as captured:
+            await client.login(
+                "admin-user",
+                "password",
+                EnterpriseHttpSettings(
+                    "https://d-123.awsapps.com/start",
+                    "us-east-1",
+                ),
+            )
+
+        self.assertEqual("signin_execute", captured.exception.stage)
+        self.assertEqual(400, getattr(captured.exception, "status_code", None))
+        self.assertNotIn("request rejected", str(captured.exception))
+
     async def test_existing_password_completes_without_password_change(self):
         redirect = {
             "url": "https://d-123.awsapps.com/start/?workflowResultHandle=auth&state=state"

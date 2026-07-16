@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Callable
 
 from .credential_models import CredentialRecord
 from .enterprise_http import EnterpriseHttpSettings
@@ -50,6 +51,36 @@ class LocalEnterpriseAuth:
             region=settings.region,
             expires_at=expires,
         )
+
+
+class IsolatedEnterpriseAuth:
+    """Creates a fresh HTTP transport and protocol for every enterprise account."""
+
+    def __init__(
+        self,
+        transport_factory: Callable[[], object],
+        protocol_factory: Callable[[object], object],
+        *,
+        now=lambda: datetime.now(timezone.utc),
+    ):
+        self.transport_factory = transport_factory
+        self.protocol_factory = protocol_factory
+        self.now = now
+
+    async def login(
+        self,
+        entry: AccountEntry,
+        settings: EnterpriseSettings,
+    ) -> CredentialRecord:
+        transport = self.transport_factory()
+        try:
+            protocol = self.protocol_factory(transport)
+            return await LocalEnterpriseAuth(protocol, now=self.now).login(
+                entry,
+                settings,
+            )
+        finally:
+            await transport.close()
 
 
 class LocalMicrosoftAuth:

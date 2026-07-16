@@ -9,7 +9,7 @@ from .browser_flows import BrowserFlows
 from .credential_store import CredentialStore
 from .enterprise_http import CurlCffiTransport, EnterpriseHttpClient
 from .gui_controller import GuiController, GuiFormState
-from .local_auth import LocalEnterpriseAuth, LocalMicrosoftAuth
+from .local_auth import IsolatedEnterpriseAuth, LocalMicrosoftAuth
 from .local_checkpoint import LocalCheckpointStore
 from .local_microsoft import MicrosoftProtocol
 from .local_runner import LocalBatchRunner
@@ -96,15 +96,14 @@ class GuiRuntime:
                     },
                 )
             )
-            self.enterprise_transport = CurlCffiTransport(
-                timeout=self.form.timeout_seconds
-            )
-            enterprise = LocalEnterpriseAuth(
-                EnterpriseHttpClient(
-                    self.enterprise_transport,
-                    vault=PasswordVault(vault_path),
+            vault = PasswordVault(vault_path)
+            enterprise = IsolatedEnterpriseAuth(
+                lambda: CurlCffiTransport(timeout=self.form.timeout_seconds),
+                lambda transport: EnterpriseHttpClient(
+                    transport,
+                    vault=vault,
                     event_sink=emit_browser_event,
-                )
+                ),
             )
             microsoft = None
         else:

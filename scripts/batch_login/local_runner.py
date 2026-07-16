@@ -198,14 +198,21 @@ class LocalBatchRunner:
             message=redact_text(str(error)),
         )
         self.checkpoint.append(record)
+        payload = {
+            "status": status,
+            "code": error.code,
+            "stage": error.stage,
+            "retryable": error.retryable,
+            "message": redact_text(str(error)),
+            "credentialSaved": False,
+        }
+        status_code = getattr(error, "status_code", None)
+        if isinstance(status_code, int):
+            payload["httpStatus"] = status_code
         self.emit(
             WorkerEvent(
                 "account_finished",
-                {
-                    "status": status,
-                    "code": error.code,
-                    "credentialSaved": False,
-                },
+                payload,
             )
         )
 

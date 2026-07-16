@@ -357,18 +357,28 @@ class GuiRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 password_vault_path=str(Path(tmp) / "passwords.sqlite3"),
             )
             runtime = GuiRuntime(form, lambda _event: None)
+            captured = {}
+
+            async def run_without_accounts(runner, _entries, _settings):
+                captured["enterprise"] = runner.enterprise
+                return None
+
             with patch(
                 "batch_login.gui_runtime.async_playwright",
                 side_effect=AssertionError("enterprise must not start Playwright"),
             ), patch(
                 "batch_login.gui_runtime.LocalBatchRunner.run",
-                new=AsyncMock(return_value=None),
+                new=run_without_accounts,
             ):
                 await runtime.run([])
 
             self.assertIsNone(runtime.playwright)
             self.assertIsNone(runtime.browser)
-            self.assertIsNotNone(runtime.enterprise_transport)
+            self.assertIsNone(runtime.enterprise_transport)
+            self.assertEqual(
+                "IsolatedEnterpriseAuth",
+                type(captured["enterprise"]).__name__,
+            )
             await runtime.close()
 
     async def test_runner_importer_defers_rs_connection_until_import_stage(self):
