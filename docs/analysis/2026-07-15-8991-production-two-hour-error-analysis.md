@@ -386,7 +386,25 @@
 - Admin UI `bun run build`：通过，生产构建处理 2582 个模块。
 - `git diff --check`、凭据形状扫描和异常长新增行扫描：通过。
 
-### 10.3 仍待完成
+### 10.3 第三轮可靠性收口
 
-- 将本地集成提交部署到隔离公网 8991，执行真实结构化 JSON、图片、损坏图片、工具和 1 秒 ping 验收。
-- 部署后观察错误快照和容器日志至少 30 分钟；生产 8990 在用户另行授权前保持不变。
+- 混合 `web_search` 路径现在复用图片软目标/硬上限、明确长度错误降级和响应体空闲 watchdog，并把原始 `RequestTracer` 传给 provider。
+- 普通 EmptyResponse、ReadError、IdleTimeout 和 InvalidToolSchema 恢复始终从原始图片体生成；只有 provider 收到明确请求体长度错误时使用激进历史图片体。
+- 工具参数和结构化输出新增 `minLength`、`maxLength`、`pattern`、数值边界、`minItems`、`maxItems` 和 `allOf` 校验；本地交付合同保留客户原始 Schema，上游仍接收 Kiro 兼容 Schema。
+- `pattern` 最多 4 KiB，正则编译体最多 512 KiB；超限或非法模式 fail-closed，错误、日志和重试描述不复制模式或客户值。
+- 旧管理客户端省略 `hardBase64LimitBytes` 时保留 provider 当前硬上限，显式值仍覆盖并持久化。
+- WebSearch 热更新超时配置改为单次读取，避免极窄窗口内从正数切换为 0 时形成 `Duration::ZERO`。
+
+客户影响：正常文本、合法工具、缓存与计费不变；以前可能带病交付的复杂 Schema 结果现在会在交付前被拦截，并只在尚未交付任何语义输出时安全重试一次。旧管理端不再意外重置图片硬上限。异常重试不会无故降低历史图片质量。
+
+### 10.4 本地门禁与 8991 部署
+
+- 最终代码提交：`ac3083ede94a0a87e1eb23535abc5cf83fbe07dc`。
+- Rust：1036/1036；`cargo check --all-targets --locked --no-default-features` 通过。
+- Admin UI：75/75；生产构建 2582 modules；8991 builder contract 4/4。
+- `cargo fmt --all -- --check`、`git diff --check` 和新增内容密钥形状扫描通过。
+- 8991 镜像：`kiro-rs-test:ac3083ede94a`，公网管理端 200，容器 healthy；生产 8990 仍为 `ghcr.io/3370842391/kiro-rs:sha-218ae0`，未重启、未替换。
+- 黑盒通过：损坏图片本地 400、8.8 MB Base64 图片本地硬上限 400 且 trace 为 `image_budget_exceeded`/0 次上游、SSE 首个 `data:` 约 1003 ms。
+- 普通文本、structured JSON、required tool 和软目标图片已进入 provider，但测试凭据被上游明确返回 `TEMPORARILY_SUSPENDED`，因此最终为 502；这是测试账号外部状态，无法据此判断模型生成链路通过或失败。
+- 部署后 6 个连续 30 秒窗口均保持 healthy，未出现 panic/fatal；完整 30 分钟无人值守观察尚未完成，后续测试流量应继续复核。
+- DEBUG 业务日志保持开启，最近窗口 183 条 DEBUG、`h2/hyper/reqwest` frame 噪声 0。
