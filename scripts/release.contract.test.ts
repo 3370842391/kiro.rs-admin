@@ -47,4 +47,19 @@ describe('one-command release contract', () => {
     expect(backup).toBeGreaterThan(dryRunExit)
     expect(pushMaster).toBeGreaterThan(backup)
   })
+
+  test('release notes fall back from changelog to GitHub generated notes and fixed text', async () => {
+    const workflow = await read('.github/workflows/release.yaml')
+    const writeNotes = workflow.indexOf('- name: Write release notes')
+    const createRelease = workflow.indexOf('- name: Create GitHub Release')
+    const notesStep = workflow.slice(writeNotes, createRelease)
+
+    expect(writeNotes).toBeGreaterThan(-1)
+    expect(createRelease).toBeGreaterThan(writeNotes)
+    expect(notesStep).toContain('GH_TOKEN: ${{ github.token }}')
+    expect(notesStep).toContain('/repos/${GITHUB_REPOSITORY}/releases/generate-notes')
+    expect(notesStep).toContain('--method POST')
+    expect(notesStep).toContain("--jq '.body'")
+    expect(notesStep).toContain('Kiro.rs ${VERSION}')
+  })
 })

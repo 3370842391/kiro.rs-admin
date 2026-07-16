@@ -218,6 +218,8 @@ jobs:
           merge-multiple: true
 
       - name: Write release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
@@ -234,6 +236,19 @@ jobs:
               }
               found { print }
             ' CHANGELOG.md > RELEASE_NOTES.md
+          fi
+
+          # CHANGELOG 没有当前版本时，让 GitHub 根据提交和 PR 自动生成。
+          # API 或网络失败不能阻断发布，后面仍会写入固定兜底说明。
+          if [ ! -s RELEASE_NOTES.md ]; then
+            if ! gh api \
+              --method POST \
+              "/repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+              -f tag_name="${{ needs.prepare.outputs.tag }}" \
+              -f target_commitish="${{ needs.prepare.outputs.target }}" \
+              --jq '.body' > RELEASE_NOTES.md; then
+              : > RELEASE_NOTES.md
+            fi
           fi
 
           if [ ! -s RELEASE_NOTES.md ]; then
