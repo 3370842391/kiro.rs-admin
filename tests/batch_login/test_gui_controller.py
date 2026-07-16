@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from batch_login.gui_controller import GuiController, GuiFormState
 from batch_login.gui_app import BatchLoginApp
 from batch_login.gui_runtime import GuiRuntime
+from batch_login.gui_settings import GuiSavedSettings, GuiSettingsError
 from batch_login.models import AccountEntry, LoginMode, ParseResult
 from batch_login.worker_events import ResultMode
 
@@ -90,6 +91,28 @@ class FakePreview:
 
     def insert(self, _parent, _index, *, values):
         self.rows.append(values)
+
+
+class FakeSettingsStore:
+    def __init__(self, loaded=None, error=None):
+        self.loaded = loaded
+        self.error = error
+        self.saved = None
+        self.cleared = False
+        self.path = Path("C:/LocalData/KiroBatchLogin/settings.json")
+
+    def load(self):
+        if self.error is not None:
+            raise self.error
+        return self.loaded
+
+    def save(self, settings):
+        self.saved = settings
+        return self.path
+
+    def clear(self):
+        self.cleared = True
+        return True
 
 
 class GuiControllerTests(unittest.TestCase):
@@ -262,6 +285,11 @@ class GuiControllerTests(unittest.TestCase):
 
 
 class BatchLoginAppTests(unittest.TestCase):
+    def require_method(self, app, name):
+        method = getattr(app, name, None)
+        self.assertIsNotNone(method, f"GUI 缺少配置方法 {name}")
+        return method
+
     def make_app(self, text, *, start_url=""):
         app = BatchLoginApp.__new__(BatchLoginApp)
         app.input_text = FakeText(text)
@@ -274,6 +302,111 @@ class BatchLoginAppTests(unittest.TestCase):
         app.last_result = ParseResult([], [])
         app.entries = []
         return app
+
+    def make_settings_app(self, *, admin_key="env-admin-key"):
+        app = BatchLoginApp.__new__(BatchLoginApp)
+        values = {
+            "input_template_var": "login = {account} / onetime password = {password}",
+            "output_template_var": "{account}----{password}",
+            "mode_var": LoginMode.ENTERPRISE.value,
+            "start_url_var": "",
+            "password_vault_path_var": "",
+            "region_var": "us-east-1",
+            "headless_var": False,
+            "timeout_var": 180.0,
+            "mfa_timeout_var": 300.0,
+            "result_mode_var": ResultMode.SAVE_ONLY.value,
+            "credential_path_var": "",
+            "checkpoint_path_var": "",
+            "resume_var": False,
+            "rs_url_var": "",
+            "admin_key_var": admin_key,
+            "use_ssh_var": False,
+            "ssh_host_var": "",
+            "ssh_user_var": "",
+            "ssh_port_var": "22",
+            "identity_file_var": "",
+            "remote_host_var": "127.0.0.1",
+            "remote_port_var": "8990",
+            "local_port_var": "",
+            "status_var": "准备就绪",
+        }
+        for name, value in values.items():
+            setattr(app, name, FakeVar(value))
+        app.settings_store = FakeSettingsStore()
+        app.settings_warning = ""
+        app.root = object()
+        app.logs = []
+        app._append_log = app.logs.append
+        return app
+
+    def test_saved_settings_are_applied_to_gui_variables(self):
+        app = self.make_settings_app()
+        settings = GuiSavedSettings(
+            input_template="{account}|{password}|{start_url}",
+            mode="microsoft",
+            start_url="https://d-123.awsapps.com/start",
+            region="us-west-2",
+            result_mode="save_and_import",
+            rs_url="https://rs.example/admin",
+            admin_key="plain-admin-key",
+            use_ssh=True,
+            ssh_host="ssh.example",
+            ssh_port="2222",
+        )
+
+        self.require_method(app, "_apply_saved_settings")(settings)
+
+        self.assertEqual("plain-admin-key", app.admin_key_var.get())
+        self.assertEqual("https://rs.example/admin", app.rs_url_var.get())
+        self.assertEqual("microsoft", app.mode_var.get())
+        self.assertEqual("save_and_import", app.result_mode_var.get())
+        self.assertTrue(app.use_ssh_var.get())
+        self.assertEqual("2222", app.ssh_port_var.get())
+
+    def test_empty_saved_admin_key_preserves_environment_default(self):
+        app = self.make_settings_app(admin_key="env-admin-key")
+
+        self.require_method(app, "_apply_saved_settings")(
+            GuiSavedSettings(admin_key="")
+        )
+
+        self.assertEqual("env-admin-key", app.admin_key_var.get())
+
+    def test_save_configuration_uses_plaintext_key_without_account_text(self):
+        app = self.make_settings_app(admin_key="plain-admin-key")
+        app.rs_url_var.set("https://rs.example/admin")
+        app.start_url_var.set("https://d-123.awsapps.com/start")
+
+        self.require_method(app, "_save_configuration")()
+
+        saved = app.settings_store.saved
+        self.assertEqual("plain-admin-key", saved.admin_key)
+        self.assertEqual("https://rs.example/admin", saved.rs_url)
+        self.assertNotIn("account", saved.as_json())
+        self.assertIn("明文 Admin Key", app.status_var.get())
+        self.assertEqual(app.status_var.get(), app.logs[-1])
+
+    def test_clear_configuration_keeps_current_form_values(self):
+        app = self.make_settings_app(admin_key="keep-current-key")
+
+        with patch("batch_login.gui_app.messagebox.askyesno", return_value=True):
+            self.require_method(app, "_clear_configuration")()
+
+        self.assertTrue(app.settings_store.cleared)
+        self.assertEqual("keep-current-key", app.admin_key_var.get())
+        self.assertIn("下次启动使用默认值", app.status_var.get())
+
+    def test_load_error_becomes_warning_instead_of_crashing(self):
+        app = self.make_settings_app()
+        app.settings_store = FakeSettingsStore(
+            error=GuiSettingsError("无法读取 GUI 配置")
+        )
+
+        loaded = self.require_method(app, "_load_saved_settings")()
+
+        self.assertIsNone(loaded)
+        self.assertIn("无法读取 GUI 配置", app.settings_warning)
 
     def test_three_field_format_is_available_as_a_preset(self):
         self.assertIn(

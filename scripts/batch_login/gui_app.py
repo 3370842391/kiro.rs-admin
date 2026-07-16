@@ -7,6 +7,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from .gui_controller import GuiController, GuiFormState
+from .gui_settings import GuiSavedSettings, GuiSettingsError, GuiSettingsStore
 from .input_parser import parse_accounts, render_accounts
 from .models import LoginMode, ParseResult
 from .redaction import redact_text
@@ -27,19 +28,28 @@ class BatchLoginApp:
         controller: GuiController,
         *,
         ssh_available: bool = True,
+        settings_store: GuiSettingsStore | None = None,
     ):
         self.root = root
         self.controller = controller
         self.ssh_available = ssh_available
+        self.settings_store = settings_store or GuiSettingsStore()
+        self.settings_warning = ""
+        saved_settings = self._load_saved_settings()
         self.form = GuiFormState(
             admin_key=os.environ.get("KIRO_RS_ADMIN_KEY", "")
         )
         self.entries = []
         self.input_path = ""
         self._build_variables()
+        if saved_settings is not None:
+            self._apply_saved_settings(saved_settings)
         self._configure_style()
         self._build_layout()
         self._apply_mode_visibility()
+        if self.settings_warning:
+            self.status_var.set("本地配置未加载")
+            self._append_log(self.settings_warning)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind("<Control-o>", lambda _event: self._open_input_file())
         self.root.bind("<Control-Return>", lambda _event: self._start())
@@ -381,6 +391,18 @@ class BatchLoginApp:
             command=self._import_existing,
         )
         import_button.pack(side="left")
+        save_config_button = ttk.Button(
+            frame,
+            text="保存配置",
+            command=self._save_configuration,
+        )
+        save_config_button.pack(side="left", padx=(8, 0))
+        clear_config_button = ttk.Button(
+            frame,
+            text="清除配置",
+            command=self._clear_configuration,
+        )
+        clear_config_button.pack(side="left", padx=(6, 0))
         self.stop_button = ttk.Button(
             frame,
             text="停止",
@@ -395,7 +417,109 @@ class BatchLoginApp:
             style="Accent.TButton",
         )
         start_button.pack(side="right", padx=8)
-        self.run_sensitive.extend([import_button, start_button])
+        self.run_sensitive.extend(
+            [import_button, save_config_button, clear_config_button, start_button]
+        )
+
+    def _load_saved_settings(self) -> GuiSavedSettings | None:
+        try:
+            return self.settings_store.load()
+        except GuiSettingsError as error:
+            self.settings_warning = redact_text(str(error))
+            return None
+
+    def _apply_saved_settings(self, settings: GuiSavedSettings) -> None:
+        bindings = {
+            "input_template": self.input_template_var,
+            "output_template": self.output_template_var,
+            "mode": self.mode_var,
+            "start_url": self.start_url_var,
+            "password_vault_path": self.password_vault_path_var,
+            "region": self.region_var,
+            "headless": self.headless_var,
+            "timeout_seconds": self.timeout_var,
+            "mfa_timeout_seconds": self.mfa_timeout_var,
+            "result_mode": self.result_mode_var,
+            "credential_path": self.credential_path_var,
+            "checkpoint_path": self.checkpoint_path_var,
+            "resume": self.resume_var,
+            "rs_url": self.rs_url_var,
+            "admin_key": self.admin_key_var,
+            "use_ssh": self.use_ssh_var,
+            "ssh_host": self.ssh_host_var,
+            "ssh_user": self.ssh_user_var,
+            "ssh_port": self.ssh_port_var,
+            "identity_file": self.identity_file_var,
+            "remote_host": self.remote_host_var,
+            "remote_port": self.remote_port_var,
+            "local_port": self.local_port_var,
+        }
+        for name, variable in bindings.items():
+            value = getattr(settings, name)
+            if name == "admin_key" and not value:
+                continue
+            variable.set(value)
+
+    def _snapshot_settings(self) -> GuiSavedSettings:
+        return GuiSavedSettings(
+            input_template=self.input_template_var.get(),
+            output_template=self.output_template_var.get(),
+            mode=self.mode_var.get(),
+            start_url=self.start_url_var.get(),
+            password_vault_path=self.password_vault_path_var.get(),
+            region=self.region_var.get(),
+            headless=bool(self.headless_var.get()),
+            timeout_seconds=float(self.timeout_var.get()),
+            mfa_timeout_seconds=float(self.mfa_timeout_var.get()),
+            result_mode=self.result_mode_var.get(),
+            credential_path=self.credential_path_var.get(),
+            checkpoint_path=self.checkpoint_path_var.get(),
+            resume=bool(self.resume_var.get()),
+            rs_url=self.rs_url_var.get(),
+            admin_key=self.admin_key_var.get(),
+            use_ssh=bool(self.use_ssh_var.get()),
+            ssh_host=self.ssh_host_var.get(),
+            ssh_user=self.ssh_user_var.get(),
+            ssh_port=self.ssh_port_var.get(),
+            identity_file=self.identity_file_var.get(),
+            remote_host=self.remote_host_var.get(),
+            remote_port=self.remote_port_var.get(),
+            local_port=self.local_port_var.get(),
+        )
+
+    def _save_configuration(self) -> None:
+        try:
+            path = self.settings_store.save(self._snapshot_settings())
+        except (GuiSettingsError, TypeError, ValueError, tk.TclError) as error:
+            messagebox.showerror(
+                "保存配置失败",
+                redact_text(str(error)),
+                parent=self.root,
+            )
+            return
+        message = f"配置已保存到 {path}（包含明文 Admin Key）"
+        self.status_var.set(message)
+        self._append_log(message)
+
+    def _clear_configuration(self) -> None:
+        if not messagebox.askyesno(
+            "清除配置",
+            "删除本地保存配置？当前表单不会清空。",
+            parent=self.root,
+        ):
+            return
+        try:
+            self.settings_store.clear()
+        except GuiSettingsError as error:
+            messagebox.showerror(
+                "清除配置失败",
+                redact_text(str(error)),
+                parent=self.root,
+            )
+            return
+        message = "配置已清除，下次启动使用默认值"
+        self.status_var.set(message)
+        self._append_log(message)
 
     def _apply_mode_visibility(self) -> None:
         if self.mode_var.get() == LoginMode.ENTERPRISE.value:
