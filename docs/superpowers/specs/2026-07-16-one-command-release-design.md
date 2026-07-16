@@ -53,7 +53,7 @@
 - 更新 `docs/更新发布流程.md`，将日常流程精简为“一条命令 → 等待 Actions → 面板更新”。
 - 文档首页直接展示 `.\scripts\release.ps1`、`-DryRun`、`-Bump` 和 `-Version` 示例。
 - 该文件继续受 `/docs/` ignore 保护，不使用 `git add -f`，避免服务器信息进入公开 GitHub 仓库。
-- ignored 文件不会自动出现在 feature worktree；因此脚本和 workflow 合并回 `master` 并验证后，再更新主工作区中的这份本地文档。该更新不进入功能分支提交，交付报告必须单独标注“本地文档已更新、未提交”。
+- ignored 文件不会自动出现在 feature worktree；因此脚本和 workflow 在功能分支验证通过后，再更新主工作区中的这份本地文档。该更新不进入功能分支提交；在功能分支尚未合并前，交付报告必须明确提示“一键命令需合并到 master 后才能使用”。
 
 ## 4. 脚本接口与版本计算
 
