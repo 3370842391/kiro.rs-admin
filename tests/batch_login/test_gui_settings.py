@@ -49,6 +49,8 @@ class GuiSettingsStoreTests(unittest.TestCase):
                 remote_host="127.0.0.1",
                 remote_port="8990",
                 local_port="4567",
+                oidc_export_mode="both",
+                oidc_export_directory="C:/oidc-exports",
             )
 
             returned_path = store.save(saved)
@@ -62,6 +64,14 @@ class GuiSettingsStoreTests(unittest.TestCase):
             self.assertNotIn("refreshToken", raw)
             self.assertEqual([], list(path.parent.glob("settings.json.tmp-*")))
 
+    def test_old_version_one_settings_default_oidc_export_fields(self):
+        module = settings_module()
+
+        loaded = module.GuiSavedSettings.from_mapping({"version": 1})
+
+        self.assertEqual("merged", loaded.oidc_export_mode)
+        self.assertEqual("", loaded.oidc_export_directory)
+
     def test_invalid_json_version_and_field_types_are_rejected(self):
         module = settings_module()
         with tempfile.TemporaryDirectory() as tmp:
@@ -73,6 +83,8 @@ class GuiSettingsStoreTests(unittest.TestCase):
                 json.dumps({"version": 1, "use_ssh": "yes"}),
                 json.dumps({"version": 1, "mode": "unknown"}),
                 json.dumps({"version": 1, "timeout_seconds": 0}),
+                json.dumps({"version": 1, "oidc_export_mode": "unknown"}),
+                json.dumps({"version": 1, "oidc_export_directory": 123}),
             )
             for raw in invalid_values:
                 with self.subTest(raw=raw):

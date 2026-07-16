@@ -40,6 +40,8 @@ class GuiSavedSettings:
     remote_host: str = "127.0.0.1"
     remote_port: str = "8990"
     local_port: str = ""
+    oidc_export_mode: str = "merged"
+    oidc_export_directory: str = ""
 
     @classmethod
     def from_mapping(cls, value: object) -> GuiSavedSettings:
@@ -69,6 +71,8 @@ class GuiSavedSettings:
             "remote_host",
             "remote_port",
             "local_port",
+            "oidc_export_mode",
+            "oidc_export_directory",
         }
         bool_fields = {"headless", "resume", "use_ssh"}
         number_fields = {"timeout_seconds", "mfa_timeout_seconds"}
@@ -96,6 +100,12 @@ class GuiSavedSettings:
             raise GuiSettingsError("GUI 配置登录模式无效")
         if cleaned["result_mode"] not in {"save_only", "save_and_import"}:
             raise GuiSettingsError("GUI 配置结果方式无效")
+        if cleaned["oidc_export_mode"] not in {
+            "merged",
+            "per_account",
+            "both",
+        }:
+            raise GuiSettingsError("GUI 配置 OIDC 导出方式无效")
         return cls(**cleaned)
 
     def as_json(self) -> dict[str, object]:

@@ -14,6 +14,7 @@ from .local_checkpoint import LocalCheckpointStore
 from .local_microsoft import MicrosoftProtocol
 from .local_runner import LocalBatchRunner
 from .models import AccountEntry, LoginMode
+from .oidc_exporter import OidcCredentialExporter
 from .password_vault import PasswordVault
 from .rs_import import RsImportClient
 from .ssh_tunnel import SshTunnel, SshTunnelSettings
@@ -157,6 +158,35 @@ class GuiRuntime:
             )
         )
         return summary
+
+    async def export_existing(self):
+        records = CredentialStore(Path(self.form.credential_path)).load()
+        if not records:
+            raise ValueError("完整凭据 JSON 中没有可导出的账号")
+        output_directory = self.form.oidc_output_dir()
+        report = OidcCredentialExporter(
+            warning_sink=lambda message: self.emit(
+                WorkerEvent("security_warning", {"message": message})
+            )
+        ).export(
+            records,
+            output_directory=output_directory,
+            mode=self.form.oidc_export_mode,
+        )
+        self.emit(
+            WorkerEvent(
+                "oidc_exported",
+                {
+                    "count": report.record_count,
+                    "fileCount": (
+                        int(report.merged_path is not None)
+                        + len(report.account_paths)
+                    ),
+                    "directory": str(output_directory),
+                },
+            )
+        )
+        return report
 
     async def close(self) -> None:
         first_error: BaseException | None = None

@@ -13,6 +13,9 @@ from batch_login.gui_app import BatchLoginApp
 from batch_login.gui_runtime import GuiRuntime
 from batch_login.gui_settings import GuiSavedSettings, GuiSettingsError
 from batch_login.models import AccountEntry, LoginMode, ParseResult
+from batch_login.oidc_exporter import OidcExportMode
+from batch_login.credential_models import CredentialRecord
+from batch_login.credential_store import CredentialStore
 from batch_login.worker_events import ResultMode
 
 
@@ -40,6 +43,7 @@ class FakeRuntime:
         self.cancelled = threading.Event()
         self.closed = threading.Event()
         self.imported = False
+        self.exported = False
 
     async def run(self, _entries):
         self.started.set()
@@ -55,6 +59,10 @@ class FakeRuntime:
     async def import_existing(self):
         self.started.set()
         self.imported = True
+
+    async def export_existing(self):
+        self.started.set()
+        self.exported = True
 
     async def close(self):
         self.closed.set()
@@ -268,6 +276,41 @@ class GuiControllerTests(unittest.TestCase):
         self.assertTrue(runtime.imported)
         self.assertTrue(runtime.closed.is_set())
 
+    def test_export_existing_needs_neither_enterprise_portal_nor_rs(self):
+        runtime = FakeRuntime()
+        self.controller = GuiController(
+            runtime_factory=lambda _form, _emit: runtime
+        )
+        form = valid_form(
+            start_url="",
+            region="",
+            input_template="{broken",
+            output_template="{also-broken",
+            result_mode=ResultMode.SAVE_AND_IMPORT,
+            rs_url="",
+            admin_key="",
+            oidc_export_mode=OidcExportMode.BOTH,
+            oidc_export_directory="C:/exports",
+        )
+
+        self.controller.export_existing(form)
+        self.controller.thread.join(timeout=1)
+
+        self.assertTrue(runtime.exported)
+        self.assertFalse(runtime.imported)
+        self.assertTrue(runtime.closed.is_set())
+
+    def test_oidc_output_directory_defaults_next_to_complete_json(self):
+        form = valid_form(
+            credential_path="nested/credentials.json",
+            oidc_export_directory="",
+        )
+
+        self.assertEqual(
+            Path("nested/credentials.json").resolve().parent,
+            form.oidc_output_dir(),
+        )
+
     def test_input_and_credential_paths_must_differ(self):
         path = str(Path("same-file.txt").resolve())
 
@@ -329,6 +372,8 @@ class BatchLoginAppTests(unittest.TestCase):
             "remote_host_var": "127.0.0.1",
             "remote_port_var": "8990",
             "local_port_var": "",
+            "oidc_export_mode_var": "合并 JSON",
+            "oidc_export_directory_var": "",
             "status_var": "准备就绪",
         }
         for name, value in values.items():
@@ -353,6 +398,8 @@ class BatchLoginAppTests(unittest.TestCase):
             use_ssh=True,
             ssh_host="ssh.example",
             ssh_port="2222",
+            oidc_export_mode="both",
+            oidc_export_directory="C:/oidc-exports",
         )
 
         self.require_method(app, "_apply_saved_settings")(settings)
@@ -363,6 +410,10 @@ class BatchLoginAppTests(unittest.TestCase):
         self.assertEqual("save_and_import", app.result_mode_var.get())
         self.assertTrue(app.use_ssh_var.get())
         self.assertEqual("2222", app.ssh_port_var.get())
+        self.assertEqual("两种同时", app.oidc_export_mode_var.get())
+        self.assertEqual(
+            "C:/oidc-exports", app.oidc_export_directory_var.get()
+        )
 
     def test_empty_saved_admin_key_preserves_environment_default(self):
         app = self.make_settings_app(admin_key="env-admin-key")
@@ -386,6 +437,29 @@ class BatchLoginAppTests(unittest.TestCase):
         self.assertNotIn("account", saved.as_json())
         self.assertIn("明文 Admin Key", app.status_var.get())
         self.assertEqual(app.status_var.get(), app.logs[-1])
+
+    def test_saved_configuration_contains_oidc_mode_and_directory(self):
+        app = self.make_settings_app()
+        app.oidc_export_mode_var.set("逐账号 JSON")
+        app.oidc_export_directory_var.set("C:/oidc-exports")
+
+        saved = self.require_method(app, "_snapshot_settings")()
+
+        self.assertEqual("per_account", saved.oidc_export_mode)
+        self.assertEqual("C:/oidc-exports", saved.oidc_export_directory)
+
+    def test_oidc_directory_chooser_uses_directory_dialog(self):
+        app = self.make_settings_app()
+
+        with patch(
+            "batch_login.gui_app.filedialog.askdirectory",
+            return_value="C:/oidc-exports",
+        ):
+            self.require_method(app, "_choose_oidc_export_directory")()
+
+        self.assertEqual(
+            "C:/oidc-exports", app.oidc_export_directory_var.get()
+        )
 
     def test_clear_configuration_keeps_current_form_values(self):
         app = self.make_settings_app(admin_key="keep-current-key")
@@ -480,6 +554,51 @@ class FakeResource:
 
 
 class GuiRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_export_existing_converts_complete_bundle_without_rs(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            credential_path = root / "credentials.json"
+            output = root / "exports"
+            CredentialStore(credential_path).append(
+                CredentialRecord(
+                    email="admin-user",
+                    auth_method="idc",
+                    provider="Enterprise",
+                    refresh_token="refresh-secret",
+                )
+            )
+            form = valid_form(
+                start_url="",
+                result_mode=ResultMode.SAVE_AND_IMPORT,
+                rs_url="",
+                admin_key="",
+                credential_path=str(credential_path),
+                oidc_export_mode=OidcExportMode.BOTH,
+                oidc_export_directory=str(output),
+            )
+            events = []
+            runtime = GuiRuntime(form, events.append)
+
+            with patch.object(
+                runtime,
+                "_connect_importer",
+                side_effect=AssertionError("manual export must not connect RS"),
+            ):
+                report = await runtime.export_existing()
+
+            self.assertEqual(1, report.record_count)
+            self.assertEqual(2, len(list(output.glob("*.json"))))
+            exported_event = next(
+                event for event in events if event.kind == "oidc_exported"
+            )
+            self.assertEqual(1, exported_event.payload["count"])
+            self.assertEqual(2, exported_event.payload["fileCount"])
+            self.assertNotIn(
+                "refresh-secret", str(exported_event.payload)
+            )
+
     async def test_enterprise_runtime_does_not_start_playwright(self):
         import tempfile
 

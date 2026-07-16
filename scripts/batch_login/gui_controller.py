@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 
 from .input_parser import compile_format
 from .models import AccountEntry, LoginMode
+from .oidc_exporter import OidcExportMode
 from .redaction import redact_text
 from .worker_events import (
     LocalRunSettings,
@@ -43,8 +44,15 @@ class GuiFormState:
     remote_host: str = "127.0.0.1"
     remote_port: int = 8990
     local_port: int | None = None
+    oidc_export_mode: OidcExportMode = OidcExportMode.MERGED
+    oidc_export_directory: str = ""
 
-    def validate(self, *, require_start_url: bool = True) -> list[str]:
+    def validate(
+        self,
+        *,
+        require_start_url: bool = True,
+        require_rs: bool = True,
+    ) -> list[str]:
         errors: list[str] = []
         try:
             compile_format(self.input_template)
@@ -67,8 +75,24 @@ class GuiFormState:
             errors.append("完整凭据 JSON 不能覆盖账号输入文件")
         if self._vault_overwrites_credentials():
             errors.append("密码保险库不能覆盖完整凭据 JSON")
-        if self.result_mode is ResultMode.SAVE_AND_IMPORT:
+        if require_rs and self.result_mode is ResultMode.SAVE_AND_IMPORT:
             self._validate_import(errors)
+        return errors
+
+    def oidc_output_dir(self) -> Path:
+        raw = self.oidc_export_directory.strip()
+        if raw:
+            return Path(raw)
+        return Path(self.credential_path).resolve().parent
+
+    def validate_oidc_export(self) -> list[str]:
+        errors: list[str] = []
+        if not self.credential_path.strip():
+            errors.append("必须选择完整凭据 JSON 路径")
+        try:
+            OidcExportMode(self.oidc_export_mode)
+        except ValueError:
+            errors.append("OIDC 导出方式无效")
         return errors
 
     def _paths_collide(self) -> bool:
@@ -161,13 +185,25 @@ class GuiController:
             raise ValueError("导入已有 JSON 必须选择保存并导入 RS")
         self._start_thread("import", [], form)
 
+    def export_existing(self, form: GuiFormState) -> None:
+        errors = form.validate_oidc_export()
+        if errors:
+            raise ValueError("\n".join(errors))
+        if self.thread is not None and self.thread.is_alive():
+            raise RuntimeError("已有任务正在运行")
+        self._start_thread("export", [], form)
+
     def _validate_start(
         self,
         form: GuiFormState,
         *,
         require_start_url: bool = True,
+        require_rs: bool = True,
     ) -> None:
-        errors = form.validate(require_start_url=require_start_url)
+        errors = form.validate(
+            require_start_url=require_start_url,
+            require_rs=require_rs,
+        )
         if errors:
             raise ValueError("\n".join(errors))
         if self.thread is not None and self.thread.is_alive():
@@ -183,11 +219,7 @@ class GuiController:
             target=self._thread_main,
             args=(action, entries, form),
             daemon=False,
-            name=(
-                "kiro-batch-login-worker"
-                if action == "run"
-                else "kiro-batch-import-worker"
-            ),
+            name=f"kiro-batch-{action}-worker",
         )
         self.thread.start()
 
@@ -203,11 +235,14 @@ class GuiController:
         runtime = None
         try:
             runtime = self.runtime_factory(form, self.events.put)
-            coroutine = (
-                runtime.run(entries)
-                if action == "run"
-                else runtime.import_existing()
-            )
+            if action == "run":
+                coroutine = runtime.run(entries)
+            elif action == "import":
+                coroutine = runtime.import_existing()
+            elif action == "export":
+                coroutine = runtime.export_existing()
+            else:
+                raise RuntimeError("未知 GUI 后台任务")
             self.task = loop.create_task(coroutine)
             loop.run_until_complete(self.task)
         except asyncio.CancelledError:

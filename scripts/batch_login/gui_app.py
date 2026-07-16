@@ -10,6 +10,7 @@ from .gui_controller import GuiController, GuiFormState
 from .gui_settings import GuiSavedSettings, GuiSettingsError, GuiSettingsStore
 from .input_parser import parse_accounts, render_accounts
 from .models import LoginMode, ParseResult
+from .oidc_exporter import OidcExportMode
 from .redaction import redact_text
 from .worker_events import ResultMode, WorkerEvent
 
@@ -21,6 +22,14 @@ class BatchLoginApp:
         "{account}----{password}",
         "{account}|{password}|{start_url}",
     )
+    OIDC_EXPORT_LABELS = {
+        OidcExportMode.MERGED: "合并 JSON",
+        OidcExportMode.PER_ACCOUNT: "逐账号 JSON",
+        OidcExportMode.BOTH: "两种同时",
+    }
+    OIDC_EXPORT_VALUES = {
+        label: mode for mode, label in OIDC_EXPORT_LABELS.items()
+    }
 
     def __init__(
         self,
@@ -68,6 +77,10 @@ class BatchLoginApp:
         self.mfa_timeout_var = tk.DoubleVar(value=300)
         self.result_mode_var = tk.StringVar(value=ResultMode.SAVE_ONLY.value)
         self.credential_path_var = tk.StringVar()
+        self.oidc_export_mode_var = tk.StringVar(
+            value=self.OIDC_EXPORT_LABELS[OidcExportMode.MERGED]
+        )
+        self.oidc_export_directory_var = tk.StringVar()
         self.checkpoint_path_var = tk.StringVar()
         self.resume_var = tk.BooleanVar(value=False)
         self.rs_url_var = tk.StringVar()
@@ -287,6 +300,24 @@ class BatchLoginApp:
             self.checkpoint_path_var,
             browse=self._choose_checkpoint_path,
         )
+        ttk.Label(frame, text="OIDC 导出方式").grid(
+            row=6, column=0, sticky="w", pady=3
+        )
+        oidc_mode = ttk.Combobox(
+            frame,
+            state="readonly",
+            textvariable=self.oidc_export_mode_var,
+            values=list(self.OIDC_EXPORT_VALUES),
+        )
+        oidc_mode.grid(row=6, column=1, sticky="ew", pady=3)
+        self.run_sensitive.append(oidc_mode)
+        self._entry_row(
+            frame,
+            7,
+            "OIDC 导出目录",
+            self.oidc_export_directory_var,
+            browse=self._choose_oidc_export_directory,
+        )
         self.headless_toggle = ttk.Checkbutton(
             frame,
             text="无头浏览器",
@@ -391,6 +422,12 @@ class BatchLoginApp:
             command=self._import_existing,
         )
         import_button.pack(side="left")
+        export_button = ttk.Button(
+            frame,
+            text="转换已有完整 JSON",
+            command=self._export_existing,
+        )
+        export_button.pack(side="left", padx=(8, 0))
         save_config_button = ttk.Button(
             frame,
             text="保存配置",
@@ -418,7 +455,13 @@ class BatchLoginApp:
         )
         start_button.pack(side="right", padx=8)
         self.run_sensitive.extend(
-            [import_button, save_config_button, clear_config_button, start_button]
+            [
+                import_button,
+                export_button,
+                save_config_button,
+                clear_config_button,
+                start_button,
+            ]
         )
 
     def _load_saved_settings(self) -> GuiSavedSettings | None:
@@ -453,12 +496,15 @@ class BatchLoginApp:
             "remote_host": self.remote_host_var,
             "remote_port": self.remote_port_var,
             "local_port": self.local_port_var,
+            "oidc_export_directory": self.oidc_export_directory_var,
         }
         for name, variable in bindings.items():
             value = getattr(settings, name)
             if name == "admin_key" and not value:
                 continue
             variable.set(value)
+        mode = OidcExportMode(settings.oidc_export_mode)
+        self.oidc_export_mode_var.set(self.OIDC_EXPORT_LABELS[mode])
 
     def _snapshot_settings(self) -> GuiSavedSettings:
         return GuiSavedSettings(
@@ -485,6 +531,8 @@ class BatchLoginApp:
             remote_host=self.remote_host_var.get(),
             remote_port=self.remote_port_var.get(),
             local_port=self.local_port_var.get(),
+            oidc_export_mode=self._selected_oidc_export_mode().value,
+            oidc_export_directory=self.oidc_export_directory_var.get(),
         )
 
     def _save_configuration(self) -> None:
@@ -576,6 +624,21 @@ class BatchLoginApp:
         )
         if selected:
             self.credential_path_var.set(selected)
+
+    def _choose_oidc_export_directory(self) -> None:
+        selected = filedialog.askdirectory(
+            title="选择 OIDC JSON 导出目录",
+            parent=self.root,
+        )
+        if selected:
+            self.oidc_export_directory_var.set(selected)
+
+    def _selected_oidc_export_mode(self) -> OidcExportMode:
+        label = self.oidc_export_mode_var.get()
+        try:
+            return self.OIDC_EXPORT_VALUES[label]
+        except KeyError as error:
+            raise ValueError("OIDC 导出方式无效") from error
 
     def _choose_checkpoint_path(self) -> None:
         selected = filedialog.asksaveasfilename(
@@ -730,6 +793,8 @@ class BatchLoginApp:
                 self.local_port_var.get(),
                 optional=True,
             ),
+            oidc_export_mode=self._selected_oidc_export_mode(),
+            oidc_export_directory=self.oidc_export_directory_var.get(),
         )
 
     def _start(self) -> None:
@@ -798,6 +863,35 @@ class BatchLoginApp:
         self.progress_var.set(0)
         self._set_running(True)
 
+    def _export_existing(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="选择已有完整凭据 JSON",
+            filetypes=[("JSON", "*.json"), ("所有文件", "*.*")],
+            parent=self.root,
+        )
+        if not selected:
+            return
+        self.credential_path_var.set(selected)
+        if not self.oidc_export_directory_var.get().strip():
+            self._choose_oidc_export_directory()
+            if not self.oidc_export_directory_var.get().strip():
+                return
+        if not messagebox.askokcancel(
+            "敏感文件提示",
+            "OIDC JSON 将包含 refresh token 和可能存在的 client secret。请勿上传、截图或提交 Git。",
+            parent=self.root,
+        ):
+            return
+        try:
+            self.controller.export_existing(self._collect_form())
+        except (ValueError, RuntimeError, tk.TclError) as error:
+            messagebox.showerror(
+                "无法转换", redact_text(str(error)), parent=self.root
+            )
+            return
+        self.progress_var.set(0)
+        self._set_running(True)
+
     def _poll_events(self) -> None:
         for event in self.controller.drain_events():
             self._handle_event(event)
@@ -846,6 +940,15 @@ class BatchLoginApp:
                 if event.kind == "batch_finished"
                 else "任务已取消"
             )
+            self._set_running(False)
+        elif event.kind == "oidc_exported":
+            message = (
+                f"OIDC 导出完成：{payload.get('count', 0)} 个账号，"
+                f"{payload.get('fileCount', 0)} 个文件，目录 {payload.get('directory', '')}"
+            )
+            self._append_log(message)
+            self.status_var.set("OIDC 导出完成")
+            self.progress_var.set(100)
             self._set_running(False)
         elif event.kind == "fatal_error":
             self._append_log(str(payload.get("message") or "任务失败"))
