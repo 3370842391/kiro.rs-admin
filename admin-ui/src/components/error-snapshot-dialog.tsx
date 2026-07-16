@@ -19,7 +19,7 @@ import {
   usePinErrorSnapshot,
   useUnpinErrorSnapshot,
 } from '@/hooks/use-error-snapshots'
-import { formatBytes, severityLabel } from '@/lib/error-snapshot-utils'
+import { dispositionLabel, formatBytes, severityLabel, snapshotDisposition } from '@/lib/error-snapshot-utils'
 import { extractErrorMessage } from '@/lib/utils'
 import type {
   ErrorSnapshotDetail,
@@ -64,6 +64,7 @@ function severityVariant(severity: ErrorSnapshotDetail['severity']) {
 }
 
 function Overview({ detail }: { detail: ErrorSnapshotDetail }) {
+  const disposition = snapshotDisposition(detail)
   const rows: Array<[string, string | number]> = [
     ['快照 ID', detail.snapshotId],
     ['Trace ID', detail.traceId],
@@ -82,6 +83,9 @@ function Overview({ detail }: { detail: ErrorSnapshotDetail }) {
     <div className="space-y-4">
       <div className="flex flex-wrap gap-2">
         <Badge variant={severityVariant(detail.severity)}>{severityLabel(detail.severity)}</Badge>
+        <Badge variant={disposition === 'final_error' ? 'destructive' : disposition === 'recovered' ? 'warning' : 'secondary'}>
+          {dispositionLabel(disposition)}
+        </Badge>
         {detail.recovered && <Badge variant="success">重试已恢复</Badge>}
         {detail.pinned && <Badge variant="outline">已固定</Badge>}
         {detail.retentionExempt && <Badge variant="outline">永久保留</Badge>}

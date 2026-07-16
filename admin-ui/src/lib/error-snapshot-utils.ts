@@ -1,4 +1,6 @@
-import type { ErrorSnapshotQuery, SnapshotSeverity } from '@/types/api'
+import type { ErrorSnapshotQuery, ErrorSnapshotSummary, SnapshotSeverity } from '@/types/api'
+
+export type SnapshotDisposition = 'recovered' | 'client_disconnected' | 'final_error'
 
 export function buildSnapshotParams(query: ErrorSnapshotQuery): Record<string, string> {
   const params: Record<string, string> = {}
@@ -31,4 +33,18 @@ export function formatBytes(bytes: number): string {
 
 export function severityLabel(severity: SnapshotSeverity): string {
   return { critical: '严重', error: '错误', warning: '警告', info: '信息' }[severity]
+}
+
+export function snapshotDisposition(record: ErrorSnapshotSummary): SnapshotDisposition {
+  if (record.recovered) return 'recovered'
+  if (record.errorType === 'client_disconnected') return 'client_disconnected'
+  return 'final_error'
+}
+
+export function dispositionLabel(disposition: SnapshotDisposition): string {
+  return {
+    recovered: '已恢复告警',
+    client_disconnected: '客户端断开',
+    final_error: '最终失败',
+  }[disposition]
 }

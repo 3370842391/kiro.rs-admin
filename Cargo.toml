@@ -17,6 +17,7 @@ atomicwrites = "0.4"
 axum = "0.8"
 tokio = { version = "1.0", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "socks", "rustls-tls-webpki-roots", "rustls-tls-native-roots", "http2", "system-proxy", "charset"] }
+regex = "1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tracing = "0.1"

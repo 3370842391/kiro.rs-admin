@@ -22,8 +22,96 @@
 use std::io::Cursor;
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use image::{ImageFormat, ImageReader, imageops::FilterType};
+use image::{ImageError, ImageFormat, ImageReader, Limits, imageops::FilterType};
 use tracing::{debug, warn};
+
+/// 经过上游兼容性预检的图片。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedImage {
+    /// 由真实 magic bytes 决定的 Kiro 格式。
+    pub format: String,
+    /// 原始或无损 PNG 归一化后的 base64。
+    pub data_base64: String,
+    /// 是否为了兼容上游而无损归一化为 PNG。
+    pub normalized: bool,
+}
+
+/// 图片预检错误只暴露安全类别，不携带原始 base64 或解码器细节。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ImageValidationError {
+    #[error("invalid base64")]
+    InvalidBase64,
+    #[error("unsupported image format")]
+    UnsupportedFormat,
+    #[error("image decode failed")]
+    DecodeFailed,
+    #[error("image exceeds safe decode limits")]
+    ResourceLimit,
+}
+
+const MAX_UPSTREAM_IMAGE_DIMENSION: u32 = 8_192;
+const MAX_UPSTREAM_IMAGE_DECODE_ALLOC: u64 = 128 * 1024 * 1024;
+
+fn classify_validation_decode_error(error: ImageError) -> ImageValidationError {
+    if matches!(error, ImageError::Limits(_)) {
+        ImageValidationError::ResourceLimit
+    } else {
+        ImageValidationError::DecodeFailed
+    }
+}
+
+/// 在图片进入 Kiro 请求前校验完整 base64、magic bytes 与像素可解码性。
+///
+/// JPEG/PNG/GIF/WebP 原样保留，只依据真实 magic 修正声明格式。其它能够被
+/// `image` 解码的静态格式无损写成标准 PNG；损坏或未知内容返回安全的 typed error。
+pub fn validate_image_for_upstream(
+    _declared_format: &str,
+    data_base64: &str,
+) -> Result<ValidatedImage, ImageValidationError> {
+    let raw = BASE64
+        .decode(data_base64)
+        .map_err(|_| ImageValidationError::InvalidBase64)?;
+    let actual = image::guess_format(&raw).map_err(|_| ImageValidationError::UnsupportedFormat)?;
+    let mut reader = ImageReader::with_format(Cursor::new(raw.as_slice()), actual);
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_UPSTREAM_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_UPSTREAM_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_UPSTREAM_IMAGE_DECODE_ALLOC);
+    reader.limits(limits);
+    let decoded = reader.decode().map_err(classify_validation_decode_error)?;
+
+    let supported = match actual {
+        ImageFormat::Png => Some("png"),
+        ImageFormat::Jpeg => Some("jpeg"),
+        ImageFormat::Gif => Some("gif"),
+        ImageFormat::WebP => Some("webp"),
+        _ => None,
+    };
+    let needs_png_normalization = actual == ImageFormat::Png
+        && !matches!(
+            decoded.color(),
+            image::ColorType::Rgb8 | image::ColorType::Rgba8
+        );
+    if let Some(format) = supported
+        && !needs_png_normalization
+    {
+        return Ok(ValidatedImage {
+            format: format.to_string(),
+            data_base64: data_base64.to_string(),
+            normalized: false,
+        });
+    }
+
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgba8(decoded.to_rgba8())
+        .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+        .map_err(|_| ImageValidationError::DecodeFailed)?;
+    Ok(ValidatedImage {
+        format: "png".to_string(),
+        data_base64: BASE64.encode(png),
+        normalized: true,
+    })
+}
 
 /// Default long-side threshold (Anthropic's recommended value)
 const DEFAULT_MAX_LONG_SIDE: u32 = 1568;
@@ -402,6 +490,80 @@ mod tests {
         img.write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
             .unwrap();
         BASE64.encode(&buf)
+    }
+
+    fn make_special_png(w: u32, h: u32) -> String {
+        use image::{GrayAlphaImage, LumaA};
+        let mut img = GrayAlphaImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                img.put_pixel(x, y, LumaA([x.wrapping_add(y) as u8, 200]));
+            }
+        }
+        let mut buf = Vec::new();
+        img.write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
+            .unwrap();
+        BASE64.encode(buf)
+    }
+
+    #[test]
+    fn validates_magic_and_corrects_mislabeled_supported_image() {
+        let jpeg = make_jpeg(64, 64);
+        let validated = validate_image_for_upstream("png", &jpeg).unwrap();
+        assert_eq!(validated.format, "jpeg");
+        assert_eq!(validated.data_base64, jpeg);
+        assert!(!validated.normalized);
+    }
+
+    #[test]
+    fn normalizes_decodable_special_static_image_to_lossless_png() {
+        let special_png = make_special_png(8, 8);
+        let original = image::load_from_memory(&BASE64.decode(&special_png).unwrap())
+            .unwrap()
+            .to_rgba8();
+        let validated = validate_image_for_upstream("png", &special_png).unwrap();
+        let normalized = image::load_from_memory(&BASE64.decode(&validated.data_base64).unwrap())
+            .unwrap()
+            .to_rgba8();
+
+        assert_eq!(validated.format, "png");
+        assert!(validated.normalized);
+        assert_eq!(
+            normalized, original,
+            "PNG normalization must preserve pixels"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_base64_and_truncated_png_with_typed_errors() {
+        assert_eq!(
+            validate_image_for_upstream("png", "not-base64!!!").unwrap_err(),
+            ImageValidationError::InvalidBase64
+        );
+
+        let truncated = BASE64.encode(b"\x89PNG\r\n\x1a\n\x00\x00");
+        assert_eq!(
+            validate_image_for_upstream("png", &truncated).unwrap_err(),
+            ImageValidationError::DecodeFailed
+        );
+    }
+
+    #[test]
+    fn valid_current_png_is_not_reencoded() {
+        let png = make_png(64, 64);
+        let validated = validate_image_for_upstream("png", &png).unwrap();
+        assert_eq!(validated.format, "png");
+        assert_eq!(validated.data_base64, png);
+        assert!(!validated.normalized);
+    }
+
+    #[test]
+    fn rejects_images_above_the_safe_decode_dimensions() {
+        let oversized = make_png(9_000, 1);
+        assert_eq!(
+            validate_image_for_upstream("png", &oversized).unwrap_err(),
+            ImageValidationError::ResourceLimit
+        );
     }
 
     #[test]

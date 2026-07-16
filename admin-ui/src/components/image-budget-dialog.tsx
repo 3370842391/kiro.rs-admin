@@ -25,6 +25,7 @@ interface ImageBudgetDialogProps {
 const DEFAULT_DRAFT: ImageBudgetConfig = {
   enabled: true,
   totalBase64BudgetBytes: 819_200,
+  hardBase64LimitBytes: 8 * 1024 * 1024,
   historyMaxDimension: 1280,
   historyJpegQuality: 72,
   retryHistoryMaxDimension: 960,
@@ -75,7 +76,7 @@ export function ImageBudgetDialog({ open, onOpenChange }: ImageBudgetDialogProps
             图片总预算
           </DialogTitle>
           <DialogDescription>
-            控制发送给 Kiro 的多轮图片总量，并为明确的请求体超限准备一次更小的降级请求。
+            用软目标控制历史图片压缩，并用独立硬上限防止过大的本地请求。
           </DialogDescription>
         </DialogHeader>
 
@@ -107,12 +108,22 @@ export function ImageBudgetDialog({ open, onOpenChange }: ImageBudgetDialogProps
             <section className="grid gap-4 rounded-2xl border border-border/70 p-4 sm:grid-cols-2">
               <BudgetField
                 id="image-budget-kib"
-                label="总 base64 预算（KiB）"
-                description="范围 256–8192；默认 800 KiB。"
+                label="软压缩目标（KiB）"
+                description="超过后压缩历史图片；不是拒绝线。范围 256–32768，默认 800。"
                 min={256}
-                max={8192}
+                max={32768}
                 value={draft.totalBase64BudgetBytes / 1024}
                 onChange={(raw) => setNumber('totalBase64BudgetBytes', String(Number(raw) * 1024))}
+                disabled={isPending || !draft.enabled}
+              />
+              <BudgetField
+                id="image-hard-limit-kib"
+                label="本地硬上限（KiB）"
+                description="普通体和激进体都超过才拒绝。范围 256–32768，默认 8192。"
+                min={256}
+                max={32768}
+                value={draft.hardBase64LimitBytes / 1024}
+                onChange={(raw) => setNumber('hardBase64LimitBytes', String(Number(raw) * 1024))}
                 disabled={isPending || !draft.enabled}
               />
               <BudgetField
@@ -135,7 +146,6 @@ export function ImageBudgetDialog({ open, onOpenChange }: ImageBudgetDialogProps
                 onChange={(raw) => setNumber('historyJpegQuality', raw)}
                 disabled={isPending || !draft.enabled}
               />
-              <div />
               <BudgetField
                 id="image-retry-dimension"
                 label="重试最大边长"
@@ -159,7 +169,7 @@ export function ImageBudgetDialog({ open, onOpenChange }: ImageBudgetDialogProps
             </section>
 
             <p className="rounded-xl border border-sky-500/20 bg-sky-500/5 p-3 text-xs leading-relaxed text-muted-foreground">
-              只自动压缩历史图片，不会删除图片，也不会修改当前轮图片。预算过低可能使长对话更早要求开启新会话。
+              只对历史图片做有损压缩，不会删除图片；当前轮只做格式校验或像素无损 PNG 归一化。超过软目标但未超过硬上限的请求仍会发送。
             </p>
 
             {validationError && <p role="alert" className="text-sm text-destructive">{validationError}</p>}

@@ -31,6 +31,7 @@ describe("8991 test builder contract", () => {
     expect(compose).toContain("kiro-rs-test:${TEST_IMAGE_TAG:-latest}");
     expect(compose).toContain("dockerfile: Dockerfile.test");
     expect(compose).toContain("http://127.0.0.1:8990/admin");
+    expect(compose).toContain("RUST_LOG: ${TEST_RUST_LOG:-debug}");
   });
 
   test("test deploy script performs detached, disposable health-checked deploys", async () => {

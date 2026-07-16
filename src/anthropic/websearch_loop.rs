@@ -20,6 +20,10 @@ use futures::{StreamExt, stream};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::admin::trace_db::TraceSink;
+use crate::kiro::image_budget::{
+    ImageBudgetError, ImageBudgetPolicy, PreparedKiroBodies, prepare_kiro_bodies,
+};
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
@@ -27,7 +31,7 @@ use crate::kiro::provider::KiroProvider;
 use crate::token;
 
 use super::converter::{ConversionError, convert_request_with_mode};
-use super::handlers::{UsageRecordHook, map_provider_error};
+use super::handlers::{RequestTracer, UsageRecordHook, map_provider_error};
 use super::stream::{CompletedToolUse, SseEvent};
 use super::types::{ErrorResponse, Message, MessagesRequest};
 use super::websearch::{self, WebSearchResults};
@@ -35,6 +39,32 @@ use crate::model::config::ToolCompatibilityMode;
 
 /// Maximum number of search rounds, to prevent an infinite loop if the upstream keeps asking to search
 const MAX_WEB_SEARCH_ROUNDS: usize = 5;
+
+fn prepare_round_bodies(
+    request: &KiroRequest,
+    policy: ImageBudgetPolicy,
+) -> Result<PreparedKiroBodies, ImageBudgetError> {
+    prepare_kiro_bodies(request, policy)
+}
+
+fn round_idle_timeout(timeout_secs: u64) -> Option<std::time::Duration> {
+    (timeout_secs > 0).then(|| std::time::Duration::from_secs(timeout_secs))
+}
+
+async fn next_stream_item_with_idle_timeout<S>(
+    stream: &mut S,
+    idle_timeout: Option<std::time::Duration>,
+) -> Result<Option<S::Item>, ()>
+where
+    S: futures::Stream + Unpin,
+{
+    if let Some(timeout) = idle_timeout {
+        return tokio::time::timeout(timeout, stream.next())
+            .await
+            .map_err(|_| ());
+    }
+    Ok(stream.next().await)
+}
 
 /// Result of buffer-decoding one round of the upstream response
 struct RoundOutcome {
@@ -114,6 +144,7 @@ async fn decode_round(
     response: reqwest::Response,
     context_window_size: i32,
     tool_name_map: &std::collections::HashMap<String, String>,
+    idle_timeout: Option<std::time::Duration>,
 ) -> RoundOutcome {
     let mut body_stream = response.bytes_stream();
     let mut decoder = EventStreamDecoder::new();
@@ -130,7 +161,18 @@ async fn decode_round(
     let mut stream_error = false;
     let mut tool_json_error = None;
 
-    while let Some(chunk) = body_stream.next().await {
+    loop {
+        let next = match next_stream_item_with_idle_timeout(&mut body_stream, idle_timeout).await {
+            Ok(next) => next,
+            Err(()) => {
+                tracing::error!("web_search loop response stream idle timeout");
+                stream_error = true;
+                break;
+            }
+        };
+        let Some(chunk) = next else {
+            break;
+        };
         let chunk = match chunk {
             Ok(c) => c,
             Err(e) => {
@@ -233,6 +275,7 @@ async fn run_round(
     group: Option<&str>,
     tool_compatibility_mode: ToolCompatibilityMode,
     context_window_size: i32,
+    sink: Option<&dyn TraceSink>,
 ) -> Result<(RoundOutcome, u64), Response> {
     let conversion = match convert_request_with_mode(payload, tool_compatibility_mode) {
         Ok(c) => c,
@@ -256,6 +299,10 @@ async fn run_round(
                     "invalid_request_error",
                     format!("invalid tool choice: {}", reason),
                 ),
+                ConversionError::InvalidImage { location, source } => (
+                    "invalid_request_error",
+                    format!("invalid image at {location}: {source}"),
+                ),
             };
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
             return Err(
@@ -269,22 +316,42 @@ async fn run_round(
         profile_arn: None,
         additional_model_request_fields: conversion.additional_model_request_fields,
     };
-    let request_body = match serde_json::to_string(&kiro_request) {
-        Ok(b) => b,
-        Err(e) => {
+    let prepared = match prepare_round_bodies(&kiro_request, provider.image_budget_policy()) {
+        Ok(prepared) => prepared,
+        Err(ImageBudgetError::Exceeded { .. }) => {
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    "invalid_request_error",
+                    "Image payload exceeds the configured upstream hard limit after compressing historical images.",
+                )),
+            )
+                .into_response());
+        }
+        Err(error) => {
+            hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            tracing::error!(%error, "failed to prepare web_search round request body");
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
                     "internal_error",
-                    format!("failed to serialize request: {}", e),
+                    "failed to prepare web_search round request",
                 )),
             )
                 .into_response());
         }
     };
 
-    let call_result = match provider.call_api_stream(&request_body, None, group).await {
+    let call_result = match provider
+        .call_api_stream_with_content_length_retry(
+            &prepared.primary_body,
+            prepared.threshold_retry_body.as_deref(),
+            sink,
+            group,
+        )
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
@@ -296,6 +363,7 @@ async fn run_round(
         call_result.response,
         context_window_size,
         &conversion.tool_name_map,
+        round_idle_timeout(provider.stream_idle_timeout_secs()),
     )
     .await;
     // Carry the declared tool names (original + shortened) so the flush step can run the
@@ -663,6 +731,7 @@ pub(super) async fn run_web_search_loop(
     provider: Arc<KiroProvider>,
     mut payload: MessagesRequest,
     hook: UsageRecordHook,
+    tracer: Arc<RequestTracer>,
     stream_client: bool,
     group: Option<String>,
     tool_compatibility_mode: ToolCompatibilityMode,
@@ -689,6 +758,7 @@ pub(super) async fn run_web_search_loop(
             group.as_deref(),
             tool_compatibility_mode,
             context_window_size,
+            Some(tracer.as_ref()),
         )
         .await
         {
@@ -1058,10 +1128,58 @@ fn build_sse_events(
 mod tests {
     use super::*;
     use crate::anthropic::websearch::{WebSearchResult, WebSearchResults};
+    use crate::kiro::image_budget::ImageBudgetPolicy;
+    use crate::kiro::model::requests::conversation::{
+        ConversationState, CurrentMessage, KiroImage, UserInputMessage,
+    };
 
     #[test]
     fn websearch_api_usage_ignores_upstream_context() {
         assert_eq!(resolve_websearch_api_input(72, Some(5_417)), 72);
+    }
+
+    #[test]
+    fn websearch_round_uses_soft_image_budget_instead_of_raw_serialization() {
+        let image = KiroImage::from_base64("png", "A".repeat(900_000));
+        let request = KiroRequest {
+            conversation_state: ConversationState::new("conv").with_current_message(
+                CurrentMessage::new(
+                    UserInputMessage::new("current", "model").with_images(vec![image]),
+                ),
+            ),
+            profile_arn: None,
+            additional_model_request_fields: None,
+        };
+        let prepared = prepare_round_bodies(
+            &request,
+            ImageBudgetPolicy {
+                total_base64_budget_bytes: 819_200,
+                hard_base64_limit_bytes: 8 * 1024 * 1024,
+                ..ImageBudgetPolicy::default()
+            },
+        )
+        .expect("soft target must not reject a body below the hard limit");
+        assert_eq!(prepared.primary_stats.after_base64_bytes, 900_000);
+    }
+
+    #[tokio::test]
+    async fn websearch_round_body_watchdog_stops_a_stalled_stream() {
+        let mut stalled = futures::stream::pending::<Result<Bytes, std::io::Error>>();
+        let timed_out = next_stream_item_with_idle_timeout(
+            &mut stalled,
+            Some(std::time::Duration::from_millis(20)),
+        )
+        .await;
+        assert!(timed_out.is_err());
+    }
+
+    #[test]
+    fn websearch_round_idle_timeout_zero_disables_watchdog() {
+        assert_eq!(round_idle_timeout(0), None);
+        assert_eq!(
+            round_idle_timeout(3),
+            Some(std::time::Duration::from_secs(3))
+        );
     }
 
     fn tu(name: &str) -> CompletedToolUse {

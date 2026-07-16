@@ -34,7 +34,7 @@ import {
   usePinErrorSnapshot,
   useUnpinErrorSnapshot,
 } from '@/hooks/use-error-snapshots'
-import { formatBytes, severityLabel } from '@/lib/error-snapshot-utils'
+import { dispositionLabel, formatBytes, severityLabel, snapshotDisposition } from '@/lib/error-snapshot-utils'
 import { extractErrorMessage } from '@/lib/utils'
 import type { ErrorSnapshotQuery, ErrorSnapshotSummary, SnapshotSeverity } from '@/types/api'
 
@@ -236,6 +236,13 @@ export function ErrorSnapshotPage() {
   const records = snapshots.data?.records ?? []
   const total = snapshots.data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
+  const dispositionCounts = records.reduce(
+    (counts, record) => {
+      counts[snapshotDisposition(record)] += 1
+      return counts
+    },
+    { recovered: 0, client_disconnected: 0, final_error: 0 } as Record<ReturnType<typeof snapshotDisposition>, number>,
+  )
 
   const handleCleanup = async () => {
     const accepted = await confirm({
@@ -277,6 +284,17 @@ export function ErrorSnapshotPage() {
       </div>
 
       <StorageCard />
+
+      <div className="grid gap-3 sm:grid-cols-3">
+        {(Object.keys(dispositionCounts) as Array<ReturnType<typeof snapshotDisposition>>).map((disposition) => (
+          <Card key={disposition}>
+            <CardContent className="p-3">
+              <div className="text-xs text-muted-foreground">{dispositionLabel(disposition)}（当前页）</div>
+              <div className="mt-1 text-xl font-semibold">{dispositionCounts[disposition]}</div>
+            </CardContent>
+          </Card>
+        ))}
+      </div>
 
       <Card>
         <CardContent className="p-4">
@@ -324,6 +342,7 @@ export function ErrorSnapshotPage() {
                     <th className="px-3 py-2 font-medium">时间</th>
                     <th className="pr-3 py-2 font-medium">级别</th>
                     <th className="pr-3 py-2 font-medium">错误类型</th>
+                    <th className="pr-3 py-2 font-medium">归类</th>
                     <th className="pr-3 py-2 font-medium">HTTP</th>
                     <th className="pr-3 py-2 font-medium">模型</th>
                     <th className="pr-3 py-2 font-medium">凭据</th>
@@ -339,6 +358,7 @@ export function ErrorSnapshotPage() {
                       <td className="whitespace-nowrap px-3 py-2.5 text-xs text-muted-foreground">{formatTime(record.ts)}</td>
                       <td className="pr-3 py-2.5"><Badge variant={severityVariant(record.severity)}>{severityLabel(record.severity)}</Badge></td>
                       <td className="pr-3 py-2.5"><span className="inline-block max-w-[220px] truncate align-middle" title={record.errorType}>{record.errorType}</span></td>
+                      <td className="pr-3 py-2.5"><Badge variant={snapshotDisposition(record) === 'final_error' ? 'destructive' : snapshotDisposition(record) === 'recovered' ? 'warning' : 'secondary'}>{dispositionLabel(snapshotDisposition(record))}</Badge></td>
                       <td className="pr-3 py-2.5 font-mono text-xs">{record.httpStatus ?? '—'}</td>
                       <td className="pr-3 py-2.5"><span className="inline-block max-w-[220px] truncate align-middle" title={record.model}>{record.model}</span></td>
                       <td className="pr-3 py-2.5 font-mono text-xs">#{record.finalCredentialId}</td>

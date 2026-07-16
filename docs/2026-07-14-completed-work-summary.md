@@ -217,3 +217,32 @@
 - 开启 `emptyUserMessageCompat` 后，精确空文本请求返回 200；Admin trace 可读取 `emptyUserCompatApplied=true`；验收后开关已恢复为 false。
 - 10 次 SSE 首个 `data:` 均为 ping，p95 为 1004.8ms；热修复镜像复测 3 次最大 1003.7ms。
 - 测试容器日志未发现 panic/fatal；生产 8990 镜像和监听状态保持不变。
+
+### 19. 生产可靠性第二轮收口（2026-07-16）
+
+本节覆盖并更新第 13 节较早的“仅 MissingRequired 可重试”结论：
+
+- 显式 JSON Schema 输出现在允许从围栏/说明中恢复唯一 JSON，随后仍按客户原 Schema 严格复验；不会放过多 JSON、错型、缺字段或额外字段。
+- 图片 800 KiB 改为软压缩目标，新增默认 8 MiB 独立硬上限；普通体/激进体都超过硬上限才返回 400。
+- 管理端可编辑、热更新并持久化图片硬上限；旧管理客户端省略新字段时兼容默认 8 MiB。
+- 普通图片和 `tool_result` 图片统一做 Base64、magic 和完整解码校验；错标格式会修正，损坏图片在调用 Kiro 前返回安全位置错误。
+- 已声明工具的 MissingRequired、TypeMismatch、AdditionalProperty、Enum/Const 等错误都可在未交付输出时安全重试一次；不猜业务值、不复制失败参数、未声明工具不重试。
+- reqwest 不再与应用 watchdog 在同一个 120 秒截止竞态；实时流、CC 缓冲流和非流式响应体均保留应用层空闲保护，零输出最多恢复一次。
+- 本地图片硬上限失败保存 `image_budget_exceeded` 和安全数值统计；管理端把已恢复告警、客户端断开和最终失败分开显示；DEBUG 默认过滤底层 HTTP/2 frame 噪声。
+
+客户影响：正常文本、合法工具、缓存和计费逻辑不变；长图片会话更少误拒绝，但图片预检增加少量 CPU/内存；只有异常零输出或非法 Schema 恢复路径可能增加一次上游调用、延迟和用量，已交付正文/工具不重放。
+
+本地最终门禁：Rust 1018/1018、Admin UI 78/78、`cargo check --all-targets`、生产构建、格式检查、差异检查和敏感信息扫描全部通过。8991 实网结果在部署后追加，生产 8990 未修改。
+
+### 20. 第三轮可靠性收口与 8991 验收（2026-07-16）
+
+- 混合 WebSearch 补齐图片预算、长度降级、响应头/响应体超时和 provider trace；普通异常重试不再误用激进图片体。
+- 工具与 structured output 的本地 Schema 校验新增字符串、数值、数组边界与 `allOf`；正则模式限制为 4 KiB、编译体限制为 512 KiB。
+- 客户原始工具 Schema 只用于本地交付复验，发往 Kiro 的 Schema 继续独立规范化，避免把不支持的顶层组合关键字发给上游。
+- 旧管理客户端省略图片硬上限字段时保留当前运行时值，不再回落到固定 8 MiB。
+- 本地最终门禁：Rust 1036/1036、Admin UI 75/75、builder contract 4/4、生产构建 2582 modules，格式、差异、全 target check 和密钥形状扫描通过。
+- 隔离公网 8991 已部署 `kiro-rs-test:ac3083ede94a` 并保持 healthy；损坏图片、图片硬上限 trace 和约 1 秒 ping 通过。
+- 测试凭据被 AWS/Kiro 返回 `TEMPORARILY_SUSPENDED`，所以普通文本、structured、tool 和软目标图片当前只能确认已进入 provider，不能完成真实模型成功验收。
+- 生产 8990 镜像仍为 `ghcr.io/3370842391/kiro-rs:sha-218ae0`，未修改。DEBUG 继续开启且底层 frame 噪声为 0。
+
+客户影响：正常请求没有新增固定提示词或 Token 注入；只有未交付输出的异常恢复可能增加一次上游调用。复杂 Schema 以前可能交付错误值，现在会重试或明确失败；不会让非法工具在客户端执行。测试凭据冻结属于外部账号状态，不是本轮代码回归。

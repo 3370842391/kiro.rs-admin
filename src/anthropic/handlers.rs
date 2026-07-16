@@ -846,6 +846,7 @@ where
             .then(|| {
                 if require_exact_json {
                     visible_text_from_events(&attempt.events)
+                        .and_then(|text| super::structured_output::extract_output_json(&text))
                 } else {
                     strict_json_from_events(&attempt.events)
                 }
@@ -1850,10 +1851,64 @@ async fn prepare_request(
     convert_request_with_mode(payload, mode).map_err(PrepareRequestError::Conversion)
 }
 
+fn conversion_error_trace_type(error: &ConversionError) -> &'static str {
+    if matches!(error, ConversionError::InvalidImage { .. }) {
+        "image_validation_error"
+    } else {
+        "request_conversion_error"
+    }
+}
+
+struct ImageBudgetFailureDetails {
+    status: StatusCode,
+    error_type: &'static str,
+    safe_message: String,
+    client_error_type: &'static str,
+    client_message: &'static str,
+}
+
+fn image_budget_failure_details(error: &ImageBudgetError) -> ImageBudgetFailureDetails {
+    match error {
+        ImageBudgetError::Exceeded {
+            count,
+            history_count,
+            current_count,
+            before,
+            after,
+            soft_limit,
+            hard_limit,
+        } => ImageBudgetFailureDetails {
+            status: StatusCode::BAD_REQUEST,
+            error_type: "image_budget_exceeded",
+            safe_message: format!(
+                "image budget exceeded: count={count}, history={history_count}, current={current_count}, before={before}, after={after}, soft={soft_limit}, hard={hard_limit}"
+            ),
+            client_error_type: "invalid_request_error",
+            client_message: "Image payload exceeds the configured upstream hard limit after compressing historical images. Reduce images or start a new conversation.",
+        },
+        ImageBudgetError::InvalidPolicy(_) | ImageBudgetError::Serialization(_) => {
+            ImageBudgetFailureDetails {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                error_type: "request_body_error",
+                safe_message: "failed to prepare the upstream image request body".to_string(),
+                client_error_type: "internal_error",
+                client_message: "Failed to prepare the upstream request body.",
+            }
+        }
+    }
+}
+
+struct OutboundKiroBodyError {
+    response: Response,
+    status: StatusCode,
+    error_type: &'static str,
+    safe_message: String,
+}
+
 fn prepare_outbound_kiro_bodies(
     request: &KiroRequest,
     provider: &crate::kiro::provider::KiroProvider,
-) -> Result<PreparedKiroBodies, Response> {
+) -> Result<PreparedKiroBodies, OutboundKiroBodyError> {
     match prepare_kiro_bodies(request, provider.image_budget_policy()) {
         Ok(prepared) => {
             tracing::info!(
@@ -1871,36 +1926,31 @@ fn prepare_outbound_kiro_bodies(
             );
             Ok(prepared)
         }
-        Err(ImageBudgetError::Exceeded {
-            count,
-            total,
-            budget,
-        }) => {
-            tracing::warn!(
-                image_count = count,
-                image_b64_bytes = total,
-                budget_bytes = budget,
-                "图片总量预检失败"
-            );
-            Err((
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(
-                    "invalid_request_error",
-                    "Image payload exceeds the configured upstream budget after compressing historical images. Reduce images or start a new conversation.",
-                )),
-            )
-                .into_response())
-        }
         Err(error) => {
-            tracing::error!(%error, "准备 Kiro 图片预算请求体失败");
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
+            let details = image_budget_failure_details(&error);
+            if details.status.is_client_error() {
+                tracing::warn!(
+                    error_type = details.error_type,
+                    diagnostic = %details.safe_message,
+                    "图片总量预检失败"
+                );
+            } else {
+                tracing::error!(%error, "准备 Kiro 图片预算请求体失败");
+            }
+            let response = (
+                details.status,
                 Json(ErrorResponse::new(
-                    "internal_error",
-                    "Failed to prepare the upstream request body.",
+                    details.client_error_type,
+                    details.client_message,
                 )),
             )
-                .into_response())
+                .into_response();
+            Err(OutboundKiroBodyError {
+                response,
+                status: details.status,
+                error_type: details.error_type,
+                safe_message: details.safe_message,
+            })
         }
     }
 }
@@ -2195,6 +2245,7 @@ pub async fn post_messages(
             provider,
             payload,
             hook,
+            tracer.clone(),
             payload_stream,
             key_ctx.group.clone(),
             state.tool_compatibility_mode,
@@ -2236,13 +2287,17 @@ pub async fn post_messages(
                 ConversionError::InvalidToolChoice(reason) => {
                     ("invalid_request_error", format!("工具选择无效: {}", reason))
                 }
+                ConversionError::InvalidImage { location, source } => (
+                    "invalid_request_error",
+                    format!("图片 {location} 无效: {source}"),
+                ),
             };
             tracing::warn!("请求转换失败: {}", e);
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
             finalize_immediate_error(
                 &tracer,
                 StatusCode::BAD_REQUEST,
-                "request_conversion_error",
+                conversion_error_trace_type(&e),
                 &message,
             );
             return (
@@ -2263,10 +2318,10 @@ pub async fn post_messages(
 
     let prepared_bodies = match prepare_outbound_kiro_bodies(&kiro_request, provider.as_ref()) {
         Ok(prepared) => prepared,
-        Err(response) => {
+        Err(error) => {
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            finalize_immediate_response(&tracer, &response, "request_body_error");
-            return response;
+            finalize_immediate_error(&tracer, error.status, error.error_type, &error.safe_message);
+            return error.response;
         }
     };
     let request_body = &prepared_bodies.primary_body;
@@ -2407,16 +2462,19 @@ struct StreamAttemptSetup {
 
 fn prepare_retry_request_body(
     request_body: &str,
-    threshold_retry_body: Option<&str>,
+    _threshold_retry_body: Option<&str>,
     failure: Option<&super::tool_attempt::AttemptFailure>,
     tool_name_map: &std::collections::HashMap<String, String>,
 ) -> Option<String> {
-    let base = threshold_retry_body.unwrap_or(request_body);
     match failure {
         Some(super::tool_attempt::AttemptFailure::InvalidToolSchema { failure }) => {
-            super::tool_schema::append_tool_schema_retry_instruction(base, failure, tool_name_map)
+            super::tool_schema::append_tool_schema_retry_instruction(
+                request_body,
+                failure,
+                tool_name_map,
+            )
         }
-        _ => Some(base.to_owned()),
+        _ => Some(request_body.to_owned()),
     }
 }
 
@@ -3050,7 +3108,8 @@ async fn run_realtime_sse_attempts(
             retry_request_body = prepared_retry_body;
             tracing::warn!(
                 attempt = attempt_index + 1,
-                "实时首轮正常 EOF 且无语义输出，丢弃整轮并重试一次"
+                termination = ?termination,
+                "实时首轮未提交语义输出，丢弃整轮并重试一次"
             );
             continue;
         }
@@ -3168,7 +3227,76 @@ struct NonStreamToolAttempt {
 
 enum NonStreamCollectError {
     Provider(anyhow::Error),
-    Body { credential_id: u64, message: String },
+    Body {
+        credential_id: u64,
+        message: String,
+        received_bytes: u64,
+    },
+    IdleTimeout {
+        credential_id: u64,
+        idle_timeout_secs: u64,
+        received_bytes: u64,
+    },
+}
+
+fn should_retry_non_stream_collect_error(attempt_index: u8, error: &NonStreamCollectError) -> bool {
+    attempt_index == 0
+        && matches!(
+            error,
+            NonStreamCollectError::Body { .. } | NonStreamCollectError::IdleTimeout { .. }
+        )
+}
+
+fn non_stream_collect_error_type(error: &NonStreamCollectError) -> Option<&'static str> {
+    match error {
+        NonStreamCollectError::Body { .. } => Some("stream_read_error"),
+        NonStreamCollectError::IdleTimeout { .. } => Some("stream_idle_timeout"),
+        NonStreamCollectError::Provider(_) => None,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum NonStreamBodyReadFailure {
+    Read {
+        message: String,
+        received_bytes: u64,
+    },
+    IdleTimeout {
+        received_bytes: u64,
+    },
+}
+
+async fn collect_body_stream_with_idle_timeout<S, E>(
+    stream: S,
+    idle_timeout: Option<Duration>,
+) -> Result<Bytes, NonStreamBodyReadFailure>
+where
+    S: Stream<Item = Result<Bytes, E>>,
+    E: std::fmt::Display,
+{
+    futures::pin_mut!(stream);
+    let mut body = bytes::BytesMut::new();
+    loop {
+        let next = if let Some(timeout) = idle_timeout {
+            tokio::time::timeout(timeout, stream.next())
+                .await
+                .map_err(|_| NonStreamBodyReadFailure::IdleTimeout {
+                    received_bytes: body.len() as u64,
+                })?
+        } else {
+            stream.next().await
+        };
+        match next {
+            Some(Ok(chunk)) => body.extend_from_slice(&chunk),
+            Some(Err(error)) => {
+                return Err(NonStreamBodyReadFailure::Read {
+                    message: error.to_string(),
+                    received_bytes: body.len() as u64,
+                });
+            }
+            None => return Ok(body.freeze()),
+        }
+    }
 }
 
 fn non_stream_attempt_error(
@@ -3261,14 +3389,27 @@ async fn collect_non_stream_tool_attempt(
         .await
         .map_err(NonStreamCollectError::Provider)?;
     let credential_id = call_result.credential_id;
+    let idle_timeout_secs = provider.stream_idle_timeout_secs();
+    let idle_timeout = (idle_timeout_secs > 0).then(|| Duration::from_secs(idle_timeout_secs));
     let body_bytes =
-        call_result
-            .response
-            .bytes()
+        collect_body_stream_with_idle_timeout(call_result.response.bytes_stream(), idle_timeout)
             .await
-            .map_err(|error| NonStreamCollectError::Body {
-                credential_id,
-                message: error.to_string(),
+            .map_err(|failure| match failure {
+                NonStreamBodyReadFailure::Read {
+                    message,
+                    received_bytes,
+                } => NonStreamCollectError::Body {
+                    credential_id,
+                    message,
+                    received_bytes,
+                },
+                NonStreamBodyReadFailure::IdleTimeout { received_bytes } => {
+                    NonStreamCollectError::IdleTimeout {
+                        credential_id,
+                        idle_timeout_secs,
+                        received_bytes,
+                    }
+                }
             })?;
 
     let mut decoder = EventStreamDecoder::new();
@@ -3511,7 +3652,7 @@ async fn handle_non_stream_request(
                     None,
                 )
             };
-            let attempt = collect_non_stream_tool_attempt(
+            let attempt = match collect_non_stream_tool_attempt(
                 provider.clone(),
                 attempt_body,
                 attempt_threshold_retry_body,
@@ -3526,7 +3667,22 @@ async fn handle_non_stream_request(
                 attempt_index,
                 identity_normalization,
             )
-            .await?;
+            .await
+            {
+                Ok(attempt) => attempt,
+                Err(error) if should_retry_non_stream_collect_error(attempt_index, &error) => {
+                    let error_type = non_stream_collect_error_type(&error)
+                        .expect("retryable body errors have a stable type");
+                    retry_failure_type = Some(error_type);
+                    retry_request_body = Some(request_body.to_owned());
+                    tracer.record_protocol_error(
+                        error_type,
+                        "the first non-stream response body ended before delivery; retrying once",
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             if attempt.state.should_retry()
                 && let Some(body) = prepare_retry_request_body(
                     request_body,
@@ -3565,14 +3721,15 @@ async fn handle_non_stream_request(
         Err(NonStreamCollectError::Body {
             credential_id,
             message,
+            received_bytes,
         }) => {
-            tracing::error!(%message, "读取非流式响应体失败");
+            tracing::error!(%message, received_bytes, "读取非流式响应体失败");
             hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
             tracer.finalize(
                 "interrupted",
                 Some(outcome::STREAM_INTERRUPTED),
                 Some(&message),
-                None,
+                Some(received_bytes),
                 TraceUsage::zero(),
             );
             return (
@@ -3584,13 +3741,35 @@ async fn handle_non_stream_request(
             )
                 .into_response();
         }
+        Err(NonStreamCollectError::IdleTimeout {
+            credential_id,
+            idle_timeout_secs,
+            received_bytes,
+        }) => {
+            let message = format!("stream idle timeout after {idle_timeout_secs}s");
+            tracing::error!(idle_timeout_secs, received_bytes, "非流式响应体空闲超时");
+            hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
+            tracer.record_protocol_error("stream_idle_timeout", &message);
+            tracer.finalize(
+                "interrupted",
+                Some("stream_idle_timeout"),
+                Some(&message),
+                Some(received_bytes),
+                TraceUsage::zero(),
+            );
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse::new("api_error", message)),
+            )
+                .into_response();
+        }
     };
 
     if attempt_count == 2 {
         let retry_failure_type = retry_failure_type.unwrap_or("upstream_empty_response");
         tracing::warn!(
             first_attempt_error = retry_failure_type,
-            "非流式首轮正常 EOF 且无语义输出，已完成一次受控重试"
+            "非流式首轮未交付响应，已完成一次受控重试"
         );
         tracer.record_protocol_error(
             retry_failure_type,
@@ -4183,6 +4362,7 @@ pub async fn post_messages_cc(
             provider,
             payload,
             hook,
+            tracer.clone(),
             payload_stream,
             key_ctx.group.clone(),
             state.tool_compatibility_mode,
@@ -4224,13 +4404,17 @@ pub async fn post_messages_cc(
                 ConversionError::InvalidToolChoice(reason) => {
                     ("invalid_request_error", format!("工具选择无效: {}", reason))
                 }
+                ConversionError::InvalidImage { location, source } => (
+                    "invalid_request_error",
+                    format!("图片 {location} 无效: {source}"),
+                ),
             };
             tracing::warn!("请求转换失败: {}", e);
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
             finalize_immediate_error(
                 &tracer,
                 StatusCode::BAD_REQUEST,
-                "request_conversion_error",
+                conversion_error_trace_type(&e),
                 &message,
             );
             return (
@@ -4251,10 +4435,10 @@ pub async fn post_messages_cc(
 
     let prepared_bodies = match prepare_outbound_kiro_bodies(&kiro_request, provider.as_ref()) {
         Ok(prepared) => prepared,
-        Err(response) => {
+        Err(error) => {
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            finalize_immediate_response(&tracer, &response, "request_body_error");
-            return response;
+            finalize_immediate_error(&tracer, error.status, error.error_type, &error.safe_message);
+            return error.response;
         }
     };
     let request_body = &prepared_bodies.primary_body;
@@ -4637,7 +4821,8 @@ async fn run_buffered_sse_attempts(
             retry_request_body = prepared_retry_body;
             tracing::warn!(
                 attempt = attempt_index + 1,
-                "CC 缓冲首轮正常 EOF 且无语义输出，丢弃整轮并重试一次"
+                termination = ?termination,
+                "CC 缓冲首轮未提交语义输出，丢弃整轮并重试一次"
             );
             continue;
         }
@@ -4845,7 +5030,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_stream_and_non_stream_retry_body_uses_threshold_variant_and_schema_hint() {
+    fn handler_retries_keep_primary_body_for_empty_transport_and_schema_failures() {
         fn body(description: &str, marker: &str) -> String {
             serde_json::json!({
                 "marker": marker,
@@ -4863,8 +5048,45 @@ mod tests {
             })
             .to_string()
         }
-        let primary = body("primary description", "primary");
-        let threshold = body("threshold description", "threshold");
+        let primary = body("primary description", "marker_primary");
+        let threshold = body("threshold description", "marker_threshold");
+
+        let transport_cases = [
+            (
+                "empty response",
+                super::super::tool_attempt::AttemptTermination::Eof,
+            ),
+            (
+                "read error",
+                super::super::tool_attempt::AttemptTermination::ReadError(
+                    "connection reset".to_string(),
+                ),
+            ),
+            (
+                "idle timeout",
+                super::super::tool_attempt::AttemptTermination::IdleTimeout,
+            ),
+        ];
+        for (case, termination) in transport_cases {
+            let state = super::super::tool_attempt::ToolAttemptState {
+                attempt_index: 0,
+                termination,
+                failure: Some(super::super::tool_attempt::AttemptFailure::EmptyResponse),
+                semantic_output_started: false,
+                tool_forwarded: false,
+            };
+            assert!(state.should_retry(), "{case} should enter handler retry");
+            let retry = prepare_retry_request_body(
+                &primary,
+                Some(&threshold),
+                state.failure.as_ref(),
+                &std::collections::HashMap::new(),
+            )
+            .expect("transport retry body");
+            assert!(retry.contains("marker_primary"), "{case}");
+            assert!(!retry.contains("marker_threshold"), "{case}");
+        }
+
         let failure = super::super::tool_schema::ToolSchemaFailure::from_error_and_input(
             super::super::tool_schema::ToolSchemaError {
                 tool_name: "get_weather".to_string(),
@@ -4878,22 +5100,33 @@ mod tests {
         );
         let attempt_failure =
             super::super::tool_attempt::AttemptFailure::InvalidToolSchema { failure };
+        let state = super::super::tool_attempt::ToolAttemptState {
+            attempt_index: 0,
+            termination: super::super::tool_attempt::AttemptTermination::Eof,
+            failure: Some(attempt_failure),
+            semantic_output_started: false,
+            tool_forwarded: false,
+        };
+        assert!(
+            state.should_retry(),
+            "schema failure should enter handler retry"
+        );
 
         let retry = prepare_retry_request_body(
             &primary,
             Some(&threshold),
-            Some(&attempt_failure),
+            state.failure.as_ref(),
             &std::collections::HashMap::new(),
         )
         .expect("schema retry body");
         let retry: serde_json::Value = serde_json::from_str(&retry).unwrap();
 
-        assert_eq!(retry["marker"], "threshold");
+        assert_eq!(retry["marker"], "marker_primary");
         let description = retry
             .pointer("/conversationState/currentMessage/userInputMessage/userInputMessageContext/tools/0/toolSpecification/description")
             .and_then(serde_json::Value::as_str)
             .unwrap();
-        assert!(description.starts_with("threshold description"));
+        assert!(description.starts_with("primary description"));
         assert!(description.contains("retry attempt only"));
         assert!(description.contains("city"));
     }
@@ -5465,6 +5698,45 @@ mod tests {
     }
 
     #[test]
+    fn non_stream_body_read_error_retries_only_before_second_attempt() {
+        let error = NonStreamCollectError::Body {
+            credential_id: 7,
+            message: "connection reset".to_string(),
+            received_bytes: 0,
+        };
+        assert!(should_retry_non_stream_collect_error(0, &error));
+        assert!(!should_retry_non_stream_collect_error(1, &error));
+
+        let provider_error = NonStreamCollectError::Provider(anyhow::anyhow!("upstream 500"));
+        assert!(!should_retry_non_stream_collect_error(0, &provider_error));
+    }
+
+    #[tokio::test]
+    async fn non_stream_body_idle_watchdog_resets_per_chunk_and_reports_safe_progress() {
+        use futures::stream;
+
+        let complete = stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(b"ab")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"cd")),
+        ]);
+        let bytes =
+            collect_body_stream_with_idle_timeout(complete, Some(Duration::from_millis(20)))
+                .await
+                .expect("complete response body");
+        assert_eq!(bytes, Bytes::from_static(b"abcd"));
+
+        let stalled = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"ab"))])
+            .chain(stream::pending());
+        let error = collect_body_stream_with_idle_timeout(stalled, Some(Duration::from_millis(20)))
+            .await
+            .expect_err("the application watchdog must stop a stalled body");
+        assert!(matches!(
+            error,
+            NonStreamBodyReadFailure::IdleTimeout { received_bytes: 2 }
+        ));
+    }
+
+    #[test]
     fn non_stream_deduplicates_reclaimed_tool_after_fixed_field_repair() {
         let known = ["exec".to_string()].into_iter().collect();
         let contracts = std::collections::HashMap::from([(
@@ -6001,7 +6273,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn structured_output_recovery_retries_markdown_wrapped_json() {
+    async fn structured_output_normalizes_markdown_wrapped_json_without_retry() {
         let format = super::super::types::OutputFormat {
             format_type: "json_schema".into(),
             schema: serde_json::json!({
@@ -6024,10 +6296,8 @@ mod tests {
             terminal_error: None,
             attempt_failure: None,
         };
-        let mut attempts = std::collections::VecDeque::from([
-            attempt("```json\n{\"answer\":42}\n```"),
-            attempt("{\"answer\":42}"),
-        ]);
+        let mut attempts =
+            std::collections::VecDeque::from([attempt("```json\n{\"answer\":42}\n```")]);
         let mut calls = 0;
         let recovered = recover_strict_json_attempts_with_validator(
             |_| {
@@ -6040,7 +6310,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(calls, 2);
+        assert_eq!(calls, 1);
         assert_eq!(recovered.json, "{\"answer\":42}");
     }
 
@@ -6481,6 +6751,45 @@ mod tests {
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[0]["text"], "native thinking fallback");
+    }
+
+    #[test]
+    fn image_budget_failure_uses_specific_safe_trace_type_and_stats() {
+        let error = ImageBudgetError::Exceeded {
+            count: 12,
+            history_count: 11,
+            current_count: 1,
+            before: 1_993_000,
+            after: 944_788,
+            soft_limit: 819_200,
+            hard_limit: 900_000,
+        };
+        let details = image_budget_failure_details(&error);
+        assert_eq!(details.status, StatusCode::BAD_REQUEST);
+        assert_eq!(details.error_type, "image_budget_exceeded");
+        assert!(details.safe_message.contains("history=11"));
+        assert!(details.safe_message.contains("current=1"));
+        assert!(details.safe_message.contains("before=1993000"));
+        assert!(details.safe_message.contains("after=944788"));
+        assert!(details.safe_message.contains("soft=819200"));
+        assert!(details.safe_message.contains("hard=900000"));
+        assert!(!details.safe_message.contains("base64"));
+    }
+
+    #[test]
+    fn invalid_image_conversion_has_a_specific_trace_type() {
+        let error = ConversionError::InvalidImage {
+            location: "current_message.images[0]".to_string(),
+            source: crate::image_resize::ImageValidationError::DecodeFailed,
+        };
+        assert_eq!(
+            conversion_error_trace_type(&error),
+            "image_validation_error"
+        );
+        assert_eq!(
+            conversion_error_trace_type(&ConversionError::EmptyMessages),
+            "request_conversion_error"
+        );
     }
 
     #[test]

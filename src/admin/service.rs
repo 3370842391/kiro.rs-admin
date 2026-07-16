@@ -127,6 +127,7 @@ fn build_image_budget_response(policy: ImageBudgetPolicy) -> ImageBudgetResponse
     ImageBudgetResponse {
         enabled: policy.enabled,
         total_base64_budget_bytes: policy.total_base64_budget_bytes,
+        hard_base64_limit_bytes: policy.hard_base64_limit_bytes,
         history_max_dimension: policy.history_max_dimension,
         history_jpeg_quality: policy.history_jpeg_quality,
         retry_history_max_dimension: policy.retry_history_max_dimension,
@@ -2894,9 +2895,13 @@ impl AdminService {
         let provider = self.kiro_provider.as_ref().ok_or_else(|| {
             AdminServiceError::InternalError("Kiro provider 未初始化".to_string())
         })?;
+        let current_policy = provider.image_budget_policy();
         let policy = ImageBudgetPolicy {
             enabled: req.enabled,
             total_base64_budget_bytes: req.total_base64_budget_bytes,
+            hard_base64_limit_bytes: req
+                .hard_base64_limit_bytes
+                .unwrap_or(current_policy.hard_base64_limit_bytes),
             history_max_dimension: req.history_max_dimension,
             history_jpeg_quality: req.history_jpeg_quality,
             retry_history_max_dimension: req.retry_history_max_dimension,
@@ -2912,6 +2917,7 @@ impl AdminService {
             .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
         config.image_budget_enabled = policy.enabled;
         config.image_total_base64_budget_bytes = policy.total_base64_budget_bytes;
+        config.image_hard_base64_limit_bytes = policy.hard_base64_limit_bytes;
         config.image_history_max_dimension = policy.history_max_dimension;
         config.image_history_jpeg_quality = policy.history_jpeg_quality;
         config.image_retry_history_max_dimension = policy.retry_history_max_dimension;
@@ -4625,6 +4631,114 @@ impl AdminService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ImageBudgetTestDir(PathBuf);
+
+    impl ImageBudgetTestDir {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("kiro-rs-image-budget-admin-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ImageBudgetTestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn image_budget_test_service(
+        initial_hard_limit: usize,
+    ) -> (AdminService, Arc<KiroProvider>, PathBuf, ImageBudgetTestDir) {
+        use crate::kiro::endpoint::{IdeEndpoint, KiroEndpoint};
+        use crate::model::config::TlsBackend;
+
+        let temp = ImageBudgetTestDir::new();
+        let config_path = temp.path().join("config.json");
+        let mut config = Config::load(&config_path).unwrap();
+        config.image_hard_base64_limit_bytes = initial_hard_limit;
+        config.save().unwrap();
+
+        let manager =
+            Arc::new(MultiTokenManager::new(config, Vec::new(), None, None, true).unwrap());
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint::new()));
+        let provider = Arc::new(KiroProvider::with_proxy(
+            Arc::clone(&manager),
+            None,
+            endpoints,
+            "ide".to_string(),
+            None,
+        ));
+        let service = AdminService::new(
+            manager,
+            vec!["ide".to_string()],
+            Arc::new(ProxyPoolManager::new(None, TlsBackend::Rustls)),
+        )
+        .with_kiro_provider(Arc::clone(&provider));
+
+        (service, provider, config_path, temp)
+    }
+
+    fn image_budget_update(hard_base64_limit_bytes: Option<usize>) -> SetImageBudgetRequest {
+        SetImageBudgetRequest {
+            enabled: true,
+            total_base64_budget_bytes: 1024 * 1024,
+            hard_base64_limit_bytes,
+            history_max_dimension: 1_280,
+            history_jpeg_quality: 72,
+            retry_history_max_dimension: 960,
+            retry_history_jpeg_quality: 60,
+        }
+    }
+
+    #[tokio::test]
+    async fn set_image_budget_omitted_hard_limit_preserves_current_policy_and_config() {
+        let current_hard_limit = 12 * 1024 * 1024;
+        let (service, provider, config_path, _temp) = image_budget_test_service(current_hard_limit);
+
+        let response = service.set_image_budget(image_budget_update(None)).unwrap();
+
+        assert_eq!(response.hard_base64_limit_bytes, current_hard_limit);
+        assert_eq!(
+            provider.image_budget_policy().hard_base64_limit_bytes,
+            current_hard_limit
+        );
+        assert_eq!(
+            Config::load(config_path)
+                .unwrap()
+                .image_hard_base64_limit_bytes,
+            current_hard_limit
+        );
+    }
+
+    #[tokio::test]
+    async fn set_image_budget_explicit_hard_limit_overrides_and_persists() {
+        let updated_hard_limit = 16 * 1024 * 1024;
+        let (service, provider, config_path, _temp) = image_budget_test_service(12 * 1024 * 1024);
+
+        let response = service
+            .set_image_budget(image_budget_update(Some(updated_hard_limit)))
+            .unwrap();
+
+        assert_eq!(response.hard_base64_limit_bytes, updated_hard_limit);
+        assert_eq!(
+            provider.image_budget_policy().hard_base64_limit_bytes,
+            updated_hard_limit
+        );
+        assert_eq!(
+            Config::load(config_path)
+                .unwrap()
+                .image_hard_base64_limit_bytes,
+            updated_hard_limit
+        );
+    }
 
     #[test]
     fn login_credential_result_maps_duplicate_flag() {

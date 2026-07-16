@@ -455,6 +455,10 @@ pub struct Config {
     #[serde(default = "default_image_total_budget")]
     pub image_total_base64_budget_bytes: usize,
 
+    /// 图片 base64 本地硬上限；普通体和激进体都超过时才拒绝。
+    #[serde(default = "default_image_hard_limit")]
+    pub image_hard_base64_limit_bytes: usize,
+
     /// 普通预检压缩历史图片时的最大边长。
     #[serde(default = "default_image_history_dimension")]
     pub image_history_max_dimension: u32,
@@ -608,6 +612,10 @@ fn default_image_total_budget() -> usize {
     819_200
 }
 
+fn default_image_hard_limit() -> usize {
+    8 * 1024 * 1024
+}
+
 fn default_image_history_dimension() -> u32 {
     1_280
 }
@@ -690,6 +698,7 @@ impl Default for Config {
             cache_hit_rate_max_pct: 0,
             image_budget_enabled: true,
             image_total_base64_budget_bytes: default_image_total_budget(),
+            image_hard_base64_limit_bytes: default_image_hard_limit(),
             image_history_max_dimension: default_image_history_dimension(),
             image_history_jpeg_quality: default_image_history_quality(),
             image_retry_history_max_dimension: default_image_retry_dimension(),
@@ -854,6 +863,7 @@ mod tests {
         let defaulted: Config = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(defaulted.image_budget_enabled);
         assert_eq!(defaulted.image_total_base64_budget_bytes, 819_200);
+        assert_eq!(defaulted.image_hard_base64_limit_bytes, 8 * 1024 * 1024);
         assert_eq!(defaulted.image_history_max_dimension, 1_280);
         assert_eq!(defaulted.image_history_jpeg_quality, 72);
         assert_eq!(defaulted.image_retry_history_max_dimension, 960);
@@ -862,6 +872,7 @@ mod tests {
         let encoded = serde_json::to_value(defaulted).unwrap();
         assert_eq!(encoded["imageBudgetEnabled"], true);
         assert_eq!(encoded["imageTotalBase64BudgetBytes"], 819_200);
+        assert_eq!(encoded["imageHardBase64LimitBytes"], 8 * 1024 * 1024);
         assert_eq!(encoded["imageHistoryMaxDimension"], 1_280);
         assert_eq!(encoded["imageHistoryJpegQuality"], 72);
         assert_eq!(encoded["imageRetryHistoryMaxDimension"], 960);

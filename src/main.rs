@@ -23,6 +23,37 @@ use kiro::token_manager::MultiTokenManager;
 use model::arg::Args;
 use model::config::Config;
 
+const QUIET_TRANSPORT_MODULES: [&str; 3] = ["h2", "hyper", "reqwest"];
+
+fn effective_log_filter(configured: Option<&str>) -> String {
+    let mut directives = configured
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("info")
+        .to_string();
+    for module in QUIET_TRANSPORT_MODULES {
+        let explicitly_configured = directives.split(',').any(|directive| {
+            directive
+                .trim()
+                .split_once('=')
+                .is_some_and(|(target, _)| target.trim() == module)
+        });
+        if !explicitly_configured {
+            directives.push(',');
+            directives.push_str(module);
+            directives.push_str("=info");
+        }
+    }
+    directives
+}
+
+fn log_env_filter() -> tracing_subscriber::EnvFilter {
+    let configured = std::env::var("RUST_LOG").ok();
+    let directives = effective_log_filter(configured.as_deref());
+    tracing_subscriber::EnvFilter::try_new(directives).unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new("info,h2=info,hyper=info,reqwest=info")
+    })
+}
+
 #[tokio::main]
 async fn main() {
     // 解析命令行参数
@@ -30,10 +61,7 @@ async fn main() {
 
     // 初始化日志
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+        .with_env_filter(log_env_filter())
         .init();
 
     // 解析配置/凭证路径
@@ -592,4 +620,33 @@ fn random_token(len: usize) -> String {
             CHARSET[idx] as char
         })
         .collect()
+}
+
+#[cfg(test)]
+mod logging_filter_tests {
+    use super::effective_log_filter;
+
+    #[test]
+    fn debug_filter_suppresses_transport_frame_noise_by_default() {
+        assert_eq!(
+            effective_log_filter(Some("debug")),
+            "debug,h2=info,hyper=info,reqwest=info"
+        );
+    }
+
+    #[test]
+    fn explicit_module_directives_override_transport_defaults() {
+        assert_eq!(
+            effective_log_filter(Some("kiro_rs=debug,h2=trace,reqwest=warn")),
+            "kiro_rs=debug,h2=trace,reqwest=warn,hyper=info"
+        );
+    }
+
+    #[test]
+    fn missing_filter_defaults_to_info_without_duplicate_directives() {
+        assert_eq!(
+            effective_log_filter(None),
+            "info,h2=info,hyper=info,reqwest=info"
+        );
+    }
 }

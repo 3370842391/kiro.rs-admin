@@ -52,6 +52,34 @@ const MAX_POLICY_TOTAL_RETRIES: usize = 30;
 /// 代理池条目较多时，避免每个不同代理都常驻一个 reqwest::Client 导致内存无界增长。
 const CLIENT_CACHE_CAP: usize = 64;
 
+/// 业务流的空闲截止由 Anthropic 适配层的 watchdog 单独负责。
+///
+/// reqwest 的 read timeout 若与 watchdog 使用同一个截止时间，两者会在边界竞态，
+/// 导致本应归类为 `stream_idle_timeout` 的请求随机先以响应体解码错误结束。
+/// 传输层因此只保留 Client 的 720 秒绝对超时，不再复用业务 idle 配置。
+fn transport_read_timeout_secs(_stream_idle_timeout_secs: u64) -> Option<u64> {
+    None
+}
+
+async fn await_response_headers<T, E, F>(future: F, timeout: Option<Duration>) -> anyhow::Result<T>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+    E: Into<anyhow::Error>,
+{
+    if let Some(timeout) = timeout {
+        return tokio::time::timeout(timeout, future)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "upstream response header timeout after {} ms",
+                    timeout.as_millis()
+                )
+            })?
+            .map_err(Into::into);
+    }
+    future.await.map_err(Into::into)
+}
+
 fn is_content_length_threshold_error(error: &anyhow::Error) -> bool {
     error
         .to_string()
@@ -208,9 +236,8 @@ pub struct KiroProvider {
     client_cache: Mutex<ClientCache>,
     /// TLS 后端配置
     tls_backend: TlsBackend,
-    /// 流式/请求 Client 的读空闲超时（秒，None = 不设置，保持旧行为）。
-    /// 来自 `config.stream_idle_timeout_secs`，让底层在上游首字节前/中途挂死时尽早报错，
-    /// 配合流层 idle watchdog 收尾，避免空烧到 720s 绝对超时。
+    /// 传输层读空闲超时。业务 Client 固定不设置，由应用 watchdog 负责稳定分类。
+    /// Client 本身仍保留 720 秒绝对请求上限。
     read_timeout_secs: Option<u64>,
     /// 端点实现注册表（key: endpoint 名称）
     endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
@@ -249,12 +276,9 @@ impl KiroProvider {
             default_endpoint
         );
         let tls_backend = token_manager.config().tls_backend;
-        // 读空闲超时：来自 config.stream_idle_timeout_secs（0 = 不设 read timeout，保持旧行为）。
-        // 让上游首字节前挂死 / 中途停流时底层读取尽早报错，配合流层 idle watchdog 收尾。
-        let read_timeout_secs = match token_manager.config().stream_idle_timeout_secs {
-            0 => None,
-            secs => Some(secs),
-        };
+        // 应用 watchdog 读取运行时配置；传输层不复用同一个截止时间，避免边界竞态。
+        let read_timeout_secs =
+            transport_read_timeout_secs(token_manager.config().stream_idle_timeout_secs);
         // 预热：构建全局代理对应的 Client（作为受保护的常驻条目）
         let initial_client =
             build_client_with_read_timeout(proxy.as_ref(), 720, read_timeout_secs, tls_backend)
@@ -263,6 +287,7 @@ impl KiroProvider {
         let configured_image_budget = ImageBudgetPolicy {
             enabled: token_manager.config().image_budget_enabled,
             total_base64_budget_bytes: token_manager.config().image_total_base64_budget_bytes,
+            hard_base64_limit_bytes: token_manager.config().image_hard_base64_limit_bytes,
             history_max_dimension: token_manager.config().image_history_max_dimension,
             history_jpeg_quality: token_manager.config().image_history_jpeg_quality,
             retry_history_max_dimension: token_manager.config().image_retry_history_max_dimension,
@@ -377,8 +402,7 @@ impl KiroProvider {
     /// client 的 read_timeout，需在流层维护一个跨迭代的空闲截止时间。
     ///
     /// 读**运行时**值（token_manager 原子态），使管理面板对 `stream_idle_timeout_secs`
-    /// 的修改立即作用于流层 watchdog。注意：HTTP client 的 `.read_timeout()` 在构造时
-    /// 已固定（连接池复用），运行时改值只影响流层 watchdog；两者协同兜底，够用。
+    /// 的修改立即作用于流层 watchdog。HTTP client 仅保留 720 秒绝对超时。
     pub fn stream_idle_timeout_secs(&self) -> u64 {
         self.token_manager.get_stream_idle_timeout_secs()
     }
@@ -609,7 +633,10 @@ impl KiroProvider {
                 tracing::debug!("  header {}: {}", k, v.to_str().unwrap_or("<binary>"));
             }
         }
-        match client.execute(request).await {
+        let header_timeout_secs = self.stream_idle_timeout_secs();
+        let header_timeout =
+            (header_timeout_secs > 0).then(|| Duration::from_secs(header_timeout_secs));
+        match await_response_headers(client.execute(request), header_timeout).await {
             Ok(response) => Ok(response),
             Err(error) => {
                 if let Some(sink) = sink {
@@ -748,7 +775,10 @@ impl KiroProvider {
                 .header("content-type", endpoint.content_type())
                 .header("Connection", "keep-alive");
             let request = endpoint.decorate_mcp(base, &rctx);
-            match request.send().await {
+            let header_timeout_secs = self.stream_idle_timeout_secs();
+            let header_timeout =
+                (header_timeout_secs > 0).then(|| Duration::from_secs(header_timeout_secs));
+            match await_response_headers(request.send(), header_timeout).await {
                 Ok(response) => {
                     let status = response.status();
                     if should_try_next_proxy(status) {
@@ -2054,6 +2084,32 @@ impl KiroProvider {
 mod tests {
     use super::*;
     use crate::kiro::parser::crc::crc32;
+
+    #[test]
+    fn application_idle_watchdog_never_becomes_reqwest_read_timeout() {
+        assert_eq!(transport_read_timeout_secs(0), None);
+        assert_eq!(transport_read_timeout_secs(120), None);
+        assert_eq!(transport_read_timeout_secs(600), None);
+    }
+
+    #[tokio::test]
+    async fn response_header_watchdog_bounds_send_without_touching_body_reads() {
+        let timeout = await_response_headers(
+            std::future::pending::<Result<(), std::io::Error>>(),
+            Some(Duration::from_millis(20)),
+        )
+        .await
+        .unwrap_err();
+        assert!(timeout.to_string().contains("response header timeout"));
+
+        let ready = await_response_headers(
+            async { Ok::<_, std::io::Error>(7_u8) },
+            Some(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ready, 7);
+    }
 
     fn string_header(name: &str, value: &str) -> Vec<u8> {
         let mut out = Vec::new();
