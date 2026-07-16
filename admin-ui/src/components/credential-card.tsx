@@ -681,7 +681,7 @@ export function CredentialCard({
         <div className="truncate text-sm font-medium leading-5">
           {displayName}
         </div>
-        <div className="mt-1 flex min-w-0 items-center gap-1 overflow-hidden [&>*]:shrink-0">
+        <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1 gap-y-1 [&>*]:shrink-0">
           {badges}
         </div>
       </div>

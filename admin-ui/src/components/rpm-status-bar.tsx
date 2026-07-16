@@ -1,8 +1,13 @@
 import type { RpmSummary } from '@/types/api'
+import {
+  formatAvailableCreditSummary,
+  type AvailableCreditSummary,
+} from '@/lib/credential-summary'
 
 interface RpmStatusBarProps {
   summary?: RpmSummary
   totalInFlight: number
+  availableCreditSummary: AvailableCreditSummary
 }
 
 interface StatusItemProps {
@@ -35,20 +40,25 @@ function StatusItem({ label, value, detail, tone = 'default' }: StatusItemProps)
   )
 }
 
-export function RpmStatusBar({ summary, totalInFlight }: RpmStatusBarProps) {
+export function RpmStatusBar({
+  summary,
+  totalInFlight,
+  availableCreditSummary,
+}: RpmStatusBarProps) {
   const current = summary?.current ?? 0
   const limitedCapacity = summary?.limitedCapacity ?? 0
   const remainingLimitedCapacity = summary?.remainingLimitedCapacity ?? 0
   const unlimitedAccounts = summary?.unlimitedAccounts ?? 0
   const saturatedAccounts = summary?.saturatedAccounts ?? 0
   const hasUnlimitedCapacity = unlimitedAccounts > 0
+  const creditDisplay = formatAvailableCreditSummary(availableCreditSummary)
 
   return (
     <section
       aria-label="最近60秒 RPM 状态"
       className="mb-4 border-y border-border/70 bg-muted/40 px-3 py-2 sm:px-4"
     >
-      <div className="grid grid-cols-2 gap-x-4 gap-y-1 sm:grid-cols-5">
+      <div className="grid grid-cols-2 gap-x-4 gap-y-1 sm:grid-cols-3 xl:grid-cols-6">
         <StatusItem label="最近60秒 RPM" value={current} />
         <StatusItem
           label={hasUnlimitedCapacity ? '总容量' : '有限容量'}
@@ -69,6 +79,11 @@ export function RpmStatusBar({ summary, totalInFlight }: RpmStatusBarProps) {
           label="进行中请求"
           value={totalInFlight}
           tone={totalInFlight > 0 ? 'warning' : 'default'}
+        />
+        <StatusItem
+          label="可用积分"
+          value={creditDisplay.value}
+          detail={creditDisplay.detail}
         />
       </div>
     </section>
