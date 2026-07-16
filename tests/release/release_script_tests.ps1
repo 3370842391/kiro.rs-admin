@@ -57,4 +57,26 @@ $emptySummary = @(Get-ReleaseSummary -Subjects @())
 Assert-Equal $emptySummary.Count 1 '空提交范围应生成维护说明'
 Assert-Equal $emptySummary[0] '其他：仅版本维护' '空提交范围说明错误'
 
+$nativeWarnings = @()
+$nativeOutput = @(Invoke-NativeChecked `
+    -FilePath 'powershell.exe' `
+    -Arguments @(
+        '-NoProfile',
+        '-Command',
+        "[Console]::Out.WriteLine('stdout-ok'); [Console]::Error.WriteLine('stderr-warning'); exit 0"
+    ) `
+    -Capture `
+    -WarningVariable nativeWarnings)
+Assert-Equal $nativeOutput.Count 1 '成功命令的 stderr 不应污染 stdout 捕获结果'
+Assert-Equal $nativeOutput[0] 'stdout-ok' '成功命令 stdout 捕获错误'
+Assert-Equal $nativeWarnings.Count 1 '成功命令的 stderr 应保留为警告'
+Assert-Equal $nativeWarnings[0].ToString() 'stderr-warning' '成功命令警告内容错误'
+
+Assert-Throws {
+    Invoke-NativeChecked `
+        -FilePath 'powershell.exe' `
+        -Arguments @('-NoProfile', '-Command', "[Console]::Error.WriteLine('fatal-error'); exit 7") `
+        -Capture
+} '非零退出码仍应失败'
+
 Write-Host 'release_script_tests: PASS'
