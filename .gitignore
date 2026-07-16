@@ -47,3 +47,4 @@ demo/
 /scripts/__pycache__/
 /scripts/batch_login/__pycache__/
 /tests/batch_login/__pycache__/
+/.superpowers/
