@@ -43,6 +43,10 @@ def clear_secret_vars(*variables) -> None:
         variable.set("")
 
 
+def password_cell_text(account) -> str:
+    return "••••••" if account.has_current_password else "未设置"
+
+
 def select_range_ids(
     row_ids: list[str] | tuple[str, ...],
     anchor: str,
@@ -77,6 +81,32 @@ class AccountManagerApp:
         "{account}----{password}",
         "{account}|{password}|{start_url}",
     )
+    PRIMARY_TOOLBAR_LABELS = (
+        "粘贴并识别",
+        "指定 URL",
+        PRIMARY_ACTION_LABEL,
+        "自动登录设置",
+    )
+    SELECTION_TOOLBAR_LABELS = (
+        "全选",
+        "反选",
+        "取消选择",
+        "查看密码",
+        "更新密码",
+        "导出账号密码",
+        "标记已售",
+        "恢复管理",
+    )
+    CONTEXT_MENU_LABELS = (
+        "一键获取 JSON",
+        "复制账号",
+        "复制 Start URL",
+        "查看密码",
+        "更新密码",
+        "导出账号密码",
+        "标记已售",
+        "恢复管理",
+    )
     STATUS_VALUES = {
         "管理中": "managed",
         "全部": "all",
@@ -97,6 +127,7 @@ class AccountManagerApp:
         self.selected_count_var = tk.StringVar(value="已选择 0 个账号")
         self.visible_ids: list[int] = []
         self.drag_anchor = ""
+        self._refreshing_tree = False
         self.root.title("Kiro 账号管理器")
         self.root.geometry("1420x820")
         self.root.minsize(1080, 640)
@@ -109,26 +140,41 @@ class AccountManagerApp:
         ttk.Label(outer, text="Kiro 账号管理器", font=("Microsoft YaHei UI", 16, "bold")).pack(anchor="w")
         ttk.Label(outer, text="粘贴入库、批量选择、密码查看、销售标记和导出", foreground="#475569").pack(anchor="w", pady=(2, 8))
         toolbar = ttk.Frame(outer)
-        toolbar.pack(fill="x", pady=(0, 8))
+        toolbar.pack(fill="x", pady=(0, 4))
         ttk.Entry(toolbar, textvariable=self.query_var, width=34).pack(side="left")
         self.query_var.trace_add("write", lambda *_args: self.refresh())
         status = ttk.Combobox(toolbar, state="readonly", textvariable=self.filter_var, values=list(self.STATUS_VALUES), width=10)
         status.pack(side="left", padx=6)
         status.bind("<<ComboboxSelected>>", lambda _event: self.refresh())
-        for text, command in (
-            ("粘贴并识别", self.open_import_dialog),
-            (self.PRIMARY_ACTION_LABEL, self.start_login_export),
-            ("全选", self.select_all),
-            ("反选", self.invert_selection),
-            ("取消选择", self.clear_selection),
-            ("查看密码", self.open_password_viewer),
-            ("更新密码", self.update_password),
-            ("导出账号密码", self.open_export_dialog),
-            ("标记已售", self.mark_sold),
-            ("恢复管理", self.restore_managed),
-            ("自动登录设置", self.open_legacy_login),
+        primary_commands = (
+            self.open_import_dialog,
+            self.open_start_url_manager,
+            self.start_login_export,
+            self.open_legacy_login,
+        )
+        for text, command in zip(
+            self.PRIMARY_TOOLBAR_LABELS, primary_commands, strict=True
         ):
             ttk.Button(toolbar, text=text, command=command).pack(side="left", padx=2)
+        selection_toolbar = ttk.Frame(outer)
+        selection_toolbar.pack(fill="x", pady=(0, 8))
+        ttk.Label(selection_toolbar, text="批量操作：").pack(side="left")
+        selection_commands = (
+            self.select_all,
+            self.invert_selection,
+            self.clear_selection,
+            self.open_password_viewer,
+            self.update_password,
+            self.open_export_dialog,
+            self.mark_sold,
+            self.restore_managed,
+        )
+        for text, command in zip(
+            self.SELECTION_TOOLBAR_LABELS, selection_commands, strict=True
+        ):
+            ttk.Button(selection_toolbar, text=text, command=command).pack(
+                side="left", padx=2
+            )
 
         self.tree = ttk.Treeview(outer, columns=self.TABLE_COLUMNS, show="headings", selectmode="extended")
         headings = {
@@ -143,9 +189,27 @@ class AccountManagerApp:
             self.tree.column(column, width=widths[column], anchor="w")
         self.tree.pack(fill="both", expand=True)
         self.tree.bind("<Button-1>", self._tree_click, add="+")
+        self.tree.bind("<Button-3>", self._tree_context_menu)
         self.tree.bind("<B1-Motion>", self._tree_drag, add="+")
         self.tree.bind("<<TreeviewSelect>>", self._tree_selection, add="+")
-        self.tree.bind("<Double-1>", lambda _event: self.open_password_viewer())
+        self.tree.bind("<Double-1>", self._tree_double_click)
+        self.context_menu = tk.Menu(self.root, tearoff=False)
+        context_commands = (
+            self.start_login_export,
+            self.copy_selected_accounts,
+            self.copy_selected_start_urls,
+            self.open_password_viewer,
+            self.update_password,
+            self.open_export_dialog,
+            self.mark_sold,
+            self.restore_managed,
+        )
+        for index, (label, command) in enumerate(
+            zip(self.CONTEXT_MENU_LABELS, context_commands, strict=True)
+        ):
+            if index in {3, 6}:
+                self.context_menu.add_separator()
+            self.context_menu.add_command(label=label, command=command)
         footer = ttk.Frame(outer)
         footer.pack(fill="x", pady=(6, 0))
         ttk.Label(footer, textvariable=self.selected_count_var).pack(side="left")
@@ -162,16 +226,21 @@ class AccountManagerApp:
             return
         self.visible_ids = [item.id for item in accounts]
         selected = self.service.selected_ids
-        self.tree.delete(*self.tree.get_children())
-        for item in accounts:
-            self.tree.insert("", "end", iid=str(item.id), values=(
-                "☑" if item.id in selected else "☐", item.account, "••••••" if item.credential_status.value != "missing" else "未设置",
-                item.start_url or "", item.login_status.value, item.credential_status.value,
-                "已售出" if item.lifecycle_status is LifecycleStatus.SOLD else "管理中",
-                item.note, item.updated_at,
-            ))
-            if item.id in selected:
-                self.tree.selection_add(str(item.id))
+        self._refreshing_tree = True
+        try:
+            self.tree.delete(*self.tree.get_children())
+            for item in accounts:
+                self.tree.insert("", "end", iid=str(item.id), values=(
+                    "☑" if item.id in selected else "☐", item.account,
+                    password_cell_text(item), item.start_url or "",
+                    item.login_status.value, item.credential_status.value,
+                    "已售出" if item.lifecycle_status is LifecycleStatus.SOLD else "管理中",
+                    item.note, item.updated_at,
+                ))
+                if item.id in selected:
+                    self.tree.selection_add(str(item.id))
+        finally:
+            self._refreshing_tree = False
         self._update_selected_count()
         self.status_var.set(f"显示 {len(accounts)} 个账号")
 
@@ -183,6 +252,7 @@ class AccountManagerApp:
         if self.tree.identify_column(event.x) == "#1":
             self.service.toggle_selected(int(row))
             self.refresh()
+            return "break"
 
     def _tree_drag(self, event) -> None:
         current = self.tree.identify_row(event.y)
@@ -193,8 +263,47 @@ class AccountManagerApp:
         self.refresh()
 
     def _tree_selection(self, _event=None) -> None:
-        self.service.select_visible(int(item) for item in self.tree.selection())
+        if self._refreshing_tree:
+            return
+        self.service.set_selected(int(item) for item in self.tree.selection())
+        self._update_tree_selection_markers()
         self._update_selected_count()
+
+    def _update_tree_selection_markers(self) -> None:
+        selected = self.service.selected_ids
+        for item in self.tree.get_children():
+            self.tree.set(
+                item,
+                "checked",
+                "☑" if int(item) in selected else "☐",
+            )
+
+    def _tree_double_click(self, event):
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return "break"
+        self.service.set_selected([int(row)])
+        self.refresh()
+        return "break"
+
+    def _tree_context_menu(self, event):
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return "break"
+        if int(row) not in self.service.selected_ids:
+            self.service.set_selected([int(row)])
+            self.refresh()
+        try:
+            self.context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.context_menu.grab_release()
+        return "break"
+
+    def _selected_action_ids(self) -> list[int]:
+        visible_selection = [int(item) for item in self.tree.selection()]
+        if visible_selection:
+            self.service.set_selected(visible_selection)
+        return sorted(self.service.selected_ids)
 
     def _update_selected_count(self) -> None:
         self.selected_count_var.set(f"已选择 {len(self.service.selected_ids)} 个账号")
@@ -211,13 +320,117 @@ class AccountManagerApp:
         self.service.clear_selected()
         self.refresh()
 
+    def open_start_url_manager(self) -> None:
+        try:
+            catalog = self.service.load_start_url_catalog()
+        except AccountManagerServiceError as error:
+            self._error(error)
+            return
+        window = tk.Toplevel(self.root)
+        window.title("指定企业 Start URL")
+        window.geometry("760x360")
+        window.transient(self.root)
+        entry_var = tk.StringVar(value=catalog.default_url)
+        default_var = tk.StringVar()
+        ttk.Label(
+            window,
+            text="保存常用企业登录 URL，并指定粘贴账号时默认使用的地址。",
+            foreground="#475569",
+        ).pack(anchor="w", padx=12, pady=(12, 6))
+        editor = ttk.Frame(window)
+        editor.pack(fill="x", padx=12)
+        ttk.Entry(editor, textvariable=entry_var).pack(
+            side="left", fill="x", expand=True
+        )
+        saved_list = tk.Listbox(window, height=9, activestyle="dotbox")
+        saved_list.pack(fill="both", expand=True, padx=12, pady=8)
+
+        def refresh_catalog(updated=None) -> None:
+            nonlocal catalog
+            if updated is not None:
+                catalog = updated
+            saved_list.delete(0, "end")
+            for item in catalog.urls:
+                prefix = "★ " if item == catalog.default_url else "   "
+                saved_list.insert("end", prefix + item)
+            default_var.set(
+                f"当前默认：{catalog.default_url or '未指定'}"
+            )
+
+        def selected_url() -> str:
+            selected = saved_list.curselection()
+            if not selected:
+                return entry_var.get().strip()
+            return catalog.urls[int(selected[0])]
+
+        def save_url(*, make_default: bool) -> None:
+            try:
+                updated = self.service.save_start_url(
+                    entry_var.get(), make_default=make_default
+                )
+            except AccountManagerServiceError as error:
+                messagebox.showerror("URL 保存失败", str(error), parent=window)
+                return
+            refresh_catalog(updated)
+            entry_var.set(updated.default_url if make_default else entry_var.get())
+
+        def set_default(_event=None) -> None:
+            value = selected_url()
+            try:
+                updated = self.service.set_default_start_url(value)
+            except AccountManagerServiceError as error:
+                messagebox.showerror("URL 设置失败", str(error), parent=window)
+                return
+            entry_var.set(updated.default_url)
+            refresh_catalog(updated)
+
+        def delete_selected() -> None:
+            value = selected_url()
+            if not value:
+                messagebox.showinfo("删除 URL", "请先选择一个 URL", parent=window)
+                return
+            try:
+                updated = self.service.delete_start_url(value)
+            except AccountManagerServiceError as error:
+                messagebox.showerror("URL 删除失败", str(error), parent=window)
+                return
+            entry_var.set(updated.default_url)
+            refresh_catalog(updated)
+
+        ttk.Button(
+            editor,
+            text="仅保存",
+            command=lambda: save_url(make_default=False),
+        ).pack(side="left", padx=(8, 0))
+        ttk.Button(
+            editor,
+            text="保存并设为默认",
+            command=lambda: save_url(make_default=True),
+        ).pack(side="left", padx=(6, 0))
+        saved_list.bind("<Double-1>", set_default)
+        footer = ttk.Frame(window)
+        footer.pack(fill="x", padx=12, pady=(0, 12))
+        ttk.Label(footer, textvariable=default_var).pack(side="left")
+        ttk.Button(footer, text="删除选中", command=delete_selected).pack(
+            side="right"
+        )
+        ttk.Button(footer, text="设为默认", command=set_default).pack(
+            side="right", padx=6
+        )
+        refresh_catalog()
+
     def open_import_dialog(self) -> None:
+        try:
+            catalog = self.service.load_start_url_catalog()
+        except AccountManagerServiceError as error:
+            self._error(error)
+            return
         window = tk.Toplevel(self.root)
         window.title("粘贴并识别账号")
         window.geometry("980x700")
         template = tk.StringVar(value=self.INPUT_TEMPLATE)
         mode = tk.StringVar(value=LoginMode.ENTERPRISE.value)
-        start_url = tk.StringVar()
+        start_url = tk.StringVar(value=catalog.default_url)
         fields = ttk.Frame(window)
         fields.pack(fill="x", padx=10, pady=(10, 4))
         ttk.Label(fields, text="账号格式").grid(row=0, column=0, sticky="w")
@@ -235,7 +448,11 @@ class AccountManagerApp:
             width=18,
         ).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
         ttk.Label(fields, text="统一 Start URL").grid(row=2, column=0, sticky="w", pady=(6, 0))
-        ttk.Entry(fields, textvariable=start_url).grid(
+        ttk.Combobox(
+            fields,
+            textvariable=start_url,
+            values=catalog.urls,
+        ).grid(
             row=2, column=1, sticky="ew", padx=(8, 0), pady=(6, 0)
         )
         ttk.Label(
@@ -288,28 +505,83 @@ class AccountManagerApp:
         ttk.Button(actions, text="转换并预览", command=parse_preview).pack(side="left")
         ttk.Button(actions, text="保存到账号库", command=confirm).pack(side="right")
 
+    def copy_selected_accounts(self) -> None:
+        ids = self._selected_action_ids()
+        if not ids:
+            messagebox.showinfo("复制账号", "请先选择账号", parent=self.root)
+            return
+        try:
+            accounts = [self.service.repository.get(item) for item in ids]
+        except Exception as error:
+            self._error(error)
+            return
+        self._copy("\n".join(item.account for item in accounts))
+        self.status_var.set(f"已复制 {len(accounts)} 个账号")
+
+    def copy_selected_start_urls(self) -> None:
+        ids = self._selected_action_ids()
+        if not ids:
+            messagebox.showinfo("复制 Start URL", "请先选择账号", parent=self.root)
+            return
+        try:
+            accounts = [self.service.repository.get(item) for item in ids]
+        except Exception as error:
+            self._error(error)
+            return
+        urls = list(
+            dict.fromkeys(item.start_url for item in accounts if item.start_url)
+        )
+        if not urls:
+            messagebox.showinfo(
+                "复制 Start URL", "所选账号没有 Start URL", parent=self.root
+            )
+            return
+        self._copy("\n".join(urls))
+        self.status_var.set(f"已复制 {len(urls)} 个 Start URL")
+
     def open_password_viewer(self) -> None:
-        ids = sorted(self.service.selected_ids)
+        ids = self._selected_action_ids()
         if len(ids) != 1:
             messagebox.showinfo("查看密码", "请选择一个账号", parent=self.root); return
         try:
-            account = self.service.repository.get(ids[0], include_secrets=True)
+            account = self._load_account_with_password_recovery(ids[0])
         except Exception as error:
             self._error(error); return
+        self.refresh()
         window = tk.Toplevel(self.root); window.title(f"密码查看 - {account.account}")
         initial = tk.StringVar(value=account.initial_password or "")
         current = tk.StringVar(value=account.current_password or "")
         for row, (label, variable) in enumerate((("初始一次性密码", initial), ("当前登录密码", current))):
             ttk.Label(window, text=label).grid(row=row, column=0, padx=10, pady=8, sticky="w")
-            entry = ttk.Entry(window, textvariable=variable, show="•", width=58); entry.grid(row=row, column=1, padx=6)
+            entry = ttk.Entry(
+                window, textvariable=variable, show="•", width=58,
+                state="readonly",
+            ); entry.grid(row=row, column=1, padx=6)
             ttk.Button(window, text="显示", command=lambda item=entry: item.configure(show="" if item.cget("show") else "•")).grid(row=row, column=2, padx=4)
             ttk.Button(window, text="复制", command=lambda var=variable: self._copy(var.get())).grid(row=row, column=3, padx=(0, 10))
+        if not account.current_password:
+            ttk.Label(
+                window,
+                text="未找到已确认的新密码，可使用“更新密码”手动录入。",
+                foreground="#b45309",
+            ).grid(row=2, column=0, columnspan=4, padx=10, pady=(2, 8))
         def close():
             clear_secret_vars(initial, current); window.destroy()
         window.protocol("WM_DELETE_WINDOW", close)
 
+    def _load_account_with_password_recovery(self, account_id: int):
+        account = self.service.repository.get(
+            account_id, include_secrets=True
+        )
+        if account.current_password or self.coordinator is None:
+            return account
+        self.coordinator.sync_saved_passwords([account_id])
+        return self.service.repository.get(
+            account_id, include_secrets=True
+        )
+
     def update_password(self) -> None:
-        ids = sorted(self.service.selected_ids)
+        ids = self._selected_action_ids()
         if not ids:
             messagebox.showinfo("更新密码", "请先选择账号", parent=self.root); return
         password = simpledialog.askstring("更新当前密码", f"为 {len(ids)} 个账号设置最新密码", show="•", parent=self.root)
@@ -322,7 +594,7 @@ class AccountManagerApp:
         self.status_var.set(f"已更新 {count} 个账号的当前密码"); self.refresh()
 
     def mark_sold(self) -> None:
-        ids = sorted(self.service.selected_ids)
+        ids = self._selected_action_ids()
         note = simpledialog.askstring("标记已售", "客户/销售备注", parent=self.root)
         if note is None:
             return
@@ -334,13 +606,13 @@ class AccountManagerApp:
 
     def restore_managed(self) -> None:
         try:
-            self.service.restore_managed(sorted(self.service.selected_ids))
+            self.service.restore_managed(self._selected_action_ids())
         except AccountManagerServiceError as error:
             self._error(error); return
         self.service.clear_selected(); self.refresh()
 
     def open_export_dialog(self) -> None:
-        ids = sorted(self.service.selected_ids)
+        ids = self._selected_action_ids()
         if not ids:
             messagebox.showinfo("导出", "请先选择账号", parent=self.root); return
         window = tk.Toplevel(self.root); window.title("导出账号密码")
@@ -379,7 +651,7 @@ class AccountManagerApp:
         if self.login_running:
             messagebox.showinfo("一键登录", "已有登录任务正在运行", parent=self.root)
             return
-        ids = sorted(self.service.selected_ids)
+        ids = self._selected_action_ids()
         if not ids:
             messagebox.showinfo("一键登录", "请先选择账号", parent=self.root)
             return

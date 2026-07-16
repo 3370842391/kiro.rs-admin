@@ -202,6 +202,62 @@ class AccountManagerServiceTests(unittest.TestCase):
         self.assertEqual(1, len(preview.entries))
         self.assertIsNone(preview.entries[0].start_url)
 
+    def test_saved_start_urls_support_default_deduplication_and_delete(self):
+        first = self.service.save_start_url(
+            "https://portal.example/one/",
+            make_default=True,
+        )
+        second = self.service.save_start_url(
+            "https://portal.example/one",
+        )
+        third = self.service.save_start_url(
+            "https://portal.example/two",
+        )
+
+        self.assertEqual(
+            ("https://portal.example/one/",),
+            first.urls,
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(
+            (
+                "https://portal.example/one/",
+                "https://portal.example/two",
+            ),
+            third.urls,
+        )
+        self.assertEqual(
+            "https://portal.example/one/",
+            third.default_url,
+        )
+
+        updated = self.service.set_default_start_url(
+            "https://portal.example/two"
+        )
+        self.assertEqual(
+            "https://portal.example/two",
+            updated.default_url,
+        )
+
+        remaining = self.service.delete_start_url(
+            "https://portal.example/two/"
+        )
+        self.assertEqual(
+            ("https://portal.example/one/",),
+            remaining.urls,
+        )
+        self.assertEqual(
+            "https://portal.example/one/",
+            remaining.default_url,
+        )
+
+    def test_saved_start_url_rejects_unsafe_value(self):
+        with self.assertRaisesRegex(AccountManagerServiceError, "HTTPS"):
+            self.service.save_start_url(
+                "http://portal.example/start",
+                make_default=True,
+            )
+
     def test_search_and_status_filters(self):
         report = self.import_accounts()
         first, second = report.accounts

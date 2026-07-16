@@ -15,6 +15,7 @@ from batch_login.account_repository import (
     CredentialStatus,
     LifecycleStatus,
     LoginStatus,
+    StartUrlCatalog,
 )
 from batch_login.models import AccountEntry, LoginMode
 from batch_login.credential_models import CredentialRecord
@@ -66,6 +67,23 @@ class AccountRepositoryTests(unittest.TestCase):
             revealed = repo.get(saved[0].id, include_secrets=True)
             self.assertEqual("private-one-time", revealed.initial_password)
             self.assertIsNone(revealed.current_password)
+            self.assertFalse(revealed.has_current_password)
+
+    def test_start_url_catalog_round_trips_through_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self.make_repo(tmp)
+            catalog = StartUrlCatalog(
+                urls=(
+                    "https://portal.example/one",
+                    "https://portal.example/two",
+                ),
+                default_url="https://portal.example/two",
+            )
+
+            repo.save_start_url_catalog(catalog)
+            reopened = self.make_repo(tmp)
+
+            self.assertEqual(catalog, reopened.load_start_url_catalog())
 
     def test_duplicate_upsert_preserves_sold_note_and_current_password(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -112,7 +130,32 @@ class AccountRepositoryTests(unittest.TestCase):
 
             self.assertEqual(1, count)
             self.assertEqual("new-password", updated.current_password)
+            self.assertTrue(updated.has_current_password)
             self.assertIs(CredentialStatus.STALE, updated.credential_status)
+
+    def test_confirmed_password_sync_preserves_valid_credential(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self.make_repo(tmp)
+            item = repo.upsert_entries(
+                [entry()],
+                login_mode=LoginMode.ENTERPRISE,
+                region="us-east-1",
+            )[0]
+            repo.save_credential(
+                item.id,
+                CredentialRecord(
+                    email="admin-user",
+                    auth_method="idc",
+                    provider="Enterprise",
+                    refresh_token="refresh-token",
+                ),
+            )
+
+            repo.sync_confirmed_passwords([item.id], "confirmed-password")
+            updated = repo.get(item.id, include_secrets=True)
+
+            self.assertEqual("confirmed-password", updated.current_password)
+            self.assertIs(CredentialStatus.VALID, updated.credential_status)
 
     def test_batch_status_update_rolls_back_when_any_id_is_missing(self):
         with tempfile.TemporaryDirectory() as tmp:

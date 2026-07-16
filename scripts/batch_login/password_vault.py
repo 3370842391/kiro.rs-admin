@@ -111,6 +111,7 @@ class PreparedPassword:
     status: PasswordStatus
     account: str = field(repr=False)
     password: str = field(repr=False)
+    scope: str = field(default="", repr=False)
 
 
 _UPPERCASE = string.ascii_uppercase
@@ -384,6 +385,7 @@ class PasswordVault:
                 account=account,
                 password=password,
                 status=PasswordStatus(str(row[3])),
+                scope=normalized_scope,
             )
         except PasswordVaultError:
             raise

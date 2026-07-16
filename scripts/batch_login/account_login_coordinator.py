@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .account_repository import (
     AccountRepository,
@@ -85,6 +87,21 @@ class AccountLoginCoordinator:
         self.runtime_factory = runtime_factory
         self.emit = emit
 
+    def sync_saved_passwords(self, account_ids: list[int]) -> int:
+        saved = self.settings_store.load()
+        if saved is None:
+            return 0
+        vault_path = saved.password_vault_path
+        if not vault_path and saved.credential_path:
+            vault_path = saved.credential_path + ".passwords.sqlite3"
+        if not vault_path:
+            return 0
+        accounts = [
+            self.repository.get(int(item), include_secrets=False)
+            for item in dict.fromkeys(account_ids)
+        ]
+        return self._sync_confirmed_passwords(Path(vault_path), accounts)
+
     async def run(
         self, account_ids: list[int], *, force_relogin: bool = False
     ) -> LoginExportReport:
@@ -144,7 +161,16 @@ class AccountLoginCoordinator:
                 except Exception as error:
                     runtime_error = error
                 finally:
-                    await runtime.close()
+                    try:
+                        await runtime.close()
+                    except Exception as error:
+                        if runtime_error is None:
+                            runtime_error = error
+                    try:
+                        self._sync_confirmed_passwords(form, batch)
+                    except Exception as error:
+                        if runtime_error is None:
+                            runtime_error = error
                 if runtime_error is not None:
                     for item in batch:
                         self.repository.mark_login_failed(
@@ -157,7 +183,6 @@ class AccountLoginCoordinator:
                     (record.email.casefold(), (record.start_url or "").rstrip("/").casefold()): record
                     for record in records
                 }
-                self._sync_confirmed_passwords(form, batch)
                 for item in batch:
                     key = (
                         item.account.casefold(),
@@ -189,17 +214,41 @@ class AccountLoginCoordinator:
             exported=len(all_credentials),
         )
 
-    def _sync_confirmed_passwords(self, form, accounts) -> None:
-        path = Path(form.password_vault_path)
+    def _sync_confirmed_passwords(self, form_or_path, accounts) -> int:
+        path = Path(
+            getattr(form_or_path, "password_vault_path", form_or_path)
+        )
         if not path.exists():
-            return
+            return 0
         records = PasswordVault(path).records()
-        confirmed = {
-            item.account.casefold(): item.password
-            for item in records
-            if item.status is PasswordStatus.CONFIRMED
-        }
+        confirmed: dict[str, dict[str, str]] = {}
+        for item in records:
+            if item.status is not PasswordStatus.CONFIRMED:
+                continue
+            confirmed.setdefault(item.account.casefold(), {})[
+                item.scope.strip().casefold()
+            ] = item.password
+        synced = 0
         for account in accounts:
-            password = confirmed.get(account.account.casefold())
+            candidates = confirmed.get(account.account.casefold(), {})
+            expected_scope = self._expected_password_scope(account)
+            password = candidates.get(expected_scope) if expected_scope else None
+            if password is None and len(candidates) == 1:
+                password = next(iter(candidates.values()))
             if password:
-                self.repository.update_current_passwords([account.id], password)
+                self.repository.sync_confirmed_passwords(
+                    [account.id], password
+                )
+                synced += 1
+        return synced
+
+    @staticmethod
+    def _expected_password_scope(account) -> str | None:
+        try:
+            hostname = (urlsplit(account.start_url or "").hostname or "").lower()
+        except ValueError:
+            return None
+        match = re.fullmatch(r"(d-[a-z0-9]+)\.awsapps\.com", hostname)
+        if match is None:
+            return None
+        return f"{account.region.strip().casefold()}/{match.group(1)}"

@@ -51,6 +51,7 @@ class ManagedAccount:
     credential_status: CredentialStatus
     lifecycle_status: LifecycleStatus
     note: str
+    has_current_password: bool = False
     initial_password: str | None = field(default=None, repr=False)
     current_password: str | None = field(default=None, repr=False)
     last_error_code: str | None = None
@@ -59,6 +60,34 @@ class ManagedAccount:
     last_exported_at: str | None = None
     created_at: str = ""
     updated_at: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class StartUrlCatalog:
+    urls: tuple[str, ...] = ()
+    default_url: str = ""
+
+    @classmethod
+    def from_json(cls, value: object) -> StartUrlCatalog:
+        if not isinstance(value, dict) or value.get("version") != 1:
+            raise AccountRepositoryError("已保存 URL 配置损坏")
+        urls = value.get("urls")
+        default_url = value.get("defaultUrl")
+        if (
+            not isinstance(urls, list)
+            or not all(isinstance(item, str) and item for item in urls)
+            or not isinstance(default_url, str)
+            or (default_url and default_url not in urls)
+        ):
+            raise AccountRepositoryError("已保存 URL 配置损坏")
+        return cls(tuple(urls), default_url)
+
+    def as_json(self) -> dict[str, object]:
+        return {
+            "version": 1,
+            "urls": list(self.urls),
+            "defaultUrl": self.default_url,
+        }
 
 
 def default_account_db_path() -> Path:
@@ -194,10 +223,73 @@ class AccountRepository:
         except sqlite3.Error as error:
             raise AccountRepositoryError("账号读取失败") from error
 
+    def load_start_url_catalog(self) -> StartUrlCatalog:
+        try:
+            with closing(self._connect()) as connection:
+                row = connection.execute(
+                    "SELECT value FROM metadata WHERE key = 'start_url_catalog'"
+                ).fetchone()
+            if row is None:
+                return StartUrlCatalog()
+            return StartUrlCatalog.from_json(json.loads(str(row[0])))
+        except AccountRepositoryError:
+            raise
+        except (json.JSONDecodeError, sqlite3.Error) as error:
+            raise AccountRepositoryError("已保存 URL 配置读取失败") from error
+
+    def save_start_url_catalog(self, catalog: StartUrlCatalog) -> None:
+        if not isinstance(catalog, StartUrlCatalog):
+            raise AccountRepositoryError("已保存 URL 配置对象无效")
+        StartUrlCatalog.from_json(catalog.as_json())
+        serialized = json.dumps(
+            catalog.as_json(), ensure_ascii=False, separators=(",", ":")
+        )
+        try:
+            with self._transaction() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO metadata(key, value)
+                    VALUES ('start_url_catalog', ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (serialized,),
+                )
+        except AccountRepositoryError:
+            raise
+        except sqlite3.Error as error:
+            raise AccountRepositoryError("已保存 URL 配置写入失败") from error
+
     def update_current_passwords(
         self,
         account_ids: Sequence[int],
         password: str,
+    ) -> int:
+        return self._store_current_passwords(
+            account_ids,
+            password,
+            mark_credential_stale=True,
+            operation="password_updated",
+        )
+
+    def sync_confirmed_passwords(
+        self,
+        account_ids: Sequence[int],
+        password: str,
+    ) -> int:
+        return self._store_current_passwords(
+            account_ids,
+            password,
+            mark_credential_stale=False,
+            operation="confirmed_password_synced",
+        )
+
+    def _store_current_passwords(
+        self,
+        account_ids: Sequence[int],
+        password: str,
+        *,
+        mark_credential_stale: bool,
+        operation: str,
     ) -> int:
         if not password:
             raise AccountRepositoryError("当前密码不能为空")
@@ -211,19 +303,34 @@ class AccountRepository:
             with self._transaction() as connection:
                 self._require_ids(connection, ids)
                 for account_id in ids:
-                    connection.execute(
-                        """
-                        UPDATE accounts
-                        SET current_password_ciphertext = ?, credential_status = ?,
-                            updated_at = ?
-                        WHERE id = ?
-                        """,
-                        (encrypted, CredentialStatus.STALE.value, now, account_id),
-                    )
+                    if mark_credential_stale:
+                        connection.execute(
+                            """
+                            UPDATE accounts
+                            SET current_password_ciphertext = ?,
+                                credential_status = ?, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                encrypted,
+                                CredentialStatus.STALE.value,
+                                now,
+                                account_id,
+                            ),
+                        )
+                    else:
+                        connection.execute(
+                            """
+                            UPDATE accounts
+                            SET current_password_ciphertext = ?, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (encrypted, now, account_id),
+                        )
                     self._append_history(
                         connection,
                         account_id,
-                        "password_updated",
+                        operation,
                         {},
                         now,
                     )
@@ -469,6 +576,7 @@ class AccountRepository:
             credential_status=CredentialStatus(str(row["credential_status"])),
             lifecycle_status=LifecycleStatus(str(row["lifecycle_status"])),
             note=str(row["note"]),
+            has_current_password=row["current_password_ciphertext"] is not None,
             initial_password=initial,
             current_password=current,
             last_error_code=row["last_error_code"],

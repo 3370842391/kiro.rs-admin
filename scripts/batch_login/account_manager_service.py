@@ -10,6 +10,7 @@ from .account_repository import (
     LifecycleStatus,
     LoginStatus,
     ManagedAccount,
+    StartUrlCatalog,
 )
 from .input_parser import (
     compile_format,
@@ -92,6 +93,70 @@ class AccountManagerService:
                 )
             )
         return ImportPreview(entries, issues, mode)
+
+    def load_start_url_catalog(self) -> StartUrlCatalog:
+        try:
+            return self.repository.load_start_url_catalog()
+        except AccountRepositoryError as error:
+            raise AccountManagerServiceError(str(error)) from error
+
+    def save_start_url(
+        self,
+        start_url: str,
+        *,
+        make_default: bool = False,
+    ) -> StartUrlCatalog:
+        normalized = self._validated_start_url(start_url)
+        catalog = self.load_start_url_catalog()
+        matching = next(
+            (
+                item
+                for item in catalog.urls
+                if self._start_url_key(item) == self._start_url_key(normalized)
+            ),
+            None,
+        )
+        urls = catalog.urls if matching else catalog.urls + (normalized,)
+        effective_url = matching or normalized
+        default_url = effective_url if make_default else catalog.default_url
+        updated = StartUrlCatalog(urls, default_url)
+        self._save_start_url_catalog(updated)
+        return updated
+
+    def set_default_start_url(self, start_url: str) -> StartUrlCatalog:
+        return self.save_start_url(start_url, make_default=True)
+
+    def delete_start_url(self, start_url: str) -> StartUrlCatalog:
+        key = self._start_url_key(start_url)
+        catalog = self.load_start_url_catalog()
+        urls = tuple(
+            item for item in catalog.urls if self._start_url_key(item) != key
+        )
+        default_url = catalog.default_url
+        if self._start_url_key(default_url) == key:
+            default_url = urls[0] if urls else ""
+        updated = StartUrlCatalog(urls, default_url)
+        self._save_start_url_catalog(updated)
+        return updated
+
+    def _save_start_url_catalog(self, catalog: StartUrlCatalog) -> None:
+        try:
+            self.repository.save_start_url_catalog(catalog)
+        except AccountRepositoryError as error:
+            raise AccountManagerServiceError(str(error)) from error
+
+    @staticmethod
+    def _validated_start_url(start_url: str) -> str:
+        normalized = start_url.strip()
+        if not is_valid_start_url(normalized):
+            raise AccountManagerServiceError(
+                "Start URL 必须是 HTTPS，且不能包含用户名或密码"
+            )
+        return normalized
+
+    @staticmethod
+    def _start_url_key(start_url: str) -> str:
+        return start_url.strip().rstrip("/").casefold()
 
     def confirm_import(
         self,

@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -13,6 +14,7 @@ from batch_login.account_manager_app import (
     AccountManagerApp,
     atomic_write_text,
     clear_secret_vars,
+    password_cell_text,
     select_range_ids,
 )
 
@@ -26,6 +28,48 @@ class FakeVar:
 
     def get(self):
         return self.value
+
+
+class FakeTree:
+    def __init__(self, selected=(), row="", column="#2"):
+        self.selected = tuple(str(item) for item in selected)
+        self.row = str(row) if row else ""
+        self.column = column
+        self.values = {}
+
+    def selection(self):
+        return self.selected
+
+    def identify_row(self, _y):
+        return self.row
+
+    def identify_column(self, _x):
+        return self.column
+
+    def get_children(self):
+        return self.selected
+
+    def set(self, item, column, value):
+        self.values[(str(item), column)] = value
+
+
+class FakeSelectionService:
+    def __init__(self, selected=()):
+        self._selected = {int(item) for item in selected}
+
+    @property
+    def selected_ids(self):
+        return set(self._selected)
+
+    def set_selected(self, ids):
+        self._selected = {int(item) for item in ids}
+
+    def toggle_selected(self, account_id):
+        account_id = int(account_id)
+        if account_id in self._selected:
+            self._selected.remove(account_id)
+        else:
+            self._selected.add(account_id)
 
 
 class AccountManagerAppTests(unittest.TestCase):
@@ -63,6 +107,28 @@ class AccountManagerAppTests(unittest.TestCase):
             ),
             AccountManagerApp.INPUT_TEMPLATE_PRESETS,
         )
+        self.assertEqual(
+            (
+                "粘贴并识别",
+                "指定 URL",
+                "一键登录导出 JSON",
+                "自动登录设置",
+            ),
+            AccountManagerApp.PRIMARY_TOOLBAR_LABELS,
+        )
+        self.assertEqual(
+            (
+                "全选",
+                "反选",
+                "取消选择",
+                "查看密码",
+                "更新密码",
+                "导出账号密码",
+                "标记已售",
+                "恢复管理",
+            ),
+            AccountManagerApp.SELECTION_TOOLBAR_LABELS,
+        )
 
     def test_password_dialog_clear_removes_both_plaintext_values(self):
         initial = FakeVar("one-time-secret")
@@ -73,13 +139,54 @@ class AccountManagerAppTests(unittest.TestCase):
         self.assertEqual("", initial.get())
         self.assertEqual("", current.get())
 
+    def test_password_cell_reflects_saved_password_not_credential_status(self):
+        without_password = type(
+            "Account", (), {"has_current_password": False}
+        )()
+        with_password = type(
+            "Account", (), {"has_current_password": True}
+        )()
+
+        self.assertEqual("未设置", password_cell_text(without_password))
+        self.assertEqual("••••••", password_cell_text(with_password))
+
+    def test_password_view_recovers_confirmed_password_when_missing(self):
+        missing = SimpleNamespace(current_password=None)
+        recovered = SimpleNamespace(current_password="recovered-password")
+
+        class Repository:
+            def __init__(self):
+                self.calls = 0
+
+            def get(self, _account_id, *, include_secrets):
+                self.calls += 1
+                return missing if self.calls == 1 else recovered
+
+        repository = Repository()
+        coordinator = SimpleNamespace(
+            calls=[],
+            sync_saved_passwords=lambda ids: coordinator.calls.append(ids),
+        )
+        app = object.__new__(AccountManagerApp)
+        app.service = SimpleNamespace(repository=repository)
+        app.coordinator = coordinator
+
+        account = app._load_account_with_password_recovery(7)
+
+        self.assertIs(recovered, account)
+        self.assertEqual([[7]], coordinator.calls)
+
     def test_import_confirmation_always_reparses_current_fields(self):
         source = inspect.getsource(AccountManagerApp.open_import_dialog)
+        parse_source = source[source.index("def parse_preview") :]
 
         self.assertIn("result = parse_preview()", source)
         self.assertNotIn('result = state.get("preview")', source)
-        self.assertLess(source.index("preview_box.delete"), source.index("try:"))
-        self.assertIn('summary.set("解析失败")', source)
+        self.assertLess(
+            parse_source.index("preview_box.delete"),
+            parse_source.index("try:"),
+        )
+        self.assertIn('summary.set("解析失败")', parse_source)
 
     def test_drag_range_selection_is_order_independent(self):
         rows = ["10", "11", "12", "13"]
@@ -87,6 +194,69 @@ class AccountManagerAppTests(unittest.TestCase):
         self.assertEqual({11, 12, 13}, select_range_ids(rows, "11", "13"))
         self.assertEqual({11, 12, 13}, select_range_ids(rows, "13", "11"))
         self.assertEqual(set(), select_range_ids(rows, "missing", "11"))
+
+    def test_tree_selection_replaces_stale_internal_selection(self):
+        app = object.__new__(AccountManagerApp)
+        app.tree = FakeTree(selected=(2,))
+        app.service = FakeSelectionService(selected=(1, 2))
+        app.selected_count_var = FakeVar("")
+        app._refreshing_tree = False
+
+        app._tree_selection()
+
+        self.assertEqual({2}, app.service.selected_ids)
+        self.assertEqual("已选择 1 个账号", app.selected_count_var.get())
+
+    def test_double_click_selects_the_whole_row(self):
+        app = object.__new__(AccountManagerApp)
+        app.tree = FakeTree(selected=(1,), row=2)
+        app.service = FakeSelectionService(selected=(1,))
+        refreshed = []
+        app.refresh = lambda: refreshed.append(True)
+
+        result = app._tree_double_click(type("Event", (), {"y": 10})())
+
+        self.assertEqual("break", result)
+        self.assertEqual({2}, app.service.selected_ids)
+        self.assertEqual([True], refreshed)
+
+    def test_checkbox_click_stops_native_selection_from_readding_row(self):
+        app = object.__new__(AccountManagerApp)
+        app.tree = FakeTree(selected=(2,), row=2, column="#1")
+        app.service = FakeSelectionService(selected=(2,))
+        app.drag_anchor = ""
+        refreshed = []
+        app.refresh = lambda: refreshed.append(True)
+        event = type("Event", (), {"x": 5, "y": 10})()
+
+        result = app._tree_click(event)
+
+        self.assertEqual("break", result)
+        self.assertEqual(set(), app.service.selected_ids)
+        self.assertEqual([True], refreshed)
+
+    def test_action_ids_follow_the_visible_tree_selection(self):
+        app = object.__new__(AccountManagerApp)
+        app.tree = FakeTree(selected=(2,))
+        app.service = FakeSelectionService(selected=(1, 2))
+
+        self.assertEqual([2], app._selected_action_ids())
+        self.assertEqual({2}, app.service.selected_ids)
+
+    def test_context_menu_exposes_requested_account_actions(self):
+        self.assertEqual(
+            (
+                "一键获取 JSON",
+                "复制账号",
+                "复制 Start URL",
+                "查看密码",
+                "更新密码",
+                "导出账号密码",
+                "标记已售",
+                "恢复管理",
+            ),
+            AccountManagerApp.CONTEXT_MENU_LABELS,
+        )
 
     def test_atomic_text_write_replaces_target_without_temp_residue(self):
         with tempfile.TemporaryDirectory() as tmp:
