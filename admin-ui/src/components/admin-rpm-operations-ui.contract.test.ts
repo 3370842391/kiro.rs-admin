@@ -101,7 +101,8 @@ describe('admin RPM operations UI wiring', () => {
     expect(status).toContain('saturatedAccounts')
     expect(status).toContain('totalInFlight')
     expect(status).toContain('grid-cols-2')
-    expect(status).toContain('sm:grid-cols-5')
+    expect(status).toContain('sm:grid-cols-3')
+    expect(status).toContain('xl:grid-cols-6')
   })
 
   test('status bar labels unlimited aggregate capacity without contradicting finite capacity', async () => {

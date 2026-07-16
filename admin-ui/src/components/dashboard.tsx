@@ -100,6 +100,7 @@ import { useFailureStats } from "@/hooks/use-traces";
 import { useGroupOptions } from "@/hooks/use-groups";
 import { useRectSelect } from "@/hooks/use-rect-select";
 import { totalInFlight } from "@/lib/rpm-operations";
+import { summarizeAvailableCredits } from "@/lib/credential-summary";
 import {
   Select,
   SelectContent,
@@ -269,6 +270,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   );
   const selectedCount = selectedCredentials.length;
   const inFlightRequestCount = data ? totalInFlight(data.credentials) : 0;
+  const availableCreditSummary = summarizeAvailableCredits(
+    data?.credentials ?? [],
+    balanceMap,
+  );
 
   // 分组筛选：'' = 全部；'__none__' = 仅显示未分组；其他 = 按分组名筛选
   const [groupFilter, setGroupFilter] = useState<string>("");
@@ -1834,6 +1839,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         <RpmStatusBar
           summary={data ? data.rpmSummary : undefined}
           totalInFlight={inFlightRequestCount}
+          availableCreditSummary={availableCreditSummary}
         />
 
         {/* 列表 */}
