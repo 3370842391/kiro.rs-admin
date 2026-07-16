@@ -11,7 +11,12 @@ from .account_repository import (
     LoginStatus,
     ManagedAccount,
 )
-from .input_parser import compile_format, parse_accounts, render_accounts
+from .input_parser import (
+    compile_format,
+    is_valid_start_url,
+    parse_accounts,
+    render_accounts,
+)
 from .models import AccountEntry, LoginMode, ParseIssue
 
 
@@ -52,9 +57,41 @@ class AccountManagerService:
         text: str,
         template: str,
         mode: LoginMode,
+        *,
+        default_start_url: str = "",
     ) -> ImportPreview:
         result = parse_accounts(text, template, mode)
-        return ImportPreview(result.entries, result.issues, mode)
+        if mode is not LoginMode.ENTERPRISE:
+            return ImportPreview(result.entries, result.issues, mode)
+
+        normalized_start_url = default_start_url.strip()
+        if normalized_start_url and not is_valid_start_url(normalized_start_url):
+            raise AccountManagerServiceError(
+                "统一 Start URL 必须是 HTTPS，且不能包含用户名或密码"
+            )
+
+        entries: list[AccountEntry] = []
+        issues = list(result.issues)
+        for item in result.entries:
+            effective_start_url = item.start_url or normalized_start_url
+            if not effective_start_url:
+                issues.append(
+                    ParseIssue(
+                        item.line_number,
+                        "missing_start_url",
+                        "企业账号缺少 Start URL，请填写统一 Start URL",
+                    )
+                )
+                continue
+            entries.append(
+                AccountEntry(
+                    line_number=item.line_number,
+                    account=item.account,
+                    password=item.password,
+                    start_url=effective_start_url,
+                )
+            )
+        return ImportPreview(entries, issues, mode)
 
     def confirm_import(
         self,

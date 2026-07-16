@@ -73,6 +73,135 @@ class AccountManagerServiceTests(unittest.TestCase):
         self.assertEqual(2, len(preview.issues))
         self.assertEqual(1, len(self.repo.list_accounts()))
 
+    def test_legacy_login_format_uses_uniform_enterprise_start_url(self):
+        preview = self.service.preview_import(
+            "\n".join(
+                (
+                    "login = legacy-user-248 / onetime password = Fake!Pass01",
+                    "login = legacy-user-249 / onetime password = "
+                    "Synthetic/%#Password-j-t4M6XHj7)With&Symbols<02",
+                )
+            ),
+            "login = {account} / onetime password = {password}",
+            LoginMode.ENTERPRISE,
+            default_start_url="https://portal.example/start",
+        )
+
+        self.assertEqual([], preview.issues)
+        self.assertEqual(2, len(preview.entries))
+        self.assertEqual("legacy-user-248", preview.entries[0].account)
+        self.assertEqual("Fake!Pass01", preview.entries[0].password)
+        self.assertEqual("legacy-user-249", preview.entries[1].account)
+        self.assertEqual(
+            "Synthetic/%#Password-j-t4M6XHj7)With&Symbols<02",
+            preview.entries[1].password,
+        )
+        self.assertEqual(
+            "https://portal.example/start",
+            preview.entries[0].start_url,
+        )
+        self.assertEqual(
+            "https://portal.example/start",
+            preview.entries[1].start_url,
+        )
+
+    def test_per_line_start_url_overrides_uniform_start_url(self):
+        preview = self.service.preview_import(
+            "enterprise-user|secret|https://portal.example/per-account",
+            "{account}|{password}|{start_url}",
+            LoginMode.ENTERPRISE,
+            default_start_url="https://portal.example/uniform",
+        )
+
+        self.assertEqual([], preview.issues)
+        self.assertEqual(
+            "https://portal.example/per-account",
+            preview.entries[0].start_url,
+        )
+
+    def test_blank_per_line_start_url_falls_back_to_uniform_start_url(self):
+        preview = self.service.preview_import(
+            "enterprise-user|secret|",
+            "{account}|{password}|{start_url}",
+            LoginMode.ENTERPRISE,
+            default_start_url="https://portal.example/uniform",
+        )
+
+        self.assertEqual([], preview.issues)
+        self.assertEqual(1, len(preview.entries))
+        self.assertEqual(
+            "https://portal.example/uniform",
+            preview.entries[0].start_url,
+        )
+
+    def test_enterprise_import_without_any_start_url_is_rejected(self):
+        preview = self.service.preview_import(
+            "login = enterprise-user / onetime password = secret",
+            "login = {account} / onetime password = {password}",
+            LoginMode.ENTERPRISE,
+        )
+
+        self.assertEqual([], preview.entries)
+        self.assertEqual(1, len(preview.issues))
+        self.assertEqual("missing_start_url", preview.issues[0].code)
+
+    def test_uniform_enterprise_start_url_must_be_safe_https(self):
+        for start_url in (
+            "http://portal.example/start",
+            "https://user:password@portal.example/start",
+            "https://portal.example:bad/start",
+            "https://portal example/start",
+            "https://portal.example/has space",
+            "https://../start",
+            "https://.example/start",
+            "https://portal.example:0/start",
+        ):
+            with self.subTest(start_url=start_url):
+                with self.assertRaisesRegex(
+                    AccountManagerServiceError,
+                    "HTTPS",
+                ):
+                    self.service.preview_import(
+                        "login = enterprise-user / onetime password = secret",
+                        "login = {account} / onetime password = {password}",
+                        LoginMode.ENTERPRISE,
+                        default_start_url=start_url,
+                    )
+
+    def test_invalid_per_line_start_url_does_not_fall_back_to_uniform_url(self):
+        preview = self.service.preview_import(
+            "enterprise-user|secret|https://portal example/start",
+            "{account}|{password}|{start_url}",
+            LoginMode.ENTERPRISE,
+            default_start_url="https://portal.example/uniform",
+        )
+
+        self.assertEqual([], preview.entries)
+        self.assertEqual(1, len(preview.issues))
+        self.assertEqual("invalid_start_url", preview.issues[0].code)
+
+    def test_microsoft_import_does_not_require_start_url(self):
+        preview = self.service.preview_import(
+            "user@example.com|secret",
+            "{account}|{password}",
+            LoginMode.MICROSOFT,
+        )
+
+        self.assertEqual([], preview.issues)
+        self.assertEqual(1, len(preview.entries))
+        self.assertIsNone(preview.entries[0].start_url)
+
+    def test_microsoft_import_allows_blank_start_url_field(self):
+        preview = self.service.preview_import(
+            "user@example.com|secret|",
+            "{account}|{password}|{start_url}",
+            LoginMode.MICROSOFT,
+        )
+
+        self.assertEqual([], preview.issues)
+        self.assertEqual(1, len(preview.entries))
+        self.assertIsNone(preview.entries[0].start_url)
+
     def test_search_and_status_filters(self):
         report = self.import_accounts()
         first, second = report.accounts

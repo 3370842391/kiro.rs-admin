@@ -71,7 +71,12 @@ class AccountManagerApp:
     )
     DEFAULT_EXPORT_TEMPLATE = "{account}----{password}----{start_url}"
     PRIMARY_ACTION_LABEL = "一键登录导出 JSON"
-    INPUT_TEMPLATE = "{account}|{password}|{start_url}"
+    INPUT_TEMPLATE = "login = {account} / onetime password = {password}"
+    INPUT_TEMPLATE_PRESETS = (
+        INPUT_TEMPLATE,
+        "{account}----{password}",
+        "{account}|{password}|{start_url}",
+    )
     STATUS_VALUES = {
         "管理中": "managed",
         "全部": "all",
@@ -209,11 +214,36 @@ class AccountManagerApp:
     def open_import_dialog(self) -> None:
         window = tk.Toplevel(self.root)
         window.title("粘贴并识别账号")
-        window.geometry("980x650")
+        window.geometry("980x700")
         template = tk.StringVar(value=self.INPUT_TEMPLATE)
         mode = tk.StringVar(value=LoginMode.ENTERPRISE.value)
-        ttk.Entry(window, textvariable=template).pack(fill="x", padx=10, pady=(10, 4))
-        ttk.Combobox(window, state="readonly", textvariable=mode, values=[item.value for item in LoginMode]).pack(anchor="w", padx=10)
+        start_url = tk.StringVar()
+        fields = ttk.Frame(window)
+        fields.pack(fill="x", padx=10, pady=(10, 4))
+        ttk.Label(fields, text="账号格式").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(
+            fields,
+            textvariable=template,
+            values=self.INPUT_TEMPLATE_PRESETS,
+        ).grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        ttk.Label(fields, text="登录方式").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Combobox(
+            fields,
+            state="readonly",
+            textvariable=mode,
+            values=[item.value for item in LoginMode],
+            width=18,
+        ).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+        ttk.Label(fields, text="统一 Start URL").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(fields, textvariable=start_url).grid(
+            row=2, column=1, sticky="ew", padx=(8, 0), pady=(6, 0)
+        )
+        ttk.Label(
+            fields,
+            text="每行没有 URL 时使用这里的地址；每行自带 URL 时以该行地址为准。",
+            foreground="#475569",
+        ).grid(row=3, column=1, sticky="w", padx=(8, 0), pady=(2, 0))
+        fields.columnconfigure(1, weight=1)
         source = tk.Text(window, height=14)
         source.pack(fill="both", expand=True, padx=10, pady=6)
         summary = tk.StringVar(value="尚未解析")
@@ -222,26 +252,29 @@ class AccountManagerApp:
         for column, title in (("line", "行"), ("account", "账号"), ("url", "Start URL"), ("status", "状态")):
             preview_box.heading(column, text=title)
         preview_box.pack(fill="both", expand=True, padx=10, pady=6)
-        state: dict[str, ImportPreview] = {}
-
-        def parse_preview():
-            try:
-                result = self.service.preview_import(source.get("1.0", "end-1c"), template.get(), LoginMode(mode.get()))
-            except (ValueError, AccountManagerServiceError) as error:
-                messagebox.showerror("解析失败", str(error), parent=window)
-                return
-            state["preview"] = result
+        def parse_preview() -> ImportPreview | None:
             preview_box.delete(*preview_box.get_children())
+            summary.set("正在解析")
+            try:
+                result = self.service.preview_import(
+                    source.get("1.0", "end-1c"),
+                    template.get(),
+                    LoginMode(mode.get()),
+                    default_start_url=start_url.get(),
+                )
+            except (ValueError, AccountManagerServiceError) as error:
+                summary.set("解析失败")
+                messagebox.showerror("解析失败", str(error), parent=window)
+                return None
             for item in result.entries:
                 preview_box.insert("", "end", values=(item.line_number, item.account, item.start_url or "", "有效"))
             for issue in result.issues:
                 preview_box.insert("", "end", values=(issue.line_number, "", "", issue.message))
             summary.set(f"有效 {len(result.entries)} 个，提示/错误 {len(result.issues)} 个")
+            return result
 
         def confirm():
-            result = state.get("preview")
-            if result is None:
-                parse_preview(); result = state.get("preview")
+            result = parse_preview()
             if result is None:
                 return
             try:

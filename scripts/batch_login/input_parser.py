@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from ipaddress import ip_address
 from collections.abc import Iterable
 from dataclasses import dataclass
 from urllib.parse import urlsplit
@@ -9,6 +10,7 @@ from .models import AccountEntry, LoginMode, ParseIssue, ParseResult
 
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+HOST_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 PLACEHOLDER_RE = re.compile(r"{(?:account|password|start_url)}")
 PLACEHOLDER_TOKEN_RE = re.compile(r"{(?P<name>account|password|start_url)}")
 
@@ -16,6 +18,39 @@ PLACEHOLDER_TOKEN_RE = re.compile(r"{(?P<name>account|password|start_url)}")
 @dataclass(frozen=True, slots=True)
 class CompiledFormat:
     pattern: re.Pattern[str]
+
+
+def is_valid_start_url(value: str) -> bool:
+    if any(
+        character.isspace()
+        or ord(character) < 32
+        or ord(character) == 127
+        for character in value
+    ):
+        return False
+    try:
+        parts = urlsplit(value)
+        port = parts.port
+        hostname = parts.hostname or ""
+        try:
+            ip_address(hostname)
+            valid_hostname = True
+        except ValueError:
+            ascii_hostname = hostname.encode("idna").decode("ascii")
+            labels = ascii_hostname.split(".")
+            valid_hostname = (
+                len(ascii_hostname) <= 253
+                and all(HOST_LABEL_RE.fullmatch(label) for label in labels)
+            )
+        return (
+            parts.scheme == "https"
+            and valid_hostname
+            and parts.username is None
+            and parts.password is None
+            and port != 0
+        )
+    except (UnicodeError, ValueError):
+        return False
 
 
 def compile_format(template: str) -> CompiledFormat:
@@ -60,7 +95,7 @@ def parse_accounts(text: str, template: str, mode: LoginMode) -> ParseResult:
         password = match.group("password")
         start_url = match.groupdict().get("start_url")
         if start_url is not None:
-            start_url = start_url.strip()
+            start_url = start_url.strip() or None
         if not account:
             issues.append(ParseIssue(line_number, "empty_account", "账号为空"))
             continue
@@ -68,17 +103,7 @@ def parse_accounts(text: str, template: str, mode: LoginMode) -> ParseResult:
             issues.append(ParseIssue(line_number, "empty_password", "密码为空"))
             continue
         if start_url is not None:
-            try:
-                parts = urlsplit(start_url)
-                valid_url = (
-                    parts.scheme == "https"
-                    and bool(parts.hostname)
-                    and parts.username is None
-                    and parts.password is None
-                )
-            except ValueError:
-                valid_url = False
-            if not valid_url:
+            if not is_valid_start_url(start_url):
                 issues.append(
                     ParseIssue(line_number, "invalid_start_url", "企业门户 URL 必须是 HTTPS")
                 )

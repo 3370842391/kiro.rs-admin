@@ -1,3 +1,4 @@
+import inspect
 import sys
 import tempfile
 import unittest
@@ -50,6 +51,18 @@ class AccountManagerAppTests(unittest.TestCase):
         self.assertEqual(
             "一键登录导出 JSON", AccountManagerApp.PRIMARY_ACTION_LABEL
         )
+        self.assertEqual(
+            "login = {account} / onetime password = {password}",
+            AccountManagerApp.INPUT_TEMPLATE,
+        )
+        self.assertEqual(
+            (
+                "login = {account} / onetime password = {password}",
+                "{account}----{password}",
+                "{account}|{password}|{start_url}",
+            ),
+            AccountManagerApp.INPUT_TEMPLATE_PRESETS,
+        )
 
     def test_password_dialog_clear_removes_both_plaintext_values(self):
         initial = FakeVar("one-time-secret")
@@ -59,6 +72,14 @@ class AccountManagerAppTests(unittest.TestCase):
 
         self.assertEqual("", initial.get())
         self.assertEqual("", current.get())
+
+    def test_import_confirmation_always_reparses_current_fields(self):
+        source = inspect.getsource(AccountManagerApp.open_import_dialog)
+
+        self.assertIn("result = parse_preview()", source)
+        self.assertNotIn('result = state.get("preview")', source)
+        self.assertLess(source.index("preview_box.delete"), source.index("try:"))
+        self.assertIn('summary.set("解析失败")', source)
 
     def test_drag_range_selection_is_order_independent(self):
         rows = ["10", "11", "12", "13"]
