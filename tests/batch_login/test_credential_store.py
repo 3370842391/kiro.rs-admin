@@ -96,6 +96,20 @@ class CredentialStoreTests(unittest.TestCase):
             self.assertEqual(1, len(bundle["credentials"]))
             self.assertNotIn("password", path.read_text(encoding="utf-8").casefold())
 
+    def test_complete_bundle_keeps_internal_fields_for_recovery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "credentials.json"
+            CredentialStore(path).append(self.idc_record())
+
+            bundle = json.loads(path.read_text(encoding="utf-8"))
+            saved = bundle["credentials"][0]
+
+            self.assertIsInstance(bundle, dict)
+            self.assertEqual(1, bundle["version"])
+            self.assertEqual("access-secret", saved["accessToken"])
+            self.assertEqual("batch-login-gui", saved["sourceChannel"])
+            self.assertEqual(10, saved["rpmLimit"])
+
     def test_append_uses_same_directory_temp_and_atomic_replace(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "nested" / "credentials.json"
