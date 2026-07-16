@@ -752,6 +752,21 @@ python scripts/kiro_batch_login_gui.py --check
 python scripts/kiro_batch_login_gui.py
 ```
 
+只测试企业账号并直接生成完整凭据 JSON 时，也可以使用纯 HTTP 命令行入口。该脚本不会
+初始化 Playwright 或启动 Chromium：
+
+```powershell
+python scripts/kiro_enterprise_http_login.py `
+  --input .\accounts.txt `
+  --start-url https://d-xxxxxxxxxx.awsapps.com/start `
+  --region us-east-1 `
+  --output .\enterprise-credentials.json
+```
+
+默认输入格式是 `login = {account} / onetime password = {password}`。需要其它格式时使用
+`--format "{account}----{password}"`。自动生成的新密码默认保存到
+`enterprise-credentials.json.passwords.sqlite3`。
+
 桌面助手支持以下完整流程：
 
 - 粘贴原始账号文本，按自定义 `{account}` / `{password}` 模板解析并预览。
