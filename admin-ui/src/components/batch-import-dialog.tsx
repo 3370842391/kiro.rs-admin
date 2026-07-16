@@ -33,6 +33,7 @@ import {
   normalizeImportAuthMethod,
   sha256Hex,
 } from '@/lib/utils'
+import { unwrapCredentialImportPayload } from '@/lib/credential-import'
 
 type ImportMode = 'json' | 'api-key'
 
@@ -147,12 +148,15 @@ function normalizeExpiresAt(value: unknown): string | undefined {
 }
 
 function parseImportEntries(parsed: unknown): unknown[] {
-  if (Array.isArray(parsed)) return parsed
+  if (Array.isArray(parsed)) return parsed as unknown[]
   if (!parsed || typeof parsed !== 'object') {
     throw new Error('无法识别的 JSON 格式')
   }
   const obj = parsed as Record<string, unknown>
-  if (Array.isArray(obj.accounts)) return obj.accounts
+  if (Array.isArray(obj.accounts)) return obj.accounts as unknown[]
+  if (Array.isArray(obj.credentials)) {
+    return unwrapCredentialImportPayload(obj)
+  }
   if (
     (obj.credentials && typeof obj.credentials === 'object') ||
     typeof obj.refreshToken === 'string' ||
