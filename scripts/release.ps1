@@ -97,12 +97,35 @@ function Invoke-NativeChecked {
     )
 
     if ($Capture) {
-        $output = @(& $FilePath @Arguments 2>&1)
-        $exitCode = $LASTEXITCODE
-        if ($exitCode -ne 0) {
-            throw "$FilePath $($Arguments -join ' ') 失败（exit=$exitCode）`n$($output -join [Environment]::NewLine)"
+        $previousErrorActionPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $rawOutput = @(& $FilePath @Arguments 2>&1)
+            $exitCode = $LASTEXITCODE
         }
-        return @($output | ForEach-Object { $_.ToString() })
+        finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
+
+        $standardOutput = New-Object System.Collections.Generic.List[string]
+        $standardError = New-Object System.Collections.Generic.List[string]
+        foreach ($item in $rawOutput) {
+            if ($item -is [System.Management.Automation.ErrorRecord]) {
+                $standardError.Add($item.ToString())
+            }
+            else {
+                $standardOutput.Add($item.ToString())
+            }
+        }
+
+        if ($exitCode -ne 0) {
+            $failureOutput = @($standardOutput.ToArray()) + @($standardError.ToArray())
+            throw "$FilePath $($Arguments -join ' ') 失败（exit=$exitCode）`n$($failureOutput -join [Environment]::NewLine)"
+        }
+        if ($standardError.Count -gt 0) {
+            Write-Warning ($standardError -join [Environment]::NewLine)
+        }
+        return $standardOutput.ToArray()
     }
 
     & $FilePath @Arguments
