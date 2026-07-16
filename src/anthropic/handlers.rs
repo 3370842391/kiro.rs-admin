@@ -3037,6 +3037,18 @@ async fn run_realtime_sse_attempts(
                             );
                             return;
                         }
+                        if ctx.repetition_guard_tripped() {
+                            tracing::warn!(
+                                attempt = attempt_index + 1,
+                                received_bytes,
+                                "upstream repetition guard ended realtime stream"
+                            );
+                            tracer.record_protocol_error(
+                                "upstream_repetition_guard",
+                                "repeated upstream output was truncated",
+                            );
+                            break AttemptTermination::Eof;
+                        }
                     }
                     Some(Err(error)) => {
                         tracing::error!(%error, attempt = attempt_index + 1, "读取响应流失败");
@@ -4768,6 +4780,18 @@ async fn run_buffered_sse_attempts(
                                 },
                                 Err(error) => tracing::warn!(%error, attempt = attempt_index + 1, "缓冲流 frame 解码失败"),
                             }
+                        }
+                        if ctx.repetition_guard_tripped() {
+                            tracing::warn!(
+                                attempt = attempt_index + 1,
+                                received_bytes,
+                                "upstream repetition guard ended buffered stream"
+                            );
+                            tracer.record_protocol_error(
+                                "upstream_repetition_guard",
+                                "repeated upstream output was truncated",
+                            );
+                            break AttemptTermination::Eof;
                         }
                     }
                     Some(Err(error)) => {

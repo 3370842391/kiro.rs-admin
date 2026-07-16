@@ -567,12 +567,15 @@ fn find_next_param_open(body: &str, from: usize) -> Option<usize> {
 /// `call` / `count` / `card`。集合形式便于以后扩充。
 const STRAY_INVOKE_TOKENS: &[&str] = &["call", "count", "card"];
 
-/// 复读熔断阈值：同一个 stray token（call/count/card）连续作为独占一行重复出现
-/// 超过这么多次，判定为「Opus 长上下文退化复读死循环」，立即熔断本轮文本输出。
+/// 复读熔断阈值：同一个非空短行/分片连续出现这么多次，判定为
+/// 「上游长上下文退化复读死循环」，立即熔断本轮文本或 Thinking 输出。
 ///
 /// 取值权衡：正常工具调用前最多出现 1 个引导词行（偶有 2~3），绝不会连续几十次。
-/// 设为 32 远高于正常上限、又远低于退化时的数万次，既不误伤正常引导词，又能尽早止血。
-const REPEAT_GUARD_TRIP_THRESHOLD: u32 = 32;
+/// 设为 16 可在客户端出现大面积刷屏前止血；比较保留行首缩进，避免把正常嵌套代码
+/// 中不同层级的闭合括号误判为同一行。
+const REPEAT_GUARD_TRIP_THRESHOLD: u32 = 16;
+/// 只对短候选做连续比较，避免复制和比较超大正文。
+const REPEAT_GUARD_MAX_UNIT_BYTES: usize = 512;
 
 /// 块级复读折叠：对「已完整的整段文本」做一次性复读熔断。
 ///
@@ -1499,9 +1502,9 @@ pub struct StreamContext {
     pub cache_usage: super::cache_metering::CacheUsage,
     /// meteringEvent 上报的 credit 计费量（上游真实下发）
     pub credits: f64,
-    /// 复读熔断：最近一次作为文本吐出的「尾行」内容（去空白）。
-    /// Opus 长上下文退化时会把同一个 stray token（call/count/card）一行一行无限复读，
-    /// 我们在文本出口处统计「同一短行连续重复了多少次」。
+    /// 复读熔断：最近一次候选来自 text 还是 thinking；通道切换时重置连续计数。
+    repeat_guard_last_channel: &'static str,
+    /// 复读熔断：最近一次候选。只去掉行尾空白，保留行首缩进参与比较。
     repeat_guard_last_line: String,
     /// 复读熔断：当前尾行已连续重复的次数。
     repeat_guard_run: u32,
@@ -1604,6 +1607,11 @@ impl StreamContext {
         self.terminal_attempt_failure.as_ref()
     }
 
+    /// 上游是否已被通用复读熔断器判定为退化输出。
+    pub fn repetition_guard_tripped(&self) -> bool {
+        self.repeat_guard_tripped
+    }
+
     /// 返回工具 JSON 的 typed 终态，供 handler 精确区分可重试的 EOF 半截与其他错误。
     #[cfg(test)]
     pub fn terminal_tool_json_error(&self) -> Option<&ToolJsonAccumulatorError> {
@@ -1668,6 +1676,7 @@ impl StreamContext {
             strip_thinking_leading_newline: false,
             cache_usage: super::cache_metering::CacheUsage::default(),
             credits: 0.0,
+            repeat_guard_last_channel: "",
             repeat_guard_last_line: String::new(),
             repeat_guard_run: 0,
             repeat_guard_tripped: false,
@@ -1949,9 +1958,12 @@ impl StreamContext {
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
                     if !thinking_content.is_empty() {
                         if let Some(thinking_index) = self.thinking_block_index {
-                            events.push(
-                                self.create_thinking_delta_event(thinking_index, &thinking_content),
-                            );
+                            if let Some(event) = self.create_guarded_thinking_delta_event(
+                                thinking_index,
+                                &thinking_content,
+                            ) {
+                                events.push(event);
+                            }
                         }
                     }
 
@@ -1992,9 +2004,12 @@ impl StreamContext {
                         let safe_content = self.thinking_buffer[..safe_len].to_string();
                         if !safe_content.is_empty() {
                             if let Some(thinking_index) = self.thinking_block_index {
-                                events.push(
-                                    self.create_thinking_delta_event(thinking_index, &safe_content),
-                                );
+                                if let Some(event) = self.create_guarded_thinking_delta_event(
+                                    thinking_index,
+                                    &safe_content,
+                                ) {
+                                    events.push(event);
+                                }
                             }
                         }
                         self.thinking_buffer = self.thinking_buffer[safe_len..].to_string();
@@ -2177,16 +2192,17 @@ impl StreamContext {
     /// 当发生 tool_use 时，状态机会自动关闭当前文本块；后续文本会自动创建新的文本块继续输出。
     ///
     /// 返回值包含可能的 content_block_start 事件和 content_block_delta 事件。
-    /// 复读熔断过滤器：在文本真正吐给客户端之前，逐行检测「同一 stray token 连续复读」。
+    /// 复读熔断过滤器：在文本或 Thinking 真正吐给客户端之前，逐行检测
+    /// 「同一非空短单元连续复读」。
     ///
     /// 工作方式（流式安全，跨 chunk 累计）：
-    /// - 把进来的 `text` 按行切，逐行和上一行（去空白）比较；
-    /// - 只对 `STRAY_INVOKE_TOKENS`（call/count/card）这类退化引导词计数，普通文本一律放行；
-    /// - 同一 stray token 连续重复达到 `REPEAT_GUARD_TRIP_THRESHOLD` 即「跳闸」；
-    /// - 跳闸后：本轮内后续任何文本（含继续复读的 count）一律丢弃，返回空串。
+    /// - 把输入按行切，只去掉行尾空白，保留行首缩进；
+    /// - 空行忽略且不重置，覆盖 `}\n\n}\n\n` 形态；
+    /// - 不超过 `REPEAT_GUARD_MAX_UNIT_BYTES` 的相同候选在同一通道连续达到阈值即跳闸；
+    /// - 跳闸后本轮后续 text/thinking 一律丢弃，并以 `max_tokens` 正常收尾。
     ///
     /// 返回应当继续吐出的文本（跳闸时返回空串）。
-    fn repeat_guard_filter(&mut self, text: &str) -> String {
+    fn repeat_guard_filter(&mut self, text: &str, channel: &'static str) -> String {
         // 已跳闸：本轮剩余文本全部丢弃，断雪球。
         if self.repeat_guard_tripped {
             return String::new();
@@ -2195,28 +2211,38 @@ impl StreamContext {
         let mut kept = String::new();
         // 用 split_inclusive 保留换行符，确保放行的正常文本不丢字节。
         for segment in text.split_inclusive('\n') {
-            let line = segment.trim();
-            if STRAY_INVOKE_TOKENS.contains(&line) {
-                if line == self.repeat_guard_last_line {
+            let line = segment.trim_end_matches(|ch: char| matches!(ch, '\r' | '\n' | ' ' | '\t'));
+            if line.is_empty() {
+                kept.push_str(segment);
+                continue;
+            }
+
+            if line.len() <= REPEAT_GUARD_MAX_UNIT_BYTES {
+                if channel == self.repeat_guard_last_channel && line == self.repeat_guard_last_line
+                {
                     self.repeat_guard_run += 1;
                 } else {
+                    self.repeat_guard_last_channel = channel;
                     self.repeat_guard_last_line = line.to_string();
                     self.repeat_guard_run = 1;
                 }
                 if self.repeat_guard_run >= REPEAT_GUARD_TRIP_THRESHOLD {
-                    // 跳闸：丢弃这一行及本轮后续所有文本。已经放行的 kept 保留
-                    // （阈值内的少量重复无害），但不再追加，并标记 tripped。
                     self.repeat_guard_tripped = true;
+                    self.state_manager.set_stop_reason("max_tokens");
+                    tracing::warn!(
+                        message_id = %self.message_id,
+                        channel = %channel,
+                        repeat_count = self.repeat_guard_run,
+                        unit_bytes = line.len(),
+                        "upstream repetition guard tripped"
+                    );
                     return kept;
                 }
-                // 阈值内：照常放行（少量引导词重复是正常的）。
                 kept.push_str(segment);
             } else {
-                // 普通文本行（含空行）：重置复读计数，正常放行。
-                if !line.is_empty() {
-                    self.repeat_guard_last_line = line.to_string();
-                    self.repeat_guard_run = 0;
-                }
+                self.repeat_guard_last_channel = channel;
+                self.repeat_guard_last_line.clear();
+                self.repeat_guard_run = 0;
                 kept.push_str(segment);
             }
         }
@@ -2229,7 +2255,7 @@ impl StreamContext {
         // 🛑 复读熔断（root cause: Opus 长上下文退化，把同一 stray token 一行行无限复读）。
         // 在文本出口处过滤：一旦同一短行连续重复超过阈值，丢弃后续复读文本，
         // 既不让它喷给客户端、不烧满 max_tokens，也不写进对话历史（断雪球）。
-        let kept = self.repeat_guard_filter(text);
+        let kept = self.repeat_guard_filter(text, "text");
         if kept.is_empty() {
             return events;
         }
@@ -2402,7 +2428,9 @@ impl StreamContext {
             self.output_tokens += estimate_tokens(text);
             events.extend(self.ensure_thinking_block());
             if let Some(idx) = self.thinking_block_index {
-                events.push(self.create_thinking_delta_event(idx, text));
+                if let Some(event) = self.create_guarded_thinking_delta_event(idx, text) {
+                    events.push(event);
+                }
             }
         }
 
@@ -2441,7 +2469,24 @@ impl StreamContext {
         events
     }
 
-    /// 创建 thinking_delta 事件
+    /// 创建受通用复读保护的 thinking_delta。空 delta 是协议收尾信号，不参与检测。
+    fn create_guarded_thinking_delta_event(
+        &mut self,
+        index: i32,
+        thinking: &str,
+    ) -> Option<SseEvent> {
+        if thinking.is_empty() {
+            return Some(self.create_thinking_delta_event(index, ""));
+        }
+        let kept = self.repeat_guard_filter(thinking, "thinking");
+        if kept.is_empty() {
+            return None;
+        }
+        self.has_visible_output = true;
+        Some(self.create_thinking_delta_event(index, &kept))
+    }
+
+    /// 创建原始 thinking_delta 事件
     fn create_thinking_delta_event(&self, index: i32, thinking: &str) -> SseEvent {
         SseEvent::new(
             "content_block_delta",
@@ -2633,9 +2678,11 @@ impl StreamContext {
                 let thinking_content = self.thinking_buffer[..end_pos].to_string();
                 if !thinking_content.is_empty() {
                     if let Some(thinking_index) = self.thinking_block_index {
-                        events.push(
-                            self.create_thinking_delta_event(thinking_index, &thinking_content),
-                        );
+                        if let Some(event) = self
+                            .create_guarded_thinking_delta_event(thinking_index, &thinking_content)
+                        {
+                            events.push(event);
+                        }
                     }
                 }
 
@@ -2758,9 +2805,12 @@ impl StreamContext {
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
                     if !thinking_content.is_empty() {
                         if let Some(thinking_index) = self.thinking_block_index {
-                            events.push(
-                                self.create_thinking_delta_event(thinking_index, &thinking_content),
-                            );
+                            if let Some(event) = self.create_guarded_thinking_delta_event(
+                                thinking_index,
+                                &thinking_content,
+                            ) {
+                                events.push(event);
+                            }
                         }
                     }
 
@@ -2788,9 +2838,12 @@ impl StreamContext {
                 } else {
                     // 如果还在 thinking 块内，发送剩余内容作为 thinking_delta
                     if let Some(thinking_index) = self.thinking_block_index {
-                        events.push(
-                            self.create_thinking_delta_event(thinking_index, &self.thinking_buffer),
-                        );
+                        let thinking_content = self.thinking_buffer.clone();
+                        if let Some(event) = self
+                            .create_guarded_thinking_delta_event(thinking_index, &thinking_content)
+                        {
+                            events.push(event);
+                        }
                     }
                     // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
                     if let Some(thinking_index) = self.thinking_block_index {
@@ -3242,6 +3295,10 @@ impl BufferedStreamContext {
 
     pub(crate) fn terminal_attempt_failure(&self) -> Option<&super::tool_attempt::AttemptFailure> {
         self.inner.terminal_attempt_failure()
+    }
+
+    pub fn repetition_guard_tripped(&self) -> bool {
+        self.inner.repetition_guard_tripped()
     }
 
     #[cfg(test)]
@@ -6427,6 +6484,106 @@ mod tests {
             "跨 chunk 复读也应熔断：实际吐出 count={}",
             emitted_counts
         );
+    }
+
+    #[test]
+    fn repeat_guard_trips_on_generic_brace_flood() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let mut events = Vec::new();
+        for _ in 0..100 {
+            events.extend(ctx.process_assistant_response("}\n\n"));
+        }
+        events.extend(ctx.generate_final_events());
+
+        let text = collect_text_content(&events);
+        assert!(
+            text.matches('}').count() < 32,
+            "generic flood was not stopped: {text:?}"
+        );
+        assert!(ctx.repetition_guard_tripped());
+        let message_delta = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("guarded stream must end with message_delta");
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "max_tokens");
+    }
+
+    #[test]
+    fn repeat_guard_trips_on_native_thinking_flood() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let mut events = Vec::new();
+        for _ in 0..100 {
+            events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+                crate::kiro::model::events::ReasoningContentEvent {
+                    text: Some("}\n\n".into()),
+                    signature: None,
+                    redacted_content: None,
+                },
+            )));
+        }
+        events.extend(ctx.generate_final_events());
+
+        let thinking = collect_thinking_content(&events);
+        assert!(
+            thinking.matches('}').count() < 32,
+            "thinking flood was not stopped: {thinking:?}"
+        );
+        assert!(ctx.repetition_guard_tripped());
+        let message_delta = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("guarded thinking stream must end with message_delta");
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "max_tokens");
+    }
+
+    #[test]
+    fn repeat_guard_allows_fifteen_identical_lines() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let mut events = Vec::new();
+        for _ in 0..15 {
+            events.extend(ctx.process_assistant_response("}\n"));
+        }
+        assert!(!ctx.repetition_guard_tripped());
+        assert_eq!(collect_text_content(&events).matches('}').count(), 15);
+    }
+
+    #[test]
+    fn repeat_guard_preserves_differently_indented_braces() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let mut events = Vec::new();
+        for _ in 0..40 {
+            events.extend(ctx.process_assistant_response("}\n  }\n    }\n"));
+        }
+        assert!(!ctx.repetition_guard_tripped());
+        assert_eq!(collect_text_content(&events).matches('}').count(), 120);
     }
 
     // ---- 块级复读熔断 (collapse_stray_token_floods)：覆盖 web_search loop 路径 ----
