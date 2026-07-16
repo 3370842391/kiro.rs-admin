@@ -304,20 +304,23 @@ class AccountManagerServiceTests(unittest.TestCase):
             self.repo.get(first.id, include_secrets=True).current_password
         )
 
-    def test_export_requires_current_password_without_fallback(self):
+    def test_export_uses_initial_password_before_first_login(self):
         first, _second = self.import_accounts().accounts
         calls = []
 
-        with self.assertRaisesRegex(AccountManagerServiceError, "当前密码"):
-            self.service.export_text(
-                [first.id],
-                template="{account}----{password}----{start_url}",
-                writer=calls.append,
-                note="客户 A",
-                mark_sold=True,
-            )
+        report = self.service.export_text(
+            [first.id],
+            template="{account}----{password}----{start_url}",
+            writer=calls.append,
+            note="客户 A",
+            mark_sold=False,
+        )
 
-        self.assertEqual([], calls)
+        self.assertEqual(1, report.exported)
+        self.assertEqual(
+            "first----one-time-1----https://portal.example/one",
+            calls[0],
+        )
         self.assertIs(
             LifecycleStatus.MANAGED,
             self.repo.get(first.id).lifecycle_status,

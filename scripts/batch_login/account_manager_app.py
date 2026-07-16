@@ -100,6 +100,7 @@ class AccountManagerApp:
     CONTEXT_MENU_LABELS = (
         "一键获取 JSON",
         "复制账号",
+        "复制账号信息",
         "复制 Start URL",
         "查看密码",
         "更新密码",
@@ -138,7 +139,11 @@ class AccountManagerApp:
         outer = ttk.Frame(self.root, padding=12)
         outer.pack(fill="both", expand=True)
         ttk.Label(outer, text="Kiro 账号管理器", font=("Microsoft YaHei UI", 16, "bold")).pack(anchor="w")
-        ttk.Label(outer, text="粘贴入库、批量选择、密码查看、销售标记和导出", foreground="#475569").pack(anchor="w", pady=(2, 8))
+        ttk.Label(
+            outer,
+            text="双击整行或点击复选框可多选；右键对全部勾选账号批量操作",
+            foreground="#475569",
+        ).pack(anchor="w", pady=(2, 8))
         toolbar = ttk.Frame(outer)
         toolbar.pack(fill="x", pady=(0, 4))
         ttk.Entry(toolbar, textvariable=self.query_var, width=34).pack(side="left")
@@ -197,6 +202,7 @@ class AccountManagerApp:
         context_commands = (
             self.start_login_export,
             self.copy_selected_accounts,
+            self.copy_selected_account_info,
             self.copy_selected_start_urls,
             self.open_password_viewer,
             self.update_password,
@@ -207,7 +213,7 @@ class AccountManagerApp:
         for index, (label, command) in enumerate(
             zip(self.CONTEXT_MENU_LABELS, context_commands, strict=True)
         ):
-            if index in {3, 6}:
+            if index in {4, 7}:
                 self.context_menu.add_separator()
             self.context_menu.add_command(label=label, command=command)
         footer = ttk.Frame(outer)
@@ -265,8 +271,6 @@ class AccountManagerApp:
     def _tree_selection(self, _event=None) -> None:
         if self._refreshing_tree:
             return
-        self.service.set_selected(int(item) for item in self.tree.selection())
-        self._update_tree_selection_markers()
         self._update_selected_count()
 
     def _update_tree_selection_markers(self) -> None:
@@ -282,7 +286,7 @@ class AccountManagerApp:
         row = self.tree.identify_row(event.y)
         if not row:
             return "break"
-        self.service.set_selected([int(row)])
+        self.service.toggle_selected(int(row))
         self.refresh()
         return "break"
 
@@ -291,7 +295,7 @@ class AccountManagerApp:
         if not row:
             return "break"
         if int(row) not in self.service.selected_ids:
-            self.service.set_selected([int(row)])
+            self.service.toggle_selected(int(row))
             self.refresh()
         try:
             self.context_menu.tk_popup(event.x_root, event.y_root)
@@ -300,9 +304,6 @@ class AccountManagerApp:
         return "break"
 
     def _selected_action_ids(self) -> list[int]:
-        visible_selection = [int(item) for item in self.tree.selection()]
-        if visible_selection:
-            self.service.set_selected(visible_selection)
         return sorted(self.service.selected_ids)
 
     def _update_selected_count(self) -> None:
@@ -517,6 +518,19 @@ class AccountManagerApp:
             return
         self._copy("\n".join(item.account for item in accounts))
         self.status_var.set(f"已复制 {len(accounts)} 个账号")
+
+    def copy_selected_account_info(self) -> None:
+        ids = self._selected_action_ids()
+        if not ids:
+            messagebox.showinfo("复制账号信息", "请先选择账号", parent=self.root)
+            return
+        try:
+            text = self.service.render_text(ids, self.DEFAULT_EXPORT_TEMPLATE)
+        except AccountManagerServiceError as error:
+            self._error(error)
+            return
+        self._copy(text)
+        self.status_var.set(f"已复制 {len(ids)} 个账号信息")
 
     def copy_selected_start_urls(self) -> None:
         ids = self._selected_action_ids()

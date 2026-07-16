@@ -268,16 +268,20 @@ class AccountManagerService:
     def render_text(self, ids: Sequence[int], template: str) -> str:
         self._validate_export_template(template)
         accounts = self._load_managed(ids, include_secrets=True)
-        missing = [item.account for item in accounts if not item.current_password]
+        missing = [
+            item.account
+            for item in accounts
+            if not (item.current_password or item.initial_password)
+        ]
         if missing:
             raise AccountManagerServiceError(
-                f"{len(missing)} 个账号缺少当前密码，无法导出"
+                f"{len(missing)} 个账号缺少可用密码，无法导出"
             )
         entries = [
             AccountEntry(
                 line_number=index,
                 account=item.account,
-                password=item.current_password or "",
+                password=item.current_password or item.initial_password or "",
                 start_url=item.start_url,
             )
             for index, item in enumerate(accounts, start=1)

@@ -72,6 +72,18 @@ class FakeSelectionService:
             self._selected.add(account_id)
 
 
+class FakeMenu:
+    def __init__(self):
+        self.popup_calls = []
+        self.released = False
+
+    def tk_popup(self, x, y):
+        self.popup_calls.append((x, y))
+
+    def grab_release(self):
+        self.released = True
+
+
 class AccountManagerAppTests(unittest.TestCase):
     def test_main_table_contains_management_columns(self):
         self.assertEqual(
@@ -195,7 +207,7 @@ class AccountManagerAppTests(unittest.TestCase):
         self.assertEqual({11, 12, 13}, select_range_ids(rows, "13", "11"))
         self.assertEqual(set(), select_range_ids(rows, "missing", "11"))
 
-    def test_tree_selection_replaces_stale_internal_selection(self):
+    def test_tree_focus_does_not_discard_checked_accounts(self):
         app = object.__new__(AccountManagerApp)
         app.tree = FakeTree(selected=(2,))
         app.service = FakeSelectionService(selected=(1, 2))
@@ -204,10 +216,10 @@ class AccountManagerAppTests(unittest.TestCase):
 
         app._tree_selection()
 
-        self.assertEqual({2}, app.service.selected_ids)
-        self.assertEqual("已选择 1 个账号", app.selected_count_var.get())
+        self.assertEqual({1, 2}, app.service.selected_ids)
+        self.assertEqual("已选择 2 个账号", app.selected_count_var.get())
 
-    def test_double_click_selects_the_whole_row(self):
+    def test_double_click_adds_row_without_clearing_existing_checks(self):
         app = object.__new__(AccountManagerApp)
         app.tree = FakeTree(selected=(1,), row=2)
         app.service = FakeSelectionService(selected=(1,))
@@ -217,8 +229,18 @@ class AccountManagerAppTests(unittest.TestCase):
         result = app._tree_double_click(type("Event", (), {"y": 10})())
 
         self.assertEqual("break", result)
-        self.assertEqual({2}, app.service.selected_ids)
+        self.assertEqual({1, 2}, app.service.selected_ids)
         self.assertEqual([True], refreshed)
+
+    def test_double_click_on_checked_row_removes_only_that_row(self):
+        app = object.__new__(AccountManagerApp)
+        app.tree = FakeTree(selected=(1, 2), row=2)
+        app.service = FakeSelectionService(selected=(1, 2))
+        app.refresh = lambda: None
+
+        app._tree_double_click(type("Event", (), {"y": 10})())
+
+        self.assertEqual({1}, app.service.selected_ids)
 
     def test_checkbox_click_stops_native_selection_from_readding_row(self):
         app = object.__new__(AccountManagerApp)
@@ -235,19 +257,39 @@ class AccountManagerAppTests(unittest.TestCase):
         self.assertEqual(set(), app.service.selected_ids)
         self.assertEqual([True], refreshed)
 
-    def test_action_ids_follow_the_visible_tree_selection(self):
+    def test_action_ids_use_all_checked_accounts_not_blue_focus(self):
         app = object.__new__(AccountManagerApp)
         app.tree = FakeTree(selected=(2,))
         app.service = FakeSelectionService(selected=(1, 2))
 
-        self.assertEqual([2], app._selected_action_ids())
-        self.assertEqual({2}, app.service.selected_ids)
+        self.assertEqual([1, 2], app._selected_action_ids())
+        self.assertEqual({1, 2}, app.service.selected_ids)
+
+    def test_right_click_adds_target_to_existing_checked_batch(self):
+        app = object.__new__(AccountManagerApp)
+        app.tree = FakeTree(selected=(1,), row=3)
+        app.service = FakeSelectionService(selected=(1, 2))
+        app.context_menu = FakeMenu()
+        app.refresh = lambda: None
+        event = type(
+            "Event",
+            (),
+            {"y": 10, "x_root": 100, "y_root": 200},
+        )()
+
+        result = app._tree_context_menu(event)
+
+        self.assertEqual("break", result)
+        self.assertEqual({1, 2, 3}, app.service.selected_ids)
+        self.assertEqual([(100, 200)], app.context_menu.popup_calls)
+        self.assertTrue(app.context_menu.released)
 
     def test_context_menu_exposes_requested_account_actions(self):
         self.assertEqual(
             (
                 "一键获取 JSON",
                 "复制账号",
+                "复制账号信息",
                 "复制 Start URL",
                 "查看密码",
                 "更新密码",
@@ -257,6 +299,34 @@ class AccountManagerAppTests(unittest.TestCase):
             ),
             AccountManagerApp.CONTEXT_MENU_LABELS,
         )
+
+    def test_copy_account_info_uses_all_checked_ids(self):
+        class Service(FakeSelectionService):
+            def __init__(self):
+                super().__init__((1, 2))
+                self.render_calls = []
+
+            def render_text(self, ids, template):
+                self.render_calls.append((list(ids), template))
+                return "first----password-one----https://portal/one\nsecond----password-two----https://portal/two"
+
+        app = object.__new__(AccountManagerApp)
+        app.tree = FakeTree(selected=(2,))
+        app.service = Service()
+        app.status_var = FakeVar("")
+        copied = []
+        app._copy = copied.append
+
+        app.copy_selected_account_info()
+
+        self.assertEqual(
+            [([1, 2], AccountManagerApp.DEFAULT_EXPORT_TEMPLATE)],
+            app.service.render_calls,
+        )
+        self.assertEqual(1, len(copied))
+        self.assertIn("first----password-one", copied[0])
+        self.assertIn("second----password-two", copied[0])
+        self.assertEqual("已复制 2 个账号信息", app.status_var.get())
 
     def test_atomic_text_write_replaces_target_without_temp_residue(self):
         with tempfile.TemporaryDirectory() as tmp:
