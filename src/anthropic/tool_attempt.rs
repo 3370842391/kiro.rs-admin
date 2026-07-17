@@ -12,6 +12,47 @@ fn bounded_upstream_error_message(message: &str) -> String {
         .collect()
 }
 
+pub(crate) fn safe_upstream_error_reason(message: &str) -> Option<String> {
+    let bounded = bounded_upstream_error_message(message);
+    let normalized = bounded.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalized = normalized.trim();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let lower = normalized.to_ascii_lowercase();
+    let contains_sensitive_data = [
+        "request body",
+        "request_body",
+        "authorization",
+        "bearer ",
+        "x-api-key",
+        "api_key",
+        "apikey",
+        "access_token",
+        "refresh_token",
+        "client_secret",
+        "password",
+        "secret",
+        "credential",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    let contains_key_prefix = lower
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')))
+        .any(|word| {
+            word.starts_with("ksk_")
+                || word.starts_with("csk_")
+                || word.starts_with("sk-")
+                || word.starts_with("akia")
+                || (word.starts_with("eyj") && word.len() >= 20)
+        });
+    let resembles_payload = (normalized.starts_with('{') && normalized.ends_with('}'))
+        || (normalized.starts_with('[') && normalized.ends_with(']'));
+    (!contains_sensitive_data && !contains_key_prefix && !resembles_payload)
+        .then(|| normalized.to_string())
+}
+
 /// 实时 SSE 的试运行缓冲。
 ///
 /// `message_start` 和空 content delta 会暂存在内存中；首个非空文本、thinking、
@@ -215,7 +256,10 @@ impl AttemptFailure {
                 "upstream_context_window_exceeded",
                 "Upstream context window was exceeded".to_string(),
             ),
-            Self::UpstreamError { error_type, .. } => {
+            Self::UpstreamError {
+                error_type,
+                message,
+            } => {
                 let safe_type = error_type
                     .chars()
                     .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
@@ -226,10 +270,10 @@ impl AttemptFailure {
                 } else {
                     safe_type.as_str()
                 };
-                (
-                    "upstream_protocol_error",
-                    format!("Upstream reported {safe_type}"),
-                )
+                let public_message = safe_upstream_error_reason(message)
+                    .map(|reason| format!("Upstream reported {safe_type}: {reason}"))
+                    .unwrap_or_else(|| format!("Upstream reported {safe_type}"));
+                ("upstream_protocol_error", public_message)
             }
         }
     }
@@ -642,6 +686,14 @@ mod tests {
         assert!(message.contains("ValidationException"));
         assert!(!message.contains(sensitive));
         assert!(!message.contains("secret customer document"));
+
+        let api_key = "csk_example_auth_material_1234567890";
+        let (_, message) = AttemptFailure::UpstreamError {
+            error_type: "AuthenticationException".into(),
+            message: format!("upstream rejected {api_key}"),
+        }
+        .public_error();
+        assert!(!message.contains(api_key));
     }
 
     #[test]
