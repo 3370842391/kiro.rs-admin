@@ -685,6 +685,27 @@ fn validate_object(
         .filter_map(serde_json::Value::as_str)
         .collect();
 
+    // Some clients use the Claude Code spelling `file_path` for a tool whose
+    // upstream contract deliberately exposes the required `path` field. This
+    // is safe to repair only when the schema itself declares `path`, does not
+    // declare a competing `file_path` property, and the alias value is a
+    // string. All other shapes continue through strict validation unchanged.
+    let can_repair_file_path_alias = required.contains("path")
+        && !object.contains_key("path")
+        && object
+            .get("file_path")
+            .is_some_and(serde_json::Value::is_string)
+        && properties.is_some_and(|properties| {
+            properties.contains_key("path") && !properties.contains_key("file_path")
+        });
+    if can_repair_file_path_alias {
+        let alias = object
+            .remove("file_path")
+            .expect("file_path alias was checked before removal");
+        object.insert("path".to_string(), alias);
+        repairs.push(property_path(path, "path"));
+    }
+
     if let Some(properties) = properties {
         for (name, property_schema) in properties {
             let child_path = property_path(path, name);
@@ -873,6 +894,56 @@ mod tests {
             validate_and_repair(&schema, &mut input),
             ToolInputOutcome::Valid
         );
+    }
+
+    #[test]
+    fn repairs_file_path_alias_when_path_is_required() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+            "additionalProperties": false
+        });
+        let mut input = serde_json::json!({"file_path": "/tmp/a.txt"});
+
+        assert_eq!(
+            validate_and_repair(&schema, &mut input),
+            ToolInputOutcome::Repaired {
+                paths: vec!["$.path".to_string()]
+            }
+        );
+        assert_eq!(input, serde_json::json!({"path": "/tmp/a.txt"}));
+    }
+
+    #[test]
+    fn rejects_file_path_alias_when_path_is_already_present_or_not_a_string() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+            "additionalProperties": false
+        });
+        let mut conflict = serde_json::json!({
+            "path": "/tmp/a.txt",
+            "file_path": "/tmp/b.txt"
+        });
+        let original_conflict = conflict.clone();
+        assert!(matches!(
+            validate_and_repair(&schema, &mut conflict),
+            ToolInputOutcome::Invalid { violations }
+                if violations.iter().any(|violation| {
+                    display_violation(violation).contains("$.file_path")
+                })
+        ));
+        assert_eq!(conflict, original_conflict);
+
+        let mut non_string = serde_json::json!({"file_path": 7});
+        let original_non_string = non_string.clone();
+        assert!(matches!(
+            validate_and_repair(&schema, &mut non_string),
+            ToolInputOutcome::Invalid { .. }
+        ));
+        assert_eq!(non_string, original_non_string);
     }
 
     #[test]

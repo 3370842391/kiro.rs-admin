@@ -667,6 +667,7 @@ impl ErrorSnapshotContext {
         let write = SnapshotWrite {
             snapshot_id: self.snapshot_id.clone(),
             trace_id: self.trace_id.clone(),
+            request_fingerprint: hex::encode(Sha256::digest(&request_bytes)),
             ts: self.ts.clone(),
             ts_epoch: self.ts_epoch,
             model: draft.model.clone(),

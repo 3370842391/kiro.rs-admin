@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::error_snapshot::{EncodedPayloadPart, SnapshotPayloadKind};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
+/// 同一请求在短时间内重复失败时只保留一份完整现场。
+const DEDUP_WINDOW_SECS: i64 = 60;
 const DEFAULT_QUERY_LIMIT: usize = 50;
 const MAX_QUERY_LIMIT: usize = 1000;
 
@@ -72,6 +74,10 @@ impl ErrorSnapshotPolicy {
 pub struct SnapshotWrite {
     pub snapshot_id: String,
     pub trace_id: String,
+    /// Sanitized client request 的稳定指纹。旧 fallback/数据库记录没有该字段时为空，
+    /// 这样可以避免把无法确认相同请求的旧记录误合并。
+    #[serde(default)]
+    pub request_fingerprint: String,
     pub ts: String,
     pub ts_epoch: i64,
     pub model: String,
@@ -185,6 +191,8 @@ pub struct SnapshotSummary {
     pub compressed_bytes: u64,
     pub created_at: i64,
     pub updated_at: i64,
+    /// 短窗口内合并的重复错误数（首份记录为 1）。
+    pub duplicate_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -357,6 +365,38 @@ impl ErrorSnapshotStore {
             return Ok(InsertOutcome::Existing(existing));
         }
 
+        // trace_id 只保证单个请求幂等；相同请求可能因为客户端重试产生不同 trace_id。
+        // 只有拥有非空请求指纹时才合并，并且必须同时匹配错误类型和响应模式。
+        let now = chrono::Utc::now().timestamp();
+        if !write.request_fingerprint.is_empty()
+            && let Some(existing) = conn
+                .query_row(
+                    "SELECT snapshot_id FROM error_snapshots
+                     WHERE request_fingerprint = ?1
+                       AND error_type = ?2
+                       AND response_mode = ?3
+                       AND updated_at >= ?4
+                     ORDER BY updated_at DESC, snapshot_id DESC LIMIT 1",
+                    params![
+                        write.request_fingerprint,
+                        write.error_type,
+                        write.response_mode.as_str(),
+                        now.saturating_sub(DEDUP_WINDOW_SECS),
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+        {
+            conn.execute(
+                "UPDATE error_snapshots
+                 SET duplicate_count = COALESCE(duplicate_count, 1) + 1,
+                     updated_at = ?2
+                 WHERE snapshot_id = ?1",
+                params![existing, now],
+            )?;
+            return Ok(InsertOutcome::Existing(existing));
+        }
+
         let payload_count = write
             .payloads
             .iter()
@@ -373,23 +413,23 @@ impl ErrorSnapshotStore {
                 .checked_add(u64::try_from(part.data.len())?)
                 .ok_or_else(|| anyhow::anyhow!("快照压缩长度溢出"))
         })?;
-        let now = chrono::Utc::now().timestamp();
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT INTO error_snapshots (
-                snapshot_id, trace_id, ts, ts_epoch, model, is_stream, key_id, key_source,
+                snapshot_id, trace_id, ts, ts_epoch, request_fingerprint, model, is_stream, key_id, key_source,
                 response_mode, final_credential_id, endpoint, http_status, final_status, error_type, severity,
                 error_message, recovered, pinned, retention_exempt, omitted_due_to_disk_pressure,
-                payload_count, original_bytes, compressed_bytes, created_at, updated_at
+                payload_count, original_bytes, compressed_bytes, duplicate_count, created_at, updated_at
              ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27
              )",
             params![
                 write.snapshot_id,
                 write.trace_id,
                 write.ts,
                 write.ts_epoch,
+                write.request_fingerprint,
                 write.model,
                 write.is_stream,
                 to_i64(write.key_id, "key_id")?,
@@ -409,6 +449,7 @@ impl ErrorSnapshotStore {
                 i64::try_from(payload_count)?,
                 to_i64(original_bytes, "original_bytes")?,
                 to_i64(compressed_bytes, "compressed_bytes")?,
+                1i64,
                 now,
                 now,
             ],
@@ -988,6 +1029,26 @@ fn ensure_response_mode_column(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+fn ensure_dedup_columns(conn: &Connection) -> rusqlite::Result<()> {
+    let mut statement = conn.prepare("PRAGMA table_info(error_snapshots)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !columns.iter().any(|name| name == "request_fingerprint") {
+        conn.execute_batch(
+            "ALTER TABLE error_snapshots
+             ADD COLUMN request_fingerprint TEXT NOT NULL DEFAULT '';",
+        )?;
+    }
+    if !columns.iter().any(|name| name == "duplicate_count") {
+        conn.execute_batch(
+            "ALTER TABLE error_snapshots
+             ADD COLUMN duplicate_count INTEGER NOT NULL DEFAULT 1;",
+        )?;
+    }
+    Ok(())
+}
+
 fn initialize_connection(conn: &Connection, is_new: bool) -> rusqlite::Result<()> {
     conn.busy_timeout(std::time::Duration::from_secs(2))?;
     conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;")?;
@@ -1002,6 +1063,11 @@ fn initialize_connection(conn: &Connection, is_new: bool) -> rusqlite::Result<()
     }
     conn.execute_batch(SCHEMA)?;
     ensure_response_mode_column(conn)?;
+    ensure_dedup_columns(conn)?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_error_snapshots_dedup
+         ON error_snapshots(request_fingerprint, error_type, response_mode, updated_at DESC);",
+    )?;
     if version < SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
@@ -1013,7 +1079,7 @@ fn summary_select() -> &'static str {
     "SELECT snapshot_id, trace_id, ts, model, is_stream, key_id, key_source,
             response_mode, final_credential_id, endpoint, http_status, final_status, error_type, severity,
             error_message, recovered, pinned, retention_exempt, omitted_due_to_disk_pressure,
-            payload_count, original_bytes, compressed_bytes, created_at, updated_at
+            payload_count, original_bytes, compressed_bytes, created_at, updated_at, duplicate_count
      FROM error_snapshots"
 }
 
@@ -1054,6 +1120,7 @@ fn summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SnapshotSummary
         compressed_bytes: from_u64(row.get::<_, i64>(21)?, 21)?,
         created_at: row.get(22)?,
         updated_at: row.get(23)?,
+        duplicate_count: from_u64(row.get::<_, i64>(24)?, 24)?,
     })
 }
 
@@ -1206,6 +1273,7 @@ CREATE TABLE IF NOT EXISTS error_snapshots (
   trace_id TEXT NOT NULL UNIQUE,
   ts TEXT NOT NULL,
   ts_epoch INTEGER NOT NULL,
+  request_fingerprint TEXT NOT NULL DEFAULT '',
   model TEXT NOT NULL,
   is_stream INTEGER NOT NULL,
   key_id INTEGER NOT NULL,
@@ -1225,6 +1293,7 @@ CREATE TABLE IF NOT EXISTS error_snapshots (
   payload_count INTEGER NOT NULL,
   original_bytes INTEGER NOT NULL,
   compressed_bytes INTEGER NOT NULL,
+  duplicate_count INTEGER NOT NULL DEFAULT 1,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -1311,6 +1380,7 @@ mod tests {
         SnapshotWrite {
             snapshot_id: snapshot_id.to_string(),
             trace_id: trace_id.to_string(),
+            request_fingerprint: format!("request-fingerprint-{trace_id}"),
             ts: "2026-07-14T00:00:00Z".to_string(),
             ts_epoch: 1_752_451_200,
             model: "claude-opus-4-8".to_string(),
@@ -1428,7 +1498,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, SCHEMA_VERSION);
         let response_mode: String = conn
             .query_row(
                 "SELECT response_mode FROM error_snapshots WHERE snapshot_id = 'legacy-snapshot'",
@@ -1474,6 +1544,118 @@ mod tests {
             store.insert(&second).unwrap(),
             InsertOutcome::Existing("snap-1".into())
         );
+    }
+
+    #[test]
+    fn duplicate_request_within_window_updates_count_without_replacing_payload() {
+        let store = ErrorSnapshotStore::open_in_memory(test_policy()).unwrap();
+        let first = sample_write("snap-dedup-first", "trace-dedup-first");
+        let mut second = sample_write("snap-dedup-second", "trace-dedup-second");
+        second.request_fingerprint = first.request_fingerprint.clone();
+        second.payloads.clear();
+
+        assert_eq!(
+            store.insert(&first).unwrap(),
+            InsertOutcome::Inserted("snap-dedup-first".into())
+        );
+        assert_eq!(
+            store.insert(&second).unwrap(),
+            InsertOutcome::Existing("snap-dedup-first".into())
+        );
+
+        let detail = store.get("snap-dedup-first").unwrap().unwrap();
+        assert_eq!(detail.summary.duplicate_count, 2);
+        assert_eq!(detail.payloads.len(), 2);
+        assert!(store.get("snap-dedup-second").unwrap().is_none());
+    }
+
+    #[test]
+    fn duplicate_request_after_window_creates_new_snapshot() {
+        let store = ErrorSnapshotStore::open_in_memory(test_policy()).unwrap();
+        let first = sample_write("snap-dedup-expired-first", "trace-dedup-expired-first");
+        store.insert(&first).unwrap();
+        store
+            .conn
+            .lock()
+            .execute(
+                "UPDATE error_snapshots SET updated_at = ?2 WHERE snapshot_id = ?1",
+                params![
+                    first.snapshot_id,
+                    chrono::Utc::now().timestamp() - DEDUP_WINDOW_SECS - 1
+                ],
+            )
+            .unwrap();
+
+        let second = sample_write("snap-dedup-expired-second", "trace-dedup-expired-second");
+        assert_eq!(
+            store.insert(&second).unwrap(),
+            InsertOutcome::Inserted("snap-dedup-expired-second".into())
+        );
+        assert_eq!(
+            store.query_paged(&SnapshotQuery::default()).unwrap().total,
+            2
+        );
+    }
+
+    #[test]
+    fn duplicate_request_does_not_merge_different_error_or_response_mode() {
+        let store = ErrorSnapshotStore::open_in_memory(test_policy()).unwrap();
+        let first = sample_write("snap-dedup-type-first", "trace-dedup-type-first");
+        store.insert(&first).unwrap();
+
+        let mut different_error = sample_write("snap-dedup-type-second", "trace-dedup-type-second");
+        different_error.request_fingerprint = first.request_fingerprint.clone();
+        different_error.error_type = "different_error".to_string();
+        assert!(matches!(
+            store.insert(&different_error).unwrap(),
+            InsertOutcome::Inserted(_)
+        ));
+
+        let mut different_mode = sample_write("snap-dedup-mode-second", "trace-dedup-mode-second");
+        different_mode.request_fingerprint = first.request_fingerprint.clone();
+        different_mode.response_mode = crate::admin::client_keys::ClientResponseMode::Detection;
+        assert!(matches!(
+            store.insert(&different_mode).unwrap(),
+            InsertOutcome::Inserted(_)
+        ));
+        assert_eq!(
+            store.query_paged(&SnapshotQuery::default()).unwrap().total,
+            3
+        );
+    }
+
+    #[test]
+    fn legacy_snapshot_defaults_duplicate_count_and_fingerprint() {
+        let conn = Connection::open_in_memory().unwrap();
+        let legacy_schema = SCHEMA
+            .replace("  request_fingerprint TEXT NOT NULL DEFAULT '',\n", "")
+            .replace("  duplicate_count INTEGER NOT NULL DEFAULT 1,\n", "");
+        conn.execute_batch(&legacy_schema).unwrap();
+        conn.execute(
+            "INSERT INTO error_snapshots (
+                snapshot_id, trace_id, ts, ts_epoch, model, is_stream, key_id, key_source,
+                response_mode, final_credential_id, endpoint, http_status, final_status, error_type, severity,
+                error_message, recovered, pinned, retention_exempt, omitted_due_to_disk_pressure,
+                payload_count, original_bytes, compressed_bytes, created_at, updated_at
+             ) VALUES (
+                'legacy-dedup', 'legacy-dedup-trace', '2026-07-15T00:00:00Z', 1, 'm', 0, 7,
+                'clientKey', 'detection', 9, NULL, 500, 'error', 'legacy_error', 'error', NULL,
+                0, 0, 0, 0, 0, 0, 0, 1, 1
+             )",
+            [],
+        )
+        .unwrap();
+        initialize_connection(&conn, false).unwrap();
+        let store = ErrorSnapshotStore {
+            conn: Mutex::new(conn),
+            db_path: None,
+            fallback_dir: None,
+            policy: RwLock::new(test_policy()),
+            disk_pressure: AtomicBool::new(false),
+            storage_probe: Arc::new(RealStorageProbe),
+        };
+        let detail = store.get("legacy-dedup").unwrap().unwrap();
+        assert_eq!(detail.summary.duplicate_count, 1);
     }
 
     #[test]

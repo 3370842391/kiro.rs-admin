@@ -1798,20 +1798,30 @@ impl StreamContext {
             }
             Event::Error {
                 error_code,
-                error_message: _,
+                error_message,
             } => {
-                tracing::error!(error_type = %error_code, "收到上游错误事件");
+                let safe_reason = super::tool_attempt::safe_upstream_error_reason(error_message);
+                tracing::error!(
+                    error_type = %error_code,
+                    reason = safe_reason.as_deref().unwrap_or("[redacted]"),
+                    "收到上游错误事件"
+                );
                 Vec::new()
             }
             Event::Exception {
                 exception_type,
-                message: _,
+                message,
             } => {
                 // 处理 ContentLengthExceededException
                 if exception_type == "ContentLengthExceededException" {
                     self.state_manager.set_stop_reason("max_tokens");
                 }
-                tracing::warn!(error_type = %exception_type, "收到上游异常事件");
+                let safe_reason = super::tool_attempt::safe_upstream_error_reason(message);
+                tracing::warn!(
+                    error_type = %exception_type,
+                    reason = safe_reason.as_deref().unwrap_or("[redacted]"),
+                    "收到上游异常事件"
+                );
                 Vec::new()
             }
             _ => Vec::new(),
@@ -3645,6 +3655,57 @@ mod tests {
         );
         let error = events.iter().find(|event| event.event == "error").unwrap();
         assert_eq!(error.data["error"]["type"], "upstream_empty_response");
+    }
+
+    #[test]
+    fn explicit_upstream_error_preserves_safe_reason() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4.8",
+            10,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_kiro_event(&Event::Error {
+            error_code: "ValidationException".into(),
+            error_message: "Input content length exceeds threshold.".into(),
+        });
+        let events = ctx.generate_final_events();
+
+        let error = events.iter().find(|event| event.event == "error").unwrap();
+        assert_eq!(error.data["error"]["type"], "upstream_protocol_error");
+        assert_eq!(
+            error.data["error"]["message"],
+            "Upstream reported ValidationException: Input content length exceeds threshold."
+        );
+    }
+
+    #[test]
+    fn explicit_upstream_exception_preserves_bounded_safe_reason() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4.8",
+            10,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let reason = format!("{}TAIL", "temporary upstream capacity issue ".repeat(40));
+        let _ = ctx.process_kiro_event(&Event::Exception {
+            exception_type: "ModelError".into(),
+            message: reason,
+        });
+        let events = ctx.generate_final_events();
+
+        let error = events.iter().find(|event| event.event == "error").unwrap();
+        let message = error.data["error"]["message"].as_str().unwrap();
+        assert_eq!(error.data["error"]["type"], "upstream_protocol_error");
+        assert!(
+            message.starts_with("Upstream reported ModelError: temporary upstream capacity issue")
+        );
+        assert!(!message.contains("TAIL"));
+        assert!(message.chars().count() <= "Upstream reported ModelError: ".chars().count() + 512);
     }
 
     #[test]
