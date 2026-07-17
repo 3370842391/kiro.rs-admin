@@ -131,6 +131,11 @@ class GuiRuntime:
             checkpoint=checkpoint,
             importer=self.runner_importer(),
             emit=self.emit,
+            api_key_transport_factory=(
+                (lambda: CurlCffiTransport(timeout=self.form.timeout_seconds))
+                if self.form.create_api_key
+                else None
+            ),
         )
         return await runner.run(entries, self.form.to_run_settings())
 

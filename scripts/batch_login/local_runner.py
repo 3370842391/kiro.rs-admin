@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import asdict
 from uuid import uuid4
 
+from .api_key_client import ApiKeyError, ensure_api_key
 from .browser_flows import BrowserFlowError
 from .credential_models import CredentialRecord
 from .enterprise_http import EnterpriseHttpError
@@ -33,6 +34,7 @@ class LocalBatchRunner:
         checkpoint,
         importer=None,
         emit=lambda _event: None,
+        api_key_transport_factory=None,
     ):
         self.enterprise = enterprise
         self.microsoft = microsoft
@@ -40,6 +42,7 @@ class LocalBatchRunner:
         self.checkpoint = checkpoint
         self.importer = importer
         self.emit = emit
+        self.api_key_transport_factory = api_key_transport_factory
         self.run_id = uuid4().hex
 
     async def run(
@@ -75,6 +78,10 @@ class LocalBatchRunner:
                 )
                 try:
                     credential = await self._login(entry, settings)
+                    if settings.create_api_key:
+                        await self._create_api_key(
+                            entry, credential, settings, summary
+                        )
                     added = self.store.append(credential)
                     if added:
                         summary.succeeded += 1
@@ -139,6 +146,94 @@ class LocalBatchRunner:
             entry,
             MicrosoftSettings(settings.region),
         )
+
+    async def _create_api_key(
+        self,
+        entry: AccountEntry,
+        credential: CredentialRecord,
+        settings: LocalRunSettings,
+        summary: BatchSummary,
+    ) -> None:
+        """登录成功后创建门户 ksk_ API Key,写入 credential;失败不影响登录结果。"""
+        token = (credential.access_token or "").strip()
+        if not token:
+            summary.api_keys_failed += 1
+            self.emit(
+                WorkerEvent(
+                    "api_key_failed",
+                    {
+                        "accountMasked": mask_account(entry.account),
+                        "code": "missing_token",
+                        "message": "凭据缺少 access_token,跳过建 Key",
+                    },
+                )
+            )
+            return
+        # 企业 SSO(external_idp)调 ListAvailableProfiles 必须带 EXTERNAL_IDP;idc/social 不需要。
+        token_type = (
+            "EXTERNAL_IDP"
+            if credential.auth_method.casefold() == "external_idp"
+            else None
+        )
+        region = credential.region or settings.region or "us-east-1"
+        if self.api_key_transport_factory is None:
+            raise RuntimeError("建 API Key 缺少 transport 工厂")
+        transport = self.api_key_transport_factory()
+        try:
+            result = await ensure_api_key(
+                transport,
+                token=token,
+                label=entry.account,
+                region=region,
+                profile_arn=credential.profile_arn,
+                token_type=token_type,
+                skip_if_labeled_exists=settings.api_key_skip_if_exists,
+            )
+        except ApiKeyError as error:
+            summary.api_keys_failed += 1
+            self.emit(
+                WorkerEvent(
+                    "api_key_failed",
+                    {
+                        "accountMasked": mask_account(entry.account),
+                        "code": error.code,
+                        "stage": error.stage,
+                        "message": redact_text(str(error)),
+                    },
+                )
+            )
+            return
+        finally:
+            try:
+                await transport.close()
+            except Exception:  # noqa: BLE001 - 关闭失败不阻断
+                pass
+        # 回填 profileArn(企业号登录流本不返回)
+        if result.profile_arn and not credential.profile_arn:
+            credential.profile_arn = result.profile_arn
+        if result.raw_key:
+            credential.kiro_api_key = result.raw_key
+            summary.api_keys_created += 1
+            self.emit(
+                WorkerEvent(
+                    "api_key_created",
+                    {
+                        "accountMasked": mask_account(entry.account),
+                        "keyPrefix": result.raw_key[:12],
+                    },
+                )
+            )
+        else:
+            # reused:同名 key 已存在且未取到 rawKey(库中若有旧值则保留)
+            self.emit(
+                WorkerEvent(
+                    "api_key_reused",
+                    {
+                        "accountMasked": mask_account(entry.account),
+                        "hasStoredKey": bool(credential.kiro_api_key),
+                    },
+                )
+            )
 
     async def _import_saved(
         self,

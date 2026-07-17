@@ -32,6 +32,8 @@ class LocalRunSettings:
     checkpoint_path: Path
     password_vault_path: Path = Path("enterprise-passwords.sqlite3")
     resume: bool = False
+    create_api_key: bool = False
+    api_key_skip_if_exists: bool = False
 
 
 @dataclass(slots=True)
@@ -43,3 +45,5 @@ class BatchSummary:
     manual_required: int = 0
     cancelled: int = 0
     imported: int = 0
+    api_keys_created: int = 0
+    api_keys_failed: int = 0

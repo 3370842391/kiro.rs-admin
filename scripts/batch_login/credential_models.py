@@ -20,6 +20,7 @@ class CredentialRecord:
     issuer_url: str | None = None
     scopes: str | None = None
     region: str | None = None
+    kiro_api_key: str | None = field(default=None, repr=False)
     priority: int = 0
     rpm_limit: int = 10
     source_channel: str = "batch-login-gui"
@@ -44,6 +45,7 @@ class CredentialRecord:
             "issuerUrl": self.issuer_url,
             "scopes": self.scopes,
             "region": self.region,
+            "kiroApiKey": self.kiro_api_key,
             "priority": self.priority,
             "rpmLimit": self.rpm_limit,
             "sourceChannel": self.source_channel,
@@ -71,6 +73,7 @@ class CredentialRecord:
             issuer_url=_optional_string(payload.get("issuerUrl")),
             scopes=_optional_string(payload.get("scopes")),
             region=_optional_string(payload.get("region")),
+            kiro_api_key=_optional_string(payload.get("kiroApiKey")),
             priority=_integer(payload.get("priority"), default=0),
             rpm_limit=_integer(payload.get("rpmLimit"), default=10),
             source_channel=_required_string(

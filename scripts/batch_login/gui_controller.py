@@ -46,6 +46,8 @@ class GuiFormState:
     local_port: int | None = None
     oidc_export_mode: OidcExportMode = OidcExportMode.MERGED
     oidc_export_directory: str = ""
+    create_api_key: bool = False
+    api_key_skip_if_exists: bool = False
 
     def validate(
         self,
@@ -154,6 +156,8 @@ class GuiFormState:
             checkpoint_path=Path(checkpoint),
             password_vault_path=Path(password_vault),
             resume=self.resume,
+            create_api_key=self.create_api_key,
+            api_key_skip_if_exists=self.api_key_skip_if_exists,
         )
 
 

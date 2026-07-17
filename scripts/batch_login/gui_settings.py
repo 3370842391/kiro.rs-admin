@@ -42,6 +42,8 @@ class GuiSavedSettings:
     local_port: str = ""
     oidc_export_mode: str = "merged"
     oidc_export_directory: str = ""
+    create_api_key: bool = False
+    api_key_skip_if_exists: bool = False
 
     @classmethod
     def from_mapping(cls, value: object) -> GuiSavedSettings:
@@ -74,7 +76,13 @@ class GuiSavedSettings:
             "oidc_export_mode",
             "oidc_export_directory",
         }
-        bool_fields = {"headless", "resume", "use_ssh"}
+        bool_fields = {
+            "headless",
+            "resume",
+            "use_ssh",
+            "create_api_key",
+            "api_key_skip_if_exists",
+        }
         number_fields = {"timeout_seconds", "mfa_timeout_seconds"}
         cleaned: dict[str, object] = {"version": SETTINGS_VERSION}
         for item in fields(cls):

@@ -83,6 +83,8 @@ class BatchLoginApp:
         self.oidc_export_directory_var = tk.StringVar()
         self.checkpoint_path_var = tk.StringVar()
         self.resume_var = tk.BooleanVar(value=False)
+        self.create_api_key_var = tk.BooleanVar(value=False)
+        self.api_key_skip_if_exists_var = tk.BooleanVar(value=False)
         self.rs_url_var = tk.StringVar()
         self.admin_key_var = tk.StringVar(value=self.form.admin_key)
         self.use_ssh_var = tk.BooleanVar(value=False)
@@ -330,7 +332,19 @@ class BatchLoginApp:
             variable=self.resume_var,
         )
         resume.grid(row=8, column=1, sticky="w", pady=(5, 0))
-        self.run_sensitive.extend([self.headless_toggle, resume])
+        create_key = ttk.Checkbutton(
+            frame,
+            text="登录后自动创建 API Key",
+            variable=self.create_api_key_var,
+        )
+        create_key.grid(row=8, column=2, sticky="w", pady=(5, 0))
+        skip_key = ttk.Checkbutton(
+            frame,
+            text="已存在同名则跳过",
+            variable=self.api_key_skip_if_exists_var,
+        )
+        skip_key.grid(row=8, column=3, sticky="w", pady=(5, 0))
+        self.run_sensitive.extend([self.headless_toggle, resume, create_key, skip_key])
         ttk.Label(frame, text="结果方式").grid(
             row=9, column=0, sticky="w", pady=(5, 0)
         )
@@ -497,6 +511,8 @@ class BatchLoginApp:
             "remote_port": self.remote_port_var,
             "local_port": self.local_port_var,
             "oidc_export_directory": self.oidc_export_directory_var,
+            "create_api_key": self.create_api_key_var,
+            "api_key_skip_if_exists": self.api_key_skip_if_exists_var,
         }
         for name, variable in bindings.items():
             value = getattr(settings, name)
@@ -533,6 +549,8 @@ class BatchLoginApp:
             local_port=self.local_port_var.get(),
             oidc_export_mode=self._selected_oidc_export_mode().value,
             oidc_export_directory=self.oidc_export_directory_var.get(),
+            create_api_key=bool(self.create_api_key_var.get()),
+            api_key_skip_if_exists=bool(self.api_key_skip_if_exists_var.get()),
         )
 
     def _save_configuration(self) -> None:
@@ -795,6 +813,8 @@ class BatchLoginApp:
             ),
             oidc_export_mode=self._selected_oidc_export_mode(),
             oidc_export_directory=self.oidc_export_directory_var.get(),
+            create_api_key=self.create_api_key_var.get(),
+            api_key_skip_if_exists=self.api_key_skip_if_exists_var.get(),
         )
 
     def _start(self) -> None:

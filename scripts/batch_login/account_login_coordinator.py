@@ -16,6 +16,7 @@ from .gui_controller import GuiFormState
 from .gui_runtime import GuiRuntime
 from .gui_settings import GuiSavedSettings, GuiSettingsStore
 from .models import AccountEntry, LoginMode
+from .api_key_exporter import ApiKeyExporter
 from .oidc_exporter import OidcCredentialExporter, OidcExportMode
 from .password_vault import PasswordStatus, PasswordVault
 from .redaction import mask_account
@@ -81,6 +82,8 @@ def form_from_saved_settings(
         local_port=integer(saved.local_port, 0) or None,
         oidc_export_mode=OidcExportMode(saved.oidc_export_mode),
         oidc_export_directory=saved.oidc_export_directory,
+        create_api_key=saved.create_api_key,
+        api_key_skip_if_exists=saved.api_key_skip_if_exists,
     )
 
 
@@ -91,12 +94,14 @@ class AccountLoginCoordinator:
         settings_store: GuiSettingsStore,
         *,
         exporter=None,
+        api_key_exporter=None,
         runtime_factory=GuiRuntime,
         emit=lambda _event: None,
     ):
         self.repository = repository
         self.settings_store = settings_store
         self.exporter = exporter or OidcCredentialExporter()
+        self.api_key_exporter = api_key_exporter or ApiKeyExporter()
         self.runtime_factory = runtime_factory
         self.emit = emit
 
@@ -270,6 +275,10 @@ class AccountLoginCoordinator:
                 all_credentials,
                 output_directory=output_directory,
                 mode=OidcExportMode(saved.oidc_export_mode),
+            )
+            self.api_key_exporter.export(
+                all_credentials,
+                output_directory=output_directory,
             )
         return LoginExportReport(
             selected=len(accounts),

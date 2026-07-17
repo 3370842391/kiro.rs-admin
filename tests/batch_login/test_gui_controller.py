@@ -374,6 +374,8 @@ class BatchLoginAppTests(unittest.TestCase):
             "local_port_var": "",
             "oidc_export_mode_var": "合并 JSON",
             "oidc_export_directory_var": "",
+            "create_api_key_var": False,
+            "api_key_skip_if_exists_var": False,
             "status_var": "准备就绪",
         }
         for name, value in values.items():
