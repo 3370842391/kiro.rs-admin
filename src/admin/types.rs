@@ -755,6 +755,8 @@ pub struct CachePolicyResponse {
     pub default_ttl_secs: u64,
     pub allowed_ttl_secs: [u64; 3],
     pub auto_without_cache_control: bool,
+    pub rolling_prefix_enabled: bool,
+    pub rolling_prefix_limit: usize,
     pub capacity: usize,
     pub flush_interval_secs: u64,
     pub min_pct: u32,
@@ -775,6 +777,10 @@ pub struct SetCachePolicyRequest {
     pub default_ttl_secs: Option<u64>,
     #[serde(default)]
     pub auto_without_cache_control: Option<bool>,
+    #[serde(default)]
+    pub rolling_prefix_enabled: Option<bool>,
+    #[serde(default)]
+    pub rolling_prefix_limit: Option<usize>,
     #[serde(default)]
     pub capacity: Option<usize>,
     #[serde(default)]
@@ -1823,11 +1829,15 @@ mod tests {
     fn cache_policy_patch_is_partial_and_camel_case() {
         let patch: SetCachePolicyRequest = serde_json::from_value(serde_json::json!({
             "defaultTtlSecs": 300,
-            "capacity": 8192
+            "capacity": 8192,
+            "rollingPrefixEnabled": false,
+            "rollingPrefixLimit": 12
         }))
         .unwrap();
         assert_eq!(patch.default_ttl_secs, Some(300));
         assert_eq!(patch.capacity, Some(8192));
+        assert_eq!(patch.rolling_prefix_enabled, Some(false));
+        assert_eq!(patch.rolling_prefix_limit, Some(12));
         assert_eq!(patch.enabled, None);
     }
 

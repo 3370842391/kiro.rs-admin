@@ -424,6 +424,14 @@ pub struct Config {
     #[serde(default = "default_cache_auto_without_control")]
     pub cache_auto_without_control: bool,
 
+    /// 是否仅登记每个请求最近的可复用前缀；关闭时恢复旧的全历史前缀算法。
+    #[serde(default = "default_cache_rolling_prefix_enabled")]
+    pub cache_rolling_prefix_enabled: bool,
+
+    /// 滚动模式下每个请求最多参与查询和登记的最近前缀数量。
+    #[serde(default = "default_cache_rolling_prefix_limit")]
+    pub cache_rolling_prefix_limit: usize,
+
     /// 模拟缓存最多保留的前缀条目数。
     #[serde(default = "default_cache_capacity")]
     pub cache_capacity: usize,
@@ -600,6 +608,14 @@ fn default_cache_auto_without_control() -> bool {
     true
 }
 
+fn default_cache_rolling_prefix_enabled() -> bool {
+    true
+}
+
+fn default_cache_rolling_prefix_limit() -> usize {
+    8
+}
+
 fn default_cache_capacity() -> usize {
     4096
 }
@@ -692,6 +708,8 @@ impl Default for Config {
             cache_metering_enabled: default_cache_metering_enabled(),
             cache_default_ttl_secs: default_cache_default_ttl_secs(),
             cache_auto_without_control: default_cache_auto_without_control(),
+            cache_rolling_prefix_enabled: default_cache_rolling_prefix_enabled(),
+            cache_rolling_prefix_limit: default_cache_rolling_prefix_limit(),
             cache_capacity: default_cache_capacity(),
             cache_flush_interval_secs: default_cache_flush_interval_secs(),
             cache_hit_rate_min_pct: 0,
@@ -856,6 +874,27 @@ mod tests {
         assert_eq!(encoded["cacheAutoWithoutControl"], false);
         assert_eq!(encoded["cacheCapacity"], 8192);
         assert_eq!(encoded["cacheFlushIntervalSecs"], 30);
+    }
+
+    #[test]
+    fn cache_rolling_policy_defaults_are_enabled_and_bounded() {
+        let config: Config = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(config.cache_rolling_prefix_enabled);
+        assert_eq!(config.cache_rolling_prefix_limit, 8);
+    }
+
+    #[test]
+    fn cache_rolling_policy_round_trips_camel_case() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "cacheRollingPrefixEnabled": false,
+            "cacheRollingPrefixLimit": 16
+        }))
+        .unwrap();
+        assert!(!config.cache_rolling_prefix_enabled);
+        assert_eq!(config.cache_rolling_prefix_limit, 16);
+        let encoded = serde_json::to_value(config).unwrap();
+        assert_eq!(encoded["cacheRollingPrefixEnabled"], false);
+        assert_eq!(encoded["cacheRollingPrefixLimit"], 16);
     }
 
     #[test]

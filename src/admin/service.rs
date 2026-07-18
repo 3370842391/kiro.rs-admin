@@ -108,6 +108,8 @@ fn build_cache_policy_response(
         default_ttl_secs: policy.default_ttl_secs,
         allowed_ttl_secs: ALLOWED_TTL_SECS,
         auto_without_cache_control: policy.auto_without_cache_control,
+        rolling_prefix_enabled: policy.rolling_prefix_enabled,
+        rolling_prefix_limit: policy.rolling_prefix_limit,
         capacity: policy.capacity,
         flush_interval_secs: policy.flush_interval_secs,
         min_pct: bounds.0,
@@ -2958,6 +2960,12 @@ impl AdminService {
             auto_without_cache_control: req
                 .auto_without_cache_control
                 .unwrap_or(current.auto_without_cache_control),
+            rolling_prefix_enabled: req
+                .rolling_prefix_enabled
+                .unwrap_or(current.rolling_prefix_enabled),
+            rolling_prefix_limit: req
+                .rolling_prefix_limit
+                .unwrap_or(current.rolling_prefix_limit),
             capacity: req.capacity.unwrap_or(current.capacity),
             flush_interval_secs: req
                 .flush_interval_secs
@@ -2976,6 +2984,8 @@ impl AdminService {
             config.cache_metering_enabled = policy.enabled;
             config.cache_default_ttl_secs = policy.default_ttl_secs;
             config.cache_auto_without_control = policy.auto_without_cache_control;
+            config.cache_rolling_prefix_enabled = policy.rolling_prefix_enabled;
+            config.cache_rolling_prefix_limit = policy.rolling_prefix_limit;
             config.cache_capacity = policy.capacity;
             config.cache_flush_interval_secs = policy.flush_interval_secs;
             config.cache_hit_rate_min_pct = min_pct;

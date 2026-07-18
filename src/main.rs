@@ -401,6 +401,8 @@ async fn main() {
         enabled: config.cache_metering_enabled,
         default_ttl_secs: config.cache_default_ttl_secs,
         auto_without_cache_control: config.cache_auto_without_control,
+        rolling_prefix_enabled: config.cache_rolling_prefix_enabled,
+        rolling_prefix_limit: config.cache_rolling_prefix_limit,
         capacity: config.cache_capacity,
         flush_interval_secs: config.cache_flush_interval_secs,
     }

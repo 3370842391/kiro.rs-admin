@@ -34,6 +34,8 @@ pub struct CachePolicy {
     pub enabled: bool,
     pub default_ttl_secs: u64,
     pub auto_without_cache_control: bool,
+    pub rolling_prefix_enabled: bool,
+    pub rolling_prefix_limit: usize,
     pub capacity: usize,
     pub flush_interval_secs: u64,
 }
@@ -44,6 +46,8 @@ impl Default for CachePolicy {
             enabled: true,
             default_ttl_secs: 1800,
             auto_without_cache_control: true,
+            rolling_prefix_enabled: true,
+            rolling_prefix_limit: 8,
             capacity: 4096,
             flush_interval_secs: 60,
         }
@@ -57,6 +61,9 @@ impl CachePolicy {
         }
         if !(256..=65_536).contains(&self.capacity) {
             anyhow::bail!("cacheCapacity 必须在 256..=65536 内");
+        }
+        if !(2..=64).contains(&self.rolling_prefix_limit) {
+            anyhow::bail!("cacheRollingPrefixLimit 必须在 2..=64 内");
         }
         if !(10..=600).contains(&self.flush_interval_secs) {
             anyhow::bail!("cacheFlushIntervalSecs 必须在 10..=600 内");
@@ -1414,6 +1421,21 @@ mod tests {
             compute_cache_usage(&cache, &request, 1).cache_covered_est,
             0
         );
+    }
+
+    #[test]
+    fn cache_policy_rejects_rolling_limit_outside_two_to_sixty_four() {
+        let invalid_low = CachePolicy {
+            rolling_prefix_limit: 1,
+            ..CachePolicy::default()
+        };
+        assert!(invalid_low.validate().is_err());
+
+        let invalid_high = CachePolicy {
+            rolling_prefix_limit: 65,
+            ..CachePolicy::default()
+        };
+        assert!(invalid_high.validate().is_err());
     }
 
     #[test]
