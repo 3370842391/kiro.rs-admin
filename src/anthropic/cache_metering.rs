@@ -512,6 +512,17 @@ struct Segment {
     ttl_secs: i64,
 }
 
+fn select_cache_candidates(
+    segments: &[Segment],
+    rolling_enabled: bool,
+    rolling_limit: usize,
+) -> &[Segment] {
+    if !rolling_enabled || segments.len() <= rolling_limit {
+        return segments;
+    }
+    &segments[segments.len() - rolling_limit..]
+}
+
 /// 调用 CacheMeter 计算本次请求的缓存覆盖情况，并把所有断点（含命中段）记录回
 /// cache、刷新 TTL。返回 [`CacheUsage`]，由调用方按客户端可见 total 做互斥分摊。
 ///
@@ -546,43 +557,46 @@ pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u6
         };
     }
 
-    let hashes: Vec<u64> = segments.iter().map(|s| s.hash).collect();
-    let cum_tokens: Vec<u32> = segments.iter().map(|s| s.cumulative_tokens).collect();
+    let candidates = select_cache_candidates(
+        &segments,
+        policy.rolling_prefix_enabled,
+        policy.rolling_prefix_limit,
+    );
+    let hashes: Vec<u64> = candidates.iter().map(|segment| segment.hash).collect();
+    let cum_tokens: Vec<u32> = candidates
+        .iter()
+        .map(|segment| segment.cumulative_tokens)
+        .collect();
     let results = cache.lookup(&hashes, &cum_tokens);
-
-    // 诊断（DEBUG 级）：打印每段 hash / 累计 token / 命中情况，排查跨轮 miss。
-    if tracing::enabled!(tracing::Level::DEBUG) {
-        let dump: Vec<String> = segments
-            .iter()
-            .zip(results.iter())
-            .enumerate()
-            .map(|(i, (s, r))| {
-                format!(
-                    "[{i}] hash={} cum={} hit={}",
-                    s.hash, s.cumulative_tokens, r.hit
-                )
-            })
-            .collect();
-        tracing::debug!(
-            "CacheMeter: {} 段, msgs={} | {}",
-            segments.len(),
-            req.messages.len(),
-            dump.join(", ")
-        );
-    }
 
     let deepest_hit = results.iter().rposition(|r| r.hit);
     // 被缓存覆盖的前缀 = 最深断点累计（最深断点之后的尾部是未缓存的真 input）。
     // 命中时 read = 命中段累计、creation = covered − read；全 miss 时 read = 0。
-    let covered = *cum_tokens.last().unwrap();
+    let covered = segments.last().unwrap().cumulative_tokens;
     let cache_read = match deepest_hit {
         Some(i) => cum_tokens[i],
         None => 0u32,
     };
 
+    tracing::debug!(
+        all_segments = segments.len(),
+        candidates = candidates.len(),
+        hits = results.iter().filter(|result| result.hit).count(),
+        misses = results.iter().filter(|result| !result.hit).count(),
+        deepest_hit = deepest_hit.map(|index| index as i64).unwrap_or(-1),
+        cache_read,
+        cache_creation = covered.saturating_sub(cache_read),
+        ttl_secs = candidates
+            .first()
+            .map(|segment| segment.ttl_secs)
+            .unwrap_or(0),
+        rolling = policy.rolling_prefix_enabled,
+        "CacheMeter summary"
+    );
+
     // 把所有段一次性写回（命中段刷新 last_hit_at；未命中段插入）。所有段共用同一
     // ttl（detect_max_ttl 的单值），单次加锁 + 单次容量检查，避免逐段重复开销。
-    cache.record(&hashes, &cum_tokens, segments[0].ttl_secs);
+    cache.record(&hashes, &cum_tokens, candidates[0].ttl_secs);
 
     CacheUsage {
         cache_read: cache_read as i32,
@@ -623,6 +637,9 @@ fn extract_segments(
         return (Vec::new(), 0);
     };
     hasher.update(seed.as_bytes());
+    if policy.rolling_prefix_enabled {
+        hasher.update(b"|cache-meter:v2|");
+    }
 
     // feed 解耦哈希与 token 估算：`hash_text` 进哈希链（决定命中），`token_text`
     // 进 token 累计（决定数值口径）。两者分离是为了让 token 计数贴近**原文**，
@@ -1436,6 +1453,74 @@ mod tests {
             ..CachePolicy::default()
         };
         assert!(invalid_high.validate().is_err());
+    }
+
+    #[test]
+    fn rolling_candidates_keep_only_the_deepest_eight_segments() {
+        let segments: Vec<Segment> = (1..=2_223)
+            .map(|i| Segment {
+                hash: i as u64,
+                cumulative_tokens: i as u32,
+                ttl_secs: 1_800,
+            })
+            .collect();
+        let selected = select_cache_candidates(&segments, true, 8);
+        assert_eq!(selected.len(), 8);
+        assert_eq!(selected.first().unwrap().hash, 2_216);
+        assert_eq!(selected.last().unwrap().hash, 2_223);
+    }
+
+    #[test]
+    fn disabling_rolling_candidates_restores_full_history() {
+        let segments: Vec<Segment> = (1..=128)
+            .map(|i| Segment {
+                hash: i as u64,
+                cumulative_tokens: i as u32,
+                ttl_secs: 1_800,
+            })
+            .collect();
+        assert_eq!(select_cache_candidates(&segments, false, 8).len(), 128);
+    }
+
+    #[test]
+    fn rolling_window_warm_turn_only_adds_new_prefixes() {
+        let cache = CacheMeter::new(None);
+        let first_messages = (0..21)
+            .map(|index| {
+                let role = if index % 2 == 0 { "user" } else { "assistant" };
+                msg_with_cc(role, &format!("turn-{index}"), false)
+            })
+            .collect::<Vec<_>>();
+        let first_request = req_with_messages(first_messages.clone());
+        let cold = compute_cache_usage(&cache, &first_request, 7);
+        assert_eq!(cold.cache_read, 0);
+        assert_eq!(cache.stats().active_entries, 8);
+
+        let mut next_messages = first_messages;
+        next_messages.push(msg_with_cc("assistant", "answer-20", false));
+        next_messages.push(msg_with_cc("user", "turn-21", false));
+        let warm = compute_cache_usage(&cache, &req_with_messages(next_messages), 7);
+        assert!(warm.cache_read > 0);
+        assert!(warm.cache_read < warm.cache_covered_est);
+        assert_eq!(cache.stats().active_entries, 10);
+    }
+
+    #[test]
+    fn rolling_and_legacy_modes_use_independent_hash_namespaces() {
+        let request = req_with_messages(vec![
+            msg_with_cc("user", "first", false),
+            msg_with_cc("assistant", "second", false),
+            msg_with_cc("user", "third", false),
+        ]);
+        let rolling = extract_segments(&request, 9, CachePolicy::default()).0;
+        let legacy_policy = CachePolicy {
+            rolling_prefix_enabled: false,
+            ..CachePolicy::default()
+        };
+        let legacy_first = extract_segments(&request, 9, legacy_policy).0;
+        let legacy_second = extract_segments(&request, 9, legacy_policy).0;
+        assert_ne!(rolling[0].hash, legacy_first[0].hash);
+        assert_eq!(legacy_first[0].hash, legacy_second[0].hash);
     }
 
     #[test]
