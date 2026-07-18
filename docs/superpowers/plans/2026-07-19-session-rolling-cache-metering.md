@@ -413,6 +413,8 @@ fn evict_batch_if_needed_locked(inner: &mut Inner, capacity: usize, now: i64) ->
 
 `CacheStats` 和 `stats()` 返回所有计数；持久化 JSON 仍只序列化 entries，不序列化计数。
 
+将 `CacheEntry.last_hit_at` 的新写入值改为 Unix 毫秒；`expires_at` 继续使用 Unix 秒。新增失败测试 `lru_touch_timestamp_uses_millisecond_resolution`，证明高并发 LRU 不再以整秒产生大量并列值。旧 JSON 中的秒级 `last_hit_at` 无需迁移，会在新条目出现后自然成为更旧候选。
+
 同时给 `CachePolicyResponse` 增加并由 `build_cache_policy_response` 填充：
 
 ```rust

@@ -14,5 +14,14 @@
   "earlyStreamHandshake": false,
   "strictThinkingValidation": false,
   "localPingResponse": true,
-  "emptyUserMessageCompat": false
+  "emptyUserMessageCompat": false,
+  "cacheMeteringEnabled": true,
+  "cacheAutoWithoutControl": true,
+  "cacheDefaultTtlSecs": 1800,
+  "cacheRollingPrefixEnabled": true,
+  "cacheRollingPrefixLimit": 8,
+  "cacheCapacity": 65536,
+  "cacheFlushIntervalSecs": 60,
+  "cacheHitRateMinPct": 0,
+  "cacheHitRateMaxPct": 95
 }
