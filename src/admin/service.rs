@@ -122,6 +122,11 @@ fn build_cache_policy_response(
             .and_then(|timestamp| DateTime::<Utc>::from_timestamp(timestamp, 0))
             .map(|value| value.to_rfc3339()),
         persist_enabled: stats.persist_enabled,
+        segment_lookups: stats.segment_lookups,
+        segment_hits: stats.segment_hits,
+        segment_misses: stats.segment_misses,
+        evictions: stats.evictions,
+        expired_entries_removed: stats.expired_entries_removed,
     }
 }
 
@@ -5194,12 +5199,22 @@ mod tests {
                 dirty: false,
                 last_flush_at: None,
                 persist_enabled: true,
+                segment_lookups: 100,
+                segment_hits: 80,
+                segment_misses: 20,
+                evictions: 3,
+                expired_entries_removed: 2,
             },
             (0, 95),
         );
         assert_eq!(response.default_ttl_secs, 1800);
         assert_eq!(response.usage_pct, 25.0);
         assert_eq!(response.max_pct, 95);
+        assert_eq!(response.segment_lookups, 100);
+        assert_eq!(response.segment_hits, 80);
+        assert_eq!(response.segment_misses, 20);
+        assert_eq!(response.evictions, 3);
+        assert_eq!(response.expired_entries_removed, 2);
     }
 
     #[test]

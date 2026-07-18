@@ -79,7 +79,7 @@ pub struct CacheEntry {
     pub tokens: u32,
     /// 过期时间戳（unix 秒）
     pub expires_at: i64,
-    /// 上次命中时间（用于 LRU 淘汰）
+    /// 上次命中时间（Unix 毫秒，用于高并发下稳定执行 LRU 淘汰）
     pub last_hit_at: i64,
 }
 
@@ -240,15 +240,25 @@ struct Inner {
     dirty: bool,
     generation: u64,
     last_flush_at: Option<i64>,
+    segment_lookups: u64,
+    segment_hits: u64,
+    segment_misses: u64,
+    evictions: u64,
+    expired_entries_removed: u64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct CacheStats {
     pub active_entries: usize,
     pub capacity: usize,
     pub dirty: bool,
     pub last_flush_at: Option<i64>,
     pub persist_enabled: bool,
+    pub segment_lookups: u64,
+    pub segment_hits: u64,
+    pub segment_misses: u64,
+    pub evictions: u64,
+    pub expired_entries_removed: u64,
 }
 
 impl CacheMeter {
@@ -277,7 +287,8 @@ impl CacheMeter {
                 }
             }
         }
-        evict_lru_locked(&mut inner, policy.capacity);
+        let evicted = evict_to_capacity_locked(&mut inner, policy.capacity);
+        inner.evictions = inner.evictions.saturating_add(evicted as u64);
         Self {
             inner: Mutex::new(inner),
             policy: RwLock::new(policy),
@@ -299,7 +310,8 @@ impl CacheMeter {
         {
             let mut inner = self.inner.lock();
             let before = inner.entries.len();
-            evict_lru_locked(&mut inner, policy.capacity);
+            let evicted = evict_to_capacity_locked(&mut inner, policy.capacity);
+            inner.evictions = inner.evictions.saturating_add(evicted as u64);
             if inner.entries.len() != before {
                 inner.generation = inner.generation.wrapping_add(1);
                 inner.dirty = self.persist_path.is_some();
@@ -318,6 +330,11 @@ impl CacheMeter {
             dirty: inner.dirty,
             last_flush_at: inner.last_flush_at,
             persist_enabled: self.persist_path.is_some(),
+            segment_lookups: inner.segment_lookups,
+            segment_hits: inner.segment_hits,
+            segment_misses: inner.segment_misses,
+            evictions: inner.evictions,
+            expired_entries_removed: inner.expired_entries_removed,
         }
     }
 
@@ -328,18 +345,31 @@ impl CacheMeter {
     pub fn lookup(&self, segment_hashes: &[u64], segment_tokens: &[u32]) -> Vec<SegmentResult> {
         debug_assert_eq!(segment_hashes.len(), segment_tokens.len());
         let now = now_secs();
+        let touched_at = now_millis();
         let mut inner = self.inner.lock();
         let mut out = Vec::with_capacity(segment_hashes.len());
+        let mut hits = 0u64;
+        let mut misses = 0u64;
         for (h, t) in segment_hashes.iter().zip(segment_tokens.iter()) {
             let hit = match inner.entries.get_mut(h) {
                 Some(entry) if entry.expires_at > now => {
-                    entry.last_hit_at = now;
+                    entry.last_hit_at = touched_at;
                     true
                 }
                 _ => false,
             };
+            if hit {
+                hits = hits.saturating_add(1);
+            } else {
+                misses = misses.saturating_add(1);
+            }
             out.push(SegmentResult { hit, tokens: *t });
         }
+        inner.segment_lookups = inner
+            .segment_lookups
+            .saturating_add(segment_hashes.len() as u64);
+        inner.segment_hits = inner.segment_hits.saturating_add(hits);
+        inner.segment_misses = inner.segment_misses.saturating_add(misses);
         out
     }
 
@@ -349,6 +379,7 @@ impl CacheMeter {
         let ttl = ttl_secs.clamp(60, MAX_TTL_SECS);
         let capacity = self.policy().capacity;
         let now = now_secs();
+        let touched_at = now_millis();
         let expires_at = now + ttl;
         let mut inner = self.inner.lock();
         for (h, t) in segment_hashes.iter().zip(segment_tokens.iter()) {
@@ -357,14 +388,14 @@ impl CacheMeter {
                 CacheEntry {
                     tokens: *t,
                     expires_at,
-                    last_hit_at: now,
+                    last_hit_at: touched_at,
                 },
             );
         }
         inner.generation = inner.generation.wrapping_add(1);
         inner.dirty = self.persist_path.is_some();
-        // 容量超限：按 last_hit_at 淘汰最旧的若干条
-        evict_lru_locked(&mut inner, capacity);
+        let evicted = evict_batch_if_needed_locked(&mut inner, capacity, now);
+        inner.evictions = inner.evictions.saturating_add(evicted as u64);
     }
 
     /// 把当前快照写到 persist_path（仅在 dirty 时实际落盘）
@@ -433,7 +464,10 @@ impl CacheMeter {
         let mut inner = self.inner.lock();
         let before = inner.entries.len();
         inner.entries.retain(|_, v| v.expires_at > now);
-        if inner.entries.len() != before {
+        let removed = before.saturating_sub(inner.entries.len());
+        if removed > 0 {
+            inner.expired_entries_removed =
+                inner.expired_entries_removed.saturating_add(removed as u64);
             inner.generation = inner.generation.wrapping_add(1);
             inner.dirty = self.persist_path.is_some();
         }
@@ -453,6 +487,14 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+fn now_millis() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
 /// 解析受支持的显式 cache_control TTL。
 pub fn parse_explicit_ttl(value: &str) -> Option<u64> {
     if value.eq_ignore_ascii_case("5m") {
@@ -467,9 +509,9 @@ pub fn parse_explicit_ttl(value: &str) -> Option<u64> {
     None
 }
 
-fn evict_lru_locked(inner: &mut Inner, capacity: usize) {
+fn evict_to_capacity_locked(inner: &mut Inner, capacity: usize) -> usize {
     if inner.entries.len() <= capacity {
-        return;
+        return 0;
     }
     let drop_n = inner.entries.len() - capacity;
     let mut victims: Vec<(u64, i64)> = inner
@@ -481,6 +523,24 @@ fn evict_lru_locked(inner: &mut Inner, capacity: usize) {
     for (key, _) in victims.into_iter().take(drop_n) {
         inner.entries.remove(&key);
     }
+    drop_n
+}
+
+fn evict_batch_if_needed_locked(inner: &mut Inner, capacity: usize, now: i64) -> usize {
+    if inner.entries.len() <= capacity {
+        return 0;
+    }
+
+    let before_expired = inner.entries.len();
+    inner.entries.retain(|_, entry| entry.expires_at > now);
+    let expired = before_expired.saturating_sub(inner.entries.len());
+    inner.expired_entries_removed = inner.expired_entries_removed.saturating_add(expired as u64);
+    if inner.entries.len() <= capacity {
+        return 0;
+    }
+
+    let target = (capacity.saturating_mul(95) / 100).max(1).min(capacity);
+    evict_to_capacity_locked(inner, target)
 }
 
 /// 兼容旧调用：无显式值或值无效时使用新的 30 分钟默认值。
@@ -1536,6 +1596,42 @@ mod tests {
             })
             .unwrap();
         assert_eq!(cache.stats().active_entries, 256);
+    }
+
+    #[test]
+    fn record_over_capacity_evicts_in_a_five_percent_batch() {
+        let cache = CacheMeter::with_policy(
+            None,
+            CachePolicy {
+                capacity: 256,
+                ..CachePolicy::default()
+            },
+        );
+        let hashes: Vec<u64> = (0..257).collect();
+        let tokens: Vec<u32> = (0..257).map(|value| value as u32 + 1).collect();
+        cache.record(&hashes, &tokens, 1_800);
+        let stats = cache.stats();
+        assert_eq!(stats.active_entries, 243);
+        assert_eq!(stats.evictions, 14);
+    }
+
+    #[test]
+    fn lookup_updates_runtime_hit_and_miss_counters() {
+        let cache = CacheMeter::new(None);
+        cache.record(&[11], &[100], 1_800);
+        cache.lookup(&[11, 12], &[100, 200]);
+        let stats = cache.stats();
+        assert_eq!(stats.segment_lookups, 2);
+        assert_eq!(stats.segment_hits, 1);
+        assert_eq!(stats.segment_misses, 1);
+    }
+
+    #[test]
+    fn lru_touch_timestamp_uses_millisecond_resolution() {
+        let cache = CacheMeter::new(None);
+        cache.record(&[77], &[100], 1_800);
+        let touched_at = cache.inner.lock().entries[&77].last_hit_at;
+        assert!(touched_at >= now_secs().saturating_mul(1_000));
     }
 
     #[test]

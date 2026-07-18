@@ -766,6 +766,11 @@ pub struct CachePolicyResponse {
     pub dirty: bool,
     pub last_flush_at: Option<String>,
     pub persist_enabled: bool,
+    pub segment_lookups: u64,
+    pub segment_hits: u64,
+    pub segment_misses: u64,
+    pub evictions: u64,
+    pub expired_entries_removed: u64,
 }
 
 #[derive(Debug, Deserialize)]
