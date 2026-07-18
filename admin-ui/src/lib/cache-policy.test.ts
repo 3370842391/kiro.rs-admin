@@ -13,6 +13,7 @@ describe('cache policy', () => {
       validateCachePolicyDraft({
         capacity: 4096,
         flushIntervalSecs: 60,
+        rollingPrefixLimit: 8,
         minPct: 0,
         maxPct: 95,
       }),
@@ -21,6 +22,7 @@ describe('cache policy', () => {
       validateCachePolicyDraft({
         capacity: 100,
         flushIntervalSecs: 60,
+        rollingPrefixLimit: 8,
         minPct: 0,
         maxPct: 95,
       }),
@@ -29,9 +31,23 @@ describe('cache policy', () => {
       validateCachePolicyDraft({
         capacity: 4096,
         flushIntervalSecs: 60,
+        rollingPrefixLimit: 8,
         minPct: 99,
         maxPct: 90,
       }),
     ).toContain('下界')
+  })
+
+  test('validates rolling prefix limit', () => {
+    const valid = {
+      capacity: 65_536,
+      flushIntervalSecs: 60,
+      rollingPrefixLimit: 8,
+      minPct: 0,
+      maxPct: 95,
+    }
+    expect(validateCachePolicyDraft(valid)).toBeNull()
+    expect(validateCachePolicyDraft({ ...valid, rollingPrefixLimit: 1 })).toContain('2–64')
+    expect(validateCachePolicyDraft({ ...valid, rollingPrefixLimit: 65 })).toContain('2–64')
   })
 })

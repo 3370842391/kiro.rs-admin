@@ -48,7 +48,9 @@ export function CachePolicyDialog({ open, onOpenChange }: CachePolicyDialogProps
   const [enabled, setEnabled] = useState(true)
   const [defaultTtlSecs, setDefaultTtlSecs] = useState<CacheTtlSeconds>(1800)
   const [autoWithoutCacheControl, setAutoWithoutCacheControl] = useState(true)
-  const [capacity, setCapacity] = useState(4096)
+  const [rollingPrefixEnabled, setRollingPrefixEnabled] = useState(true)
+  const [rollingPrefixLimit, setRollingPrefixLimit] = useState(8)
+  const [capacity, setCapacity] = useState(65_536)
   const [flushIntervalSecs, setFlushIntervalSecs] = useState(60)
   const [minPct, setMinPct] = useState(0)
   const [maxPct, setMaxPct] = useState(0)
@@ -59,6 +61,8 @@ export function CachePolicyDialog({ open, onOpenChange }: CachePolicyDialogProps
     setEnabled(data.enabled)
     setDefaultTtlSecs(data.defaultTtlSecs)
     setAutoWithoutCacheControl(data.autoWithoutCacheControl)
+    setRollingPrefixEnabled(data.rollingPrefixEnabled)
+    setRollingPrefixLimit(data.rollingPrefixLimit)
     setCapacity(data.capacity)
     setFlushIntervalSecs(data.flushIntervalSecs)
     setMinPct(data.minPct)
@@ -73,6 +77,7 @@ export function CachePolicyDialog({ open, onOpenChange }: CachePolicyDialogProps
     const message = validateCachePolicyDraft({
       capacity,
       flushIntervalSecs,
+      rollingPrefixLimit,
       minPct,
       maxPct,
     })
@@ -84,6 +89,8 @@ export function CachePolicyDialog({ open, onOpenChange }: CachePolicyDialogProps
         enabled,
         defaultTtlSecs,
         autoWithoutCacheControl,
+        rollingPrefixEnabled,
+        rollingPrefixLimit,
         capacity,
         flushIntervalSecs,
         minPct,
@@ -158,7 +165,24 @@ export function CachePolicyDialog({ open, onOpenChange }: CachePolicyDialogProps
                 onCheckedChange={setAutoWithoutCacheControl}
                 disabled={busy || !enabled}
               />
+              <SettingSwitch
+                id="cache-rolling-prefix-enabled"
+                label="最近前缀滚动缓存"
+                description="每次只登记最近的可复用前缀，避免超长对话占满缓存；关闭后恢复旧算法。"
+                checked={rollingPrefixEnabled}
+                onCheckedChange={setRollingPrefixEnabled}
+                disabled={busy || !enabled}
+              />
             </section>
+
+            {!rollingPrefixEnabled && enabled && (
+              <div
+                role="alert"
+                className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs leading-relaxed text-amber-700 dark:text-amber-300"
+              >
+                已恢复旧的全历史前缀算法。超长对话可能一次写入数千条缓存记录，建议只用于临时对比或紧急回退。
+              </div>
+            )}
 
             <section className="grid gap-4 rounded-2xl border border-border/70 p-4 sm:grid-cols-2">
               <div className="space-y-2">
@@ -189,12 +213,23 @@ export function CachePolicyDialog({ open, onOpenChange }: CachePolicyDialogProps
               <NumberField
                 id="cache-capacity"
                 label="最大缓存条目"
-                description="范围 256–65536；调小会立即按 LRU 淘汰。"
+                description="范围 256–65536，推荐 65536；调小会立即按 LRU 淘汰。"
                 min={256}
                 max={65_536}
                 value={capacity}
                 onChange={setCapacity}
                 disabled={busy || !enabled}
+              />
+
+              <NumberField
+                id="cache-rolling-prefix-limit"
+                label="每请求滚动前缀数"
+                description="范围 2–64，推荐 8；仅在滚动缓存开启时生效。"
+                min={2}
+                max={64}
+                value={rollingPrefixLimit}
+                onChange={setRollingPrefixLimit}
+                disabled={busy || !enabled || !rollingPrefixEnabled}
               />
 
               <NumberField
@@ -249,6 +284,9 @@ export function CachePolicyDialog({ open, onOpenChange }: CachePolicyDialogProps
               <Progress value={data.usagePct} aria-label={`缓存容量使用率 ${data.usagePct.toFixed(1)}%`} />
               <div className="grid gap-2 text-xs text-muted-foreground sm:grid-cols-3">
                 <StatusItem label="容量使用率" value={`${data.usagePct.toFixed(1)}%`} />
+                <StatusItem label="段命中率" value={formatSegmentHitRate(data.segmentLookups, data.segmentHits)} />
+                <StatusItem label="累计淘汰" value={`${data.evictions} 条`} />
+                <StatusItem label="过期清理" value={`${data.expiredEntriesRemoved} 条`} />
                 <StatusItem label="落盘状态" value={data.persistEnabled ? (data.dirty ? '等待落盘' : '已同步') : '未启用'} />
                 <StatusItem label="最后落盘" value={formatTimestamp(data.lastFlushAt)} />
               </div>
@@ -405,4 +443,9 @@ function formatTimestamp(value?: string | null): string {
   if (!value) return '尚未落盘'
   const timestamp = new Date(value)
   return Number.isNaN(timestamp.getTime()) ? value : timestamp.toLocaleString()
+}
+
+function formatSegmentHitRate(lookups: number, hits: number): string {
+  if (lookups <= 0) return '尚无数据'
+  return `${((hits / lookups) * 100).toFixed(1)}%（${hits}/${lookups}）`
 }

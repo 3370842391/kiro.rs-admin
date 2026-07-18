@@ -587,6 +587,8 @@ export interface CachePolicyConfig {
   defaultTtlSecs: 300 | 1800 | 3600
   allowedTtlSecs: number[]
   autoWithoutCacheControl: boolean
+  rollingPrefixEnabled: boolean
+  rollingPrefixLimit: number
   capacity: number
   flushIntervalSecs: number
   minPct: number
@@ -596,6 +598,11 @@ export interface CachePolicyConfig {
   dirty: boolean
   lastFlushAt?: string | null
   persistEnabled: boolean
+  segmentLookups: number
+  segmentHits: number
+  segmentMisses: number
+  evictions: number
+  expiredEntriesRemoved: number
 }
 
 export type SetCachePolicyRequest = Partial<
@@ -604,6 +611,8 @@ export type SetCachePolicyRequest = Partial<
     | 'enabled'
     | 'defaultTtlSecs'
     | 'autoWithoutCacheControl'
+    | 'rollingPrefixEnabled'
+    | 'rollingPrefixLimit'
     | 'capacity'
     | 'flushIntervalSecs'
     | 'minPct'

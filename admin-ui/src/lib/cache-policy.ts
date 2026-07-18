@@ -12,11 +12,19 @@ export function formatTtl(seconds: number): string {
 export function validateCachePolicyDraft(value: {
   capacity: number
   flushIntervalSecs: number
+  rollingPrefixLimit: number
   minPct: number
   maxPct: number
 }): string | null {
   if (!Number.isInteger(value.capacity) || value.capacity < 256 || value.capacity > 65_536) {
     return '最大条目必须是 256–65536 内的整数'
+  }
+  if (
+    !Number.isInteger(value.rollingPrefixLimit) ||
+    value.rollingPrefixLimit < 2 ||
+    value.rollingPrefixLimit > 64
+  ) {
+    return '滚动前缀数必须是 2–64 内的整数'
   }
   if (
     !Number.isInteger(value.flushIntervalSecs) ||
