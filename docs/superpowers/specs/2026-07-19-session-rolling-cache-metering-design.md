@@ -47,6 +47,7 @@ cacheHitRateMaxPct=95
 5. 不修改响应正文、工具调用、SSE 顺序、首字节握手和上游请求内容。
 6. 不通过固定比例或无条件伪造命中来隐藏冷启动；真正的新会话仍应产生 creation。
 7. 保持三项 input token 总量守恒。
+8. 提供独立运行时开关，管理员可以无重启启用滚动窗口或恢复旧的全历史前缀算法。
 
 ## 3. 非目标
 
@@ -127,6 +128,21 @@ input = 可见总 input - cache_read - cache_creation
 
 本轮不引入明文 session id 落盘。日志和持久化文件继续只保存不可逆 hash、token 数和时间戳。
 
+### 5.5 运行时开关
+
+新增独立开关：
+
+```text
+cacheRollingPrefixEnabled=true
+```
+
+- 开启：使用 v2 最近前缀滚动窗口，受 `cacheRollingPrefixLimit` 限制。
+- 关闭：恢复当前 v1 全历史前缀 lookup/record 行为，用于紧急回退和对比测试。
+- 保存后立即生效，不需要重启，不自动清空缓存和 usage 历史。
+- 该开关独立于 `cacheMeteringEnabled` 和 `cacheAutoWithoutControl`；关闭滚动窗口不等于关闭缓存计量。
+- v1/v2 使用不同内部哈希命名空间，切换时不会把另一种算法的条目误判为命中；切换后的首轮允许正常冷创建。
+- 管理端关闭开关时显示警告：长对话可能再次产生大量 creation 并快速占满容量。
+
 ## 6. 容量与淘汰策略
 
 ### 6.1 默认参数
@@ -134,6 +150,7 @@ input = 可见总 input - cache_read - cache_creation
 新增结构化配置：
 
 ```text
+cacheRollingPrefixEnabled=true
 cacheRollingPrefixLimit=8
 ```
 
@@ -141,6 +158,7 @@ cacheRollingPrefixLimit=8
 
 ```text
 cacheCapacity=65536
+cacheRollingPrefixEnabled=true
 cacheRollingPrefixLimit=8
 cacheDefaultTtlSecs=1800
 ```
@@ -188,7 +206,7 @@ cacheHitRateMaxPct=95
 
 缓存文件仍使用 `cache_metering.json`，现有 entry 字段无需增加客户或会话明文。滚动窗口只改变未来 lookup/record 的候选集合，旧 JSON 可以继续加载。
 
-为避免旧算法产生的全历史前缀被误认为新算法热缓存，前缀哈希种子加入内部算法版本：
+为避免旧算法产生的全历史前缀被误认为新算法热缓存，滚动模式的前缀哈希种子加入内部算法版本：
 
 ```text
 cache-meter:v2
@@ -198,6 +216,7 @@ cache-meter:v2
 
 - 部署后的每个会话第一次请求会有一次正常冷创建。
 - 旧 v1 条目不会命中，会按 TTL 到期或容量策略被淘汰。
+- 关闭滚动开关时使用 v1 命名空间；重新开启后返回 v2 命名空间，两边条目可以在 TTL 内共存但不会交叉命中。
 - 无需删除 usage 历史。
 - 无需在升级时强制清空文件，避免启动路径加入破坏性操作。
 
@@ -232,9 +251,13 @@ expiredEntriesRemoved
 
 ## 10. 管理端
 
-缓存策略界面增加“每请求滚动前缀数”，默认 8，并显示说明：
+缓存策略界面增加“最近前缀滚动缓存”开关以及“每请求滚动前缀数”，开关默认开启、数量默认 8，并显示说明：
 
 > 仅保留最近的可复用历史前缀。数值越大越能容忍分支或工具多阶段续轮，但会增加内存与淘汰压力。一般保持 8。
+
+关闭开关后隐藏或禁用数量输入，并展示：
+
+> 已恢复旧的全历史前缀算法。超长对话可能一次写入数千条缓存记录，建议只用于临时对比或紧急回退。
 
 容量字段推荐值调整为 65,536，但升级时不静默覆盖用户已有配置。管理员保存后运行时生效并持久化到 `config.json`。
 
@@ -244,6 +267,7 @@ expiredEntriesRemoved
 - 最近运行期段命中率；
 - 累计淘汰数量；
 - 滚动前缀限制；
+- 滚动算法是否启用；
 - TTL 和自动缓存开关。
 
 ## 11. 错误处理
@@ -294,11 +318,14 @@ expiredEntriesRemoved
 8. 批量淘汰优先删除过期项，并下降到 95% 容量目标。
 9. 非法滚动前缀配置被拒绝。
 10. v1 持久化文件可加载，但不会与 v2 hash 命中。
+11. 运行时关闭滚动开关后恢复全历史候选，重新开启后立即恢复最多 8 个候选。
+12. 开关切换不清空缓存、不修改历史 usage，也不影响正在处理的请求所持有的策略快照。
 
 ### 13.2 回归测试
 
 - `cacheAutoWithoutControl=false` 且请求无 cache_control 时仍为全 input。
 - 缓存总开关关闭时不 lookup、不 record。
+- 滚动开关关闭时保留旧算法行为，但不影响缓存总开关和自动缓存开关的语义。
 - 显式 TTL 和默认 TTL 规则保持现状。
 - 命中率上限不能制造冷启动 read。
 - direct/NewAPI、流式/非流式 usage 总量一致。
@@ -335,8 +362,8 @@ expiredEntriesRemoved
 4. 观察 8991 至少 30 分钟，确认无缓存容量快速周转、无对话中断。
 5. 再部署生产；生产部署后预期出现一次 v2 冷创建。
 6. 生产观察首个 30 分钟窗口，按 key/model 对比 creation-only、read-positive、淘汰数与 entry 年龄。
-7. 若出现异常，可把 `cacheRollingPrefixLimit` 调回较大值或关闭自动缓存；代码回滚时 v2 条目不会破坏请求正文。
+7. 若出现异常，可关闭 `cacheRollingPrefixEnabled` 立即恢复 v1；也可关闭自动缓存或缓存总开关。任何回退都不修改请求正文。
 
 ## 15. 设计结论
 
-采用“最近 8 个前缀滚动窗口 + 65,536 全局容量 + 95% 批量 LRU”的组合。该方案从源头消除单个长对话一次写入数千项的容量放大，不依赖固定比例伪造 read，并保持对话、工具、SSE 和上游调用行为不变。
+采用“可运行时开关的最近 8 个前缀滚动窗口 + 65,536 全局容量 + 95% 批量 LRU”的组合。默认启用滚动算法，管理员可以无重启切回旧算法。该方案从源头消除单个长对话一次写入数千项的容量放大，不依赖固定比例伪造 read，并保持对话、工具、SSE 和上游调用行为不变。
