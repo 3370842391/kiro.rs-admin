@@ -2943,9 +2943,10 @@ impl AdminService {
         let cache_meter = self.cache_meter.as_ref().ok_or_else(|| {
             AdminServiceError::InternalError("缓存计量器未注入 AdminService".to_string())
         })?;
+        let (policy, stats) = cache_meter.snapshot();
         Ok(build_cache_policy_response(
-            cache_meter.policy(),
-            cache_meter.stats(),
+            policy,
+            stats,
             self.token_manager.get_cache_hit_rate_bounds(),
         ))
     }

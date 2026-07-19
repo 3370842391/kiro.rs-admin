@@ -271,20 +271,33 @@ impl CacheMeter {
     pub fn with_policy(persist_path: Option<PathBuf>, policy: CachePolicy) -> Self {
         let mut inner = Inner::default();
         if let Some(path) = persist_path.as_ref() {
-            if let Ok(bytes) = std::fs::read(path) {
-                if let Ok(entries) = serde_json::from_slice::<HashMap<u64, CacheEntry>>(&bytes) {
-                    let now = now_secs();
-                    for (k, v) in entries {
-                        if v.expires_at > now {
-                            inner.entries.insert(k, v);
+            match std::fs::read(path) {
+                Ok(bytes) => match serde_json::from_slice::<HashMap<u64, CacheEntry>>(&bytes) {
+                    Ok(entries) => {
+                        let now = now_secs();
+                        for (k, v) in entries {
+                            if v.expires_at > now {
+                                inner.entries.insert(k, v);
+                            }
                         }
+                        tracing::info!(
+                            "CacheMeter 重建：从 {} 加载 {} 条有效记录",
+                            path.display(),
+                            inner.entries.len()
+                        );
                     }
-                    tracing::info!(
-                        "CacheMeter 重建：从 {} 加载 {} 条有效记录",
-                        path.display(),
-                        inner.entries.len()
-                    );
-                }
+                    Err(error) => tracing::warn!(
+                        %error,
+                        path = %path.display(),
+                        "CacheMeter 持久化文件解析失败，将以冷缓存启动"
+                    ),
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    %error,
+                    path = %path.display(),
+                    "CacheMeter 持久化文件读取失败，将以冷缓存启动"
+                ),
             }
         }
         let evicted = evict_to_capacity_locked(&mut inner, policy.capacity);
@@ -306,13 +319,11 @@ impl CacheMeter {
         {
             let mut current = self.policy.write();
             *current = policy;
-        }
-        {
             let mut inner = self.inner.lock();
-            let before = inner.entries.len();
+            let expired = evict_expired_locked(&mut inner, now_secs());
             let evicted = evict_to_capacity_locked(&mut inner, policy.capacity);
             inner.evictions = inner.evictions.saturating_add(evicted as u64);
-            if inner.entries.len() != before {
+            if expired > 0 || evicted > 0 {
                 inner.generation = inner.generation.wrapping_add(1);
                 inner.dirty = self.persist_path.is_some();
             }
@@ -322,9 +333,15 @@ impl CacheMeter {
     }
 
     pub fn stats(&self) -> CacheStats {
-        let policy = self.policy();
+        self.snapshot().1
+    }
+
+    /// 原子读取策略与运行统计，避免管理端在热切换瞬间拼出不同版本的数据。
+    pub fn snapshot(&self) -> (CachePolicy, CacheStats) {
+        let policy_guard = self.policy.read();
         let inner = self.inner.lock();
-        CacheStats {
+        let policy = *policy_guard;
+        let stats = CacheStats {
             active_entries: inner.entries.len(),
             capacity: policy.capacity,
             dirty: inner.dirty,
@@ -335,7 +352,8 @@ impl CacheMeter {
             segment_misses: inner.segment_misses,
             evictions: inner.evictions,
             expired_entries_removed: inner.expired_entries_removed,
-        }
+        };
+        (policy, stats)
     }
 
     /// 查询一组前缀段哈希，返回每段命中情况；命中段会刷新 last_hit_at。
@@ -377,7 +395,12 @@ impl CacheMeter {
     pub fn record(&self, segment_hashes: &[u64], segment_tokens: &[u32], ttl_secs: i64) {
         debug_assert_eq!(segment_hashes.len(), segment_tokens.len());
         let ttl = ttl_secs.clamp(60, MAX_TTL_SECS);
-        let capacity = self.policy().capacity;
+        // 与 update_policy 统一采用 policy → inner 的锁顺序，并把策略读锁持有到
+        // 本次写入和淘汰完成。这样管理员并发缩容时，不会先按新容量淘汰、随后又被
+        // 一个携带旧容量快照的请求写回到新上限以上。
+        let policy = self.policy.read();
+        #[cfg(test)]
+        test_hooks::after_record_policy_snapshot();
         let now = now_secs();
         let touched_at = now_millis();
         let expires_at = now + ttl;
@@ -394,7 +417,7 @@ impl CacheMeter {
         }
         inner.generation = inner.generation.wrapping_add(1);
         inner.dirty = self.persist_path.is_some();
-        let evicted = evict_batch_if_needed_locked(&mut inner, capacity, now);
+        let evicted = evict_batch_if_needed_locked(&mut inner, policy.capacity, now);
         inner.evictions = inner.evictions.saturating_add(evicted as u64);
     }
 
@@ -462,12 +485,8 @@ impl CacheMeter {
     pub fn evict_expired(&self) {
         let now = now_secs();
         let mut inner = self.inner.lock();
-        let before = inner.entries.len();
-        inner.entries.retain(|_, v| v.expires_at > now);
-        let removed = before.saturating_sub(inner.entries.len());
+        let removed = evict_expired_locked(&mut inner, now);
         if removed > 0 {
-            inner.expired_entries_removed =
-                inner.expired_entries_removed.saturating_add(removed as u64);
             inner.generation = inner.generation.wrapping_add(1);
             inner.dirty = self.persist_path.is_some();
         }
@@ -531,16 +550,21 @@ fn evict_batch_if_needed_locked(inner: &mut Inner, capacity: usize, now: i64) ->
         return 0;
     }
 
-    let before_expired = inner.entries.len();
-    inner.entries.retain(|_, entry| entry.expires_at > now);
-    let expired = before_expired.saturating_sub(inner.entries.len());
-    inner.expired_entries_removed = inner.expired_entries_removed.saturating_add(expired as u64);
+    evict_expired_locked(inner, now);
     if inner.entries.len() <= capacity {
         return 0;
     }
 
     let target = (capacity.saturating_mul(95) / 100).max(1).min(capacity);
     evict_to_capacity_locked(inner, target)
+}
+
+fn evict_expired_locked(inner: &mut Inner, now: i64) -> usize {
+    let before = inner.entries.len();
+    inner.entries.retain(|_, entry| entry.expires_at > now);
+    let removed = before.saturating_sub(inner.entries.len());
+    inner.expired_entries_removed = inner.expired_entries_removed.saturating_add(removed as u64);
+    removed
 }
 
 /// 兼容旧调用：无显式值或值无效时使用新的 30 分钟默认值。
@@ -992,6 +1016,35 @@ fn image_source_parts(v: &serde_json::Value) -> (&str, &str) {
         .and_then(|x| x.as_str())
         .unwrap_or("");
     (media_type, data)
+}
+
+#[cfg(test)]
+mod test_hooks {
+    use std::cell::RefCell;
+    use std::sync::{Arc, Barrier};
+
+    thread_local! {
+        static RECORD_POLICY_SNAPSHOT_HOOK: RefCell<Option<(Arc<Barrier>, Arc<Barrier>)>> =
+            const { RefCell::new(None) };
+    }
+
+    pub fn install_record_policy_snapshot_hook(
+        snapshot_reached: Arc<Barrier>,
+        resume_record: Arc<Barrier>,
+    ) {
+        RECORD_POLICY_SNAPSHOT_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some((snapshot_reached, resume_record));
+        });
+    }
+
+    pub fn after_record_policy_snapshot() {
+        RECORD_POLICY_SNAPSHOT_HOOK.with(|slot| {
+            if let Some((snapshot_reached, resume_record)) = slot.borrow_mut().take() {
+                snapshot_reached.wait();
+                resume_record.wait();
+            }
+        });
+    }
 }
 
 #[cfg(test)]
@@ -1584,6 +1637,41 @@ mod tests {
     }
 
     #[test]
+    fn runtime_switch_preserves_each_modes_cache_without_cross_hits() {
+        let request = req_with_messages(
+            (0..21)
+                .map(|index| {
+                    let role = if index % 2 == 0 { "user" } else { "assistant" };
+                    msg_with_cc(role, &format!("switch-turn-{index}"), false)
+                })
+                .collect(),
+        );
+        let cache = CacheMeter::new(None);
+
+        let rolling_cold = compute_cache_usage(&cache, &request, 19);
+        assert_eq!(rolling_cold.cache_read, 0);
+        assert!(compute_cache_usage(&cache, &request, 19).cache_read > 0);
+        assert_eq!(cache.stats().active_entries, 8);
+
+        cache
+            .update_policy(CachePolicy {
+                rolling_prefix_enabled: false,
+                ..CachePolicy::default()
+            })
+            .unwrap();
+        let legacy_cold = compute_cache_usage(&cache, &request, 19);
+        assert_eq!(legacy_cold.cache_read, 0, "v1 不应误命中 v2 前缀");
+        assert!(compute_cache_usage(&cache, &request, 19).cache_read > 0);
+        let entries_with_both_namespaces = cache.stats().active_entries;
+        assert!(entries_with_both_namespaces > 8);
+
+        cache.update_policy(CachePolicy::default()).unwrap();
+        let rolling_again = compute_cache_usage(&cache, &request, 19);
+        assert!(rolling_again.cache_read > 0, "切回 v2 应复用原来的滚动前缀");
+        assert_eq!(cache.stats().active_entries, entries_with_both_namespaces);
+    }
+
+    #[test]
     fn lowering_capacity_evicts_lru_immediately() {
         let cache = CacheMeter::new(None);
         let hashes: Vec<u64> = (0..257).collect();
@@ -1596,6 +1684,118 @@ mod tests {
             })
             .unwrap();
         assert_eq!(cache.stats().active_entries, 256);
+    }
+
+    #[test]
+    fn concurrent_capacity_reduction_cannot_be_undone_by_an_inflight_record() {
+        use std::sync::{Arc, Barrier, mpsc};
+        use std::time::Duration;
+
+        let cache = Arc::new(CacheMeter::with_policy(
+            None,
+            CachePolicy {
+                capacity: 512,
+                ..CachePolicy::default()
+            },
+        ));
+        let snapshot_reached = Arc::new(Barrier::new(2));
+        let resume_record = Arc::new(Barrier::new(2));
+        let record_cache = Arc::clone(&cache);
+        let record_snapshot_reached = Arc::clone(&snapshot_reached);
+        let record_resume = Arc::clone(&resume_record);
+        let record_thread = std::thread::spawn(move || {
+            super::test_hooks::install_record_policy_snapshot_hook(
+                record_snapshot_reached,
+                record_resume,
+            );
+            let hashes: Vec<u64> = (0..400).collect();
+            let tokens = vec![10; hashes.len()];
+            record_cache.record(&hashes, &tokens, 1_800);
+        });
+
+        snapshot_reached.wait();
+        let update_cache = Arc::clone(&cache);
+        let (update_done_tx, update_done_rx) = mpsc::channel();
+        let update_thread = std::thread::spawn(move || {
+            update_cache
+                .update_policy(CachePolicy {
+                    capacity: 256,
+                    ..CachePolicy::default()
+                })
+                .unwrap();
+            update_done_tx.send(()).unwrap();
+        });
+
+        // 旧实现会让更新线程在 record 暂停时完成缩容；record 随后仍按旧的 512
+        // 容量写回 400 条。修复后 record 持有策略读锁，缩容必须排在该次写入之后。
+        let update_finished_before_record = update_done_rx
+            .recv_timeout(Duration::from_millis(250))
+            .is_ok();
+        resume_record.wait();
+        record_thread.join().unwrap();
+        update_thread.join().unwrap();
+
+        assert!(
+            !update_finished_before_record,
+            "缩容不应越过已取得策略快照、尚未写入的请求"
+        );
+        assert!(cache.stats().active_entries <= 256);
+    }
+
+    #[test]
+    fn lowering_capacity_removes_expired_entries_before_live_lru_entries() {
+        let cache = CacheMeter::with_policy(
+            None,
+            CachePolicy {
+                capacity: 512,
+                ..CachePolicy::default()
+            },
+        );
+        let now = now_secs();
+        {
+            let mut inner = cache.inner.lock();
+            for key in 0..50_u64 {
+                inner.entries.insert(
+                    key,
+                    CacheEntry {
+                        tokens: 10,
+                        expires_at: now - 1,
+                        // 故意让过期项比有效项“更新”；纯 LRU 会错误保留这些过期项。
+                        last_hit_at: now_millis() + 10_000,
+                    },
+                );
+            }
+            for key in 50..300_u64 {
+                inner.entries.insert(
+                    key,
+                    CacheEntry {
+                        tokens: 10,
+                        expires_at: now + 1_800,
+                        last_hit_at: now_millis() - 10_000,
+                    },
+                );
+            }
+        }
+
+        cache
+            .update_policy(CachePolicy {
+                capacity: 256,
+                ..CachePolicy::default()
+            })
+            .unwrap();
+
+        let stats = cache.stats();
+        assert_eq!(stats.active_entries, 250);
+        assert_eq!(stats.expired_entries_removed, 50);
+        assert_eq!(stats.evictions, 0);
+        assert!(
+            cache
+                .inner
+                .lock()
+                .entries
+                .values()
+                .all(|entry| entry.expires_at > now)
+        );
     }
 
     #[test]
@@ -1632,6 +1832,34 @@ mod tests {
         cache.record(&[77], &[100], 1_800);
         let touched_at = cache.inner.lock().entries[&77].last_hit_at;
         assert!(touched_at >= now_secs().saturating_mul(1_000));
+    }
+
+    #[test]
+    fn persisted_second_precision_last_hit_timestamp_remains_compatible() {
+        let path = std::env::temp_dir().join(format!(
+            "kiro-cache-legacy-seconds-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let legacy_timestamp = now_secs() - 30;
+        let fixture = serde_json::json!({
+            "77": {
+                "tokens": 100,
+                "expires_at": now_secs() + 1_800,
+                "last_hit_at": legacy_timestamp
+            }
+        });
+        std::fs::write(&path, serde_json::to_vec(&fixture).unwrap()).unwrap();
+
+        let cache = CacheMeter::new(Some(path.clone()));
+        assert_eq!(cache.stats().active_entries, 1);
+        assert_eq!(
+            cache.inner.lock().entries[&77].last_hit_at,
+            legacy_timestamp
+        );
+        assert!(cache.lookup(&[77], &[100])[0].hit);
+        assert!(cache.inner.lock().entries[&77].last_hit_at >= now_secs() * 1_000);
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
