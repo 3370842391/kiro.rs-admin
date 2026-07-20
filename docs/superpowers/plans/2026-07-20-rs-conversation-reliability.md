@@ -4,7 +4,7 @@
 
 **Goal:** 安全修复工具参数等价别名和同消息内完全重复的 `tool_use`，消除生产日志中可由 RS 解决的客户续轮中断。
 
-**Architecture:** 在既有 `tool_schema` 事务式校验边界内加入 Schema 感知的受限别名搬移；在既有 `tool_history` ID 规范化前，对历史副本执行完全相同块去重，再继续原有全局唯一性和结果配对校验。两处修改均失败关闭，不猜测缺失业务值，并沿用现有流式、非流式和错误快照路径。
+**Architecture:** 在既有 `tool_schema` 事务式校验边界内加入 Schema 感知的受限别名搬移；在既有 `tool_history` ID 规范化前，只读记录完全相同块的索引，全部唯一性和配对校验成功后再原地提交去重。两处修改均失败关闭，不复制整段对话，不猜测缺失业务值，并沿用现有流式、非流式和错误快照路径。
 
 **Tech Stack:** Rust 2024、serde/serde_json、现有单元测试、Cargo、Docker BuildKit、隔离公网 8991。
 
@@ -13,7 +13,7 @@
 ## 文件结构
 
 - `src/anthropic/tool_schema.rs`：声明受限字段别名并在对象 Schema 校验前安全搬移现有值；同文件单元测试覆盖成功和失败关闭边界。
-- `src/anthropic/tool_history.rs`：在历史副本中去除同消息内完全重复的工具块，保留冲突/跨消息重复的严格拒绝；同文件单元测试覆盖配对行为。
+- `src/anthropic/tool_history.rs`：只读扫描同消息内完全重复的工具块，校验成功后按索引原地删除，保留冲突/跨消息重复的严格拒绝；同文件单元测试覆盖配对行为。
 - `src/anthropic/converter.rs`：消费规范化报告，只记录去重数量，不记录工具输入正文。
 - `docs/superpowers/specs/2026-07-20-rs-conversation-reliability-design.md`：已批准设计，不再扩大范围。
 
@@ -358,67 +358,85 @@ pub(crate) struct ToolIdNormalization {
 }
 ```
 
-增加助手消息内去重函数：
+增加只读索引扫描函数：
 
 ```rust
-fn deduplicate_identical_tool_uses(
-    history: &mut [Message],
-) -> Result<usize, ToolHistoryError> {
-    let mut deduplicated = 0;
+fn identical_tool_use_duplicate_indices(
+    history: &[Message],
+) -> Result<Vec<Vec<usize>>, ToolHistoryError> {
+    let mut duplicate_indices = Vec::with_capacity(history.len());
     for message in history {
         let Message::Assistant(message) = message else {
+            duplicate_indices.push(Vec::new());
             continue;
         };
-        let Some(tool_uses) = &mut message.assistant_response_message.tool_uses else {
+        let Some(tool_uses) = &message.assistant_response_message.tool_uses else {
+            duplicate_indices.push(Vec::new());
             continue;
         };
-        let mut seen = HashMap::<String, (String, serde_json::Value)>::new();
-        let mut retained = Vec::with_capacity(tool_uses.len());
-        for tool_use in std::mem::take(tool_uses) {
-            match seen.get(&tool_use.tool_use_id) {
-                Some((name, input))
-                    if name == &tool_use.name && input == &tool_use.input =>
+        let mut seen = HashMap::<&str, (&str, &serde_json::Value)>::new();
+        let mut message_duplicates = Vec::new();
+        for (index, tool_use) in tool_uses.iter().enumerate() {
+            match seen.get(tool_use.tool_use_id.as_str()) {
+                Some(&(name, input))
+                    if name == tool_use.name.as_str() && input == &tool_use.input =>
                 {
-                    deduplicated += 1;
+                    message_duplicates.push(index);
                 }
                 Some(_) => {
                     return Err(ToolHistoryError::DuplicateToolUseId(
-                        tool_use.tool_use_id,
+                        tool_use.tool_use_id.clone(),
                     ));
                 }
                 None => {
                     seen.insert(
-                        tool_use.tool_use_id.clone(),
-                        (tool_use.name.clone(), tool_use.input.clone()),
+                        tool_use.tool_use_id.as_str(),
+                        (tool_use.name.as_str(), &tool_use.input),
                     );
-                    retained.push(tool_use);
                 }
             }
         }
-        *tool_uses = retained;
+        duplicate_indices.push(message_duplicates);
     }
-    Ok(deduplicated)
+    Ok(duplicate_indices)
 }
 ```
 
-在 `normalize_tool_history_ids` 起始处创建副本，并让后续历史循环全部使用副本：
+在 `normalize_tool_history_ids` 起始处只读扫描：
 
 ```rust
-let mut candidate_history = history.to_vec();
-let deduplicated_tool_uses = deduplicate_identical_tool_uses(&mut candidate_history)?;
+let duplicate_indices = identical_tool_use_duplicate_indices(history)?;
+let deduplicated_tool_uses = duplicate_indices.iter().map(Vec::len).sum();
 ```
 
-完成所有既有校验和 ID 改写后再提交副本：
+首轮全局 ID 校验按 `message_index/tool_index` 跳过已确认的完全重复索引；现有 `tool_result` 校验全部成功后，再原地删除这些索引：
 
 ```rust
-history.clone_from_slice(&candidate_history);
+for (message, duplicates) in history.iter_mut().zip(&duplicate_indices) {
+    if duplicates.is_empty() {
+        continue;
+    }
+    let Message::Assistant(message) = message else {
+        continue;
+    };
+    let Some(tool_uses) = &mut message.assistant_response_message.tool_uses else {
+        continue;
+    };
+    let mut index = 0;
+    tool_uses.retain(|_| {
+        let keep = !duplicates.contains(&index);
+        index += 1;
+        keep
+    });
+}
+
 Ok(ToolIdNormalization {
     rewritten_ids,
     deduplicated_tool_uses,
 })
 ```
 
-确保任何后续孤立结果或冲突错误都不会部分修改调用方的 `history`。
+确保任何后续孤立结果或冲突错误都不会部分修改调用方的 `history`，同时避免复制超长对话正文和图片。
 
 - [ ] **Step 5: 在转换入口记录安全计数**
 
