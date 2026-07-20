@@ -36,6 +36,13 @@ const MAX_SAFE_VIOLATION_CHARS: usize = 256;
 const MAX_TOOL_DESCRIPTION_CHARS: usize = 10_000;
 const MAX_SCHEMA_PATTERN_BYTES: usize = 4 * 1024;
 const MAX_SCHEMA_REGEX_SIZE_BYTES: usize = 512 * 1024;
+const SAFE_REQUIRED_PROPERTY_ALIASES: &[(&str, &str)] = &[
+    ("file_path", "path"),
+    ("name_path", "name_path_pattern"),
+    ("content", "contents"),
+    ("pattern", "glob_pattern"),
+    ("query", "pattern"),
+];
 
 /// 工具 Schema 失败的安全副本。
 ///
@@ -685,25 +692,8 @@ fn validate_object(
         .filter_map(serde_json::Value::as_str)
         .collect();
 
-    // Some clients use the Claude Code spelling `file_path` for a tool whose
-    // upstream contract deliberately exposes the required `path` field. This
-    // is safe to repair only when the schema itself declares `path`, does not
-    // declare a competing `file_path` property, and the alias value is a
-    // string. All other shapes continue through strict validation unchanged.
-    let can_repair_file_path_alias = required.contains("path")
-        && !object.contains_key("path")
-        && object
-            .get("file_path")
-            .is_some_and(serde_json::Value::is_string)
-        && properties.is_some_and(|properties| {
-            properties.contains_key("path") && !properties.contains_key("file_path")
-        });
-    if can_repair_file_path_alias {
-        let alias = object
-            .remove("file_path")
-            .expect("file_path alias was checked before removal");
-        object.insert("path".to_string(), alias);
-        repairs.push(property_path(path, "path"));
+    if let Some(properties) = properties {
+        repair_required_property_aliases(properties, &required, object, path, repairs);
     }
 
     if let Some(properties) = properties {
@@ -771,6 +761,41 @@ fn validate_object(
             ),
             _ => {}
         }
+    }
+}
+
+fn repair_required_property_aliases(
+    properties: &serde_json::Map<String, serde_json::Value>,
+    required: &std::collections::HashSet<&str>,
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    path: &str,
+    repairs: &mut Vec<String>,
+) {
+    for &(source, target) in SAFE_REQUIRED_PROPERTY_ALIASES {
+        if !required.contains(target)
+            || object.contains_key(target)
+            || properties.contains_key(source)
+        {
+            continue;
+        }
+        let Some(target_schema) = properties.get(target) else {
+            continue;
+        };
+        let Some(source_value) = object.get(source) else {
+            continue;
+        };
+        let Some(declared_type) = target_schema.get("type") else {
+            continue;
+        };
+        if !matches_declared_type(declared_type, source_value) {
+            continue;
+        }
+
+        let value = object
+            .remove(source)
+            .expect("source alias was checked before removal");
+        object.insert(target.to_string(), value);
+        repairs.push(property_path(path, target));
     }
 }
 
@@ -916,6 +941,42 @@ mod tests {
     }
 
     #[test]
+    fn repairs_observed_aliases_only_when_target_is_required_by_schema() {
+        for (source, target) in [
+            ("name_path", "name_path_pattern"),
+            ("content", "contents"),
+            ("pattern", "glob_pattern"),
+            ("query", "pattern"),
+        ] {
+            let mut schema = serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": [target.to_string()],
+                "additionalProperties": false
+            });
+            schema["properties"][target] = serde_json::json!({"type": "string"});
+            let mut input = serde_json::Value::Object(serde_json::Map::from_iter([(
+                source.to_string(),
+                serde_json::json!("customer-value"),
+            )]));
+
+            assert_eq!(
+                validate_and_repair(&schema, &mut input),
+                ToolInputOutcome::Repaired {
+                    paths: vec![format!("$.{target}")]
+                }
+            );
+            assert_eq!(
+                input,
+                serde_json::Value::Object(serde_json::Map::from_iter([(
+                    target.to_string(),
+                    serde_json::json!("customer-value"),
+                )]))
+            );
+        }
+    }
+
+    #[test]
     fn rejects_file_path_alias_when_path_is_already_present_or_not_a_string() {
         let schema = serde_json::json!({
             "type": "object",
@@ -944,6 +1005,100 @@ mod tests {
             ToolInputOutcome::Invalid { .. }
         ));
         assert_eq!(non_string, original_non_string);
+    }
+
+    #[test]
+    fn alias_repair_never_overwrites_target_or_declared_source() {
+        let target_schema = serde_json::json!({
+            "type": "object",
+            "properties": {"contents": {"type": "string"}},
+            "required": ["contents"],
+            "additionalProperties": false
+        });
+        let mut conflict = serde_json::json!({
+            "content": "source",
+            "contents": "target"
+        });
+        let original_conflict = conflict.clone();
+        assert!(matches!(
+            validate_and_repair(&target_schema, &mut conflict),
+            ToolInputOutcome::Invalid { .. }
+        ));
+        assert_eq!(conflict, original_conflict);
+
+        let both_declared = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "content": {"type": "string"},
+                "contents": {"type": "string"}
+            },
+            "required": ["contents"],
+            "additionalProperties": false
+        });
+        let mut declared_source = serde_json::json!({"content": "source"});
+        let original_declared_source = declared_source.clone();
+        assert!(matches!(
+            validate_and_repair(&both_declared, &mut declared_source),
+            ToolInputOutcome::Invalid { .. }
+        ));
+        assert_eq!(declared_source, original_declared_source);
+    }
+
+    #[test]
+    fn alias_repair_requires_matching_declared_type_and_required_target() {
+        let required_string = serde_json::json!({
+            "type": "object",
+            "properties": {"contents": {"type": "string"}},
+            "required": ["contents"],
+            "additionalProperties": false
+        });
+        let mut wrong_type = serde_json::json!({"content": 7});
+        let original_wrong_type = wrong_type.clone();
+        assert!(matches!(
+            validate_and_repair(&required_string, &mut wrong_type),
+            ToolInputOutcome::Invalid { .. }
+        ));
+        assert_eq!(wrong_type, original_wrong_type);
+
+        let optional_target = serde_json::json!({
+            "type": "object",
+            "properties": {"contents": {"type": "string"}},
+            "required": [],
+            "additionalProperties": false
+        });
+        let mut optional = serde_json::json!({"content": "source"});
+        let original_optional = optional.clone();
+        assert!(matches!(
+            validate_and_repair(&optional_target, &mut optional),
+            ToolInputOutcome::Invalid { .. }
+        ));
+        assert_eq!(optional, original_optional);
+    }
+
+    #[test]
+    fn alias_repair_is_transactional_when_target_constraints_fail() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "glob_pattern": {"type": "string", "pattern": "^src/"}
+            },
+            "required": ["glob_pattern"],
+            "additionalProperties": false
+        });
+        let mut input = serde_json::json!({"pattern": "private/*.txt"});
+        let original = input.clone();
+
+        assert!(matches!(
+            validate_and_repair(&schema, &mut input),
+            ToolInputOutcome::Invalid { violations }
+                if violations.iter().any(|violation| {
+                    matches!(violation, ToolInputViolation::ConstraintViolation {
+                        path,
+                        keyword: "pattern"
+                    } if path == "$.glob_pattern")
+                })
+        ));
+        assert_eq!(input, original);
     }
 
     #[test]
