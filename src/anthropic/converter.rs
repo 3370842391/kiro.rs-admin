@@ -896,8 +896,15 @@ pub fn convert_request_with_mode(
     // 同时返回孤立的 tool_use_id 集合，用于后续清理
     // Kiro 仅接受 ASCII 字母、数字、下划线和连字符组成且不超过 64 字节的工具 ID。
     // 只修改本次转换生成的 Kiro 请求副本，并在现有配对过滤前拒绝重复或孤立引用。
-    super::tool_history::normalize_tool_history_ids(&mut history, &mut tool_results)
-        .map_err(|error| ConversionError::InvalidToolHistory(error.to_string()))?;
+    let normalization =
+        super::tool_history::normalize_tool_history_ids(&mut history, &mut tool_results)
+            .map_err(|error| ConversionError::InvalidToolHistory(error.to_string()))?;
+    if normalization.deduplicated_tool_uses > 0 {
+        tracing::warn!(
+            count = normalization.deduplicated_tool_uses,
+            "去重同一助手消息内完全相同的历史工具调用"
+        );
+    }
 
     let (validated_tool_results, orphaned_tool_use_ids) =
         validate_tool_pairing(&history, &tool_results);

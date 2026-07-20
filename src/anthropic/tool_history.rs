@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ToolIdNormalization {
     pub(crate) rewritten_ids: HashMap<String, String>,
+    pub(crate) deduplicated_tool_uses: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,20 +60,25 @@ pub(crate) fn normalize_tool_history_ids(
     history: &mut [Message],
     current_results: &mut [ToolResult],
 ) -> Result<ToolIdNormalization, ToolHistoryError> {
+    let duplicate_indices = identical_tool_use_duplicate_indices(history)?;
+    let deduplicated_tool_uses = duplicate_indices.iter().map(Vec::len).sum();
     let mut original_to_normalized = HashMap::new();
     let mut normalized_to_original = HashMap::new();
     let mut rewritten_ids = HashMap::new();
     let mut outstanding_tool_uses = HashSet::new();
     let mut seen_results = HashSet::new();
 
-    for message in history.iter() {
+    for (message_index, message) in history.iter().enumerate() {
         match message {
             Message::Assistant(message) => {
                 let Some(tool_uses) = &message.assistant_response_message.tool_uses else {
                     continue;
                 };
 
-                for tool_use in tool_uses {
+                for (tool_index, tool_use) in tool_uses.iter().enumerate() {
+                    if duplicate_indices[message_index].contains(&tool_index) {
+                        continue;
+                    }
                     let original = tool_use.tool_use_id.clone();
                     if original_to_normalized.contains_key(&original) {
                         return Err(ToolHistoryError::DuplicateToolUseId(original));
@@ -119,6 +125,24 @@ pub(crate) fn normalize_tool_history_ids(
         )?;
     }
 
+    for (message, duplicates) in history.iter_mut().zip(&duplicate_indices) {
+        if duplicates.is_empty() {
+            continue;
+        }
+        let Message::Assistant(message) = message else {
+            continue;
+        };
+        let Some(tool_uses) = &mut message.assistant_response_message.tool_uses else {
+            continue;
+        };
+        let mut index = 0;
+        tool_uses.retain(|_| {
+            let keep = !duplicates.contains(&index);
+            index += 1;
+            keep
+        });
+    }
+
     for message in history.iter_mut() {
         match message {
             Message::Assistant(message) => {
@@ -144,7 +168,50 @@ pub(crate) fn normalize_tool_history_ids(
         result.tool_use_id = original_to_normalized[&result.tool_use_id].clone();
     }
 
-    Ok(ToolIdNormalization { rewritten_ids })
+    Ok(ToolIdNormalization {
+        rewritten_ids,
+        deduplicated_tool_uses,
+    })
+}
+
+fn identical_tool_use_duplicate_indices(
+    history: &[Message],
+) -> Result<Vec<Vec<usize>>, ToolHistoryError> {
+    let mut duplicate_indices = Vec::with_capacity(history.len());
+    for message in history {
+        let Message::Assistant(message) = message else {
+            duplicate_indices.push(Vec::new());
+            continue;
+        };
+        let Some(tool_uses) = &message.assistant_response_message.tool_uses else {
+            duplicate_indices.push(Vec::new());
+            continue;
+        };
+        let mut seen = HashMap::<&str, (&str, &serde_json::Value)>::new();
+        let mut message_duplicates = Vec::new();
+        for (index, tool_use) in tool_uses.iter().enumerate() {
+            match seen.get(tool_use.tool_use_id.as_str()) {
+                Some(&(name, input))
+                    if name == tool_use.name.as_str() && input == &tool_use.input =>
+                {
+                    message_duplicates.push(index);
+                }
+                Some(_) => {
+                    return Err(ToolHistoryError::DuplicateToolUseId(
+                        tool_use.tool_use_id.clone(),
+                    ));
+                }
+                None => {
+                    seen.insert(
+                        tool_use.tool_use_id.as_str(),
+                        (tool_use.name.as_str(), &tool_use.input),
+                    );
+                }
+            }
+        }
+        duplicate_indices.push(message_duplicates);
+    }
+    Ok(duplicate_indices)
 }
 
 fn validate_result_id(
@@ -324,13 +391,81 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_tool_use_ids() {
-        let mut history = vec![assistant_with_tool_uses(&["a:b", "a:b"])];
-        let mut current = vec![ToolResult::success("a:b", "ok")];
+    fn rejects_same_message_duplicate_id_with_different_name_or_input() {
+        for second in [
+            ToolUseEntry::new("duplicate:1", "other_tool")
+                .with_input(serde_json::json!({"city": "Paris"})),
+            ToolUseEntry::new("duplicate:1", "get_weather")
+                .with_input(serde_json::json!({"city": "London"})),
+        ] {
+            let first = ToolUseEntry::new("duplicate:1", "get_weather")
+                .with_input(serde_json::json!({"city": "Paris"}));
+            let mut history = vec![Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: AssistantMessage::new("calling tool")
+                    .with_tool_uses(vec![first, second]),
+            })];
 
-        let error = normalize_tool_history_ids(&mut history, &mut current).unwrap_err();
+            assert_eq!(
+                normalize_tool_history_ids(&mut history, &mut []).unwrap_err(),
+                ToolHistoryError::DuplicateToolUseId("duplicate:1".into())
+            );
+            let Message::Assistant(message) = &history[0] else {
+                panic!("expected assistant message");
+            };
+            assert_eq!(
+                message
+                    .assistant_response_message
+                    .tool_uses
+                    .as_ref()
+                    .expect("tool uses")
+                    .len(),
+                2,
+                "failed normalization must not partially mutate history"
+            );
+        }
+    }
 
-        assert_eq!(error, ToolHistoryError::DuplicateToolUseId("a:b".into()));
+    #[test]
+    fn deduplicates_identical_tool_uses_within_one_assistant_message() {
+        let tool_use = ToolUseEntry::new("duplicate:1", "get_weather")
+            .with_input(serde_json::json!({"city": "Paris"}));
+        let mut history = vec![Message::Assistant(HistoryAssistantMessage {
+            assistant_response_message: AssistantMessage::new("calling tool")
+                .with_tool_uses(vec![tool_use.clone(), tool_use]),
+        })];
+        let mut current = vec![ToolResult::success("duplicate:1", "sunny")];
+
+        let report = normalize_tool_history_ids(&mut history, &mut current)
+            .expect("identical duplicate should be repaired");
+
+        let Message::Assistant(message) = &history[0] else {
+            panic!("expected assistant message");
+        };
+        assert_eq!(
+            message
+                .assistant_response_message
+                .tool_uses
+                .as_ref()
+                .expect("tool uses")
+                .len(),
+            1
+        );
+        assert_eq!(report.deduplicated_tool_uses, 1);
+        assert!(report.rewritten_ids.contains_key("duplicate:1"));
+        assert_eq!(current[0].tool_use_id, tool_use_id(&history[0], 0));
+    }
+
+    #[test]
+    fn rejects_identical_tool_use_id_reused_across_assistant_messages() {
+        let mut history = vec![
+            assistant_with_tool_uses(&["duplicate:1"]),
+            assistant_with_tool_uses(&["duplicate:1"]),
+        ];
+
+        assert_eq!(
+            normalize_tool_history_ids(&mut history, &mut []).unwrap_err(),
+            ToolHistoryError::DuplicateToolUseId("duplicate:1".into())
+        );
     }
 
     #[test]
