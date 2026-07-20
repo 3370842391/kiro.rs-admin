@@ -36,13 +36,17 @@ fn repairs_observed_aliases_only_when_target_is_required_by_schema() {
         ("pattern", "glob_pattern"),
         ("query", "pattern"),
     ] {
-        let schema = serde_json::json!({
+        let mut schema = serde_json::json!({
             "type": "object",
-            "properties": {target: {"type": "string"}},
-            "required": [target],
+            "properties": {},
+            "required": [target.to_string()],
             "additionalProperties": false
         });
-        let mut input = serde_json::json!({source: "customer-value"});
+        schema["properties"][target] = serde_json::json!({"type": "string"});
+        let mut input = serde_json::Value::Object(serde_json::Map::from_iter([(
+            source.to_string(),
+            serde_json::json!("customer-value"),
+        )]));
 
         assert_eq!(
             validate_and_repair(&schema, &mut input),
@@ -50,7 +54,13 @@ fn repairs_observed_aliases_only_when_target_is_required_by_schema() {
                 paths: vec![format!("$.{target}")]
             }
         );
-        assert_eq!(input, serde_json::json!({target: "customer-value"}));
+        assert_eq!(
+            input,
+            serde_json::Value::Object(serde_json::Map::from_iter([(
+                target.to_string(),
+                serde_json::json!("customer-value"),
+            )]))
+        );
     }
 }
 ```
