@@ -48,8 +48,9 @@ function createError(
   defaultApiRegion: SupportedApiRegion | undefined,
   message: string,
 ): ApiKeyLineError {
-  const nickname = redactApiKeys(columns[0]?.trim() || '(空)')
-  const maskedApiKey = maskApiKey(columns[1] ?? '')
+  const singleColumn = columns.length === 1
+  const nickname = redactApiKeys(singleColumn ? '' : columns[0]?.trim() || '(空)')
+  const maskedApiKey = maskApiKey(singleColumn ? columns[0] ?? '' : columns[1] ?? '')
   const apiRegion = redactApiKeys(columns[2]?.trim() || defaultApiRegion || '(未指定)')
 
   return {
@@ -76,17 +77,20 @@ export function parseApiKeyLines(
     if (!trimmedLine || trimmedLine.startsWith('#')) return
 
     const columns = rawLine.split('|').map((column) => column.trim())
-    if (columns.length < 2 || columns.length > 3) {
+    const singleColumn = columns.length === 1
+    if (!singleColumn && (columns.length < 2 || columns.length > 3)) {
       errors.push(createError(lineNumber, columns, defaultApiRegion, '列数必须为 2 或 3 列'))
       return
     }
 
-    const [nickname, kiroApiKey, regionOverride] = columns
+    const [nickname, kiroApiKey, regionOverride] = singleColumn
+      ? ['', columns[0] ?? '', '']
+      : columns
     const apiRegion = regionOverride || defaultApiRegion
     let supportedApiRegion: SupportedApiRegion | undefined
     const messages: string[] = []
 
-    if (!nickname) {
+    if (!singleColumn && !nickname) {
       messages.push('nickname 不能为空')
     } else if (Array.from(nickname).length > MAX_NICKNAME_CHARS) {
       messages.push('nickname 最多 128 个字符')

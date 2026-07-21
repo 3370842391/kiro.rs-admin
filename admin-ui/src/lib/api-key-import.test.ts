@@ -6,6 +6,30 @@ import {
 } from './api-key-import'
 
 describe('parseApiKeyLines', () => {
+  test('one-column API Key uses batch region without generating a nickname', () => {
+    const result = parseApiKeyLines(
+      ['ksk_raw_only_alpha_12345678', 'ksk_raw_only_beta_87654321'].join('\n'),
+      'us-east-1',
+    )
+
+    expect(result.errors).toEqual([])
+    expect(result.entries).toEqual([
+      {
+        lineNumber: 1,
+        nickname: '',
+        kiroApiKey: 'ksk_raw_only_alpha_12345678',
+        maskedApiKey: 'ksk_••••5678',
+        apiRegion: 'us-east-1',
+      },
+      {
+        lineNumber: 2,
+        nickname: '',
+        kiroApiKey: 'ksk_raw_only_beta_87654321',
+        maskedApiKey: 'ksk_••••4321',
+        apiRegion: 'us-east-1',
+      },
+    ])
+  })
   test('双列格式使用批次 API Region，并忽略空行、注释及两侧空白', () => {
     const result = parseApiKeyLines(
       [
@@ -60,14 +84,16 @@ describe('parseApiKeyLines', () => {
 
     expect(result.entries).toEqual([])
     expect(result.errors.map((error) => error.lineNumber)).toEqual([1, 2, 3, 4, 5, 6])
-    expect(result.errors.map((error) => error.message)).toEqual([
+    const expectedMessages = [
       'nickname 不能为空；请选择批次 API Region或在第三列指定',
       'API Key 不能为空；请选择批次 API Region或在第三列指定',
       'API Key 必须以 ksk_ 开头；请选择批次 API Region或在第三列指定',
       'API Region 仅支持 us-east-1 或 eu-central-1',
       '列数必须为 2 或 3 列',
       '列数必须为 2 或 3 列',
-    ])
+    ]
+    expectedMessages[5] = expectedMessages[2]
+    expect(result.errors.map((error) => error.message)).toEqual(expectedMessages)
   })
 
   test('同一批次重复 Key 只保留首次出现的有效行', () => {

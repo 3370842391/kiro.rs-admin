@@ -276,7 +276,7 @@ function toApiKeyCredentials(
 ): CredentialInput[] {
   return entries.map((entry) => ({
     authMethod: 'api_key',
-    nickname: entry.nickname,
+    nickname: entry.nickname || undefined,
     kiroApiKey: entry.kiroApiKey,
     authRegion: 'us-east-1',
     apiRegion: entry.apiRegion,
@@ -748,14 +748,14 @@ export function BatchImportDialog({
     () => [
       ...apiKeyParseResult.entries.map((entry) => ({
         lineNumber: entry.lineNumber,
-        nickname: redactApiKeys(entry.nickname),
+        nickname: redactApiKeys(entry.nickname) || `API Key #${entry.lineNumber}`,
         maskedApiKey: entry.maskedApiKey,
         apiRegion: entry.apiRegion,
         message: '',
       })),
       ...apiKeyParseResult.errors.map((error) => ({
         lineNumber: error.lineNumber,
-        nickname: error.nickname,
+        nickname: error.nickname || `API Key #${error.lineNumber}`,
         maskedApiKey: error.maskedApiKey,
         apiRegion: error.apiRegion,
         message: error.message,
@@ -922,6 +922,9 @@ export function BatchImportDialog({
                   aria-describedby="batch-api-key-format"
                   className="flex min-h-[180px] w-full rounded-xl border border-input bg-background/60 px-3.5 py-2.5 font-mono text-sm transition-[border-color,background-color,box-shadow] duration-150 ease-apple placeholder:text-muted-foreground/70 hover:border-border focus-visible:outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/30 focus-visible:bg-background disabled:cursor-not-allowed disabled:opacity-50"
                 />
+                <p className="text-xs text-muted-foreground">
+                  也支持每行只填写一个 ksk_...，不需要输入用户名；批次 Region 会应用到这些 Key。
+                </p>
                 <p id="batch-api-key-format" className="text-xs text-muted-foreground">
                   每行使用半角 | 分隔。支持 nickname | Key，或 nickname | Key | API Region；空行和 # 注释会被忽略。预览和错误只显示 Key 掩码。
                 </p>

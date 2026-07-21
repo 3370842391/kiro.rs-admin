@@ -14,8 +14,10 @@ describe('API Key import UI wiring', () => {
     expect(dialog).toContain('API Key 文本')
     expect(dialog).toContain('parseApiKeyLines(apiKeyInput, batchApiRegion || undefined)')
     expect(dialog).toContain("authRegion: 'us-east-1'")
-    expect(dialog).toContain('nickname: entry.nickname')
+    expect(dialog).toContain('nickname: entry.nickname || undefined')
     expect(dialog).toContain('apiRegion: entry.apiRegion')
+    expect(dialog).toContain('API Key #${entry.lineNumber}')
+    expect(dialog).toContain('也支持每行只填写一个 ksk_...')
   })
 
   test('batch text preview exposes only masked keys and accessible row errors', async () => {
