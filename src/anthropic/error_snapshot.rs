@@ -856,6 +856,7 @@ mod tests {
             group: None,
             key_source: crate::admin::trace_db::TraceKeySource::ClientKey,
             response_mode: crate::admin::client_keys::ClientResponseMode::Detection,
+            cache_hit_rate: None,
         };
         let request: crate::anthropic::types::MessagesRequest =
             serde_json::from_value(serde_json::json!({
@@ -989,6 +990,7 @@ mod tests {
             group: None,
             key_source: crate::admin::trace_db::TraceKeySource::ClientKey,
             response_mode: crate::admin::client_keys::ClientResponseMode::KiroNative,
+            cache_hit_rate: None,
         };
         let request: crate::anthropic::types::MessagesRequest =
             serde_json::from_value(serde_json::json!({
@@ -1133,6 +1135,7 @@ mod tests {
             group: None,
             key_source: crate::admin::trace_db::TraceKeySource::ClientKey,
             response_mode: crate::admin::client_keys::ClientResponseMode::Detection,
+            cache_hit_rate: None,
         };
         let request: crate::anthropic::types::MessagesRequest =
             serde_json::from_value(serde_json::json!({

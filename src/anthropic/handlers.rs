@@ -5,7 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Instant;
 
-use crate::admin::client_keys::{ClientResponseMode, SharedClientKeyManager};
+use crate::admin::client_keys::{CacheHitRateBounds, ClientResponseMode, SharedClientKeyManager};
 use crate::admin::trace_db::{
     SharedTraceStore, TraceAttempt, TraceDiagnosticEvent, TraceKeySource, TraceRecord, TraceSink,
     outcome,
@@ -51,6 +51,22 @@ fn effective_identity_normalization(globally_enabled: bool, mode: ClientResponse
     globally_enabled && mode.allows_identity_normalization()
 }
 
+fn effective_cache_hit_rate_bounds(
+    provider: &crate::kiro::provider::KiroProvider,
+    override_bounds: Option<CacheHitRateBounds>,
+) -> (u32, u32) {
+    resolve_cache_hit_rate_bounds(override_bounds, provider.cache_hit_rate_bounds())
+}
+
+fn resolve_cache_hit_rate_bounds(
+    override_bounds: Option<CacheHitRateBounds>,
+    global_bounds: (u32, u32),
+) -> (u32, u32) {
+    override_bounds
+        .map(|bounds| (bounds.min_pct, bounds.max_pct))
+        .unwrap_or(global_bounds)
+}
+
 /// 请求结束时记录用量的钩子
 ///
 /// 在 handler 入口构造，调用 [`Self::record`] 时把当次请求的 input/output token、
@@ -64,17 +80,19 @@ pub(crate) struct UsageRecordHook {
     pub aggregator: Option<SharedAggregator>,
     pub client_keys: Option<SharedClientKeyManager>,
     pub key_id: u64,
+    pub cache_hit_rate: Option<CacheHitRateBounds>,
     pub model: String,
     pub started_at: Instant,
 }
 
 impl UsageRecordHook {
-    pub fn from_state(state: &AppState, key_id: u64, model: String) -> Self {
+    pub fn from_state(state: &AppState, key_ctx: &KeyContext, model: String) -> Self {
         Self {
             recorder: state.usage_recorder.clone(),
             aggregator: state.usage_aggregator.clone(),
             client_keys: state.client_keys.clone(),
-            key_id,
+            key_id: key_ctx.key_id,
+            cache_hit_rate: key_ctx.cache_hit_rate,
             model,
             started_at: Instant::now(),
         }
@@ -1340,7 +1358,7 @@ fn try_local_exact_system_response(
         .as_ref()
         .map(|cache| {
             let usage = super::cache_metering::compute_cache_usage(cache, payload, hook.key_id);
-            let (hr_min, hr_max) = provider.cache_hit_rate_bounds();
+            let (hr_min, hr_max) = effective_cache_hit_rate_bounds(provider, hook.cache_hit_rate);
             usage.with_hit_rate_bounds(hr_min, hr_max)
         })
         .unwrap_or_default();
@@ -1424,7 +1442,7 @@ fn try_local_exact_user_response(
         .as_ref()
         .map(|cache| {
             let usage = super::cache_metering::compute_cache_usage(cache, payload, hook.key_id);
-            let (hr_min, hr_max) = provider.cache_hit_rate_bounds();
+            let (hr_min, hr_max) = effective_cache_hit_rate_bounds(provider, hook.cache_hit_rate);
             usage.with_hit_rate_bounds(hr_min, hr_max)
         })
         .unwrap_or_default();
@@ -1490,7 +1508,7 @@ fn try_local_ping_response(
         .as_ref()
         .map(|cache| {
             let usage = super::cache_metering::compute_cache_usage(cache, payload, hook.key_id);
-            let (hr_min, hr_max) = provider.cache_hit_rate_bounds();
+            let (hr_min, hr_max) = effective_cache_hit_rate_bounds(provider, hook.cache_hit_rate);
             usage.with_hit_rate_bounds(hr_min, hr_max)
         })
         .unwrap_or_default();
@@ -1569,7 +1587,7 @@ fn try_local_model_profile_response(
         .as_ref()
         .map(|cache| {
             let usage = super::cache_metering::compute_cache_usage(cache, payload, hook.key_id);
-            let (hr_min, hr_max) = provider.cache_hit_rate_bounds();
+            let (hr_min, hr_max) = effective_cache_hit_rate_bounds(provider, hook.cache_hit_rate);
             usage.with_hit_rate_bounds(hr_min, hr_max)
         })
         .unwrap_or_default();
@@ -1679,7 +1697,7 @@ fn try_local_document_identifier_response(
         .as_ref()
         .map(|cache| {
             let usage = super::cache_metering::compute_cache_usage(cache, payload, hook.key_id);
-            let (hr_min, hr_max) = provider.cache_hit_rate_bounds();
+            let (hr_min, hr_max) = effective_cache_hit_rate_bounds(provider, hook.cache_hit_rate);
             usage.with_hit_rate_bounds(hr_min, hr_max)
         })
         .unwrap_or_default();
@@ -2095,7 +2113,7 @@ pub async fn post_messages(
             "incoming image payload is large; if upstream rejects with CONTENT_LENGTH_EXCEEDS_THRESHOLD, reduce image count or use lower-resolution screenshots"
         );
     }
-    let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
+    let hook = UsageRecordHook::from_state(&state, &key_ctx, payload.model.clone());
     let tracer = std::sync::Arc::new(RequestTracer::new(
         &state,
         RequestTraceOptions {
@@ -2363,7 +2381,8 @@ pub async fn post_messages(
         .map(|cache| {
             let usage = super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id);
             // 注入运行时命中率整形区间（0,0 = 不整形）；随 cache_usage 带到分摊末尾。
-            let (hr_min, hr_max) = provider.cache_hit_rate_bounds();
+            let (hr_min, hr_max) =
+                effective_cache_hit_rate_bounds(&provider, key_ctx.cache_hit_rate);
             usage.with_hit_rate_bounds(hr_min, hr_max)
         })
         .unwrap_or_default();
@@ -4223,7 +4242,7 @@ pub async fn post_messages_cc(
         message_count = %payload.messages.len(),
         "Received POST /cc/v1/messages request"
     );
-    let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
+    let hook = UsageRecordHook::from_state(&state, &key_ctx, payload.model.clone());
     let tracer = std::sync::Arc::new(RequestTracer::new(
         &state,
         RequestTraceOptions {
@@ -4491,7 +4510,8 @@ pub async fn post_messages_cc(
         .map(|cache| {
             let usage = super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id);
             // 注入运行时命中率整形区间（0,0 = 不整形）；随 cache_usage 带到分摊末尾。
-            let (hr_min, hr_max) = provider.cache_hit_rate_bounds();
+            let (hr_min, hr_max) =
+                effective_cache_hit_rate_bounds(&provider, key_ctx.cache_hit_rate);
             usage.with_hit_rate_bounds(hr_min, hr_max)
         })
         .unwrap_or_default();
@@ -5025,6 +5045,21 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn client_cache_hit_rate_override_takes_precedence_and_inherit_falls_back() {
+        let custom = crate::admin::client_keys::CacheHitRateBounds::new(10, 90).unwrap();
+        assert_eq!(
+            resolve_cache_hit_rate_bounds(Some(custom), (0, 95)),
+            (10, 90)
+        );
+        assert_eq!(resolve_cache_hit_rate_bounds(None, (0, 95)), (0, 95));
+        let disabled = crate::admin::client_keys::CacheHitRateBounds::new(0, 0).unwrap();
+        assert_eq!(
+            resolve_cache_hit_rate_bounds(Some(disabled), (0, 95)),
+            (0, 0)
+        );
+    }
+
     fn response_mode_exact_system_request() -> MessagesRequest {
         serde_json::from_value(serde_json::json!({
             "model": "claude-opus-4-8",
@@ -5286,6 +5321,7 @@ mod tests {
             group: None,
             key_source: TraceKeySource::ClientKey,
             response_mode: crate::admin::client_keys::ClientResponseMode::Detection,
+            cache_hit_rate: None,
         };
         let request: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model": "claude-opus-4-8",

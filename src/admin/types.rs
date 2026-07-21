@@ -4,7 +4,7 @@ use crate::admin::proxy_pool::ProxyHealth;
 use crate::model::config::RetryPolicy;
 use serde::{Deserialize, Serialize};
 
-use super::client_keys::ClientResponseMode;
+use super::client_keys::{CacheHitRateBounds, ClientResponseMode};
 
 // ============ 凭据状态 ============
 
@@ -1129,6 +1129,8 @@ pub struct ClientKeyItem {
     pub total_cache_read_tokens: u64,
     pub response_mode: ClientResponseMode,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_hit_rate: Option<CacheHitRateBounds>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     /// 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换）
     #[serde(default)]
@@ -1154,6 +1156,8 @@ pub struct CreateClientKeyRequest {
     pub group: Option<String>,
     #[serde(default)]
     pub response_mode: Option<String>,
+    #[serde(default)]
+    pub cache_hit_rate: Option<CacheHitRateBounds>,
 }
 
 /// 创建客户端 Key 响应（明文 Key 仅在此处返回一次）
@@ -1165,6 +1169,20 @@ pub struct CreateClientKeyResponse {
     pub name: String,
     pub created_at: String,
     pub response_mode: ClientResponseMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_hit_rate: Option<CacheHitRateBounds>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum CacheHitRatePatch {
+    Inherit,
+    Custom {
+        #[serde(rename = "minPct")]
+        min_pct: u32,
+        #[serde(rename = "maxPct")]
+        max_pct: u32,
+    },
 }
 
 /// 更新客户端 Key 元数据
@@ -1177,6 +1195,8 @@ pub struct UpdateClientKeyRequest {
     pub group: Option<String>,
     #[serde(default)]
     pub response_mode: Option<String>,
+    #[serde(default)]
+    pub cache_hit_rate: Option<CacheHitRatePatch>,
 }
 
 /// 更新客户端 Key 响应；保留原成功响应字段，并返回实际持久化的模式。
@@ -1187,6 +1207,8 @@ pub struct UpdateClientKeyResponse {
     pub message: String,
     pub id: u64,
     pub response_mode: ClientResponseMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_hit_rate: Option<CacheHitRateBounds>,
 }
 
 // ============ IdC 设备授权登录 ============
@@ -2024,6 +2046,18 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(update.response_mode.as_deref(), Some("detection"));
+
+        let custom: UpdateClientKeyRequest = serde_json::from_value(serde_json::json!({
+            "cacheHitRate": {"mode": "custom", "minPct": 10, "maxPct": 90}
+        }))
+        .unwrap();
+        assert!(matches!(
+            custom.cache_hit_rate,
+            Some(CacheHitRatePatch::Custom {
+                min_pct: 10,
+                max_pct: 90
+            })
+        ));
     }
 
     #[test]
@@ -2033,6 +2067,7 @@ mod tests {
             message: "updated".into(),
             id: 7,
             response_mode: ClientResponseMode::KiroNative,
+            cache_hit_rate: None,
         };
         let value = serde_json::to_value(response).unwrap();
 

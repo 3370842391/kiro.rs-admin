@@ -16,20 +16,20 @@ use sha2::Digest as _;
 use std::sync::Arc;
 
 use super::{
-    client_keys::{ClientResponseMode, mask_client_key},
+    client_keys::{CacheHitRateBounds, ClientResponseMode, mask_client_key},
     error_snapshot_db::{SnapshotQuery, SnapshotSeverity},
     middleware::AdminState,
     trace_db::TraceQuery,
     types::{
         AddCredentialRequest, AddProxyRequest, ApplyModelProfilesRequest, AssignProxyRequest,
         AssignRoundRobinRequest, BatchAddProxyRequest, BatchImportEvent, BatchImportRequest,
-        BatchImportSummary, BatchUpdateCredentialsRequest, ClientKeyItem, ClientKeysResponse,
-        CompleteSocialLoginRequest, CreateClientKeyRequest, CreateClientKeyResponse,
-        CredentialResponseTestRequest, FetchModelProfileRequest, GlobalProxyResponse,
-        PatchModelProfileRequest, PreviewModelProfilesRequest, ProxyCheckUrlRequest,
-        RevisionRequest, SetAccountThrottleConfigRequest, SetCacheHitRateRequest,
-        SetCachePolicyRequest, SetCompatibilityConfigRequest, SetDisabledRequest,
-        SetEndpointChainsRequest, SetGlobalProxyRequest, SetImageBudgetRequest,
+        BatchImportSummary, BatchUpdateCredentialsRequest, CacheHitRatePatch, ClientKeyItem,
+        ClientKeysResponse, CompleteSocialLoginRequest, CreateClientKeyRequest,
+        CreateClientKeyResponse, CredentialResponseTestRequest, FetchModelProfileRequest,
+        GlobalProxyResponse, PatchModelProfileRequest, PreviewModelProfilesRequest,
+        ProxyCheckUrlRequest, RevisionRequest, SetAccountThrottleConfigRequest,
+        SetCacheHitRateRequest, SetCachePolicyRequest, SetCompatibilityConfigRequest,
+        SetDisabledRequest, SetEndpointChainsRequest, SetGlobalProxyRequest, SetImageBudgetRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetModelProfileSettingsRequest,
         SetPriorityRequest, SetProxyBalancingModeRequest, SetRetryPolicyRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
@@ -1133,6 +1133,7 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         total_cache_creation_tokens: k.total_cache_creation_tokens,
         total_cache_read_tokens: k.total_cache_read_tokens,
         response_mode: k.response_mode,
+        cache_hit_rate: k.cache_hit_rate,
         group: k.group.clone(),
         is_system: k.is_system,
     }
@@ -1175,7 +1176,22 @@ pub async fn create_client_key(
                 .into_response();
         }
     };
-    let entry = match state.client_keys.try_create_with_mode(
+    let cache_hit_rate = match payload.cache_hit_rate {
+        Some(bounds) => match CacheHitRateBounds::new(bounds.min_pct, bounds.max_pct) {
+            Ok(bounds) => Some(bounds),
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(super::types::AdminErrorResponse::invalid_request(
+                        error.to_string(),
+                    )),
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
+    let entry = match state.client_keys.try_create_with_mode_and_cache(
         name.to_string(),
         payload
             .description
@@ -1186,6 +1202,7 @@ pub async fn create_client_key(
             .map(|g| g.trim().to_string())
             .filter(|g| !g.is_empty()),
         response_mode,
+        cache_hit_rate,
     ) {
         Ok(entry) => entry,
         Err(error) => {
@@ -1205,6 +1222,7 @@ pub async fn create_client_key(
         name: entry.name,
         created_at: entry.created_at,
         response_mode: entry.response_mode,
+        cache_hit_rate: entry.cache_hit_rate,
     })
     .into_response()
 }
@@ -1266,15 +1284,39 @@ pub async fn update_client_key(
                 .into_response();
         }
     };
-    match state
-        .client_keys
-        .update_meta(id, payload.name, description, group, response_mode)
-    {
+    let cache_hit_rate = match payload.cache_hit_rate {
+        None => Ok(None),
+        Some(CacheHitRatePatch::Inherit) => Ok(Some(None)),
+        Some(CacheHitRatePatch::Custom { min_pct, max_pct }) => {
+            CacheHitRateBounds::new(min_pct, max_pct).map(|bounds| Some(Some(bounds)))
+        }
+    };
+    let cache_hit_rate = match cache_hit_rate {
+        Ok(value) => value,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(super::types::AdminErrorResponse::invalid_request(
+                    error.to_string(),
+                )),
+            )
+                .into_response();
+        }
+    };
+    match state.client_keys.update_meta_with_cache(
+        id,
+        payload.name,
+        description,
+        group,
+        response_mode,
+        cache_hit_rate,
+    ) {
         Ok(Some(entry)) => Json(UpdateClientKeyResponse {
             success: true,
             message: format!("Key #{} 已更新", id),
             id,
             response_mode: entry.response_mode,
+            cache_hit_rate: entry.cache_hit_rate,
         })
         .into_response(),
         Ok(None) => (
@@ -1362,6 +1404,7 @@ pub async fn rotate_client_key(
                 name: entry.name,
                 created_at: entry.created_at,
                 response_mode: entry.response_mode,
+                cache_hit_rate: entry.cache_hit_rate,
             })
             .into_response()
         }

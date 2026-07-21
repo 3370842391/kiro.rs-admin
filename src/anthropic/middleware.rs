@@ -10,7 +10,7 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 
-use crate::admin::client_keys::SharedClientKeyManager;
+use crate::admin::client_keys::{CacheHitRateBounds, SharedClientKeyManager};
 use crate::admin::error_snapshot_db::SharedErrorSnapshotStore;
 use crate::admin::trace_db::{SharedTraceStore, TraceKeySource};
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
@@ -31,6 +31,8 @@ pub struct KeyContext {
     pub key_source: TraceKeySource,
     /// 本轮请求在鉴权时捕获的回复模式；在途请求不随后台编辑变化。
     pub response_mode: crate::admin::client_keys::ClientResponseMode,
+    /// Per-key cache hit-rate override captured during authentication.
+    pub cache_hit_rate: Option<CacheHitRateBounds>,
 }
 
 /// 应用共享状态
@@ -162,6 +164,7 @@ pub async fn auth_middleware(
                 group: authorized.group,
                 key_source: TraceKeySource::ClientKey,
                 response_mode: authorized.response_mode,
+                cache_hit_rate: authorized.cache_hit_rate,
             });
             return next.run(request).await;
         }

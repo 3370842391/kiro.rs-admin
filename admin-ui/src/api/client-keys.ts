@@ -5,6 +5,7 @@ import type {
   CreateClientKeyRequest,
   CreateClientKeyResponse,
   UpdateClientKeyRequest,
+  UpdateClientKeyResponse,
   SuccessResponse,
 } from '@/types/api'
 
@@ -40,8 +41,8 @@ export async function deleteClientKey(id: number): Promise<SuccessResponse> {
 export async function updateClientKey(
   id: number,
   req: UpdateClientKeyRequest,
-): Promise<SuccessResponse> {
-  const { data } = await api.put<SuccessResponse>(`/client-keys/${id}`, req)
+): Promise<UpdateClientKeyResponse> {
+  const { data } = await api.put<UpdateClientKeyResponse>(`/client-keys/${id}`, req)
   return data
 }
 

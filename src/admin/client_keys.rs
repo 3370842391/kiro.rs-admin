@@ -78,12 +78,41 @@ impl std::str::FromStr for ClientResponseMode {
     }
 }
 
+/// Optional per-client-key cache hit-rate shaping bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheHitRateBounds {
+    pub min_pct: u32,
+    pub max_pct: u32,
+}
+
+impl CacheHitRateBounds {
+    pub fn new(min_pct: u32, max_pct: u32) -> anyhow::Result<Self> {
+        if min_pct > 100 || max_pct > 100 {
+            anyhow::bail!(
+                "缓存命中率必须在 0..=100 内: min={} max={}",
+                min_pct,
+                max_pct
+            );
+        }
+        if min_pct > 0 && max_pct > 0 && min_pct > max_pct {
+            anyhow::bail!(
+                "缓存命中率下限不能大于上限: min={} max={}",
+                min_pct,
+                max_pct
+            );
+        }
+        Ok(Self { min_pct, max_pct })
+    }
+}
+
 /// 数据面鉴权成功时的一次性不可变快照。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizedClientKey {
     pub id: u64,
     pub group: Option<String>,
     pub response_mode: ClientResponseMode,
+    pub cache_hit_rate: Option<CacheHitRateBounds>,
 }
 
 /// 单条客户端 Key
@@ -123,6 +152,9 @@ pub struct ClientKey {
     /// 助手回复模式；旧数据默认保持当前检测兼容行为。
     #[serde(default)]
     pub response_mode: ClientResponseMode,
+    /// Per-key cache hit-rate shaping override; `None` inherits global config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_hit_rate: Option<CacheHitRateBounds>,
     /// 系统 Key（由 config.json apiKey bootstrap 生成，不可删除 / 不可轮换）。
     /// 老数据无此字段，默认 false。
     #[serde(default, skip_serializing_if = "is_false")]
@@ -234,12 +266,24 @@ impl ClientKeyManager {
         group: Option<String>,
         response_mode: ClientResponseMode,
     ) -> ClientKey {
+        self.create_with_mode_and_cache(name, description, group, response_mode, None)
+    }
+
+    pub fn create_with_mode_and_cache(
+        &self,
+        name: String,
+        description: Option<String>,
+        group: Option<String>,
+        response_mode: ClientResponseMode,
+        cache_hit_rate: Option<CacheHitRateBounds>,
+    ) -> ClientKey {
         self.create_with_key_and_mode(
             name,
             description,
             group,
             generate_client_key(),
             response_mode,
+            cache_hit_rate,
         )
     }
 
@@ -251,12 +295,24 @@ impl ClientKeyManager {
         group: Option<String>,
         response_mode: ClientResponseMode,
     ) -> anyhow::Result<ClientKey> {
+        self.try_create_with_mode_and_cache(name, description, group, response_mode, None)
+    }
+
+    pub fn try_create_with_mode_and_cache(
+        &self,
+        name: String,
+        description: Option<String>,
+        group: Option<String>,
+        response_mode: ClientResponseMode,
+        cache_hit_rate: Option<CacheHitRateBounds>,
+    ) -> anyhow::Result<ClientKey> {
         self.try_create_with_key_and_mode(
             name,
             description,
             group,
             generate_client_key(),
             response_mode,
+            cache_hit_rate,
         )
     }
 
@@ -275,6 +331,7 @@ impl ClientKeyManager {
             group,
             plaintext,
             ClientResponseMode::Detection,
+            None,
         )
     }
 
@@ -285,6 +342,7 @@ impl ClientKeyManager {
         group: Option<String>,
         plaintext: String,
         response_mode: ClientResponseMode,
+        cache_hit_rate: Option<CacheHitRateBounds>,
     ) -> ClientKey {
         let mut inner = self.inner.write();
         // 防止 bootstrap 重复导入同一明文
@@ -302,6 +360,7 @@ impl ClientKeyManager {
             group,
             plaintext,
             response_mode,
+            cache_hit_rate,
         );
         self.save_locked(&inner);
         entry
@@ -314,6 +373,7 @@ impl ClientKeyManager {
         group: Option<String>,
         plaintext: String,
         response_mode: ClientResponseMode,
+        cache_hit_rate: Option<CacheHitRateBounds>,
     ) -> anyhow::Result<ClientKey> {
         let mut inner = self.inner.write();
         if let Some(&id) = inner.by_key.get(&plaintext) {
@@ -331,6 +391,7 @@ impl ClientKeyManager {
             group,
             plaintext,
             response_mode,
+            cache_hit_rate,
         );
         if let Err(error) = self.try_save_locked(&inner) {
             inner.by_key.remove(&entry.key);
@@ -348,6 +409,7 @@ impl ClientKeyManager {
         group: Option<String>,
         plaintext: String,
         response_mode: ClientResponseMode,
+        cache_hit_rate: Option<CacheHitRateBounds>,
     ) -> ClientKey {
         let id = inner.next_id;
         inner.next_id += 1;
@@ -367,6 +429,7 @@ impl ClientKeyManager {
             total_credits: 0.0,
             group: group.filter(|g| !g.trim().is_empty()),
             response_mode,
+            cache_hit_rate,
             is_system: false,
         };
         inner.by_key.insert(plaintext, id);
@@ -440,6 +503,7 @@ impl ClientKeyManager {
                     total_credits: 0.0,
                     group: None,
                     response_mode: ClientResponseMode::Detection,
+                    cache_hit_rate: None,
                     is_system: true,
                 };
                 inner.by_key.insert(plaintext, id);
@@ -491,10 +555,28 @@ impl ClientKeyManager {
         group: Option<Option<String>>,
         response_mode: Option<ClientResponseMode>,
     ) -> anyhow::Result<Option<ClientKey>> {
+        self.update_meta_with_cache(id, name, description, group, response_mode, None)
+    }
+
+    /// Update metadata and optionally patch the per-key cache policy.
+    /// `None` preserves the current policy, `Some(None)` clears it, and
+    /// `Some(Some(bounds))` replaces it.
+    pub fn update_meta_with_cache(
+        &self,
+        id: u64,
+        name: Option<String>,
+        description: Option<Option<String>>,
+        group: Option<Option<String>>,
+        response_mode: Option<ClientResponseMode>,
+        cache_hit_rate: Option<Option<CacheHitRateBounds>>,
+    ) -> anyhow::Result<Option<ClientKey>> {
         let mut inner = self.inner.write();
         let Some(previous) = inner.entries.get(&id).cloned() else {
             return Ok(None);
         };
+        if let Some(Some(bounds)) = cache_hit_rate {
+            CacheHitRateBounds::new(bounds.min_pct, bounds.max_pct)?;
+        }
         let updated = {
             let entry = inner.entries.get_mut(&id).expect("entry existed above");
             if let Some(value) = name {
@@ -508,6 +590,9 @@ impl ClientKeyManager {
             }
             if let Some(value) = response_mode {
                 entry.response_mode = value;
+            }
+            if let Some(value) = cache_hit_rate {
+                entry.cache_hit_rate = value;
             }
             entry.clone()
         };
@@ -672,6 +757,7 @@ impl ClientKeyManager {
             id,
             group: entry.group.clone(),
             response_mode: entry.response_mode,
+            cache_hit_rate: entry.cache_hit_rate,
         })
     }
 
@@ -896,6 +982,7 @@ mod tests {
             group: Some("team-a".into()),
             is_system: false,
             response_mode: ClientResponseMode::KiroNative,
+            cache_hit_rate: None,
         };
         let json = serde_json::to_value(&key).unwrap();
         assert_eq!(json["responseMode"], "kiro_native");
@@ -1076,5 +1163,63 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"original");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn cache_hit_rate_bounds_validate_global_semantics() {
+        assert!(CacheHitRateBounds::new(0, 0).is_ok());
+        assert!(CacheHitRateBounds::new(50, 0).is_ok());
+        assert!(CacheHitRateBounds::new(0, 90).is_ok());
+        assert!(CacheHitRateBounds::new(90, 50).is_err());
+        assert!(CacheHitRateBounds::new(101, 0).is_err());
+        assert!(CacheHitRateBounds::new(0, 101).is_err());
+    }
+
+    #[test]
+    fn cache_hit_rate_bounds_legacy_json_defaults_to_inherit_global() {
+        let raw = r#"{
+            "id": 10,
+            "key": "csk_legacy",
+            "name": "legacy",
+            "createdAt": "2026-07-15T00:00:00Z"
+        }"#;
+        let key: ClientKey = serde_json::from_str(raw).unwrap();
+        assert_eq!(key.cache_hit_rate, None);
+    }
+
+    #[test]
+    fn cache_hit_rate_bounds_create_and_authorize_snapshot() {
+        let manager = ClientKeyManager::new();
+        let bounds = CacheHitRateBounds::new(0, 90).unwrap();
+        let entry = manager.create_with_mode_and_cache(
+            "cached".into(),
+            None,
+            None,
+            ClientResponseMode::Detection,
+            Some(bounds),
+        );
+
+        assert_eq!(entry.cache_hit_rate, Some(bounds));
+        let authorized = manager.verify_and_touch_context(&entry.key).unwrap();
+        assert_eq!(authorized.cache_hit_rate, Some(bounds));
+    }
+
+    #[test]
+    fn cache_hit_rate_bounds_update_can_set_and_clear_atomically() {
+        let manager = ClientKeyManager::new();
+        let entry = manager.create("cached".into(), None, None);
+        let bounds = CacheHitRateBounds::new(50, 95).unwrap();
+
+        let updated = manager
+            .update_meta_with_cache(entry.id, None, None, None, None, Some(Some(bounds)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.cache_hit_rate, Some(bounds));
+
+        let inherited = manager
+            .update_meta_with_cache(entry.id, None, None, None, None, Some(None))
+            .unwrap()
+            .unwrap();
+        assert_eq!(inherited.cache_hit_rate, None);
     }
 }

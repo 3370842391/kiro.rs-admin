@@ -433,6 +433,15 @@ export type PollSocialLoginResponse = PollIdcLoginResponse
 
 export type ClientResponseMode = 'detection' | 'kiro_native'
 
+export interface CacheHitRateBounds {
+  minPct: number
+  maxPct: number
+}
+
+export type CacheHitRatePatch =
+  | { mode: 'inherit' }
+  | { mode: 'custom'; minPct: number; maxPct: number }
+
 export interface ClientKeyItem {
   id: number
   /** 脱敏后的 Key（仅展示） */
@@ -450,6 +459,7 @@ export interface ClientKeyItem {
   /** 绑定的账号分组（未绑定时为 undefined） */
   group?: string
   responseMode: ClientResponseMode
+  cacheHitRate?: CacheHitRateBounds
   /** 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换） */
   isSystem: boolean
 }
@@ -464,6 +474,7 @@ export interface CreateClientKeyRequest {
   description?: string
   group?: string
   responseMode?: ClientResponseMode
+  cacheHitRate?: CacheHitRateBounds
 }
 
 /** 创建响应：明文 Key 仅在此处返回一次 */
@@ -473,6 +484,7 @@ export interface CreateClientKeyResponse {
   name: string
   createdAt: string
   responseMode: ClientResponseMode
+  cacheHitRate?: CacheHitRateBounds
 }
 
 export interface UpdateClientKeyRequest {
@@ -480,6 +492,15 @@ export interface UpdateClientKeyRequest {
   description?: string
   group?: string
   responseMode?: ClientResponseMode
+  cacheHitRate?: CacheHitRatePatch
+}
+
+export interface UpdateClientKeyResponse {
+  success: boolean
+  message: string
+  id: number
+  responseMode: ClientResponseMode
+  cacheHitRate?: CacheHitRateBounds
 }
 
 // ============ 用量统计 ============

@@ -27,6 +27,12 @@ import type {
   ClientKeyItem, ClientResponseMode, CreateClientKeyResponse,
 } from '@/types/api'
 import {
+  buildClientKeyCacheHitRatePatch,
+  cacheHitRateLabel,
+  parseClientKeyCacheHitRate,
+  type ClientKeyCacheHitRateMode,
+} from '@/lib/client-key-cache-hit-rate'
+import {
   DEFAULT_CLIENT_RESPONSE_MODE,
   responseModeDescription,
   responseModeLabel,
@@ -70,6 +76,9 @@ export function ClientKeysPage() {
   const [createResponseMode, setCreateResponseMode] = useState<ClientResponseMode>(
     DEFAULT_CLIENT_RESPONSE_MODE,
   )
+  const [createCacheHitRateMode, setCreateCacheHitRateMode] = useState<ClientKeyCacheHitRateMode>('inherit')
+  const [createCacheHitRateMin, setCreateCacheHitRateMin] = useState('')
+  const [createCacheHitRateMax, setCreateCacheHitRateMax] = useState('')
   const [createdKey, setCreatedKey] = useState<CreateClientKeyResponse | null>(null)
   const [showCreatedPlain, setShowCreatedPlain] = useState(true)
 
@@ -81,6 +90,9 @@ export function ClientKeysPage() {
   const [editResponseMode, setEditResponseMode] = useState<ClientResponseMode>(
     DEFAULT_CLIENT_RESPONSE_MODE,
   )
+  const [editCacheHitRateMode, setEditCacheHitRateMode] = useState<ClientKeyCacheHitRateMode>('inherit')
+  const [editCacheHitRateMin, setEditCacheHitRateMin] = useState('')
+  const [editCacheHitRateMax, setEditCacheHitRateMax] = useState('')
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -89,12 +101,22 @@ export function ClientKeysPage() {
       toast.error('请填写名称')
       return
     }
+    let cacheHitRate
+    if (createCacheHitRateMode === 'custom') {
+      const parsed = parseClientKeyCacheHitRate(createCacheHitRateMin, createCacheHitRateMax)
+      if (!parsed.ok) {
+        toast.error(parsed.message)
+        return
+      }
+      cacheHitRate = { minPct: parsed.minPct, maxPct: parsed.maxPct }
+    }
     try {
       const res = await createKey.mutateAsync({
         name,
         description: createDesc.trim() || undefined,
         group: createGroup.trim() || undefined,
         responseMode: createResponseMode,
+        cacheHitRate,
       })
       setCreatedKey(res)
       setCreateOpen(false)
@@ -102,6 +124,9 @@ export function ClientKeysPage() {
       setCreateDesc('')
       setCreateGroup('')
       setCreateResponseMode(DEFAULT_CLIENT_RESPONSE_MODE)
+      setCreateCacheHitRateMode('inherit')
+      setCreateCacheHitRateMin('')
+      setCreateCacheHitRateMax('')
       setShowCreatedPlain(true)
     } catch (err) {
       toast.error('创建失败：' + extractErrorMessage(err))
@@ -184,6 +209,9 @@ export function ClientKeysPage() {
     setEditDesc(item.description ?? '')
     setEditGroup(item.group ?? '')
     setEditResponseMode(item.responseMode)
+    setEditCacheHitRateMode(item.cacheHitRate ? 'custom' : 'inherit')
+    setEditCacheHitRateMin(item.cacheHitRate ? String(item.cacheHitRate.minPct) : '')
+    setEditCacheHitRateMax(item.cacheHitRate ? String(item.cacheHitRate.maxPct) : '')
     setEditOpen(true)
   }
 
@@ -194,6 +222,17 @@ export function ClientKeysPage() {
       editTarget.responseMode,
       editResponseMode,
     )
+    let cacheHitRate
+    try {
+      cacheHitRate = buildClientKeyCacheHitRatePatch({
+        mode: editCacheHitRateMode,
+        minPct: editCacheHitRateMin,
+        maxPct: editCacheHitRateMax,
+      })
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : '缓存命中率配置无效')
+      return
+    }
     try {
       await updateKey.mutateAsync({
         id: editTarget.id,
@@ -202,6 +241,7 @@ export function ClientKeysPage() {
           description: editDesc.trim(),
           group: editGroup.trim(),
           responseMode: editResponseMode,
+          cacheHitRate,
         },
       })
       if (warning) {
@@ -264,6 +304,7 @@ export function ClientKeysPage() {
                   <th className="text-left font-medium px-4 py-3">Key</th>
                   <th className="text-left font-medium px-4 py-3">分组</th>
                   <th className="text-left font-medium px-4 py-3">回复模式</th>
+                  <th className="text-left font-medium px-4 py-3">缓存命中率</th>
                   <th className="text-left font-medium px-4 py-3">状态</th>
                   <th className="text-right font-medium px-4 py-3">总调用</th>
                   <th className="text-right font-medium px-4 py-3">输入</th>
@@ -323,6 +364,9 @@ export function ClientKeysPage() {
                       <Badge variant={k.responseMode === 'kiro_native' ? 'outline' : 'secondary'}>
                         {responseModeLabel(k.responseMode)}
                       </Badge>
+                    </td>
+                    <td className="px-4 py-3 text-[12px] text-muted-foreground">
+                      {cacheHitRateLabel(k.cacheHitRate)}
                     </td>
                     <td className="px-4 py-3">
                       {k.disabled ? (
@@ -448,6 +492,47 @@ export function ClientKeysPage() {
                 {responseModeDescription(createResponseMode)}
               </p>
             </div>
+            <div className="space-y-2 rounded-lg border border-border/60 p-3">
+              <label className="text-[12px] text-muted-foreground">缓存命中率策略</label>
+              <Select
+                value={createCacheHitRateMode}
+                onValueChange={(value) => setCreateCacheHitRateMode(value as ClientKeyCacheHitRateMode)}
+                disabled={createKey.isPending}
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="inherit">继承全局配置</SelectItem>
+                  <SelectItem value="custom">自定义范围</SelectItem>
+                </SelectContent>
+              </Select>
+              {createCacheHitRateMode === 'custom' && (
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label htmlFor="create-cache-hit-rate-min" className="text-[11px] text-muted-foreground">最小（%）</label>
+                    <Input
+                      id="create-cache-hit-rate-min"
+                      inputMode="numeric"
+                      value={createCacheHitRateMin}
+                      onChange={(e) => setCreateCacheHitRateMin(e.target.value)}
+                      placeholder="0"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="create-cache-hit-rate-max" className="text-[11px] text-muted-foreground">最大（%）</label>
+                    <Input
+                      id="create-cache-hit-rate-max"
+                      inputMode="numeric"
+                      value={createCacheHitRateMax}
+                      onChange={(e) => setCreateCacheHitRateMax(e.target.value)}
+                      placeholder="90"
+                    />
+                  </div>
+                </div>
+              )}
+              <p className="text-[11px] text-muted-foreground">不填写覆盖时沿用全局；0/0 表示关闭该 Key 的命中率整形。</p>
+            </div>
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setCreateOpen(false)} disabled={createKey.isPending}>
                 取消
@@ -568,6 +653,47 @@ export function ClientKeysPage() {
               <p className="mt-1 text-[11px] text-muted-foreground">
                 {responseModeDescription(editResponseMode)}
               </p>
+            </div>
+            <div className="space-y-2 rounded-lg border border-border/60 p-3">
+              <label className="text-[12px] text-muted-foreground">缓存命中率策略</label>
+              <Select
+                value={editCacheHitRateMode}
+                onValueChange={(value) => setEditCacheHitRateMode(value as ClientKeyCacheHitRateMode)}
+                disabled={updateKey.isPending}
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="inherit">继承全局配置</SelectItem>
+                  <SelectItem value="custom">自定义范围</SelectItem>
+                </SelectContent>
+              </Select>
+              {editCacheHitRateMode === 'custom' && (
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label htmlFor="edit-cache-hit-rate-min" className="text-[11px] text-muted-foreground">最小（%）</label>
+                    <Input
+                      id="edit-cache-hit-rate-min"
+                      inputMode="numeric"
+                      value={editCacheHitRateMin}
+                      onChange={(e) => setEditCacheHitRateMin(e.target.value)}
+                      placeholder="0"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="edit-cache-hit-rate-max" className="text-[11px] text-muted-foreground">最大（%）</label>
+                    <Input
+                      id="edit-cache-hit-rate-max"
+                      inputMode="numeric"
+                      value={editCacheHitRateMax}
+                      onChange={(e) => setEditCacheHitRateMax(e.target.value)}
+                      placeholder="90"
+                    />
+                  </div>
+                </div>
+              )}
+              <p className="text-[11px] text-muted-foreground">继承全局不会修改全局设置；0/0 表示关闭该 Key 的命中率整形。</p>
             </div>
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setEditOpen(false)}>取消</Button>
