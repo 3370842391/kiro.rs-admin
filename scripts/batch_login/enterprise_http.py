@@ -75,10 +75,13 @@ class HttpResponse:
 class CurlCffiTransport:
     """Chrome-impersonating HTTP transport; no browser process is created."""
 
-    def __init__(self, *, timeout: float = 45):
+    def __init__(self, *, timeout: float = 45, proxy: str | None = None):
         from curl_cffi.requests import AsyncSession
 
-        self.session = AsyncSession(impersonate="chrome", timeout=timeout)
+        proxies = {"http": proxy, "https": proxy} if proxy else None
+        self.session = AsyncSession(
+            impersonate="chrome", timeout=timeout, proxies=proxies
+        )
 
     @property
     def cookies(self):

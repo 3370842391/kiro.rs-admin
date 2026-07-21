@@ -40,15 +40,19 @@ class Exporter:
 
 
 class Runtime:
+    """并发 run() 用的假 runtime:open_for_concurrent + login_one。
+
+    calls 记录每次 login_one 的账号(顺序不保证,并发);测试用 set 比对。
+    """
     def __init__(self, form, emit, calls): self.form=form; self.calls=calls
-    async def run(self, entries):
-        self.calls.append([item.account for item in entries])
-        for item in entries:
-            CredentialStore(Path(self.form.credential_path)).append(CredentialRecord(
-                email=item.account, auth_method="idc", provider="Enterprise",
-                refresh_token="refresh-" + item.account, start_url=item.start_url,
-                region="us-east-1",
-            ))
+    async def open_for_concurrent(self): return True
+    async def login_one(self, entry):
+        self.calls.append(entry.account)
+        return CredentialRecord(
+            email=entry.account, auth_method="idc", provider="Enterprise",
+            refresh_token="refresh-" + entry.account, start_url=entry.start_url,
+            region="us-east-1",
+        )
     async def close(self): pass
 
 
@@ -89,10 +93,89 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         report = await coordinator.run([item.id for item in self.accounts])
 
-        self.assertEqual([["first", "second"]], calls)
+        self.assertEqual({"first", "second"}, set(calls))  # 并发,顺序不保证
         self.assertEqual(2, report.logged_in)
         self.assertEqual(2, report.exported)
         self.assertEqual("refresh-first", self.repo.load_credential(self.accounts[0].id).refresh_token)
+
+    async def test_login_only_stores_credentials_without_exporting_files(self):
+        calls=[]; exporter=Exporter()
+        coordinator = AccountLoginCoordinator(self.repo, SettingsStore(self.settings), exporter=exporter, runtime_factory=lambda f,e: Runtime(f,e,calls))
+
+        report = await coordinator.run(
+            [item.id for item in self.accounts], export_files=False
+        )
+
+        # 登录发生、凭据落库,但不写任何文件、exported 记 0
+        self.assertEqual({"first", "second"}, set(calls))  # 并发,顺序不保证
+        self.assertEqual(2, report.logged_in)
+        self.assertEqual(0, report.exported)
+        self.assertIsNone(exporter.records)
+        self.assertEqual(
+            "refresh-first", self.repo.load_credential(self.accounts[0].id).refresh_token
+        )
+
+    async def test_concurrent_login_persists_each_account_and_reports_success(self):
+        """并发 login_one:每号登完立刻存库 + 报 success(terminal)。"""
+        events = []
+        coordinator = AccountLoginCoordinator(
+            self.repo, SettingsStore(self.settings),
+            exporter=Exporter(), runtime_factory=lambda f, e: Runtime(f, e, []),
+        )
+
+        report = await coordinator.run(
+            [item.id for item in self.accounts],
+            progress=events.append,
+            event_sink=lambda _e: None,
+            export_files=False,
+        )
+
+        self.assertEqual(2, report.logged_in)
+        self.assertEqual("refresh-first", self.repo.load_credential(self.accounts[0].id).refresh_token)
+        self.assertEqual("refresh-second", self.repo.load_credential(self.accounts[1].id).refresh_token)
+        success = [e for e in events if isinstance(e, LoginProgressEvent) and e.status == "success"]
+        self.assertEqual(2, len(success))
+
+    async def test_cancellation_keeps_done_account_and_marks_rest_cancelled(self):
+        """终止:已登成功的号保留凭据,其余标记 cancelled,run() 抛 CancelledError。"""
+        import asyncio
+
+        gate = asyncio.Event()
+
+        class CancelRuntime:
+            def __init__(self, form, emit):
+                self.form = form
+            async def open_for_concurrent(self): return True
+            async def login_one(self, entry):
+                if entry.account == "first":
+                    gate.set()
+                    return CredentialRecord(
+                        email="first", auth_method="idc", provider="Enterprise",
+                        refresh_token="refresh-first", start_url=entry.start_url, region="us-east-1",
+                    )
+                # 第二个号一直挂着,等外部取消
+                await asyncio.sleep(3600)
+                raise AssertionError("不应到达")
+            async def close(self): pass
+
+        coordinator = AccountLoginCoordinator(
+            self.repo, SettingsStore(self.settings),
+            exporter=Exporter(), runtime_factory=lambda f, e: CancelRuntime(f, e),
+        )
+
+        task = asyncio.ensure_future(
+            coordinator.run([item.id for item in self.accounts], concurrency=2, export_files=False)
+        )
+        await gate.wait()          # 等第一个号登完落库
+        await asyncio.sleep(0)     # 让 save/notify 跑完
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        # 第一个号凭据保留;第二个号被标记(cancelled),未写入凭据
+        self.assertEqual("refresh-first", self.repo.load_credential(self.accounts[0].id).refresh_token)
+        self.assertIsNone(self.repo.load_credential(self.accounts[1].id))
+        self.assertIsNone(self.repo.load_credential(self.accounts[1].id))
 
     async def test_progress_covers_reused_success_and_failed_accounts_once(self):
         third = self.repo.upsert_entries(
@@ -122,22 +205,16 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         class PartialRuntime:
             def __init__(self, form, _emit):
                 self.form = form
-
-            async def run(self, entries):
-                successful = next(
-                    item for item in entries if item.account == "second"
-                )
-                CredentialStore(Path(self.form.credential_path)).append(
-                    CredentialRecord(
-                        email=successful.account,
-                        auth_method="idc",
-                        provider="Enterprise",
+            async def open_for_concurrent(self): return True
+            async def login_one(self, entry):
+                # second 成功,third 失败(抛异常)
+                if entry.account == "second":
+                    return CredentialRecord(
+                        email=entry.account, auth_method="idc", provider="Enterprise",
                         refresh_token="new-refresh-secret",
-                        start_url=successful.start_url,
-                        region="us-east-1",
+                        start_url=entry.start_url, region="us-east-1",
                     )
-                )
-
+                raise RuntimeError("password=never-log-this-password login failed")
             async def close(self):
                 pass
 
@@ -166,25 +243,21 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 third.id,
             )
         }
-        self.assertEqual(
-            ["waiting", "reused"], statuses[self.accounts[0].id]
-        )
-        self.assertEqual(
-            ["waiting", "running", "success"],
-            statuses[self.accounts[1].id],
-        )
-        self.assertEqual(
-            ["waiting", "running", "failed"], statuses[third.id]
-        )
+        # 第一个号:有效凭据复用(不经登录);顺序确定
+        self.assertEqual(["waiting", "reused"], statuses[self.accounts[0].id])
+        # 并发下 second/third 的 running/终态穿插,只断言集合与终态
+        self.assertEqual({"waiting", "running", "success"}, set(statuses[self.accounts[1].id]))
+        self.assertEqual({"waiting", "running", "failed"}, set(statuses[third.id]))
         terminal = [
             event
             for event in progress
             if event.status in {"reused", "success", "failed"}
         ]
-        self.assertEqual([1, 2, 3], [event.completed for event in terminal])
+        # completed 计数单调递增到 3(并发下终态顺序不定)
+        self.assertEqual([1, 2, 3], sorted(event.completed for event in terminal))
         self.assertTrue(all(event.total == 3 for event in progress))
-        self.assertEqual(3, terminal[-1].completed)
-        self.assertEqual("login_failed", terminal[-1].code)
+        third_terminal = next(e for e in terminal if e.account_id == third.id)
+        self.assertEqual("login_failed", third_terminal.code)
         self.assertEqual(1, report.reused)
         self.assertEqual(1, report.logged_in)
         self.assertEqual(1, report.failed)
@@ -213,30 +286,24 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
             login_mode=LoginMode.MICROSOFT,
             region="us-east-1",
         )[0]
-        calls = []
+        opened = []
 
         class ModeRuntime:
             def __init__(self, form, _emit):
                 self.form = form
-
-            async def run(self, entries):
-                calls.append(self.form.mode)
+            async def open_for_concurrent(self):
+                opened.append(self.form.mode)
+                return self.form.mode is LoginMode.ENTERPRISE
+            async def login_one(self, entry):
                 if self.form.mode is LoginMode.ENTERPRISE:
                     raise RuntimeError(
                         "password=enterprise-password-secret "
                         "refreshToken=enterprise-refresh-secret"
                     )
-                for entry in entries:
-                    CredentialStore(Path(self.form.credential_path)).append(
-                        CredentialRecord(
-                            email=entry.account,
-                            auth_method="social",
-                            provider="Google",
-                            refresh_token="microsoft-refresh-secret",
-                            region="us-east-1",
-                        )
-                    )
-
+                return CredentialRecord(
+                    email=entry.account, auth_method="social", provider="Google",
+                    refresh_token="microsoft-refresh-secret", region="us-east-1",
+                )
             async def close(self):
                 pass
 
@@ -255,9 +322,8 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
             event_sink=runtime_events.append,
         )
 
-        self.assertEqual(
-            [LoginMode.ENTERPRISE, LoginMode.MICROSOFT], calls
-        )
+        # 两种 mode 各开一个 runtime(顺序按 LoginMode 枚举)
+        self.assertEqual([LoginMode.ENTERPRISE, LoginMode.MICROSOFT], opened)
         self.assertEqual(1, report.failed)
         self.assertEqual(1, report.logged_in)
         terminal = [
@@ -265,25 +331,32 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
             for event in progress
             if event.status in {"reused", "success", "failed"}
         ]
-        self.assertEqual([1, 2], [event.completed for event in terminal])
-        self.assertEqual("failed", terminal[0].status)
-        self.assertEqual("runtime_failed", terminal[0].code)
-        self.assertEqual("automatic_login", terminal[0].stage)
-        self.assertEqual("success", terminal[1].status)
+        self.assertEqual([1, 2], sorted(event.completed for event in terminal))
+        ent_terminal = next(e for e in terminal if e.account_id == self.accounts[0].id)
+        ms_terminal = next(e for e in terminal if e.account_id == microsoft.id)
+        self.assertEqual("failed", ent_terminal.status)
+        self.assertEqual("login_failed", ent_terminal.code)
+        self.assertEqual("automatic_login", ent_terminal.stage)
+        self.assertEqual("success", ms_terminal.status)
         self.assertEqual([], runtime_events)
 
     async def test_runtime_worker_events_are_forwarded_to_explicit_sink(self):
         emitted = WorkerEvent("browser_stage", {"stage": "portal_init"})
         received = []
 
-        class EventRuntime(Runtime):
+        class EventRuntime:
             def __init__(self, form, emit):
-                super().__init__(form, emit, [])
+                self.form = form
                 self.emit = emit
-
-            async def run(self, entries):
+            async def open_for_concurrent(self): return True
+            async def login_one(self, entry):
                 self.emit(emitted)
-                await super().run(entries)
+                return CredentialRecord(
+                    email=entry.account, auth_method="idc", provider="Enterprise",
+                    refresh_token="refresh-" + entry.account,
+                    start_url=entry.start_url, region="us-east-1",
+                )
+            async def close(self): pass
 
         coordinator = AccountLoginCoordinator(
             self.repo,
@@ -309,11 +382,10 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         class FailingRuntime:
             def __init__(self, form, _emit):
                 self.form = form
-
-            async def run(self, _entries):
+            async def open_for_concurrent(self): return True
+            async def login_one(self, _entry):
                 Path(self.form.password_vault_path).touch()
                 raise RuntimeError("rs_import_failed")
-
             async def close(self):
                 pass
 

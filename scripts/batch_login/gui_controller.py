@@ -48,6 +48,9 @@ class GuiFormState:
     oidc_export_directory: str = ""
     create_api_key: bool = False
     api_key_skip_if_exists: bool = False
+    proxy_enabled: bool = False
+    system_proxy: str = ""
+    home_proxies: str = ""
 
     def validate(
         self,

@@ -23,10 +23,7 @@ class ApiKeyExportReport:
 
 
 class ApiKeyExporter:
-    """把 ksk_ API Key 导出成文本清单:`login = <账号> / apikey = ksk_xxx`,每行一条。
-
-    没有 key 的账号列在文件尾部注释里,便于人工补。
-    """
+    """把 ksk_ API Key 导出成纯清单:每行一个 ksk_xxx,无前缀无注释。"""
 
     def __init__(
         self,
@@ -52,15 +49,8 @@ class ApiKeyExporter:
         stamp = self.now().strftime("%Y%m%d-%H%M%S")
         path = self._unused_path(output_directory / f"kiro-apikeys-{stamp}.txt")
 
-        lines = [
-            f"login = {r.email} / apikey = {(r.kiro_api_key or '').strip()}"
-            for r in with_key
-        ]
-        body = "\n".join(lines)
-        if without_key:
-            body += "\n\n# 未拿到 API Key(需人工补):\n"
-            body += "\n".join(f"# {r.email}" for r in without_key)
-        body += "\n"
+        lines = [(r.kiro_api_key or "").strip() for r in with_key]
+        body = "\n".join(lines) + "\n"
 
         try:
             output_directory.mkdir(parents=True, exist_ok=True)

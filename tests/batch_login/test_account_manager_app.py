@@ -132,6 +132,7 @@ class AccountManagerAppTests(unittest.TestCase):
                 "login_status",
                 "credential_status",
                 "json_status",
+                "quota",
                 "lifecycle_status",
                 "note",
                 "updated_at",
@@ -162,6 +163,8 @@ class AccountManagerAppTests(unittest.TestCase):
                 "粘贴并识别",
                 "指定 URL",
                 "一键登录导出 JSON",
+                "提取 API Key",
+                "代理设置",
                 "自动登录设置",
             ),
             AccountManagerApp.PRIMARY_TOOLBAR_LABELS,
@@ -171,6 +174,7 @@ class AccountManagerAppTests(unittest.TestCase):
                 "全选",
                 "反选",
                 "取消选择",
+                "刷新额度",
                 "查看密码",
                 "更新密码",
                 "导出账号密码",
@@ -220,9 +224,13 @@ class AccountManagerAppTests(unittest.TestCase):
         app = object.__new__(AccountManagerApp)
         app.json_status_by_id = {}
         app.login_progress_var = FakeVar(0)
+        app.login_progress_prefix = "JSON 进度"
         app.login_progress_text_var = FakeVar("")
+        app.login_count_var = FakeVar("")
+        app.extract_count_var = FakeVar("")
         app.tree = FakeTree(rows=(7,))
         app.login_log_text = FakeText()
+        app.extract_log_text = FakeText()
 
         app._apply_login_progress(
             LoginProgressEvent(
@@ -383,7 +391,14 @@ class AccountManagerAppTests(unittest.TestCase):
     def test_context_menu_exposes_requested_account_actions(self):
         self.assertEqual(
             (
+                "登录（存 token）",
+                "强制重新登录",
+                "⚡ 并发登录+提Key",
                 "一键获取 JSON",
+                "提取 API Key",
+                "查看 API Key",
+                "复制 API Key",
+                "刷新额度",
                 "复制账号",
                 "复制账号信息",
                 "复制 Start URL",
@@ -451,6 +466,216 @@ class AccountManagerAppTests(unittest.TestCase):
 
             self.assertEqual("old", path.read_text(encoding="utf-8"))
             self.assertEqual([], list(path.parent.glob(".*.tmp")))
+
+    def test_api_key_events_render_safely(self):
+        created = format_worker_event(
+            WorkerEvent("api_key_created", {"accountMasked": "ac***", "keyPrefix": "ksk_abcd1234"})
+        )
+        self.assertIn("ac***", created)
+        self.assertIn("已创建", created)
+
+        reused = format_worker_event(
+            WorkerEvent("api_key_reused", {"accountMasked": "ac***", "hasStoredKey": False})
+        )
+        self.assertIn("需手动补", reused)
+
+        refreshed = format_worker_event(
+            WorkerEvent("api_key_refreshed", {"accountMasked": "ac***"})
+        )
+        self.assertIn("刷新", refreshed)
+
+        failed = format_worker_event(
+            WorkerEvent(
+                "api_key_failed",
+                {"accountMasked": "ac***", "code": "http_error", "message": "boom-secret"},
+            )
+        )
+        self.assertIn("http_error", failed)
+
+        exported = format_worker_event(
+            WorkerEvent("api_key_exported", {"path": "/tmp/kiro-apikeys-x.txt", "count": 3})
+        )
+        self.assertIn("kiro-apikeys", exported)
+
+    def test_api_key_finished_reports_counts(self):
+        from batch_login.account_login_coordinator import ApiKeyExtractionReport
+
+        app = object.__new__(AccountManagerApp)
+        app.login_running = True
+        app.status_var = FakeVar("")
+        app.login_log_text = FakeText()
+        app.refresh = lambda: None
+
+        app._api_key_finished(
+            report=ApiKeyExtractionReport(
+                selected=3, created=2, reused=0, refreshed=1, failed=1, skipped=0,
+                export_path="/tmp/kiro-apikeys.txt",
+            ),
+            error=None,
+        )
+
+        self.assertFalse(app.login_running)
+        self.assertIn("创建 2", app.status_var.get())
+        self.assertIn("失败 1", app.status_var.get())
+        self.assertIn("kiro-apikeys.txt", app.login_log_text.content)
+
+    def test_api_key_finished_surfaces_error(self):
+        app = object.__new__(AccountManagerApp)
+        app.login_running = True
+        app.status_var = FakeVar("")
+        app.login_log_text = FakeText()
+        app.refresh = lambda: None
+        errors = []
+        app._error = errors.append
+
+        app._api_key_finished(report=None, error=RuntimeError("boom"))
+
+        self.assertFalse(app.login_running)
+        self.assertEqual(1, len(errors))
+        self.assertEqual("API Key 提取失败", app.status_var.get())
+
+    def test_copy_api_keys_copies_raw_keys_one_per_line(self):
+        creds = {
+            1: SimpleNamespace(kiro_api_key="ksk_aaa"),
+            2: SimpleNamespace(kiro_api_key="ksk_bbb"),
+            3: SimpleNamespace(kiro_api_key=None),  # no key yet
+        }
+
+        class Repo:
+            def load_credential(self, account_id):
+                return creds.get(account_id)
+
+        app = object.__new__(AccountManagerApp)
+        app.root = None
+        app.service = SimpleNamespace(repository=Repo())
+        app.status_var = FakeVar("")
+        copied = []
+        app._copy = copied.append
+        app._selected_action_ids = lambda: [1, 2, 3]
+
+        app.copy_api_keys()
+
+        self.assertEqual("ksk_aaa\nksk_bbb", copied[0])  # 纯 key,一行一个
+        self.assertIn("已复制 2", app.status_var.get())
+        self.assertIn("1 个还没有", app.status_var.get())
+
+    def test_api_key_phase_event_switches_progress_prefix(self):
+        app = object.__new__(AccountManagerApp)
+        app.login_progress_prefix = "API Key 进度"
+        app.login_progress_var = FakeVar(50)
+        app.login_progress_text_var = FakeVar("")
+        app.login_log_text = FakeText()
+        app.extract_log_text = FakeText()
+
+        app._apply_worker_event(
+            WorkerEvent("api_key_phase", {"phase": "login", "count": 3})
+        )
+        self.assertEqual("登录取 JSON 进度", app.login_progress_prefix)
+        self.assertEqual("登录取 JSON 进度：0/3", app.login_progress_text_var.get())
+        self.assertEqual(0, app.login_progress_var.get())
+
+        app._apply_worker_event(
+            WorkerEvent("api_key_phase", {"phase": "extract", "count": 5})
+        )
+        self.assertEqual("API Key 进度", app.login_progress_prefix)
+        self.assertEqual("API Key 进度：0/5", app.login_progress_text_var.get())
+
+    def test_quota_events_and_cell_render(self):
+        from batch_login.account_manager_app import quota_cell_text
+
+        self.assertEqual("未查询", quota_cell_text(None))
+        self.assertEqual("剩余 416 / 总 550", quota_cell_text({"remaining": 416.0, "total": 550}))
+        self.assertEqual("剩余 416.50 / 总 550", quota_cell_text({"remaining": 416.5, "total": 550}))
+
+        up = format_worker_event(
+            WorkerEvent("quota_updated", {"accountMasked": "ac***", "display": "剩余 5 / 总 10"})
+        )
+        self.assertIn("额度已更新", up)
+        self.assertIn("剩余 5 / 总 10", up)
+        fail = format_worker_event(
+            WorkerEvent("quota_failed", {"accountMasked": "ac***", "code": "http_error"})
+        )
+        self.assertIn("额度查询失败", fail)
+        self.assertIn("http_error", fail)
+
+    def test_quota_finished_reports_counts(self):
+        from batch_login.account_login_coordinator import QuotaRefreshReport
+
+        app = object.__new__(AccountManagerApp)
+        app.login_running = True
+        app.status_var = FakeVar("")
+        app.login_log_text = FakeText()
+        app.refresh = lambda: None
+
+        app._quota_finished(
+            report=QuotaRefreshReport(selected=3, updated=2, refreshed=1, failed=0, skipped=1),
+            error=None,
+        )
+        self.assertFalse(app.login_running)
+        self.assertIn("更新 2", app.status_var.get())
+        self.assertIn("跳过 1", app.status_var.get())
+
+    def test_quota_finished_surfaces_error(self):
+        app = object.__new__(AccountManagerApp)
+        app.login_running = True
+        app.status_var = FakeVar("")
+        app.login_log_text = FakeText()
+        app.refresh = lambda: None
+        errors = []
+        app._error = errors.append
+
+        app._quota_finished(report=None, error=RuntimeError("boom"))
+        self.assertFalse(app.login_running)
+        self.assertEqual(1, len(errors))
+        self.assertEqual("额度刷新失败", app.status_var.get())
+
+    def test_proxy_settings_store_prefers_coordinator_store(self):
+        from batch_login.gui_settings import GuiSettingsStore
+
+        store = GuiSettingsStore(Path("x/settings.json"))
+        app = object.__new__(AccountManagerApp)
+        app.coordinator = SimpleNamespace(settings_store=store)
+        self.assertIs(store, app._settings_store())
+
+        app.coordinator = SimpleNamespace(settings_store=None)
+        self.assertIsInstance(app._settings_store(), GuiSettingsStore)
+
+    def test_home_exit_labels_first_is_round_robin_then_masked(self):
+        labels = AccountManagerApp._home_exit_labels(
+            "socks5://u:p@1.1.1.1:1080\nsocks5://u:p@2.2.2.2:1080"
+        )
+        self.assertEqual(3, len(labels))
+        self.assertIsNone(labels[0][1])  # 全部/轮询 -> 不覆盖
+        self.assertIn("轮询 2", labels[0][0])
+        self.assertEqual("socks5://u:p@1.1.1.1:1080", labels[1][1])  # 原始行作 override
+        self.assertNotIn("u:p", labels[1][0])  # 标签打码,不暴露账密
+        self.assertEqual("socks5://u:p@2.2.2.2:1080", labels[2][1])
+
+    def test_proxy_button_and_handler_present(self):
+        self.assertIn("代理设置", AccountManagerApp.PRIMARY_TOOLBAR_LABELS)
+        self.assertTrue(callable(AccountManagerApp.open_proxy_settings))
+        self.assertEqual(
+            "socks5://127.0.0.1:7890", AccountManagerApp.DEFAULT_SYSTEM_PROXY
+        )
+
+    def test_extract_dispatches_finished_sentinel_through_poller(self):
+        from batch_login.account_login_coordinator import ApiKeyExtractionReport
+        import queue as queue_module
+
+        app = object.__new__(AccountManagerApp)
+        app.login_event_queue = queue_module.Queue()
+        handled = []
+        app._apply_login_progress = lambda e: handled.append(("progress", e))
+        app._apply_worker_event = lambda e: handled.append(("worker", e))
+        app._login_finished = lambda *, report, error: handled.append(("login", report, error))
+        app._api_key_finished = lambda *, report, error: handled.append(("apikey", report, error))
+        app.root = SimpleNamespace(after=lambda *_a: None)
+
+        report = ApiKeyExtractionReport(1, 1, 0, 0, 0, 0, None)
+        app.login_event_queue.put(("apikey_finished", report, None))
+        app._poll_login_events()
+
+        self.assertEqual([("apikey", report, None)], handled)
 
 
 if __name__ == "__main__":

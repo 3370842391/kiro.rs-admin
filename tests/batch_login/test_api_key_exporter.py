@@ -37,8 +37,7 @@ class ApiKeyExporterTests(unittest.TestCase):
             self.assertEqual(1, report.with_key)
             self.assertEqual(1, report.without_key)
             text = report.path.read_text(encoding="utf-8")
-            self.assertIn("login = codeflow2-7 / apikey = ksk_aaa", text)
-            self.assertIn("# codeflow2-8", text)
+            self.assertEqual("ksk_aaa\n", text)  # 纯 key,一行一个,无前缀无注释
 
     def test_returns_none_when_no_keys(self):
         with tempfile.TemporaryDirectory() as tmp:

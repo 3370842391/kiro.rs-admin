@@ -85,6 +85,10 @@ class BatchLoginApp:
         self.resume_var = tk.BooleanVar(value=False)
         self.create_api_key_var = tk.BooleanVar(value=False)
         self.api_key_skip_if_exists_var = tk.BooleanVar(value=False)
+        # 代理设置在账号管理器里配置;此窗口无 UI,仅原样保留,避免保存时被清空。
+        self._proxy_enabled = False
+        self._system_proxy = ""
+        self._home_proxies = ""
         self.rs_url_var = tk.StringVar()
         self.admin_key_var = tk.StringVar(value=self.form.admin_key)
         self.use_ssh_var = tk.BooleanVar(value=False)
@@ -519,6 +523,9 @@ class BatchLoginApp:
             if name == "admin_key" and not value:
                 continue
             variable.set(value)
+        self._proxy_enabled = settings.proxy_enabled
+        self._system_proxy = settings.system_proxy
+        self._home_proxies = settings.home_proxies
         mode = OidcExportMode(settings.oidc_export_mode)
         self.oidc_export_mode_var.set(self.OIDC_EXPORT_LABELS[mode])
 
@@ -551,6 +558,9 @@ class BatchLoginApp:
             oidc_export_directory=self.oidc_export_directory_var.get(),
             create_api_key=bool(self.create_api_key_var.get()),
             api_key_skip_if_exists=bool(self.api_key_skip_if_exists_var.get()),
+            proxy_enabled=getattr(self, "_proxy_enabled", False),
+            system_proxy=getattr(self, "_system_proxy", ""),
+            home_proxies=getattr(self, "_home_proxies", ""),
         )
 
     def _save_configuration(self) -> None:

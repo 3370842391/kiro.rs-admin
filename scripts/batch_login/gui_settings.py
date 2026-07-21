@@ -44,6 +44,9 @@ class GuiSavedSettings:
     oidc_export_directory: str = ""
     create_api_key: bool = False
     api_key_skip_if_exists: bool = False
+    proxy_enabled: bool = False
+    system_proxy: str = ""
+    home_proxies: str = ""
 
     @classmethod
     def from_mapping(cls, value: object) -> GuiSavedSettings:
@@ -75,6 +78,8 @@ class GuiSavedSettings:
             "local_port",
             "oidc_export_mode",
             "oidc_export_directory",
+            "system_proxy",
+            "home_proxies",
         }
         bool_fields = {
             "headless",
@@ -82,6 +87,7 @@ class GuiSavedSettings:
             "use_ssh",
             "create_api_key",
             "api_key_skip_if_exists",
+            "proxy_enabled",
         }
         number_fields = {"timeout_seconds", "mfa_timeout_seconds"}
         cleaned: dict[str, object] = {"version": SETTINGS_VERSION}

@@ -106,6 +106,7 @@ class AccountRepository:
         self.path = Path(path)
         self.protector = protector or WindowsDpapiProtector()
         self._initialize()
+        self._ensure_quota_table()
 
     def upsert_entries(
         self,
@@ -471,6 +472,120 @@ class AccountRepository:
             if isinstance(error, AccountRepositoryError):
                 raise
             raise AccountRepositoryError("账号凭据读取失败") from error
+
+    def _ensure_quota_table(self) -> None:
+        """额度快照表(手动刷新写入)。IF NOT EXISTS,老库也能补建,无需升 schema 版本。"""
+        try:
+            with self._transaction() as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS account_quota (
+                        account_id INTEGER PRIMARY KEY,
+                        remaining REAL,
+                        total REAL,
+                        used REAL,
+                        subscription TEXT,
+                        free_trial INTEGER NOT NULL DEFAULT 0,
+                        next_reset TEXT,
+                        updated_at TEXT NOT NULL,
+                        FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+                    )
+                    """
+                )
+        except sqlite3.Error as error:
+            raise AccountRepositoryError("额度表初始化失败") from error
+
+    def save_quota(
+        self,
+        account_id: int,
+        *,
+        remaining: float,
+        total: float,
+        used: float,
+        subscription: str | None,
+        free_trial: bool,
+        next_reset: str | None,
+    ) -> None:
+        now = self._utc_now()
+        try:
+            with self._transaction() as connection:
+                self._require_ids(connection, [account_id])
+                connection.execute(
+                    """
+                    INSERT INTO account_quota(
+                        account_id, remaining, total, used, subscription,
+                        free_trial, next_reset, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(account_id) DO UPDATE SET
+                        remaining = excluded.remaining,
+                        total = excluded.total,
+                        used = excluded.used,
+                        subscription = excluded.subscription,
+                        free_trial = excluded.free_trial,
+                        next_reset = excluded.next_reset,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        account_id,
+                        float(remaining),
+                        float(total),
+                        float(used),
+                        subscription,
+                        1 if free_trial else 0,
+                        next_reset,
+                        now,
+                    ),
+                )
+        except AccountRepositoryError:
+            raise
+        except sqlite3.Error as error:
+            raise AccountRepositoryError("额度快照保存失败") from error
+
+    def load_quota(self, account_id: int) -> dict[str, object] | None:
+        try:
+            with closing(self._connect()) as connection:
+                row = connection.execute(
+                    "SELECT * FROM account_quota WHERE account_id = ?", (account_id,)
+                ).fetchone()
+            if row is None:
+                return None
+            return {
+                "remaining": row["remaining"],
+                "total": row["total"],
+                "used": row["used"],
+                "subscription": row["subscription"],
+                "free_trial": bool(row["free_trial"]),
+                "next_reset": row["next_reset"],
+                "updated_at": row["updated_at"],
+            }
+        except sqlite3.Error as error:
+            raise AccountRepositoryError("额度快照读取失败") from error
+
+    def load_quotas(self, account_ids: Sequence[int]) -> dict[int, dict[str, object]]:
+        ids = self._unique_ids(account_ids)
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        try:
+            with closing(self._connect()) as connection:
+                rows = connection.execute(
+                    f"SELECT * FROM account_quota WHERE account_id IN ({placeholders})",
+                    tuple(ids),
+                ).fetchall()
+            return {
+                int(row["account_id"]): {
+                    "remaining": row["remaining"],
+                    "total": row["total"],
+                    "used": row["used"],
+                    "subscription": row["subscription"],
+                    "free_trial": bool(row["free_trial"]),
+                    "next_reset": row["next_reset"],
+                    "updated_at": row["updated_at"],
+                }
+                for row in rows
+            }
+        except sqlite3.Error as error:
+            raise AccountRepositoryError("额度快照批量读取失败") from error
 
     def mark_login_running(self, account_ids: Sequence[int]) -> int:
         ids = self._unique_ids(account_ids)
