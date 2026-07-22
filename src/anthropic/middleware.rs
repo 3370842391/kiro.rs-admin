@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::{
     body::Body,
     extract::State,
-    http::{Request, StatusCode},
+    http::{HeaderValue, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Json, Response},
 };
@@ -248,4 +248,51 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["responseMode"], "kiro_native");
     }
+
+    #[tokio::test]
+    async fn oneapi_request_id_middleware_adds_request_and_response_headers() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::extract::Request;
+        use axum::http::HeaderMap;
+        use axum::middleware;
+        use axum::response::IntoResponse;
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        async fn inspect(headers: HeaderMap) -> impl IntoResponse {
+            assert!(headers.get("x-oneapi-request-id").is_some());
+            "ok"
+        }
+
+        let app = Router::new()
+            .route("/", get(inspect))
+            .layer(middleware::from_fn(oneapi_request_id_middleware));
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let value = response
+            .headers()
+            .get("x-oneapi-request-id")
+            .and_then(|header| header.to_str().ok())
+            .unwrap_or_default();
+        assert!(!value.is_empty());
+        assert!(uuid::Uuid::parse_str(value).is_ok());
+    }
+}
+
+/// Generates one correlation id for the whole request and exposes it to NewAPI.
+/// Any client-provided value is replaced before the handler observes headers.
+pub async fn oneapi_request_id_middleware(mut request: Request<Body>, next: Next) -> Response {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let header_value = HeaderValue::from_str(&request_id).expect("UUID is a valid header value");
+    request
+        .headers_mut()
+        .insert("x-oneapi-request-id", header_value.clone());
+    let mut response = next.run(request).await;
+    response
+        .headers_mut()
+        .insert("x-oneapi-request-id", header_value);
+    response
 }
