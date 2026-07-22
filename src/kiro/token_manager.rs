@@ -30,7 +30,7 @@ use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::kiro::region::{
     API_KEY_AUTH_REGION, KiroService, data_plane_host, rest_region_candidates, validate_api_region,
 };
-use crate::model::config::{Config, RetryMode, RetryPolicy};
+use crate::model::config::{Config, EndpointMode, RetryMode, RetryPolicy};
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -1255,6 +1255,8 @@ pub struct MultiTokenManager {
     retry_policy: Mutex<Option<RetryPolicy>>,
     /// 429 降级桶链运行时覆盖（运行时可修改）。None = 回退各 endpoint 静态 fallback_chain()。
     endpoint_chains: Mutex<Option<HashMap<String, Vec<String>>>>,
+    /// 全局端点路由模式，运行时可由 Admin API 切换。
+    endpoint_mode: Mutex<EndpointMode>,
     /// 单请求备用桶尝试总数硬上限（运行时可修改，0 = 不限）。
     max_bucket_attempts_per_request: AtomicUsize,
     /// 流式空闲超时秒数（运行时可修改，0 = 关闭 idle watchdog）。
@@ -1494,6 +1496,7 @@ impl MultiTokenManager {
         let retry_mode = config.retry_mode;
         let retry_policy = config.retry_policy.clone();
         let endpoint_chains = config.endpoint_chains.clone();
+        let endpoint_mode = config.endpoint_mode;
         let max_bucket_attempts = config.max_bucket_attempts_per_request;
         let stream_idle_timeout_secs = config.stream_idle_timeout_secs;
         let empty_user_message_compat = config.empty_user_message_compat;
@@ -1528,6 +1531,7 @@ impl MultiTokenManager {
             retry_mode: Mutex::new(retry_mode),
             retry_policy: Mutex::new(retry_policy),
             endpoint_chains: Mutex::new(endpoint_chains),
+            endpoint_mode: Mutex::new(endpoint_mode),
             max_bucket_attempts_per_request: AtomicUsize::new(max_bucket_attempts),
             stream_idle_timeout_secs: AtomicU64::new(stream_idle_timeout_secs),
             empty_user_message_compat: AtomicBool::new(empty_user_message_compat),
@@ -4394,6 +4398,38 @@ impl MultiTokenManager {
             .save()
             .with_context(|| format!("持久化降级桶链失败: {}", config_path.display()))?;
 
+        Ok(())
+    }
+
+    /// 获取当前端点路由模式。
+    pub fn get_endpoint_mode(&self) -> EndpointMode {
+        *self.endpoint_mode.lock()
+    }
+
+    /// 更新端点路由模式并持久化 config.json。
+    pub fn set_endpoint_mode(&self, mode: EndpointMode) -> anyhow::Result<()> {
+        let previous = *self.endpoint_mode.lock();
+        *self.endpoint_mode.lock() = mode;
+        if let Err(error) = self.persist_endpoint_mode(mode) {
+            *self.endpoint_mode.lock() = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn persist_endpoint_mode(&self, mode: EndpointMode) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let Some(path) = self.config.config_path() else {
+            tracing::warn!("配置文件路径未知，端点模式仅在当前进程生效");
+            return Ok(());
+        };
+        let mut config = Config::load(path)
+            .with_context(|| format!("重新加载配置失败: {}", path.display()))?;
+        config.endpoint_mode = mode;
+        config
+            .save()
+            .with_context(|| format!("持久化端点模式失败: {}", path.display()))?;
         Ok(())
     }
 
