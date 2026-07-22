@@ -388,6 +388,7 @@ class AccountLoginCoordinator:
         self,
         account_ids: list[int],
         *,
+        concurrency: int = 5,
         progress=None,
         event_sink=None,
         home_proxies_override: str | None = None,
@@ -414,6 +415,8 @@ class AccountLoginCoordinator:
         positions = {account.id: index for index, account in enumerate(accounts, start=1)}
 
         updated = refreshed = failed = skipped = 0
+        limiter = asyncio.Semaphore(max(1, int(concurrency)))
+        counters_lock = asyncio.Lock()
 
         def notify(account, status, *, code=None, terminal=False):
             nonlocal completed
@@ -434,71 +437,83 @@ class AccountLoginCoordinator:
         for account in accounts:
             notify(account, "waiting")
 
-        for account in accounts:
-            notify(account, "running")
-            credential = self.repository.load_credential(account.id)
-            if credential is None:
-                skipped += 1
-                emit(
-                    WorkerEvent(
-                        "quota_failed",
-                        {
-                            "accountMasked": mask_account(account.account),
-                            "code": "no_credential",
-                            "message": "账号还没有登录凭据,请先登录",
-                        },
-                    )
-                )
-                notify(account, "failed", code="no_credential", terminal=True)
-                continue
+        async def handle(account):
+            nonlocal updated, refreshed, failed, skipped
+            async with limiter:
+                notify(account, "running")
+                credential = self.repository.load_credential(account.id)
+                if credential is None:
+                    async with counters_lock:
+                        skipped += 1
+                        emit(
+                            WorkerEvent(
+                                "quota_failed",
+                                {
+                                    "accountMasked": mask_account(account.account),
+                                    "code": "no_credential",
+                                    "message": "账号还没有登录凭据,请先登录",
+                                },
+                            )
+                        )
+                        notify(account, "failed", code="no_credential", terminal=True)
+                    return
 
-            transport = transport_factory()
-            try:
-                if await self._maybe_refresh_token(account, credential, transport, saved, emit):
-                    refreshed += 1
-                snapshot = await self._fetch_quota(credential, account, transport, saved)
-            except (UsageError, ApiKeyError) as error:
-                failed += 1
-                emit(
-                    WorkerEvent(
-                        "quota_failed",
-                        {
-                            "accountMasked": mask_account(account.account),
-                            "code": error.code,
-                            "stage": error.stage,
-                            "message": redact_text(str(error)),
-                        },
-                    )
-                )
-                notify(account, "failed", code=error.code, terminal=True)
-                continue
-            finally:
+                transport = transport_factory()
                 try:
-                    await transport.close()
-                except Exception:  # noqa: BLE001 - 关闭失败不阻断
-                    pass
+                    did_refresh = await self._maybe_refresh_token(
+                        account, credential, transport, saved, emit
+                    )
+                    snapshot = await self._fetch_quota(
+                        credential, account, transport, saved
+                    )
+                except (UsageError, ApiKeyError) as error:
+                    async with counters_lock:
+                        failed += 1
+                        emit(
+                            WorkerEvent(
+                                "quota_failed",
+                                {
+                                    "accountMasked": mask_account(account.account),
+                                    "code": error.code,
+                                    "stage": error.stage,
+                                    "message": redact_text(str(error)),
+                                },
+                            )
+                        )
+                        notify(account, "failed", code=error.code, terminal=True)
+                    return
+                finally:
+                    try:
+                        await transport.close()
+                    except Exception:  # noqa: BLE001 - 关闭失败不阻断
+                        pass
 
-            self.repository.save_quota(
-                account.id,
-                remaining=snapshot.remaining,
-                total=snapshot.total,
-                used=snapshot.used,
-                subscription=snapshot.subscription,
-                free_trial=snapshot.free_trial,
-                next_reset=snapshot.next_reset,
-            )
-            updated += 1
-            emit(
-                WorkerEvent(
-                    "quota_updated",
-                    {
-                        "accountMasked": mask_account(account.account),
-                        "display": snapshot.display(),
-                        "subscription": snapshot.subscription,
-                    },
+                self.repository.save_quota(
+                    account.id,
+                    remaining=snapshot.remaining,
+                    total=snapshot.total,
+                    used=snapshot.used,
+                    subscription=snapshot.subscription,
+                    free_trial=snapshot.free_trial,
+                    next_reset=snapshot.next_reset,
                 )
-            )
-            notify(account, "success", terminal=True)
+                async with counters_lock:
+                    if did_refresh:
+                        refreshed += 1
+                    updated += 1
+                    emit(
+                        WorkerEvent(
+                            "quota_updated",
+                            {
+                                "accountMasked": mask_account(account.account),
+                                "display": snapshot.display(),
+                                "subscription": snapshot.subscription,
+                            },
+                        )
+                    )
+                    notify(account, "success", terminal=True)
+
+        await asyncio.gather(*(handle(account) for account in accounts))
 
         return QuotaRefreshReport(
             selected=total,
@@ -539,6 +554,7 @@ class AccountLoginCoordinator:
         account_ids: list[int],
         *,
         force_relogin: bool = False,
+        concurrency: int = 5,
         progress=None,
         event_sink=None,
         home_proxies_override: str | None = None,
@@ -568,6 +584,7 @@ class AccountLoginCoordinator:
                 await self.run(
                     need_login,
                     force_relogin=force_relogin,
+                    concurrency=concurrency,
                     progress=progress,
                     event_sink=event_sink,
                     home_proxies_override=home_proxies_override,
@@ -583,6 +600,7 @@ class AccountLoginCoordinator:
         emit(WorkerEvent("api_key_phase", {"phase": "extract", "count": len(ids)}))
         return await self.extract_api_keys(
             ids,
+            concurrency=concurrency,
             progress=progress,
             event_sink=event_sink,
             home_proxies_override=home_proxies_override,

@@ -1,3 +1,4 @@
+import asyncio
 import sys
 import tempfile
 import unittest
@@ -221,6 +222,55 @@ class RefreshQuotaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, report.failed)
         self.assertEqual(0, report.updated)
         self.assertTrue(self.transports[0].closed)
+
+    async def test_refresh_quota_honors_concurrency_limit(self):
+        extra_accounts = self.repo.upsert_entries(
+            [
+                AccountEntry(2, "acc-2", "pw", "https://d-9067123456.awsapps.com/start"),
+                AccountEntry(3, "acc-3", "pw", "https://d-9067123456.awsapps.com/start"),
+                AccountEntry(4, "acc-4", "pw", "https://d-9067123456.awsapps.com/start"),
+            ],
+            login_mode=LoginMode.ENTERPRISE,
+            region="us-east-1",
+        )
+        accounts = [self.account, *extra_accounts]
+        for account in accounts:
+            self.repo.save_credential(
+                account.id,
+                CredentialRecord(
+                    email=account.account,
+                    auth_method="idc",
+                    provider="Enterprise",
+                    access_token=f"tok-{account.id}",
+                    profile_arn="arn:x",
+                    region="us-east-1",
+                    expires_at=stamp(3600),
+                    start_url=account.start_url,
+                ),
+            )
+
+        coordinator = self._coordinator()
+        active = 0
+        max_active = 0
+
+        async def fake_usage(*_args, **_kwargs):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return UsageSnapshot(10, 20, 10, None, False, None)
+
+        import batch_login.account_login_coordinator as mod
+        with _patch(mod, "get_usage_limits", fake_usage):
+            report = await coordinator.refresh_quota(
+                [account.id for account in accounts],
+                concurrency=2,
+                event_sink=lambda _e: None,
+            )
+
+        self.assertEqual(4, report.updated)
+        self.assertEqual(2, max_active)
 
 
 if __name__ == "__main__":

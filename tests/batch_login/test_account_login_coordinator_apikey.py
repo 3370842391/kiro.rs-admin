@@ -368,8 +368,27 @@ class ExtractApiKeysTests(unittest.IsolatedAsyncioTestCase):
         coordinator.extract_api_keys = fake_extract
 
         await coordinator.login_and_extract_api_keys([self.account_id])
+        self.assertEqual([], run_calls)
 
-        self.assertEqual([], run_calls)  # 已有有效凭据,不登录
+    async def test_login_and_extract_forwards_same_concurrency_to_both_stages(self):
+        coordinator, _events, _progress = self._coordinator()
+        calls = []
+
+        async def fake_run(ids, **kwargs):
+            calls.append(("login", kwargs["concurrency"]))
+
+        async def fake_extract(ids, **kwargs):
+            calls.append(("extract", kwargs["concurrency"]))
+            return ApiKeyExtractionReport(len(ids), len(ids), 0, 0, 0, 0, None)
+
+        coordinator.run = fake_run
+        coordinator.extract_api_keys = fake_extract
+
+        await coordinator.login_and_extract_api_keys(
+            [self.account_id], concurrency=2
+        )
+
+        self.assertEqual([("login", 2), ("extract", 2)], calls)
 
     async def test_missing_refresh_material_uses_stored_token(self):
         # 过期但缺 refresh 材料:不刷新,直接用库存 token 尝试。

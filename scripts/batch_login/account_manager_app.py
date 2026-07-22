@@ -1388,6 +1388,7 @@ class AccountManagerApp:
         if self.coordinator is None:
             messagebox.showerror("登录", "登录协调器未初始化", parent=self.root)
             return
+        concurrency = self._read_concurrency()
         exit_override = self._choose_home_exit("登录")
         if exit_override is _EXIT_CANCELLED:
             self._append_login_log("已取消登录（未选择家宽出口）", "warn")
@@ -1398,14 +1399,15 @@ class AccountManagerApp:
         self._prepare_login_progress(ids)
         mode_hint = "强制重新登录" if force_relogin else "复用有效 token，仅登录失效账号"
         self._append_login_log(
-            f"开始登录 {len(ids)} 个账号（{mode_hint}；只存 token 不导文件）"
+            f"开始登录 {len(ids)} 个账号（并发 {concurrency}；{mode_hint}；只存 token 不导文件）"
         )
-        self.status_var.set(f"正在登录 {len(ids)} 个账号…")
+        self.status_var.set(f"正在登录 {len(ids)} 个账号（并发 {concurrency}）…")
 
         self._spawn_cancelable_task(
             lambda: self.coordinator.run(
                 ids,
                 force_relogin=force_relogin,
+                concurrency=concurrency,
                 progress=self.login_event_queue.put,
                 event_sink=self.login_event_queue.put,
                 home_proxies_override=exit_override,
@@ -1429,9 +1431,10 @@ class AccountManagerApp:
         if self.coordinator is None:
             messagebox.showerror("一键登录", "登录协调器未初始化", parent=self.root)
             return
+        concurrency = self._read_concurrency()
         choice = messagebox.askyesnocancel(
             "一键登录导出 JSON",
-            "选择“是”将强制重新登录全部账号；选择“否”将复用已有有效凭据。",
+            f"当前并发 {concurrency}。选择“是”将强制重新登录全部账号；选择“否”将复用已有有效凭据。",
             parent=self.root,
         )
         if choice is None:
@@ -1443,13 +1446,14 @@ class AccountManagerApp:
         self.login_action_label = "一键登录导出 JSON"
         self.login_progress_prefix = "JSON 进度"
         self._prepare_login_progress(ids)
-        self._append_login_log(f"开始获取 {len(ids)} 个账号的 JSON")
-        self.status_var.set(f"正在处理 {len(ids)} 个账号…")
+        self._append_login_log(f"开始获取 {len(ids)} 个账号的 JSON（并发 {concurrency}）")
+        self.status_var.set(f"正在处理 {len(ids)} 个账号（并发 {concurrency}）…")
 
         self._spawn_cancelable_task(
             lambda: self.coordinator.run(
                 ids,
                 force_relogin=bool(choice),
+                concurrency=concurrency,
                 progress=self.login_event_queue.put,
                 event_sink=self.login_event_queue.put,
                 home_proxies_override=exit_override,
@@ -1512,9 +1516,10 @@ class AccountManagerApp:
         if self.coordinator is None:
             messagebox.showerror("提取 API Key", "登录协调器未初始化", parent=self.root)
             return
+        concurrency = self._read_concurrency()
         if not messagebox.askyesno(
             "提取 API Key",
-            f"将为 {len(ids)} 个账号提取 API Key（ksk_）。\n"
+            f"将为 {len(ids)} 个账号提取 API Key（ksk_，并发 {concurrency}）。\n"
             "缺 JSON 的账号会自动先登录取凭据，过期 token 会先刷新。是否继续？",
             parent=self.root,
         ):
@@ -1525,12 +1530,15 @@ class AccountManagerApp:
         self._set_task_running(True)
         self.login_progress_prefix = "API Key 进度"
         self._prepare_login_progress(ids)
-        self._append_login_log(f"开始为 {len(ids)} 个账号提取 API Key（缺 JSON 的先自动登录）")
-        self.status_var.set(f"正在提取 {len(ids)} 个账号的 API Key…")
+        self._append_login_log(
+            f"开始为 {len(ids)} 个账号提取 API Key（并发 {concurrency}；缺 JSON 的先自动登录）"
+        )
+        self.status_var.set(f"正在提取 {len(ids)} 个账号的 API Key（并发 {concurrency}）…")
 
         self._spawn_cancelable_task(
             lambda: self.coordinator.login_and_extract_api_keys(
                 ids,
+                concurrency=concurrency,
                 progress=self.login_event_queue.put,
                 event_sink=self.login_event_queue.put,
                 home_proxies_override=exit_override,
@@ -1572,18 +1580,20 @@ class AccountManagerApp:
         if self.coordinator is None:
             messagebox.showerror("刷新额度", "登录协调器未初始化", parent=self.root)
             return
+        concurrency = self._read_concurrency()
         exit_override = self._choose_home_exit("刷新额度")
         if exit_override is _EXIT_CANCELLED:
             return
         self._set_task_running(True)
         self.login_progress_prefix = "额度进度"
         self._prepare_login_progress(ids)
-        self._append_login_log(f"开始刷新 {len(ids)} 个账号的剩余额度")
-        self.status_var.set(f"正在刷新 {len(ids)} 个账号额度…")
+        self._append_login_log(f"开始刷新 {len(ids)} 个账号的剩余额度（并发 {concurrency}）")
+        self.status_var.set(f"正在刷新 {len(ids)} 个账号额度（并发 {concurrency}）…")
 
         self._spawn_cancelable_task(
             lambda: self.coordinator.refresh_quota(
                 ids,
+                concurrency=concurrency,
                 progress=self.login_event_queue.put,
                 event_sink=self.login_event_queue.put,
                 home_proxies_override=exit_override,

@@ -123,6 +123,80 @@ class FakeMenu:
 
 
 class AccountManagerAppTests(unittest.TestCase):
+    def test_extract_api_key_entry_passes_selected_concurrency(self):
+        calls = []
+
+        def fake_extract(*args, **kwargs):
+            calls.append((args, kwargs))
+            return "fake-coro"
+
+        app = object.__new__(AccountManagerApp)
+        app.root = None
+        app.login_running = False
+        app.coordinator = SimpleNamespace(
+            login_and_extract_api_keys=fake_extract,
+        )
+        app.login_event_queue = SimpleNamespace(put=lambda _event: None)
+        app.status_var = FakeVar("")
+        app._selected_action_ids = lambda: [1, 2]
+        app._read_concurrency = lambda: 3
+        app._choose_home_exit = lambda _title: None
+        app._set_task_running = lambda _running: None
+        app._prepare_login_progress = lambda _ids: None
+        app._append_login_log = lambda *_args: None
+        app._spawn_cancelable_task = lambda factory, _tag: factory()
+
+        with patch.object(account_manager_module.messagebox, "askyesno", return_value=True):
+            app.start_api_key_extraction()
+
+        self.assertEqual(1, len(calls))
+        self.assertEqual(3, calls[0][1]["concurrency"])
+        self.assertIn("并发 3", app.status_var.get())
+
+    def test_all_batch_entries_pass_selected_concurrency(self):
+        calls = []
+
+        def record(name):
+            def invoke(*args, **kwargs):
+                calls.append((name, kwargs))
+                return "fake-coro"
+
+            return invoke
+
+        app = object.__new__(AccountManagerApp)
+        app.root = None
+        app.login_running = False
+        app.coordinator = SimpleNamespace(
+            run=record("run"),
+            login_and_extract_api_keys=record("extract"),
+            refresh_quota=record("quota"),
+        )
+        app.login_event_queue = SimpleNamespace(put=lambda _event: None)
+        app.status_var = FakeVar("")
+        app.login_progress_prefix = ""
+        app.login_action_label = ""
+        app._selected_action_ids = lambda: [1, 2]
+        app._read_concurrency = lambda: 3
+        app._choose_home_exit = lambda _title: None
+        app._set_task_running = lambda _running: None
+        app._prepare_login_progress = lambda _ids: None
+        app._append_login_log = lambda *_args: None
+        app._append_extract_log = lambda *_args: None
+        app._spawn_cancelable_task = lambda factory, _tag: factory()
+
+        with patch.object(account_manager_module.messagebox, "askyesno", return_value=True), patch.object(
+            account_manager_module.messagebox,
+            "askyesnocancel",
+            return_value=False,
+        ):
+            app.start_login_only()
+            app.start_login_export()
+            app.start_api_key_extraction()
+            app.start_quota_refresh()
+
+        self.assertEqual(["run", "run", "extract", "quota"], [name for name, _ in calls])
+        self.assertEqual([3, 3, 3, 3], [kwargs["concurrency"] for _, kwargs in calls])
+
     def test_main_table_contains_management_columns(self):
         self.assertEqual(
             (
