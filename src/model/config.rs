@@ -369,6 +369,26 @@ pub struct Config {
     #[serde(default = "default_usage_log_retention_days")]
     pub usage_log_retention_days: u32,
 
+    /// NewAPI 利润统计连接地址（仅管理员统计使用）。
+    #[serde(default)]
+    pub profit_newapi_base: Option<String>,
+
+    /// NewAPI 利润统计访问令牌（仅服务端使用，不回显到管理端）。
+    #[serde(default)]
+    pub profit_newapi_token: Option<String>,
+
+    /// NewAPI 管理员用户 ID。
+    #[serde(default)]
+    pub profit_newapi_user: Option<String>,
+
+    /// Kiro 每个 Credit 的采购成本，默认 ¥45 / 2000。
+    #[serde(default = "default_profit_credit_price")]
+    pub profit_credit_price: f64,
+
+    /// NewAPI quota 转换为 ¥1 所需的额度单位。
+    #[serde(default = "default_profit_quota_per_unit")]
+    pub profit_quota_per_unit: f64,
+
     /// 是否记录失败、中断和可选恢复请求的完整脱敏诊断快照。
     #[serde(default = "default_true")]
     pub error_snapshot_enabled: bool,
@@ -665,6 +685,14 @@ fn default_usage_log_retention_days() -> u32 {
     31
 }
 
+fn default_profit_credit_price() -> f64 {
+    45.0 / 2000.0
+}
+
+fn default_profit_quota_per_unit() -> f64 {
+    500_000.0
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -708,6 +736,11 @@ impl Default for Config {
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
+            profit_newapi_base: None,
+            profit_newapi_token: None,
+            profit_newapi_user: None,
+            profit_credit_price: default_profit_credit_price(),
+            profit_quota_per_unit: default_profit_quota_per_unit(),
             error_snapshot_enabled: true,
             error_snapshot_retention_days: default_error_snapshot_retention_days(),
             error_snapshot_max_storage_gb: default_error_snapshot_max_storage_gb(),
@@ -832,6 +865,18 @@ mod tests {
         assert_eq!(encoded["errorSnapshotCaptureRecovered"], false);
         assert_eq!(encoded["errorSnapshotCaptureBodies"], false);
         assert_eq!(encoded["errorSnapshotMinFreeDiskGb"], 32);
+    }
+
+    #[test]
+    fn profit_config_defaults_to_45_over_2000_and_round_trips() {
+        let defaulted: Config = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!((defaulted.profit_credit_price - 0.0225).abs() < 1e-12);
+        assert_eq!(defaulted.profit_quota_per_unit, 500_000.0);
+        assert!(defaulted.profit_newapi_token.is_none());
+
+        let value = serde_json::to_value(&defaulted).unwrap();
+        assert_eq!(value["profitCreditPrice"], 0.0225);
+        assert_eq!(value["profitQuotaPerUnit"], 500_000.0);
     }
 
     #[test]
