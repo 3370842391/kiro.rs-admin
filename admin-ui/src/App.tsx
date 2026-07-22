@@ -4,7 +4,7 @@ import { LoginPage } from "@/components/login-page";
 import { Toaster } from "@/components/ui/sonner";
 import { ConfirmProvider } from "@/components/ui/confirm-dialog";
 import { Button } from "@/components/ui/button";
-import { Activity, KeyRound, Server, LogOut, Moon, Sun, ScrollText, FolderTree, ShieldAlert } from "lucide-react";
+import { Activity, KeyRound, Server, LogOut, Moon, Sun, ScrollText, FolderTree, ShieldAlert, DollarSign } from "lucide-react";
 import { TopbarTools } from "@/components/topbar-tools";
 
 function GithubIcon({ className }: { className?: string }) {
@@ -48,8 +48,13 @@ const ErrorSnapshotPage = lazy(() =>
     default: m.ErrorSnapshotPage,
   })),
 );
+const ProfitPage = lazy(() =>
+  import("@/components/profit-page").then((m) => ({
+    default: m.ProfitPage,
+  })),
+);
 
-type Tab = "overview" | "credentials" | "keys" | "groups" | "traces" | "snapshots";
+type Tab = "overview" | "credentials" | "keys" | "groups" | "traces" | "snapshots" | "profit";
 
 const TABS: {
   key: Tab;
@@ -93,6 +98,12 @@ const TABS: {
     mobileLabel: "快照",
     icon: <ShieldAlert className="h-3.5 w-3.5" />,
   },
+  {
+    key: "profit",
+    label: "利润报表",
+    mobileLabel: "利润",
+    icon: <DollarSign className="h-3.5 w-3.5" />,
+  },
 ];
 
 function readTabFromHash(): Tab {
@@ -103,7 +114,8 @@ function readTabFromHash(): Tab {
     h === "groups" ||
     h === "overview" ||
     h === "traces" ||
-    h === "snapshots"
+    h === "snapshots" ||
+    h === "profit"
   )
     return h;
   return "overview";
@@ -391,6 +403,7 @@ function AppMain({ onLogout, tab }: { onLogout: () => void; tab: Tab }) {
         {tab === "groups" && <GroupsPage />}
         {tab === "traces" && <TraceLogPage />}
         {tab === "snapshots" && <ErrorSnapshotPage />}
+        {tab === "profit" && <ProfitPage />}
       </Suspense>
     </main>
   );

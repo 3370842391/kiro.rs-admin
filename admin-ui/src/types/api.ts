@@ -128,6 +128,58 @@ export interface AdminErrorResponse {
   }
 }
 
+// NewAPI 收入与 RS Credits 成本利润报表
+export interface ProfitConfigView {
+  newapiBase?: string
+  newapiUser?: string
+  creditPrice: number
+  quotaPerUnit: number
+  tokenConfigured: boolean
+}
+
+export interface ProfitConfigUpdate {
+  newapiBase?: string
+  newapiToken?: string
+  newapiUser?: string
+  creditPrice?: number
+  quotaPerUnit?: number
+}
+
+export interface ProfitBreakdownStat {
+  name: string
+  keyId?: number
+  keyName?: string
+  count: number
+  revenue: number
+  credits: number
+  cost: number
+  profit: number
+  missingCost: number
+}
+
+export interface ProfitReport {
+  startTimestamp: number
+  endTimestamp: number
+  minutes: number
+  creditPrice: number
+  quotaPerUnit: number
+  rows: number
+  matched: number
+  unmatched: number
+  missingCost: number
+  revenue: number
+  matchedRevenue: number
+  unmatchedRevenue: number
+  credits: number
+  cost: number
+  profit: number
+  marginPct: number
+  byKey: ProfitBreakdownStat[]
+  byGroup: ProfitBreakdownStat[]
+  byModel: ProfitBreakdownStat[]
+  byUser: ProfitBreakdownStat[]
+}
+
 // 请求类型
 export interface SetDisabledRequest {
   disabled: boolean
