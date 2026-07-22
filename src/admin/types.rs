@@ -637,6 +637,33 @@ pub struct SetCompatibilityConfigRequest {
     pub empty_user_message_compat: bool,
 }
 
+/// 利润报表配置（Token 只返回是否已配置）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfitConfigResponse {
+    pub newapi_base: Option<String>,
+    pub newapi_user: Option<String>,
+    pub credit_price: f64,
+    pub quota_per_unit: f64,
+    pub token_configured: bool,
+}
+
+/// 更新利润报表配置；Token 省略或空字符串表示保留原值。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetProfitConfigRequest {
+    #[serde(default)]
+    pub newapi_base: Option<String>,
+    #[serde(default)]
+    pub newapi_token: Option<String>,
+    #[serde(default)]
+    pub newapi_user: Option<String>,
+    #[serde(default)]
+    pub credit_price: Option<f64>,
+    #[serde(default)]
+    pub quota_per_unit: Option<f64>,
+}
+
 /// 普通 429 重试策略响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

@@ -37,6 +37,7 @@ use super::error::AdminServiceError;
 use super::model_profile_sync::{
     ModelProfileSyncService, PreviewCacheError, SyncCollection, SyncError,
 };
+use super::profit::ProfitConfig;
 use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
     AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse,
@@ -54,16 +55,16 @@ use super::types::{
     ModelProfileSettingsResponse, ModelProfileSourceSummaryResponse, ModelProfileSyncResponse,
     ModelProfileSyncSummaryResponse, ModelProfileViewResponse, ModelProfilesResponse,
     PatchModelProfileRequest, PollIdcLoginResponse, PreviewModelProfilesRequest,
-    ProxyBalancingModeResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyCheckUrlRequest,
-    ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult, ResolvedModelProfileResponse,
-    RetryPolicyResponse, RevisionRequest, RpmSummary, SetAccountThrottleConfigRequest,
-    SetCacheHitRateRequest, SetCachePolicyRequest, SetCompatibilityConfigRequest,
-    SetEndpointChainsRequest, SetEndpointModeRequest, SetImageBudgetRequest,
-    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetModelProfileSettingsRequest,
-    SetProxyBalancingModeRequest, SetRetryPolicyRequest, SetUpdateConfigRequest,
-    StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse,
-    SyncModelProfilesRequest, UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest,
-    UpdateRefreshTokenRequest,
+    ProfitConfigResponse, ProxyBalancingModeResponse, ProxyCheckAllResponse, ProxyCheckResponse,
+    ProxyCheckUrlRequest, ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult,
+    ResolvedModelProfileResponse, RetryPolicyResponse, RevisionRequest, RpmSummary,
+    SetAccountThrottleConfigRequest, SetCacheHitRateRequest, SetCachePolicyRequest,
+    SetCompatibilityConfigRequest, SetEndpointChainsRequest, SetEndpointModeRequest,
+    SetImageBudgetRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
+    SetModelProfileSettingsRequest, SetProfitConfigRequest, SetProxyBalancingModeRequest,
+    SetRetryPolicyRequest, SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse,
+    StartSocialLoginRequest, StartSocialLoginResponse, SyncModelProfilesRequest, UpdateCheckInfo,
+    UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -2714,6 +2715,105 @@ impl AdminService {
             .set_empty_user_message_compat(req.empty_user_message_compat)
             .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
         Ok(self.get_compatibility_config())
+    }
+
+    /// 从磁盘读取最新利润配置，避免保存后继续使用启动时快照。
+    pub fn load_profit_config(&self) -> Result<ProfitConfig, AdminServiceError> {
+        let base = self.token_manager.config();
+        let cfg = if let Some(path) = base.config_path() {
+            Config::load(path)
+                .map_err(|error| AdminServiceError::InternalError(error.to_string()))?
+        } else {
+            base.clone()
+        };
+        Ok(ProfitConfig {
+            newapi_base: cfg.profit_newapi_base,
+            newapi_token: cfg.profit_newapi_token,
+            newapi_user: cfg.profit_newapi_user,
+            credit_price: cfg.profit_credit_price,
+            quota_per_unit: cfg.profit_quota_per_unit,
+        })
+    }
+
+    /// Reads profit configuration; the access token is returned only as a boolean.
+    pub fn get_profit_config(&self) -> Result<ProfitConfigResponse, AdminServiceError> {
+        let cfg = self.load_profit_config()?;
+        Ok(ProfitConfigResponse {
+            newapi_base: cfg.newapi_base,
+            newapi_user: cfg.newapi_user,
+            credit_price: cfg.credit_price,
+            quota_per_unit: cfg.quota_per_unit,
+            token_configured: cfg
+                .newapi_token
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty()),
+        })
+    }
+
+    /// Updates profit configuration and persists it to config.json.
+    pub fn set_profit_config(
+        &self,
+        req: SetProfitConfigRequest,
+    ) -> Result<ProfitConfigResponse, AdminServiceError> {
+        let path = self
+            .token_manager
+            .config()
+            .config_path()
+            .ok_or_else(|| AdminServiceError::InternalError("配置文件路径未知".to_string()))?
+            .to_path_buf();
+        let mut cfg = Config::load(&path)
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+
+        if let Some(base) = req.newapi_base {
+            let normalized = base.trim().trim_end_matches('/').to_string();
+            if !normalized.is_empty()
+                && !(normalized.starts_with("http://") || normalized.starts_with("https://"))
+            {
+                return Err(AdminServiceError::InvalidCredential(
+                    "NewAPI 地址必须使用 http:// 或 https://".to_string(),
+                ));
+            }
+            cfg.profit_newapi_base = (!normalized.is_empty()).then_some(normalized);
+        }
+        if let Some(token) = req.newapi_token {
+            let token = token.trim().to_string();
+            if !token.is_empty() {
+                cfg.profit_newapi_token = Some(token);
+            }
+        }
+        if let Some(user) = req.newapi_user {
+            let user = user.trim().to_string();
+            cfg.profit_newapi_user = (!user.is_empty()).then_some(user);
+        }
+        if let Some(price) = req.credit_price {
+            if !price.is_finite() || price <= 0.0 {
+                return Err(AdminServiceError::InvalidCredential(
+                    "Credit 单价必须是正数".to_string(),
+                ));
+            }
+            cfg.profit_credit_price = price;
+        }
+        if let Some(quota_per_unit) = req.quota_per_unit {
+            if !quota_per_unit.is_finite() || quota_per_unit < 1.0 {
+                return Err(AdminServiceError::InvalidCredential(
+                    "quota 单位必须是不小于 1 的数字".to_string(),
+                ));
+            }
+            cfg.profit_quota_per_unit = quota_per_unit;
+        }
+        cfg.save()
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+
+        Ok(ProfitConfigResponse {
+            newapi_base: cfg.profit_newapi_base,
+            newapi_user: cfg.profit_newapi_user,
+            credit_price: cfg.profit_credit_price,
+            quota_per_unit: cfg.profit_quota_per_unit,
+            token_configured: cfg
+                .profit_newapi_token
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty()),
+        })
     }
 
     /// 获取普通 429 重试策略

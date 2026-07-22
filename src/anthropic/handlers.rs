@@ -216,7 +216,12 @@ impl RequestTracer {
         headers: &HeaderMap,
         request: &MessagesRequest,
     ) -> Self {
-        let trace_id = Uuid::new_v4().to_string();
+        let trace_id = headers
+            .get("x-oneapi-request-id")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| Uuid::parse_str(value).is_ok())
+            .map(str::to_string)
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         let snapshot = state.error_snapshot_store.as_ref().and_then(|store| {
             super::error_snapshot::ErrorSnapshotContext::new_if_enabled(
                 store.clone(),
