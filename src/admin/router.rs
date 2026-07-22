@@ -24,19 +24,19 @@ use super::{
         get_proxy_pool, get_retry_policy, get_update_config, list_client_keys,
         list_error_snapshots, list_groups, list_model_mappings, list_traces, patch_model_profile,
         pin_error_snapshot, poll_idc_login, poll_idc_relogin, poll_social_login,
-        poll_social_relogin, preview_model_profiles, pull_update_image, replace_model_mappings,
-        reset_all_success_count, reset_client_key_stats, reset_failure_count, reset_success_count,
-        rollback_image_update, rotate_client_key, set_account_throttle_config, set_cache_hit_rate,
-        set_cache_policy, set_client_key_disabled, set_compatibility_config,
-        set_credential_disabled, set_credential_overage, set_credential_priority,
-        set_endpoint_chains, set_endpoint_mode, set_global_proxy, set_image_budget,
-        set_load_balancing_mode, set_log_governance_config, set_model_profile_settings,
-        set_profit_config, set_proxy_balancing_mode, set_proxy_enabled, set_retry_policy,
-        set_update_config, start_idc_login, start_idc_relogin, start_social_login,
-        start_social_relogin, stats_by_credential, stats_by_model, stats_overview,
-        stats_timeseries, sync_model_profiles, test_credential_response, trace_failure_stats,
-        unpin_error_snapshot, update_admin_key, update_client_key, update_credential, update_group,
-        update_refresh_token, upsert_model_mapping,
+        poll_social_relogin, preview_model_profiles, profit_report, pull_update_image,
+        replace_model_mappings, reset_all_success_count, reset_client_key_stats,
+        reset_failure_count, reset_success_count, rollback_image_update, rotate_client_key,
+        set_account_throttle_config, set_cache_hit_rate, set_cache_policy, set_client_key_disabled,
+        set_compatibility_config, set_credential_disabled, set_credential_overage,
+        set_credential_priority, set_endpoint_chains, set_endpoint_mode, set_global_proxy,
+        set_image_budget, set_load_balancing_mode, set_log_governance_config,
+        set_model_profile_settings, set_profit_config, set_proxy_balancing_mode, set_proxy_enabled,
+        set_retry_policy, set_update_config, start_idc_login, start_idc_relogin,
+        start_social_login, start_social_relogin, stats_by_credential, stats_by_model,
+        stats_overview, stats_timeseries, sync_model_profiles, test_credential_response,
+        trace_failure_stats, unpin_error_snapshot, update_admin_key, update_client_key,
+        update_credential, update_group, update_refresh_token, upsert_model_mapping,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -137,6 +137,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/config/profit",
             get(get_profit_config).put(set_profit_config),
         )
+        .route("/profit/report", post(profit_report))
         .route(
             "/config/retry-policy",
             get(get_retry_policy).put(set_retry_policy),
@@ -404,6 +405,42 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["emptyUserMessageCompat"], true);
+    }
+
+    #[tokio::test]
+    async fn profit_report_route_rejects_out_of_range_minutes() {
+        let response = batch_update_test_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/profit/report")
+                    .header("x-api-key", "test-admin-key")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"minutes":0}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn profit_report_route_rejects_missing_newapi_settings() {
+        let response = batch_update_test_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/profit/report")
+                    .header("x-api-key", "test-admin-key")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"minutes":30}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

@@ -7,6 +7,7 @@
 //! 存储：SQLite（`traces.db`），WAL 模式。前端查询直接走 SQL（索引 + WHERE + LIMIT），
 //! 不维护内存缓冲。后台任务定期清理超过保留天数的记录（保留天数与启用开关运行时可改）。
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -151,6 +152,16 @@ pub struct TraceRecord {
     pub snapshot_id: Option<String>,
     /// 每跳明细
     pub attempts: Vec<TraceAttempt>,
+}
+
+/// 利润报表关联所需的最小 trace 视图；不读取 attempts，避免报表查询放大 SQLite I/O。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProfitTraceRecord {
+    pub trace_id: String,
+    pub key_id: u64,
+    pub model: String,
+    pub credits: f64,
+    pub final_status: String,
 }
 
 /// 失败分类（attempt.outcome / record.error_type 取值）
@@ -477,6 +488,56 @@ impl TraceStore {
                 (Vec::new(), 0)
             }
         }
+    }
+
+    /// 按精确 trace ID 和时间窗口批量读取利润关联字段。
+    ///
+    /// 每批最多 400 个 ID，为时间范围参数和不同 SQLite 参数上限保留余量。
+    pub fn query_profit_traces(
+        &self,
+        trace_ids: &[String],
+        start_epoch: i64,
+        end_epoch: i64,
+    ) -> rusqlite::Result<Vec<ProfitTraceRecord>> {
+        if trace_ids.is_empty() || start_epoch >= end_epoch {
+            return Ok(Vec::new());
+        }
+
+        let unique_ids: Vec<String> = trace_ids
+            .iter()
+            .filter(|value| !value.trim().is_empty())
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let conn = self.conn.lock();
+        let mut records = Vec::new();
+        for chunk in unique_ids.chunks(400) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT trace_id, key_id, model, credits, final_status \
+                 FROM traces WHERE ts_epoch >= ? AND ts_epoch <= ? \
+                 AND trace_id IN ({placeholders})"
+            );
+            let mut params = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 2);
+            params.push(start_epoch.into());
+            params.push(end_epoch.into());
+            params.extend(chunk.iter().cloned().map(rusqlite::types::Value::Text));
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
+                Ok(ProfitTraceRecord {
+                    trace_id: row.get(0)?,
+                    key_id: row.get::<_, i64>(1)? as u64,
+                    model: row.get(2)?,
+                    credits: row.get(3)?,
+                    final_status: row.get(4)?,
+                })
+            })?;
+            records.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+        }
+        Ok(records)
     }
 
     /// 测试辅助：仅取记录、忽略总数
@@ -844,6 +905,7 @@ CREATE INDEX IF NOT EXISTS idx_attempts_trace ON trace_attempts(trace_id);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::DateTime;
 
     struct TraceSample<'a> {
         trace_id: &'a str,
@@ -962,6 +1024,49 @@ mod tests {
             serde_json::to_value(&out[0]).unwrap()["emptyUserCompatApplied"],
             false
         );
+    }
+
+    #[test]
+    fn query_profit_traces_matches_exact_ids_inside_window() {
+        let store = mem_store();
+        let mut inside = sample(TraceSample {
+            trace_id: "trace-inside",
+            status: "success",
+            credential_id: 5,
+            model: "claude-opus-4-8",
+        });
+        inside.ts = DateTime::<Utc>::from_timestamp(1_700_000_100, 0)
+            .unwrap()
+            .to_rfc3339();
+        inside.key_id = 42;
+        inside.credits = 0.75;
+        store.insert(&inside);
+
+        let mut outside = inside.clone();
+        outside.trace_id = "trace-outside".to_string();
+        outside.ts = DateTime::<Utc>::from_timestamp(1_699_999_999, 0)
+            .unwrap()
+            .to_rfc3339();
+        store.insert(&outside);
+
+        let rows = store
+            .query_profit_traces(
+                &[
+                    "trace-inside".to_string(),
+                    "trace-outside".to_string(),
+                    "trace-missing".to_string(),
+                ],
+                1_700_000_000,
+                1_700_000_200,
+            )
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].trace_id, "trace-inside");
+        assert_eq!(rows[0].key_id, 42);
+        assert_eq!(rows[0].model, "claude-opus-4-8");
+        assert_eq!(rows[0].credits, 0.75);
+        assert_eq!(rows[0].final_status, "success");
     }
 
     #[test]

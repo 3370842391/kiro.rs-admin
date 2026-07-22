@@ -10,7 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
-use chrono::{Datelike, Duration, Local, NaiveDate, TimeZone};
+use chrono::{Datelike, Duration, Local, NaiveDate, TimeZone, Utc};
 use futures::StreamExt;
 use sha2::Digest as _;
 use std::sync::Arc;
@@ -19,6 +19,10 @@ use super::{
     client_keys::{CacheHitRateBounds, ClientResponseMode, mask_client_key},
     error_snapshot_db::{SnapshotQuery, SnapshotSeverity},
     middleware::AdminState,
+    profit::{
+        ProfitKeyMetadata, ProfitReportRequest, ProfitReportResponse, aggregate_rows,
+        fetch_newapi_logs, join_newapi_logs,
+    },
     trace_db::TraceQuery,
     types::{
         AddCredentialRequest, AddProxyRequest, ApplyModelProfilesRequest, AssignProxyRequest,
@@ -722,7 +726,10 @@ pub async fn set_compatibility_config(
 
 /// GET /api/admin/config/profit
 pub async fn get_profit_config(State(state): State<AdminState>) -> impl IntoResponse {
-    Json(state.service.get_profit_config())
+    match state.service.get_profit_config() {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
 }
 
 /// PUT /api/admin/config/profit
@@ -734,6 +741,97 @@ pub async fn set_profit_config(
         Ok(response) => Json(response).into_response(),
         Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
     }
+}
+
+/// POST /api/admin/profit/report
+pub async fn profit_report(
+    State(state): State<AdminState>,
+    Json(payload): Json<ProfitReportRequest>,
+) -> Response {
+    if !(1..=10_080).contains(&payload.minutes) {
+        let error = super::error::AdminServiceError::InvalidCredential(
+            "统计时长必须在 1 到 10080 分钟之间".to_string(),
+        );
+        return (error.status_code(), Json(error.into_response())).into_response();
+    }
+
+    let config = match state.service.load_profit_config() {
+        Ok(config) => config,
+        Err(error) => {
+            return (error.status_code(), Json(error.into_response())).into_response();
+        }
+    };
+    let missing_setting = [
+        ("NewAPI 地址", config.newapi_base.as_deref()),
+        ("NewAPI 访问令牌", config.newapi_token.as_deref()),
+        ("NewAPI 管理员用户 ID", config.newapi_user.as_deref()),
+    ]
+    .into_iter()
+    .find_map(|(name, value)| {
+        value
+            .is_none_or(|value| value.trim().is_empty())
+            .then_some(name)
+    });
+    if let Some(name) = missing_setting {
+        let error = super::error::AdminServiceError::InvalidCredential(format!(
+            "{name}未配置，无法生成利润报表"
+        ));
+        return (error.status_code(), Json(error.into_response())).into_response();
+    }
+    let end_timestamp = Utc::now().timestamp();
+    let start_timestamp = end_timestamp - i64::from(payload.minutes) * 60;
+    let logs = match fetch_newapi_logs(&config, start_timestamp, end_timestamp).await {
+        Ok(logs) => logs,
+        Err(error) => {
+            let error = super::error::AdminServiceError::UpstreamError(error.to_string());
+            return (error.status_code(), Json(error.into_response())).into_response();
+        }
+    };
+    let trace_ids: Vec<String> = logs
+        .iter()
+        .map(|log| log.upstream_request_id.clone())
+        .filter(|trace_id| !trace_id.trim().is_empty())
+        .collect();
+    let trace_store = state.trace_store.clone();
+    let traces = match tokio::task::spawn_blocking(move || {
+        trace_store.query_profit_traces(&trace_ids, start_timestamp, end_timestamp)
+    })
+    .await
+    {
+        Ok(Ok(traces)) => traces,
+        Ok(Err(error)) => {
+            let error = super::error::AdminServiceError::InternalError(format!(
+                "读取利润关联 trace 失败: {error}"
+            ));
+            return (error.status_code(), Json(error.into_response())).into_response();
+        }
+        Err(error) => {
+            let error = super::error::AdminServiceError::InternalError(format!(
+                "利润关联任务异常结束: {error}"
+            ));
+            return (error.status_code(), Json(error.into_response())).into_response();
+        }
+    };
+    let keys = state
+        .client_keys
+        .list()
+        .into_iter()
+        .map(|key| ProfitKeyMetadata {
+            key_id: key.id,
+            key_name: key.name,
+            group: key.group,
+        })
+        .collect();
+    let report = aggregate_rows(join_newapi_logs(logs, traces, keys), config.clone());
+    Json(ProfitReportResponse {
+        start_timestamp,
+        end_timestamp,
+        minutes: payload.minutes,
+        credit_price: config.credit_price,
+        quota_per_unit: config.quota_per_unit,
+        report,
+    })
+    .into_response()
 }
 
 /// GET /api/admin/config/retry-policy
