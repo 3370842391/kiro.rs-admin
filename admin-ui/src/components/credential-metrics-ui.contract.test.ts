@@ -17,4 +17,9 @@ describe('credential metrics UI wiring', () => {
     expect(source).toContain('view === "list"')
     expect(source).toContain('view = "card"')
   })
+
+  test('refreshes account state frequently enough for the one-minute RPM view', async () => {
+    const source = await readSource('hooks/use-credentials.ts')
+    expect(source).toContain('refetchInterval: 10000')
+  })
 })

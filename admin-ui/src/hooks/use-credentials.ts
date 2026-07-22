@@ -40,7 +40,7 @@ export function useCredentials() {
   return useQuery({
     queryKey: ['credentials'],
     queryFn: getCredentials,
-    refetchInterval: 30000, // 每 30 秒刷新一次
+    refetchInterval: 10000, // 每 10 秒刷新一次，保持 RPM / in-flight 指标新鲜
   })
 }
 
