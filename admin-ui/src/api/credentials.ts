@@ -559,6 +559,26 @@ export async function setEndpointChains(
   return data
 }
 
+export type EndpointMode = 'best' | 'manual'
+
+export interface EndpointModeConfig {
+  mode: EndpointMode
+  label: string
+  primaryEndpoint: string
+  fallbackEndpoints: string[]
+  adaptiveScheduling: boolean
+}
+
+export async function getEndpointMode(): Promise<EndpointModeConfig> {
+  const { data } = await api.get<EndpointModeConfig>('/config/endpoint-mode')
+  return data
+}
+
+export async function setEndpointMode(mode: EndpointMode): Promise<EndpointModeConfig> {
+  const { data } = await api.put<EndpointModeConfig>('/config/endpoint-mode', { mode })
+  return data
+}
+
 export interface CacheHitRateConfig {
   minPct: number
   maxPct: number

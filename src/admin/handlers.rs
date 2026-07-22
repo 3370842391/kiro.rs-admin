@@ -29,12 +29,13 @@ use super::{
         GlobalProxyResponse, PatchModelProfileRequest, PreviewModelProfilesRequest,
         ProxyCheckUrlRequest, RevisionRequest, SetAccountThrottleConfigRequest,
         SetCacheHitRateRequest, SetCachePolicyRequest, SetCompatibilityConfigRequest,
-        SetDisabledRequest, SetEndpointChainsRequest, SetGlobalProxyRequest, SetImageBudgetRequest,
-        SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetModelProfileSettingsRequest,
-        SetPriorityRequest, SetProxyBalancingModeRequest, SetRetryPolicyRequest,
-        SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
-        SyncModelProfilesRequest, UpdateAdminKeyRequest, UpdateClientKeyRequest,
-        UpdateClientKeyResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
+        SetDisabledRequest, SetEndpointChainsRequest, SetEndpointModeRequest,
+        SetGlobalProxyRequest, SetImageBudgetRequest, SetLoadBalancingModeRequest,
+        SetLogGovernanceConfigRequest, SetModelProfileSettingsRequest, SetPriorityRequest,
+        SetProxyBalancingModeRequest, SetRetryPolicyRequest, SetUpdateConfigRequest,
+        StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse, SyncModelProfilesRequest,
+        UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateClientKeyResponse,
+        UpdateCredentialRequest, UpdateRefreshTokenRequest,
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
 };
@@ -758,6 +759,22 @@ pub async fn set_endpoint_chains(
     match state.service.set_endpoint_chains(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/endpoint-mode
+pub async fn get_endpoint_mode(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_endpoint_mode())
+}
+
+/// PUT /api/admin/config/endpoint-mode
+pub async fn set_endpoint_mode(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetEndpointModeRequest>,
+) -> impl IntoResponse {
+    match state.service.set_endpoint_mode(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
     }
 }
 

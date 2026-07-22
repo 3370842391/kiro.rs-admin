@@ -23,6 +23,8 @@ import {
   setRetryPolicy,
   getEndpointChains,
   setEndpointChains,
+  getEndpointMode,
+  setEndpointMode,
   getCacheHitRate,
   setCacheHitRate,
   getCachePolicy,
@@ -289,6 +291,24 @@ export function useSetEndpointChains() {
     mutationFn: setEndpointChains,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['endpointChains'] })
+    },
+  })
+}
+
+export function useEndpointMode() {
+  return useQuery({
+    queryKey: ['endpointMode'],
+    queryFn: getEndpointMode,
+  })
+}
+
+export function useSetEndpointMode() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setEndpointMode,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['endpointMode'] })
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
   })
 }

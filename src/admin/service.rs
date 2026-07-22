@@ -31,7 +31,7 @@ use crate::kiro::token_manager::{
     CredentialBatchPatch, CredentialBatchUpdateError, CredentialEntrySnapshot,
     CredentialGroupPatch, MultiTokenManager, RPM_WINDOW_SECONDS,
 };
-use crate::model::config::{Config, RetryMode};
+use crate::model::config::{Config, EndpointMode, RetryMode};
 
 use super::error::AdminServiceError;
 use super::model_profile_sync::{
@@ -47,22 +47,23 @@ use super::types::{
     ClearCacheResponse, CompatibilityConfigResponse, CompleteSocialLoginRequest,
     CredentialResponseTestResponse, CredentialStatusItem, CredentialsExportResponse,
     CredentialsStatusResponse, EnableOverageAllResult, EndpointBucketOption,
-    EndpointChainsResponse, ExportedAccount, ExportedCredentials, FetchModelProfileRequest,
-    GitHubRateLimitInfo, ImageBudgetResponse, ImageUpdateResponse, LoadBalancingModeResponse,
-    LogGovernanceConfigResponse, ModelProfileFieldRefResponse, ModelProfileFieldResponse,
-    ModelProfilePreviewChangeResponse, ModelProfilePreviewResponse, ModelProfileSettingsResponse,
-    ModelProfileSourceSummaryResponse, ModelProfileSyncResponse, ModelProfileSyncSummaryResponse,
-    ModelProfileViewResponse, ModelProfilesResponse, PatchModelProfileRequest,
-    PollIdcLoginResponse, PreviewModelProfilesRequest, ProxyBalancingModeResponse,
-    ProxyCheckAllResponse, ProxyCheckResponse, ProxyCheckUrlRequest, ProxyPoolEntry,
-    ProxyPoolResponse, QuotaExceededResult, ResolvedModelProfileResponse, RetryPolicyResponse,
-    RevisionRequest, RpmSummary, SetAccountThrottleConfigRequest, SetCacheHitRateRequest,
-    SetCachePolicyRequest, SetCompatibilityConfigRequest, SetEndpointChainsRequest,
-    SetImageBudgetRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
-    SetModelProfileSettingsRequest, SetProxyBalancingModeRequest, SetRetryPolicyRequest,
-    SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
-    StartSocialLoginResponse, SyncModelProfilesRequest, UpdateCheckInfo, UpdateConfigResponse,
-    UpdateCredentialRequest, UpdateRefreshTokenRequest,
+    EndpointChainsResponse, EndpointModeResponse, ExportedAccount, ExportedCredentials,
+    FetchModelProfileRequest, GitHubRateLimitInfo, ImageBudgetResponse, ImageUpdateResponse,
+    LoadBalancingModeResponse, LogGovernanceConfigResponse, ModelProfileFieldRefResponse,
+    ModelProfileFieldResponse, ModelProfilePreviewChangeResponse, ModelProfilePreviewResponse,
+    ModelProfileSettingsResponse, ModelProfileSourceSummaryResponse, ModelProfileSyncResponse,
+    ModelProfileSyncSummaryResponse, ModelProfileViewResponse, ModelProfilesResponse,
+    PatchModelProfileRequest, PollIdcLoginResponse, PreviewModelProfilesRequest,
+    ProxyBalancingModeResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyCheckUrlRequest,
+    ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult, ResolvedModelProfileResponse,
+    RetryPolicyResponse, RevisionRequest, RpmSummary, SetAccountThrottleConfigRequest,
+    SetCacheHitRateRequest, SetCachePolicyRequest, SetCompatibilityConfigRequest,
+    SetEndpointChainsRequest, SetEndpointModeRequest, SetImageBudgetRequest,
+    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetModelProfileSettingsRequest,
+    SetProxyBalancingModeRequest, SetRetryPolicyRequest, SetUpdateConfigRequest,
+    StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse,
+    SyncModelProfilesRequest, UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest,
+    UpdateRefreshTokenRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -1239,6 +1240,7 @@ impl AdminService {
                     rpm_limit: entry.rpm_limit,
                     rpm_current: entry.rpm_current,
                     in_flight: entry.in_flight,
+                    first_byte_ewma_ms: entry.first_byte_ewma_ms,
                     disabled: entry.disabled,
                     failure_count: entry.failure_count,
                     total_failure_count: entry.total_failure_count,
@@ -2864,6 +2866,30 @@ impl AdminService {
         }
 
         self.get_endpoint_chains()
+    }
+
+    pub fn get_endpoint_mode(&self) -> EndpointModeResponse {
+        let mode = self.token_manager.get_endpoint_mode();
+        endpoint_mode_response(mode)
+    }
+
+    pub fn set_endpoint_mode(
+        &self,
+        req: SetEndpointModeRequest,
+    ) -> Result<EndpointModeResponse, AdminServiceError> {
+        let mode = match req.mode.trim().to_ascii_lowercase().as_str() {
+            "best" => EndpointMode::Best,
+            "manual" => EndpointMode::Manual,
+            _ => {
+                return Err(AdminServiceError::InvalidCredential(
+                    "mode must be best or manual".to_string(),
+                ));
+            }
+        };
+        self.token_manager
+            .set_endpoint_mode(mode)
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+        Ok(endpoint_mode_response(mode))
     }
 
     /// 读取缓存命中率整形区间配置。
@@ -4644,6 +4670,29 @@ impl AdminService {
     }
 }
 
+fn endpoint_mode_response(mode: EndpointMode) -> EndpointModeResponse {
+    match mode {
+        EndpointMode::Best => EndpointModeResponse {
+            mode: "best".to_string(),
+            label: "默认最好模式".to_string(),
+            primary_endpoint: "runtime".to_string(),
+            fallback_endpoints: vec![
+                "ide".to_string(),
+                "codewhisperer".to_string(),
+                "amazonq".to_string(),
+            ],
+            adaptive_scheduling: true,
+        },
+        EndpointMode::Manual => EndpointModeResponse {
+            mode: "manual".to_string(),
+            label: "手动端点模式".to_string(),
+            primary_endpoint: "configured".to_string(),
+            fallback_endpoints: Vec::new(),
+            adaptive_scheduling: false,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4849,6 +4898,7 @@ mod tests {
             rpm_limit,
             rpm_current,
             in_flight: 0,
+            first_byte_ewma_ms: None,
             disabled,
             failure_count: 0,
             total_failure_count: 0,

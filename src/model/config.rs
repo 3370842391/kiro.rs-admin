@@ -48,6 +48,15 @@ pub enum RetryMode {
     Custom,
 }
 
+/// 上游端点路由预设。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum EndpointMode {
+    #[default]
+    Best,
+    Manual,
+}
+
 impl std::fmt::Display for RetryMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let value = match self {
@@ -340,6 +349,10 @@ pub struct Config {
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
+
+    /// 端点路由模式：best（默认最好模式）或 manual（手动端点链）。
+    #[serde(default)]
+    pub endpoint_mode: EndpointMode,
 
     /// 是否启用请求链路追踪（写 traces.db）。默认 true。
     ///
@@ -691,6 +704,7 @@ impl Default for Config {
             model_profile_exact_answers_enabled: default_true(),
             tool_compatibility_mode: default_tool_compatibility_mode(),
             default_endpoint: default_endpoint(),
+            endpoint_mode: EndpointMode::default(),
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
@@ -951,5 +965,22 @@ mod tests {
         assert!(enabled.empty_user_message_compat);
         let encoded = serde_json::to_value(enabled).unwrap();
         assert_eq!(encoded["emptyUserMessageCompat"], true);
+    }
+
+    #[test]
+    fn endpoint_mode_defaults_to_best_and_round_trips() {
+        let defaulted: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaulted.endpoint_mode, EndpointMode::Best);
+
+        let manual: Config = serde_json::from_str(r#"{"endpointMode":"manual"}"#).unwrap();
+        assert_eq!(manual.endpoint_mode, EndpointMode::Manual);
+        let encoded = serde_json::to_value(manual).unwrap();
+        assert_eq!(encoded["endpointMode"], "manual");
+    }
+
+    #[test]
+    fn endpoint_mode_rejects_unknown_values() {
+        let error = serde_json::from_str::<Config>(r#"{"endpointMode":"turbo"}"#).unwrap_err();
+        assert!(error.to_string().contains("unknown variant"));
     }
 }

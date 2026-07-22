@@ -30,7 +30,7 @@ use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::kiro::region::{
     API_KEY_AUTH_REGION, KiroService, data_plane_host, rest_region_candidates, validate_api_region,
 };
-use crate::model::config::{Config, RetryMode, RetryPolicy};
+use crate::model::config::{Config, EndpointMode, RetryMode, RetryPolicy};
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -1060,6 +1060,14 @@ struct CredentialEntry {
     /// 最近 60 秒内「对该账号上游发起请求」的时间戳队列（RPM 滑动窗口计数）。
     /// record_request 时 push 队尾并剔除过期项；不持久化，进程重启清空。
     recent_requests: VecDeque<Instant>,
+    /// 流式首字节延迟 EWMA，仅保存在进程内用于调度。
+    first_byte_ewma_ms: Option<f64>,
+}
+
+#[derive(Clone, Copy)]
+struct SessionAffinity {
+    credential_id: u64,
+    expires_at: Instant,
 }
 
 /// 禁用原因
@@ -1109,6 +1117,9 @@ pub struct CredentialEntrySnapshot {
     pub rpm_current: u32,
     /// 当前正在使用该凭据的请求数
     pub in_flight: u32,
+    /// 最近流式首字节延迟的 EWMA（毫秒）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_byte_ewma_ms: Option<f64>,
     /// 是否被禁用
     pub disabled: bool,
     /// 连续失败次数
@@ -1255,6 +1266,10 @@ pub struct MultiTokenManager {
     retry_policy: Mutex<Option<RetryPolicy>>,
     /// 429 降级桶链运行时覆盖（运行时可修改）。None = 回退各 endpoint 静态 fallback_chain()。
     endpoint_chains: Mutex<Option<HashMap<String, Vec<String>>>>,
+    /// 全局端点路由模式，运行时可由 Admin API 切换。
+    endpoint_mode: Mutex<EndpointMode>,
+    /// 会话到凭据的短期粘性，仅在默认最好模式使用，不写入凭据文件。
+    session_affinity: Mutex<HashMap<String, SessionAffinity>>,
     /// 单请求备用桶尝试总数硬上限（运行时可修改，0 = 不限）。
     max_bucket_attempts_per_request: AtomicUsize,
     /// 流式空闲超时秒数（运行时可修改，0 = 关闭 idle watchdog）。
@@ -1275,6 +1290,9 @@ pub struct MultiTokenManager {
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
+const SESSION_AFFINITY_TTL: StdDuration = StdDuration::from_secs(5 * 60);
+const SESSION_AFFINITY_MAX_IN_FLIGHT: u32 = 2;
+const FIRST_BYTE_EWMA_ALPHA: f64 = 0.3;
 
 /// API 调用上下文
 ///
@@ -1433,6 +1451,7 @@ impl MultiTokenManager {
                     rate_limited_until: None,
                     in_flight: 0,
                     recent_requests: VecDeque::new(),
+                    first_byte_ewma_ms: None,
                 }
             })
             .collect();
@@ -1494,6 +1513,7 @@ impl MultiTokenManager {
         let retry_mode = config.retry_mode;
         let retry_policy = config.retry_policy.clone();
         let endpoint_chains = config.endpoint_chains.clone();
+        let endpoint_mode = config.endpoint_mode;
         let max_bucket_attempts = config.max_bucket_attempts_per_request;
         let stream_idle_timeout_secs = config.stream_idle_timeout_secs;
         let empty_user_message_compat = config.empty_user_message_compat;
@@ -1528,6 +1548,8 @@ impl MultiTokenManager {
             retry_mode: Mutex::new(retry_mode),
             retry_policy: Mutex::new(retry_policy),
             endpoint_chains: Mutex::new(endpoint_chains),
+            endpoint_mode: Mutex::new(endpoint_mode),
+            session_affinity: Mutex::new(HashMap::new()),
             max_bucket_attempts_per_request: AtomicUsize::new(max_bucket_attempts),
             stream_idle_timeout_secs: AtomicU64::new(stream_idle_timeout_secs),
             empty_user_message_compat: AtomicBool::new(empty_user_message_compat),
@@ -1625,6 +1647,95 @@ impl MultiTokenManager {
             .count()
     }
 
+    /// 记录指定会话当前使用的凭据。该状态只在进程内保存并自动过期。
+    fn remember_session_affinity(&self, key: &str, credential_id: u64) {
+        if key.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut affinity = self.session_affinity.lock();
+        affinity.retain(|_, value| value.expires_at > now);
+        affinity.insert(
+            key.to_string(),
+            SessionAffinity {
+                credential_id,
+                expires_at: now + SESSION_AFFINITY_TTL,
+            },
+        );
+    }
+
+    fn forget_session_affinity(&self, key: &str, credential_id: u64) {
+        let mut affinity = self.session_affinity.lock();
+        if affinity
+            .get(key)
+            .is_some_and(|value| value.credential_id == credential_id)
+        {
+            affinity.remove(key);
+        }
+    }
+
+    fn affinity_credential(
+        &self,
+        key: &str,
+        model: Option<&str>,
+        group: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+    ) -> Option<(u64, KiroCredentials)> {
+        let now = Instant::now();
+        let candidate = self.session_affinity.lock().get(key).copied();
+        let Some(candidate) = candidate else {
+            return None;
+        };
+        if candidate.expires_at <= now {
+            self.session_affinity.lock().remove(key);
+            return None;
+        }
+
+        let entries = self.entries.lock();
+        let entry = entries.iter().find(|entry| {
+            entry.id == candidate.credential_id
+                && !excluded_ids.contains(&entry.id)
+                && !entry.disabled
+                && !entry.throttled_until.map(|t| t > now).unwrap_or(false)
+                && !entry.rate_limited_until.map(|t| t > now).unwrap_or(false)
+                && !is_rpm_exceeded(entry, now)
+                && entry.in_flight < SESSION_AFFINITY_MAX_IN_FLIGHT
+                && credential_matches_request(&entry.credentials, model, group)
+        });
+        if let Some(entry) = entry {
+            Some((entry.id, entry.credentials.clone()))
+        } else {
+            // 凭据被禁用、限流或过载后立即释放粘性，下一次请求走实时调度。
+            self.session_affinity.lock().remove(key);
+            None
+        }
+    }
+
+    /// 记录一个请求从上游收到首个 body chunk 的延迟（毫秒）。
+    pub fn record_first_byte_latency(&self, id: u64, millis: u64) {
+        if millis == 0 {
+            return;
+        }
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+            entry.first_byte_ewma_ms = Some(match entry.first_byte_ewma_ms {
+                Some(previous) => {
+                    FIRST_BYTE_EWMA_ALPHA * millis as f64 + (1.0 - FIRST_BYTE_EWMA_ALPHA) * previous
+                }
+                None => millis as f64,
+            });
+        }
+    }
+
+    #[cfg(test)]
+    fn first_byte_ewma(&self, id: u64) -> Option<f64> {
+        self.entries
+            .lock()
+            .iter()
+            .find(|entry| entry.id == id)
+            .and_then(|entry| entry.first_byte_ewma_ms)
+    }
+
     /// 根据负载均衡模式选择下一个凭据
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
@@ -1648,6 +1759,24 @@ impl MultiTokenManager {
         group: Option<&str>,
         excluded_ids: &HashSet<u64>,
     ) -> Option<(u64, KiroCredentials)> {
+        self.select_next_credential_with_affinity(model, group, excluded_ids, None)
+    }
+
+    fn select_next_credential_with_affinity(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+        affinity_key: Option<&str>,
+    ) -> Option<(u64, KiroCredentials)> {
+        if self.get_endpoint_mode() == EndpointMode::Best {
+            if let Some(key) = affinity_key {
+                if let Some(hit) = self.affinity_credential(key, model, group, excluded_ids) {
+                    return Some(hit);
+                }
+            }
+        }
+
         let entries = self.entries.lock();
         let now = Instant::now();
 
@@ -1685,7 +1814,13 @@ impl MultiTokenManager {
             return None;
         }
 
-        let mode = self.load_balancing_mode.lock().clone();
+        let configured_mode = self.load_balancing_mode.lock().clone();
+        let mode =
+            if self.get_endpoint_mode() == EndpointMode::Best && configured_mode != "least_conn" {
+                "least_conn".to_string()
+            } else {
+                configured_mode
+            };
         let mode = mode.as_str();
 
         match mode {
@@ -1703,9 +1838,25 @@ impl MultiTokenManager {
                 // Least-Connections 策略：选择当前在途请求数最少的凭据。
                 // 直接反映瞬时压力，天然避免惊群与「反复选中→反复 429」死循环。
                 // 平局按优先级（数字小者优先），再平按累计成功数（在空闲均势下更均衡）。
-                let entry = available
-                    .iter()
-                    .min_by_key(|e| (e.in_flight, e.credentials.priority, e.balance_count))?;
+                let entry = if self.get_endpoint_mode() == EndpointMode::Best {
+                    available.iter().min_by(|a, b| {
+                        a.in_flight
+                            .cmp(&b.in_flight)
+                            .then_with(|| match (a.first_byte_ewma_ms, b.first_byte_ewma_ms) {
+                                (Some(a), Some(b)) => {
+                                    a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)
+                                }
+                                // 没有样本的账号不因未知延迟被硬性惩罚。
+                                _ => std::cmp::Ordering::Equal,
+                            })
+                            .then_with(|| a.credentials.priority.cmp(&b.credentials.priority))
+                            .then_with(|| a.balance_count.cmp(&b.balance_count))
+                    })?
+                } else {
+                    available
+                        .iter()
+                        .min_by_key(|e| (e.in_flight, e.credentials.priority, e.balance_count))?
+                };
 
                 Some((entry.id, entry.credentials.clone()))
             }
@@ -1759,6 +1910,17 @@ impl MultiTokenManager {
         group: Option<&str>,
         excluded_ids: &HashSet<u64>,
     ) -> anyhow::Result<CallContext> {
+        self.acquire_context_excluding_with_affinity(model, group, excluded_ids, None)
+            .await
+    }
+
+    pub async fn acquire_context_excluding_with_affinity(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+        affinity_key: Option<&str>,
+    ) -> anyhow::Result<CallContext> {
         let total = self.total_count_in_group(group);
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -1774,11 +1936,19 @@ impl MultiTokenManager {
 
             let (id, credentials) = {
                 // priority 模式固定 current_id；balanced / least_conn 每次重新选择
-                let re_select_each_request = self.load_balancing_mode.lock().as_str() != "priority";
+                let re_select_each_request = self.get_endpoint_mode() == EndpointMode::Best
+                    || self.load_balancing_mode.lock().as_str() != "priority";
 
                 // 非 priority 模式：每次请求都重新选择，不固定 current_id
                 // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if re_select_each_request {
+                let affinity_hit = if self.get_endpoint_mode() == EndpointMode::Best {
+                    affinity_key
+                        .and_then(|key| self.affinity_credential(key, model, group, excluded_ids))
+                } else {
+                    None
+                };
+
+                let current_hit = if re_select_each_request || affinity_hit.is_some() {
                     None
                 } else {
                     let entries = self.entries.lock();
@@ -1798,12 +1968,16 @@ impl MultiTokenManager {
                         .map(|e| (e.id, e.credentials.clone()))
                 };
 
-                if let Some(hit) = current_hit {
+                if let Some(hit) = affinity_hit.or(current_hit) {
                     hit
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best =
-                        self.select_next_credential_excluding(model, group, excluded_ids);
+                    let mut best = self.select_next_credential_with_affinity(
+                        model,
+                        group,
+                        excluded_ids,
+                        affinity_key,
+                    );
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                     if best.is_none() {
@@ -1822,8 +1996,12 @@ impl MultiTokenManager {
                                 }
                             }
                             drop(entries);
-                            best =
-                                self.select_next_credential_excluding(model, group, excluded_ids);
+                            best = self.select_next_credential_with_affinity(
+                                model,
+                                group,
+                                excluded_ids,
+                                affinity_key,
+                            );
                         }
                     }
 
@@ -1849,9 +2027,17 @@ impl MultiTokenManager {
                     // 仅在最终把凭据交给调用方时 +1（least_conn 在途计数）。
                     // 上面 token 重载的 continue 不会到达这里，故不会误增。
                     self.inc_in_flight(ctx.id);
+                    if let Some(key) = affinity_key {
+                        if self.get_endpoint_mode() == EndpointMode::Best {
+                            self.remember_session_affinity(key, ctx.id);
+                        }
+                    }
                     return Ok(ctx);
                 }
                 Err(e) => {
+                    if let Some(key) = affinity_key {
+                        self.forget_session_affinity(key, id);
+                    }
                     let has_available = if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
                         // 先尝试从源文件重新加载（适用于 IDE 退出后 token rotation 导致失效的场景）
                         if self.try_reload_credential_from_file(id) {
@@ -2679,6 +2865,7 @@ impl MultiTokenManager {
                     rpm_limit: e.credentials.rpm_limit,
                     rpm_current: rpm_window_count(e, now),
                     in_flight: e.in_flight,
+                    first_byte_ewma_ms: e.first_byte_ewma_ms,
                     disabled: e.disabled,
                     failure_count: e.failure_count,
                     total_failure_count: e.total_failure_count,
@@ -3722,6 +3909,7 @@ impl MultiTokenManager {
                 rate_limited_until: None,
                 in_flight: 0,
                 recent_requests: VecDeque::new(),
+                first_byte_ewma_ms: None,
             });
         }
 
@@ -4394,6 +4582,38 @@ impl MultiTokenManager {
             .save()
             .with_context(|| format!("持久化降级桶链失败: {}", config_path.display()))?;
 
+        Ok(())
+    }
+
+    /// 获取当前端点路由模式。
+    pub fn get_endpoint_mode(&self) -> EndpointMode {
+        *self.endpoint_mode.lock()
+    }
+
+    /// 更新端点路由模式并持久化 config.json。
+    pub fn set_endpoint_mode(&self, mode: EndpointMode) -> anyhow::Result<()> {
+        let previous = *self.endpoint_mode.lock();
+        *self.endpoint_mode.lock() = mode;
+        if let Err(error) = self.persist_endpoint_mode(mode) {
+            *self.endpoint_mode.lock() = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn persist_endpoint_mode(&self, mode: EndpointMode) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let Some(path) = self.config.config_path() else {
+            tracing::warn!("配置文件路径未知，端点模式仅在当前进程生效");
+            return Ok(());
+        };
+        let mut config =
+            Config::load(path).with_context(|| format!("重新加载配置失败: {}", path.display()))?;
+        config.endpoint_mode = mode;
+        config
+            .save()
+            .with_context(|| format!("持久化端点模式失败: {}", path.display()))?;
         Ok(())
     }
 
@@ -5620,6 +5840,149 @@ mod tests {
         }
         let pick = manager.select_next_credential(None, None);
         assert_eq!(pick.map(|(id, _)| id), Some(1), "平局应按优先级稳定选 A");
+    }
+
+    #[test]
+    fn session_affinity_prefers_same_credential_within_ttl() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("a", &[]), grouped_cred("b", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        manager.remember_session_affinity("group-a\0conversation-1", 2);
+        let selected = manager
+            .select_next_credential_with_affinity(
+                None,
+                None,
+                &HashSet::new(),
+                Some("group-a\0conversation-1"),
+            )
+            .map(|(id, _)| id);
+
+        assert_eq!(selected, Some(2));
+    }
+
+    #[test]
+    fn session_affinity_releases_overloaded_credential() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("a", &[]), grouped_cred("b", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.remember_session_affinity("group-a\0conversation-1", 1);
+        manager
+            .entries
+            .lock()
+            .iter_mut()
+            .find(|e| e.id == 1)
+            .unwrap()
+            .in_flight = 2;
+
+        let selected = manager
+            .select_next_credential_with_affinity(
+                None,
+                None,
+                &HashSet::new(),
+                Some("group-a\0conversation-1"),
+            )
+            .map(|(id, _)| id);
+
+        assert_eq!(selected, Some(2));
+    }
+
+    #[test]
+    fn session_affinity_key_keeps_groups_isolated() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("a", &["g1"]), grouped_cred("b", &["g2"])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.remember_session_affinity("g1\0same-conversation", 1);
+
+        let selected = manager
+            .select_next_credential_with_affinity(
+                None,
+                Some("g2"),
+                &HashSet::new(),
+                Some("g2\0same-conversation"),
+            )
+            .map(|(id, _)| id);
+        assert_eq!(selected, Some(2));
+    }
+
+    #[test]
+    fn first_byte_ewma_uses_alpha_and_ignores_zero() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("a", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        manager.record_first_byte_latency(1, 100);
+        assert_eq!(manager.first_byte_ewma(1), Some(100.0));
+        manager.record_first_byte_latency(1, 0);
+        assert_eq!(manager.first_byte_ewma(1), Some(100.0));
+        manager.record_first_byte_latency(1, 200);
+        assert!((manager.first_byte_ewma(1).unwrap() - 130.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn first_byte_ewma_does_not_change_manual_tie_breaking() {
+        let mut config = Config::default();
+        config.endpoint_mode = EndpointMode::Manual;
+        config.load_balancing_mode = "least_conn".to_string();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![grouped_cred("a", &[]), grouped_cred("b", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.record_first_byte_latency(2, 1);
+
+        let selected = manager.select_next_credential(None, None).map(|(id, _)| id);
+        assert_eq!(selected, Some(1));
+    }
+
+    #[test]
+    fn best_mode_uses_realtime_load_even_when_priority_mode_is_configured() {
+        let mut config = Config::default();
+        config.endpoint_mode = EndpointMode::Best;
+        config.load_balancing_mode = "priority".to_string();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![grouped_cred("a", &[]), grouped_cred("b", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager
+            .entries
+            .lock()
+            .iter_mut()
+            .find(|e| e.id == 1)
+            .unwrap()
+            .in_flight = 3;
+
+        let selected = manager
+            .select_next_credential_with_affinity(None, None, &HashSet::new(), None)
+            .map(|(id, _)| id);
+        assert_eq!(selected, Some(2));
     }
 
     #[test]

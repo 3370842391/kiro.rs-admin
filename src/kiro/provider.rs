@@ -31,7 +31,7 @@ use crate::kiro::model_capabilities::ModelAvailability;
 use crate::kiro::model_catalog::{DynamicModelCatalog, ModelCatalogError};
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::token_manager::MultiTokenManager;
-use crate::model::config::{RetryMode, RetryPolicy, TlsBackend};
+use crate::model::config::{EndpointMode, RetryMode, RetryPolicy, TlsBackend};
 use parking_lot::{Mutex, RwLock};
 
 /// 每个凭据的最大重试次数
@@ -51,6 +51,18 @@ const MAX_POLICY_TOTAL_RETRIES: usize = 30;
 /// HTTP Client 缓存容量上限（不含常驻的全局代理 client）。
 /// 代理池条目较多时，避免每个不同代理都常驻一个 reqwest::Client 导致内存无界增长。
 const CLIENT_CACHE_CAP: usize = 64;
+
+/// 默认最好模式：Kiro Runtime 首选，随后依次尝试三个 Legacy IDE 协议端点。
+pub const BEST_ENDPOINT_NAME: &str = "runtime";
+pub const BEST_ENDPOINT_CHAIN: &[&str] = &["ide", "codewhisperer", "amazonq"];
+
+pub fn best_endpoint_name() -> &'static str {
+    BEST_ENDPOINT_NAME
+}
+
+pub fn best_endpoint_chain() -> &'static [&'static str] {
+    BEST_ENDPOINT_CHAIN
+}
 
 /// 业务流的空闲截止由 Anthropic 适配层的 watchdog 单独负责。
 ///
@@ -314,6 +326,11 @@ impl KiroProvider {
 
     pub fn image_budget_policy(&self) -> ImageBudgetPolicy {
         *self.image_budget_policy.read()
+    }
+
+    pub fn record_first_byte_latency(&self, credential_id: u64, millis: u64) {
+        self.token_manager
+            .record_first_byte_latency(credential_id, millis);
     }
 
     pub fn set_image_budget_policy(&self, policy: ImageBudgetPolicy) -> anyhow::Result<()> {
@@ -828,10 +845,14 @@ impl KiroProvider {
                 .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少必填字段 apiRegion"))?;
             crate::kiro::region::validate_api_region(api_region)?;
         }
-        let name = credentials
-            .endpoint
-            .as_deref()
-            .unwrap_or(&self.default_endpoint);
+        let configured_name = credentials.endpoint.as_deref();
+        let name = configured_name.unwrap_or_else(|| {
+            if self.token_manager.get_endpoint_mode() == EndpointMode::Best {
+                BEST_ENDPOINT_NAME
+            } else {
+                self.default_endpoint.as_str()
+            }
+        });
         self.endpoints
             .get(name)
             .cloned()
@@ -1284,6 +1305,8 @@ impl KiroProvider {
 
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
+        let affinity_key = Self::extract_conversation_id_from_request(request_body)
+            .map(|conversation_id| format!("{}\0{}", group.unwrap_or_default(), conversation_id));
 
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
@@ -1292,7 +1315,12 @@ impl KiroProvider {
             // 获取调用上下文（绑定 index、credentials、token）
             let mut ctx = match self
                 .token_manager
-                .acquire_context_excluding(model.as_deref(), group, &excluded_ids)
+                .acquire_context_excluding_with_affinity(
+                    model.as_deref(),
+                    group,
+                    &excluded_ids,
+                    affinity_key.as_deref(),
+                )
                 .await
             {
                 Ok(c) => c,
@@ -1639,16 +1667,25 @@ impl KiroProvider {
                 //
                 // 降级链来源：运行时覆盖（config.endpointChains，管理面板可改）优先，
                 // 未配置该主端点时回退各 endpoint 的静态 fallback_chain()（零行为变化）。
-                let fallback_chain: Vec<String> = self
-                    .token_manager
-                    .endpoint_chain_for(endpoint.name())
-                    .unwrap_or_else(|| {
-                        endpoint
-                            .fallback_chain()
-                            .iter()
-                            .map(|s| s.to_string())
-                            .collect()
-                    });
+                let fallback_chain: Vec<String> = if self.token_manager.get_endpoint_mode()
+                    == EndpointMode::Best
+                    && endpoint.name() == BEST_ENDPOINT_NAME
+                {
+                    BEST_ENDPOINT_CHAIN
+                        .iter()
+                        .map(|s| (*s).to_string())
+                        .collect()
+                } else {
+                    self.token_manager
+                        .endpoint_chain_for(endpoint.name())
+                        .unwrap_or_else(|| {
+                            endpoint
+                                .fallback_chain()
+                                .iter()
+                                .map(|s| s.to_string())
+                                .collect()
+                        })
+                };
                 for fb_name in &fallback_chain {
                     // 单请求桶尝试总数硬上限（跨 attempt 累计）：防止「链长 × attempt 数」
                     // 把单请求放大成上百次上游调用。0 = 不限。
@@ -1991,6 +2028,16 @@ impl KiroProvider {
             .map(|s| s.to_string())
     }
 
+    fn extract_conversation_id_from_request(request_body: &str) -> Option<String> {
+        let json: serde_json::Value = serde_json::from_str(request_body).ok()?;
+
+        json.get("conversationState")?
+            .get("conversationId")?
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .map(ToOwned::to_owned)
+    }
+
     fn effective_retry_policy(&self) -> anyhow::Result<(RetryMode, RetryPolicy)> {
         let (mode, _, effective) = self.token_manager.get_retry_policy()?;
         Ok((mode, effective))
@@ -2219,5 +2266,28 @@ mod tests {
                 .contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD")
         );
         assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn best_endpoint_chain_has_runtime_primary_and_three_legacy_fallbacks() {
+        assert_eq!(best_endpoint_name(), "runtime");
+        assert_eq!(best_endpoint_chain(), &["ide", "codewhisperer", "amazonq"]);
+    }
+
+    #[test]
+    fn extracts_conversation_id_without_failing_malformed_requests() {
+        let body = r#"{"conversationState":{"conversationId":"conv-123"}}"#;
+        assert_eq!(
+            KiroProvider::extract_conversation_id_from_request(body).as_deref(),
+            Some("conv-123")
+        );
+        assert_eq!(
+            KiroProvider::extract_conversation_id_from_request("{}"),
+            None
+        );
+        assert_eq!(
+            KiroProvider::extract_conversation_id_from_request("not-json"),
+            None
+        );
     }
 }

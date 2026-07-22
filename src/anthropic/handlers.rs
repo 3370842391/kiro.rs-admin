@@ -258,11 +258,19 @@ impl RequestTracer {
     }
 
     /// 标记首个 Kiro 原始 body chunk 到达（幂等，仅记录第一次）
-    pub fn mark_upstream_first_byte(&self) {
+    pub fn mark_upstream_first_byte(&self) -> bool {
         let mut slot = self.upstream_first_byte_at.lock();
         if slot.is_none() {
             *slot = Some(Instant::now());
+            return true;
         }
+        false
+    }
+
+    pub fn upstream_first_byte_ms(&self) -> Option<u64> {
+        self.upstream_first_byte_at
+            .lock()
+            .map(|instant| instant.duration_since(self.started_at).as_millis() as u64)
     }
 
     pub fn set_reasoning_effort(&self, value: Option<String>) {
@@ -3021,7 +3029,11 @@ async fn run_realtime_sse_attempts(
                 _ = sender.closed() => break AttemptTermination::ClientClosed,
                 chunk_result = body_stream.next() => match chunk_result {
                     Some(Ok(chunk)) => {
-                        tracer.mark_upstream_first_byte();
+                        if tracer.mark_upstream_first_byte() {
+                            if let Some(millis) = tracer.upstream_first_byte_ms() {
+                                setup.provider.record_first_byte_latency(credential_id, millis);
+                            }
+                        }
                         tracer.record_stream_chunk(&chunk);
                         received_bytes += chunk.len() as u64;
                         idle_deadline = TokioInstant::now() + Duration::from_secs(idle_timeout_secs.max(1));
@@ -4784,7 +4796,11 @@ async fn run_buffered_sse_attempts(
                 }
                 chunk_result = body_stream.next() => match chunk_result {
                     Some(Ok(chunk)) => {
-                        tracer.mark_upstream_first_byte();
+                        if tracer.mark_upstream_first_byte() {
+                            if let Some(millis) = tracer.upstream_first_byte_ms() {
+                                setup.provider.record_first_byte_latency(credential_id, millis);
+                            }
+                        }
                         tracer.record_stream_chunk(&chunk);
                         received_bytes += chunk.len() as u64;
                         idle_deadline = TokioInstant::now() + Duration::from_secs(idle_timeout_secs.max(1));
