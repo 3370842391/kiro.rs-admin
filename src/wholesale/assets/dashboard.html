@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>我的号池</title>
+<style>
+  :root{--bg:#0f1216;--panel:#1b1f24;--line:#2a2f36;--txt:#e6e6e6;--muted:#9aa4ad;
+    --ok:#51cf66;--warn:#ffd43b;--err:#ff6b6b;--accent:#ff9900;--blue:#4c6ef5;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.6 system-ui,Segoe UI,sans-serif}
+  .wrap{max-width:960px;margin:0 auto;padding:20px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:16px}
+  h1{font-size:20px;margin:0 0 12px}h2{font-size:15px;margin:0 0 12px;color:var(--muted)}
+  label{display:block;color:var(--muted);margin:8px 0 3px;font-size:12px}
+  input{width:100%;padding:8px 10px;background:var(--bg);border:1px solid var(--line);color:var(--txt);border-radius:8px}
+  button{cursor:pointer;border:none;border-radius:8px;padding:8px 14px;font-weight:600;color:#fff;background:var(--blue)}
+  button.primary{background:var(--accent);color:#111}
+  button.sm{padding:3px 9px;font-size:12px}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:end}.row>div{flex:1;min-width:110px}
+  .stat{display:flex;gap:20px;flex-wrap:wrap}
+  .stat .box{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:12px 16px;flex:1;min-width:120px}
+  .stat .box .n{font-size:22px;font-weight:700}.stat .box .l{color:var(--muted);font-size:12px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line);vertical-align:middle}
+  th{color:var(--muted)}
+  td.num{text-align:right;font-variant-numeric:tabular-nums}
+  .badge{padding:2px 8px;border-radius:99px;font-size:12px;font-weight:600;white-space:nowrap}
+  .b-active{background:rgba(81,207,102,.15);color:var(--ok)}
+  .b-low_quota{background:rgba(255,212,59,.15);color:var(--warn)}
+  .b-dead{background:rgba(255,107,107,.15);color:var(--err)}
+  tr.dead{background:rgba(255,107,107,.05)}
+  .key{font-family:Consolas,monospace;font-size:12px;color:var(--muted)}
+  .ok{color:var(--ok)}.err{color:var(--err)}.muted{color:var(--muted)}
+  pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:12px;overflow:auto;font-size:12px;white-space:pre-wrap;word-break:break-all}
+  .toast{position:fixed;bottom:20px;right:20px;background:#2a2f36;border:1px solid var(--line);padding:10px 16px;border-radius:8px;opacity:0;transition:opacity .3s;z-index:9}
+  .toast.show{opacity:1}
+  .hide{display:none}
+  .tabsw{display:flex;gap:8px;margin-bottom:12px}
+  .tabsw button{background:transparent;border:1px solid var(--line);color:var(--muted)}
+  .tabsw button.on{background:var(--blue);color:#fff}
+  a{color:#8ab0ff}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>📦 我的号池</h1>
+
+  <div id="auth" class="card">
+    <div class="tabsw">
+      <button id="tab-login" class="on" onclick="authTab('login')">登录</button>
+      <button id="tab-reg" onclick="authTab('register')">注册</button>
+    </div>
+    <div id="login-box">
+      <label>用户名</label><input id="l-user">
+      <label>密码</label><input id="l-pass" type="password">
+      <div style="margin-top:12px"><button class="primary" onclick="doLogin()">登录</button></div>
+    </div>
+    <div id="reg-box" class="hide">
+      <label>用户名（≥3位）</label><input id="r-user">
+      <label>密码（≥6位）</label><input id="r-pass" type="password">
+      <label>邮箱（可选）</label><input id="r-email">
+      <div style="margin-top:12px"><button class="primary" onclick="doRegister()">注册</button></div>
+      <div id="reg-out" class="hide" style="margin-top:12px"></div>
+    </div>
+    <div id="auth-msg" class="err" style="font-size:12px;margin-top:8px"></div>
+  </div>
+
+  <div id="app" class="hide">
+    <div class="card">
+      <div class="stat">
+        <div class="box"><div class="n" id="s-alive">–</div><div class="l">正常号</div></div>
+        <div class="box"><div class="n" id="s-target">–</div><div class="l">目标数</div></div>
+        <div class="box"><div class="n" id="s-balance">–</div><div class="l">余额(元)</div></div>
+        <div class="box"><div class="n" id="s-uid" style="font-size:14px">–</div><div class="l">UID</div></div>
+      </div>
+      <div class="row" style="margin-top:14px">
+        <div style="flex:0"><label>目标数</label><input id="c-target" type="number" style="width:90px"></div>
+        <div style="flex:0;align-self:end"><button class="primary" onclick="doSync()">立即同步补号</button></div>
+        <div style="flex:0;align-self:end"><button onclick="refresh()">刷新</button></div>
+        <div style="flex:0;align-self:end"><button onclick="logout()" style="background:#495057">退出</button></div>
+      </div>
+      <div id="sync-msg" class="muted" style="font-size:12px;margin-top:8px"></div>
+    </div>
+
+    <div class="card">
+      <h2>号池</h2>
+      <table>
+        <thead><tr><th>编号</th><th>状态</th><th>API Key</th><th>母号</th><th>额度</th><th>存活</th><th>质保剩余</th></tr></thead>
+        <tbody id="pool-body"><tr><td colspan="7" class="muted">加载中…</td></tr></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>CDK 充值</h2>
+      <div class="row">
+        <div><input id="cdk-code" placeholder="输入卡密 CDK-XXXX-XXXX-XXXX"></div>
+        <div style="flex:0"><button class="primary" onclick="doRedeem()">充值</button></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>API 调用文档</h2>
+      <p class="muted" style="font-size:13px">每隔 60 秒调一次 <b>/wholesale/sync</b>，服务端自动把你的正常号补齐到目标数。号死了下次自动补；余额不足会停，充值后继续。返回 <code>pool[].apiKey</code> 直接拿去连 Kiro。status=dead 的号请弃用。<b>30 分钟内死的号自动退回余额。</b></p>
+      <pre id="api-doc"></pre>
+    </div>
+  </div>
+</div>
+<div id="toast" class="toast"></div>
+<script src="/wholesale/dashboard.js"></script>
+</body>
+</html>

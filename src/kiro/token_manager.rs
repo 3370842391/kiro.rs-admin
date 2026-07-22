@@ -732,6 +732,67 @@ pub(crate) async fn get_usage_limits(
     );
 }
 
+/// 创建 Kiro 门户 `ksk_` API Key（批发交付）。
+///
+/// `POST https://management.{region}.kiro.dev/`
+/// header `x-amz-target: KiroControlPlaneBearerService.CreateApiKey`
+/// body `{"profileArn":"...","label":"..."}` → `{keyId, keyPrefix, rawKey}`。
+/// rawKey 只返一次。返回 `(key_id, raw_key)`。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn create_kiro_api_key(
+    config: &Config,
+    token: &str,
+    profile_arn: Option<&str>,
+    region: &str,
+    label: &str,
+    proxy: Option<&ProxyConfig>,
+    token_type_header: Option<&'static str>,
+) -> anyhow::Result<(String, String)> {
+    let host = format!("management.{region}.kiro.dev");
+    let url = format!("https://{host}/");
+
+    let mut body = serde_json::Map::new();
+    if let Some(arn) = profile_arn {
+        body.insert("profileArn".to_string(), serde_json::Value::String(arn.to_string()));
+    }
+    body.insert("label".to_string(), serde_json::Value::String(label.to_string()));
+    let body = serde_json::Value::Object(body);
+
+    let client = build_client(proxy, 60, config.tls_backend)?;
+    let mut request = client
+        .post(&url)
+        .header("content-type", "application/x-amz-json-1.0")
+        .header("x-amz-target", "KiroControlPlaneBearerService.CreateApiKey")
+        .header("host", &host)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Connection", "close")
+        .json(&body);
+    if let Some(token_type) = token_type_header {
+        request = request.header("tokentype", token_type);
+    }
+
+    let response = request.send().await?;
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("CreateApiKey HTTP {}: {}", status.as_u16(), text);
+    }
+
+    let data: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("CreateApiKey 响应解析失败: {} — {}", e, text))?;
+    let key_id = data
+        .get("keyId")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let raw_key = data
+        .get("rawKey")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("CreateApiKey 响应缺少 rawKey: {}", text))?
+        .to_string();
+    Ok((key_id, raw_key))
+}
+
 /// 获取该凭据当前可用的模型列表
 ///
 /// 上游接口：`GET https://{resolved_host}/ListAvailableModels?origin=AI_EDITOR&maxResults=50`
@@ -3527,6 +3588,44 @@ impl MultiTokenManager {
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
         get_available_models(&credentials, &self.config, &token, effective_proxy.as_ref()).await
+    }
+
+    /// 为指定凭据创建一个 Kiro 门户 `ksk_` API Key（批发交付用）。
+    ///
+    /// 链路（见 memory `reference_kiro_apikey_api`）：
+    /// 1. 拿有效 access_token（内部刷新逻辑）+ 解析真实 profileArn；
+    /// 2. `POST https://management.{region}.kiro.dev/`，
+    ///    target `KiroControlPlaneBearerService.CreateApiKey`，
+    ///    body `{"profileArn":"...","label":"..."}` → `{keyId, keyPrefix, rawKey}`。
+    ///
+    /// **rawKey 只在创建时返回一次**，调用方须立即加密持久化。
+    /// 返回 `(key_id, raw_key)`。
+    pub async fn create_ksk_for(&self, id: u64, label: &str) -> anyhow::Result<(String, String)> {
+        let (token, credentials) = self.prepare_request_token(id).await?;
+
+        // profileArn：API Key 凭据无此概念，企业/IdC 号必需
+        let profile_arn = self.resolve_profile_arn_for(id, &token).await?;
+
+        // 区域：优先真实 ARN 区域，回退候选首位
+        let candidates = rest_api_region_candidates_for(&credentials, &self.config)?;
+        let region = candidates
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "us-east-1".to_string());
+
+        let global_proxy = self.proxy.lock().clone();
+        let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
+
+        create_kiro_api_key(
+            &self.config,
+            &token,
+            profile_arn.as_deref(),
+            &region,
+            label,
+            effective_proxy.as_ref(),
+            credentials.token_type_header(),
+        )
+        .await
     }
 
     /// 设置用户偏好（开启/关闭超额）— Admin API

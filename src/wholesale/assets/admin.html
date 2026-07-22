@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>号池管理端</title>
+<style>
+  :root{--bg:#0f1216;--panel:#1b1f24;--line:#2a2f36;--txt:#e6e6e6;--muted:#9aa4ad;
+    --ok:#51cf66;--warn:#ffd43b;--err:#ff6b6b;--accent:#ff9900;--blue:#4c6ef5;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.6 system-ui,Segoe UI,sans-serif}
+  .wrap{max-width:1100px;margin:0 auto;padding:20px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:16px}
+  h1{font-size:20px;margin:0 0 12px}h2{font-size:15px;margin:0 0 12px;color:var(--muted)}
+  label{display:block;color:var(--muted);margin:8px 0 3px;font-size:12px}
+  input,select{width:100%;padding:8px 10px;background:var(--bg);border:1px solid var(--line);color:var(--txt);border-radius:8px}
+  button{cursor:pointer;border:none;border-radius:8px;padding:8px 14px;font-weight:600;color:#fff;background:var(--blue)}
+  button.primary{background:var(--accent);color:#111}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:end}.row>div{flex:1;min-width:110px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:7px 6px;border-bottom:1px solid var(--line)}
+  th{color:var(--muted);position:sticky;top:0;background:var(--panel)}
+  td.num{text-align:right;font-variant-numeric:tabular-nums}
+  .badge{padding:2px 8px;border-radius:99px;font-size:12px;font-weight:600}
+  .b-fresh{background:rgba(81,207,102,.15);color:var(--ok)}
+  .b-active{background:rgba(76,110,245,.2);color:#8ab0ff}
+  .b-aging{background:rgba(255,212,59,.15);color:var(--warn)}
+  .b-dead{background:rgba(255,107,107,.15);color:var(--err)}
+  .ok{color:var(--ok)}.err{color:var(--err)}.muted{color:var(--muted)}
+  pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;overflow:auto;font-size:12px;white-space:pre-wrap;word-break:break-all}
+  .toast{position:fixed;bottom:20px;right:20px;background:#2a2f36;border:1px solid var(--line);padding:10px 16px;border-radius:8px;opacity:0;transition:opacity .3s}
+  .toast.show{opacity:1}
+  .tabs{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}
+  .tabs button{background:transparent;border:1px solid var(--line);color:var(--muted)}
+  .tabs button.on{background:var(--blue);color:#fff}
+  .hide{display:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🛠 号池管理端</h1>
+  <div id="keybar" class="card">
+    <label>Admin Key（sk-admin…）</label>
+    <div class="row"><div style="flex:4"><input id="admin-key" type="password" placeholder="输入 adminApiKey"></div>
+      <div style="flex:0"><button class="primary" onclick="saveKey()">进入</button></div></div>
+    <div id="key-msg" class="err" style="font-size:12px"></div>
+  </div>
+
+  <div id="panel" class="hide">
+    <div class="tabs">
+      <button class="on" onclick="tab('users')">用户</button>
+      <button onclick="tab('mothers')">母号</button>
+      <button onclick="tab('cdk')">CDK</button>
+      <button onclick="tab('upload')">上号测活</button>
+    </div>
+
+    <div id="t-users" class="card">
+      <h2>用户看板</h2>
+      <div style="max-height:60vh;overflow:auto"><table>
+        <thead><tr><th>id</th><th>uid</th><th>用户名</th><th>正常/目标</th><th>余额(元)</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody id="users-body"><tr><td colspan="7" class="muted">加载中…</td></tr></tbody>
+      </table></div>
+    </div>
+
+    <div id="t-mothers" class="card hide">
+      <h2>母号看板</h2>
+      <div style="max-height:60vh;overflow:auto"><table>
+        <thead><tr><th>directory</th><th>状态</th><th>存活/死亡</th><th>加入</th><th>近死</th><th>操作</th></tr></thead>
+        <tbody id="mothers-body"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody>
+      </table></div>
+    </div>
+
+    <div id="t-cdk" class="card hide">
+      <h2>CDK 生成</h2>
+      <div class="row">
+        <div><label>面额(元)</label><input id="cdk-yuan" type="number" value="10"></div>
+        <div><label>数量</label><input id="cdk-count" type="number" value="10"></div>
+        <div><label>批次备注</label><input id="cdk-batch" placeholder="可选"></div>
+        <div style="flex:0"><button class="primary" onclick="genCdk()">生成</button></div>
+      </div>
+      <pre id="cdk-out" class="hide"></pre>
+      <h2 style="margin-top:16px">CDK 列表 <button onclick="loadCdks()" style="padding:2px 8px">刷新</button>
+        <label style="display:inline"><input type="checkbox" id="cdk-unused" style="width:auto" onchange="loadCdks()"> 只看未用</label></h2>
+      <div style="max-height:40vh;overflow:auto"><table>
+        <thead><tr><th>卡密</th><th>面额</th><th>状态</th><th>批次</th></tr></thead>
+        <tbody id="cdks-body"></tbody>
+      </table></div>
+    </div>
+
+    <div id="t-upload" class="card hide">
+      <h2>上号测活</h2>
+      <p class="muted" style="font-size:12px">号需先通过 Admin 凭据导入拿到 credentialId。这里粘贴 JSON 数组：每项 {"credentialId":123,"startUrl":"https://d-xxx.awsapps.com/start","region":"us-east-1"}。系统会探活，活的才入销售池。</p>
+      <textarea id="upload-json" style="width:100%;height:140px;background:var(--bg);border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:10px;font-family:Consolas,monospace"></textarea>
+      <div style="margin-top:10px"><button class="primary" onclick="uploadTest()">测活并入池</button></div>
+      <pre id="upload-out" class="hide"></pre>
+    </div>
+  </div>
+</div>
+<div id="toast" class="toast"></div>
+<script src="/wholesale/admin.js"></script>
+</body>
+</html>
