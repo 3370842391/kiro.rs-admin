@@ -13,6 +13,7 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 HOST_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 PLACEHOLDER_RE = re.compile(r"{(?:account|password|start_url)}")
 PLACEHOLDER_TOKEN_RE = re.compile(r"{(?P<name>account|password|start_url)}")
+AUTO_START_URL_FORMAT = "{account}----{password}----{start_url}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,8 +77,19 @@ def compile_format(template: str) -> CompiledFormat:
     return CompiledFormat(pattern=re.compile(r"\A" + expression + r"\Z"))
 
 
-def parse_accounts(text: str, template: str, mode: LoginMode) -> ParseResult:
+def parse_accounts(
+    text: str,
+    template: str,
+    mode: LoginMode,
+    *,
+    auto_detect_start_url: bool = False,
+) -> ParseResult:
     compiled = compile_format(template)
+    auto_compiled = (
+        compile_format(AUTO_START_URL_FORMAT)
+        if auto_detect_start_url and "{start_url}" not in template
+        else None
+    )
     entries: list[AccountEntry] = []
     issues: list[ParseIssue] = []
     seen: set[str] = set()
@@ -86,7 +98,9 @@ def parse_accounts(text: str, template: str, mode: LoginMode) -> ParseResult:
         line = raw_line.lstrip("\ufeff") if line_number == 1 else raw_line
         if not line.strip() or line.lstrip().startswith("#"):
             continue
-        match = compiled.pattern.fullmatch(line)
+        match = auto_compiled.pattern.fullmatch(line) if auto_compiled else None
+        if match is None:
+            match = compiled.pattern.fullmatch(line)
         if match is None:
             issues.append(ParseIssue(line_number, "format_mismatch", "缺少格式分隔符"))
             continue

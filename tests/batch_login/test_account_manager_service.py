@@ -105,6 +105,31 @@ class AccountManagerServiceTests(unittest.TestCase):
             preview.entries[1].start_url,
         )
 
+    def test_preview_auto_detects_dashed_per_line_start_urls(self):
+        portal = "https://d-9066760521.awsapps.com/start"
+        preview = self.service.preview_import(
+            "\n".join(
+                (
+                    f"NobleFlame1----#5P%<g)g@d80D>o03$OHKz----{portal}",
+                    f"NobleFlame2----part----two----{portal}",
+                )
+            ),
+            "login = {account} / onetime password = {password}",
+            LoginMode.ENTERPRISE,
+        )
+
+        self.assertEqual([], preview.issues)
+        self.assertEqual(
+            ["NobleFlame1", "NobleFlame2"],
+            [item.account for item in preview.entries],
+        )
+        self.assertEqual("#5P%<g)g@d80D>o03$OHKz", preview.entries[0].password)
+        self.assertEqual("part----two", preview.entries[1].password)
+        self.assertEqual(
+            [portal, portal],
+            [item.start_url for item in preview.entries],
+        )
+
     def test_per_line_start_url_overrides_uniform_start_url(self):
         preview = self.service.preview_import(
             "enterprise-user|secret|https://portal.example/per-account",
@@ -190,6 +215,19 @@ class AccountManagerServiceTests(unittest.TestCase):
         self.assertEqual([], preview.issues)
         self.assertEqual(1, len(preview.entries))
         self.assertIsNone(preview.entries[0].start_url)
+
+    def test_microsoft_import_does_not_enable_enterprise_url_auto_detection(self):
+        preview = self.service.preview_import(
+            "user@example.com----secret----https://portal.example/start",
+            "login = {account} / onetime password = {password}",
+            LoginMode.MICROSOFT,
+        )
+
+        self.assertEqual([], preview.entries)
+        self.assertEqual(
+            ["format_mismatch"],
+            [issue.code for issue in preview.issues],
+        )
 
     def test_microsoft_import_allows_blank_start_url_field(self):
         preview = self.service.preview_import(

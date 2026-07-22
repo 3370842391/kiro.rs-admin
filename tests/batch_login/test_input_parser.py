@@ -140,6 +140,31 @@ class InputParserTests(unittest.TestCase):
         self.assertEqual("user@example.com", result.entries[0].account)
         self.assertEqual("abc----123", result.entries[0].password)
 
+    def test_dashed_start_url_auto_detection_is_opt_in(self):
+        raw = "user----part----two----https://portal.example/start"
+        strict = parse_accounts(
+            raw,
+            "{account}----{password}",
+            LoginMode.ENTERPRISE,
+        )
+        detected = parse_accounts(
+            raw,
+            "{account}----{password}",
+            LoginMode.ENTERPRISE,
+            auto_detect_start_url=True,
+        )
+
+        self.assertIsNone(strict.entries[0].start_url)
+        self.assertEqual(
+            "part----two----https://portal.example/start",
+            strict.entries[0].password,
+        )
+        self.assertEqual("part----two", detected.entries[0].password)
+        self.assertEqual(
+            "https://portal.example/start",
+            detected.entries[0].start_url,
+        )
+
     def test_password_first_uses_last_separator(self):
         result = parse_accounts(
             "abc----123####user@example.com\n",

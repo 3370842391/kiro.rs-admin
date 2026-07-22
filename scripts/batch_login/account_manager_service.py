@@ -61,7 +61,12 @@ class AccountManagerService:
         *,
         default_start_url: str = "",
     ) -> ImportPreview:
-        result = parse_accounts(text, template, mode)
+        result = parse_accounts(
+            text,
+            template,
+            mode,
+            auto_detect_start_url=mode is LoginMode.ENTERPRISE,
+        )
         if mode is not LoginMode.ENTERPRISE:
             return ImportPreview(result.entries, result.issues, mode)
 
