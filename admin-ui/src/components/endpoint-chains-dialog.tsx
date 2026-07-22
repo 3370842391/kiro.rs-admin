@@ -7,7 +7,9 @@ import { Checkbox } from '@/components/ui/checkbox'
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter,
 } from '@/components/ui/dialog'
-import { useEndpointChains, useSetEndpointChains } from '@/hooks/use-credentials'
+import {
+  useEndpointChains, useSetEndpointChains, useEndpointMode, useSetEndpointMode,
+} from '@/hooks/use-credentials'
 import type { EndpointBucketOption } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 
@@ -35,6 +37,13 @@ const BUCKET_HINT: Record<string, string> = {
   ide: 'ide — Kiro IDE 主端点桶。',
 }
 
+const ENDPOINT_LABEL: Record<string, string> = {
+  runtime: 'Kiro Runtime',
+  ide: 'Legacy Kiro IDE',
+  codewhisperer: 'Legacy CodeWhisperer',
+  amazonq: 'Legacy Amazon Q',
+}
+
 /**
  * 429 降级桶链配置：主端点 429 时「换桶不换号」依次尝试的备用桶（有序、可勾选）。
  * 未配置时走各端点静态默认链。空选 = 该主端点不降级。
@@ -42,6 +51,8 @@ const BUCKET_HINT: Record<string, string> = {
 export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialogProps) {
   const { data, isLoading } = useEndpointChains()
   const { mutate: save, isPending: saving } = useSetEndpointChains()
+  const { data: modeData } = useEndpointMode()
+  const { mutate: saveMode, isPending: savingMode } = useSetEndpointMode()
 
   // 本地编辑态：primary -> 有序桶名数组
   const [draft, setDraft] = useState<Record<string, string[]>>({})
@@ -114,6 +125,39 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
             未配置时走内置默认链。
           </DialogDescription>
         </DialogHeader>
+
+        <div className="rounded-lg border bg-muted/30 p-3">
+          <div className="mb-2 text-sm font-medium">全局端点运行模式</div>
+          <div className="flex flex-wrap gap-2">
+            <Button
+              type="button"
+              size="sm"
+              variant={modeData?.mode === 'best' ? 'default' : 'outline'}
+              disabled={savingMode || !modeData}
+              onClick={() => saveMode('best')}
+            >
+              默认最好模式
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant={modeData?.mode === 'manual' ? 'default' : 'outline'}
+              disabled={savingMode || !modeData}
+              onClick={() => saveMode('manual')}
+            >
+              手动端点模式
+            </Button>
+          </div>
+          {modeData && (
+            <p className="mt-2 text-xs text-muted-foreground">
+              当前：{modeData.label}；主端点 {ENDPOINT_LABEL[modeData.primaryEndpoint] ?? modeData.primaryEndpoint}
+              {modeData.fallbackEndpoints.length > 0
+                ? `，故障降级：${modeData.fallbackEndpoints.map((name) => ENDPOINT_LABEL[name] ?? name).join(' → ')}`
+                : ''}
+              {modeData.adaptiveScheduling ? '；已启用会话粘性和实时调度。' : ''}
+            </p>
+          )}
+        </div>
 
         {isLoading ? (
           <div className="py-8 text-center text-sm text-muted-foreground">加载中…</div>

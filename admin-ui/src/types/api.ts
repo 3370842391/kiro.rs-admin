@@ -22,6 +22,7 @@ export interface CredentialStatusItem {
   id: number
   priority: number
   inFlight: number
+  firstByteEwmaMs?: number
   /** 每分钟请求数上限（0 = 不限速） */
   rpmLimit: number
   /** 当前滑动窗口内已用请求条数 */

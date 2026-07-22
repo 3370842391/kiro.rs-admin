@@ -980,8 +980,7 @@ mod tests {
 
     #[test]
     fn endpoint_mode_rejects_unknown_values() {
-        let error = serde_json::from_str::<Config>(r#"{"endpointMode":"turbo"}"#)
-            .unwrap_err();
+        let error = serde_json::from_str::<Config>(r#"{"endpointMode":"turbo"}"#).unwrap_err();
         assert!(error.to_string().contains("unknown variant"));
     }
 }

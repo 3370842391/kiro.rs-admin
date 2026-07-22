@@ -328,6 +328,11 @@ impl KiroProvider {
         *self.image_budget_policy.read()
     }
 
+    pub fn record_first_byte_latency(&self, credential_id: u64, millis: u64) {
+        self.token_manager
+            .record_first_byte_latency(credential_id, millis);
+    }
+
     pub fn set_image_budget_policy(&self, policy: ImageBudgetPolicy) -> anyhow::Result<()> {
         *self.image_budget_policy.write() = policy.validate()?;
         Ok(())
@@ -1300,6 +1305,8 @@ impl KiroProvider {
 
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
+        let affinity_key = Self::extract_conversation_id_from_request(request_body)
+            .map(|conversation_id| format!("{}\0{}", group.unwrap_or_default(), conversation_id));
 
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
@@ -1308,7 +1315,12 @@ impl KiroProvider {
             // 获取调用上下文（绑定 index、credentials、token）
             let mut ctx = match self
                 .token_manager
-                .acquire_context_excluding(model.as_deref(), group, &excluded_ids)
+                .acquire_context_excluding_with_affinity(
+                    model.as_deref(),
+                    group,
+                    &excluded_ids,
+                    affinity_key.as_deref(),
+                )
                 .await
             {
                 Ok(c) => c,
@@ -1659,7 +1671,10 @@ impl KiroProvider {
                     == EndpointMode::Best
                     && endpoint.name() == BEST_ENDPOINT_NAME
                 {
-                    BEST_ENDPOINT_CHAIN.iter().map(|s| (*s).to_string()).collect()
+                    BEST_ENDPOINT_CHAIN
+                        .iter()
+                        .map(|s| (*s).to_string())
+                        .collect()
                 } else {
                     self.token_manager
                         .endpoint_chain_for(endpoint.name())
@@ -2013,6 +2028,16 @@ impl KiroProvider {
             .map(|s| s.to_string())
     }
 
+    fn extract_conversation_id_from_request(request_body: &str) -> Option<String> {
+        let json: serde_json::Value = serde_json::from_str(request_body).ok()?;
+
+        json.get("conversationState")?
+            .get("conversationId")?
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .map(ToOwned::to_owned)
+    }
+
     fn effective_retry_policy(&self) -> anyhow::Result<(RetryMode, RetryPolicy)> {
         let (mode, _, effective) = self.token_manager.get_retry_policy()?;
         Ok((mode, effective))
@@ -2247,5 +2272,22 @@ mod tests {
     fn best_endpoint_chain_has_runtime_primary_and_three_legacy_fallbacks() {
         assert_eq!(best_endpoint_name(), "runtime");
         assert_eq!(best_endpoint_chain(), &["ide", "codewhisperer", "amazonq"]);
+    }
+
+    #[test]
+    fn extracts_conversation_id_without_failing_malformed_requests() {
+        let body = r#"{"conversationState":{"conversationId":"conv-123"}}"#;
+        assert_eq!(
+            KiroProvider::extract_conversation_id_from_request(body).as_deref(),
+            Some("conv-123")
+        );
+        assert_eq!(
+            KiroProvider::extract_conversation_id_from_request("{}"),
+            None
+        );
+        assert_eq!(
+            KiroProvider::extract_conversation_id_from_request("not-json"),
+            None
+        );
     }
 }

@@ -51,6 +51,9 @@ pub struct CredentialStatusItem {
     pub rpm_current: u32,
     /// 当前正在使用该凭据的请求数
     pub in_flight: u32,
+    /// 最近流式首字节延迟的 EWMA（毫秒）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_byte_ewma_ms: Option<f64>,
     /// 是否被禁用
     pub disabled: bool,
     /// 连续失败次数
@@ -700,6 +703,23 @@ pub struct SetEndpointChainsRequest {
     /// 流式空闲超时（秒，0 = 关闭）；省略则不改。
     #[serde(default)]
     pub stream_idle_timeout_secs: Option<u64>,
+}
+
+/// 全局端点运行模式。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EndpointModeResponse {
+    pub mode: String,
+    pub label: String,
+    pub primary_endpoint: String,
+    pub fallback_endpoints: Vec<String>,
+    pub adaptive_scheduling: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetEndpointModeRequest {
+    pub mode: String,
 }
 
 /// 缓存命中率整形区间配置响应
