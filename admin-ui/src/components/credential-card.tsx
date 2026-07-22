@@ -49,6 +49,14 @@ import {
 } from "@/lib/utils";
 import { rpmLoadState } from "@/lib/rpm-operations";
 import {
+  connectionLabel,
+  formatBalanceFreshness,
+  formatRpmMetric,
+  formatRpmUtilization,
+  formatSuccessRate,
+  formatTokenState,
+} from "@/lib/credential-metrics";
+import {
   useSetDisabled,
   useSetPriority,
   useResetFailure,
@@ -204,6 +212,60 @@ function getDisabledReasonStyle(reason?: string | null): {
     default:
       return { label: reason, variant: "outline" };
   }
+}
+
+function CredentialMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div
+      className="flex min-w-0 items-center justify-between gap-1 rounded-md border border-border/50 bg-secondary/30 px-1.5 py-1 sm:justify-start sm:gap-1.5"
+      title={`${label}: ${value}`}
+      aria-label={`${label}: ${value}`}
+    >
+      <span className="shrink-0 text-[10px] text-muted-foreground">{label}</span>
+      <span className="min-w-0 truncate text-[11px] font-medium tabular-nums text-foreground">
+        {value}
+      </span>
+    </div>
+  );
+}
+
+function CredentialMetricsStrip({ credential }: { credential: CredentialStatusItem }) {
+  const rpmCurrent = credential.rpmCurrent ?? 0;
+  const rpmLimit = credential.rpmLimit ?? 0;
+  const tokenValue =
+    credential.authMethod === "api_key"
+      ? "API Key"
+      : formatTokenState(credential.expiresAt);
+
+  return (
+    <div
+      data-credential-metrics
+      className="mt-1 grid min-w-0 grid-cols-2 gap-1 text-[11px] sm:grid-cols-4 xl:flex xl:flex-wrap"
+    >
+      <CredentialMetric
+        label="近1分钟 RPM"
+        value={formatRpmMetric(rpmCurrent, rpmLimit)}
+      />
+      <CredentialMetric
+        label="RPM 使用率"
+        value={formatRpmUtilization(rpmCurrent, rpmLimit)}
+      />
+      <CredentialMetric
+        label="成功率"
+        value={formatSuccessRate(
+          credential.successCount,
+          credential.totalFailureCount,
+        )}
+      />
+      <CredentialMetric label="进行中" value={String(credential.inFlight ?? 0)} />
+      <CredentialMetric label="Token" value={tokenValue} />
+      <CredentialMetric
+        label="余额更新"
+        value={formatBalanceFreshness(credential.balanceUpdatedAt)}
+      />
+      <CredentialMetric label="连接" value={connectionLabel(credential.hasProxy)} />
+    </div>
+  );
 }
 
 export function CredentialCard({
@@ -684,6 +746,7 @@ export function CredentialCard({
         <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1 gap-y-1 [&>*]:shrink-0">
           {badges}
         </div>
+        <CredentialMetricsStrip credential={credential} />
       </div>
 
       {/* 关键指标（中大屏） */}
@@ -952,6 +1015,7 @@ export function CredentialCard({
               <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-1 overflow-hidden">
                 {badges}
               </div>
+              <CredentialMetricsStrip credential={credential} />
             </div>
             <Switch
               className="mt-0.5"
