@@ -55,6 +55,19 @@ describe('admin RPM operations UI wiring', () => {
     expect(dialog).toContain('id="batch-group-mode-description"')
   })
 
+  test('batch dialog exposes fixed and promoted priority modes', async () => {
+    const dialog = await readSource('src/components/batch-edit-credential-dialog.tsx')
+
+    expect(dialog).toContain('editPriority')
+    expect(dialog).toContain('priorityMode')
+    expect(dialog).toContain('batch-priority-value')
+    expect(dialog).toContain('指定数值')
+    expect(dialog).toContain('最高优先池')
+    expect(dialog).toContain('数字越小优先级越高')
+    expect(dialog).toContain('可能承担全部新流量')
+    expect(dialog).toContain('priorityAdjusted')
+  })
+
   test('batch dialog separates HTTP failures from success callbacks', async () => {
     const dialog = await readSource('src/components/batch-edit-credential-dialog.tsx')
     const catchIndex = dialog.indexOf('} catch (error) {')
