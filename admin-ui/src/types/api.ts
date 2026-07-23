@@ -174,6 +174,15 @@ export interface ProfitReport {
   cost: number
   profit: number
   marginPct: number
+  attributedCredits: number
+  unattributedCredits: number
+  attributedCost: number
+  unattributedCost: number
+  attributedRevenue: number
+  unattributedRevenue: number
+  observedChannelIds: number[]
+  observedKeyIds: number[]
+  ledgerScopeConfirmed: boolean
   byKey: ProfitBreakdownStat[]
   byGroup: ProfitBreakdownStat[]
   byModel: ProfitBreakdownStat[]

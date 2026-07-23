@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { DollarSign, RefreshCw, Save, TriangleAlert } from 'lucide-react'
+import { DollarSign, RefreshCw, Save, ShieldAlert, TriangleAlert } from 'lucide-react'
 import { toast } from 'sonner'
 
 import {
@@ -93,7 +93,7 @@ export function ProfitPage() {
             NewAPI 利润
           </h2>
           <p className="mt-1 text-sm text-muted-foreground">
-            按 NewAPI 收入精确关联 RS trace，并使用 Kiro 实际 Credits 计算成本。
+            收入按已识别的 RS 渠道统计；顶部总成本来自 RS 实际 metering 账本。
           </p>
         </div>
         <Badge variant={configQuery.data?.tokenConfigured ? 'success' : 'warning'}>
@@ -121,7 +121,7 @@ export function ProfitPage() {
         <CardHeader className="gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div>
             <CardTitle>利润报表</CardTitle>
-            <CardDescription>仅统计能够由请求 ID 精确关联的数据。</CardDescription>
+            <CardDescription>总成本使用 usage 账本，分组表仅展示可精确归属部分。</CardDescription>
           </div>
           <div className="flex flex-wrap gap-2">
             {TIME_RANGES.map((range) => (
@@ -269,14 +269,16 @@ function Field({
 }
 
 function KpiGrid({ report }: { report: ProfitReport }) {
-  const matchPct = report.rows > 0 ? report.matched / report.rows * 100 : 0
+  const attributionPct = report.revenue > 0
+    ? report.attributedRevenue / report.revenue * 100
+    : 0
   const cards = [
     ['收入', money(report.revenue)],
     ['上游 Credits', number(report.credits, 4)],
     ['成本', money(report.cost)],
-    ['利润', money(report.profit)],
-    ['毛利率', `${number(report.marginPct, 2)}%`],
-    ['匹配率', `${number(matchPct, 2)}%`],
+    ['利润', report.ledgerScopeConfirmed ? money(report.profit) : '不可用'],
+    ['毛利率', report.ledgerScopeConfirmed ? `${number(report.marginPct, 2)}%` : '不可用'],
+    ['归属率', `${number(attributionPct, 2)}%`],
   ]
   return (
     <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
@@ -286,7 +288,7 @@ function KpiGrid({ report }: { report: ProfitReport }) {
           <p
             className={cn(
               'mt-1 text-lg font-semibold tabular-nums',
-              label === '利润' && report.profit < 0 && 'text-destructive',
+              (label === '利润' && report.ledgerScopeConfirmed && report.profit < 0) && 'text-destructive',
             )}
           >
             {value}
@@ -298,15 +300,35 @@ function KpiGrid({ report }: { report: ProfitReport }) {
 }
 
 function ReportWarnings({ report }: { report: ProfitReport }) {
-  if (report.unmatched === 0 && report.missingCost === 0) return null
+  const hasUnattributed = report.unattributedRevenue > 0 || report.unattributedCredits > 0 || report.unattributedCost > 0
+  if (report.ledgerScopeConfirmed && report.unmatched === 0 && report.missingCost === 0 && !hasUnattributed) return null
   return (
-    <div className="flex flex-wrap gap-2 rounded-xl border border-amber-500/30 bg-amber-500/5 p-3 text-xs">
-      <TriangleAlert className="h-4 w-4 text-amber-600" />
+    <div
+      role="alert"
+      aria-live="polite"
+      className={cn(
+        'flex flex-wrap items-center gap-2 rounded-xl border p-3 text-xs',
+        report.ledgerScopeConfirmed
+          ? 'border-amber-500/30 bg-amber-500/5'
+          : 'border-destructive/40 bg-destructive/5 text-destructive',
+      )}
+    >
+      {report.ledgerScopeConfirmed ? (
+        <TriangleAlert className="h-4 w-4 text-amber-600" />
+      ) : (
+        <ShieldAlert className="h-4 w-4" />
+      )}
+      {!report.ledgerScopeConfirmed && <strong>范围未确认：暂不展示可信利润结论。</strong>}
       {report.unmatched > 0 && (
         <span>未匹配收入：{report.unmatched} 条 / {money(report.unmatchedRevenue)}</span>
       )}
-      {report.missingCost > 0 && <span>缺失成本：{report.missingCost} 条</span>}
-      <span className="text-muted-foreground">未确认成本不会被虚构为 1 Credit。</span>
+      {report.unattributedRevenue > 0 && <span>未归属收入：{money(report.unattributedRevenue)}</span>}
+      {report.unattributedCredits > 0 && <span>未归属 Credits：{number(report.unattributedCredits, 4)}</span>}
+      {report.unattributedCost > 0 && <span>未归属成本：{money(report.unattributedCost)}</span>}
+      {report.missingCost > 0 && <span>缺失成本记录：{report.missingCost} 条</span>}
+      <span className={report.ledgerScopeConfirmed ? 'text-muted-foreground' : undefined}>
+        顶部总成本来自 RS 实际 metering 账本；分组表仅展示可精确归属部分。
+      </span>
     </div>
   )
 }
