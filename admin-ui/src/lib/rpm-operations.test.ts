@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   buildBatchUpdateRequest,
+  parsePriority,
   parseRpmLimit,
   rpmLoadState,
   totalInFlight,
@@ -23,6 +24,20 @@ describe('parseRpmLimit', () => {
         ok: false,
         message: 'RPM 上限必须是 0 到 100000 的整数',
       })
+    },
+  )
+})
+
+describe('parsePriority', () => {
+  test('接受 0 和 u32 最大值', () => {
+    expect(parsePriority('0')).toEqual({ ok: true, value: 0 })
+    expect(parsePriority('4294967295')).toEqual({ ok: true, value: 4294967295 })
+  })
+
+  test.each(['', '-1', '1.5', '1e3', '4294967296'])(
+    '拒绝无效优先级 %s',
+    (draft) => {
+      expect(parsePriority(draft).ok).toBe(false)
     },
   )
 })
@@ -71,6 +86,33 @@ describe('totalInFlight', () => {
 })
 
 describe('buildBatchUpdateRequest', () => {
+  test('固定数值与最高优先池生成互斥请求', () => {
+    const base = {
+      ids: [1, 2],
+      editRpm: false,
+      rpmDraft: '',
+      editGroups: false,
+      groupMode: 'replace' as const,
+      groups: [],
+      editSource: false,
+      sourceChannel: '',
+      editPriority: true,
+    }
+
+    expect(
+      buildBatchUpdateRequest({ ...base, priorityMode: 'fixed', priorityDraft: '10' }),
+    ).toEqual({
+      ok: true,
+      value: { ids: [1, 2], priority: 10 },
+    })
+    expect(
+      buildBatchUpdateRequest({ ...base, priorityMode: 'promote', priorityDraft: '' }),
+    ).toEqual({
+      ok: true,
+      value: { ids: [1, 2], promotePriority: true },
+    })
+  })
+
   test('拒绝空 ID 集合', () => {
     const result = buildBatchUpdateRequest({
       ids: [],

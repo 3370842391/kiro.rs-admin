@@ -257,12 +257,15 @@ export interface BatchUpdateCredentialsRequest {
   rpmLimit?: number
   groups?: BatchCredentialGroupPatch
   sourceChannel?: string
+  priority?: number
+  promotePriority?: boolean
 }
 
 export interface BatchUpdateCredentialsResponse {
   selected: number
   updated: number
   unchanged: number
+  priorityAdjusted: number
   rpmSummary: RpmSummary
 }
 

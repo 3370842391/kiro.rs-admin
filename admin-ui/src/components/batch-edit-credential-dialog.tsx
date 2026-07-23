@@ -13,7 +13,11 @@ import { Switch } from '@/components/ui/switch'
 import { Input } from '@/components/ui/input'
 import { GroupMultiSelect } from '@/components/group-select'
 import { useBatchUpdateCredentials } from '@/hooks/use-credentials'
-import { buildBatchUpdateRequest, parseRpmLimit } from '@/lib/rpm-operations'
+import {
+  buildBatchUpdateRequest,
+  parsePriority,
+  parseRpmLimit,
+} from '@/lib/rpm-operations'
 import { extractErrorMessage } from '@/lib/utils'
 import type { CredentialStatusItem } from '@/types/api'
 
@@ -50,6 +54,11 @@ export function BatchEditCredentialDialog({
   const [groups, setGroups] = useState<string[]>([])
   const [editSource, setEditSource] = useState(false)
   const [sourceChannel, setSourceChannel] = useState('')
+  const [editPriority, setEditPriority] = useState(false)
+  const [priorityMode, setPriorityMode] = useState<'fixed' | 'promote'>('fixed')
+  const [priorityDraft, setPriorityDraft] = useState('0')
+  const [priorityError, setPriorityError] = useState('')
+  const priorityInputRef = useRef<HTMLInputElement>(null)
   const [running, setRunning] = useState(false)
 
   useEffect(() => {
@@ -62,6 +71,10 @@ export function BatchEditCredentialDialog({
     setGroups([])
     setEditSource(false)
     setSourceChannel('')
+    setEditPriority(false)
+    setPriorityMode('fixed')
+    setPriorityDraft('0')
+    setPriorityError('')
     setRunning(false)
   }, [open])
 
@@ -79,6 +92,16 @@ export function BatchEditCredentialDialog({
     }
     setRpmError('')
 
+    if (editPriority && priorityMode === 'fixed') {
+      const parsedPriority = parsePriority(priorityDraft)
+      if (!parsedPriority.ok) {
+        setPriorityError(parsedPriority.message)
+        priorityInputRef.current?.focus()
+        return
+      }
+    }
+    setPriorityError('')
+
     const request = buildBatchUpdateRequest({
       ids: credentials.map((credential) => credential.id),
       editRpm,
@@ -88,6 +111,9 @@ export function BatchEditCredentialDialog({
       groups,
       editSource,
       sourceChannel,
+      editPriority,
+      priorityMode,
+      priorityDraft,
     })
     if (!request.ok) {
       toast.error(request.message)
@@ -105,7 +131,11 @@ export function BatchEditCredentialDialog({
       setRunning(false)
     }
 
-    toast.success(`已更新 ${result.updated} 个账号，${result.unchanged} 个未变化`)
+    const prioritySummary =
+      result.priorityAdjusted > 0 ? `，调整 ${result.priorityAdjusted} 个账号优先级` : ''
+    toast.success(
+      `已更新 ${result.updated} 个账号，${result.unchanged} 个未变化${prioritySummary}`,
+    )
     onOpenChange(false)
     onDone()
   }
@@ -254,6 +284,106 @@ export function BatchEditCredentialDialog({
                   disabled={running}
                   className="h-11 sm:h-9"
                 />
+              </div>
+            ) : null}
+          </section>
+
+          <section className="space-y-3 rounded-md border border-border/60 p-3">
+            <label
+              htmlFor="batch-edit-priority"
+              className="flex min-h-11 items-center justify-between gap-3"
+            >
+              <span className="text-sm font-medium">修改优先级</span>
+              <Switch
+                id="batch-edit-priority"
+                checked={editPriority}
+                onCheckedChange={setEditPriority}
+                disabled={running}
+              />
+            </label>
+            {editPriority ? (
+              <div className="space-y-3">
+                <div
+                  role="group"
+                  aria-label="优先级修改方式"
+                  className="grid grid-cols-2 gap-2"
+                >
+                  <Button
+                    type="button"
+                    size="sm"
+                    className="h-11 sm:h-8"
+                    aria-pressed={priorityMode === 'fixed'}
+                    variant={priorityMode === 'fixed' ? 'default' : 'outline'}
+                    onClick={() => {
+                      setPriorityMode('fixed')
+                      setPriorityError('')
+                    }}
+                    disabled={running}
+                  >
+                    指定数值
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    className="h-11 sm:h-8"
+                    aria-pressed={priorityMode === 'promote'}
+                    variant={priorityMode === 'promote' ? 'default' : 'outline'}
+                    onClick={() => {
+                      setPriorityMode('promote')
+                      setPriorityError('')
+                    }}
+                    disabled={running}
+                  >
+                    最高优先池
+                  </Button>
+                </div>
+
+                {priorityMode === 'fixed' ? (
+                  <div className="space-y-2">
+                    <label
+                      htmlFor="batch-priority-value"
+                      className="block text-xs font-medium text-muted-foreground"
+                    >
+                      优先级数值
+                    </label>
+                    <Input
+                      ref={priorityInputRef}
+                      id="batch-priority-value"
+                      name="priority"
+                      autoComplete="off"
+                      type="number"
+                      inputMode="numeric"
+                      min={0}
+                      max={4294967295}
+                      step={1}
+                      value={priorityDraft}
+                      onChange={(event) => {
+                        setPriorityDraft(event.target.value)
+                        setPriorityError('')
+                      }}
+                      aria-invalid={Boolean(priorityError)}
+                      aria-describedby={
+                        priorityError
+                          ? 'batch-priority-hint batch-priority-error'
+                          : 'batch-priority-hint'
+                      }
+                      disabled={running}
+                      className="h-11 sm:h-9 tabular-nums"
+                    />
+                    {priorityError ? (
+                      <p id="batch-priority-error" className="text-xs text-destructive" role="alert">
+                        {priorityError}
+                      </p>
+                    ) : null}
+                    <p id="batch-priority-hint" className="text-xs text-muted-foreground">
+                      数字越小优先级越高；相同数字属于同一个调度池。
+                    </p>
+                  </div>
+                ) : (
+                  <p className="rounded-md border border-amber-500/40 bg-amber-500/10 p-2 text-xs text-amber-700 dark:text-amber-300">
+                    选中账号会设为 0，其他账号保持相对层级并顺延。仅选择一个账号时，它可能承担全部新流量；不可用、RPM 满或冷却时会自动回退。
+                  </p>
+                )}
               </div>
             ) : null}
           </section>
