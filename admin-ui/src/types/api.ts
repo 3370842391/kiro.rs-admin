@@ -801,6 +801,9 @@ export interface ErrorSnapshotStorageStatus {
   shmBytes: number
   fallbackBytes: number
   totalBytes: number
+  allocatedBytes: number
+  liveBytes: number
+  reusableBytes: number
   availableBytes: number
   maxStorageBytes: number
   minFreeDiskBytes: number
@@ -808,6 +811,8 @@ export interface ErrorSnapshotStorageStatus {
   records: number
   pinnedRecords: number
   criticalRecords: number
+  skippedCapacity: number
+  captureMode: 'full' | 'criticalOnly' | 'metadataOnly' | 'disabled'
 }
 
 /** 单凭据失败分类计数（鉴权 / 账号风控 / 其他） */

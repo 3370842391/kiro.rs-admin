@@ -402,7 +402,7 @@ pub struct Config {
     pub error_snapshot_max_storage_gb: u64,
 
     /// 是否保存经过重试后恢复成功的请求现场。
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub error_snapshot_capture_recovered: bool,
 
     /// 是否保存脱敏后的请求/响应正文；关闭后仅记录结构化元数据。
@@ -610,15 +610,15 @@ fn default_trace_retention_days() -> u32 {
 }
 
 fn default_error_snapshot_retention_days() -> u32 {
-    90
+    7
 }
 
 fn default_error_snapshot_max_storage_gb() -> u64 {
-    200
+    5
 }
 
 fn default_error_snapshot_min_free_disk_gb() -> u64 {
-    100
+    10
 }
 
 fn default_stream_idle_timeout_secs() -> u64 {
@@ -744,7 +744,7 @@ impl Default for Config {
             error_snapshot_enabled: true,
             error_snapshot_retention_days: default_error_snapshot_retention_days(),
             error_snapshot_max_storage_gb: default_error_snapshot_max_storage_gb(),
-            error_snapshot_capture_recovered: true,
+            error_snapshot_capture_recovered: false,
             error_snapshot_capture_bodies: true,
             error_snapshot_min_free_disk_gb: default_error_snapshot_min_free_disk_gb(),
             stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
@@ -843,11 +843,11 @@ mod tests {
     fn error_snapshot_defaults_are_safe_and_round_trip_in_camel_case() {
         let defaulted: Config = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(defaulted.error_snapshot_enabled);
-        assert_eq!(defaulted.error_snapshot_retention_days, 90);
-        assert_eq!(defaulted.error_snapshot_max_storage_gb, 200);
-        assert!(defaulted.error_snapshot_capture_recovered);
+        assert_eq!(defaulted.error_snapshot_retention_days, 7);
+        assert_eq!(defaulted.error_snapshot_max_storage_gb, 5);
+        assert!(!defaulted.error_snapshot_capture_recovered);
         assert!(defaulted.error_snapshot_capture_bodies);
-        assert_eq!(defaulted.error_snapshot_min_free_disk_gb, 100);
+        assert_eq!(defaulted.error_snapshot_min_free_disk_gb, 10);
 
         let custom: Config = serde_json::from_value(serde_json::json!({
             "errorSnapshotEnabled": false,

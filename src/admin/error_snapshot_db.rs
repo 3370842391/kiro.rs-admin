@@ -1,7 +1,7 @@
 use std::io::Read as _;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use base64::Engine as _;
 use parking_lot::{Mutex, RwLock};
@@ -15,6 +15,8 @@ const SCHEMA_VERSION: i64 = 3;
 const DEDUP_WINDOW_SECS: i64 = 60;
 const DEFAULT_QUERY_LIMIT: usize = 50;
 const MAX_QUERY_LIMIT: usize = 1000;
+const MAINTENANCE_BATCH_SIZE: usize = 512;
+const SNAPSHOT_ROW_OVERHEAD_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -121,13 +123,60 @@ pub enum InsertOutcome {
     Inserted(String),
     Existing(String),
     Fallback(String),
+    SkippedCapacity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum CaptureMode {
     Full,
+    CriticalOnly,
     MetadataOnly,
+    Disabled,
+}
+
+impl CaptureMode {
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Full => 0,
+            Self::CriticalOnly => 1,
+            Self::MetadataOnly => 2,
+            Self::Disabled => 3,
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::CriticalOnly,
+            2 => Self::MetadataOnly,
+            3 => Self::Disabled,
+            _ => Self::Full,
+        }
+    }
+}
+
+fn capture_mode_for(
+    live_bytes: u64,
+    max_storage_bytes: u64,
+    available_bytes: u64,
+    min_free_disk_bytes: u64,
+    enabled: bool,
+) -> CaptureMode {
+    if !enabled || max_storage_bytes == 0 || live_bytes >= max_storage_bytes {
+        return CaptureMode::Disabled;
+    }
+    if available_bytes < min_free_disk_bytes {
+        return CaptureMode::MetadataOnly;
+    }
+    let utilization = u128::from(live_bytes).saturating_mul(100);
+    let maximum = u128::from(max_storage_bytes);
+    if utilization >= maximum.saturating_mul(90) {
+        CaptureMode::MetadataOnly
+    } else if utilization >= maximum.saturating_mul(80) {
+        CaptureMode::CriticalOnly
+    } else {
+        CaptureMode::Full
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -145,6 +194,7 @@ pub struct MaintenanceReport {
     pub imported: usize,
     pub disk_pressure: bool,
     pub total_bytes: u64,
+    pub needs_follow_up: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -155,6 +205,9 @@ pub struct StorageStatus {
     pub shm_bytes: u64,
     pub fallback_bytes: u64,
     pub total_bytes: u64,
+    pub allocated_bytes: u64,
+    pub live_bytes: u64,
+    pub reusable_bytes: u64,
     pub available_bytes: u64,
     pub max_storage_bytes: u64,
     pub min_free_disk_bytes: u64,
@@ -162,6 +215,8 @@ pub struct StorageStatus {
     pub records: u64,
     pub pinned_records: u64,
     pub critical_records: u64,
+    pub skipped_capacity: u64,
+    pub capture_mode: CaptureMode,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -236,7 +291,8 @@ pub struct ErrorSnapshotStore {
     #[allow(dead_code)]
     fallback_dir: Option<PathBuf>,
     policy: RwLock<ErrorSnapshotPolicy>,
-    disk_pressure: AtomicBool,
+    capture_mode: AtomicU8,
+    skipped_capacity: AtomicU64,
     storage_probe: Arc<dyn StorageProbe>,
 }
 
@@ -295,12 +351,14 @@ impl ErrorSnapshotStore {
         let is_new = !path.exists();
         let conn = Connection::open(&path)?;
         initialize_connection(&conn, is_new)?;
+        let initial_mode = if policy.enabled { 0 } else { 3 };
         Ok(Self {
             conn: Mutex::new(conn),
             db_path: Some(path),
             fallback_dir: Some(fallback_dir),
             policy: RwLock::new(policy),
-            disk_pressure: AtomicBool::new(false),
+            capture_mode: AtomicU8::new(initial_mode),
+            skipped_capacity: AtomicU64::new(0),
             storage_probe: Arc::new(RealStorageProbe),
         })
     }
@@ -308,12 +366,14 @@ impl ErrorSnapshotStore {
     pub fn open_in_memory(policy: ErrorSnapshotPolicy) -> rusqlite::Result<Self> {
         let conn = Connection::open_in_memory()?;
         initialize_connection(&conn, true)?;
+        let initial_mode = if policy.enabled { 0 } else { 3 };
         Ok(Self {
             conn: Mutex::new(conn),
             db_path: None,
             fallback_dir: None,
             policy: RwLock::new(policy),
-            disk_pressure: AtomicBool::new(false),
+            capture_mode: AtomicU8::new(initial_mode),
+            skipped_capacity: AtomicU64::new(0),
             storage_probe: Arc::new(RealStorageProbe),
         })
     }
@@ -334,12 +394,14 @@ impl ErrorSnapshotStore {
     ) -> rusqlite::Result<Self> {
         let conn = Connection::open_in_memory()?;
         initialize_connection(&conn, true)?;
+        let initial_mode = if policy.enabled { 0 } else { 3 };
         Ok(Self {
             conn: Mutex::new(conn),
             db_path: None,
             fallback_dir: None,
             policy: RwLock::new(policy),
-            disk_pressure: AtomicBool::new(false),
+            capture_mode: AtomicU8::new(initial_mode),
+            skipped_capacity: AtomicU64::new(0),
             storage_probe,
         })
     }
@@ -349,11 +411,90 @@ impl ErrorSnapshotStore {
     }
 
     pub fn set_policy(&self, policy: ErrorSnapshotPolicy) {
+        self.capture_mode.store(
+            if policy.enabled {
+                CaptureMode::Full.as_u8()
+            } else {
+                CaptureMode::Disabled.as_u8()
+            },
+            Ordering::Release,
+        );
         *self.policy.write() = policy;
+    }
+
+    fn capacity_state_with_conn(&self, conn: &Connection) -> anyhow::Result<(CaptureMode, u64)> {
+        let (_, sqlite_live_bytes, _) = sqlite_page_metrics(conn)?;
+        let wal_bytes = self
+            .db_path
+            .as_ref()
+            .map(|path| sidecar_path(path, "-wal"))
+            .map(|path| self.storage_probe.tree_bytes(&[path]))
+            .transpose()?
+            .unwrap_or(0);
+        let fallback_bytes = self
+            .fallback_dir
+            .as_ref()
+            .map(|path| self.storage_probe.tree_bytes(std::slice::from_ref(path)))
+            .transpose()?
+            .unwrap_or(0);
+        let probe_path = self
+            .db_path
+            .as_deref()
+            .and_then(std::path::Path::parent)
+            .or(self.fallback_dir.as_deref())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let available_bytes = self.storage_probe.available_bytes(probe_path)?;
+        let policy = self.policy();
+        let live_bytes = sqlite_live_bytes
+            .saturating_add(wal_bytes)
+            .saturating_add(fallback_bytes);
+        Ok((
+            capture_mode_for(
+                live_bytes,
+                policy.max_storage_bytes,
+                available_bytes,
+                policy.min_free_disk_bytes,
+                policy.enabled,
+            ),
+            live_bytes,
+        ))
     }
 
     pub fn insert(&self, write: &SnapshotWrite) -> anyhow::Result<InsertOutcome> {
         let mut conn = self.conn.lock();
+        let (mut mode, live_bytes) = self.capacity_state_with_conn(&conn)?;
+        let policy = self.policy();
+        let payload_bytes = write.payloads.iter().fold(0u64, |total, part| {
+            total.saturating_add(u64::try_from(part.data.len()).unwrap_or(u64::MAX))
+        });
+        let projected_bytes = live_bytes
+            .saturating_add(SNAPSHOT_ROW_OVERHEAD_BYTES)
+            .saturating_add(payload_bytes);
+        if projected_bytes > policy.max_storage_bytes {
+            mode = if write.severity == SnapshotSeverity::Critical
+                && live_bytes.saturating_add(SNAPSHOT_ROW_OVERHEAD_BYTES)
+                    <= policy.max_storage_bytes
+            {
+                CaptureMode::MetadataOnly
+            } else {
+                CaptureMode::Disabled
+            };
+        }
+        self.capture_mode.store(mode.as_u8(), Ordering::Release);
+        if mode == CaptureMode::Disabled
+            || (mode != CaptureMode::Full && write.severity != SnapshotSeverity::Critical)
+        {
+            self.skipped_capacity.fetch_add(1, Ordering::Relaxed);
+            return Ok(InsertOutcome::SkippedCapacity);
+        }
+        let mut metadata_write = None;
+        if mode == CaptureMode::MetadataOnly {
+            let mut sanitized = write.clone();
+            sanitized.payloads.clear();
+            sanitized.omitted_due_to_disk_pressure = true;
+            metadata_write = Some(sanitized);
+        }
+        let write = metadata_write.as_ref().unwrap_or(write);
         if let Some(existing) = conn
             .query_row(
                 "SELECT snapshot_id FROM error_snapshots WHERE trace_id = ?1",
@@ -653,7 +794,7 @@ impl ErrorSnapshotStore {
         }
         let corrupt_dir = dir.join("corrupt");
         let mut report = FallbackImportReport::default();
-        for entry in std::fs::read_dir(dir)? {
+        for entry in std::fs::read_dir(dir)?.take(MAINTENANCE_BATCH_SIZE) {
             let entry = entry?;
             let path = entry.path();
             if !entry.file_type()?.is_file()
@@ -697,6 +838,9 @@ impl ErrorSnapshotStore {
                     report.existing += 1;
                     std::fs::remove_file(&path)?;
                 }
+                Ok(InsertOutcome::SkippedCapacity) => {
+                    report.failed += 1;
+                }
                 Err(error) => {
                     report.failed += 1;
                     tracing::warn!(
@@ -717,75 +861,84 @@ impl ErrorSnapshotStore {
     }
 
     pub fn run_maintenance_at(&self, now_epoch: i64) -> anyhow::Result<MaintenanceReport> {
-        let imported = self.import_fallback()?.imported;
+        let import_report = self.import_fallback()?;
+        let imported = import_report.imported;
+        let fallback_may_have_more = import_report
+            .imported
+            .saturating_add(import_report.existing)
+            >= MAINTENANCE_BATCH_SIZE;
         let policy = self.policy();
         let retention_secs = i64::from(policy.retention_days).saturating_mul(86_400);
         let cutoff = now_epoch.saturating_sub(retention_secs);
+        let before = self.storage_status()?;
+        let target_bytes = policy.max_storage_bytes.saturating_mul(70) / 100;
+        let capacity_cleanup = before.live_bytes > target_bytes;
+        let started = std::time::Instant::now();
         let mut deleted = 0usize;
         {
-            let conn = self.conn.lock();
-            for severity in ["warning", "error", "info"] {
-                deleted += conn.execute(
-                    "DELETE FROM error_snapshots
-                     WHERE ts_epoch < ?1 AND severity = ?2
-                       AND pinned = 0 AND retention_exempt = 0 AND severity <> 'critical'",
-                    params![cutoff, severity],
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction()?;
+            let candidates = {
+                let mut stmt = tx.prepare(
+                    "SELECT snapshot_id FROM error_snapshots
+                     WHERE pinned = 0 AND retention_exempt = 0 AND severity <> 'critical'
+                       AND severity IN ('warning', 'error', 'info')
+                       AND (ts_epoch < ?1 OR ?2 = 1)
+                     ORDER BY CASE severity WHEN 'warning' THEN 0 WHEN 'error' THEN 1 ELSE 2 END,
+                              ts_epoch ASC
+                     LIMIT 512",
                 )?;
-            }
-        }
-
-        let mut status = self.storage_status()?;
-        if status.total_bytes > policy.max_storage_bytes {
-            let conn = self.conn.lock();
-            loop {
-                let candidate: Option<(String, u64)> = conn
-                    .query_row(
-                        "SELECT snapshot_id, compressed_bytes FROM error_snapshots
-                         WHERE pinned = 0 AND retention_exempt = 0 AND severity <> 'critical'
-                           AND severity IN ('warning', 'error', 'info')
-                         ORDER BY CASE severity WHEN 'warning' THEN 0 WHEN 'error' THEN 1 ELSE 2 END,
-                                  ts_epoch ASC LIMIT 1",
-                        [],
-                        |row| Ok((row.get(0)?, from_u64(row.get::<_, i64>(1)?, 1)?)),
-                    )
-                    .optional()?;
-                let Some((id, estimated_bytes)) = candidate else {
+                stmt.query_map(params![cutoff, capacity_cleanup], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for id in candidates {
+                if started.elapsed() >= std::time::Duration::from_millis(250) {
                     break;
-                };
-                deleted += conn.execute(
+                }
+                deleted += tx.execute(
                     "DELETE FROM error_snapshots WHERE snapshot_id = ?1
                        AND pinned = 0 AND retention_exempt = 0 AND severity <> 'critical'",
                     params![id],
                 )?;
-                status.total_bytes = status.total_bytes.saturating_sub(estimated_bytes.max(1));
-                if status.total_bytes <= policy.max_storage_bytes {
-                    break;
-                }
             }
+            tx.commit()?;
         }
-        {
-            let conn = self.conn.lock();
-            conn.execute_batch(
-                "PRAGMA wal_checkpoint(TRUNCATE); PRAGMA incremental_vacuum(4096);",
+        let status = self.storage_status()?;
+        let (has_more_expired, has_capacity_candidates): (bool, bool) =
+            self.conn.lock().query_row(
+                "SELECT
+                EXISTS(
+                    SELECT 1 FROM error_snapshots
+                    WHERE ts_epoch < ?1 AND pinned = 0 AND retention_exempt = 0
+                      AND severity <> 'critical'
+                ),
+                EXISTS(
+                    SELECT 1 FROM error_snapshots
+                    WHERE pinned = 0 AND retention_exempt = 0
+                      AND severity <> 'critical'
+                )",
+                params![cutoff],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
-        }
-        status = self.storage_status()?;
+        let needs_follow_up = fallback_may_have_more
+            || has_more_expired
+            || (status.live_bytes > target_bytes && has_capacity_candidates);
         let disk_pressure = status.available_bytes < policy.min_free_disk_bytes;
-        self.disk_pressure.store(disk_pressure, Ordering::Release);
+        self.capture_mode
+            .store(status.capture_mode.as_u8(), Ordering::Release);
         Ok(MaintenanceReport {
             deleted,
             imported,
             disk_pressure,
             total_bytes: status.total_bytes,
+            needs_follow_up,
         })
     }
 
     pub fn capture_mode(&self) -> CaptureMode {
-        if self.disk_pressure.load(Ordering::Acquire) {
-            CaptureMode::MetadataOnly
-        } else {
-            CaptureMode::Full
-        }
+        CaptureMode::from_u8(self.capture_mode.load(Ordering::Acquire))
     }
 
     pub fn storage_status(&self) -> anyhow::Result<StorageStatus> {
@@ -823,6 +976,8 @@ impl ErrorSnapshotStore {
             .unwrap_or_else(|| std::path::Path::new("."));
         let available_bytes = self.storage_probe.available_bytes(probe_path)?;
         let conn = self.conn.lock();
+        let (sqlite_allocated_bytes, sqlite_live_bytes, reusable_bytes) =
+            sqlite_page_metrics(&conn)?;
         let (records, pinned_records, critical_records): (i64, i64, i64) = conn.query_row(
             "SELECT COUNT(*),
                     COALESCE(SUM(CASE WHEN pinned = 1 THEN 1 ELSE 0 END), 0),
@@ -831,12 +986,32 @@ impl ErrorSnapshotStore {
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
+        let allocated_bytes = db_bytes
+            .max(sqlite_allocated_bytes)
+            .saturating_add(wal_bytes)
+            .saturating_add(shm_bytes)
+            .saturating_add(fallback_bytes);
+        let live_bytes = sqlite_live_bytes
+            .saturating_add(wal_bytes)
+            .saturating_add(fallback_bytes);
+        let capture_mode = capture_mode_for(
+            live_bytes,
+            policy.max_storage_bytes,
+            available_bytes,
+            policy.min_free_disk_bytes,
+            policy.enabled,
+        );
+        self.capture_mode
+            .store(capture_mode.as_u8(), Ordering::Release);
         Ok(StorageStatus {
             db_bytes,
             wal_bytes,
             shm_bytes,
             fallback_bytes,
             total_bytes,
+            allocated_bytes,
+            live_bytes,
+            reusable_bytes,
             available_bytes,
             max_storage_bytes: policy.max_storage_bytes,
             min_free_disk_bytes: policy.min_free_disk_bytes,
@@ -844,6 +1019,8 @@ impl ErrorSnapshotStore {
             records: u64::try_from(records)?,
             pinned_records: u64::try_from(pinned_records)?,
             critical_records: u64::try_from(critical_records)?,
+            skipped_capacity: self.skipped_capacity.load(Ordering::Relaxed),
+            capture_mode,
         })
     }
 
@@ -851,10 +1028,12 @@ impl ErrorSnapshotStore {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT trace_id, snapshot_id FROM error_snapshots
-             WHERE ts_epoch >= ?1 ORDER BY ts_epoch ASC",
+             WHERE ts_epoch >= ?1 ORDER BY ts_epoch DESC LIMIT ?2",
         )?;
         Ok(stmt
-            .query_map(params![since_epoch], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .query_map(params![since_epoch, MAINTENANCE_BATCH_SIZE], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 }
@@ -985,6 +1164,19 @@ fn is_busy_error(error: &anyhow::Error) -> bool {
                     )
             )
         })
+}
+
+fn sqlite_page_metrics(conn: &Connection) -> anyhow::Result<(u64, u64, u64)> {
+    let page_count =
+        u64::try_from(conn.query_row("PRAGMA page_count", [], |row| row.get::<_, i64>(0))?)?;
+    let freelist_count =
+        u64::try_from(conn.query_row("PRAGMA freelist_count", [], |row| row.get::<_, i64>(0))?)?;
+    let page_size =
+        u64::try_from(conn.query_row("PRAGMA page_size", [], |row| row.get::<_, i64>(0))?)?;
+    let allocated_bytes = page_count.saturating_mul(page_size);
+    let reusable_bytes = freelist_count.min(page_count).saturating_mul(page_size);
+    let live_bytes = allocated_bytes.saturating_sub(reusable_bytes);
+    Ok((allocated_bytes, live_bytes, reusable_bytes))
 }
 
 fn sidecar_path(path: &std::path::Path, suffix: &str) -> PathBuf {
@@ -1351,7 +1543,7 @@ mod tests {
             max_storage_bytes: 200 * 1024 * 1024 * 1024,
             capture_recovered: true,
             capture_bodies: true,
-            min_free_disk_bytes: 100 * 1024 * 1024 * 1024,
+            min_free_disk_bytes: 0,
         }
     }
 
@@ -1651,7 +1843,8 @@ mod tests {
             db_path: None,
             fallback_dir: None,
             policy: RwLock::new(test_policy()),
-            disk_pressure: AtomicBool::new(false),
+            capture_mode: AtomicU8::new(CaptureMode::Full.as_u8()),
+            skipped_capacity: AtomicU64::new(0),
             storage_probe: Arc::new(RealStorageProbe),
         };
         let detail = store.get("legacy-dedup").unwrap().unwrap();
@@ -1711,7 +1904,7 @@ mod tests {
         let store = test_store_with_probe(50, 1_000);
         let mut policy = store.policy();
         policy.retention_days = 1;
-        policy.max_storage_bytes = 1_000;
+        policy.max_storage_bytes = 1024 * 1024 * 1024;
         policy.min_free_disk_bytes = 100;
         store.set_policy(policy);
         insert_at(
@@ -1748,6 +1941,82 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_deletes_at_most_one_bounded_batch() {
+        let store = test_store_with_probe(50, 1_000);
+        let mut policy = store.policy();
+        policy.retention_days = 1;
+        policy.max_storage_bytes = u64::MAX;
+        policy.min_free_disk_bytes = 0;
+        store.set_policy(policy);
+        for index in 0..520 {
+            insert_at(
+                &store,
+                &format!("old-{index}"),
+                SnapshotSeverity::Warning,
+                false,
+                false,
+                1,
+            );
+        }
+        insert_at(
+            &store,
+            "pinned-batch",
+            SnapshotSeverity::Warning,
+            true,
+            false,
+            1,
+        );
+        insert_at(
+            &store,
+            "critical-batch",
+            SnapshotSeverity::Critical,
+            false,
+            true,
+            1,
+        );
+
+        let report = store.run_maintenance_at(100 * 86_400).unwrap();
+
+        assert_eq!(report.deleted, 512);
+        assert_eq!(
+            store
+                .query_paged(&SnapshotQuery {
+                    limit: 1_000,
+                    ..Default::default()
+                })
+                .unwrap()
+                .total,
+            10
+        );
+        assert!(store.get("pinned-batch").unwrap().is_some());
+        assert!(store.get("critical-batch").unwrap().is_some());
+    }
+
+    #[test]
+    fn maintenance_does_not_spin_when_only_protected_records_exceed_target() {
+        let store = ErrorSnapshotStore::open_in_memory(test_policy()).unwrap();
+        insert_at(
+            &store,
+            "critical-only",
+            SnapshotSeverity::Critical,
+            false,
+            true,
+            1,
+        );
+        let mut policy = store.policy();
+        policy.retention_days = 1;
+        policy.max_storage_bytes = 1;
+        policy.min_free_disk_bytes = 0;
+        store.set_policy(policy);
+
+        let report = store.run_maintenance_at(100 * 86_400).unwrap();
+
+        assert_eq!(report.deleted, 0);
+        assert!(!report.needs_follow_up);
+        assert!(store.get("critical-only").unwrap().is_some());
+    }
+
+    #[test]
     fn low_free_space_enters_metadata_only_mode() {
         let store = test_store_with_probe(10_000, 99);
         let mut policy = store.policy();
@@ -1758,6 +2027,68 @@ mod tests {
 
         assert!(report.disk_pressure);
         assert_eq!(store.capture_mode(), CaptureMode::MetadataOnly);
+    }
+
+    #[test]
+    fn capacity_thresholds_preserve_critical_diagnostics_before_disabling_capture() {
+        assert_eq!(
+            capture_mode_for(79, 100, 1_000, 100, true),
+            CaptureMode::Full
+        );
+        assert_eq!(
+            capture_mode_for(80, 100, 1_000, 100, true),
+            CaptureMode::CriticalOnly
+        );
+        assert_eq!(
+            capture_mode_for(90, 100, 1_000, 100, true),
+            CaptureMode::MetadataOnly
+        );
+        assert_eq!(
+            capture_mode_for(100, 100, 1_000, 100, true),
+            CaptureMode::Disabled
+        );
+        assert_eq!(
+            capture_mode_for(10, 100, 99, 100, true),
+            CaptureMode::MetadataOnly
+        );
+        assert_eq!(
+            capture_mode_for(0, 100, 1_000, 100, false),
+            CaptureMode::Disabled
+        );
+    }
+
+    #[test]
+    fn hard_capacity_skip_never_writes_fallback() {
+        let fallback = temp_path("snapshot-capacity-fallback");
+        let mut policy = test_policy();
+        policy.max_storage_bytes = 1;
+        policy.min_free_disk_bytes = 0;
+        let store =
+            ErrorSnapshotStore::open_in_memory_with_fallback(fallback.clone(), policy).unwrap();
+
+        let outcome = store
+            .insert_with_fallback(&sample_write("snap-full", "trace-full"))
+            .unwrap();
+
+        assert_eq!(outcome, InsertOutcome::SkippedCapacity);
+        assert!(!fallback.exists());
+    }
+
+    #[test]
+    fn prospective_write_cannot_jump_over_hard_capacity() {
+        let store = ErrorSnapshotStore::open_in_memory(test_policy()).unwrap();
+        let live_bytes = store.storage_status().unwrap().live_bytes;
+        let mut policy = store.policy();
+        policy.max_storage_bytes = live_bytes.saturating_add(32 * 1024);
+        policy.min_free_disk_bytes = 0;
+        store.set_policy(policy);
+
+        let outcome = store
+            .insert_with_fallback(&sample_write("snap-jump", "trace-jump"))
+            .unwrap();
+
+        assert_eq!(outcome, InsertOutcome::SkippedCapacity);
+        assert!(store.get("snap-jump").unwrap().is_none());
     }
 
     #[test]

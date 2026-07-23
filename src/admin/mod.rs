@@ -20,6 +20,7 @@ mod binary_update;
 pub mod client_keys;
 mod error;
 pub mod error_snapshot_db;
+pub mod error_snapshot_maintenance;
 pub mod groups;
 mod handlers;
 mod middleware;

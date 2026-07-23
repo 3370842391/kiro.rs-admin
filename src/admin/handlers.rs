@@ -2052,7 +2052,12 @@ pub async fn error_snapshot_storage(State(state): State<AdminState>) -> Response
 }
 
 pub async fn cleanup_error_snapshots(State(state): State<AdminState>) -> Response {
-    match state.error_snapshot_store.run_maintenance() {
+    match crate::admin::error_snapshot_maintenance::run_maintenance_batch(
+        state.error_snapshot_store.clone(),
+        Some(state.trace_store.clone()),
+    )
+    .await
+    {
         Ok(report) => Json(report).into_response(),
         Err(error) => snapshot_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     }

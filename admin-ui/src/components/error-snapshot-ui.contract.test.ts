@@ -19,4 +19,13 @@ describe('error snapshot UI wiring', () => {
       'errorSnapshotCaptureBodies', 'errorSnapshotMinFreeDiskGb',
     ]) expect(trace).toContain(field)
   })
+
+  test('exposes capacity diagnostics in the storage contract', async () => {
+    const api = await readFile('src/types/api.ts', 'utf8')
+    for (const field of [
+      'allocatedBytes', 'liveBytes', 'reusableBytes',
+      'skippedCapacity', 'captureMode',
+    ]) expect(api).toContain(field)
+    expect(api).toContain("'full' | 'criticalOnly' | 'metadataOnly' | 'disabled'")
+  })
 })
