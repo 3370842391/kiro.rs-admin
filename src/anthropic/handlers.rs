@@ -110,6 +110,7 @@ impl UsageRecordHook {
     ) {
         let rec = UsageRecord {
             ts: Utc::now().to_rfc3339(),
+            trace_id: None,
             key_id: self.key_id,
             credential_id,
             model: self.model.clone(),
