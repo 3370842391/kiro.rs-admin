@@ -62,10 +62,12 @@ continue to support full diagnostic capture.
 
 ## Payload Budget
 
-Each snapshot has an 8 MiB total uncompressed diagnostic budget, including request, upstream
-response, diagnostics, and stream tail. Payloads beyond the remaining budget are replaced with
-metadata containing their original length and SHA-256 digest. No individual request can therefore
-consume an unbounded amount of database space.
+Each snapshot has a 16 MiB total uncompressed diagnostic budget, including request, upstream
+response, diagnostics, and stream tail. Protocol diagnostics, internal errors, and the stream tail
+have a reserved portion of that budget and are encoded before ordinary request/response bodies.
+Oversized bodies retain sanitized head and tail samples plus their original length and SHA-256
+digest instead of being discarded. No individual request can therefore consume unbounded space,
+while a rare failure still retains the evidence most likely to explain it.
 
 Existing secret and binary redaction remains in force. Authorization and token header values must
 also never be emitted by DEBUG provider logs; logs retain only the header name and `[REDACTED]`.
@@ -75,8 +77,11 @@ also never be emitted by DEBUG provider logs; logs retain only the header name a
 `CaptureMode` gains a disabled/capacity-exhausted state:
 
 - Below 80% of the configured maximum: capture eligible snapshots normally.
-- At or above 80%, or below the configured free-disk reserve: capture metadata only.
-- At or above 100%: skip new snapshots without failing the user request.
+- At or above 80%, routine/non-critical diagnostic captures stop; critical protocol/internal
+  failures retain bounded bodies from a reserved capacity band.
+- At or above 90%, critical failures retain metadata, protocol diagnostics, and stream tail only.
+- At or above 100%: Trace remains complete and snapshot capacity skips are counted without failing
+  the user request.
 
 Capacity uses SQLite page metrics (`page_count`, `freelist_count`, `page_size`) plus WAL and
 fallback sizes. Allocated bytes and live bytes are reported separately. Freed pages count as
@@ -139,7 +144,8 @@ until the new build has been verified under load.
 1. A final suspended 403 (`auth_failed`) produces Trace data but no snapshot.
 2. A recovered 403/429 failover produces Trace attempts but no snapshot.
 3. Protocol corruption and stream interruption still create snapshots.
-4. Payloads over 8 MiB are bounded and replaced with length/hash metadata.
+4. Payloads over 16 MiB preserve prioritized diagnostics and sanitized head/tail samples while
+   remaining within the hard budget.
 5. Soft and hard admission thresholds select full, metadata-only, and disabled modes.
 6. Fallback cannot bypass the hard capacity limit.
 7. Maintenance deletes only a bounded batch and preserves pinned/critical records.
