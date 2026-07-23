@@ -5556,9 +5556,13 @@ mod tests {
             error_snippet: Some("Invalid tool use format.".to_string()),
             duration_ms: 5,
         });
+        tracer.record_protocol_error(
+            "upstream_tool_protocol_error",
+            "provider returned an invalid tool-use envelope",
+        );
         tracer.finalize(
             "error",
-            Some("bad_request"),
+            Some("upstream_tool_protocol_error"),
             Some("Invalid tool use format."),
             None,
             TraceUsage::zero(),

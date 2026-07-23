@@ -73,6 +73,24 @@ fn transport_read_timeout_secs(_stream_idle_timeout_secs: u64) -> Option<u64> {
     None
 }
 
+fn debug_header_value(name: &str, value: &[u8]) -> String {
+    let normalized = name.to_ascii_lowercase().replace(['-', '_'], "");
+    if matches!(
+        normalized.as_str(),
+        "authorization"
+            | "proxyauthorization"
+            | "xapikey"
+            | "apikey"
+            | "cookie"
+            | "setcookie"
+            | "clientsecret"
+    ) || normalized.contains("token")
+    {
+        return "[REDACTED]".to_string();
+    }
+    std::str::from_utf8(value).unwrap_or("<binary>").to_string()
+}
+
 async fn await_response_headers<T, E, F>(future: F, timeout: Option<Duration>) -> anyhow::Result<T>
 where
     F: std::future::Future<Output = Result<T, E>>,
@@ -647,7 +665,11 @@ impl KiroProvider {
         })?;
         if tracing::enabled!(tracing::Level::DEBUG) {
             for (k, v) in request.headers() {
-                tracing::debug!("  header {}: {}", k, v.to_str().unwrap_or("<binary>"));
+                tracing::debug!(
+                    "  header {}: {}",
+                    k,
+                    debug_header_value(k.as_str(), v.as_bytes())
+                );
             }
         }
         let header_timeout_secs = self.stream_idle_timeout_secs();
@@ -2131,6 +2153,23 @@ impl KiroProvider {
 mod tests {
     use super::*;
     use crate::kiro::parser::crc::crc32;
+
+    #[test]
+    fn debug_header_value_redacts_credentials() {
+        for name in [
+            "authorization",
+            "proxy-authorization",
+            "x-api-key",
+            "x-access-token",
+        ] {
+            assert_eq!(debug_header_value(name, b"super-secret"), "[REDACTED]");
+        }
+        assert_eq!(
+            debug_header_value("content-type", b"application/json"),
+            "application/json"
+        );
+        assert_eq!(debug_header_value("x-binary", &[0xff]), "<binary>");
+    }
 
     #[test]
     fn application_idle_watchdog_never_becomes_reqwest_read_timeout() {

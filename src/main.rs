@@ -321,53 +321,12 @@ async fn main() {
         }
     };
 
-    // 启动时先导入数据库故障期间留下的 fallback，并补齐最近 trace 的 snapshotId 回链。
-    match error_snapshot_store.import_fallback() {
-        Ok(report) if report.imported > 0 || report.existing > 0 || report.failed > 0 => {
-            tracing::info!(
-                imported = report.imported,
-                existing = report.existing,
-                failed = report.failed,
-                "错误快照 fallback 启动导入完成"
-            );
-        }
-        Ok(_) => {}
-        Err(error) => tracing::error!(%error, "错误快照 fallback 启动导入失败"),
-    }
-    if let Some(store) = &trace_store {
-        match error_snapshot_store.recent_trace_links(chrono::Utc::now().timestamp() - 7 * 86_400) {
-            Ok(links) => {
-                for (trace_id, snapshot_id) in links {
-                    store.link_snapshot(&trace_id, &snapshot_id);
-                }
-            }
-            Err(error) => tracing::error!(%error, "读取最近错误快照回链失败"),
-        }
-    }
-
-    {
-        let store = error_snapshot_store.clone();
-        let trace_store = trace_store.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            loop {
-                if let Err(error) = store.run_maintenance() {
-                    tracing::error!(%error, "错误快照维护失败");
-                }
-                if let Some(trace_store) = &trace_store {
-                    match store.recent_trace_links(chrono::Utc::now().timestamp() - 7 * 86_400) {
-                        Ok(links) => {
-                            for (trace_id, snapshot_id) in links {
-                                trace_store.link_snapshot(&trace_id, &snapshot_id);
-                            }
-                        }
-                        Err(error) => tracing::error!(%error, "错误快照回链维护失败"),
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-            }
-        });
-    }
+    // fallback 导入、清理与 trace 回链全部在 blocking pool 中分批执行。
+    // 服务会先继续启动，历史快照库再大也不会占住 Tokio 请求线程。
+    admin::error_snapshot_maintenance::spawn_scheduler(
+        error_snapshot_store.clone(),
+        trace_store.clone(),
+    );
 
     // 启动后定期清理过期 usage_log 与 trace 记录
     {

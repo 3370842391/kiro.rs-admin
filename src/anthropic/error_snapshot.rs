@@ -9,12 +9,13 @@ use sha2::{Digest as _, Sha256};
 use crate::admin::error_snapshot_db::{
     CaptureMode, InsertOutcome, SharedErrorSnapshotStore, SnapshotSeverity, SnapshotWrite,
 };
-use crate::admin::trace_db::TraceKeySource;
+use crate::admin::trace_db::{TraceKeySource, outcome};
 
 pub use crate::common::error_snapshot::{EncodedPayloadPart, SnapshotPayloadKind};
 
 pub const MAX_UNCOMPRESSED_PART_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_DECOMPRESSED_PAYLOAD_BYTES: usize = 128 * 1024 * 1024;
+pub const MAX_SNAPSHOT_DIAGNOSTIC_BYTES: usize = 16 * 1024 * 1024;
 const LONG_BASE64_THRESHOLD: usize = 4096;
 const ZSTD_LEVEL: i32 = 3;
 
@@ -257,6 +258,111 @@ struct RawSnapshotPayload {
     attempt: Option<u32>,
     content_type: String,
     data: Vec<u8>,
+}
+
+fn is_priority_diagnostic(kind: SnapshotPayloadKind) -> bool {
+    matches!(
+        kind,
+        SnapshotPayloadKind::ToolDiagnostics
+            | SnapshotPayloadKind::InternalError
+            | SnapshotPayloadKind::StreamTail
+    )
+}
+
+fn utf8_head(input: &str, limit: usize) -> &str {
+    let mut end = limit.min(input.len());
+    while end > 0 && !input.is_char_boundary(end) {
+        end -= 1;
+    }
+    &input[..end]
+}
+
+fn utf8_tail(input: &str, limit: usize) -> &str {
+    let mut start = input.len().saturating_sub(limit);
+    while start < input.len() && !input.is_char_boundary(start) {
+        start += 1;
+    }
+    &input[start..]
+}
+
+fn sampled_payload(mut raw: RawSnapshotPayload, budget: usize) -> Option<RawSnapshotPayload> {
+    let original_bytes = raw.data.len();
+    let sha256 = hex::encode(Sha256::digest(&raw.data));
+    let utf8 = std::str::from_utf8(&raw.data).ok();
+    let mut edge_bytes = budget.saturating_sub(512) / 2;
+
+    loop {
+        let (encoding, head, tail) = if let Some(text) = utf8 {
+            (
+                "utf8",
+                utf8_head(text, edge_bytes).to_string(),
+                utf8_tail(text, edge_bytes).to_string(),
+            )
+        } else {
+            let head_end = edge_bytes.min(raw.data.len());
+            let tail_start = raw.data.len().saturating_sub(edge_bytes);
+            (
+                "base64",
+                base64::engine::general_purpose::STANDARD.encode(&raw.data[..head_end]),
+                base64::engine::general_purpose::STANDARD.encode(&raw.data[tail_start..]),
+            )
+        };
+        let envelope = serde_json::to_vec(&serde_json::json!({
+            "truncated": true,
+            "original_bytes": original_bytes,
+            "sha256": sha256,
+            "original_content_type": raw.content_type,
+            "encoding": encoding,
+            "head": head,
+            "tail": tail,
+        }))
+        .ok()?;
+        if envelope.len() <= budget {
+            raw.content_type = "application/json".to_string();
+            raw.data = envelope;
+            return Some(raw);
+        }
+        if edge_bytes == 0 {
+            return None;
+        }
+        let excess = envelope.len() - budget;
+        edge_bytes = edge_bytes.saturating_sub((excess / 2).saturating_add(1));
+    }
+}
+
+fn apply_snapshot_budget(payloads: Vec<RawSnapshotPayload>) -> Vec<RawSnapshotPayload> {
+    let mut diagnostics = Vec::new();
+    let mut bodies = Vec::new();
+    for payload in payloads {
+        if is_priority_diagnostic(payload.kind) {
+            diagnostics.push(payload);
+        } else {
+            bodies.push(payload);
+        }
+    }
+
+    let mut output = Vec::with_capacity(diagnostics.len() + bodies.len());
+    let mut remaining = MAX_SNAPSHOT_DIAGNOSTIC_BYTES;
+
+    for payload in diagnostics.into_iter().chain(bodies) {
+        if remaining == 0 {
+            break;
+        }
+        if payload.data.len() <= remaining {
+            remaining -= payload.data.len();
+            output.push(payload);
+            continue;
+        }
+        if let Some(sampled) = sampled_payload(payload, remaining) {
+            remaining -= sampled.data.len();
+            output.push(sampled);
+        }
+    }
+
+    debug_assert!(
+        output.iter().map(|item| item.data.len()).sum::<usize>() <= MAX_SNAPSHOT_DIAGNOSTIC_BYTES
+    );
+    output
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -584,6 +690,9 @@ impl ErrorSnapshotContext {
                     .map(|attempt| attempt.outcome.clone())
             })
             .unwrap_or_else(|| "recovered_request".to_string());
+        if critical_protocol_error.is_none() && is_routine_trace_only_error(&error_type) {
+            return Ok(None);
+        }
         let severity = classify_severity(&error_type, recovered);
         let retention_exempt = severity == SnapshotSeverity::Critical;
         let metadata_only = self.store.capture_mode() == CaptureMode::MetadataOnly;
@@ -644,9 +753,19 @@ impl ErrorSnapshotContext {
                 data: draft.stream_tail.snapshot_bytes(),
             });
         }
+        let sanitized_payloads = raw_payloads
+            .into_iter()
+            .map(|mut raw| {
+                raw.data = sanitize_payload_data(&raw.content_type, raw.data);
+                raw
+            })
+            .collect();
         let mut payloads = Vec::new();
-        for (seq, raw) in raw_payloads.into_iter().enumerate() {
-            let data = sanitize_payload_data(&raw.content_type, raw.data);
+        for (seq, raw) in apply_snapshot_budget(sanitized_payloads)
+            .into_iter()
+            .enumerate()
+        {
+            let data = raw.data;
             let mut encoded = encode_payload(raw.kind, raw.attempt, &raw.content_type, &data)?;
             for part in &mut encoded {
                 part.seq = u32::try_from(seq)?;
@@ -692,9 +811,22 @@ impl ErrorSnapshotContext {
             InsertOutcome::Inserted(id)
             | InsertOutcome::Existing(id)
             | InsertOutcome::Fallback(id) => id,
+            InsertOutcome::SkippedCapacity => return Ok(None),
         };
         Ok(Some(id))
     }
+}
+
+fn is_routine_trace_only_error(error_type: &str) -> bool {
+    matches!(
+        error_type,
+        outcome::AUTH_FAILED
+            | outcome::QUOTA_EXHAUSTED
+            | outcome::ACCOUNT_THROTTLED
+            | outcome::TRANSIENT
+            | outcome::NETWORK_ERROR
+            | outcome::BAD_REQUEST
+    )
 }
 
 fn sanitize_payload_data(content_type: &str, data: Vec<u8>) -> Vec<u8> {
@@ -983,6 +1115,117 @@ mod tests {
     }
 
     #[test]
+    fn oversized_snapshot_preserves_diagnostics_and_head_tail_within_budget() {
+        const EXPECTED_BUDGET: u64 = 16 * 1024 * 1024;
+        const HEAD_MARKER: &str = "SNAPSHOT_HEAD_MARKER";
+        const TAIL_MARKER: &str = "SNAPSHOT_TAIL_MARKER";
+
+        let store = test_store();
+        let key = crate::anthropic::middleware::KeyContext {
+            key_id: 7,
+            group: None,
+            key_source: crate::admin::trace_db::TraceKeySource::ClientKey,
+            response_mode: crate::admin::client_keys::ClientResponseMode::Detection,
+            cache_hit_rate: None,
+        };
+        let content = format!("{HEAD_MARKER}{}{TAIL_MARKER}", "x".repeat(18 * 1024 * 1024));
+        let request: crate::anthropic::types::MessagesRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": content}],
+                "stream": false
+            }))
+            .unwrap();
+        let ctx = ErrorSnapshotContext::new(
+            store.clone(),
+            "trace-budget".to_string(),
+            &key,
+            &axum::http::HeaderMap::new(),
+            &request,
+        );
+        ctx.record_internal_error("upstream_tool_protocol_error", "tool JSON truncated");
+
+        let id = ctx
+            .finalize(SnapshotFinalState::error(
+                "upstream_tool_protocol_error",
+                Some(502),
+            ))
+            .unwrap()
+            .unwrap();
+        let detail = store.get(&id).unwrap().unwrap();
+        assert!(
+            detail
+                .payloads
+                .iter()
+                .map(|payload| payload.original_bytes)
+                .sum::<u64>()
+                <= EXPECTED_BUDGET
+        );
+        assert!(
+            detail
+                .payloads
+                .iter()
+                .any(|payload| payload.kind == SnapshotPayloadKind::ToolDiagnostics)
+        );
+        assert!(
+            detail
+                .payloads
+                .iter()
+                .any(|payload| payload.kind == SnapshotPayloadKind::InternalError)
+        );
+
+        let sampled = detail
+            .payloads
+            .iter()
+            .find(|payload| payload.kind == SnapshotPayloadKind::ClientRequest)
+            .expect("sampled client request");
+        let decoded = store.read_payload(&id, sampled.seq).unwrap().unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(&decoded.data).unwrap();
+        assert_eq!(envelope["truncated"], true);
+        assert!(envelope["original_bytes"].as_u64().unwrap() > EXPECTED_BUDGET);
+        assert_eq!(envelope["sha256"].as_str().unwrap().len(), 64);
+        assert!(envelope["head"].as_str().unwrap().contains(HEAD_MARKER));
+        assert!(envelope["tail"].as_str().unwrap().contains(TAIL_MARKER));
+    }
+
+    #[test]
+    fn routine_upstream_auth_failure_stays_trace_only() {
+        let store = test_store();
+        let ctx = sample_context(store.clone(), true, true);
+        ctx.record_attempt_status(0, Some(403), "auth_failed");
+
+        let id = ctx
+            .finalize(SnapshotFinalState::error("auth_failed", Some(403)))
+            .unwrap();
+
+        assert!(id.is_none());
+        assert!(
+            store
+                .query_paged(&crate::admin::error_snapshot_db::SnapshotQuery {
+                    limit: 10,
+                    offset: 0,
+                    ..Default::default()
+                })
+                .unwrap()
+                .records
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn recovered_routine_upstream_failure_stays_trace_only() {
+        let store = test_store();
+        let ctx = sample_context(store.clone(), true, true);
+        ctx.record_attempt_status(0, Some(429), "account_throttled");
+        ctx.record_attempt_status(1, Some(200), "success");
+
+        let id = ctx.finalize(SnapshotFinalState::success()).unwrap();
+
+        assert!(id.is_none());
+    }
+
+    #[test]
     fn response_mode_is_frozen_when_snapshot_context_is_created() {
         let store = test_store();
         let mut key = crate::anthropic::middleware::KeyContext {
@@ -1076,8 +1319,11 @@ mod tests {
     fn recovered_request_is_warning_when_capture_recovered_is_enabled() {
         let store = test_store();
         let ctx = sample_context(store.clone(), true, true);
-        ctx.record_attempt_status(0, Some(500), "transient");
-        ctx.record_attempt_status(1, Some(200), "success");
+        ctx.record_internal_error(
+            "structured_output_retry",
+            "the first structured output attempt was invalid and a retry recovered",
+        );
+        ctx.record_attempt_status(0, Some(200), "success");
         let id = ctx
             .finalize(SnapshotFinalState::success())
             .unwrap()
