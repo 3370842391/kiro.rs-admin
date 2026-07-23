@@ -4,10 +4,16 @@ import type {
 } from '@/types/api'
 
 const MAX_RPM_LIMIT = 100_000
+const MAX_PRIORITY = 4_294_967_295
 const MAX_SOURCE_CHANNEL_CHARS = 128
 const INVALID_RPM_MESSAGE = `RPM 上限必须是 0 到 ${MAX_RPM_LIMIT} 的整数`
+const INVALID_PRIORITY_MESSAGE = `优先级必须是 0 到 ${MAX_PRIORITY} 的十进制整数`
 
 export type RpmLimitParseResult =
+  | { ok: true; value: number }
+  | { ok: false; message: string }
+
+export type PriorityParseResult =
   | { ok: true; value: number }
   | { ok: false; message: string }
 
@@ -22,6 +28,9 @@ export interface BatchUpdateInput {
   groups: string[]
   editSource: boolean
   sourceChannel: string
+  editPriority?: boolean
+  priorityMode?: 'fixed' | 'promote'
+  priorityDraft?: string
 }
 
 export type BatchUpdateRequestResult =
@@ -41,6 +50,20 @@ export function parseRpmLimit(draft: string): RpmLimitParseResult {
   const value = Number(trimmed)
   if (!Number.isSafeInteger(value) || value > MAX_RPM_LIMIT) {
     return { ok: false, message: INVALID_RPM_MESSAGE }
+  }
+
+  return { ok: true, value }
+}
+
+export function parsePriority(draft: string): PriorityParseResult {
+  const trimmed = draft.trim()
+  if (!/^\d+$/.test(trimmed)) {
+    return { ok: false, message: INVALID_PRIORITY_MESSAGE }
+  }
+
+  const value = Number(trimmed)
+  if (!Number.isSafeInteger(value) || value > MAX_PRIORITY) {
+    return { ok: false, message: INVALID_PRIORITY_MESSAGE }
   }
 
   return { ok: true, value }
@@ -84,7 +107,7 @@ export function buildBatchUpdateRequest(
     return { ok: false, message: '凭据 ID 不能重复' }
   }
 
-  if (!input.editRpm && !input.editGroups && !input.editSource) {
+  if (!input.editRpm && !input.editGroups && !input.editSource && !input.editPriority) {
     return { ok: false, message: '请至少选择一项要修改的内容' }
   }
 
@@ -111,6 +134,18 @@ export function buildBatchUpdateRequest(
       return { ok: false, message: '来源渠道最多 128 个字符' }
     }
     request.sourceChannel = sourceChannel
+  }
+
+  if (input.editPriority) {
+    if (input.priorityMode === 'promote') {
+      request.promotePriority = true
+    } else {
+      const priority = parsePriority(input.priorityDraft ?? '')
+      if (!priority.ok) {
+        return priority
+      }
+      request.priority = priority.value
+    }
   }
 
   return { ok: true, value: request }
