@@ -1015,6 +1015,23 @@ impl AdminService {
         self
     }
 
+    /// 查询利润报表使用的真实 usage 账本记录。
+    pub fn query_usage_records(
+        &self,
+        start_epoch: i64,
+        end_epoch: i64,
+    ) -> Result<crate::admin::usage_stats::UsageRangeRead, AdminServiceError> {
+        self.usage_recorder
+            .as_ref()
+            .ok_or_else(|| {
+                AdminServiceError::InternalError("usage 计费账本未启用".to_string())
+            })?
+            .query_range(start_epoch, end_epoch)
+            .map_err(|error| {
+                AdminServiceError::InternalError(format!("读取 usage 计费账本失败: {error}"))
+            })
+    }
+
     /// 注入与业务 API 共享的 KiroProvider。
     pub fn with_kiro_provider(mut self, provider: Arc<KiroProvider>) -> Self {
         self.kiro_provider = Some(provider);
@@ -4948,6 +4965,40 @@ mod tests {
                 crate::model::config::TlsBackend::Rustls,
             )),
         )
+    }
+
+    #[tokio::test]
+    async fn query_usage_records_reads_injected_ledger() {
+        let dir = std::env::temp_dir().join(format!(
+            "kiro-rs-profit-service-{}",
+            Uuid::new_v4()
+        ));
+        let recorder = Arc::new(crate::admin::usage_stats::UsageRecorder::with_retention(
+            dir.clone(),
+            1,
+        ));
+        recorder.record(&crate::admin::usage_stats::UsageRecord {
+            ts: Utc::now().to_rfc3339(),
+            trace_id: Some("profit-service-trace".to_string()),
+            key_id: 7,
+            credential_id: 11,
+            model: "claude-opus-4-8".to_string(),
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            credits: 0.5,
+            duration_ms: 10,
+            status: "success".to_string(),
+        });
+        let service = auth_test_service().with_log_governance(None, Some(recorder), None);
+        let now = Utc::now().timestamp();
+
+        let result = service.query_usage_records(now - 5, now + 5).unwrap();
+
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].trace_id.as_deref(), Some("profit-service-trace"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

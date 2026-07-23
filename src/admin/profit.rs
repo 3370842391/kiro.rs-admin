@@ -1,6 +1,6 @@
 //! NewAPI 收入与 RS 上游 Credits 成本的利润领域模型。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -45,6 +45,8 @@ pub struct NewapiLogItem {
     pub group: String,
     #[serde(default)]
     pub quota: i64,
+    #[serde(default)]
+    pub channel_id: u64,
     #[serde(default)]
     pub upstream_request_id: String,
 }
@@ -247,10 +249,293 @@ pub struct ProfitReport {
     pub cost: f64,
     pub profit: f64,
     pub margin_pct: f64,
+    pub attributed_credits: f64,
+    pub unattributed_credits: f64,
+    pub attributed_cost: f64,
+    pub unattributed_cost: f64,
+    pub attributed_revenue: f64,
+    pub unattributed_revenue: f64,
+    pub observed_channel_ids: Vec<u64>,
+    pub observed_key_ids: Vec<u64>,
+    pub ledger_scope_confirmed: bool,
     pub by_key: Vec<ProfitGroupStat>,
     pub by_group: Vec<ProfitGroupStat>,
     pub by_model: Vec<ProfitGroupStat>,
     pub by_user: Vec<ProfitGroupStat>,
+}
+
+#[derive(Debug, Clone)]
+struct LedgerAttribution {
+    trace_id: String,
+    key_id: u64,
+    model: String,
+    credits: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct UsageTraceSummary {
+    key_id: u64,
+    model: String,
+    credits: f64,
+}
+
+/// 以 usage JSONL 为成本事实源，两阶段识别本次窗口实际属于 RS 的渠道与 Key。
+pub fn aggregate_ledger_report(
+    logs: Vec<NewapiLogItem>,
+    usage: Vec<crate::admin::usage_stats::UsageRecord>,
+    traces: Vec<crate::admin::trace_db::ProfitTraceRecord>,
+    keys: Vec<ProfitKeyMetadata>,
+    config: ProfitConfig,
+) -> ProfitReport {
+    let credit_price = effective_credit_price(&config);
+    let quota_per_unit = effective_quota_per_unit(&config);
+    let key_by_id: HashMap<u64, ProfitKeyMetadata> =
+        keys.into_iter().map(|key| (key.key_id, key)).collect();
+    let trace_by_id: HashMap<String, crate::admin::trace_db::ProfitTraceRecord> = traces
+        .into_iter()
+        .map(|trace| (trace.trace_id.clone(), trace))
+        .collect();
+
+    let mut usage_by_trace = HashMap::<String, UsageTraceSummary>::new();
+    for record in &usage {
+        let Some(trace_id) = record
+            .trace_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let entry = usage_by_trace
+            .entry(trace_id.to_string())
+            .or_insert_with(|| UsageTraceSummary {
+                key_id: record.key_id,
+                model: record.model.clone(),
+                credits: 0.0,
+            });
+        if entry.key_id != record.key_id {
+            entry.key_id = 0;
+        }
+        if entry.model.is_empty() {
+            entry.model = record.model.clone();
+        }
+        if record.credits.is_finite() && record.credits > 0.0 {
+            entry.credits += record.credits;
+        }
+    }
+
+    let attributions: Vec<Option<LedgerAttribution>> = logs
+        .iter()
+        .map(|log| {
+            let trace_id = log.upstream_request_id.trim();
+            if trace_id.is_empty() {
+                return None;
+            }
+            let attribution = if let Some(summary) = usage_by_trace.get(trace_id) {
+                LedgerAttribution {
+                    trace_id: trace_id.to_string(),
+                    key_id: summary.key_id,
+                    model: summary.model.clone(),
+                    credits: summary.credits,
+                }
+            } else if let Some(trace) = trace_by_id.get(trace_id) {
+                LedgerAttribution {
+                    trace_id: trace_id.to_string(),
+                    key_id: trace.key_id,
+                    model: trace.model.clone(),
+                    credits: positive_finite(trace.credits),
+                }
+            } else {
+                return None;
+            };
+            key_by_id.contains_key(&attribution.key_id).then_some(attribution)
+        })
+        .collect();
+
+    let observed_channel_ids: BTreeSet<u64> = logs
+        .iter()
+        .zip(&attributions)
+        .filter_map(|(log, attribution)| {
+            (log.channel_id != 0 && attribution.is_some()).then_some(log.channel_id)
+        })
+        .collect();
+    let observed_key_ids: BTreeSet<u64> = logs
+        .iter()
+        .zip(&attributions)
+        .filter_map(|(log, attribution)| {
+            if log.channel_id == 0 {
+                None
+            } else {
+                attribution.as_ref().map(|value| value.key_id)
+            }
+        })
+        .collect();
+
+    let mut report = ProfitReport {
+        rows: logs.len() as u64,
+        observed_channel_ids: observed_channel_ids.iter().copied().collect(),
+        observed_key_ids: observed_key_ids.iter().copied().collect(),
+        ledger_scope_confirmed: !observed_channel_ids.is_empty() && !observed_key_ids.is_empty(),
+        ..ProfitReport::default()
+    };
+    if !report.ledger_scope_confirmed {
+        report.unmatched = report.rows;
+        return report;
+    }
+
+    let mut credits_by_key = BTreeMap::<u64, f64>::new();
+    for record in &usage {
+        if observed_key_ids.contains(&record.key_id) {
+            let credits = positive_finite(record.credits);
+            if credits > 0.0 {
+                *credits_by_key.entry(record.key_id).or_default() += credits;
+            }
+        }
+    }
+    report.credits = credits_by_key.values().sum();
+    report.cost = report.credits * credit_price;
+
+    let mut remaining_credits = credits_by_key;
+    let mut attributed_trace_ids = HashSet::<String>::new();
+    let mut by_key = BTreeMap::<String, ProfitGroupStat>::new();
+    let mut by_group = BTreeMap::<String, ProfitGroupStat>::new();
+    let mut by_model = BTreeMap::<String, ProfitGroupStat>::new();
+    let mut by_user = BTreeMap::<String, ProfitGroupStat>::new();
+    report.rows = 0;
+
+    for (log, attribution) in logs.into_iter().zip(attributions) {
+        if !observed_channel_ids.contains(&log.channel_id) {
+            continue;
+        }
+        report.rows += 1;
+        let revenue = quota_revenue(log.quota, quota_per_unit);
+        report.revenue += revenue;
+        let Some(attribution) = attribution else {
+            report.unmatched += 1;
+            report.unmatched_revenue += revenue;
+            report.unattributed_revenue += revenue;
+            continue;
+        };
+
+        report.matched += 1;
+        report.matched_revenue += revenue;
+        report.attributed_revenue += revenue;
+        let available = remaining_credits.entry(attribution.key_id).or_default();
+        let attributed_credits = if attributed_trace_ids.insert(attribution.trace_id.clone()) {
+            let value = attribution.credits.min(*available).max(0.0);
+            *available -= value;
+            value
+        } else {
+            0.0
+        };
+        report.attributed_credits += attributed_credits;
+        let cost = attributed_credits * credit_price;
+        let missing_cost = u64::from(attributed_credits <= 0.0);
+        report.missing_cost += missing_cost;
+
+        let key = key_by_id
+            .get(&attribution.key_id)
+            .expect("attribution only contains known RS keys");
+        let group = key
+            .group
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| (!log.group.trim().is_empty()).then(|| log.group.trim().to_string()))
+            .unwrap_or_else(|| "未分组".to_string());
+        let model = if log.model_name.trim().is_empty() {
+            attribution.model
+        } else {
+            log.model_name
+        };
+        add_stat(
+            &mut by_key,
+            key.key_name.clone(),
+            Some(key.key_id),
+            Some(key.key_name.clone()),
+            revenue,
+            attributed_credits,
+            cost,
+            missing_cost,
+        );
+        add_stat(
+            &mut by_group,
+            group,
+            None,
+            None,
+            revenue,
+            attributed_credits,
+            cost,
+            missing_cost,
+        );
+        add_stat(
+            &mut by_model,
+            model,
+            None,
+            None,
+            revenue,
+            attributed_credits,
+            cost,
+            missing_cost,
+        );
+        add_stat(
+            &mut by_user,
+            log.username,
+            None,
+            None,
+            revenue,
+            attributed_credits,
+            cost,
+            missing_cost,
+        );
+    }
+
+    report.unattributed_credits = (report.credits - report.attributed_credits).max(0.0);
+    report.attributed_cost = report.attributed_credits * credit_price;
+    report.unattributed_cost = report.unattributed_credits * credit_price;
+    report.unattributed_revenue = (report.revenue - report.attributed_revenue).max(0.0);
+    report.profit = report.revenue - report.cost;
+    if report.revenue > 0.0 {
+        report.margin_pct = report.profit / report.revenue * 100.0;
+    }
+    report.by_key = sorted_stats(by_key);
+    report.by_group = sorted_stats(by_group);
+    report.by_model = sorted_stats(by_model);
+    report.by_user = sorted_stats(by_user);
+    report
+}
+
+fn effective_credit_price(config: &ProfitConfig) -> f64 {
+    if config.credit_price.is_finite() && config.credit_price > 0.0 {
+        config.credit_price
+    } else {
+        DEFAULT_PROFIT_CREDIT_PRICE
+    }
+}
+
+fn effective_quota_per_unit(config: &ProfitConfig) -> f64 {
+    if config.quota_per_unit.is_finite() && config.quota_per_unit > 0.0 {
+        config.quota_per_unit
+    } else {
+        DEFAULT_PROFIT_QUOTA_PER_UNIT
+    }
+}
+
+fn positive_finite(value: f64) -> f64 {
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        0.0
+    }
+}
+
+fn quota_revenue(quota: i64, quota_per_unit: f64) -> f64 {
+    if quota > 0 {
+        quota as f64 / quota_per_unit
+    } else {
+        0.0
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -418,6 +703,49 @@ fn sorted_stats(stats: BTreeMap<String, ProfitGroupStat>) -> Vec<ProfitGroupStat
 mod tests {
     use super::*;
     use crate::admin::trace_db::ProfitTraceRecord;
+    use crate::admin::usage_stats::UsageRecord;
+
+    fn newapi_log(trace_id: &str, channel_id: u64, quota: i64) -> NewapiLogItem {
+        NewapiLogItem {
+            channel_id,
+            quota,
+            upstream_request_id: trace_id.to_string(),
+            token_name: "rs-key".to_string(),
+            model_name: "claude-opus-4-8".to_string(),
+            username: "alice".to_string(),
+            ..NewapiLogItem::default()
+        }
+    }
+
+    fn usage(
+        trace_id: Option<&str>,
+        key_id: u64,
+        credits: f64,
+        status: &str,
+    ) -> UsageRecord {
+        UsageRecord {
+            ts: "2026-07-23T01:00:00Z".to_string(),
+            trace_id: trace_id.map(str::to_string),
+            key_id,
+            credential_id: 11,
+            model: "claude-opus-4-8".to_string(),
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            credits,
+            duration_ms: 10,
+            status: status.to_string(),
+        }
+    }
+
+    fn key(key_id: u64, name: &str, group: &str) -> ProfitKeyMetadata {
+        ProfitKeyMetadata {
+            key_id,
+            key_name: name.to_string(),
+            group: Some(group.to_string()),
+        }
+    }
 
     fn joined(group: &str, key_name: &str, credits: f64, quota: i64) -> JoinedProfitRow {
         JoinedProfitRow {
@@ -472,6 +800,58 @@ mod tests {
         let report = aggregate_rows(vec![row], ProfitConfig::default());
         assert_eq!(report.unmatched, 1);
         assert_eq!(report.unmatched_revenue, 1.0);
+        assert_eq!(report.profit, 0.0);
+    }
+
+    #[test]
+    fn ledger_report_uses_all_usage_cost_for_observed_rs_keys() {
+        let logs = vec![
+            newapi_log("matched", 19, 500_000),
+            newapi_log("legacy-missing", 19, 500_000),
+            newapi_log("gpt", 1, 500_000),
+        ];
+        let usage = vec![
+            usage(Some("matched"), 3, 1.0, "success"),
+            usage(None, 3, 9.0, "success"),
+            usage(None, 3, 2.0, "error"),
+            usage(None, 99, 100.0, "success"),
+        ];
+        let traces = vec![ProfitTraceRecord {
+            trace_id: "legacy-missing".to_string(),
+            key_id: 3,
+            model: "claude-opus-4-8".to_string(),
+            credits: 0.0,
+            final_status: "error".to_string(),
+        }];
+        let report = aggregate_ledger_report(
+            logs,
+            usage,
+            traces,
+            vec![key(3, "rs-key", "rs")],
+            ProfitConfig::default(),
+        );
+        assert!(report.ledger_scope_confirmed);
+        assert_eq!(report.observed_channel_ids, vec![19]);
+        assert_eq!(report.observed_key_ids, vec![3]);
+        assert_eq!(report.revenue, 2.0);
+        assert_eq!(report.credits, 12.0);
+        assert_eq!(report.attributed_credits, 1.0);
+        assert_eq!(report.unattributed_credits, 11.0);
+        assert!((report.cost - 0.27).abs() < 1e-9);
+        assert!((report.profit - 1.73).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ledger_report_fails_closed_without_observed_channel_or_key() {
+        let report = aggregate_ledger_report(
+            vec![newapi_log("missing", 19, 500_000)],
+            vec![usage(None, 3, 10.0, "success")],
+            Vec::new(),
+            vec![key(3, "rs-key", "rs")],
+            ProfitConfig::default(),
+        );
+        assert!(!report.ledger_scope_confirmed);
+        assert_eq!(report.cost, 0.0);
         assert_eq!(report.profit, 0.0);
     }
 

@@ -79,6 +79,7 @@ pub(crate) struct UsageRecordHook {
     pub recorder: Option<SharedRecorder>,
     pub aggregator: Option<SharedAggregator>,
     pub client_keys: Option<SharedClientKeyManager>,
+    pub trace_id: Option<String>,
     pub key_id: u64,
     pub cache_hit_rate: Option<CacheHitRateBounds>,
     pub model: String,
@@ -86,11 +87,17 @@ pub(crate) struct UsageRecordHook {
 }
 
 impl UsageRecordHook {
-    pub fn from_state(state: &AppState, key_ctx: &KeyContext, model: String) -> Self {
+    pub fn from_state(
+        state: &AppState,
+        key_ctx: &KeyContext,
+        model: String,
+        trace_id: Option<String>,
+    ) -> Self {
         Self {
             recorder: state.usage_recorder.clone(),
             aggregator: state.usage_aggregator.clone(),
             client_keys: state.client_keys.clone(),
+            trace_id,
             key_id: key_ctx.key_id,
             cache_hit_rate: key_ctx.cache_hit_rate,
             model,
@@ -110,6 +117,7 @@ impl UsageRecordHook {
     ) {
         let rec = UsageRecord {
             ts: Utc::now().to_rfc3339(),
+            trace_id: self.trace_id.clone(),
             key_id: self.key_id,
             credential_id,
             model: self.model.clone(),
@@ -2126,7 +2134,6 @@ pub async fn post_messages(
             "incoming image payload is large; if upstream rejects with CONTENT_LENGTH_EXCEEDS_THRESHOLD, reduce image count or use lower-resolution screenshots"
         );
     }
-    let hook = UsageRecordHook::from_state(&state, &key_ctx, payload.model.clone());
     let tracer = std::sync::Arc::new(RequestTracer::new(
         &state,
         RequestTraceOptions {
@@ -2143,6 +2150,12 @@ pub async fn post_messages(
         &headers,
         &payload,
     ));
+    let hook = UsageRecordHook::from_state(
+        &state,
+        &key_ctx,
+        payload.model.clone(),
+        Some(tracer.trace_id().to_string()),
+    );
     if let Some(response) = handle_empty_user_message(&state, &mut payload, &hook, &tracer) {
         return response;
     }
@@ -4259,7 +4272,6 @@ pub async fn post_messages_cc(
         message_count = %payload.messages.len(),
         "Received POST /cc/v1/messages request"
     );
-    let hook = UsageRecordHook::from_state(&state, &key_ctx, payload.model.clone());
     let tracer = std::sync::Arc::new(RequestTracer::new(
         &state,
         RequestTraceOptions {
@@ -4276,6 +4288,12 @@ pub async fn post_messages_cc(
         &headers,
         &payload,
     ));
+    let hook = UsageRecordHook::from_state(
+        &state,
+        &key_ctx,
+        payload.model.clone(),
+        Some(tracer.trace_id().to_string()),
+    );
 
     if let Some(response) = handle_empty_user_message(&state, &mut payload, &hook, &tracer) {
         return response;
@@ -5079,6 +5097,46 @@ mod tests {
             resolve_cache_hit_rate_bounds(Some(disabled), (0, 95)),
             (0, 0)
         );
+    }
+
+    #[test]
+    fn usage_hook_carries_request_trace_id() {
+        let dir = std::env::temp_dir().join(format!(
+            "kiro-rs-usage-hook-{}",
+            Uuid::new_v4()
+        ));
+        let recorder = Arc::new(crate::admin::usage_stats::UsageRecorder::with_retention(
+            dir.clone(),
+            1,
+        ));
+        let state = AppState::new(
+            false,
+            crate::model::config::ToolCompatibilityMode::Raw,
+        )
+        .with_usage(None, Some(recorder.clone()), None);
+        let key_ctx = KeyContext {
+            key_id: 7,
+            group: None,
+            key_source: TraceKeySource::ClientKey,
+            response_mode: ClientResponseMode::KiroNative,
+            cache_hit_rate: None,
+        };
+        let trace_id = "trace-hook-test-123".to_string();
+        let hook = UsageRecordHook::from_state(
+            &state,
+            &key_ctx,
+            "claude-opus-4-8".to_string(),
+            Some(trace_id.clone()),
+        );
+
+        hook.record(11, 10, 3, 2, 1, 0.25, "success");
+
+        let now = Utc::now().timestamp();
+        let result = recorder.query_range(now - 5, now + 5).unwrap();
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].trace_id.as_deref(), Some(trace_id.as_str()));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn response_mode_exact_system_request() -> MessagesRequest {

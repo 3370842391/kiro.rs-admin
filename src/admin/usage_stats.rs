@@ -29,6 +29,9 @@ const DAY_BUCKETS: usize = 31;
 pub struct UsageRecord {
     /// 请求结束时间（RFC3339）
     pub ts: String,
+    /// 与 NewAPI `upstream_request_id` 对应的请求关联 ID；旧日志没有该字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
     /// 客户端 Key id；0 表示用 master apiKey 调用
     pub key_id: u64,
     /// 实际命中的上游凭据 id；0 表示请求未走到上游
@@ -63,6 +66,13 @@ struct RecorderState {
     /// 当前打开的 writer 与对应日期
     current_date: Option<NaiveDate>,
     writer: Option<BufWriter<File>>,
+}
+
+/// 精确时间范围内的 usage 账本读取结果。
+#[derive(Debug, Default)]
+pub struct UsageRangeRead {
+    pub records: Vec<UsageRecord>,
+    pub invalid_lines: u64,
 }
 
 impl UsageRecorder {
@@ -127,6 +137,72 @@ impl UsageRecorder {
             // 立即 flush，保证崩溃时不丢失最近一条
             let _ = w.flush();
         }
+    }
+
+    /// 顺序读取时间窗口涉及的 JSONL 文件；读取前 flush 当前 writer，保证最新记录可见。
+    pub fn query_range(
+        &self,
+        start_epoch: i64,
+        end_epoch: i64,
+    ) -> std::io::Result<UsageRangeRead> {
+        if start_epoch > end_epoch {
+            return Ok(UsageRangeRead::default());
+        }
+        let start = DateTime::<Utc>::from_timestamp(start_epoch, 0).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "usage query start timestamp is out of range",
+            )
+        })?;
+        let end = DateTime::<Utc>::from_timestamp(end_epoch, 0).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "usage query end timestamp is out of range",
+            )
+        })?;
+        if let Some(writer) = self.inner.lock().writer.as_mut() {
+            writer.flush()?;
+        }
+
+        let start_date = start.with_timezone(&Local).date_naive();
+        let end_date = end.with_timezone(&Local).date_naive();
+        let mut result = UsageRangeRead::default();
+
+        for entry in std::fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(date) = parse_usage_log_filename(&name) else {
+                continue;
+            };
+            if date < start_date || date > end_date {
+                continue;
+            }
+
+            let reader = BufReader::new(File::open(entry.path())?);
+            for line in reader.lines() {
+                let line = line?;
+                let Ok(record) = serde_json::from_str::<UsageRecord>(&line) else {
+                    result.invalid_lines += 1;
+                    continue;
+                };
+                let Ok(ts) = DateTime::parse_from_rfc3339(&record.ts) else {
+                    result.invalid_lines += 1;
+                    continue;
+                };
+                let ts = ts.with_timezone(&Utc);
+                if ts >= start && ts <= end {
+                    result.records.push(record);
+                }
+            }
+        }
+
+        result.records.sort_by_cached_key(|record| {
+            DateTime::parse_from_rfc3339(&record.ts)
+                .expect("query_range only retains valid RFC3339 timestamps")
+        });
+        Ok(result)
     }
 
     /// 获取保留天数
@@ -711,6 +787,273 @@ pub type SharedAggregator = Arc<UsageAggregator>;
 mod tests {
     use super::*;
 
+    fn usage_test_record(ts: &str, trace_id: Option<&str>, credits: f64) -> UsageRecord {
+        UsageRecord {
+            ts: ts.to_string(),
+            trace_id: trace_id.map(str::to_string),
+            key_id: 3,
+            credential_id: 9,
+            model: "claude-opus-4-8".to_string(),
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            credits,
+            duration_ms: 100,
+            status: "success".to_string(),
+        }
+    }
+
+    fn temp_usage_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "kiro-rs-usage-{name}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn usage_log_path(dir: &Path, date: NaiveDate) -> PathBuf {
+        dir.join(format!("usage_log.{}.jsonl", date.format("%Y-%m-%d")))
+    }
+
+    fn write_usage_lines(dir: &Path, date: NaiveDate, lines: &[String]) {
+        let mut contents = lines.join("\n");
+        contents.push('\n');
+        std::fs::write(usage_log_path(dir, date), contents).unwrap();
+    }
+
+    fn local_time(date: NaiveDate, hour: u32, minute: u32, second: u32) -> DateTime<Local> {
+        Local
+            .from_local_datetime(&date.and_hms_opt(hour, minute, second).unwrap())
+            .single()
+            .unwrap()
+    }
+
+    #[test]
+    fn usage_record_trace_id_is_backward_compatible() {
+        let legacy: UsageRecord = serde_json::from_value(serde_json::json!({
+            "ts": "2026-07-23T01:00:00Z",
+            "keyId": 3,
+            "credentialId": 9,
+            "model": "claude-opus-4-8",
+            "inputTokens": 10,
+            "outputTokens": 5,
+            "status": "success"
+        }))
+        .unwrap();
+        assert_eq!(legacy.trace_id, None);
+
+        let mut current = legacy;
+        current.trace_id = Some("trace-1".to_string());
+        assert_eq!(
+            serde_json::to_value(current).unwrap()["traceId"],
+            "trace-1"
+        );
+    }
+
+    #[test]
+    fn usage_recorder_reads_exact_window_and_reports_invalid_lines() {
+        let dir = temp_usage_dir("range");
+        let recorder = UsageRecorder::with_retention(dir.clone(), 31);
+        let date = NaiveDate::from_ymd_opt(2026, 7, 23).unwrap();
+        let before = local_time(date, 10, 0, 0);
+        let included = local_time(date, 11, 0, 0);
+        let end = local_time(date, 12, 0, 0);
+        let invalid_timestamp = usage_test_record("not-rfc3339", None, 4.0);
+        write_usage_lines(
+            &dir,
+            date,
+            &[
+                serde_json::to_string(&usage_test_record(
+                    &before.to_rfc3339(),
+                    Some("before"),
+                    1.0,
+                ))
+                .unwrap(),
+                serde_json::to_string(&usage_test_record(
+                    &included.to_rfc3339(),
+                    None,
+                    2.0,
+                ))
+                .unwrap(),
+                serde_json::to_string(&usage_test_record(
+                    &end.to_rfc3339(),
+                    Some("end"),
+                    3.0,
+                ))
+                .unwrap(),
+                "{not-json".to_string(),
+                serde_json::to_string(&invalid_timestamp).unwrap(),
+            ],
+        );
+
+        let result = recorder
+            .query_range((before + Duration::minutes(30)).timestamp(), end.timestamp())
+            .unwrap();
+        assert_eq!(result.records.len(), 2);
+        assert_eq!(result.records[0].credits, 2.0);
+        assert_eq!(result.records[1].credits, 3.0);
+        assert_eq!(result.invalid_lines, 2);
+        drop(recorder);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn usage_recorder_sorts_submillisecond_timestamps() {
+        let dir = temp_usage_dir("submillisecond-sort");
+        let recorder = UsageRecorder::with_retention(dir.clone(), 31);
+        let date = NaiveDate::from_ymd_opt(2026, 7, 23).unwrap();
+        let base = local_time(date, 12, 0, 0);
+        let later = usage_test_record(
+            &base.with_nanosecond(200).unwrap().to_rfc3339(),
+            None,
+            2.0,
+        );
+        let earlier = usage_test_record(
+            &base.with_nanosecond(100).unwrap().to_rfc3339(),
+            None,
+            1.0,
+        );
+        write_usage_lines(
+            &dir,
+            date,
+            &[
+                serde_json::to_string(&later).unwrap(),
+                serde_json::to_string(&earlier).unwrap(),
+            ],
+        );
+
+        let result = recorder
+            .query_range(base.timestamp(), (base + Duration::seconds(1)).timestamp())
+            .unwrap();
+        assert_eq!(
+            result
+                .records
+                .iter()
+                .map(|record| record.credits)
+                .collect::<Vec<_>>(),
+            vec![1.0, 2.0]
+        );
+        drop(recorder);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn usage_recorder_flushes_current_writer_before_reading() {
+        let dir = temp_usage_dir("flush-before-read");
+        let recorder = UsageRecorder::with_retention(dir.clone(), 31);
+        let date = NaiveDate::from_ymd_opt(2026, 7, 23).unwrap();
+        let ts = local_time(date, 12, 0, 0);
+        let path = usage_log_path(&dir, date);
+        let record = usage_test_record(&ts.to_rfc3339(), Some("buffered"), 1.0);
+        {
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap();
+            let mut state = recorder.inner.lock();
+            state.current_date = Some(date);
+            state.writer = Some(BufWriter::new(file));
+            writeln!(
+                state.writer.as_mut().unwrap(),
+                "{}",
+                serde_json::to_string(&record).unwrap()
+            )
+            .unwrap();
+        }
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+
+        let result = recorder.query_range(ts.timestamp(), ts.timestamp()).unwrap();
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].trace_id.as_deref(), Some("buffered"));
+        drop(recorder);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn usage_recorder_reads_cross_day_window_and_skips_unrelated_dates() {
+        let dir = temp_usage_dir("cross-day");
+        let recorder = UsageRecorder::with_retention(dir.clone(), 31);
+        let first_date = NaiveDate::from_ymd_opt(2026, 7, 23).unwrap();
+        let second_date = first_date.succ_opt().unwrap();
+        let start = local_time(first_date, 23, 59, 59);
+        let end = local_time(second_date, 0, 0, 1);
+        let first = usage_test_record(&start.to_rfc3339(), None, 1.0);
+        let second = usage_test_record(&end.to_rfc3339(), None, 2.0);
+        let unrelated = usage_test_record(
+            &(start + Duration::seconds(1)).to_rfc3339(),
+            None,
+            99.0,
+        );
+        write_usage_lines(
+            &dir,
+            first_date,
+            &[serde_json::to_string(&first).unwrap()],
+        );
+        write_usage_lines(
+            &dir,
+            second_date,
+            &[serde_json::to_string(&second).unwrap()],
+        );
+        for date in [first_date.pred_opt().unwrap(), second_date.succ_opt().unwrap()] {
+            write_usage_lines(
+                &dir,
+                date,
+                &[
+                    serde_json::to_string(&unrelated).unwrap(),
+                    "{not-json".to_string(),
+                ],
+            );
+        }
+
+        let result = recorder
+            .query_range(start.timestamp(), end.timestamp())
+            .unwrap();
+        assert_eq!(
+            result
+                .records
+                .iter()
+                .map(|record| record.credits)
+                .collect::<Vec<_>>(),
+            vec![1.0, 2.0]
+        );
+        assert_eq!(result.invalid_lines, 0);
+        drop(recorder);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn usage_recorder_end_boundary_excludes_later_subsecond() {
+        let dir = temp_usage_dir("subsecond-boundary");
+        let recorder = UsageRecorder::with_retention(dir.clone(), 31);
+        let date = NaiveDate::from_ymd_opt(2026, 7, 23).unwrap();
+        let end = local_time(date, 12, 0, 0);
+        let exact_end = usage_test_record(&end.to_rfc3339(), None, 1.0);
+        let after_end = usage_test_record(
+            &(end + Duration::milliseconds(999)).to_rfc3339(),
+            None,
+            2.0,
+        );
+        write_usage_lines(
+            &dir,
+            date,
+            &[
+                serde_json::to_string(&exact_end).unwrap(),
+                serde_json::to_string(&after_end).unwrap(),
+            ],
+        );
+
+        let result = recorder
+            .query_range((end - Duration::seconds(1)).timestamp(), end.timestamp())
+            .unwrap();
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].credits, 1.0);
+        drop(recorder);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn parse_log_filename() {
         assert!(parse_usage_log_filename("usage_log.2026-05-22.jsonl").is_some());
@@ -723,6 +1066,7 @@ mod tests {
         let now = Utc::now();
         let rec = UsageRecord {
             ts: now.to_rfc3339(),
+            trace_id: None,
             key_id: 1,
             credential_id: 5,
             model: "claude-opus-4-7".to_string(),
@@ -761,6 +1105,7 @@ mod tests {
         let now = Utc::now().to_rfc3339();
         let rec_a = UsageRecord {
             ts: now.clone(),
+            trace_id: None,
             key_id: 1,
             credential_id: 5,
             model: "m-a".to_string(),
@@ -774,6 +1119,7 @@ mod tests {
         };
         let rec_b = UsageRecord {
             ts: now,
+            trace_id: None,
             key_id: 2,
             credential_id: 6,
             model: "m-b".to_string(),
@@ -828,6 +1174,7 @@ mod tests {
             .to_rfc3339();
         let rec_yesterday = UsageRecord {
             ts: yesterday_noon,
+            trace_id: None,
             key_id: 0,
             credential_id: 5,
             model: "m-yesterday".to_string(),
@@ -841,6 +1188,7 @@ mod tests {
         };
         let rec_today = UsageRecord {
             ts: today_noon,
+            trace_id: None,
             key_id: 0,
             credential_id: 5,
             model: "m-today".to_string(),
@@ -890,6 +1238,7 @@ mod tests {
         let agg = UsageAggregator::new();
         let rec = UsageRecord {
             ts: Utc::now().to_rfc3339(),
+            trace_id: None,
             key_id: 0,
             credential_id: 0,
             model: "claude-opus-4-7".to_string(),

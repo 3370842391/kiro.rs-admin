@@ -19,10 +19,16 @@ describe('NewAPI 利润报表 UI 接线', () => {
     expect(page).toContain('成本')
     expect(page).toContain('利润')
     expect(page).toContain('毛利率')
-    expect(page).toContain('匹配率')
+    expect(page).toContain('归属率')
     expect(page).toContain('text-destructive')
     expect(page).toContain('未匹配收入')
-    expect(page).toContain('缺失成本')
+    expect(page).toContain('未归属收入')
+    expect(page).toContain('未归属 Credits')
+    expect(page).toContain('未归属成本')
+    expect(page).toContain('顶部总成本来自 RS 实际 metering 账本')
+    expect(page).toContain('范围未确认')
+    expect(page).toContain('ledgerScopeConfirmed')
+    expect(await readSource('types/api.ts')).toContain('unattributedCost')
   })
 
   test('API 使用专用端点且空 Token 不会覆盖服务端密钥', async () => {
