@@ -20,8 +20,8 @@ use super::{
     error_snapshot_db::{SnapshotQuery, SnapshotSeverity},
     middleware::AdminState,
     profit::{
-        ProfitKeyMetadata, ProfitReportRequest, ProfitReportResponse, aggregate_rows,
-        fetch_newapi_logs, join_newapi_logs,
+        ProfitKeyMetadata, ProfitReportRequest, ProfitReportResponse, aggregate_ledger_report,
+        fetch_newapi_logs,
     },
     trace_db::TraceQuery,
     types::{
@@ -793,16 +793,21 @@ pub async fn profit_report(
         .filter(|trace_id| !trace_id.trim().is_empty())
         .collect();
     let trace_store = state.trace_store.clone();
-    let traces = match tokio::task::spawn_blocking(move || {
-        trace_store.query_profit_traces(&trace_ids, start_timestamp, end_timestamp)
+    let service = Arc::clone(&state.service);
+    let (traces, usage_read) = match tokio::task::spawn_blocking(move || {
+        let traces = trace_store
+            .query_profit_traces(&trace_ids, start_timestamp, end_timestamp)
+            .map_err(|error| format!("读取利润关联 trace 失败: {error}"))?;
+        let usage = service
+            .query_usage_records(start_timestamp, end_timestamp)
+            .map_err(|error| error.to_string())?;
+        Ok::<_, String>((traces, usage))
     })
     .await
     {
-        Ok(Ok(traces)) => traces,
+        Ok(Ok(result)) => result,
         Ok(Err(error)) => {
-            let error = super::error::AdminServiceError::InternalError(format!(
-                "读取利润关联 trace 失败: {error}"
-            ));
+            let error = super::error::AdminServiceError::InternalError(error);
             return (error.status_code(), Json(error.into_response())).into_response();
         }
         Err(error) => {
@@ -812,6 +817,14 @@ pub async fn profit_report(
             return (error.status_code(), Json(error.into_response())).into_response();
         }
     };
+    if usage_read.invalid_lines > 0 {
+        tracing::warn!(
+            invalid_lines = usage_read.invalid_lines,
+            start_timestamp,
+            end_timestamp,
+            "利润报表跳过了损坏的 usage 账本行"
+        );
+    }
     let keys = state
         .client_keys
         .list()
@@ -822,7 +835,7 @@ pub async fn profit_report(
             group: key.group,
         })
         .collect();
-    let report = aggregate_rows(join_newapi_logs(logs, traces, keys), config.clone());
+    let report = aggregate_ledger_report(logs, usage_read.records, traces, keys, config.clone());
     Json(ProfitReportResponse {
         start_timestamp,
         end_timestamp,
