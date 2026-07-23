@@ -337,6 +337,11 @@ fn normalize_batch_update_request(
             "rpmLimit 不能大于 100000".to_string(),
         ));
     }
+    if request.priority.is_some() && request.promote_priority {
+        return Err(AdminServiceError::InvalidCredential(
+            "priority 与 promotePriority 不能同时设置".to_string(),
+        ));
+    }
 
     let groups = request
         .groups
@@ -400,8 +405,15 @@ fn normalize_batch_update_request(
         rpm_limit: request.rpm_limit,
         groups,
         source_channel,
+        priority: request.priority,
+        promote_priority: request.promote_priority,
     };
-    if patch.rpm_limit.is_none() && patch.groups.is_none() && patch.source_channel.is_none() {
+    if patch.rpm_limit.is_none()
+        && patch.groups.is_none()
+        && patch.source_channel.is_none()
+        && request.priority.is_none()
+        && !request.promote_priority
+    {
         return Err(AdminServiceError::InvalidCredential(
             "批量更新至少需要一个修改字段".to_string(),
         ));
@@ -1301,6 +1313,7 @@ impl AdminService {
             selected: result.selected,
             updated: result.updated,
             unchanged: result.unchanged,
+            priority_adjusted: result.priority_adjusted,
             rpm_summary: calculate_rpm_summary(&snapshot.entries),
         })
     }
@@ -5092,6 +5105,8 @@ mod tests {
             rpm_limit,
             groups,
             source_channel,
+            priority: None,
+            promote_priority: false,
         };
 
         assert!(normalize_batch_update_request(request(vec![], Some(1), None, None)).is_err());
@@ -5131,6 +5146,37 @@ mod tests {
     }
 
     #[test]
+    fn normalize_batch_update_request_rejects_conflicting_priority_modes() {
+        use super::super::types::BatchUpdateCredentialsRequest;
+
+        let conflict = normalize_batch_update_request(BatchUpdateCredentialsRequest {
+            ids: vec![1, 2],
+            rpm_limit: None,
+            groups: None,
+            source_channel: None,
+            priority: Some(10),
+            promote_priority: true,
+        });
+        assert!(matches!(
+            conflict,
+            Err(AdminServiceError::InvalidCredential(message))
+                if message.contains("priority") && message.contains("promotePriority")
+        ));
+
+        let promoted = normalize_batch_update_request(BatchUpdateCredentialsRequest {
+            ids: vec![1, 2],
+            rpm_limit: None,
+            groups: None,
+            source_channel: None,
+            priority: None,
+            promote_priority: true,
+        })
+        .unwrap();
+        assert!(promoted.patch.promote_priority);
+        assert_eq!(promoted.patch.priority, None);
+    }
+
+    #[test]
     fn normalize_batch_update_request_enforces_group_boundaries() {
         use super::super::types::{
             BatchGroupMode, BatchGroupsPatchRequest, BatchUpdateCredentialsRequest,
@@ -5145,6 +5191,8 @@ mod tests {
                 values,
             }),
             source_channel: None,
+            priority: None,
+            promote_priority: false,
         };
 
         let mut maximum_groups = (0..100)
@@ -5190,6 +5238,8 @@ mod tests {
                 values: vec!["  ".to_string(), String::new()],
             }),
             source_channel: Some("   ".to_string()),
+            priority: None,
+            promote_priority: false,
         })
         .unwrap();
         assert_eq!(clear.ids, vec![1]);
@@ -5214,6 +5264,8 @@ mod tests {
                 ],
             }),
             source_channel: Some(" migration ".to_string()),
+            priority: None,
+            promote_priority: false,
         })
         .unwrap();
         assert_eq!(
@@ -5282,12 +5334,15 @@ mod tests {
                 rpm_limit: Some(4),
                 groups: None,
                 source_channel: None,
+                priority: None,
+                promote_priority: false,
             })
             .unwrap();
 
         assert_eq!(response.selected, 1);
         assert_eq!(response.updated, 1);
         assert_eq!(response.unchanged, 0);
+        assert_eq!(response.priority_adjusted, 0);
         assert_eq!(response.rpm_summary.current, 2);
         assert_eq!(response.rpm_summary.limited_capacity, 4);
         assert_eq!(response.rpm_summary.remaining_limited_capacity, 3);

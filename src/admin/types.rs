@@ -350,6 +350,10 @@ pub struct BatchUpdateCredentialsRequest {
     pub groups: Option<BatchGroupsPatchRequest>,
     #[serde(default)]
     pub source_channel: Option<String>,
+    #[serde(default)]
+    pub priority: Option<u32>,
+    #[serde(default)]
+    pub promote_priority: bool,
 }
 
 /// 批量修改凭据响应
@@ -359,6 +363,7 @@ pub struct BatchUpdateCredentialsResponse {
     pub selected: usize,
     pub updated: usize,
     pub unchanged: usize,
+    pub priority_adjusted: usize,
     pub rpm_summary: RpmSummary,
 }
 
@@ -2077,6 +2082,25 @@ mod tests {
         assert_eq!(groups.mode, BatchGroupMode::Add);
         assert_eq!(groups.values, vec!["team-a", "team-b"]);
         assert_eq!(request.source_channel.as_deref(), Some("migration"));
+    }
+
+    #[test]
+    fn batch_update_request_accepts_fixed_or_promoted_priority() {
+        let fixed: BatchUpdateCredentialsRequest = serde_json::from_value(serde_json::json!({
+            "ids": [1, 2],
+            "priority": 10
+        }))
+        .unwrap();
+        assert_eq!(fixed.priority, Some(10));
+        assert!(!fixed.promote_priority);
+
+        let promoted: BatchUpdateCredentialsRequest = serde_json::from_value(serde_json::json!({
+            "ids": [1, 2],
+            "promotePriority": true
+        }))
+        .unwrap();
+        assert_eq!(promoted.priority, None);
+        assert!(promoted.promote_priority);
     }
 
     #[test]

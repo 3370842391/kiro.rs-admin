@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -1263,12 +1263,16 @@ pub(crate) enum CredentialGroupPatch {
 }
 
 /// 批量账号配置补丁。字段为 `None` 时保持原值不变。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct CredentialBatchPatch {
     pub rpm_limit: Option<u32>,
     pub groups: Option<CredentialGroupPatch>,
     /// 外层 `None` 表示不修改，`Some(None)` 表示清除来源渠道。
     pub source_channel: Option<Option<String>>,
+    /// 固定数值模式：只修改选中账号。
+    pub priority: Option<u32>,
+    /// 最高优先池模式：选中账号为 0，其他账号稳定压缩到 1..N。
+    pub promote_priority: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1287,6 +1291,7 @@ pub(crate) struct CredentialBatchUpdateResult {
     pub selected: usize,
     pub updated: usize,
     pub unchanged: usize,
+    pub priority_adjusted: usize,
 }
 
 /// 多凭据 Token 管理器
@@ -1901,8 +1906,10 @@ impl MultiTokenManager {
                 // 平局按优先级（数字小者优先），再平按累计成功数（在空闲均势下更均衡）。
                 let entry = if self.get_endpoint_mode() == EndpointMode::Best {
                     available.iter().min_by(|a, b| {
-                        a.in_flight
-                            .cmp(&b.in_flight)
+                        a.credentials
+                            .priority
+                            .cmp(&b.credentials.priority)
+                            .then_with(|| a.in_flight.cmp(&b.in_flight))
                             .then_with(|| match (a.first_byte_ewma_ms, b.first_byte_ewma_ms) {
                                 (Some(a), Some(b)) => {
                                     a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)
@@ -1910,8 +1917,8 @@ impl MultiTokenManager {
                                 // 没有样本的账号不因未知延迟被硬性惩罚。
                                 _ => std::cmp::Ordering::Equal,
                             })
-                            .then_with(|| a.credentials.priority.cmp(&b.credentials.priority))
                             .then_with(|| a.balance_count.cmp(&b.balance_count))
+                            .then_with(|| a.id.cmp(&b.id))
                     })?
                 } else {
                     available
@@ -4140,16 +4147,60 @@ impl MultiTokenManager {
         let previous_credentials = entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| target_ids.contains(&entry.id))
+            .filter(|(_, entry)| patch.promote_priority || target_ids.contains(&entry.id))
             .map(|(index, entry)| (index, entry.credentials.clone()))
             .collect::<Vec<_>>();
+
+        let mut priority_adjusted = 0usize;
+        let mut selected_priority_changed = HashSet::with_capacity(ids.len());
+        if patch.promote_priority {
+            let unselected_levels = entries
+                .iter()
+                .filter(|entry| !target_ids.contains(&entry.id))
+                .map(|entry| entry.credentials.priority)
+                .collect::<BTreeSet<_>>();
+            let level_map = unselected_levels
+                .into_iter()
+                .enumerate()
+                .map(|(index, priority)| {
+                    let normalized = u32::try_from(index + 1).unwrap_or(u32::MAX);
+                    (priority, normalized)
+                })
+                .collect::<BTreeMap<_, _>>();
+
+            for entry in entries.iter_mut() {
+                let next_priority = if target_ids.contains(&entry.id) {
+                    0
+                } else {
+                    level_map
+                        .get(&entry.credentials.priority)
+                        .copied()
+                        .expect("unselected priority level must be mapped")
+                };
+                if entry.credentials.priority != next_priority {
+                    entry.credentials.priority = next_priority;
+                    priority_adjusted += 1;
+                    if target_ids.contains(&entry.id) {
+                        selected_priority_changed.insert(entry.id);
+                    }
+                }
+            }
+        }
 
         let mut updated = 0;
         for entry in entries
             .iter_mut()
             .filter(|entry| target_ids.contains(&entry.id))
         {
-            let mut changed = false;
+            let mut changed = selected_priority_changed.contains(&entry.id);
+
+            if let Some(priority) = patch.priority
+                && entry.credentials.priority != priority
+            {
+                entry.credentials.priority = priority;
+                priority_adjusted += 1;
+                changed = true;
+            }
 
             if let Some(rpm_limit) = patch.rpm_limit
                 && entry.credentials.rpm_limit != rpm_limit
@@ -4210,9 +4261,10 @@ impl MultiTokenManager {
             selected: ids.len(),
             updated,
             unchanged: ids.len() - updated,
+            priority_adjusted,
         };
 
-        if result.updated > 0 {
+        if result.updated > 0 || result.priority_adjusted > 0 {
             let credentials = Self::credentials_snapshot(&entries);
             if let Err(error) = self.persist_credentials_locked(&credentials) {
                 for (index, credentials) in previous_credentials {
@@ -4220,6 +4272,13 @@ impl MultiTokenManager {
                 }
                 return Err(CredentialBatchUpdateError::Persist(error));
             }
+        }
+
+        let should_reselect = result.priority_adjusted > 0;
+        drop(entries);
+        drop(_write_guard);
+        if should_reselect {
+            self.select_highest_priority();
         }
 
         Ok(result)
@@ -6085,6 +6144,56 @@ mod tests {
     }
 
     #[test]
+    fn best_mode_prefers_priority_tier_before_realtime_load() {
+        let manager = batch_priority_manager(&[(1, 0), (2, 10)]);
+        manager
+            .entries
+            .lock()
+            .iter_mut()
+            .find(|entry| entry.id == 1)
+            .unwrap()
+            .in_flight = 3;
+
+        let selected = manager
+            .select_next_credential(None, None)
+            .map(|value| value.0);
+        assert_eq!(selected, Some(1));
+    }
+
+    #[test]
+    fn best_mode_uses_realtime_load_inside_same_priority_tier() {
+        let manager = batch_priority_manager(&[(1, 0), (2, 0)]);
+        manager
+            .entries
+            .lock()
+            .iter_mut()
+            .find(|entry| entry.id == 1)
+            .unwrap()
+            .in_flight = 3;
+
+        let selected = manager
+            .select_next_credential(None, None)
+            .map(|value| value.0);
+        assert_eq!(selected, Some(2));
+    }
+
+    #[test]
+    fn best_mode_falls_back_when_top_tier_hits_rpm_limit() {
+        let manager = batch_priority_manager(&[(1, 0), (2, 10)]);
+        {
+            let mut entries = manager.entries.lock();
+            let top = entries.iter_mut().find(|entry| entry.id == 1).unwrap();
+            top.credentials.rpm_limit = 1;
+            top.recent_requests.push_back(Instant::now());
+        }
+
+        let selected = manager
+            .select_next_credential(None, None)
+            .map(|value| value.0);
+        assert_eq!(selected, Some(2));
+    }
+
+    #[test]
     fn test_rpm_window_count_and_expiry() {
         let manager = MultiTokenManager::new(
             Config::default(),
@@ -6242,6 +6351,149 @@ mod tests {
         credential
     }
 
+    fn batch_priority_manager(values: &[(u64, u32)]) -> MultiTokenManager {
+        let credentials = values
+            .iter()
+            .map(|(id, priority)| {
+                let mut credential = batch_test_credential(*id, 0, &[], None);
+                credential.priority = *priority;
+                credential
+            })
+            .collect();
+        MultiTokenManager::new(Config::default(), credentials, None, None, true).unwrap()
+    }
+
+    fn credential_priorities(manager: &MultiTokenManager) -> Vec<(u64, u32)> {
+        let mut values = manager
+            .clone_all_credentials()
+            .into_iter()
+            .map(|credential| (credential.id.unwrap(), credential.priority))
+            .collect::<Vec<_>>();
+        values.sort_by_key(|value| value.0);
+        values
+    }
+
+    #[test]
+    fn batch_priority_supports_fixed_value_and_stable_promotion() {
+        let manager = batch_priority_manager(&[(1, 0), (2, 0), (3, 10), (4, 20)]);
+        let fixed = manager
+            .batch_update_credentials(
+                &[3],
+                CredentialBatchPatch {
+                    rpm_limit: None,
+                    groups: None,
+                    source_channel: None,
+                    priority: Some(7),
+                    promote_priority: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(fixed.priority_adjusted, 1);
+        assert_eq!(
+            credential_priorities(&manager),
+            vec![(1, 0), (2, 0), (3, 7), (4, 20)]
+        );
+
+        let promoted = manager
+            .batch_update_credentials(
+                &[3, 4],
+                CredentialBatchPatch {
+                    rpm_limit: None,
+                    groups: None,
+                    source_channel: None,
+                    priority: None,
+                    promote_priority: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(promoted.priority_adjusted, 4);
+        assert_eq!(
+            credential_priorities(&manager),
+            vec![(1, 1), (2, 1), (3, 0), (4, 0)]
+        );
+
+        let repeated = manager
+            .batch_update_credentials(
+                &[3, 4],
+                CredentialBatchPatch {
+                    rpm_limit: None,
+                    groups: None,
+                    source_channel: None,
+                    priority: None,
+                    promote_priority: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(repeated.priority_adjusted, 0);
+        assert_eq!(repeated.updated, 0);
+    }
+
+    #[test]
+    fn batch_priority_promoting_all_accounts_sets_one_top_tier() {
+        let manager = batch_priority_manager(&[(1, 3), (2, 20), (3, 20)]);
+        let result = manager
+            .batch_update_credentials(
+                &[1, 2, 3],
+                CredentialBatchPatch {
+                    rpm_limit: None,
+                    groups: None,
+                    source_channel: None,
+                    priority: None,
+                    promote_priority: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(result.priority_adjusted, 3);
+        assert_eq!(
+            credential_priorities(&manager),
+            vec![(1, 0), (2, 0), (3, 0)]
+        );
+    }
+
+    #[test]
+    fn batch_priority_rolls_back_all_accounts_after_persist_failure() {
+        let path = tmp_creds_path("batch_priority_persist_failure");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        let mut credentials = vec![
+            batch_test_credential(1, 0, &[], None),
+            batch_test_credential(2, 0, &[], None),
+            batch_test_credential(3, 0, &[], None),
+        ];
+        credentials[0].priority = 0;
+        credentials[1].priority = 10;
+        credentials[2].priority = 20;
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            credentials,
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+
+        let error = manager
+            .batch_update_credentials(
+                &[3],
+                CredentialBatchPatch {
+                    rpm_limit: None,
+                    groups: None,
+                    source_channel: None,
+                    priority: None,
+                    promote_priority: true,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, CredentialBatchUpdateError::Persist(_)));
+        assert_eq!(
+            credential_priorities(&manager),
+            vec![(1, 0), (2, 10), (3, 20)]
+        );
+
+        std::fs::remove_dir_all(&path).unwrap();
+    }
+
     #[test]
     fn batch_update_credentials_validates_ten_thousand_ids() {
         let credentials = (1..=10_000)
@@ -6258,6 +6510,7 @@ mod tests {
                     rpm_limit: Some(7),
                     groups: None,
                     source_channel: None,
+                    ..CredentialBatchPatch::default()
                 },
             )
             .unwrap();
@@ -6298,6 +6551,7 @@ mod tests {
                     rpm_limit: Some(0),
                     groups: None,
                     source_channel: Some(Some("batch-import".to_string())),
+                    ..CredentialBatchPatch::default()
                 },
             )
             .unwrap();
@@ -6312,6 +6566,7 @@ mod tests {
                     rpm_limit: Some(0),
                     groups: None,
                     source_channel: None,
+                    ..CredentialBatchPatch::default()
                 },
             )
             .unwrap();
@@ -6326,6 +6581,7 @@ mod tests {
                     rpm_limit: None,
                     groups: None,
                     source_channel: Some(None),
+                    ..CredentialBatchPatch::default()
                 },
             )
             .unwrap();
@@ -6393,6 +6649,7 @@ mod tests {
                     rpm_limit: Some(3),
                     groups: Some(CredentialGroupPatch::Replace(vec!["new".to_string()])),
                     source_channel: Some(None),
+                    ..CredentialBatchPatch::default()
                 },
             )
             .unwrap_err();
@@ -6435,6 +6692,7 @@ mod tests {
                     rpm_limit: Some(1),
                     groups: Some(CredentialGroupPatch::Remove(vec!["a".to_string()])),
                     source_channel: Some(None),
+                    ..CredentialBatchPatch::default()
                 },
             )
             .unwrap_err();
@@ -6484,6 +6742,7 @@ mod tests {
                         "y".to_string(),
                     ])),
                     source_channel: None,
+                    ..CredentialBatchPatch::default()
                 },
             )
             .unwrap();
@@ -6500,6 +6759,7 @@ mod tests {
                         "z".to_string(),
                     ])),
                     source_channel: None,
+                    ..CredentialBatchPatch::default()
                 },
             )
             .unwrap();
@@ -6516,6 +6776,7 @@ mod tests {
                         "z".to_string(),
                     ])),
                     source_channel: None,
+                    ..CredentialBatchPatch::default()
                 },
             )
             .unwrap();
@@ -6532,6 +6793,7 @@ mod tests {
                         "missing".to_string(),
                     ])),
                     source_channel: None,
+                    ..CredentialBatchPatch::default()
                 },
             )
             .unwrap();
@@ -6572,6 +6834,7 @@ mod tests {
                     rpm_limit: Some(3),
                     groups: None,
                     source_channel: None,
+                    ..CredentialBatchPatch::default()
                 },
             )
             .unwrap_err();
@@ -6587,6 +6850,7 @@ mod tests {
                     rpm_limit: Some(3),
                     groups: None,
                     source_channel: None,
+                    ..CredentialBatchPatch::default()
                 },
             )
             .unwrap();
@@ -6630,6 +6894,7 @@ mod tests {
                     rpm_limit: Some(2),
                     groups: None,
                     source_channel: None,
+                    ..CredentialBatchPatch::default()
                 },
             )
             .unwrap();
