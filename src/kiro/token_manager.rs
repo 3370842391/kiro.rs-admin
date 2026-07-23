@@ -1905,17 +1905,28 @@ impl MultiTokenManager {
                 // 直接反映瞬时压力，天然避免惊群与「反复选中→反复 429」死循环。
                 // 平局按优先级（数字小者优先），再平按累计成功数（在空闲均势下更均衡）。
                 let entry = if self.get_endpoint_mode() == EndpointMode::Best {
+                    let incomplete_latency_groups = available
+                        .iter()
+                        .filter(|entry| entry.first_byte_ewma_ms.is_none())
+                        .map(|entry| (entry.credentials.priority, entry.in_flight))
+                        .collect::<HashSet<_>>();
                     available.iter().min_by(|a, b| {
                         a.credentials
                             .priority
                             .cmp(&b.credentials.priority)
                             .then_with(|| a.in_flight.cmp(&b.in_flight))
-                            .then_with(|| match (a.first_byte_ewma_ms, b.first_byte_ewma_ms) {
-                                (Some(a), Some(b)) => {
-                                    a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| {
+                                let group = (a.credentials.priority, a.in_flight);
+                                if incomplete_latency_groups.contains(&group) {
+                                    // 同池存在无样本账号时整池跳过延迟比较，避免未知样本被惩罚，
+                                    // 同时保证比较器满足全序，不因账号存储顺序改变选择结果。
+                                    std::cmp::Ordering::Equal
+                                } else {
+                                    a.first_byte_ewma_ms
+                                        .unwrap()
+                                        .partial_cmp(&b.first_byte_ewma_ms.unwrap())
+                                        .unwrap_or(std::cmp::Ordering::Equal)
                                 }
-                                // 没有样本的账号不因未知延迟被硬性惩罚。
-                                _ => std::cmp::Ordering::Equal,
                             })
                             .then_with(|| a.balance_count.cmp(&b.balance_count))
                             .then_with(|| a.id.cmp(&b.id))
@@ -6175,6 +6186,37 @@ mod tests {
             .select_next_credential(None, None)
             .map(|value| value.0);
         assert_eq!(selected, Some(2));
+    }
+
+    #[test]
+    fn best_mode_mixed_latency_samples_are_order_independent() {
+        fn selected_id(values: &[(u64, u32)]) -> u64 {
+            let manager = batch_priority_manager(values);
+            let mut entries = manager.entries.lock();
+            for entry in entries.iter_mut() {
+                match entry.id {
+                    1 => {
+                        entry.first_byte_ewma_ms = Some(100.0);
+                        entry.balance_count = 30;
+                    }
+                    2 => {
+                        entry.first_byte_ewma_ms = None;
+                        entry.balance_count = 20;
+                    }
+                    3 => {
+                        entry.first_byte_ewma_ms = Some(200.0);
+                        entry.balance_count = 10;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            drop(entries);
+
+            manager.select_next_credential(None, None).unwrap().0
+        }
+
+        assert_eq!(selected_id(&[(1, 0), (2, 0), (3, 0)]), 3);
+        assert_eq!(selected_id(&[(3, 0), (2, 0), (1, 0)]), 3);
     }
 
     #[test]
