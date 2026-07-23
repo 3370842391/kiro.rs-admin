@@ -148,18 +148,24 @@ impl UsageRecorder {
         if start_epoch > end_epoch {
             return Ok(UsageRangeRead::default());
         }
+        let start = DateTime::<Utc>::from_timestamp(start_epoch, 0).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "usage query start timestamp is out of range",
+            )
+        })?;
+        let end = DateTime::<Utc>::from_timestamp(end_epoch, 0).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "usage query end timestamp is out of range",
+            )
+        })?;
         if let Some(writer) = self.inner.lock().writer.as_mut() {
             writer.flush()?;
         }
 
-        let start_date = Local
-            .timestamp_opt(start_epoch, 0)
-            .single()
-            .map(|value| value.date_naive());
-        let end_date = Local
-            .timestamp_opt(end_epoch, 0)
-            .single()
-            .map(|value| value.date_naive());
+        let start_date = start.with_timezone(&Local).date_naive();
+        let end_date = end.with_timezone(&Local).date_naive();
         let mut result = UsageRangeRead::default();
 
         for entry in std::fs::read_dir(&self.dir)? {
@@ -170,9 +176,7 @@ impl UsageRecorder {
             let Some(date) = parse_usage_log_filename(&name) else {
                 continue;
             };
-            if start_date.is_some_and(|start| date < start)
-                || end_date.is_some_and(|end| date > end)
-            {
+            if date < start_date || date > end_date {
                 continue;
             }
 
@@ -187,7 +191,8 @@ impl UsageRecorder {
                     result.invalid_lines += 1;
                     continue;
                 };
-                if ts.timestamp() >= start_epoch && ts.timestamp() <= end_epoch {
+                let ts = ts.with_timezone(&Utc);
+                if ts >= start && ts <= end {
                     result.records.push(record);
                 }
             }
@@ -808,6 +813,23 @@ mod tests {
         path
     }
 
+    fn usage_log_path(dir: &Path, date: NaiveDate) -> PathBuf {
+        dir.join(format!("usage_log.{}.jsonl", date.format("%Y-%m-%d")))
+    }
+
+    fn write_usage_lines(dir: &Path, date: NaiveDate, lines: &[String]) {
+        let mut contents = lines.join("\n");
+        contents.push('\n');
+        std::fs::write(usage_log_path(dir, date), contents).unwrap();
+    }
+
+    fn local_time(date: NaiveDate, hour: u32, minute: u32, second: u32) -> DateTime<Local> {
+        Local
+            .from_local_datetime(&date.and_hms_opt(hour, minute, second).unwrap())
+            .single()
+            .unwrap()
+    }
+
     #[test]
     fn usage_record_trace_id_is_backward_compatible() {
         let legacy: UsageRecord = serde_json::from_value(serde_json::json!({
@@ -834,32 +856,45 @@ mod tests {
     fn usage_recorder_reads_exact_window_and_reports_invalid_lines() {
         let dir = temp_usage_dir("range");
         let recorder = UsageRecorder::with_retention(dir.clone(), 31);
-        recorder.record(&usage_test_record(
-            "2026-07-23T01:00:00Z",
-            Some("a"),
-            1.0,
-        ));
-        recorder.record(&usage_test_record("2026-07-23T02:00:00Z", None, 2.0));
-        recorder.record(&usage_test_record(
-            "2026-07-23T03:00:00Z",
-            Some("c"),
-            3.0,
-        ));
+        let date = NaiveDate::from_ymd_opt(2026, 7, 23).unwrap();
+        let before = local_time(date, 10, 0, 0);
+        let included = local_time(date, 11, 0, 0);
+        let end = local_time(date, 12, 0, 0);
+        let invalid_timestamp = usage_test_record("not-rfc3339", None, 4.0);
+        write_usage_lines(
+            &dir,
+            date,
+            &[
+                serde_json::to_string(&usage_test_record(
+                    &before.to_rfc3339(),
+                    Some("before"),
+                    1.0,
+                ))
+                .unwrap(),
+                serde_json::to_string(&usage_test_record(
+                    &included.to_rfc3339(),
+                    None,
+                    2.0,
+                ))
+                .unwrap(),
+                serde_json::to_string(&usage_test_record(
+                    &end.to_rfc3339(),
+                    Some("end"),
+                    3.0,
+                ))
+                .unwrap(),
+                "{not-json".to_string(),
+                serde_json::to_string(&invalid_timestamp).unwrap(),
+            ],
+        );
 
         let result = recorder
-            .query_range(
-                DateTime::parse_from_rfc3339("2026-07-23T01:30:00Z")
-                    .unwrap()
-                    .timestamp(),
-                DateTime::parse_from_rfc3339("2026-07-23T03:00:00Z")
-                    .unwrap()
-                    .timestamp(),
-            )
+            .query_range((before + Duration::minutes(30)).timestamp(), end.timestamp())
             .unwrap();
         assert_eq!(result.records.len(), 2);
         assert_eq!(result.records[0].credits, 2.0);
         assert_eq!(result.records[1].credits, 3.0);
-        assert_eq!(result.invalid_lines, 0);
+        assert_eq!(result.invalid_lines, 2);
         drop(recorder);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -868,24 +903,29 @@ mod tests {
     fn usage_recorder_sorts_submillisecond_timestamps() {
         let dir = temp_usage_dir("submillisecond-sort");
         let recorder = UsageRecorder::with_retention(dir.clone(), 31);
-        let later = usage_test_record("2026-07-23T02:00:00.000000200Z", None, 2.0);
-        let earlier = usage_test_record("2026-07-23T02:00:00.000000100Z", None, 1.0);
-        let contents = format!(
-            "{}\n{}\n",
-            serde_json::to_string(&later).unwrap(),
-            serde_json::to_string(&earlier).unwrap()
+        let date = NaiveDate::from_ymd_opt(2026, 7, 23).unwrap();
+        let base = local_time(date, 12, 0, 0);
+        let later = usage_test_record(
+            &base.with_nanosecond(200).unwrap().to_rfc3339(),
+            None,
+            2.0,
         );
-        std::fs::write(dir.join("usage_log.2026-07-23.jsonl"), contents).unwrap();
+        let earlier = usage_test_record(
+            &base.with_nanosecond(100).unwrap().to_rfc3339(),
+            None,
+            1.0,
+        );
+        write_usage_lines(
+            &dir,
+            date,
+            &[
+                serde_json::to_string(&later).unwrap(),
+                serde_json::to_string(&earlier).unwrap(),
+            ],
+        );
 
         let result = recorder
-            .query_range(
-                DateTime::parse_from_rfc3339("2026-07-23T02:00:00Z")
-                    .unwrap()
-                    .timestamp(),
-                DateTime::parse_from_rfc3339("2026-07-23T02:00:01Z")
-                    .unwrap()
-                    .timestamp(),
-            )
+            .query_range(base.timestamp(), (base + Duration::seconds(1)).timestamp())
             .unwrap();
         assert_eq!(
             result
@@ -895,6 +935,121 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1.0, 2.0]
         );
+        drop(recorder);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn usage_recorder_flushes_current_writer_before_reading() {
+        let dir = temp_usage_dir("flush-before-read");
+        let recorder = UsageRecorder::with_retention(dir.clone(), 31);
+        let date = NaiveDate::from_ymd_opt(2026, 7, 23).unwrap();
+        let ts = local_time(date, 12, 0, 0);
+        let path = usage_log_path(&dir, date);
+        let record = usage_test_record(&ts.to_rfc3339(), Some("buffered"), 1.0);
+        {
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap();
+            let mut state = recorder.inner.lock();
+            state.current_date = Some(date);
+            state.writer = Some(BufWriter::new(file));
+            writeln!(
+                state.writer.as_mut().unwrap(),
+                "{}",
+                serde_json::to_string(&record).unwrap()
+            )
+            .unwrap();
+        }
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+
+        let result = recorder.query_range(ts.timestamp(), ts.timestamp()).unwrap();
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].trace_id.as_deref(), Some("buffered"));
+        drop(recorder);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn usage_recorder_reads_cross_day_window_and_skips_unrelated_dates() {
+        let dir = temp_usage_dir("cross-day");
+        let recorder = UsageRecorder::with_retention(dir.clone(), 31);
+        let first_date = NaiveDate::from_ymd_opt(2026, 7, 23).unwrap();
+        let second_date = first_date.succ_opt().unwrap();
+        let start = local_time(first_date, 23, 59, 59);
+        let end = local_time(second_date, 0, 0, 1);
+        let first = usage_test_record(&start.to_rfc3339(), None, 1.0);
+        let second = usage_test_record(&end.to_rfc3339(), None, 2.0);
+        let unrelated = usage_test_record(
+            &(start + Duration::seconds(1)).to_rfc3339(),
+            None,
+            99.0,
+        );
+        write_usage_lines(
+            &dir,
+            first_date,
+            &[serde_json::to_string(&first).unwrap()],
+        );
+        write_usage_lines(
+            &dir,
+            second_date,
+            &[serde_json::to_string(&second).unwrap()],
+        );
+        for date in [first_date.pred_opt().unwrap(), second_date.succ_opt().unwrap()] {
+            write_usage_lines(
+                &dir,
+                date,
+                &[
+                    serde_json::to_string(&unrelated).unwrap(),
+                    "{not-json".to_string(),
+                ],
+            );
+        }
+
+        let result = recorder
+            .query_range(start.timestamp(), end.timestamp())
+            .unwrap();
+        assert_eq!(
+            result
+                .records
+                .iter()
+                .map(|record| record.credits)
+                .collect::<Vec<_>>(),
+            vec![1.0, 2.0]
+        );
+        assert_eq!(result.invalid_lines, 0);
+        drop(recorder);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn usage_recorder_end_boundary_excludes_later_subsecond() {
+        let dir = temp_usage_dir("subsecond-boundary");
+        let recorder = UsageRecorder::with_retention(dir.clone(), 31);
+        let date = NaiveDate::from_ymd_opt(2026, 7, 23).unwrap();
+        let end = local_time(date, 12, 0, 0);
+        let exact_end = usage_test_record(&end.to_rfc3339(), None, 1.0);
+        let after_end = usage_test_record(
+            &(end + Duration::milliseconds(999)).to_rfc3339(),
+            None,
+            2.0,
+        );
+        write_usage_lines(
+            &dir,
+            date,
+            &[
+                serde_json::to_string(&exact_end).unwrap(),
+                serde_json::to_string(&after_end).unwrap(),
+            ],
+        );
+
+        let result = recorder
+            .query_range((end - Duration::seconds(1)).timestamp(), end.timestamp())
+            .unwrap();
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].credits, 1.0);
         drop(recorder);
         std::fs::remove_dir_all(dir).unwrap();
     }
