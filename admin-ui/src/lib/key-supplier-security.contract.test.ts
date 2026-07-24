@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 
 async function readApiTypes(): Promise<string> {
-  return Bun.file('src/types/api.ts').text()
+  return Bun.file(new URL('../types/api.ts', import.meta.url)).text()
 }
 
 function interfaceBody(source: string, name: string): string {
