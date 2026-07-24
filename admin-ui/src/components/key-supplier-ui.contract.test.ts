@@ -43,6 +43,8 @@ describe('key supplier management UI contract', () => {
     expect(page).toContain('hasUnreadSupplierEvents')
     expect(page).toContain('profile')
     expect(page).toContain('stockMax')
+    expect(page).toContain('生成中')
+    expect(page).toContain('空闲')
   })
 
   test('page keeps supplier secrets write-only and never renders purchased key material', async () => {

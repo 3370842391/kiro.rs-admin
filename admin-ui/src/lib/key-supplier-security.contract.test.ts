@@ -27,6 +27,7 @@ describe('key supplier API security contracts', () => {
     expect(interfaceBody(source, 'SupplierConfigView')).toMatch(/apiKeyConfigured: boolean/)
     expect(interfaceBody(source, 'SupplierConfigView')).toMatch(/webhookTokenConfigured: boolean/)
     expect(interfaceBody(source, 'SupplierOverview')).toMatch(/stockMax: number/)
+    expect(interfaceBody(source, 'SupplierOverview')).toMatch(/generating: boolean/)
     expect(interfaceBody(source, 'PurchaseResponse')).toMatch(/purchased: number/)
   })
 })

@@ -1075,7 +1075,7 @@ export interface SupplierOverview {
     keysActive: number
     keysDead: number
     keysStock: number
-    generating: number
+    generating: boolean
   }
 }
 

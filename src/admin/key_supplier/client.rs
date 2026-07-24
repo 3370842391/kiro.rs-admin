@@ -172,7 +172,7 @@ mod tests {
             keys_active: 1,
             keys_dead: 0,
             keys_stock: 0,
-            generating: 0,
+            generating: false,
             extra,
         };
         for output in [format!("{profile:?}"), format!("{status:?}")] {
@@ -180,6 +180,21 @@ mod tests {
             assert!(!output.contains("ksk_secret"));
             assert!(!output.contains("usr_secret"));
         }
+    }
+
+    #[test]
+    fn deserializes_documented_boolean_generating_status() {
+        let status: SupplierStatus = serde_json::from_value(serde_json::json!({
+            "keys_active": 10,
+            "keys_dead": 2,
+            "keys_stock": 4,
+            "generating": false,
+            "auto_check": true
+        }))
+        .unwrap();
+
+        assert!(!status.generating);
+        assert_eq!(status.keys_active, 10);
     }
 
     #[test]
@@ -594,7 +609,7 @@ pub struct SupplierStatus {
     #[serde(default)]
     pub keys_stock: u64,
     #[serde(default)]
-    pub generating: u64,
+    pub generating: bool,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }

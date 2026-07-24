@@ -488,7 +488,7 @@ struct StatusView {
     keys_active: u64,
     keys_dead: u64,
     keys_stock: u64,
-    generating: u64,
+    generating: bool,
 }
 
 #[derive(Deserialize)]

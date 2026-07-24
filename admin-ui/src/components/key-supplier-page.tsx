@@ -271,7 +271,7 @@ export function KeySupplierPage() {
               <Metric label="Stock Max" value={overviewQuery.data.stockMax} />
               <Metric label="可用 Keys" value={overviewQuery.data.status.keysActive} />
               <Metric label="库存 Keys" value={overviewQuery.data.status.keysStock} />
-              <Metric label="失效 / 生成中" value={`${overviewQuery.data.status.keysDead} / ${overviewQuery.data.status.generating}`} />
+              <Metric label="失效 / 生成状态" value={`${overviewQuery.data.status.keysDead} / ${overviewQuery.data.status.generating ? '生成中' : '空闲'}`} />
             </div>
           ) : null}
         </CardContent>
