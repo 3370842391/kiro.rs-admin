@@ -17,10 +17,22 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { extractErrorMessage } from '@/lib/utils'
-import { getSupplierEventStatusLabel, hasUnreadSupplierEvents } from '@/lib/key-supplier'
+import { getSupplierEventStatusLabel, hasUnreadSupplierEvents, parseSupplierNumberDraft } from '@/lib/key-supplier'
 import type { SupplierConfigUpdate, SupplierEvent, SupplierEventStatus } from '@/types/api'
 
 const EVENT_PAGE_SIZE = 20
+
+type SupplierNumericField = 'minPurchase' | 'maxPurchase' | 'rpmLimit' | 'priority'
+type NumericDrafts = Record<SupplierNumericField, string>
+
+function toNumericDrafts(config: Pick<SupplierConfigUpdate, SupplierNumericField>): NumericDrafts {
+  return {
+    minPurchase: String(config.minPurchase),
+    maxPurchase: String(config.maxPurchase),
+    rpmLimit: String(config.rpmLimit),
+    priority: String(config.priority),
+  }
+}
 
 function parseGroups(value: string): string[] {
   return value.split(',').map((group) => group.trim()).filter(Boolean)
@@ -63,7 +75,10 @@ export function KeySupplierPage() {
   const [apiKey, setApiKey] = useState('')
   const [webhookToken, setWebhookToken] = useState('')
   const [groupsText, setGroupsText] = useState('')
-  const [purchaseCount, setPurchaseCount] = useState(1)
+  const [numericDrafts, setNumericDrafts] = useState<NumericDrafts>({
+    minPurchase: '', maxPurchase: '', rpmLimit: '', priority: '',
+  })
+  const [purchaseCountDraft, setPurchaseCountDraft] = useState('1')
   const [selectedIds, setSelectedIds] = useState<number[]>([])
   const [before, setBefore] = useState<number | undefined>()
   const [previousCursors, setPreviousCursors] = useState<Array<number | undefined>>([])
@@ -99,6 +114,7 @@ export function KeySupplierPage() {
       nicknamePrefix: next.nicknamePrefix,
     })
     setGroupsText(next.groups.join(', '))
+    setNumericDrafts(toNumericDrafts(next))
   }, [configQuery.data])
 
   useEffect(() => {
@@ -180,10 +196,31 @@ export function KeySupplierPage() {
   const updateField = <K extends keyof SupplierConfigUpdate>(field: K, value: SupplierConfigUpdate[K]) => {
     setConfig((current) => current ? { ...current, [field]: value } : current)
   }
+  const updateNumericDraft = (field: SupplierNumericField, value: string) => {
+    setNumericDrafts((current) => ({ ...current, [field]: value }))
+  }
+  const parsedMinPurchase = parseSupplierNumberDraft(numericDrafts.minPurchase, 0)
+  const parsedMaxPurchase = parseSupplierNumberDraft(numericDrafts.maxPurchase, 0)
+  const parsedRpmLimit = parseSupplierNumberDraft(numericDrafts.rpmLimit, 0)
+  const parsedPriority = parseSupplierNumberDraft(numericDrafts.priority, 0)
+  const configNumbersValid = [parsedMinPurchase, parsedMaxPurchase, parsedRpmLimit, parsedPriority]
+    .every((value) => value !== null)
+  const parsedPurchaseCount = parseSupplierNumberDraft(purchaseCountDraft, 1)
   const handleSave = () => {
     if (!config) return
+    if (
+      parsedMinPurchase === null || parsedMaxPurchase === null ||
+      parsedRpmLimit === null || parsedPriority === null
+    ) {
+      toast.error('请输入有效的非负整数配置')
+      return
+    }
     saveConfig.mutate({
       ...config,
+      minPurchase: parsedMinPurchase,
+      maxPurchase: parsedMaxPurchase,
+      rpmLimit: parsedRpmLimit,
+      priority: parsedPriority,
       groups: parseGroups(groupsText),
       apiKey: apiKey || undefined,
       webhookToken: webhookToken || undefined,
@@ -276,18 +313,19 @@ export function KeySupplierPage() {
                   <Switch id="auto-purchase" checked={config.autoPurchase} onCheckedChange={(checked) => updateField('autoPurchase', checked)} disabled={saveConfig.isPending} aria-label="自动购买" />
                 </div>
                 <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-                  <Field label="最小库存"><Input type="number" min={0} value={config.minPurchase} onChange={(event) => updateField('minPurchase', Number(event.target.value))} disabled={saveConfig.isPending} /></Field>
-                  <Field label="最大库存"><Input type="number" min={0} value={config.maxPurchase} onChange={(event) => updateField('maxPurchase', Number(event.target.value))} disabled={saveConfig.isPending} /></Field>
+                  <Field label="最小库存"><Input type="number" min={0} value={numericDrafts.minPurchase} onChange={(event) => updateNumericDraft('minPurchase', event.target.value)} disabled={saveConfig.isPending} /></Field>
+                  <Field label="最大库存"><Input type="number" min={0} value={numericDrafts.maxPurchase} onChange={(event) => updateNumericDraft('maxPurchase', event.target.value)} disabled={saveConfig.isPending} /></Field>
                   <Field label="API Region"><Input value={config.apiRegion} onChange={(event) => updateField('apiRegion', event.target.value)} disabled={saveConfig.isPending} /></Field>
-                  <Field label="RPM"><Input type="number" min={0} value={config.rpmLimit} onChange={(event) => updateField('rpmLimit', Number(event.target.value))} disabled={saveConfig.isPending} /></Field>
-                  <Field label="Priority"><Input type="number" value={config.priority} onChange={(event) => updateField('priority', Number(event.target.value))} disabled={saveConfig.isPending} /></Field>
+                  <Field label="RPM"><Input type="number" min={0} value={numericDrafts.rpmLimit} onChange={(event) => updateNumericDraft('rpmLimit', event.target.value)} disabled={saveConfig.isPending} /></Field>
+                  <Field label="Priority"><Input type="number" min={0} value={numericDrafts.priority} onChange={(event) => updateNumericDraft('priority', event.target.value)} disabled={saveConfig.isPending} /></Field>
                   <Field label="Source Channel"><Input value={config.sourceChannel} onChange={(event) => updateField('sourceChannel', event.target.value)} disabled={saveConfig.isPending} /></Field>
                 </div>
                 <div className="grid gap-3 sm:grid-cols-2">
                   <Field label="Groups（逗号分隔）"><Input value={groupsText} onChange={(event) => setGroupsText(event.target.value)} disabled={saveConfig.isPending} /></Field>
                   <Field label="Nickname Prefix"><Input value={config.nicknamePrefix} onChange={(event) => updateField('nicknamePrefix', event.target.value)} disabled={saveConfig.isPending} /></Field>
                 </div>
-                <Button onClick={handleSave} disabled={saveConfig.isPending}>
+                {!configNumbersValid && <p className="text-xs text-destructive">请填写有效的非负整数配置。</p>}
+                <Button onClick={handleSave} disabled={saveConfig.isPending || !configNumbersValid}>
                   {saveConfig.isPending && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
                   保存配置
                 </Button>
@@ -300,8 +338,9 @@ export function KeySupplierPage() {
           <Card>
             <CardHeader className="pb-3"><CardTitle>手动购买</CardTitle><CardDescription>{purchaseResultSummary}</CardDescription></CardHeader>
             <CardContent className="flex flex-wrap items-end gap-3">
-              <Field label="购买数量" className="w-full sm:w-40"><Input type="number" min={1} value={purchaseCount} onChange={(event) => setPurchaseCount(Math.max(1, Number(event.target.value)))} disabled={purchase.isPending} /></Field>
-              <Button onClick={() => purchase.mutate(purchaseCount)} disabled={purchase.isPending}><PackagePlus className="h-3.5 w-3.5" />购买</Button>
+              <Field label="购买数量" className="w-full sm:w-40"><Input type="number" min={1} value={purchaseCountDraft} onChange={(event) => setPurchaseCountDraft(event.target.value)} disabled={purchase.isPending} /></Field>
+              {parsedPurchaseCount === null && <p className="w-full text-xs text-destructive sm:w-auto">请输入大于 0 的整数。</p>}
+              <Button onClick={() => { if (parsedPurchaseCount !== null) purchase.mutate(parsedPurchaseCount) }} disabled={purchase.isPending || parsedPurchaseCount === null}><PackagePlus className="h-3.5 w-3.5" />购买</Button>
             </CardContent>
           </Card>
           <Card>

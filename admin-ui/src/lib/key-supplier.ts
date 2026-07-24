@@ -30,6 +30,14 @@ export function buildSupplierConfigPayload(update: SupplierConfigUpdate): Suppli
   return payload
 }
 
+export function parseSupplierNumberDraft(value: string, minimum: number): number | null {
+  const normalized = value.trim()
+  if (!normalized) return null
+
+  const parsed = Number(normalized)
+  return Number.isSafeInteger(parsed) && parsed >= minimum ? parsed : null
+}
+
 const supplierEventStatusLabels: Record<SupplierEventStatus, string> = {
   received: '已接收',
   processing: '处理中',

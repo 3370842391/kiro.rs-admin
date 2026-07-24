@@ -1,5 +1,5 @@
 import { useState, useEffect, lazy, Suspense } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { storage } from "@/lib/storage";
 import { listSupplierEvents } from "@/api/key-supplier";
 import { LoginPage } from "@/components/login-page";
@@ -145,7 +145,8 @@ interface AppHeaderProps {
 }
 
 function App() {
-  const app = useAppShell();
+  const queryClient = useQueryClient();
+  const app = useAppShell(queryClient);
   const supplierEvents = useQuery({
     queryKey: ["supplier-events", "header-unread"],
     queryFn: () => listSupplierEvents({ limit: 1 }),
@@ -169,7 +170,7 @@ function App() {
   );
 }
 
-function useAppShell() {
+function useAppShell(queryClient: QueryClient) {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [tab, setTab] = useState<Tab>(readTabFromHash);
   const [darkMode, setDarkMode] = useState(() => {
@@ -197,6 +198,7 @@ function useAppShell() {
   const handleLogin = () => setIsLoggedIn(true);
   const handleLogout = () => {
     storage.removeApiKey();
+    queryClient.clear();
     setIsLoggedIn(false);
   };
   const toggleDarkMode = () => {

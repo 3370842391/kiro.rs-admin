@@ -19,6 +19,15 @@ describe('key supplier management UI contract', () => {
     expect(app).toContain('unreadCount')
   })
 
+  test('logout clears the shared React Query cache before another administrator logs in', async () => {
+    const app = await readSource('App.tsx')
+
+    expect(app).toContain('useQueryClient')
+    expect(app).toContain('queryClient.clear()')
+    expect(app).toContain('storage.removeApiKey()')
+    expect(app).toContain('["supplier-events", "header-unread"]')
+  })
+
   test('page provides configuration, purchase, webhook, event controls and polling', async () => {
     const page = await readSource('components/key-supplier-page.tsx')
 
@@ -66,5 +75,17 @@ describe('key supplier management UI contract', () => {
     expect(page).toContain('event.eventId')
     expect(page).toContain('event.purchaseOrderId')
     expect(page).not.toContain('#${event.id}')
+  })
+
+  test('page keeps numeric inputs as validated drafts and blocks invalid submits', async () => {
+    const page = await readSource('components/key-supplier-page.tsx')
+
+    expect(page).toContain('numericDrafts')
+    expect(page).toContain('parseSupplierNumberDraft')
+    expect(page).toContain('purchaseCountDraft')
+    expect(page).toContain('parsedPurchaseCount === null')
+    expect(page).toContain('configNumbersValid')
+    expect(page).not.toContain("updateField('minPurchase', Number(event.target.value))")
+    expect(page).not.toContain('purchase.mutate(purchaseCount)')
   })
 })

@@ -5,6 +5,7 @@ import {
   getSupplierEventStatusLabel,
   hasUnreadSupplierEvents,
 } from './key-supplier'
+import * as keySupplier from './key-supplier'
 
 const update: SupplierConfigUpdate = {
   baseUrl: 'https://supplier.example',
@@ -105,5 +106,21 @@ describe('key supplier helpers', () => {
     const repeatedDatabaseId = { ...event(7), eventId: 'supplier-event-replayed' }
 
     expect(hasUnreadSupplierEvents(previous, page([repeatedDatabaseId]))).toBe(true)
+  })
+
+  test('parses only finite non-negative integer supplier number drafts', () => {
+    const parse = (keySupplier as typeof keySupplier & {
+      parseSupplierNumberDraft?: (value: string, minimum: number) => number | null
+    }).parseSupplierNumberDraft
+
+    expect(parse).toBeDefined()
+    if (!parse) return
+    expect(parse('', 0)).toBeNull()
+    expect(parse('NaN', 0)).toBeNull()
+    expect(parse('Infinity', 0)).toBeNull()
+    expect(parse('-1', 0)).toBeNull()
+    expect(parse('1.5', 0)).toBeNull()
+    expect(parse('0', 0)).toBe(0)
+    expect(parse('3', 1)).toBe(3)
   })
 })
