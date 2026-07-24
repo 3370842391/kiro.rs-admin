@@ -259,6 +259,18 @@ impl KeySupplierService {
         self.store.clone()
     }
 
+    async fn run_store_operation<T, F>(&self, operation: F) -> Result<T, SupplierServiceError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&SupplierEventStore) -> rusqlite::Result<T> + Send + 'static,
+    {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || operation(store.as_ref()))
+            .await
+            .map_err(|_| SupplierServiceError::Store)?
+            .map_err(|_| SupplierServiceError::Store)
+    }
+
     pub fn has_valid_webhook_token(&self, token: &str) -> bool {
         let runtime = self.runtime_config();
         is_valid_webhook_token(&runtime.webhook_token)
@@ -366,9 +378,9 @@ impl KeySupplierService {
 
     pub async fn run_processing_cycle(&self) -> Result<usize, SupplierServiceError> {
         let _guard = self.processing_lock.lock().await;
-        self.store
-            .recover_stale_processing(Utc::now() - ChronoDuration::minutes(5))
-            .map_err(|_| SupplierServiceError::Store)?;
+        let cutoff = Utc::now() - ChronoDuration::minutes(5);
+        self.run_store_operation(move |store| store.recover_stale_processing(cutoff))
+            .await?;
         self.process_pending_locked().await
     }
 
@@ -441,9 +453,8 @@ impl KeySupplierService {
     async fn process_pending_locked(&self) -> Result<usize, SupplierServiceError> {
         let mut processed = 0;
         while let Some(event) = self
-            .store
-            .claim_next()
-            .map_err(|_| SupplierServiceError::Store)?
+            .run_store_operation(SupplierEventStore::claim_next)
+            .await?
         {
             if let Err(error) = self.process_claimed(event).await {
                 tracing::warn!(
@@ -467,19 +478,19 @@ impl KeySupplierService {
 
         let _guard = self.processing_lock.lock().await;
         let order_id = uuid::Uuid::new_v4().simple().to_string();
-        self.store
-            .insert_event(IncomingSupplierEvent {
-                event_id: order_id.clone(),
-                event_type: "manual_purchase".to_owned(),
-                purchase_order_id: Some(order_id.clone()),
-                message: None,
-                quantity: i64::from(count),
-            })
-            .map_err(|_| SupplierServiceError::Store)?;
+        let event = IncomingSupplierEvent {
+            event_id: order_id.clone(),
+            event_type: "manual_purchase".to_owned(),
+            purchase_order_id: Some(order_id.clone()),
+            message: None,
+            quantity: i64::from(count),
+        };
+        self.run_store_operation(move |store| store.insert_event(event))
+            .await?;
+        let lookup_order_id = order_id.clone();
         let event = self
-            .store
-            .claim_by_event_id(&order_id)
-            .map_err(|_| SupplierServiceError::Store)?
+            .run_store_operation(move |store| store.claim_by_event_id(&lookup_order_id))
+            .await?
             .ok_or(SupplierServiceError::Store)?;
         let summary = self.process_claimed(event).await?;
         Ok(ManualPurchaseResult {
@@ -498,34 +509,32 @@ impl KeySupplierService {
     ) -> Result<ProcessSummary, SupplierServiceError> {
         match self.execute_claimed(&event).await {
             Ok(ProcessAction::Complete(summary)) => {
-                self.store
-                    .complete(event.id, summary.clone())
-                    .map_err(|_| SupplierServiceError::Store)?;
+                let stored_summary = summary.clone();
+                self.run_store_operation(move |store| store.complete(event.id, stored_summary))
+                    .await?;
                 Ok(summary)
             }
             Ok(ProcessAction::Skip) => {
-                self.store
-                    .skip(event.id, Some("purchase skipped"))
-                    .map_err(|_| SupplierServiceError::Store)?;
+                self.run_store_operation(move |store| {
+                    store.skip(event.id, Some("purchase skipped"))
+                })
+                .await?;
                 Ok(empty_summary())
             }
             Ok(ProcessAction::Failed { summary, error }) => {
-                self.store
-                    .fail_with_summary(
-                        event.id,
-                        summary.clone(),
-                        &sanitize_error(&error.persistence_detail(), &self.runtime_config()),
-                    )
-                    .map_err(|_| SupplierServiceError::Store)?;
+                let persistence_error =
+                    sanitize_error(&error.persistence_detail(), &self.runtime_config());
+                self.run_store_operation(move |store| {
+                    store.fail_with_summary(event.id, summary, &persistence_error)
+                })
+                .await?;
                 Err(error)
             }
             Err(error) => {
-                self.store
-                    .fail(
-                        event.id,
-                        &sanitize_error(&error.persistence_detail(), &self.runtime_config()),
-                    )
-                    .map_err(|_| SupplierServiceError::Store)?;
+                let persistence_error =
+                    sanitize_error(&error.persistence_detail(), &self.runtime_config());
+                self.run_store_operation(move |store| store.fail(event.id, &persistence_error))
+                    .await?;
                 Err(error)
             }
         }
@@ -951,6 +960,19 @@ mod tests {
         let store = Arc::new(SupplierEventStore::open_in_memory().unwrap());
         let service = KeySupplierService::new(store.clone(), runtime(token));
         (service, store)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_store_operations_run_on_the_blocking_pool() {
+        let (service, _) = service(TOKEN);
+        let worker_thread = std::thread::current().id();
+
+        let store_thread = service
+            .run_store_operation(|_| Ok::<_, rusqlite::Error>(std::thread::current().id()))
+            .await
+            .unwrap();
+
+        assert_ne!(store_thread, worker_thread);
     }
 
     fn supplier_update(runtime: &SupplierRuntimeConfig) -> SupplierConfigUpdate {
