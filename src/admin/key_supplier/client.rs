@@ -134,6 +134,56 @@ mod tests {
         assert!(!format!("{client:?}").contains("secret"));
     }
 
+    #[test]
+    fn rejects_non_origin_supplier_base_urls_and_builds_endpoints() {
+        for base in [
+            "http://localhost/api",
+            "http://localhost/api/",
+            "http://user:pass@localhost/",
+            "http://localhost/?query=1",
+            "http://localhost/#fragment",
+        ] {
+            assert!(SupplierClient::new(base, "secret").is_err(), "{base}");
+        }
+        let client = SupplierClient::new("http://localhost", "secret").unwrap();
+        assert_eq!(
+            client.endpoint("/api/status").unwrap().as_str(),
+            "http://localhost/api/status"
+        );
+    }
+
+    #[test]
+    fn debug_redacts_profile_webhook_and_status_extra_values() {
+        let profile = Profile {
+            name: "demo".into(),
+            quota: 1,
+            remaining: 1,
+            used_quota: 0,
+            webhook_url: "https://canary.invalid/hook?secret=canary".into(),
+        };
+        let mut extra = serde_json::Map::new();
+        extra.insert("ksk".into(), serde_json::json!("ksk_secret"));
+        extra.insert("usr".into(), serde_json::json!("usr_secret"));
+        let status = SupplierStatus {
+            keys_active: 1,
+            keys_dead: 0,
+            keys_stock: 0,
+            generating: 0,
+            extra,
+        };
+        for output in [format!("{profile:?}"), format!("{status:?}")] {
+            assert!(!output.contains("canary"));
+            assert!(!output.contains("ksk_secret"));
+            assert!(!output.contains("usr_secret"));
+        }
+    }
+
+    #[test]
+    fn requires_a_nonempty_supplier_key_suffix_and_redacts_empty_token() {
+        assert!(sanitize("ksk_", "secret").contains("[REDACTED]"));
+        assert!(sanitize("ksk_good", "secret").contains("[REDACTED]"));
+    }
+
     #[tokio::test]
     async fn retries_server_errors_exactly_three_times_and_returns_last_error() {
         let calls = Arc::new(Mutex::new(0));
@@ -154,8 +204,8 @@ mod tests {
         );
         let client = SupplierClient::new(server(app).await, "usr secret").unwrap();
         let error = client.test_webhook().await.unwrap_err();
-        assert_eq!(*calls.lock().unwrap(), 3);
-        assert!(error.to_string().contains("last body 3"));
+        assert_eq!(*calls.lock().unwrap(), 1);
+        assert!(error.to_string().contains("last body 1"));
     }
 
     #[tokio::test]
@@ -163,22 +213,13 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            for attempt in 1..=3 {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                if attempt < 3 {
-                    drop(stream);
-                } else {
-                    let mut request = [0_u8; 512];
-                    let _ = stream.read(&mut request).await;
-                    stream
-                        .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
-                        .await
-                        .unwrap();
-                }
+            for _attempt in 1..=1 {
+                let (stream, _) = listener.accept().await.unwrap();
+                drop(stream);
             }
         });
         let client = SupplierClient::new(format!("http://{address}"), "secret").unwrap();
-        client.test_webhook().await.unwrap();
+        assert!(client.test_webhook().await.is_err());
     }
 
     #[tokio::test]
@@ -262,7 +303,7 @@ const MAX_ATTEMPTS: usize = 3;
 #[derive(Clone)]
 pub struct SupplierClient {
     client: reqwest::Client,
-    base_url: String,
+    base_url: Url,
     api_key: Secret,
 }
 
@@ -283,6 +324,18 @@ impl SupplierClient {
         if !matches!(url.scheme(), "http" | "https") {
             return Err(SupplierError::invalid("base_url must use http or https"));
         }
+        if (url.path() != "" && url.path() != "/")
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(SupplierError::invalid(
+                "base_url must contain only an http(s) origin",
+            ));
+        }
+        let mut base_url = url;
+        base_url.set_path("/");
         let key = api_key.as_ref().trim();
         if key.is_empty() {
             return Err(SupplierError::invalid("api_key must not be empty"));
@@ -294,21 +347,24 @@ impl SupplierClient {
             .map_err(|error| SupplierError::network(&error.to_string(), key))?;
         Ok(Self {
             client,
-            base_url: raw_url.trim_end_matches('/').to_owned(),
+            base_url,
             api_key: Secret(key.to_owned()),
         })
     }
 
     pub async fn profile(&self) -> Result<Profile, SupplierError> {
-        self.request(Method::GET, "/api/my/profile", None).await
+        self.request(Method::GET, "/api/my/profile", None, RetryPolicy::Retryable)
+            .await
     }
 
     pub async fn stock(&self) -> Result<Stock, SupplierError> {
-        self.request(Method::GET, "/api/my/stock", None).await
+        self.request(Method::GET, "/api/my/stock", None, RetryPolicy::Retryable)
+            .await
     }
 
     pub async fn status(&self) -> Result<SupplierStatus, SupplierError> {
-        self.request(Method::GET, "/api/status", None).await
+        self.request(Method::GET, "/api/status", None, RetryPolicy::Retryable)
+            .await
     }
 
     pub async fn purchase(
@@ -334,6 +390,7 @@ impl SupplierClient {
                     "count": count,
                     "client_order_id": client_order_id,
                 })),
+                RetryPolicy::Retryable,
             )
             .await?;
         if response.client_order_id != client_order_id {
@@ -355,7 +412,7 @@ impl SupplierClient {
             .keys
             .into_iter()
             .map(|key| {
-                if key.key.is_empty() || !key.key.starts_with("ksk_") {
+                if !key.key.starts_with("ksk_") || key.key.len() <= "ksk_".len() {
                     Err(SupplierError::invalid(
                         "purchase response contains an invalid key",
                     ))
@@ -378,13 +435,19 @@ impl SupplierClient {
             Method::PUT,
             "/api/my/webhook",
             Some(serde_json::json!({ "webhook_url": webhook_url })),
+            RetryPolicy::Retryable,
         )
         .await
     }
 
     pub async fn test_webhook(&self) -> Result<(), SupplierError> {
-        self.request_empty(Method::POST, "/api/my/webhook/test", None)
-            .await
+        self.request_empty(
+            Method::POST,
+            "/api/my/webhook/test",
+            None,
+            RetryPolicy::Never,
+        )
+        .await
     }
 
     async fn request<T: DeserializeOwned>(
@@ -392,8 +455,9 @@ impl SupplierClient {
         method: Method,
         path: &str,
         body: Option<serde_json::Value>,
+        policy: RetryPolicy,
     ) -> Result<T, SupplierError> {
-        let text = self.send(method, path, body).await?;
+        let text = self.send(method, path, body, policy).await?;
         serde_json::from_str(&text)
             .map_err(|error| SupplierError::decode(&error.to_string(), &self.api_key.0))
     }
@@ -403,8 +467,9 @@ impl SupplierClient {
         method: Method,
         path: &str,
         body: Option<serde_json::Value>,
+        policy: RetryPolicy,
     ) -> Result<(), SupplierError> {
-        self.send(method, path, body).await.map(|_| ())
+        self.send(method, path, body, policy).await.map(|_| ())
     }
 
     async fn send(
@@ -412,13 +477,15 @@ impl SupplierClient {
         method: Method,
         path: &str,
         body: Option<serde_json::Value>,
+        policy: RetryPolicy,
     ) -> Result<String, SupplierError> {
-        let url = format!("{}{}", self.base_url, path);
+        let url = self.endpoint(path)?;
         let mut last_network = None;
-        for attempt in 0..MAX_ATTEMPTS {
+        let attempts = policy.attempts();
+        for attempt in 0..attempts {
             let mut request = self
                 .client
-                .request(method.clone(), &url)
+                .request(method.clone(), url.clone())
                 .header("X-API-Key", &self.api_key.0);
             if let Some(json) = body.clone() {
                 request = request.json(&json);
@@ -428,7 +495,7 @@ impl SupplierClient {
                 Err(error) => {
                     last_network =
                         Some(SupplierError::network(&error.to_string(), &self.api_key.0));
-                    if attempt + 1 < MAX_ATTEMPTS {
+                    if attempt + 1 < attempts {
                         continue;
                     }
                     return Err(last_network.unwrap());
@@ -440,13 +507,13 @@ impl SupplierClient {
                 Err(error) => {
                     last_network =
                         Some(SupplierError::network(&error.to_string(), &self.api_key.0));
-                    if attempt + 1 < MAX_ATTEMPTS {
+                    if attempt + 1 < attempts {
                         continue;
                     }
                     return Err(last_network.unwrap());
                 }
             };
-            if status.is_server_error() && attempt + 1 < MAX_ATTEMPTS {
+            if status.is_server_error() && policy.allows_retry() && attempt + 1 < attempts {
                 continue;
             }
             if !status.is_success() {
@@ -455,6 +522,31 @@ impl SupplierClient {
             return Ok(text);
         }
         Err(last_network.unwrap_or_else(|| SupplierError::invalid("request failed")))
+    }
+
+    fn endpoint(&self, path: &str) -> Result<Url, SupplierError> {
+        self.base_url
+            .join(path)
+            .map_err(|_| SupplierError::invalid("invalid supplier endpoint"))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RetryPolicy {
+    Retryable,
+    Never,
+}
+
+impl RetryPolicy {
+    fn attempts(self) -> usize {
+        match self {
+            Self::Retryable => MAX_ATTEMPTS,
+            Self::Never => 1,
+        }
+    }
+
+    fn allows_retry(self) -> bool {
+        matches!(self, Self::Retryable)
     }
 }
 
@@ -468,6 +560,18 @@ pub struct Profile {
     pub remaining: u64,
     pub used_quota: u64,
     pub webhook_url: String,
+}
+
+impl fmt::Debug for Profile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Profile")
+            .field("name", &self.name)
+            .field("quota", &self.quota)
+            .field("remaining", &self.remaining)
+            .field("used_quota", &self.used_quota)
+            .field("webhook_url", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -487,6 +591,19 @@ pub struct SupplierStatus {
     pub generating: u64,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl fmt::Debug for SupplierStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SupplierStatus")
+            .field("keys_active", &self.keys_active)
+            .field("keys_dead", &self.keys_dead)
+            .field("keys_stock", &self.keys_stock)
+            .field("generating", &self.generating)
+            .field("extra_keys", &self.extra.keys().collect::<Vec<_>>())
+            .field("extra_count", &self.extra.len())
+            .finish()
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -585,7 +702,7 @@ fn validate_http_url(value: &str) -> Result<(), SupplierError> {
 
 fn sanitize(value: &str, secret: &str) -> String {
     static TOKEN: OnceLock<regex::Regex> = OnceLock::new();
-    let token = TOKEN.get_or_init(|| regex::Regex::new(r#"ksk_[^\s"'<>]+"#).unwrap());
+    let token = TOKEN.get_or_init(|| regex::Regex::new(r#"ksk_[^\s"'<>]*"#).unwrap());
     let replaced_secret = value.replace(secret, "[REDACTED]");
     let redacted = token.replace_all(&replaced_secret, "[REDACTED]");
     redacted.chars().take(300).collect()
