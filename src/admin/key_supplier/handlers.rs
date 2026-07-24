@@ -169,6 +169,7 @@ pub async fn overview(State(state): State<AdminState>) -> Response {
                 used_quota: overview.profile.used_quota,
             },
             stock_max: overview.stock.max,
+            webhook_registered: overview.webhook_registered,
             status: StatusView {
                 keys_active: overview.status.keys_active,
                 keys_dead: overview.status.keys_dead,
@@ -471,6 +472,7 @@ struct PurchaseResponse {
 struct OverviewResponse {
     profile: ProfileView,
     stock_max: u64,
+    webhook_registered: bool,
     status: StatusView,
 }
 

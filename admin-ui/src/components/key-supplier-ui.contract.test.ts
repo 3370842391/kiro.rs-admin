@@ -32,6 +32,11 @@ describe('key supplier management UI contract', () => {
     const page = await readSource('components/key-supplier-page.tsx')
 
     expect(page).toContain('自动购买')
+    expect(page).toContain('收到新 Key 就绪 Webhook 后自动发起一次购买')
+    expect(page).toContain('单次最小购买量')
+    expect(page).toContain('单次最大购买量')
+    expect(page).not.toContain('最小库存')
+    expect(page).not.toContain('最大库存')
     expect(page).toContain('手动购买')
     expect(page).toContain('注册 Webhook')
     expect(page).toContain('测试 Webhook')
@@ -45,6 +50,8 @@ describe('key supplier management UI contract', () => {
     expect(page).toContain('stockMax')
     expect(page).toContain('生成中')
     expect(page).toContain('空闲')
+    expect(page).toContain('webhookRegistered')
+    expect(page).toContain('Webhook 已注册')
   })
 
   test('page keeps supplier secrets write-only and never renders purchased key material', async () => {
@@ -85,7 +92,10 @@ describe('key supplier management UI contract', () => {
     expect(page).toContain('numericDrafts')
     expect(page).toContain('parseSupplierNumberDraft')
     expect(page).toContain('purchaseCountDraft')
-    expect(page).toContain('parsedPurchaseCount === null')
+    expect(page).toContain('setPurchaseCountDraft(String(next.minPurchase))')
+    expect(page).toContain('min={config?.minPurchase ?? 1}')
+    expect(page).toContain('max={config?.maxPurchase}')
+    expect(page).toContain('purchaseCountValid')
     expect(page).toContain('configNumbersValid')
     expect(page).not.toContain("updateField('minPurchase', Number(event.target.value))")
     expect(page).not.toContain('purchase.mutate(purchaseCount)')

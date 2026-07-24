@@ -115,6 +115,7 @@ export function KeySupplierPage() {
     })
     setGroupsText(next.groups.join(', '))
     setNumericDrafts(toNumericDrafts(next))
+    setPurchaseCountDraft(String(next.minPurchase))
   }, [configQuery.data])
 
   useEffect(() => {
@@ -167,7 +168,10 @@ export function KeySupplierPage() {
   })
   const registerWebhook = useMutation({
     mutationFn: registerSupplierWebhook,
-    onSuccess: () => toast.success('Webhook 已注册'),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['supplier-overview'] })
+      toast.success('Webhook 已注册')
+    },
     onError: (error) => toast.error(extractErrorMessage(error)),
   })
   const testWebhook = useMutation({
@@ -199,13 +203,15 @@ export function KeySupplierPage() {
   const updateNumericDraft = (field: SupplierNumericField, value: string) => {
     setNumericDrafts((current) => ({ ...current, [field]: value }))
   }
-  const parsedMinPurchase = parseSupplierNumberDraft(numericDrafts.minPurchase, 0)
-  const parsedMaxPurchase = parseSupplierNumberDraft(numericDrafts.maxPurchase, 0)
+  const parsedMinPurchase = parseSupplierNumberDraft(numericDrafts.minPurchase, 1)
+  const parsedMaxPurchase = parseSupplierNumberDraft(numericDrafts.maxPurchase, 1)
   const parsedRpmLimit = parseSupplierNumberDraft(numericDrafts.rpmLimit, 0)
   const parsedPriority = parseSupplierNumberDraft(numericDrafts.priority, 0)
-  const configNumbersValid = [parsedMinPurchase, parsedMaxPurchase, parsedRpmLimit, parsedPriority]
-    .every((value) => value !== null)
+  const configNumbersValid = parsedMinPurchase !== null && parsedMaxPurchase !== null &&
+    parsedRpmLimit !== null && parsedPriority !== null && parsedMinPurchase <= parsedMaxPurchase
   const parsedPurchaseCount = parseSupplierNumberDraft(purchaseCountDraft, 1)
+  const purchaseCountValid = parsedPurchaseCount !== null && config !== null &&
+    parsedPurchaseCount >= config.minPurchase && parsedPurchaseCount <= config.maxPurchase
   const handleSave = () => {
     if (!config) return
     if (
@@ -309,12 +315,12 @@ export function KeySupplierPage() {
                   <Field label="Webhook Token（只写入）"><Input type="password" autoComplete="new-password" placeholder={configQuery.data?.webhookTokenConfigured ? '已配置；留空则保持不变' : '仅保存时写入'} value={webhookToken} onChange={(event) => setWebhookToken(event.target.value)} disabled={saveConfig.isPending} /></Field>
                 </div>
                 <div className="flex items-center justify-between gap-3 border-y border-border/50 py-3">
-                  <div><label htmlFor="auto-purchase" className="text-sm font-medium">自动购买</label><p className="text-xs text-muted-foreground">根据库存下限触发采购。</p></div>
+                  <div><label htmlFor="auto-purchase" className="text-sm font-medium">自动购买</label><p className="text-xs text-muted-foreground">收到新 Key 就绪 Webhook 后自动发起一次购买。</p></div>
                   <Switch id="auto-purchase" checked={config.autoPurchase} onCheckedChange={(checked) => updateField('autoPurchase', checked)} disabled={saveConfig.isPending} aria-label="自动购买" />
                 </div>
                 <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-                  <Field label="最小库存"><Input type="number" min={0} value={numericDrafts.minPurchase} onChange={(event) => updateNumericDraft('minPurchase', event.target.value)} disabled={saveConfig.isPending} /></Field>
-                  <Field label="最大库存"><Input type="number" min={0} value={numericDrafts.maxPurchase} onChange={(event) => updateNumericDraft('maxPurchase', event.target.value)} disabled={saveConfig.isPending} /></Field>
+                  <Field label="单次最小购买量"><Input type="number" min={1} value={numericDrafts.minPurchase} onChange={(event) => updateNumericDraft('minPurchase', event.target.value)} disabled={saveConfig.isPending} /></Field>
+                  <Field label="单次最大购买量"><Input type="number" min={1} value={numericDrafts.maxPurchase} onChange={(event) => updateNumericDraft('maxPurchase', event.target.value)} disabled={saveConfig.isPending} /></Field>
                   <Field label="API Region"><Input value={config.apiRegion} onChange={(event) => updateField('apiRegion', event.target.value)} disabled={saveConfig.isPending} /></Field>
                   <Field label="RPM"><Input type="number" min={0} value={numericDrafts.rpmLimit} onChange={(event) => updateNumericDraft('rpmLimit', event.target.value)} disabled={saveConfig.isPending} /></Field>
                   <Field label="Priority"><Input type="number" min={0} value={numericDrafts.priority} onChange={(event) => updateNumericDraft('priority', event.target.value)} disabled={saveConfig.isPending} /></Field>
@@ -324,7 +330,7 @@ export function KeySupplierPage() {
                   <Field label="Groups（逗号分隔）"><Input value={groupsText} onChange={(event) => setGroupsText(event.target.value)} disabled={saveConfig.isPending} /></Field>
                   <Field label="Nickname Prefix"><Input value={config.nicknamePrefix} onChange={(event) => updateField('nicknamePrefix', event.target.value)} disabled={saveConfig.isPending} /></Field>
                 </div>
-                {!configNumbersValid && <p className="text-xs text-destructive">请填写有效的非负整数配置。</p>}
+                {!configNumbersValid && <p className="text-xs text-destructive">购买量需为正整数，且最小值不能大于最大值；RPM 和 Priority 需为非负整数。</p>}
                 <Button onClick={handleSave} disabled={saveConfig.isPending || !configNumbersValid}>
                   {saveConfig.isPending && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
                   保存配置
@@ -336,18 +342,18 @@ export function KeySupplierPage() {
 
         <div className="space-y-5">
           <Card>
-            <CardHeader className="pb-3"><CardTitle>手动购买</CardTitle><CardDescription>{purchaseResultSummary}</CardDescription></CardHeader>
+            <CardHeader className="pb-3"><CardTitle>手动购买</CardTitle><CardDescription>{purchaseResultSummary}{config ? ` 单次允许 ${config.minPurchase}-${config.maxPurchase} 个。` : ''}</CardDescription></CardHeader>
             <CardContent className="flex flex-wrap items-end gap-3">
-              <Field label="购买数量" className="w-full sm:w-40"><Input type="number" min={1} value={purchaseCountDraft} onChange={(event) => setPurchaseCountDraft(event.target.value)} disabled={purchase.isPending} /></Field>
-              {parsedPurchaseCount === null && <p className="w-full text-xs text-destructive sm:w-auto">请输入大于 0 的整数。</p>}
-              <Button onClick={() => { if (parsedPurchaseCount !== null) purchase.mutate(parsedPurchaseCount) }} disabled={purchase.isPending || parsedPurchaseCount === null}><PackagePlus className="h-3.5 w-3.5" />购买</Button>
+              <Field label="购买数量" className="w-full sm:w-40"><Input type="number" min={config?.minPurchase ?? 1} max={config?.maxPurchase} value={purchaseCountDraft} onChange={(event) => setPurchaseCountDraft(event.target.value)} disabled={purchase.isPending} /></Field>
+              {config && !purchaseCountValid && <p className="w-full text-xs text-destructive sm:w-auto">请输入 {config.minPurchase} 到 {config.maxPurchase} 之间的整数。</p>}
+              <Button onClick={() => { if (purchaseCountValid && parsedPurchaseCount !== null) purchase.mutate(parsedPurchaseCount) }} disabled={purchase.isPending || !purchaseCountValid}><PackagePlus className="h-3.5 w-3.5" />购买</Button>
             </CardContent>
           </Card>
           <Card>
-            <CardHeader className="pb-3"><CardTitle className="flex items-center gap-2"><Webhook className="h-4 w-4" />Webhook</CardTitle><CardDescription>注册供应商回调并执行连通性测试。</CardDescription></CardHeader>
+            <CardHeader className="pb-3"><CardTitle className="flex flex-wrap items-center gap-2"><Webhook className="h-4 w-4" />Webhook<Badge variant={overviewQuery.data?.webhookRegistered ? 'success' : 'warning'}>{overviewQuery.data?.webhookRegistered ? 'Webhook 已注册' : 'Webhook 未注册'}</Badge></CardTitle><CardDescription>注册状态来自供应商账号；测试消息只验证连通性，不会购买。</CardDescription></CardHeader>
             <CardContent className="space-y-3">
               {registerWebhook.data?.callbackUrl && <div className="flex min-w-0 gap-2"><Input aria-label="Webhook callback URL" value={registerWebhook.data.callbackUrl} readOnly /><Button size="icon" variant="outline" title="复制回调地址" onClick={copyCallbackUrl}><Clipboard className="h-3.5 w-3.5" /></Button></div>}
-              <div className="flex flex-wrap gap-2"><Button variant="outline" onClick={() => registerWebhook.mutate()} disabled={registerWebhook.isPending}><Webhook className="h-3.5 w-3.5" />注册 Webhook</Button><Button variant="outline" onClick={() => testWebhook.mutate()} disabled={testWebhook.isPending}><Send className="h-3.5 w-3.5" />测试 Webhook</Button></div>
+              <div className="flex flex-wrap gap-2"><Button variant="outline" onClick={() => registerWebhook.mutate()} disabled={registerWebhook.isPending}><Webhook className="h-3.5 w-3.5" />{overviewQuery.data?.webhookRegistered ? '重新注册 Webhook' : '注册 Webhook'}</Button><Button variant="outline" onClick={() => testWebhook.mutate()} disabled={testWebhook.isPending}><Send className="h-3.5 w-3.5" />测试 Webhook</Button></div>
             </CardContent>
           </Card>
         </div>

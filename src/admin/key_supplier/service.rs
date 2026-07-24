@@ -327,6 +327,10 @@ impl KeySupplierService {
             .profile()
             .await
             .map_err(SupplierServiceError::supplier_api)?;
+        let webhook_registered = self
+            .callback_url()
+            .ok()
+            .is_some_and(|callback| profile.webhook_url == callback);
         let stock = client
             .stock()
             .await
@@ -339,6 +343,7 @@ impl KeySupplierService {
             profile,
             stock,
             status,
+            webhook_registered,
         })
     }
 
@@ -766,6 +771,7 @@ pub struct SupplierOverview {
     pub profile: Profile,
     pub stock: Stock,
     pub status: SupplierStatus,
+    pub webhook_registered: bool,
 }
 
 impl fmt::Debug for SupplierOverview {
@@ -775,6 +781,7 @@ impl fmt::Debug for SupplierOverview {
             .field("profile", &self.profile)
             .field("stock_max", &self.stock.max)
             .field("status", &self.status)
+            .field("webhook_registered", &self.webhook_registered)
             .finish()
     }
 }
@@ -1871,6 +1878,7 @@ mod tests {
         assert_eq!(overview.profile.name, "demo");
         assert_eq!(overview.stock.max, 4);
         assert_eq!(overview.status.keys_active, 3);
+        assert!(!overview.webhook_registered);
         assert!(!format!("{overview:?}").contains(&config.webhook_token));
         let callback = service.register_webhook().await.unwrap();
         service.test_webhook().await.unwrap();

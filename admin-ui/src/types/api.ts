@@ -1071,6 +1071,7 @@ export interface SupplierOverview {
     usedQuota: number
   }
   stockMax: number
+  webhookRegistered: boolean
   status: {
     keysActive: number
     keysDead: number
