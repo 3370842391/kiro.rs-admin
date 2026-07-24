@@ -1,7 +1,9 @@
 use anyhow::Context;
+use atomicwrites::{AllowOverwrite, AtomicFile};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -85,6 +87,80 @@ impl std::str::FromStr for RetryMode {
             "polite" => Ok(Self::Polite),
             "custom" => Ok(Self::Custom),
             _ => anyhow::bail!("无效的重试模式: {}", value),
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct KeySupplierConfig {
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub public_base_url: String,
+    #[serde(default)]
+    pub webhook_token: String,
+    #[serde(default)]
+    pub auto_purchase: bool,
+    #[serde(default = "default_supplier_purchase")]
+    pub min_purchase: u32,
+    #[serde(default = "default_supplier_purchase")]
+    pub max_purchase: u32,
+    #[serde(default = "default_region")]
+    pub api_region: String,
+    #[serde(default = "default_supplier_rpm_limit")]
+    pub rpm_limit: u32,
+    #[serde(default)]
+    pub priority: u32,
+    #[serde(default)]
+    pub groups: Vec<String>,
+    #[serde(default = "default_supplier_source_channel")]
+    pub source_channel: String,
+    #[serde(default = "default_supplier_nickname_prefix")]
+    pub nickname_prefix: String,
+}
+
+impl std::fmt::Debug for KeySupplierConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeySupplierConfig")
+            .field("base_url", &self.base_url)
+            .field("api_key_configured", &(!self.api_key.is_empty()))
+            .field("public_base_url", &self.public_base_url)
+            .field(
+                "webhook_token_configured",
+                &(!self.webhook_token.is_empty()),
+            )
+            .field("auto_purchase", &self.auto_purchase)
+            .field("min_purchase", &self.min_purchase)
+            .field("max_purchase", &self.max_purchase)
+            .field("api_region", &self.api_region)
+            .field("rpm_limit", &self.rpm_limit)
+            .field("priority", &self.priority)
+            .field("groups", &self.groups)
+            .field("source_channel", &self.source_channel)
+            .field("nickname_prefix", &self.nickname_prefix)
+            .finish()
+    }
+}
+
+impl Default for KeySupplierConfig {
+    fn default() -> Self {
+        Self {
+            base_url: String::new(),
+            api_key: String::new(),
+            public_base_url: String::new(),
+            webhook_token: String::new(),
+            auto_purchase: false,
+            min_purchase: default_supplier_purchase(),
+            max_purchase: default_supplier_purchase(),
+            api_region: default_region(),
+            rpm_limit: default_supplier_rpm_limit(),
+            priority: 0,
+            groups: Vec::new(),
+            source_channel: default_supplier_source_channel(),
+            nickname_prefix: default_supplier_nickname_prefix(),
         }
     }
 }
@@ -389,6 +465,10 @@ pub struct Config {
     #[serde(default = "default_profit_quota_per_unit")]
     pub profit_quota_per_unit: f64,
 
+    /// Kiro API Key 供应商与 Webhook 自动采购配置。
+    #[serde(default)]
+    pub key_supplier: KeySupplierConfig,
+
     /// 是否记录失败、中断和可选恢复请求的完整脱敏诊断快照。
     #[serde(default = "default_true")]
     pub error_snapshot_enabled: bool,
@@ -538,6 +618,22 @@ fn default_port() -> u16 {
 
 fn default_region() -> String {
     "us-east-1".to_string()
+}
+
+fn default_supplier_purchase() -> u32 {
+    1
+}
+
+fn default_supplier_rpm_limit() -> u32 {
+    10
+}
+
+fn default_supplier_source_channel() -> String {
+    "Webhook 自动采购".to_string()
+}
+
+fn default_supplier_nickname_prefix() -> String {
+    "自动采购".to_string()
 }
 
 fn default_kiro_version() -> String {
@@ -741,6 +837,7 @@ impl Default for Config {
             profit_newapi_user: None,
             profit_credit_price: default_profit_credit_price(),
             profit_quota_per_unit: default_profit_quota_per_unit(),
+            key_supplier: KeySupplierConfig::default(),
             error_snapshot_enabled: true,
             error_snapshot_retention_days: default_error_snapshot_retention_days(),
             error_snapshot_max_storage_gb: default_error_snapshot_max_storage_gb(),
@@ -829,7 +926,8 @@ impl Config {
             .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存配置"))?;
 
         let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
-        fs::write(path, content)
+        AtomicFile::new(path, AllowOverwrite)
+            .write(|file| file.write_all(content.as_bytes()))
             .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
     }
@@ -838,6 +936,87 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_supplier_defaults_keep_legacy_config_compatible() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+
+        assert!(config.key_supplier.base_url.is_empty());
+        assert!(config.key_supplier.api_key.is_empty());
+        assert!(config.key_supplier.public_base_url.is_empty());
+        assert!(config.key_supplier.webhook_token.is_empty());
+        assert!(!config.key_supplier.auto_purchase);
+        assert_eq!(config.key_supplier.min_purchase, 1);
+        assert_eq!(config.key_supplier.max_purchase, 1);
+        assert_eq!(config.key_supplier.api_region, "us-east-1");
+        assert_eq!(config.key_supplier.rpm_limit, 10);
+        assert_eq!(config.key_supplier.priority, 0);
+        assert!(config.key_supplier.groups.is_empty());
+        assert_eq!(config.key_supplier.source_channel, "Webhook 自动采购");
+        assert_eq!(config.key_supplier.nickname_prefix, "自动采购");
+    }
+
+    #[test]
+    fn key_supplier_config_round_trips_in_camel_case() {
+        let input = serde_json::json!({
+            "keySupplier": {
+                "baseUrl": "https://supplier.example",
+                "apiKey": "secret",
+                "publicBaseUrl": "https://public.example",
+                "webhookToken": "token",
+                "autoPurchase": true,
+                "minPurchase": 2,
+                "maxPurchase": 4,
+                "apiRegion": "eu-central-1",
+                "rpmLimit": 20,
+                "priority": 3,
+                "groups": ["paid"],
+                "sourceChannel": "supplier",
+                "nicknamePrefix": "auto"
+            }
+        });
+
+        let config: Config = serde_json::from_value(input.clone()).unwrap();
+        let encoded = serde_json::to_value(config).unwrap();
+        assert_eq!(encoded["keySupplier"], input["keySupplier"]);
+        assert!(encoded.get("key_supplier").is_none());
+    }
+
+    #[test]
+    fn save_persists_updated_json_value() {
+        let path = std::env::temp_dir().join(format!(
+            "kiro-config-save-{}-{}.json",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let mut config = Config::load(&path).unwrap();
+        config.host = "127.0.0.2".to_string();
+        config.save().unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["host"], "127.0.0.2");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn debug_does_not_expose_key_supplier_secrets() {
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "keySupplier": {
+                "apiKey": "config-api-key-canary",
+                "webhookToken": "config-webhook-token-canary"
+            }
+        }))
+        .unwrap();
+        config.key_supplier.api_key = "config-api-key-canary".to_string();
+        config.key_supplier.webhook_token = "config-webhook-token-canary".to_string();
+
+        let debug = format!("{:?}", config);
+
+        assert!(!debug.contains("config-api-key-canary"));
+        assert!(!debug.contains("config-webhook-token-canary"));
+    }
 
     #[test]
     fn error_snapshot_defaults_are_safe_and_round_trip_in_camel_case() {

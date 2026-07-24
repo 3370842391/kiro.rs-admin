@@ -1,10 +1,12 @@
 import { useState, useEffect, lazy, Suspense } from "react";
+import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { storage } from "@/lib/storage";
+import { listSupplierEvents } from "@/api/key-supplier";
 import { LoginPage } from "@/components/login-page";
 import { Toaster } from "@/components/ui/sonner";
 import { ConfirmProvider } from "@/components/ui/confirm-dialog";
 import { Button } from "@/components/ui/button";
-import { Activity, KeyRound, Server, LogOut, Moon, Sun, ScrollText, FolderTree, ShieldAlert, DollarSign } from "lucide-react";
+import { Activity, KeyRound, Server, LogOut, Moon, Sun, ScrollText, FolderTree, ShieldAlert, DollarSign, PackageSearch } from "lucide-react";
 import { TopbarTools } from "@/components/topbar-tools";
 
 function GithubIcon({ className }: { className?: string }) {
@@ -53,8 +55,13 @@ const ProfitPage = lazy(() =>
     default: m.ProfitPage,
   })),
 );
+const KeySupplierPage = lazy(() =>
+  import("@/components/key-supplier-page").then((m) => ({
+    default: m.KeySupplierPage,
+  })),
+);
 
-type Tab = "overview" | "credentials" | "keys" | "groups" | "traces" | "snapshots" | "profit";
+type Tab = "overview" | "credentials" | "keys" | "groups" | "traces" | "snapshots" | "profit" | "supplier";
 
 const TABS: {
   key: Tab;
@@ -104,6 +111,12 @@ const TABS: {
     mobileLabel: "利润",
     icon: <DollarSign className="h-3.5 w-3.5" />,
   },
+  {
+    key: "supplier",
+    label: "Key 供应",
+    mobileLabel: "供应",
+    icon: <PackageSearch className="h-3.5 w-3.5" />,
+  },
 ];
 
 function readTabFromHash(): Tab {
@@ -115,7 +128,8 @@ function readTabFromHash(): Tab {
     h === "overview" ||
     h === "traces" ||
     h === "snapshots" ||
-    h === "profit"
+    h === "profit" ||
+    h === "supplier"
   )
     return h;
   return "overview";
@@ -127,10 +141,18 @@ interface AppHeaderProps {
   onLogout: () => void;
   onSwitchTab: (next: Tab) => void;
   onToggleDarkMode: () => void;
+  supplierUnread: number;
 }
 
 function App() {
-  const app = useAppShell();
+  const queryClient = useQueryClient();
+  const app = useAppShell(queryClient);
+  const supplierEvents = useQuery({
+    queryKey: ["supplier-events", "header-unread"],
+    queryFn: () => listSupplierEvents({ limit: 1 }),
+    enabled: app.isLoggedIn,
+    refetchInterval: 5000,
+  });
 
   if (!app.isLoggedIn) {
     return <LoggedOutApp onLogin={app.handleLogin} />;
@@ -143,11 +165,12 @@ function App() {
       onLogout={app.handleLogout}
       onSwitchTab={app.switchTab}
       onToggleDarkMode={app.toggleDarkMode}
+      supplierUnread={supplierEvents.data?.unreadCount ?? 0}
     />
   );
 }
 
-function useAppShell() {
+function useAppShell(queryClient: QueryClient) {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [tab, setTab] = useState<Tab>(readTabFromHash);
   const [darkMode, setDarkMode] = useState(() => {
@@ -175,6 +198,7 @@ function useAppShell() {
   const handleLogin = () => setIsLoggedIn(true);
   const handleLogout = () => {
     storage.removeApiKey();
+    queryClient.clear();
     setIsLoggedIn(false);
   };
   const toggleDarkMode = () => {
@@ -207,6 +231,7 @@ function LoggedInApp({
   onLogout,
   onSwitchTab,
   onToggleDarkMode,
+  supplierUnread,
   tab,
 }: AppHeaderProps) {
   return (
@@ -217,6 +242,7 @@ function LoggedInApp({
         onLogout={onLogout}
         onSwitchTab={onSwitchTab}
         onToggleDarkMode={onToggleDarkMode}
+        supplierUnread={supplierUnread}
       />
       <AppMain tab={tab} onLogout={onLogout} />
       <Toaster position="bottom-center" />
@@ -229,28 +255,31 @@ function AppHeader({
   onLogout,
   onSwitchTab,
   onToggleDarkMode,
+  supplierUnread,
   tab,
 }: AppHeaderProps) {
   return (
     <header className="sticky top-0 z-50 w-full glass">
       <div className="mx-auto flex h-14 max-w-[1400px] min-w-0 items-center gap-2 px-3 sm:h-16 sm:px-4 xl:px-8">
-        <HeaderBrand tab={tab} onSwitchTab={onSwitchTab} />
+        <HeaderBrand tab={tab} supplierUnread={supplierUnread} onSwitchTab={onSwitchTab} />
         <HeaderActions
           darkMode={darkMode}
           onLogout={onLogout}
           onToggleDarkMode={onToggleDarkMode}
         />
       </div>
-      <MobileTabs tab={tab} onSwitchTab={onSwitchTab} />
+      <MobileTabs tab={tab} supplierUnread={supplierUnread} onSwitchTab={onSwitchTab} />
     </header>
   );
 }
 
 function HeaderBrand({
   onSwitchTab,
+  supplierUnread,
   tab,
 }: {
   onSwitchTab: (next: Tab) => void;
+  supplierUnread: number;
   tab: Tab;
 }) {
   return (
@@ -264,16 +293,18 @@ function HeaderBrand({
       <span className="min-w-0 truncate text-sm font-semibold tracking-tight min-[380px]:text-base">
         Kiro Admin
       </span>
-      <DesktopTabs tab={tab} onSwitchTab={onSwitchTab} />
+      <DesktopTabs tab={tab} supplierUnread={supplierUnread} onSwitchTab={onSwitchTab} />
     </div>
   );
 }
 
 function DesktopTabs({
   onSwitchTab,
+  supplierUnread,
   tab,
 }: {
   onSwitchTab: (next: Tab) => void;
+  supplierUnread: number;
   tab: Tab;
 }) {
   return (
@@ -282,6 +313,7 @@ function DesktopTabs({
         <TabButton
           key={t.key}
           active={tab === t.key}
+          supplierUnread={supplierUnread}
           tab={t}
           onSwitchTab={onSwitchTab}
         />
@@ -342,9 +374,11 @@ function GithubButton() {
 
 function MobileTabs({
   onSwitchTab,
+  supplierUnread,
   tab,
 }: {
   onSwitchTab: (next: Tab) => void;
+  supplierUnread: number;
   tab: Tab;
 }) {
   return (
@@ -354,6 +388,7 @@ function MobileTabs({
           key={t.key}
           active={tab === t.key}
           mobile
+          supplierUnread={supplierUnread}
           tab={t}
           onSwitchTab={onSwitchTab}
         />
@@ -366,11 +401,13 @@ function TabButton({
   active,
   mobile = false,
   onSwitchTab,
+  supplierUnread,
   tab,
 }: {
   active: boolean;
   mobile?: boolean;
   onSwitchTab: (next: Tab) => void;
+  supplierUnread: number;
   tab: (typeof TABS)[number];
 }) {
   const className = mobile
@@ -389,6 +426,11 @@ function TabButton({
       <span className={mobile ? "min-w-0 truncate" : undefined}>
         {label}
       </span>
+      {tab.key === "supplier" && supplierUnread > 0 && (
+        <span className="flex h-4 min-w-4 items-center justify-center rounded-full bg-destructive px-1 text-[10px] font-semibold leading-none text-destructive-foreground" aria-label={`${supplierUnread} 条未读事件`}>
+          {supplierUnread > 99 ? "99+" : supplierUnread}
+        </span>
+      )}
     </Button>
   );
 }
@@ -404,6 +446,7 @@ function AppMain({ onLogout, tab }: { onLogout: () => void; tab: Tab }) {
         {tab === "traces" && <TraceLogPage />}
         {tab === "snapshots" && <ErrorSnapshotPage />}
         {tab === "profit" && <ProfitPage />}
+        {tab === "supplier" && <KeySupplierPage />}
       </Suspense>
     </main>
   );

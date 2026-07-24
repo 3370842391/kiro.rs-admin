@@ -77,7 +77,7 @@ async fn main() {
     ensure_config_files(&config_path, &credentials_path);
 
     // 加载配置
-    let config = Config::load(&config_path).unwrap_or_else(|e| {
+    let mut config = Config::load(&config_path).unwrap_or_else(|e| {
         tracing::error!("加载配置失败: {}", e);
         std::process::exit(1);
     });
@@ -253,6 +253,12 @@ async fn main() {
     let cache_dir = token_manager
         .cache_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let key_supplier_service = initialize_key_supplier_service(
+        &mut config,
+        &config_path,
+        &cache_dir,
+        token_manager.clone(),
+    );
     let client_keys_path = admin::client_keys::default_path_in(&cache_dir);
     let client_key_manager = std::sync::Arc::new(
         admin::ClientKeyManager::load(&client_keys_path).unwrap_or_else(|e| {
@@ -463,7 +469,10 @@ async fn main() {
     let app = if let Some(admin_key) = &config.admin_api_key {
         if admin_key.trim().is_empty() {
             tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
-            anthropic_app
+            anthropic_app.nest(
+                "/api/admin",
+                admin::create_key_supplier_webhook_router(key_supplier_service.clone()),
+            )
         } else {
             // Admin 查询需要一个确定的 store；traces.db 打开失败时用内存兜底（仅本进程有效）
             let admin_trace_store = trace_store.clone().unwrap_or_else(|| {
@@ -493,6 +502,7 @@ async fn main() {
                 error_snapshot_store.clone(),
                 group_manager.clone(),
                 model_mapping_manager.clone(),
+                key_supplier_service.clone(),
             );
 
             // 启动余额后台刷新调度器（每 5 分钟一次，与缓存 TTL 对齐）
@@ -521,7 +531,10 @@ async fn main() {
                 .nest("/admin", admin_ui_app)
         }
     } else {
-        anthropic_app
+        anthropic_app.nest(
+            "/api/admin",
+            admin::create_key_supplier_webhook_router(key_supplier_service.clone()),
+        )
     };
 
     // 挂载批发号池路由（若可用）
@@ -551,6 +564,58 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+fn initialize_key_supplier_service(
+    config: &mut Config,
+    config_path: &str,
+    cache_dir: &std::path::Path,
+    token_manager: Arc<MultiTokenManager>,
+) -> Option<Arc<admin::key_supplier::service::KeySupplierService>> {
+    if config.key_supplier.webhook_token.trim().is_empty() {
+        config.key_supplier.webhook_token = admin::key_supplier::config::generate_webhook_token();
+        if let Err(error) = config.save() {
+            config.key_supplier.webhook_token.clear();
+            tracing::error!(
+                %error,
+                "key supplier webhook token could not be persisted; supplier service is disabled"
+            );
+            return None;
+        }
+    }
+
+    let runtime = match admin::key_supplier::config::SupplierRuntimeConfig::from_config(config) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "key supplier configuration is invalid; supplier service is disabled"
+            );
+            return None;
+        }
+    };
+    let store = match admin::key_supplier::store::SupplierEventStore::open(
+        cache_dir.join("key_supplier.db"),
+    ) {
+        Ok(store) => Arc::new(store),
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "key supplier event store could not be opened; supplier service is disabled"
+            );
+            return None;
+        }
+    };
+    let service = Arc::new(
+        admin::key_supplier::service::KeySupplierService::new_with_token_manager(
+            store,
+            runtime,
+            token_manager,
+        )
+        .with_config_path(config_path),
+    );
+    service.start_processor();
+    Some(service)
 }
 
 /// 文件不存在时初始化配置/凭证文件
