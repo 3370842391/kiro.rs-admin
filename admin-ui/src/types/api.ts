@@ -1031,6 +1031,7 @@ export interface SupplierConfigView {
   baseUrl: string
   publicBaseUrl: string
   autoPurchase: boolean
+  autoDeleteForbidden: boolean
   minPurchase: number
   maxPurchase: number
   apiRegion: string
@@ -1048,6 +1049,7 @@ export interface SupplierConfigUpdate {
   baseUrl: string
   publicBaseUrl: string
   autoPurchase: boolean
+  autoDeleteForbidden: boolean
   minPurchase: number
   maxPurchase: number
   apiRegion: string

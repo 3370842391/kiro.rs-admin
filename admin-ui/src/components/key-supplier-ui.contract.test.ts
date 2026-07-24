@@ -52,6 +52,12 @@ describe('key supplier management UI contract', () => {
     expect(page).toContain('空闲')
     expect(page).toContain('webhookRegistered')
     expect(page).toContain('Webhook 已注册')
+    expect(page).toContain('自动采购 RPM 预设')
+    expect(page).toContain('useGroupOptions')
+    expect(page).toContain('GroupMultiSelect')
+    expect(page).toContain('autoDeleteForbidden')
+    expect(page).toContain('403 时自动删除')
+    expect(page).not.toContain('Groups（逗号分隔）')
   })
 
   test('page keeps supplier secrets write-only and never renders purchased key material', async () => {

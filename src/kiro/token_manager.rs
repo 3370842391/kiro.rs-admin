@@ -4441,6 +4441,26 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 上游返回 403 时删除显式启用该策略的凭证。
+    ///
+    /// `Ok(None)` 表示凭证不存在或未启用自动删除，调用方应继续原有失败处理；
+    /// `Ok(Some(has_available))` 表示删除成功，并返回是否仍有可用凭证。
+    pub fn delete_credential_on_forbidden(&self, id: u64) -> anyhow::Result<Option<bool>> {
+        let should_delete = self
+            .entries
+            .lock()
+            .iter()
+            .find(|entry| entry.id == id)
+            .is_some_and(|entry| entry.credentials.delete_on_forbidden);
+        if !should_delete {
+            return Ok(None);
+        }
+
+        self.delete_credential(id)?;
+        let has_available = self.entries.lock().iter().any(|entry| !entry.disabled);
+        Ok(Some(has_available))
+    }
+
     /// 更新指定凭据的 refreshToken（Admin API）
     ///
     /// # 前置条件
@@ -7887,6 +7907,50 @@ mod tests {
             new_id, 3,
             "new credential IDs must not reuse deleted IDs, otherwise historical failure logs attach to the new account"
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn delete_credential_on_forbidden_only_removes_flagged_credentials() {
+        let path = tmp_creds_path("delete_on_forbidden");
+        let mut flagged = KiroCredentials::default();
+        flagged.id = Some(1);
+        flagged.kiro_api_key = Some("ksk_delete_on_forbidden".to_string());
+        flagged.auth_method = Some("api_key".to_string());
+        flagged.api_region = Some("us-east-1".to_string());
+        flagged.delete_on_forbidden = true;
+
+        let mut normal = KiroCredentials::default();
+        normal.id = Some(2);
+        normal.kiro_api_key = Some("ksk_keep_on_forbidden".to_string());
+        normal.auth_method = Some("api_key".to_string());
+        normal.api_region = Some("us-east-1".to_string());
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![flagged, normal],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(manager.delete_credential_on_forbidden(1).unwrap(), Some(true));
+        assert_eq!(
+            manager
+                .clone_all_credentials()
+                .iter()
+                .map(|credential| credential.id.unwrap())
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(manager.delete_credential_on_forbidden(2).unwrap(), None);
+
+        let persisted: Vec<KiroCredentials> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].id, Some(2));
 
         let _ = std::fs::remove_file(&path);
     }

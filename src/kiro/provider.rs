@@ -286,6 +286,33 @@ pub struct KiroProvider {
 }
 
 impl KiroProvider {
+    fn handle_auth_failure(&self, credential_id: u64, status: u16) -> bool {
+        if status == 403 {
+            match self
+                .token_manager
+                .delete_credential_on_forbidden(credential_id)
+            {
+                Ok(Some(has_available)) => {
+                    tracing::warn!(
+                        "凭据 #{} 收到上游 403，已按自动采购策略删除",
+                        credential_id
+                    );
+                    return has_available;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::error!(
+                        "凭据 #{} 收到上游 403，但自动删除失败: {}",
+                        credential_id,
+                        error
+                    );
+                }
+            }
+        }
+
+        self.token_manager.report_failure(credential_id)
+    }
+
     /// 创建带代理配置和端点注册表的 KiroProvider 实例
     ///
     /// # Arguments
@@ -1205,7 +1232,7 @@ impl KiroProvider {
                     tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
                 }
 
-                let has_available = self.token_manager.report_failure(ctx.id);
+                let has_available = self.handle_auth_failure(ctx.id, status.as_u16());
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
                 }
@@ -1591,7 +1618,7 @@ impl KiroProvider {
                     tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
                 }
 
-                let has_available = self.token_manager.report_failure(ctx.id);
+                let has_available = self.handle_auth_failure(ctx.id, status.as_u16());
                 if !has_available {
                     anyhow::bail!(
                         "{} API 请求失败（所有凭据已用尽）: {} {}",

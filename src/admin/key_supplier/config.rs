@@ -24,6 +24,7 @@ pub struct SupplierRuntimeConfig {
     pub public_base_url: String,
     pub webhook_token: String,
     pub auto_purchase: bool,
+    pub auto_delete_forbidden: bool,
     pub min_purchase: u32,
     pub max_purchase: u32,
     pub api_region: String,
@@ -42,6 +43,7 @@ pub struct SupplierConfigView {
     pub public_base_url: String,
     pub webhook_token_configured: bool,
     pub auto_purchase: bool,
+    pub auto_delete_forbidden: bool,
     pub min_purchase: u32,
     pub max_purchase: u32,
     pub api_region: String,
@@ -62,6 +64,8 @@ pub struct SupplierConfigUpdate {
     #[serde(default)]
     pub webhook_token: Option<String>,
     pub auto_purchase: bool,
+    #[serde(default)]
+    pub auto_delete_forbidden: bool,
     pub min_purchase: u64,
     pub max_purchase: u64,
     pub api_region: String,
@@ -84,6 +88,7 @@ impl std::fmt::Debug for SupplierRuntimeConfig {
                 &(!self.webhook_token.is_empty()),
             )
             .field("auto_purchase", &self.auto_purchase)
+            .field("auto_delete_forbidden", &self.auto_delete_forbidden)
             .field("min_purchase", &self.min_purchase)
             .field("max_purchase", &self.max_purchase)
             .field("api_region", &self.api_region)
@@ -110,6 +115,7 @@ impl std::fmt::Debug for SupplierConfigUpdate {
                 &self.webhook_token.as_ref().is_some_and(|v| !v.is_empty()),
             )
             .field("auto_purchase", &self.auto_purchase)
+            .field("auto_delete_forbidden", &self.auto_delete_forbidden)
             .field("min_purchase", &self.min_purchase)
             .field("max_purchase", &self.max_purchase)
             .field("api_region", &self.api_region)
@@ -172,6 +178,7 @@ impl SupplierRuntimeConfig {
             public_base_url,
             webhook_token,
             auto_purchase: update.auto_purchase,
+            auto_delete_forbidden: update.auto_delete_forbidden,
             min_purchase: update.min_purchase as u32,
             max_purchase: update.max_purchase as u32,
             api_region,
@@ -202,6 +209,7 @@ impl From<&SupplierRuntimeConfig> for KeySupplierConfig {
             public_base_url: value.public_base_url.clone(),
             webhook_token: value.webhook_token.clone(),
             auto_purchase: value.auto_purchase,
+            auto_delete_forbidden: value.auto_delete_forbidden,
             min_purchase: value.min_purchase,
             max_purchase: value.max_purchase,
             api_region: value.api_region.clone(),
@@ -222,6 +230,7 @@ impl From<&SupplierRuntimeConfig> for SupplierConfigView {
             public_base_url: value.public_base_url.clone(),
             webhook_token_configured: !value.webhook_token.is_empty(),
             auto_purchase: value.auto_purchase,
+            auto_delete_forbidden: value.auto_delete_forbidden,
             min_purchase: value.min_purchase,
             max_purchase: value.max_purchase,
             api_region: value.api_region.clone(),
@@ -249,6 +258,7 @@ fn normalize_persisted(value: &KeySupplierConfig) -> anyhow::Result<SupplierRunt
         public_base_url: value.public_base_url.clone(),
         webhook_token: Some(value.webhook_token.clone()),
         auto_purchase: value.auto_purchase,
+        auto_delete_forbidden: value.auto_delete_forbidden,
         min_purchase: u64::from(value.min_purchase),
         max_purchase: u64::from(value.max_purchase),
         api_region: value.api_region.clone(),
@@ -343,6 +353,7 @@ mod tests {
             public_base_url: " https://public.example/ ".to_string(),
             webhook_token: None,
             auto_purchase: true,
+            auto_delete_forbidden: true,
             min_purchase: 2,
             max_purchase: 5,
             api_region: " us-east-1 ".to_string(),
@@ -428,6 +439,7 @@ mod tests {
         assert_eq!(runtime.public_base_url, "https://public.example");
         assert_eq!(runtime.api_region, "us-east-1");
         assert_eq!(runtime.groups, vec!["production", "backup"]);
+        assert!(runtime.auto_delete_forbidden);
         assert_eq!(runtime.webhook_token.len(), 64);
         assert!(
             runtime
@@ -437,6 +449,7 @@ mod tests {
         );
         assert_eq!(config.key_supplier.base_url, runtime.base_url);
         assert_eq!(config.key_supplier.webhook_token, runtime.webhook_token);
+        assert!(config.key_supplier.auto_delete_forbidden);
     }
 
     #[test]

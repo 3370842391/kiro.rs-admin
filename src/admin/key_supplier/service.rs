@@ -714,6 +714,7 @@ fn credential_from_supplier_key(
         priority: runtime.priority,
         groups: runtime.groups.clone(),
         source_channel: Some(runtime.source_channel.clone()),
+        delete_on_forbidden: runtime.auto_delete_forbidden,
         nickname: Some(nickname),
         ..Default::default()
     }
@@ -964,6 +965,7 @@ mod tests {
             public_base_url: String::new(),
             webhook_token: token.to_string(),
             auto_purchase: false,
+            auto_delete_forbidden: false,
             min_purchase: 1,
             max_purchase: 10,
             api_region: "us-east-1".to_string(),
@@ -1001,6 +1003,7 @@ mod tests {
             public_base_url: runtime.public_base_url.clone(),
             webhook_token: None,
             auto_purchase: runtime.auto_purchase,
+            auto_delete_forbidden: runtime.auto_delete_forbidden,
             min_purchase: u64::from(runtime.min_purchase),
             max_purchase: u64::from(runtime.max_purchase),
             api_region: runtime.api_region.clone(),
@@ -1298,6 +1301,7 @@ mod tests {
         let mut config = runtime(TOKEN);
         config.base_url = server(app).await;
         config.auto_purchase = true;
+        config.auto_delete_forbidden = true;
         config.rpm_limit = 37;
         config.priority = 9;
         config.groups = vec!["g1".to_owned(), "g2".to_owned()];
@@ -1328,6 +1332,7 @@ mod tests {
         assert_eq!(credential.priority, 9);
         assert_eq!(credential.groups, config.groups);
         assert_eq!(credential.source_channel.as_deref(), Some("supplier-a"));
+        assert!(credential.delete_on_forbidden);
         assert_eq!(credential.nickname.as_deref(), Some("supplier-fedcba98-1"));
     }
 

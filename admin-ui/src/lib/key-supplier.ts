@@ -11,6 +11,7 @@ export function buildSupplierConfigPayload(update: SupplierConfigUpdate): Suppli
     baseUrl: update.baseUrl,
     publicBaseUrl: update.publicBaseUrl,
     autoPurchase: update.autoPurchase,
+    autoDeleteForbidden: update.autoDeleteForbidden,
     minPurchase: update.minPurchase,
     maxPurchase: update.maxPurchase,
     apiRegion: update.apiRegion,

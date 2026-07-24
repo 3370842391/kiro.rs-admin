@@ -104,6 +104,8 @@ pub struct KeySupplierConfig {
     pub webhook_token: String,
     #[serde(default)]
     pub auto_purchase: bool,
+    #[serde(default)]
+    pub auto_delete_forbidden: bool,
     #[serde(default = "default_supplier_purchase")]
     pub min_purchase: u32,
     #[serde(default = "default_supplier_purchase")]
@@ -133,6 +135,7 @@ impl std::fmt::Debug for KeySupplierConfig {
                 &(!self.webhook_token.is_empty()),
             )
             .field("auto_purchase", &self.auto_purchase)
+            .field("auto_delete_forbidden", &self.auto_delete_forbidden)
             .field("min_purchase", &self.min_purchase)
             .field("max_purchase", &self.max_purchase)
             .field("api_region", &self.api_region)
@@ -153,6 +156,7 @@ impl Default for KeySupplierConfig {
             public_base_url: String::new(),
             webhook_token: String::new(),
             auto_purchase: false,
+            auto_delete_forbidden: false,
             min_purchase: default_supplier_purchase(),
             max_purchase: default_supplier_purchase(),
             api_region: default_region(),
@@ -946,6 +950,7 @@ mod tests {
         assert!(config.key_supplier.public_base_url.is_empty());
         assert!(config.key_supplier.webhook_token.is_empty());
         assert!(!config.key_supplier.auto_purchase);
+        assert!(!config.key_supplier.auto_delete_forbidden);
         assert_eq!(config.key_supplier.min_purchase, 1);
         assert_eq!(config.key_supplier.max_purchase, 1);
         assert_eq!(config.key_supplier.api_region, "us-east-1");
@@ -965,6 +970,7 @@ mod tests {
                 "publicBaseUrl": "https://public.example",
                 "webhookToken": "token",
                 "autoPurchase": true,
+                "autoDeleteForbidden": true,
                 "minPurchase": 2,
                 "maxPurchase": 4,
                 "apiRegion": "eu-central-1",

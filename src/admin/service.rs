@@ -1914,6 +1914,7 @@ impl AdminService {
             endpoint: req.endpoint,
             groups: req.groups,
             source_channel: req.source_channel,
+            delete_on_forbidden: false,
         };
 
         // 调用 token_manager 添加凭据

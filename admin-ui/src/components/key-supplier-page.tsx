@@ -16,6 +16,8 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
+import { GroupMultiSelect } from '@/components/group-select'
+import { useGroupOptions } from '@/hooks/use-groups'
 import { extractErrorMessage } from '@/lib/utils'
 import { getSupplierEventStatusLabel, hasUnreadSupplierEvents, parseSupplierNumberDraft } from '@/lib/key-supplier'
 import type { SupplierConfigUpdate, SupplierEvent, SupplierEventStatus } from '@/types/api'
@@ -32,10 +34,6 @@ function toNumericDrafts(config: Pick<SupplierConfigUpdate, SupplierNumericField
     rpmLimit: String(config.rpmLimit),
     priority: String(config.priority),
   }
-}
-
-function parseGroups(value: string): string[] {
-  return value.split(',').map((group) => group.trim()).filter(Boolean)
 }
 
 function formatTime(value: string): string {
@@ -74,7 +72,7 @@ export function KeySupplierPage() {
   const [config, setConfig] = useState<SupplierConfigUpdate | null>(null)
   const [apiKey, setApiKey] = useState('')
   const [webhookToken, setWebhookToken] = useState('')
-  const [groupsText, setGroupsText] = useState('')
+  const groupOptions = useGroupOptions()
   const [numericDrafts, setNumericDrafts] = useState<NumericDrafts>({
     minPurchase: '', maxPurchase: '', rpmLimit: '', priority: '',
   })
@@ -104,6 +102,7 @@ export function KeySupplierPage() {
       baseUrl: next.baseUrl,
       publicBaseUrl: next.publicBaseUrl,
       autoPurchase: next.autoPurchase,
+      autoDeleteForbidden: next.autoDeleteForbidden,
       minPurchase: next.minPurchase,
       maxPurchase: next.maxPurchase,
       apiRegion: next.apiRegion,
@@ -113,7 +112,6 @@ export function KeySupplierPage() {
       sourceChannel: next.sourceChannel,
       nicknamePrefix: next.nicknamePrefix,
     })
-    setGroupsText(next.groups.join(', '))
     setNumericDrafts(toNumericDrafts(next))
     setPurchaseCountDraft(String(next.minPurchase))
   }, [configQuery.data])
@@ -227,7 +225,6 @@ export function KeySupplierPage() {
       maxPurchase: parsedMaxPurchase,
       rpmLimit: parsedRpmLimit,
       priority: parsedPriority,
-      groups: parseGroups(groupsText),
       apiKey: apiKey || undefined,
       webhookToken: webhookToken || undefined,
     })
@@ -318,16 +315,20 @@ export function KeySupplierPage() {
                   <div><label htmlFor="auto-purchase" className="text-sm font-medium">自动购买</label><p className="text-xs text-muted-foreground">收到新 Key 就绪 Webhook 后自动发起一次购买。</p></div>
                   <Switch id="auto-purchase" checked={config.autoPurchase} onCheckedChange={(checked) => updateField('autoPurchase', checked)} disabled={saveConfig.isPending} aria-label="自动购买" />
                 </div>
+                <div className="flex items-center justify-between gap-3 border-b border-border/50 pb-3">
+                  <div><label htmlFor="auto-delete-forbidden" className="text-sm font-medium">403 时自动删除</label><p className="text-xs text-muted-foreground">仅删除按此预设导入的自动采购账号。</p></div>
+                  <Switch id="auto-delete-forbidden" checked={config.autoDeleteForbidden} onCheckedChange={(checked) => updateField('autoDeleteForbidden', checked)} disabled={saveConfig.isPending} aria-label="403 时自动删除" />
+                </div>
                 <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
                   <Field label="单次最小购买量"><Input type="number" min={1} value={numericDrafts.minPurchase} onChange={(event) => updateNumericDraft('minPurchase', event.target.value)} disabled={saveConfig.isPending} /></Field>
                   <Field label="单次最大购买量"><Input type="number" min={1} value={numericDrafts.maxPurchase} onChange={(event) => updateNumericDraft('maxPurchase', event.target.value)} disabled={saveConfig.isPending} /></Field>
                   <Field label="API Region"><Input value={config.apiRegion} onChange={(event) => updateField('apiRegion', event.target.value)} disabled={saveConfig.isPending} /></Field>
-                  <Field label="RPM"><Input type="number" min={0} value={numericDrafts.rpmLimit} onChange={(event) => updateNumericDraft('rpmLimit', event.target.value)} disabled={saveConfig.isPending} /></Field>
+                  <Field label="自动采购 RPM 预设"><Input type="number" min={0} value={numericDrafts.rpmLimit} onChange={(event) => updateNumericDraft('rpmLimit', event.target.value)} disabled={saveConfig.isPending} /></Field>
                   <Field label="Priority"><Input type="number" min={0} value={numericDrafts.priority} onChange={(event) => updateNumericDraft('priority', event.target.value)} disabled={saveConfig.isPending} /></Field>
                   <Field label="Source Channel"><Input value={config.sourceChannel} onChange={(event) => updateField('sourceChannel', event.target.value)} disabled={saveConfig.isPending} /></Field>
                 </div>
                 <div className="grid gap-3 sm:grid-cols-2">
-                  <Field label="Groups（逗号分隔）"><Input value={groupsText} onChange={(event) => setGroupsText(event.target.value)} disabled={saveConfig.isPending} /></Field>
+                  <Field label="自动采购分组预设"><GroupMultiSelect value={config.groups} options={groupOptions} onChange={(groups) => updateField('groups', groups)} disabled={saveConfig.isPending} /></Field>
                   <Field label="Nickname Prefix"><Input value={config.nicknamePrefix} onChange={(event) => updateField('nicknamePrefix', event.target.value)} disabled={saveConfig.isPending} /></Field>
                 </div>
                 {!configNumbersValid && <p className="text-xs text-destructive">购买量需为正整数，且最小值不能大于最大值；RPM 和 Priority 需为非负整数。</p>}
