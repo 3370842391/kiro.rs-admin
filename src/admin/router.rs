@@ -482,6 +482,7 @@ mod tests {
         assert_eq!(accepted.status(), StatusCode::ACCEPTED);
 
         let duplicate = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -493,6 +494,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(duplicate.status(), StatusCode::OK);
+
+        let test_event = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"event":"test","event_id":"dddddddddddddddddddddddddddddddd","message":"Webhook test"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(test_event.status(), StatusCode::ACCEPTED);
     }
 
     #[tokio::test]

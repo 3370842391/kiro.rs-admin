@@ -57,6 +57,10 @@ pub enum IncomingWebhook {
         message: String,
         dead: u32,
     },
+    Test {
+        event_id: String,
+        message: String,
+    },
 }
 
 impl IncomingWebhook {
@@ -89,6 +93,7 @@ impl IncomingWebhook {
                 message,
                 dead: required_quantity(object, "dead")?,
             }),
+            "test" => Ok(Self::Test { event_id, message }),
             _ => Err(SupplierServiceError::InvalidPayload),
         }
     }
@@ -117,6 +122,13 @@ impl IncomingWebhook {
                 purchase_order_id: None,
                 message: Some(message),
                 quantity: i64::from(dead),
+            },
+            Self::Test { event_id, message } => IncomingSupplierEvent {
+                event_id,
+                event_type: "test".to_string(),
+                purchase_order_id: None,
+                message: Some(message),
+                quantity: 0,
             },
         }
     }
@@ -544,7 +556,7 @@ impl KeySupplierService {
         &self,
         event: &StoredSupplierEvent,
     ) -> Result<ProcessAction, SupplierServiceError> {
-        if event.event_type == "all_keys_dead" {
+        if matches!(event.event_type.as_str(), "all_keys_dead" | "test") {
             return Ok(ProcessAction::Complete(empty_summary()));
         }
 
@@ -1031,7 +1043,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_both_supported_webhook_events() {
+    fn parses_all_supported_webhook_events() {
         let new_keys = IncomingWebhook::parse(
             format!(
                 r#"{{"event":"new_keys_available","event_id":"{EVENT_ID}","purchase_order_id":"{ORDER_ID}","message":"ready","new_keys":3}}"#
@@ -1052,6 +1064,13 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(dead, IncomingWebhook::AllKeysDead { dead: 2, .. }));
+
+        let test = IncomingWebhook::parse(
+            format!(r#"{{"event":"test","event_id":"{EVENT_ID}","message":"test"}}"#)
+                .as_bytes(),
+        )
+        .unwrap();
+        assert!(matches!(test, IncomingWebhook::Test { .. }));
     }
 
     #[test]
