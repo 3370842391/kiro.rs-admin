@@ -45,4 +45,26 @@ describe('key supplier management UI contract', () => {
     expect(page).not.toContain('item.keys')
     expect(page).not.toMatch(/purchased(?:Keys|Key|_keys)\s*[:.[]/)
   })
+
+  test('page exposes a retryable configuration error and safe supplier summary', async () => {
+    const page = await readSource('components/key-supplier-page.tsx')
+
+    expect(page).toContain('configQuery.isError')
+    expect(page).toContain('extractErrorMessage(configQuery.error)')
+    expect(page).toContain('configQuery.refetch')
+    expect(page).toContain('apiKeyConfigured')
+    expect(page).toContain('webhookTokenConfigured')
+    expect(page).toContain('purchaseResultSummary')
+  })
+
+  test('page uses supplier eventId for notification baselines and displays safe event metadata', async () => {
+    const page = await readSource('components/key-supplier-page.tsx')
+
+    expect(page).toContain('seenEventIds')
+    expect(page).toContain('previousEvents.current === null')
+    expect(page).toContain('seenEventIds.current.add(event.eventId)')
+    expect(page).toContain('event.eventId')
+    expect(page).toContain('event.purchaseOrderId')
+    expect(page).not.toContain('#${event.id}')
+  })
 })

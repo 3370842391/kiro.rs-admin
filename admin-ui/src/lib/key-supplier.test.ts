@@ -99,4 +99,11 @@ describe('key supplier helpers', () => {
     expect(hasUnreadSupplierEvents(previous, page([event(2, '2026-07-24T00:01:00Z')]))).toBe(false)
     expect(hasUnreadSupplierEvents(previous, page([event(1)]))).toBe(false)
   })
+
+  test('identifies new unread events by supplier eventId instead of database id', () => {
+    const previous = page([event(7)])
+    const repeatedDatabaseId = { ...event(7), eventId: 'supplier-event-replayed' }
+
+    expect(hasUnreadSupplierEvents(previous, page([repeatedDatabaseId]))).toBe(true)
+  })
 })

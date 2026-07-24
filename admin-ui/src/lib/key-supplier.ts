@@ -54,8 +54,8 @@ export function hasUnreadSupplierEvents(
 ): boolean {
   if (!previous) return false
 
-  const previousIds = new Set(getSupplierEvents(previous).map((event) => event.id))
+  const previousEventIds = new Set(getSupplierEvents(previous).map((event) => event.eventId))
   return getSupplierEvents(current).some(
-    (event) => !previousIds.has(event.id) && event.readAt === null,
+    (event) => !previousEventIds.has(event.eventId) && event.readAt === null,
   )
 }

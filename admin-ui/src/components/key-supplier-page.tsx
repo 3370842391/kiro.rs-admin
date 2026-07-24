@@ -68,7 +68,7 @@ export function KeySupplierPage() {
   const [before, setBefore] = useState<number | undefined>()
   const [previousCursors, setPreviousCursors] = useState<Array<number | undefined>>([])
   const previousEvents = useRef<readonly SupplierEvent[] | null>(null)
-  const notifiedEventIds = useRef(new Set<number>())
+  const seenEventIds = useRef(new Set<string>())
 
   const configQuery = useQuery({ queryKey: ['supplier-config'], queryFn: getSupplierConfig })
   const overviewQuery = useQuery({
@@ -104,15 +104,25 @@ export function KeySupplierPage() {
   useEffect(() => {
     const current = eventsQuery.data?.items
     if (!current) return
-    const previous = previousEvents.current
-    if (before === undefined && hasUnreadSupplierEvents(previous, current)) {
-      current.forEach((event) => {
-        if (event.readAt === null && !notifiedEventIds.current.has(event.id)) {
-          notifiedEventIds.current.add(event.id)
-          toast.info('收到新的供应商事件', { description: `${event.eventType} · #${event.id}` })
-        }
-      })
+
+    if (before !== undefined) {
+      current.forEach((event) => seenEventIds.current.add(event.eventId))
+      return
     }
+
+    if (previousEvents.current === null) {
+      current.forEach((event) => seenEventIds.current.add(event.eventId))
+      previousEvents.current = current
+      return
+    }
+
+    const hasNewUnread = hasUnreadSupplierEvents(previousEvents.current, current)
+    current.forEach((event) => {
+      if (hasNewUnread && event.readAt === null && !seenEventIds.current.has(event.eventId)) {
+        toast.info('收到新的供应商事件', { description: `${event.eventType} · ${event.eventId}` })
+      }
+      seenEventIds.current.add(event.eventId)
+    })
     previousEvents.current = current
   }, [before, eventsQuery.data])
 
@@ -194,6 +204,7 @@ export function KeySupplierPage() {
   }
   const rows = eventsQuery.data?.items ?? []
   const showNext = rows.length === EVENT_PAGE_SIZE
+  const purchaseResultSummary = '购买结果只显示计数，不展示 Key。'
 
   return (
     <div className="space-y-5">
@@ -236,8 +247,24 @@ export function KeySupplierPage() {
             <CardDescription>留空的 secret 不会覆盖服务端现有值。</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
-            {configQuery.isLoading || !config ? <div className="py-4 text-sm text-muted-foreground">加载配置中...</div> : (
+            {configQuery.isLoading ? <div className="py-4 text-sm text-muted-foreground">加载配置中...</div> : configQuery.isError ? (
+              <div className="flex flex-wrap items-center gap-3 py-4 text-sm text-destructive">
+                <span>{extractErrorMessage(configQuery.error)}</span>
+                <Button size="sm" variant="outline" onClick={() => configQuery.refetch()} disabled={configQuery.isFetching}>
+                  <RefreshCw className={`h-3.5 w-3.5 ${configQuery.isFetching ? 'animate-spin' : ''}`} />
+                  重试加载
+                </Button>
+              </div>
+            ) : !config ? <div className="py-4 text-sm text-muted-foreground">暂未获取配置。</div> : (
               <>
+                <div className="border border-border/50 bg-secondary/20 p-3 text-xs">
+                  <div className="font-medium text-foreground">安全摘要</div>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    <Badge variant={configQuery.data?.apiKeyConfigured ? 'success' : 'secondary'}>API Key {configQuery.data?.apiKeyConfigured ? '已配置' : '未配置'}</Badge>
+                    <Badge variant={configQuery.data?.webhookTokenConfigured ? 'success' : 'secondary'}>Webhook Token {configQuery.data?.webhookTokenConfigured ? '已配置' : '未配置'}</Badge>
+                  </div>
+                  <p className="mt-2 text-muted-foreground">{purchaseResultSummary}</p>
+                </div>
                 <div className="grid gap-3 sm:grid-cols-2">
                   <Field label="Supplier Base URL"><Input value={config.baseUrl} onChange={(event) => updateField('baseUrl', event.target.value)} disabled={saveConfig.isPending} /></Field>
                   <Field label="Public Base URL"><Input value={config.publicBaseUrl} onChange={(event) => updateField('publicBaseUrl', event.target.value)} disabled={saveConfig.isPending} /></Field>
@@ -271,7 +298,7 @@ export function KeySupplierPage() {
 
         <div className="space-y-5">
           <Card>
-            <CardHeader className="pb-3"><CardTitle>手动购买</CardTitle><CardDescription>仅展示采购与导入计数，不展示任何 Key 内容。</CardDescription></CardHeader>
+            <CardHeader className="pb-3"><CardTitle>手动购买</CardTitle><CardDescription>{purchaseResultSummary}</CardDescription></CardHeader>
             <CardContent className="flex flex-wrap items-end gap-3">
               <Field label="购买数量" className="w-full sm:w-40"><Input type="number" min={1} value={purchaseCount} onChange={(event) => setPurchaseCount(Math.max(1, Number(event.target.value)))} disabled={purchase.isPending} /></Field>
               <Button onClick={() => purchase.mutate(purchaseCount)} disabled={purchase.isPending}><PackagePlus className="h-3.5 w-3.5" />购买</Button>
@@ -297,7 +324,7 @@ export function KeySupplierPage() {
             const retryable = event.status === 'failed' || event.status === 'skipped'
             return <div key={event.id} className={`grid gap-2 border border-border/50 p-3 sm:grid-cols-[auto_minmax(0,1fr)_auto] sm:items-center ${event.readAt === null ? 'border-primary/40 bg-primary/[0.03]' : ''}`}>
               <Checkbox checked={selectedIds.includes(event.id)} onCheckedChange={(checked) => toggleSelected(event.id, checked === true)} aria-label={`选择事件 ${event.id}`} />
-              <div className="min-w-0 space-y-1"><div className="flex flex-wrap items-center gap-2"><span className="font-mono text-xs text-muted-foreground">#{event.id}</span><Badge variant={eventBadgeVariant(event.status)}>{getSupplierEventStatusLabel(event.status)}</Badge><span className="min-w-0 break-all text-sm font-medium">{event.eventType}</span><Badge variant="outline">{event.readAt === null ? '未读' : '已读'}</Badge></div><div className="break-words text-xs text-muted-foreground">{eventDetail(event)} · 尝试 {event.attempts} · {formatTime(event.receivedAt)}</div>{event.message && <div className="break-words text-xs text-muted-foreground">{event.message}</div>}{event.lastError && <div className="break-words text-xs text-destructive">{event.lastError}</div>}</div>
+              <div className="min-w-0 space-y-1"><div className="flex flex-wrap items-center gap-2"><span className="break-all font-mono text-xs text-muted-foreground">{event.eventId}</span><Badge variant={eventBadgeVariant(event.status)}>{getSupplierEventStatusLabel(event.status)}</Badge><span className="min-w-0 break-all text-sm font-medium">{event.eventType}</span><Badge variant="outline">{event.readAt === null ? '未读' : '已读'}</Badge></div><div className="break-words text-xs text-muted-foreground">{eventDetail(event)} · 尝试 {event.attempts} · {formatTime(event.receivedAt)}</div>{event.purchaseOrderId && <div className="break-all text-xs text-muted-foreground">订单 ID：{event.purchaseOrderId}</div>}{event.message && <div className="break-words text-xs text-muted-foreground">{event.message}</div>}{event.lastError && <div className="break-words text-xs text-destructive">{event.lastError}</div>}</div>
               {retryable && <Button size="sm" variant="outline" onClick={() => retryEvent.mutate(event.id)} disabled={retryEvent.isPending}><RotateCcw className="h-3.5 w-3.5" />重试</Button>}
             </div>
           })}
