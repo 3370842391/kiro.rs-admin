@@ -15,6 +15,7 @@ use axum::{
 use super::client_keys::SharedClientKeyManager;
 use super::error_snapshot_db::SharedErrorSnapshotStore;
 use super::groups::SharedGroupManager;
+use super::key_supplier::service::KeySupplierService;
 use super::service::AdminService;
 use super::trace_db::SharedTraceStore;
 use super::types::AdminErrorResponse;
@@ -40,6 +41,8 @@ pub struct AdminState {
     pub groups: SharedGroupManager,
     /// 模型映射注册表（持久化到 model_mappings.json，与 anthropic 路由共享）
     pub model_mappings: super::model_mapping::SharedModelMappingManager,
+    /// 供应商自动采购服务。数据库初始化失败时为 None，相关端点返回 503。
+    pub key_supplier: Option<Arc<KeySupplierService>>,
 }
 
 impl AdminState {
@@ -53,6 +56,7 @@ impl AdminState {
         error_snapshot_store: SharedErrorSnapshotStore,
         groups: SharedGroupManager,
         model_mappings: super::model_mapping::SharedModelMappingManager,
+        key_supplier: Option<Arc<KeySupplierService>>,
     ) -> Self {
         Self {
             admin_api_key: Arc::new(RwLock::new(admin_api_key.into())),
@@ -63,6 +67,7 @@ impl AdminState {
             error_snapshot_store,
             groups,
             model_mappings,
+            key_supplier,
         }
     }
 }

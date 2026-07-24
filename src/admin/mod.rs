@@ -40,7 +40,7 @@ pub use error_snapshot_db::{ErrorSnapshotStore, SharedErrorSnapshotStore};
 pub use groups::GroupManager;
 pub use middleware::AdminState;
 pub use model_mapping::{ModelMappingManager, SharedModelMappingManager};
-pub use router::create_admin_router;
+pub use router::{create_admin_router, create_key_supplier_webhook_router};
 pub use service::AdminService;
 pub use trace_db::{SharedTraceStore, TraceStore};
 pub use usage_stats::{UsageAggregator, UsageRecorder};

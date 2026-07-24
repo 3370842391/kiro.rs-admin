@@ -1,5 +1,7 @@
 //! Admin API 路由配置
 
+use std::sync::Arc;
+
 use axum::{
     Router, middleware,
     routing::{delete, get, post, put},
@@ -37,6 +39,13 @@ use super::{
         stats_overview, stats_timeseries, sync_model_profiles, test_credential_response,
         trace_failure_stats, unpin_error_snapshot, update_admin_key, update_client_key,
         update_credential, update_group, update_refresh_token, upsert_model_mapping,
+    },
+    key_supplier::handlers::{
+        get_config as get_key_supplier_config, list_events as list_key_supplier_events,
+        mark_events_read, overview as key_supplier_overview, purchase as key_supplier_purchase,
+        put_config as put_key_supplier_config, register_webhook as register_key_supplier_webhook,
+        retry_event as retry_key_supplier_event, test_webhook as test_key_supplier_webhook,
+        webhook_router,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -179,6 +188,26 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_update_config).put(set_update_config),
         )
         .route("/config/admin-key", put(update_admin_key))
+        .route(
+            "/config/key-supplier",
+            get(get_key_supplier_config).put(put_key_supplier_config),
+        )
+        .route("/key-supplier/overview", get(key_supplier_overview))
+        .route("/key-supplier/purchase", post(key_supplier_purchase))
+        .route(
+            "/key-supplier/webhook/register",
+            post(register_key_supplier_webhook),
+        )
+        .route(
+            "/key-supplier/webhook/test",
+            post(test_key_supplier_webhook),
+        )
+        .route("/key-supplier/events", get(list_key_supplier_events))
+        .route("/key-supplier/events/read", post(mark_events_read))
+        .route(
+            "/key-supplier/events/{id}/retry",
+            post(retry_key_supplier_event),
+        )
         .route("/system/update/pull", post(pull_update_image))
         .route("/system/update/apply", post(apply_image_update))
         .route("/system/update/rollback", post(rollback_image_update))
@@ -265,15 +294,26 @@ pub fn create_admin_router(state: AdminState) -> Router {
             admin_auth_middleware,
         ));
 
-    Router::new().merge(authenticated).with_state(state)
+    authenticated
+        .with_state(state.clone())
+        .merge(webhook_router(state.key_supplier.clone()))
+}
+
+/// 公开 webhook 子路由。用于未配置 Admin API Key 时仍可接收供应商回调。
+pub fn create_key_supplier_webhook_router(
+    service: Option<Arc<super::key_supplier::service::KeySupplierService>>,
+) -> Router {
+    webhook_router(service)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::{future::Future, pin::Pin};
 
     use axum::{
+        Json,
         body::{Body, to_bytes},
         http::{Request, StatusCode, header},
     };
@@ -282,7 +322,13 @@ mod tests {
     use crate::{
         admin::{
             AdminService, ClientKeyManager, ErrorSnapshotStore, GroupManager, ModelMappingManager,
-            TraceStore, UsageAggregator, error_snapshot_db::ErrorSnapshotPolicy,
+            TraceStore, UsageAggregator,
+            error_snapshot_db::ErrorSnapshotPolicy,
+            key_supplier::{
+                config::SupplierRuntimeConfig,
+                service::{CredentialImporter, KeySupplierService},
+                store::{IncomingSupplierEvent, SupplierEventStore},
+            },
             proxy_pool::ProxyPoolManager,
         },
         kiro::{model::credentials::KiroCredentials, token_manager::MultiTokenManager},
@@ -316,9 +362,448 @@ mod tests {
             ),
             Arc::new(GroupManager::new()),
             Arc::new(ModelMappingManager::new()),
+            None,
         );
 
         create_admin_router(state)
+    }
+
+    fn key_supplier_test_app() -> (Router, String, Arc<KeySupplierService>) {
+        let token = "a".repeat(64);
+        let runtime = SupplierRuntimeConfig {
+            base_url: String::new(),
+            api_key: "supplier-api-key-canary".to_string(),
+            public_base_url: "https://public.example".to_string(),
+            webhook_token: token.clone(),
+            auto_purchase: false,
+            min_purchase: 1,
+            max_purchase: 10,
+            api_region: "us-east-1".to_string(),
+            rpm_limit: 0,
+            priority: 0,
+            groups: Vec::new(),
+            source_channel: "supplier".to_string(),
+            nickname_prefix: "supplier".to_string(),
+        };
+        let supplier = Arc::new(KeySupplierService::new(
+            Arc::new(SupplierEventStore::open_in_memory().unwrap()),
+            runtime,
+        ));
+
+        let app = key_supplier_admin_app(supplier.clone());
+        (app, token, supplier)
+    }
+
+    fn key_supplier_admin_app(supplier: Arc<KeySupplierService>) -> Router {
+        let credentials = vec![KiroCredentials {
+            id: Some(1),
+            rpm_limit: 10,
+            ..Default::default()
+        }];
+        let token_manager = Arc::new(
+            MultiTokenManager::new(Config::default(), credentials, None, None, true).unwrap(),
+        );
+        let service = AdminService::new(
+            token_manager,
+            Vec::new(),
+            Arc::new(ProxyPoolManager::new(None, TlsBackend::Rustls)),
+        );
+        let config = Config::default();
+        let state = AdminState::new(
+            "test-admin-key",
+            service,
+            Arc::new(ClientKeyManager::new()),
+            Arc::new(UsageAggregator::new()),
+            Arc::new(TraceStore::open_in_memory().unwrap()),
+            Arc::new(
+                ErrorSnapshotStore::open_in_memory(ErrorSnapshotPolicy::from_config(&config))
+                    .unwrap(),
+            ),
+            Arc::new(GroupManager::new()),
+            Arc::new(ModelMappingManager::new()),
+            Some(supplier.clone()),
+        );
+        Router::new().nest("/api/admin", create_admin_router(state))
+    }
+
+    struct AcceptingImporter;
+
+    impl CredentialImporter for AcceptingImporter {
+        fn import(
+            &self,
+            _: KiroCredentials,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    async fn purchase_supplier_server() -> String {
+        let app = Router::new().route(
+            "/api/my/purchase",
+            post(|Json(request): Json<serde_json::Value>| async move {
+                Json(serde_json::json!({
+                    "client_order_id": request["client_order_id"],
+                    "purchased": 1,
+                    "remaining": 4,
+                    "keys": [{"key": "ksk_purchase_canary"}],
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{address}")
+    }
+
+    fn webhook_body(event_id: &str) -> String {
+        format!(
+            r#"{{"event":"new_keys_available","event_id":"{event_id}","purchase_order_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","message":"available","new_keys":1}}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn key_supplier_router_webhook_is_public_and_deduplicates() {
+        let (app, token, _) = key_supplier_test_app();
+        let path = format!("/api/admin/key-supplier/webhook/{token}");
+        let body = webhook_body("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+        let accepted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&path)
+                    .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+
+        let duplicate = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(duplicate.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn key_supplier_router_rejects_invalid_webhook_requests() {
+        let (app, token, _) = key_supplier_test_app();
+        let path = format!("/api/admin/key-supplier/webhook/{token}");
+
+        let wrong_token = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/key-supplier/webhook/not-the-real-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(webhook_body("cccccccccccccccccccccccccccccccc")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            wrong_token.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::NOT_FOUND
+        ));
+
+        let malformed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+
+        let wrong_content_type = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&path)
+                    .header(header::CONTENT_TYPE, "text/plain")
+                    .body(Body::from(webhook_body("dddddddddddddddddddddddddddddddd")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            wrong_content_type.status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+
+        let too_large = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(vec![b'x'; 64 * 1024 + 1]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(too_large.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn key_supplier_admin_routes_require_admin_key() {
+        let (app, _, _) = key_supplier_test_app();
+        for (method, path) in [
+            ("GET", "/api/admin/config/key-supplier"),
+            ("PUT", "/api/admin/config/key-supplier"),
+            ("GET", "/api/admin/key-supplier/overview"),
+            ("POST", "/api/admin/key-supplier/purchase"),
+            ("POST", "/api/admin/key-supplier/webhook/register"),
+            ("POST", "/api/admin/key-supplier/webhook/test"),
+            ("GET", "/api/admin/key-supplier/events"),
+            ("POST", "/api/admin/key-supplier/events/read"),
+            ("POST", "/api/admin/key-supplier/events/1/retry"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn key_supplier_admin_routes_map_config_events_read_retry_and_purchase() {
+        let (app, token, supplier) = key_supplier_test_app();
+        let authorized = |method: &str, path: &str, body: Body| {
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header("x-api-key", "test-admin-key")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(body)
+                .unwrap()
+        };
+
+        let config = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                "/api/admin/config/key-supplier",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(config.status(), StatusCode::OK);
+        let config_body = to_bytes(config.into_body(), usize::MAX).await.unwrap();
+        let config_json: serde_json::Value = serde_json::from_slice(&config_body).unwrap();
+        assert_eq!(config_json["apiKeyConfigured"], true);
+        assert!(config_json.get("apiKey").is_none());
+        assert!(config_json.get("webhookToken").is_none());
+
+        let events = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                "/api/admin/key-supplier/events?limit=1",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(events.status(), StatusCode::OK);
+
+        let webhook = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/admin/key-supplier/webhook/{token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(webhook_body("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(webhook.status(), StatusCode::ACCEPTED);
+
+        let events = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                "/api/admin/key-supplier/events?limit=1",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let events_body = to_bytes(events.into_body(), usize::MAX).await.unwrap();
+        let event_id = serde_json::from_slice::<serde_json::Value>(&events_body).unwrap()["items"]
+            [0]["id"]
+            .as_i64()
+            .unwrap();
+        let read = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/api/admin/key-supplier/events/read",
+                Body::from(format!(r#"{{"ids":[{event_id}],"markAll":false}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(read.status(), StatusCode::OK);
+
+        let failed = supplier
+            .store()
+            .insert_event(IncomingSupplierEvent {
+                event_id: "ffffffffffffffffffffffffffffffff".to_string(),
+                event_type: "new_keys_available".to_string(),
+                purchase_order_id: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()),
+                message: None,
+                quantity: 1,
+            })
+            .unwrap();
+        let failed_id = match failed {
+            crate::admin::key_supplier::store::InsertOutcome::Inserted(event) => event.id,
+            crate::admin::key_supplier::store::InsertOutcome::Duplicate(_) => unreachable!(),
+        };
+        let claimed = supplier
+            .store()
+            .claim_by_event_id("ffffffffffffffffffffffffffffffff")
+            .unwrap()
+            .unwrap();
+        supplier
+            .store()
+            .fail(claimed.id, "temporary failure")
+            .unwrap();
+        assert_eq!(claimed.id, failed_id);
+        let retry = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                &format!("/api/admin/key-supplier/events/{failed_id}/retry"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(retry.status(), StatusCode::OK);
+
+        let invalid_read = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/api/admin/key-supplier/events/read",
+                Body::from(r#"{"ids":[],"markAll":false}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid_read.status(), StatusCode::BAD_REQUEST);
+
+        let invalid_retry = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/api/admin/key-supplier/events/999/retry",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid_retry.status(), StatusCode::NOT_FOUND);
+
+        let invalid_purchase = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/api/admin/key-supplier/purchase",
+                Body::from(r#"{"count":0}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid_purchase.status(), StatusCode::BAD_REQUEST);
+
+        let invalid_config = app
+            .clone()
+            .oneshot(authorized(
+                "PUT",
+                "/api/admin/config/key-supplier",
+                Body::from(r#"{"baseUrl":"","publicBaseUrl":"","autoPurchase":false,"minPurchase":1,"maxPurchase":10,"apiRegion":"us-east-1","rpmLimit":0,"priority":0,"groups":[],"sourceChannel":"supplier","nicknamePrefix":"supplier"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid_config.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let invalid_events = app
+            .oneshot(authorized(
+                "GET",
+                "/api/admin/key-supplier/events?limit=0",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid_events.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn key_supplier_purchase_route_returns_summary_without_supplier_keys() {
+        let token = "c".repeat(64);
+        let store = Arc::new(SupplierEventStore::open_in_memory().unwrap());
+        let service = Arc::new(KeySupplierService::with_importer(
+            store,
+            SupplierRuntimeConfig {
+                base_url: purchase_supplier_server().await,
+                api_key: "supplier-api-key-canary".to_string(),
+                public_base_url: "https://public.example".to_string(),
+                webhook_token: token,
+                auto_purchase: false,
+                min_purchase: 1,
+                max_purchase: 10,
+                api_region: "us-east-1".to_string(),
+                rpm_limit: 0,
+                priority: 0,
+                groups: Vec::new(),
+                source_channel: "supplier".to_string(),
+                nickname_prefix: "supplier".to_string(),
+            },
+            Arc::new(AcceptingImporter),
+        ));
+        let response = key_supplier_admin_app(service)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/key-supplier/purchase")
+                    .header("x-api-key", "test-admin-key")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"count":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let encoded = String::from_utf8(body.to_vec()).unwrap();
+        assert!(encoded.contains("\"purchased\":1"));
+        assert!(!encoded.contains("ksk_purchase_canary"));
     }
 
     #[tokio::test]
