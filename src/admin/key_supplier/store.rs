@@ -107,8 +107,8 @@ pub struct StoredSupplierEvent {
     pub status: SupplierEventStatus,
     pub attempts: i64,
     pub last_error: Option<String>,
-    pub purchased: bool,
-    pub imported: bool,
+    pub purchased_count: i64,
+    pub imported_count: i64,
     pub duplicate_count: i64,
     pub failed_count: i64,
     pub read_at: Option<String>,
@@ -117,8 +117,10 @@ pub struct StoredSupplierEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessSummary {
-    pub purchased: bool,
-    pub imported: bool,
+    pub purchased_count: i64,
+    pub imported_count: i64,
+    pub duplicate_count: i64,
+    pub failed_count: i64,
     pub message: Option<String>,
 }
 
@@ -187,13 +189,7 @@ impl SupplierEventStore {
         if inserted == 1 {
             Ok(InsertOutcome::Inserted(stored))
         } else {
-            conn.execute(
-                "UPDATE supplier_events SET duplicate_count = duplicate_count + 1 WHERE event_id = ?1",
-                params![event.event_id],
-            )?;
-            Ok(InsertOutcome::Duplicate(
-                Self::query_by_event_id(&conn, &event.event_id)?.unwrap(),
-            ))
+            Ok(InsertOutcome::Duplicate(stored))
         }
     }
 
@@ -211,25 +207,42 @@ impl SupplierEventStore {
             tx.commit()?;
             return Ok(None);
         };
-        let now = Utc::now().to_rfc3339();
-        tx.execute(
-            "UPDATE supplier_events SET status='processing', attempts=attempts+1, processing_started_at=?1 WHERE id=?2 AND status='received'",
-            params![now, id],
-        )?;
-        let stored = Self::query_by_id(&tx, id)?.expect("claimed event must exist");
+        let stored = Self::claim_in_transaction(&tx, id)?;
         tx.commit()?;
-        Ok(Some(stored))
+        Ok(stored)
+    }
+
+    pub fn claim_by_event_id(
+        &self,
+        event_id: &str,
+    ) -> rusqlite::Result<Option<StoredSupplierEvent>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let id: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM supplier_events WHERE event_id=?1 AND status='received'",
+                params![event_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let stored = match id {
+            Some(id) => Self::claim_in_transaction(&tx, id)?,
+            None => None,
+        };
+        tx.commit()?;
+        Ok(stored)
     }
 
     pub fn complete(&self, id: i64, summary: ProcessSummary) -> rusqlite::Result<()> {
         self.transition_processing(
             id,
             "succeeded",
-            summary
-                .message
-                .map(|value| truncate_chars(&value, MAX_MESSAGE_CHARS)),
-            summary.purchased,
-            summary.imported,
+            ProcessSummary {
+                message: summary
+                    .message
+                    .map(|value| truncate_chars(&value, MAX_MESSAGE_CHARS)),
+                ..summary
+            },
         )
     }
 
@@ -237,14 +250,28 @@ impl SupplierEventStore {
         self.transition_processing(
             id,
             "skipped",
-            message.map(|value| truncate_chars(value, MAX_MESSAGE_CHARS)),
-            false,
-            false,
+            ProcessSummary {
+                purchased_count: 0,
+                imported_count: 0,
+                duplicate_count: 0,
+                failed_count: 0,
+                message: message.map(|value| truncate_chars(value, MAX_MESSAGE_CHARS)),
+            },
         )
     }
 
     pub fn fail(&self, id: i64, error: &str) -> rusqlite::Result<()> {
-        self.transition_processing(id, "failed", Some(truncate_chars(error, 300)), false, false)
+        self.transition_processing(
+            id,
+            "failed",
+            ProcessSummary {
+                purchased_count: 0,
+                imported_count: 0,
+                duplicate_count: 0,
+                failed_count: 1,
+                message: Some(truncate_chars(error, 300)),
+            },
+        )
     }
 
     pub fn retry(&self, id: i64) -> rusqlite::Result<()> {
@@ -318,17 +345,23 @@ impl SupplierEventStore {
         &self,
         id: i64,
         status: &str,
-        message: Option<String>,
-        purchased: bool,
-        imported: bool,
+        summary: ProcessSummary,
     ) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         let changed = conn.execute(
             "UPDATE supplier_events SET status=?1, message=COALESCE(?2,message), purchased=?3, imported=?4,
-             last_error=CASE WHEN ?1='failed' THEN ?2 ELSE last_error END, processing_started_at=NULL,
-             failed_count=CASE WHEN ?1='failed' THEN failed_count+1 ELSE failed_count END
-             WHERE id=?5 AND status='processing'",
-            params![status, message, purchased, imported, id],
+             duplicate_count=?5, failed_count=?6,
+             last_error=CASE WHEN ?1='failed' THEN ?2 ELSE last_error END, processing_started_at=NULL
+             WHERE id=?7 AND status='processing'",
+            params![
+                status,
+                summary.message,
+                summary.purchased_count,
+                summary.imported_count,
+                summary.duplicate_count,
+                summary.failed_count,
+                id
+            ],
         )?;
         if changed == 1 {
             Ok(())
@@ -363,13 +396,31 @@ impl SupplierEventStore {
             status: SupplierEventStatus::from_db(&row.get::<_, String>(7)?, 7)?,
             attempts: row.get(8)?,
             last_error: row.get(9)?,
-            purchased: row.get(10)?,
-            imported: row.get(11)?,
+            purchased_count: row.get(10)?,
+            imported_count: row.get(11)?,
             duplicate_count: row.get(12)?,
             failed_count: row.get(13)?,
             read_at: row.get(14)?,
             processing_started_at: row.get(15)?,
         })
+    }
+
+    fn claim_in_transaction(
+        tx: &rusqlite::Transaction<'_>,
+        id: i64,
+    ) -> rusqlite::Result<Option<StoredSupplierEvent>> {
+        let now = Utc::now().to_rfc3339();
+        let changed = tx.execute(
+            "UPDATE supplier_events SET status='processing', attempts=attempts+1, processing_started_at=?1 WHERE id=?2 AND status='received'",
+            params![now, id],
+        )?;
+        if changed == 1 {
+            Ok(Some(
+                Self::query_by_id(tx, id)?.expect("claimed event must exist"),
+            ))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -466,8 +517,8 @@ mod tests {
         assert_eq!(page.items[0].event_id, "legacy-1");
         assert_eq!(page.items[0].quantity, 0);
         assert_eq!(page.items[0].attempts, 0);
-        assert!(!page.items[0].purchased);
-        assert!(!page.items[0].imported);
+        assert_eq!(page.items[0].purchased_count, 0);
+        assert_eq!(page.items[0].imported_count, 0);
         assert_eq!(store.claim_next().unwrap().unwrap().event_id, "legacy-1");
 
         let _ = std::fs::remove_file(path);
@@ -554,8 +605,10 @@ mod tests {
             .complete(
                 claimed.id,
                 ProcessSummary {
-                    purchased: false,
-                    imported: false,
+                    purchased_count: 0,
+                    imported_count: 0,
+                    duplicate_count: 0,
+                    failed_count: 0,
                     message: Some(complete_message),
                 },
             )
@@ -601,7 +654,9 @@ mod tests {
             store.insert_event(event("a")).unwrap(),
             InsertOutcome::Duplicate(_)
         ));
-        assert_eq!(store.list(10, None).unwrap().items.len(), 1);
+        let items = store.list(10, None).unwrap().items;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].duplicate_count, 0);
     }
 
     #[test]
@@ -619,6 +674,43 @@ mod tests {
     }
 
     #[test]
+    fn complete_persists_all_processing_counts_atomically() {
+        let store = SupplierEventStore::open_in_memory().unwrap();
+        store.insert_event(event("counts")).unwrap();
+        let claimed = store.claim_next().unwrap().unwrap();
+
+        store
+            .complete(
+                claimed.id,
+                ProcessSummary {
+                    purchased_count: 3,
+                    imported_count: 1,
+                    duplicate_count: 1,
+                    failed_count: 1,
+                    message: None,
+                },
+            )
+            .unwrap();
+
+        let stored = store.list(1, None).unwrap().items.remove(0);
+        assert_eq!(stored.purchased_count, 3);
+        assert_eq!(stored.imported_count, 1);
+        assert_eq!(stored.duplicate_count, 1);
+        assert_eq!(stored.failed_count, 1);
+    }
+
+    #[test]
+    fn claim_by_event_id_only_claims_received_event() {
+        let store = SupplierEventStore::open_in_memory().unwrap();
+        store.insert_event(event("a")).unwrap();
+
+        let claimed = store.claim_by_event_id("a").unwrap().unwrap();
+        assert_eq!(claimed.status, SupplierEventStatus::Processing);
+        assert_eq!(claimed.attempts, 1);
+        assert!(store.claim_by_event_id("a").unwrap().is_none());
+    }
+
+    #[test]
     fn state_transitions_retry_and_stale_recovery_are_restricted() {
         let store = SupplierEventStore::open_in_memory().unwrap();
         store.insert_event(event("a")).unwrap();
@@ -627,8 +719,10 @@ mod tests {
             .complete(
                 claimed.id,
                 ProcessSummary {
-                    purchased: true,
-                    imported: true,
+                    purchased_count: 1,
+                    imported_count: 1,
+                    duplicate_count: 0,
+                    failed_count: 0,
                     message: None,
                 },
             )
