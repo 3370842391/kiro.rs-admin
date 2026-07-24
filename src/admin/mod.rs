@@ -23,6 +23,7 @@ pub mod error_snapshot_db;
 pub mod error_snapshot_maintenance;
 pub mod groups;
 mod handlers;
+pub mod key_supplier;
 mod middleware;
 pub mod model_mapping;
 pub mod model_profile_sync;
