@@ -162,8 +162,8 @@ mod tests {
             webhook_url: "https://canary.invalid/hook?secret=canary".into(),
         };
         let mut extra = serde_json::Map::new();
-        extra.insert("ksk".into(), serde_json::json!("ksk_secret"));
-        extra.insert("usr".into(), serde_json::json!("usr_secret"));
+        extra.insert("ksk_secret".into(), serde_json::json!("ksk_value"));
+        extra.insert("usr_secret".into(), serde_json::json!("usr_value"));
         let status = SupplierStatus {
             keys_active: 1,
             keys_dead: 0,
@@ -600,7 +600,6 @@ impl fmt::Debug for SupplierStatus {
             .field("keys_dead", &self.keys_dead)
             .field("keys_stock", &self.keys_stock)
             .field("generating", &self.generating)
-            .field("extra_keys", &self.extra.keys().collect::<Vec<_>>())
             .field("extra_count", &self.extra.len())
             .finish()
     }
