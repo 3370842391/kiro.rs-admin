@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, types::Type, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::Type};
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS supplier_events (
@@ -23,9 +23,26 @@ CREATE TABLE IF NOT EXISTS supplier_events (
     read_at TEXT,
     processing_started_at TEXT
 );
+"#;
+
+const INDEXES: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_supplier_events_queue ON supplier_events(status, id);
 CREATE INDEX IF NOT EXISTS idx_supplier_events_read ON supplier_events(read_at);
 "#;
+
+const MIGRATION_COLUMNS: &[(&str, &str)] = &[
+    ("purchase_order_id", "TEXT"),
+    ("message", "TEXT"),
+    ("quantity", "INTEGER NOT NULL DEFAULT 0"),
+    ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+    ("last_error", "TEXT"),
+    ("purchased", "INTEGER NOT NULL DEFAULT 0"),
+    ("imported", "INTEGER NOT NULL DEFAULT 0"),
+    ("duplicate_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("failed_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("read_at", "TEXT"),
+    ("processing_started_at", "TEXT"),
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SupplierEventStatus {
@@ -129,7 +146,7 @@ impl SupplierEventStore {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.execute_batch(SCHEMA)?;
+        initialize_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -137,7 +154,7 @@ impl SupplierEventStore {
 
     pub fn open_in_memory() -> rusqlite::Result<Self> {
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch(SCHEMA)?;
+        initialize_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -342,6 +359,24 @@ impl SupplierEventStore {
     }
 }
 
+fn initialize_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(SCHEMA)?;
+    let columns: std::collections::HashSet<String> = conn
+        .prepare("PRAGMA table_info(supplier_events)")?
+        .query_map([], |row| row.get(1))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    for (name, definition) in MIGRATION_COLUMNS {
+        if !columns.contains(*name) {
+            conn.execute(
+                &format!("ALTER TABLE supplier_events ADD COLUMN {name} {definition}"),
+                [],
+            )?;
+        }
+    }
+    conn.execute_batch(INDEXES)
+}
+
 fn truncate_chars(value: &str, max: usize) -> String {
     value.chars().take(max).collect()
 }
@@ -383,6 +418,43 @@ mod tests {
             .unwrap();
         assert!(columns.contains(&"processing_started_at".to_string()));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn open_migrates_minimal_legacy_supplier_events_table() {
+        let path = std::env::temp_dir().join(format!(
+            "kiro-supplier-legacy-{}-{}.db",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE supplier_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    received_at TEXT NOT NULL,
+                    status TEXT NOT NULL
+                );
+                INSERT INTO supplier_events (event_id, event_type, received_at, status)
+                VALUES ('legacy-1', 'purchase.requested', '2026-01-01T00:00:00Z', 'received');",
+            )
+            .unwrap();
+        }
+
+        let store = SupplierEventStore::open(&path).unwrap();
+        let page = store.list(10, None).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].event_id, "legacy-1");
+        assert_eq!(page.items[0].quantity, 0);
+        assert_eq!(page.items[0].attempts, 0);
+        assert!(!page.items[0].purchased);
+        assert!(!page.items[0].imported);
+        assert_eq!(store.claim_next().unwrap().unwrap().event_id, "legacy-1");
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
