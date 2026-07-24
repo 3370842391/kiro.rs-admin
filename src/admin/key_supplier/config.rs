@@ -17,7 +17,7 @@ const MAX_PURCHASE: u64 = 10_000;
 const MAX_RPM_LIMIT: u64 = 100_000;
 const MAX_PRIORITY: u64 = u32::MAX as u64;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SupplierRuntimeConfig {
     pub base_url: String,
     pub api_key: String,
@@ -52,7 +52,7 @@ pub struct SupplierConfigView {
     pub nickname_prefix: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SupplierConfigUpdate {
     pub base_url: String,
@@ -71,6 +71,55 @@ pub struct SupplierConfigUpdate {
     pub groups: Vec<String>,
     pub source_channel: String,
     pub nickname_prefix: String,
+}
+
+impl std::fmt::Debug for SupplierRuntimeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SupplierRuntimeConfig")
+            .field("base_url", &self.base_url)
+            .field("api_key_configured", &(!self.api_key.is_empty()))
+            .field("public_base_url", &self.public_base_url)
+            .field(
+                "webhook_token_configured",
+                &(!self.webhook_token.is_empty()),
+            )
+            .field("auto_purchase", &self.auto_purchase)
+            .field("min_purchase", &self.min_purchase)
+            .field("max_purchase", &self.max_purchase)
+            .field("api_region", &self.api_region)
+            .field("rpm_limit", &self.rpm_limit)
+            .field("priority", &self.priority)
+            .field("groups", &self.groups)
+            .field("source_channel", &self.source_channel)
+            .field("nickname_prefix", &self.nickname_prefix)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for SupplierConfigUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SupplierConfigUpdate")
+            .field("base_url", &self.base_url)
+            .field(
+                "api_key_configured",
+                &self.api_key.as_ref().is_some_and(|v| !v.is_empty()),
+            )
+            .field("public_base_url", &self.public_base_url)
+            .field(
+                "webhook_token_configured",
+                &self.webhook_token.as_ref().is_some_and(|v| !v.is_empty()),
+            )
+            .field("auto_purchase", &self.auto_purchase)
+            .field("min_purchase", &self.min_purchase)
+            .field("max_purchase", &self.max_purchase)
+            .field("api_region", &self.api_region)
+            .field("rpm_limit", &self.rpm_limit)
+            .field("priority", &self.priority)
+            .field("groups", &self.groups)
+            .field("source_channel", &self.source_channel)
+            .field("nickname_prefix", &self.nickname_prefix)
+            .finish()
+    }
 }
 
 impl SupplierRuntimeConfig {
@@ -335,10 +384,12 @@ mod tests {
         assert_eq!(runtime.api_region, "us-east-1");
         assert_eq!(runtime.groups, vec!["production", "backup"]);
         assert_eq!(runtime.webhook_token.len(), 64);
-        assert!(runtime
-            .webhook_token
-            .chars()
-            .all(|ch| ch.is_ascii_hexdigit()));
+        assert!(
+            runtime
+                .webhook_token
+                .chars()
+                .all(|ch| ch.is_ascii_hexdigit())
+        );
         assert_eq!(config.key_supplier.base_url, runtime.base_url);
         assert_eq!(config.key_supplier.webhook_token, runtime.webhook_token);
     }
@@ -367,5 +418,29 @@ mod tests {
 
         assert!(runtime.webhook_token.is_empty());
         assert!(!view.webhook_token_configured);
+    }
+
+    #[test]
+    fn debug_does_not_expose_supplier_runtime_secrets() {
+        let mut runtime = SupplierRuntimeConfig::from_config(&Config::default()).unwrap();
+        runtime.api_key = "runtime-api-key-canary".to_string();
+        runtime.webhook_token = "runtime-webhook-token-canary".to_string();
+
+        let debug = format!("{:?}", runtime);
+
+        assert!(!debug.contains("runtime-api-key-canary"));
+        assert!(!debug.contains("runtime-webhook-token-canary"));
+    }
+
+    #[test]
+    fn debug_does_not_expose_supplier_update_secrets() {
+        let mut update = valid_update();
+        update.api_key = Some("update-api-key-canary".to_string());
+        update.webhook_token = Some("update-webhook-token-canary".to_string());
+
+        let debug = format!("{:?}", update);
+
+        assert!(!debug.contains("update-api-key-canary"));
+        assert!(!debug.contains("update-webhook-token-canary"));
     }
 }

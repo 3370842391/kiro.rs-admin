@@ -89,7 +89,7 @@ impl std::str::FromStr for RetryMode {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct KeySupplierConfig {
     #[serde(default)]
@@ -118,6 +118,29 @@ pub struct KeySupplierConfig {
     pub source_channel: String,
     #[serde(default = "default_supplier_nickname_prefix")]
     pub nickname_prefix: String,
+}
+
+impl std::fmt::Debug for KeySupplierConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeySupplierConfig")
+            .field("base_url", &self.base_url)
+            .field("api_key_configured", &(!self.api_key.is_empty()))
+            .field("public_base_url", &self.public_base_url)
+            .field(
+                "webhook_token_configured",
+                &(!self.webhook_token.is_empty()),
+            )
+            .field("auto_purchase", &self.auto_purchase)
+            .field("min_purchase", &self.min_purchase)
+            .field("max_purchase", &self.max_purchase)
+            .field("api_region", &self.api_region)
+            .field("rpm_limit", &self.rpm_limit)
+            .field("priority", &self.priority)
+            .field("groups", &self.groups)
+            .field("source_channel", &self.source_channel)
+            .field("nickname_prefix", &self.nickname_prefix)
+            .finish()
+    }
 }
 
 impl Default for KeySupplierConfig {
@@ -954,6 +977,24 @@ mod tests {
         let encoded = serde_json::to_value(config).unwrap();
         assert_eq!(encoded["keySupplier"], input["keySupplier"]);
         assert!(encoded.get("key_supplier").is_none());
+    }
+
+    #[test]
+    fn debug_does_not_expose_key_supplier_secrets() {
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "keySupplier": {
+                "apiKey": "config-api-key-canary",
+                "webhookToken": "config-webhook-token-canary"
+            }
+        }))
+        .unwrap();
+        config.key_supplier.api_key = "config-api-key-canary".to_string();
+        config.key_supplier.webhook_token = "config-webhook-token-canary".to_string();
+
+        let debug = format!("{:?}", config);
+
+        assert!(!debug.contains("config-api-key-canary"));
+        assert!(!debug.contains("config-webhook-token-canary"));
     }
 
     #[test]
