@@ -97,6 +97,10 @@ impl ProbationBuffer {
         self.committed
     }
 
+    pub(crate) fn semantic_output_started(&self) -> bool {
+        self.committed
+    }
+
     #[cfg(test)]
     pub(crate) fn tool_forwarded(&self) -> bool {
         self.tool_forwarded

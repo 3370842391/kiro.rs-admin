@@ -1603,6 +1603,18 @@ impl StreamContext {
             .or_else(|| self.tool_json_error.as_ref().map(|err| err.message()))
     }
 
+    pub(crate) fn terminal_error_type(&self) -> Option<&'static str> {
+        self.terminal_attempt_failure
+            .as_ref()
+            .map(|failure| failure.public_error().0)
+            .or_else(|| {
+                self.tool_json_error
+                    .as_ref()
+                    .map(ToolJsonAccumulatorError::error_type)
+            })
+            .or(self.terminal_protocol_error_type)
+    }
+
     pub(crate) fn terminal_attempt_failure(&self) -> Option<&super::tool_attempt::AttemptFailure> {
         self.terminal_attempt_failure.as_ref()
     }
@@ -3301,6 +3313,10 @@ impl BufferedStreamContext {
     /// 上游终态错误信息（转发内部 StreamContext）。缓冲流据此记 error。
     pub fn terminal_error_message(&self) -> Option<String> {
         self.inner.terminal_error_message()
+    }
+
+    pub(crate) fn terminal_error_type(&self) -> Option<&'static str> {
+        self.inner.terminal_error_type()
     }
 
     pub(crate) fn terminal_attempt_failure(&self) -> Option<&super::tool_attempt::AttemptFailure> {

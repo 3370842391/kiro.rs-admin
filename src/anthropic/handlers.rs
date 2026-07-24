@@ -1,6 +1,7 @@
 //! Anthropic API Handler 函数
 
 use std::convert::Infallible;
+#[cfg(test)]
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Instant;
@@ -2593,7 +2594,7 @@ async fn handle_stream_request(
 ) -> Response {
     if provider.early_stream_handshake() {
         let idle_timeout_secs = provider.stream_idle_timeout_secs();
-        let stream = create_early_sse_stream(
+        let prepared = create_early_sse_stream(
             provider,
             request_body.to_owned(),
             threshold_retry_body.map(str::to_owned),
@@ -2612,13 +2613,7 @@ async fn handle_stream_request(
             idle_timeout_secs,
             identity_normalization,
         );
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/event-stream")
-            .header(header::CACHE_CONTROL, "no-cache")
-            .header(header::CONNECTION, "keep-alive")
-            .body(Body::from_stream(stream))
-            .unwrap();
+        return prepared_sse_response(prepared).await;
     }
 
     // 调用 Kiro API（支持多凭据故障转移）
@@ -2665,16 +2660,8 @@ async fn handle_stream_request(
 
     // 创建 SSE 流（带 idle watchdog：上游首字节前挂死 / 中途停流超阈值主动收尾）
     let idle_timeout_secs = provider.stream_idle_timeout_secs();
-    let stream = create_sse_stream(call_result, attempt_setup, hook, tracer, idle_timeout_secs);
-
-    // 返回 SSE 响应
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(stream))
-        .unwrap()
+    let prepared = create_sse_stream(call_result, attempt_setup, hook, tracer, idle_timeout_secs);
+    prepared_sse_response(prepared).await
 }
 
 struct EarlyStreamSetup {
@@ -2703,7 +2690,9 @@ fn create_early_sse_stream(
     group: Option<String>,
     idle_timeout_secs: u64,
     identity_normalization: bool,
-) -> impl Stream<Item = Result<Bytes, Infallible>> {
+) -> PreparedSseStream {
+    let (sender, receiver) = tokio::sync::mpsc::channel(16);
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel();
     let tracer_for_call = tracer.clone();
     let provider_for_call = provider.clone();
     let request_body_for_call = request_body.clone();
@@ -2719,7 +2708,7 @@ fn create_early_sse_stream(
             )
             .await
     };
-    let mut setup = Some(EarlyStreamSetup {
+    let setup = EarlyStreamSetup {
         attempt: StreamAttemptSetup {
             provider: provider.clone(),
             request_body,
@@ -2740,23 +2729,26 @@ fn create_early_sse_stream(
         hook,
         tracer,
         idle_timeout_secs,
-    });
+    };
 
-    flatten_pending_call(call, move |result| {
-        let setup = setup.take().expect("early stream setup consumed once");
-        match result {
-            Ok(call_result) => Box::pin(create_sse_stream(
-                call_result,
-                setup.attempt,
-                setup.hook,
-                setup.tracer,
-                setup.idle_timeout_secs,
-            )),
+    tokio::spawn(async move {
+        match call.await {
+            Ok(call_result) => {
+                run_realtime_sse_attempts(
+                    call_result,
+                    setup.attempt,
+                    setup.hook,
+                    setup.tracer,
+                    setup.idle_timeout_secs,
+                    sender,
+                    Some(start_tx),
+                )
+                .await;
+            }
             Err(err) => {
                 setup
                     .hook
                     .record(0, setup.attempt.input_tokens, 0, 0, 0, 0.0, "error");
-                let upstream_status = setup.tracer.last_http_status();
                 let error_type = last_attempt_outcome(&setup.tracer);
                 let error_text = err.to_string();
                 setup.tracer.finalize(
@@ -2766,28 +2758,44 @@ fn create_early_sse_stream(
                     None,
                     TraceUsage::zero(),
                 );
-                Box::pin(stream::once(async move {
-                    Ok(provider_error_sse(err, upstream_status))
-                }))
+                let classified = classify_provider_error(&err);
+                let _ = start_tx.send(StreamStart::Failed(StreamStartFailure {
+                    status: classified.http_status,
+                    error_type: classified.error_type.to_string(),
+                    message: classified.public_message.to_string(),
+                }));
             }
         }
-    })
+    });
+
+    let stream = Box::pin(stream::unfold(receiver, |mut receiver| async move {
+        receiver.recv().await.map(|item| (item, receiver))
+    }));
+    PreparedSseStream {
+        stream,
+        start: start_rx,
+    }
 }
 
 /// Ping 事件间隔（25秒）
 const PING_INTERVAL_SECS: u64 = 25;
 
+#[cfg(test)]
 const EARLY_CONNECTED_SSE: &[u8] = b": connected\n\n";
+#[cfg(test)]
 const EARLY_PING_SSE: &[u8] = b"event: ping\ndata: {\"type\":\"ping\"}\n\n";
+#[cfg(test)]
 const EARLY_PING_INTERVAL: Duration = Duration::from_secs(1);
 
 type BoxByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, Infallible>> + Send>>;
 
+#[cfg(test)]
 enum PendingCallEvent<T> {
     Comment(Bytes),
     Complete(anyhow::Result<T>),
 }
 
+#[cfg(test)]
 fn pending_call_stream<F, T>(future: F) -> impl Stream<Item = PendingCallEvent<T>>
 where
     F: Future<Output = anyhow::Result<T>> + Send + 'static,
@@ -2836,6 +2844,7 @@ where
     )
 }
 
+#[cfg(test)]
 fn flatten_pending_call<F, T, M>(
     future: F,
     mut on_complete: M,
@@ -2933,6 +2942,198 @@ fn mark_first_token_if_visible(tracer: &RequestTracer, events: &[SseEvent]) {
     }
 }
 
+#[derive(Debug)]
+enum StreamStart {
+    Ready,
+    Failed(StreamStartFailure),
+}
+
+#[derive(Debug)]
+struct StreamStartFailure {
+    status: StatusCode,
+    error_type: String,
+    message: String,
+}
+
+struct PreparedSseStream {
+    stream: BoxByteStream,
+    start: tokio::sync::oneshot::Receiver<StreamStart>,
+}
+
+async fn prepared_sse_response(prepared: PreparedSseStream) -> Response {
+    let PreparedSseStream { stream, start } = prepared;
+    match start.await {
+        Ok(StreamStart::Ready) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header(header::CONNECTION, "keep-alive")
+            .body(Body::from_stream(stream))
+            .unwrap(),
+        Ok(StreamStart::Failed(failure)) => stream_start_failure_response(failure),
+        Err(_) => stream_start_canceled_response(),
+    }
+}
+
+fn classify_stream_completion(
+    termination: &AttemptTermination,
+    has_semantic_output: bool,
+    terminal_error: Option<(&str, &str)>,
+) -> Option<StreamStartFailure> {
+    if let Some((error_type, message)) = terminal_error {
+        return Some(StreamStartFailure {
+            status: StatusCode::BAD_GATEWAY,
+            error_type: error_type.to_string(),
+            message: message.to_string(),
+        });
+    }
+    if has_semantic_output {
+        return None;
+    }
+
+    let (error_type, message) = match termination {
+        AttemptTermination::Eof => (
+            "upstream_empty_response",
+            "Upstream returned no assistant content after one retry",
+        ),
+        AttemptTermination::ReadError(_) => (
+            "upstream_stream_interrupted",
+            "Upstream response stream was interrupted before assistant content",
+        ),
+        AttemptTermination::IdleTimeout => (
+            "upstream_stream_idle_timeout",
+            "Upstream response stream timed out before assistant content",
+        ),
+        AttemptTermination::ClientClosed => return None,
+    };
+    Some(StreamStartFailure {
+        status: StatusCode::BAD_GATEWAY,
+        error_type: error_type.to_string(),
+        message: message.to_string(),
+    })
+}
+
+fn stream_start_failure_response(failure: StreamStartFailure) -> Response {
+    if failure.status.is_client_error() {
+        tracing::warn!(error_type = %failure.error_type, message = %failure.message, "流式请求在发送响应前失败");
+    } else {
+        tracing::error!(error_type = %failure.error_type, message = %failure.message, "上游未产生可交付的助手内容");
+    }
+    (
+        failure.status,
+        Json(ErrorResponse::new(failure.error_type, failure.message)),
+    )
+        .into_response()
+}
+
+fn stream_start_canceled_response() -> Response {
+    stream_start_failure_response(StreamStartFailure {
+        status: StatusCode::BAD_GATEWAY,
+        error_type: "upstream_stream_interrupted".to_string(),
+        message: "Upstream response ended before assistant content was available".to_string(),
+    })
+}
+
+fn signal_stream_start_failure(
+    start_tx: &mut Option<tokio::sync::oneshot::Sender<StreamStart>>,
+    failure: StreamStartFailure,
+) {
+    if let Some(tx) = start_tx.take() {
+        let _ = tx.send(StreamStart::Failed(failure));
+    }
+}
+
+#[cfg(test)]
+mod stream_gate_tests {
+    use super::*;
+
+    #[test]
+    fn empty_eof_is_a_gateway_failure_before_response_headers() {
+        let failure = classify_stream_completion(
+            &super::super::tool_attempt::AttemptTermination::Eof,
+            false,
+            None,
+        )
+        .expect("empty EOF must not be reported as success");
+
+        assert_eq!(failure.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(failure.error_type, "upstream_empty_response");
+    }
+
+    #[test]
+    fn handshake_only_stream_is_not_successful() {
+        let failure = classify_stream_completion(
+            &super::super::tool_attempt::AttemptTermination::Eof,
+            false,
+            None,
+        );
+
+        assert!(failure.is_some());
+    }
+
+    #[test]
+    fn stream_with_visible_content_can_start_http_response() {
+        assert!(classify_stream_completion(
+            &super::super::tool_attempt::AttemptTermination::Eof,
+            true,
+            None,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn read_error_before_visible_content_is_a_gateway_failure() {
+        let failure = classify_stream_completion(
+            &super::super::tool_attempt::AttemptTermination::ReadError("reset".into()),
+            false,
+            None,
+        )
+        .expect("read error before content must remain retryable by NewAPI");
+
+        assert_eq!(failure.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(failure.error_type, "upstream_stream_interrupted");
+    }
+
+    #[tokio::test]
+    async fn failed_stream_gate_returns_http_502_instead_of_empty_200() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(StreamStart::Failed(StreamStartFailure {
+            status: StatusCode::BAD_GATEWAY,
+            error_type: "upstream_empty_response".to_string(),
+            message: "Upstream returned no assistant content after one retry".to_string(),
+        }))
+        .unwrap();
+        let response = prepared_sse_response(PreparedSseStream {
+            stream: Box::pin(stream::empty()),
+            start: rx,
+        })
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_ne!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&header::HeaderValue::from_static("text/event-stream"))
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_stream_gate_returns_http_200_sse() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(StreamStart::Ready).unwrap();
+        let response = prepared_sse_response(PreparedSseStream {
+            stream: Box::pin(stream::empty()),
+            start: rx,
+        })
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&header::HeaderValue::from_static("text/event-stream"))
+        );
+    }
+}
+
 /// 创建 SSE 事件流
 fn create_sse_stream(
     first_call: crate::kiro::provider::KiroCallResult,
@@ -2940,8 +3141,9 @@ fn create_sse_stream(
     hook: UsageRecordHook,
     tracer: std::sync::Arc<RequestTracer>,
     idle_timeout_secs: u64,
-) -> impl Stream<Item = Result<Bytes, Infallible>> {
+) -> PreparedSseStream {
     let (sender, receiver) = tokio::sync::mpsc::channel(16);
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(run_realtime_sse_attempts(
         first_call,
         setup,
@@ -2949,18 +3151,30 @@ fn create_sse_stream(
         tracer,
         idle_timeout_secs,
         sender,
+        Some(start_tx),
     ));
-    stream::unfold(receiver, |mut receiver| async move {
+    let stream = Box::pin(stream::unfold(receiver, |mut receiver| async move {
         receiver.recv().await.map(|item| (item, receiver))
-    })
+    }));
+    PreparedSseStream {
+        stream,
+        start: start_rx,
+    }
 }
 
 async fn send_sse_events(
     sender: &tokio::sync::mpsc::Sender<Result<Bytes, Infallible>>,
     tracer: &RequestTracer,
     events: Vec<SseEvent>,
+    start_tx: &mut Option<tokio::sync::oneshot::Sender<StreamStart>>,
 ) -> bool {
-    mark_first_token_if_visible(tracer, &events);
+    let has_visible_content = events.iter().any(is_client_visible_content);
+    if has_visible_content {
+        mark_first_token_if_visible(tracer, &events);
+        if let Some(tx) = start_tx.take() {
+            let _ = tx.send(StreamStart::Ready);
+        }
+    }
     for event in events {
         if sender
             .send(Ok(Bytes::from(event.to_sse_string())))
@@ -2980,6 +3194,7 @@ async fn run_realtime_sse_attempts(
     tracer: std::sync::Arc<RequestTracer>,
     idle_timeout_secs: u64,
     sender: tokio::sync::mpsc::Sender<Result<Bytes, Infallible>>,
+    mut start_tx: Option<tokio::sync::oneshot::Sender<StreamStart>>,
 ) {
     let mut first_call = Some(first_call);
     let mut retry_request_body = None;
@@ -2988,6 +3203,14 @@ async fn run_realtime_sse_attempts(
             call_result
         } else {
             let Some(request_body) = retry_request_body.as_deref() else {
+                signal_stream_start_failure(
+                    &mut start_tx,
+                    StreamStartFailure {
+                        status: StatusCode::BAD_GATEWAY,
+                        error_type: "upstream_stream_interrupted".to_string(),
+                        message: "Upstream retry request could not be prepared".to_string(),
+                    },
+                );
                 tracing::error!("缺少受控重试请求体，停止第二次上游调用");
                 return;
             };
@@ -3013,6 +3236,14 @@ async fn run_realtime_sse_attempts(
                         None,
                         TraceUsage::zero(),
                     );
+                    signal_stream_start_failure(
+                        &mut start_tx,
+                        StreamStartFailure {
+                            status: StatusCode::BAD_GATEWAY,
+                            error_type: "api_error".to_string(),
+                            message: "Upstream API request failed.".to_string(),
+                        },
+                    );
                     let _ = sender
                         .send(Ok(provider_error_sse(error, upstream_status)))
                         .await;
@@ -3025,7 +3256,7 @@ async fn run_realtime_sse_attempts(
         let mut ctx = setup.new_context();
         let mut probation = ProbationBuffer::default();
         let initial_events = probation.push_all(ctx.generate_initial_events());
-        if !send_sse_events(&sender, tracer.as_ref(), initial_events).await {
+        if !send_sse_events(&sender, tracer.as_ref(), initial_events, &mut start_tx).await {
             finalize_realtime_client_disconnected(&hook, tracer.as_ref(), &ctx, credential_id, 0);
             return;
         }
@@ -3076,7 +3307,7 @@ async fn run_realtime_sse_attempts(
                             }
                         }
                         let visible = probation.push_all(events);
-                        if !send_sse_events(&sender, tracer.as_ref(), visible).await {
+                        if !send_sse_events(&sender, tracer.as_ref(), visible, &mut start_tx).await {
                             finalize_realtime_client_disconnected(
                                 &hook,
                                 tracer.as_ref(),
@@ -3107,7 +3338,9 @@ async fn run_realtime_sse_attempts(
                     None => break AttemptTermination::Eof,
                 },
                 _ = ping_interval.tick() => {
-                    if sender.send(Ok(create_ping_sse())).await.is_err() {
+                    if start_tx.is_none()
+                        && sender.send(Ok(create_ping_sse())).await.is_err()
+                    {
                         finalize_realtime_client_disconnected(
                             &hook,
                             tracer.as_ref(),
@@ -3175,9 +3408,34 @@ async fn run_realtime_sse_attempts(
             continue;
         }
 
+        if !probation.semantic_output_started() {
+            let terminal_message = ctx.terminal_error_message();
+            let terminal_type = ctx.terminal_error_type().unwrap_or("api_error");
+            if let Some(failure) = classify_stream_completion(
+                &termination,
+                false,
+                terminal_message
+                    .as_deref()
+                    .map(|message| (terminal_type, message)),
+            ) {
+                let error_type = failure.error_type.clone();
+                let message = failure.message.clone();
+                signal_stream_start_failure(&mut start_tx, failure);
+                record_stream_usage(&hook, &ctx, credential_id, "error");
+                tracer.finalize(
+                    "error",
+                    Some(&error_type),
+                    Some(&message),
+                    None,
+                    stream_trace_usage(&ctx),
+                );
+                return;
+            }
+        }
+
         let mut visible = visible;
         visible.extend(probation.take_pending());
-        if !send_sse_events(&sender, tracer.as_ref(), visible).await {
+        if !send_sse_events(&sender, tracer.as_ref(), visible, &mut start_tx).await {
             finalize_realtime_client_disconnected(
                 &hook,
                 tracer.as_ref(),
@@ -4689,17 +4947,9 @@ async fn handle_stream_request_buffered(
 
     // 创建缓冲 SSE 流
     let idle_timeout_secs = provider.stream_idle_timeout_secs();
-    let stream =
+    let prepared =
         create_buffered_sse_stream(call_result, attempt_setup, hook, tracer, idle_timeout_secs);
-
-    // 返回 SSE 响应
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(stream))
-        .unwrap()
+    prepared_sse_response(prepared).await
 }
 
 /// 创建缓冲 SSE 事件流
@@ -4715,8 +4965,9 @@ fn create_buffered_sse_stream(
     hook: UsageRecordHook,
     tracer: std::sync::Arc<RequestTracer>,
     idle_timeout_secs: u64,
-) -> impl Stream<Item = Result<Bytes, Infallible>> {
+) -> PreparedSseStream {
     let (sender, receiver) = tokio::sync::mpsc::channel(16);
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(run_buffered_sse_attempts(
         first_call,
         setup,
@@ -4724,10 +4975,15 @@ fn create_buffered_sse_stream(
         tracer,
         idle_timeout_secs,
         sender,
+        Some(start_tx),
     ));
-    stream::unfold(receiver, |mut receiver| async move {
+    let stream = Box::pin(stream::unfold(receiver, |mut receiver| async move {
         receiver.recv().await.map(|item| (item, receiver))
-    })
+    }));
+    PreparedSseStream {
+        stream,
+        start: start_rx,
+    }
 }
 
 async fn run_buffered_sse_attempts(
@@ -4737,6 +4993,7 @@ async fn run_buffered_sse_attempts(
     tracer: std::sync::Arc<RequestTracer>,
     idle_timeout_secs: u64,
     sender: tokio::sync::mpsc::Sender<Result<Bytes, Infallible>>,
+    mut start_tx: Option<tokio::sync::oneshot::Sender<StreamStart>>,
 ) {
     let mut first_call = Some(first_call);
     let mut retry_request_body = None;
@@ -4746,6 +5003,14 @@ async fn run_buffered_sse_attempts(
         } else {
             let Some(request_body) = retry_request_body.as_deref() else {
                 tracing::error!("缺少受控重试请求体，停止第二次上游调用");
+                signal_stream_start_failure(
+                    &mut start_tx,
+                    StreamStartFailure {
+                        status: StatusCode::BAD_GATEWAY,
+                        error_type: "upstream_stream_interrupted".to_string(),
+                        message: "Upstream retry request could not be prepared".to_string(),
+                    },
+                );
                 return;
             };
             let retry_result = tokio::select! {
@@ -4769,6 +5034,14 @@ async fn run_buffered_sse_attempts(
                         Some(&message),
                         None,
                         TraceUsage::zero(),
+                    );
+                    signal_stream_start_failure(
+                        &mut start_tx,
+                        StreamStartFailure {
+                            status: StatusCode::BAD_GATEWAY,
+                            error_type: "api_error".to_string(),
+                            message: "Upstream API request failed.".to_string(),
+                        },
                     );
                     let _ = sender
                         .send(Ok(provider_error_sse(error, upstream_status)))
@@ -4798,7 +5071,9 @@ async fn run_buffered_sse_attempts(
                 biased;
                 _ = sender.closed() => break AttemptTermination::ClientClosed,
                 _ = ping_interval.tick() => {
-                    if sender.send(Ok(create_ping_sse())).await.is_err() {
+                    if start_tx.is_none()
+                        && sender.send(Ok(create_ping_sse())).await.is_err()
+                    {
                         finalize_buffered_client_disconnected(
                             &hook,
                             tracer.as_ref(),
@@ -4910,9 +5185,43 @@ async fn run_buffered_sse_attempts(
             continue;
         }
 
+        if !probation.semantic_output_started() {
+            let terminal_message = ctx.terminal_error_message();
+            let terminal_type = ctx.terminal_error_type().unwrap_or("api_error");
+            if let Some(failure) = classify_stream_completion(
+                &termination,
+                false,
+                terminal_message
+                    .as_deref()
+                    .map(|message| (terminal_type, message)),
+            ) {
+                let error_type = failure.error_type.clone();
+                let message = failure.message.clone();
+                signal_stream_start_failure(&mut start_tx, failure);
+                let (input, output, cache_creation, cache_read, credits) = ctx.final_usage();
+                hook.record(
+                    credential_id,
+                    input,
+                    output,
+                    cache_creation,
+                    cache_read,
+                    credits,
+                    "error",
+                );
+                tracer.finalize(
+                    "error",
+                    Some(&error_type),
+                    Some(&message),
+                    None,
+                    buffered_stream_trace_usage(&ctx),
+                );
+                return;
+            }
+        }
+
         let mut visible = visible;
         visible.extend(probation.take_pending());
-        if !send_sse_events(&sender, tracer.as_ref(), visible).await {
+        if !send_sse_events(&sender, tracer.as_ref(), visible, &mut start_tx).await {
             finalize_buffered_client_disconnected(
                 &hook,
                 tracer.as_ref(),
