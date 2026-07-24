@@ -24,6 +24,10 @@ mod tests {
             .route("/api/my/profile", get(move |request: axum::http::Request<axum::body::Body>| {
                 let seen = seen_clone.clone();
                 async move {
+                    assert_eq!(
+                        request.headers().get("user-agent").unwrap(),
+                        "kiro-rs-key-supplier/1.0"
+                    );
                     seen.lock().unwrap().push((request.uri().path().to_owned(), request.headers().get("x-api-key").unwrap().to_str().unwrap().to_owned(), request.headers().get("content-type").map(|v| v.to_str().unwrap().to_owned())));
                     axum::Json(serde_json::json!({"name":"demo","quota":10,"remaining":7,"used_quota":3,"webhook_url":"http://hook"}))
                 }
@@ -299,6 +303,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{fmt, sync::OnceLock};
 
 const MAX_ATTEMPTS: usize = 3;
+const SUPPLIER_USER_AGENT: &str = "kiro-rs-key-supplier/1.0";
 
 #[derive(Clone)]
 pub struct SupplierClient {
@@ -343,6 +348,7 @@ impl SupplierClient {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
             .no_proxy()
+            .user_agent(SUPPLIER_USER_AGENT)
             .build()
             .map_err(|error| SupplierError::network(&error.to_string(), key))?;
         Ok(Self {
