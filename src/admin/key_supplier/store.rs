@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS supplier_events (
 const INDEXES: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_supplier_events_queue ON supplier_events(status, id);
 CREATE INDEX IF NOT EXISTS idx_supplier_events_read ON supplier_events(read_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_supplier_events_event_id_unique ON supplier_events(event_id);
 "#;
 
 const MIGRATION_COLUMNS: &[(&str, &str)] = &[
@@ -374,6 +375,13 @@ fn initialize_schema(conn: &Connection) -> rusqlite::Result<()> {
             )?;
         }
     }
+    conn.execute(
+        "DELETE FROM supplier_events
+         WHERE id NOT IN (
+             SELECT MIN(id) FROM supplier_events GROUP BY event_id
+         )",
+        [],
+    )?;
     conn.execute_batch(INDEXES)
 }
 
@@ -453,6 +461,56 @@ mod tests {
         assert!(!page.items[0].purchased);
         assert!(!page.items[0].imported);
         assert_eq!(store.claim_next().unwrap().unwrap().event_id, "legacy-1");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn open_deduplicates_legacy_event_ids_and_enforces_uniqueness() {
+        let path = std::env::temp_dir().join(format!(
+            "kiro-supplier-duplicate-{}-{}.db",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE supplier_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    received_at TEXT NOT NULL,
+                    status TEXT NOT NULL
+                );
+                INSERT INTO supplier_events (event_id, event_type, received_at, status)
+                VALUES
+                    ('duplicate-1', 'purchase.requested', '2026-01-01T00:00:00Z', 'received'),
+                    ('duplicate-1', 'purchase.requested', '2026-01-02T00:00:00Z', 'received');",
+            )
+            .unwrap();
+        }
+
+        let store = SupplierEventStore::open(&path).unwrap();
+        let page = store.list(10, None).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].id, 1);
+        assert!(matches!(
+            store.insert_event(event("duplicate-1")).unwrap(),
+            InsertOutcome::Duplicate(_)
+        ));
+        let error = store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO supplier_events
+                 (event_id,event_type,quantity,received_at,status)
+                 VALUES ('duplicate-1','purchase.requested',1,'2026-01-03T00:00:00Z','received')",
+                [],
+            )
+            .unwrap_err();
+        assert!(matches!(error, rusqlite::Error::SqliteFailure(_, _)));
 
         let _ = std::fs::remove_file(path);
     }
