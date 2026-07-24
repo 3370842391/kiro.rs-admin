@@ -1,7 +1,9 @@
 use anyhow::Context;
+use atomicwrites::{AllowOverwrite, AtomicFile};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -924,7 +926,8 @@ impl Config {
             .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存配置"))?;
 
         let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
-        fs::write(path, content)
+        AtomicFile::new(path, AllowOverwrite)
+            .write(|file| file.write_all(content.as_bytes()))
             .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
     }
@@ -977,6 +980,24 @@ mod tests {
         let encoded = serde_json::to_value(config).unwrap();
         assert_eq!(encoded["keySupplier"], input["keySupplier"]);
         assert!(encoded.get("key_supplier").is_none());
+    }
+
+    #[test]
+    fn save_persists_updated_json_value() {
+        let path = std::env::temp_dir().join(format!(
+            "kiro-config-save-{}-{}.json",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let mut config = Config::load(&path).unwrap();
+        config.host = "127.0.0.2".to_string();
+        config.save().unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["host"], "127.0.0.2");
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

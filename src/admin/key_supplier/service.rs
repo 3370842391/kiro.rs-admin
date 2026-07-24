@@ -259,6 +259,12 @@ impl KeySupplierService {
         self.store.clone()
     }
 
+    pub fn has_valid_webhook_token(&self, token: &str) -> bool {
+        let runtime = self.runtime_config();
+        is_valid_webhook_token(&runtime.webhook_token)
+            && crate::common::auth::constant_time_eq(&runtime.webhook_token, token)
+    }
+
     pub fn config_view(&self) -> SupplierConfigView {
         SupplierConfigView::from(&self.runtime_config())
     }
@@ -404,12 +410,10 @@ impl KeySupplierService {
         token: &str,
         body: B,
     ) -> Result<IngestResult, SupplierServiceError> {
-        let runtime = self.runtime_config();
-        if !is_valid_webhook_token(&runtime.webhook_token)
-            || !crate::common::auth::constant_time_eq(&runtime.webhook_token, token)
-        {
+        if !self.has_valid_webhook_token(token) {
             return Err(SupplierServiceError::Unauthorized);
         }
+        let runtime = self.runtime_config();
 
         let webhook = IncomingWebhook::parse(body.as_ref())?;
         let mut event = webhook.into_event();

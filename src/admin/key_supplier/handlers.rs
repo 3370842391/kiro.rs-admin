@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     body::{Body, to_bytes},
@@ -23,6 +23,14 @@ const MAX_WEBHOOK_BODY_BYTES: usize = 64 * 1024;
 const DEFAULT_EVENT_LIMIT: usize = 50;
 const MAX_EVENT_LIMIT: usize = 200;
 const MAX_READ_IDS: usize = 200;
+const MAX_WEBHOOK_CONCURRENCY: usize = 32;
+const WEBHOOK_BODY_READ_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Clone)]
+pub(crate) struct WebhookState {
+    service: Option<Arc<KeySupplierService>>,
+    permits: Arc<tokio::sync::Semaphore>,
+}
 
 pub fn webhook_router(service: Option<Arc<KeySupplierService>>) -> axum::Router {
     axum::Router::new()
@@ -30,18 +38,28 @@ pub fn webhook_router(service: Option<Arc<KeySupplierService>>) -> axum::Router 
             "/key-supplier/webhook/{token}",
             axum::routing::post(ingest_webhook),
         )
-        .with_state(service)
+        .with_state(WebhookState {
+            service,
+            permits: Arc::new(tokio::sync::Semaphore::new(MAX_WEBHOOK_CONCURRENCY)),
+        })
 }
 
 pub async fn ingest_webhook(
-    State(service): State<Option<Arc<KeySupplierService>>>,
+    State(state): State<WebhookState>,
     Path(token): Path<String>,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let Some(service) = service else {
+    let Some(service) = state.service else {
         return unavailable();
     };
+    if !service.has_valid_webhook_token(&token) {
+        return error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "webhook endpoint not found",
+        );
+    }
     if !is_json_content_type(&headers) {
         return error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -49,18 +67,34 @@ pub async fn ingest_webhook(
             "Content-Type must be application/json",
         );
     }
-    let body = match to_bytes(body, MAX_WEBHOOK_BODY_BYTES).await {
-        Ok(body) => body,
-        Err(_) => {
+    let _permit = match state.permits.try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return unavailable(),
+    };
+    let body = match tokio::time::timeout(
+        WEBHOOK_BODY_READ_TIMEOUT,
+        to_bytes(body, MAX_WEBHOOK_BODY_BYTES),
+    )
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(_)) => {
             return error(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "payload_too_large",
                 "request body exceeds 64 KiB",
             );
         }
+        Err(_) => {
+            return error(
+                StatusCode::REQUEST_TIMEOUT,
+                "request_timeout",
+                "webhook request body timed out",
+            );
+        }
     };
-    match service.ingest(&token, body) {
-        Ok(result) => {
+    match tokio::task::spawn_blocking(move || service.ingest(&token, body)).await {
+        Ok(Ok(result)) => {
             let status = if result.duplicate {
                 StatusCode::OK
             } else {
@@ -77,18 +111,18 @@ pub async fn ingest_webhook(
             )
                 .into_response()
         }
-        Err(SupplierServiceError::Unauthorized) => error(
+        Ok(Err(SupplierServiceError::Unauthorized)) => error(
             StatusCode::NOT_FOUND,
             "not_found",
             "webhook endpoint not found",
         ),
-        Err(SupplierServiceError::InvalidJson | SupplierServiceError::InvalidPayload) => error(
+        Ok(Err(SupplierServiceError::InvalidJson | SupplierServiceError::InvalidPayload)) => error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
             "invalid webhook payload",
         ),
-        Err(SupplierServiceError::Store) => unavailable(),
-        Err(_) => error(
+        Ok(Err(SupplierServiceError::Store)) | Err(_) => unavailable(),
+        Ok(Err(_)) => error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
             "webhook request could not be accepted",
@@ -217,16 +251,20 @@ pub async fn list_events(
             "invalid event pagination",
         );
     }
-    match service.store().list(limit, query.before) {
-        Ok(page) => match service.store().unread_count() {
-            Ok(unread_count) => Json(EventPageResponse {
-                items: page.items.into_iter().map(EventView::from).collect(),
-                unread_count,
-            })
-            .into_response(),
-            Err(_) => unavailable(),
-        },
-        Err(_) => unavailable(),
+    let store = service.store();
+    match tokio::task::spawn_blocking(move || {
+        let page = store.list(limit, query.before)?;
+        let unread_count = store.unread_count()?;
+        Ok::<_, rusqlite::Error>((page, unread_count))
+    })
+    .await
+    {
+        Ok(Ok((page, unread_count))) => Json(EventPageResponse {
+            items: page.items.into_iter().map(EventView::from).collect(),
+            unread_count,
+        })
+        .into_response(),
+        Ok(Err(_)) | Err(_) => unavailable(),
     }
 }
 
@@ -242,7 +280,7 @@ pub async fn mark_events_read(
         Ok(service) => service,
         Err(response) => return response,
     };
-    let changed = if request.mark_all {
+    let operation = if request.mark_all {
         if request.ids.as_ref().is_some_and(|ids| !ids.is_empty()) {
             return error(
                 StatusCode::BAD_REQUEST,
@@ -250,7 +288,7 @@ pub async fn mark_events_read(
                 "markAll cannot be combined with ids",
             );
         }
-        service.store().mark_all_read()
+        MarkReadOperation::All
     } else {
         let Some(ids) = request.ids.as_deref() else {
             return error(
@@ -270,11 +308,17 @@ pub async fn mark_events_read(
                 "ids must be unique positive event ids",
             );
         }
-        service.store().mark_read(ids)
+        MarkReadOperation::Ids(ids.to_vec())
     };
-    match changed {
-        Ok(changed) => Json(serde_json::json!({ "updated": changed })).into_response(),
-        Err(_) => unavailable(),
+    let store = service.store();
+    match tokio::task::spawn_blocking(move || match operation {
+        MarkReadOperation::All => store.mark_all_read(),
+        MarkReadOperation::Ids(ids) => store.mark_read(&ids),
+    })
+    .await
+    {
+        Ok(Ok(changed)) => Json(serde_json::json!({ "updated": changed })).into_response(),
+        Ok(Err(_)) | Err(_) => unavailable(),
     }
 }
 
@@ -297,14 +341,15 @@ pub async fn retry_event(State(state): State<AdminState>, Path(id): Path<String>
         Ok(service) => service,
         Err(response) => return response,
     };
-    match service.store().retry(id) {
-        Ok(()) => Json(serde_json::json!({ "retried": true })).into_response(),
-        Err(rusqlite::Error::QueryReturnedNoRows) => error(
+    let store = service.store();
+    match tokio::task::spawn_blocking(move || store.retry(id)).await {
+        Ok(Ok(())) => Json(serde_json::json!({ "retried": true })).into_response(),
+        Ok(Err(rusqlite::Error::QueryReturnedNoRows)) => error(
             StatusCode::NOT_FOUND,
             "not_found",
             "supplier event not found or not retryable",
         ),
-        Err(_) => unavailable(),
+        Ok(Err(_)) | Err(_) => unavailable(),
     }
 }
 
@@ -458,6 +503,11 @@ pub(crate) struct MarkReadRequest {
     ids: Option<Vec<i64>>,
     #[serde(default)]
     mark_all: bool,
+}
+
+enum MarkReadOperation {
+    All,
+    Ids(Vec<i64>),
 }
 
 #[derive(Serialize)]

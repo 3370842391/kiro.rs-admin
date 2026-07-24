@@ -563,6 +563,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn key_supplier_router_rejects_invalid_token_before_reading_oversized_body() {
+        let (app, _, supplier) = key_supplier_test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/key-supplier/webhook/not-the-real-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(vec![b'x'; 64 * 1024 + 1]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(supplier.store().list(1, None).unwrap().items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn key_supplier_router_rejects_invalid_token_before_reading_slow_body() {
+        let (app, _, supplier) = key_supplier_test_app();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/key-supplier/webhook/not-the-real-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from_stream(futures::stream::pending::<
+                        Result<bytes::Bytes, std::io::Error>,
+                    >()))
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("invalid tokens must be rejected without reading the body")
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(supplier.store().list(1, None).unwrap().items.is_empty());
+    }
+
+    #[tokio::test]
     async fn key_supplier_admin_routes_require_admin_key() {
         let (app, _, _) = key_supplier_test_app();
         for (method, path) in [
