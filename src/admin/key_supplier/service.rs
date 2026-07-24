@@ -403,13 +403,18 @@ impl KeySupplierService {
         token: &str,
         body: B,
     ) -> Result<IngestResult, SupplierServiceError> {
-        let expected = self.runtime.read().webhook_token.clone();
-        if expected.is_empty() || !crate::common::auth::constant_time_eq(&expected, token) {
+        let runtime = self.runtime_config();
+        if runtime.webhook_token.is_empty()
+            || !crate::common::auth::constant_time_eq(&runtime.webhook_token, token)
+        {
             return Err(SupplierServiceError::Unauthorized);
         }
 
         let webhook = IncomingWebhook::parse(body.as_ref())?;
-        let event = webhook.into_event();
+        let mut event = webhook.into_event();
+        event.message = event
+            .message
+            .map(|message| redact_runtime_secrets(&message, &runtime));
         let event_id = event.event_id.clone();
         let event_type = event.event_type.clone();
         let outcome = self
@@ -657,11 +662,27 @@ fn is_duplicate_error(error: &str) -> bool {
 }
 
 fn sanitize_error(error: &str, runtime: &SupplierRuntimeConfig) -> String {
-    let without_runtime_key = error.replace(&runtime.api_key, "[REDACTED]");
+    redact_runtime_secrets(error, runtime)
+        .chars()
+        .take(300)
+        .collect()
+}
+
+fn redact_runtime_secrets(value: &str, runtime: &SupplierRuntimeConfig) -> String {
+    let without_runtime_api_key = if runtime.api_key.is_empty() {
+        value.to_owned()
+    } else {
+        value.replace(&runtime.api_key, "[REDACTED]")
+    };
+    let without_runtime_secrets = if runtime.webhook_token.is_empty() {
+        without_runtime_api_key
+    } else {
+        without_runtime_api_key.replace(&runtime.webhook_token, "[REDACTED]")
+    };
     let without_supplier_keys = regex::Regex::new(r#"ksk_[^\s\"'<>]*"#)
         .expect("supplier key redaction pattern is valid")
-        .replace_all(&without_runtime_key, "[REDACTED]");
-    without_supplier_keys.chars().take(300).collect()
+        .replace_all(&without_runtime_secrets, "[REDACTED]");
+    without_supplier_keys.into_owned()
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -983,6 +1004,68 @@ mod tests {
             assert!(!rendered.contains("ksk-canary"));
             assert!(!rendered.contains("body-canary"));
         }
+    }
+
+    #[test]
+    fn sanitize_error_removes_runtime_webhook_token() {
+        let mut config = runtime("webhook-token-canary");
+        config.api_key = "supplier-api-key-canary".to_owned();
+        let error = format!(
+            "supplier={} webhook={} discovered=ksk_untrusted_canary",
+            config.api_key, config.webhook_token
+        );
+
+        let redacted = sanitize_error(&error, &config);
+
+        for secret in [
+            config.api_key.as_str(),
+            config.webhook_token.as_str(),
+            "ksk_untrusted_canary",
+        ] {
+            assert!(!redacted.contains(secret), "leaked secret: {secret}");
+        }
+    }
+
+    #[test]
+    fn webhook_message_is_redacted_before_storage_listing_and_debug() {
+        let path = temp_config_path("webhook-redaction");
+        let store = Arc::new(SupplierEventStore::open(&path).unwrap());
+        let mut config = runtime("webhook-token-canary");
+        config.api_key = "supplier-api-key-canary".to_owned();
+        let service = KeySupplierService::new(store.clone(), config.clone());
+        let message = format!(
+            "supplier={} webhook={} discovered=ksk_untrusted_canary",
+            config.api_key, config.webhook_token
+        );
+        let body = format!(
+            r#"{{"event":"all_keys_dead","event_id":"{EVENT_ID}","message":"{message}","dead":1}}"#
+        );
+
+        service
+            .ingest(&config.webhook_token, body.as_bytes())
+            .unwrap();
+
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        let stored: String = connection
+            .query_row("SELECT message FROM supplier_events", [], |row| row.get(0))
+            .unwrap();
+        let listed = store.list(1, None).unwrap().items.remove(0);
+        let debug = format!("{listed:?}");
+
+        for secret in [
+            config.api_key.as_str(),
+            config.webhook_token.as_str(),
+            "ksk_untrusted_canary",
+        ] {
+            assert!(!stored.contains(secret), "storage leaked secret: {secret}");
+            assert!(!listed.message.as_deref().unwrap().contains(secret));
+            assert!(!debug.contains(secret), "Debug leaked secret: {secret}");
+        }
+
+        drop(connection);
+        drop(service);
+        drop(store);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
