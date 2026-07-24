@@ -434,7 +434,7 @@ class _PipelineRuntime:
         return CredentialRecord(
             email=entry.account, auth_method="idc", provider="Enterprise",
             access_token="fresh-" + entry.account, refresh_token="r-" + entry.account,
-            start_url=entry.start_url, region="us-east-1",
+            start_url=entry.start_url, region=self.form.region,
         )
 
     async def close(self):
@@ -505,6 +505,48 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         # 进度事件分 login / apikey 两个阶段
         stages = {e.stage for e in progress if isinstance(e, LoginProgressEvent)}
         self.assertEqual({"login", "apikey"}, stages)
+
+    async def test_pipeline_uses_each_accounts_saved_region(self):
+        eu_account = self.repo.upsert_entries(
+            [
+                AccountEntry(
+                    3,
+                    "eu-account",
+                    "pw3",
+                    "https://d-99674db463.awsapps.com/start",
+                )
+            ],
+            login_mode=LoginMode.ENTERPRISE,
+            region="eu-central-1",
+        )[0]
+        coordinator = AccountLoginCoordinator(
+            self.repo,
+            SettingsStore(self.settings),
+            runtime_factory=lambda form, emit: _PipelineRuntime(form, emit),
+            api_key_transport_factory=FakeTransport,
+            token_refresher=self._no_refresh,
+            now=lambda: NOW,
+        )
+
+        async def fake_ensure(*_args, label, region, **_kwargs):
+            return ApiKeyResult(
+                raw_key="ksk_" + label,
+                profile_arn=f"arn:{region}",
+                reused=False,
+            )
+
+        import batch_login.account_login_coordinator as mod
+        with unittest_patch(mod, "ensure_api_key", fake_ensure):
+            report = await coordinator.login_and_extract_pipeline(
+                [self.accounts[0].id, eu_account.id],
+                concurrency=2,
+            )
+
+        self.assertEqual(2, report.logged_in)
+        self.assertEqual(
+            {"us-east-1", "eu-central-1"},
+            {runtime.form.region for runtime in _PipelineRuntime.instances},
+        )
 
     async def test_pipeline_login_failure_skips_extract_and_counts(self):
         class FailRuntime(_PipelineRuntime):

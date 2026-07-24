@@ -635,6 +635,7 @@ class AccountManagerApp:
         template = tk.StringVar(value=self.INPUT_TEMPLATE)
         mode = tk.StringVar(value=LoginMode.ENTERPRISE.value)
         start_url = tk.StringVar(value=catalog.default_url)
+        region = tk.StringVar(value=self._default_import_region())
         fields = ttk.Frame(window)
         fields.pack(fill="x", padx=10, pady=(10, 4))
         ttk.Label(fields, text="账号格式").grid(row=0, column=0, sticky="w")
@@ -664,6 +665,12 @@ class AccountManagerApp:
             text="每行没有 URL 时使用这里的地址；每行自带 URL 时以该行地址为准。",
             foreground="#475569",
         ).grid(row=3, column=1, sticky="w", padx=(8, 0), pady=(2, 0))
+        ttk.Label(fields, text="Region").grid(
+            row=4, column=0, sticky="w", pady=(6, 0)
+        )
+        ttk.Entry(fields, textvariable=region).grid(
+            row=4, column=1, sticky="ew", padx=(8, 0), pady=(6, 0)
+        )
         fields.columnconfigure(1, weight=1)
         source = tk.Text(window, height=14)
         source.pack(fill="both", expand=True, padx=10, pady=6)
@@ -699,7 +706,7 @@ class AccountManagerApp:
             if result is None:
                 return
             try:
-                report = self.service.confirm_import(result)
+                report = self.service.confirm_import(result, region=region.get())
             except AccountManagerServiceError as error:
                 messagebox.showerror("保存失败", str(error), parent=window); return
             self.status_var.set(f"已保存 {report.saved} 个账号")
@@ -863,6 +870,15 @@ class AccountManagerApp:
     def _settings_store(self) -> GuiSettingsStore:
         store = getattr(self.coordinator, "settings_store", None)
         return store if isinstance(store, GuiSettingsStore) else GuiSettingsStore()
+
+    def _default_import_region(self) -> str:
+        try:
+            saved = self._settings_store().load()
+        except GuiSettingsError:
+            saved = None
+        if saved is None:
+            return "us-east-1"
+        return saved.region.strip().lower() or "us-east-1"
 
     def open_proxy_settings(self) -> None:
         store = self._settings_store()

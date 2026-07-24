@@ -171,6 +171,47 @@ class EnterpriseHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("d-123", result.directory_id)
         self.assertEqual([], transport.responses)
 
+    async def test_eu_central_portal_uses_eu_endpoints(self):
+        portal_url = "https://d-99674db463.awsapps.com/start"
+        redirect = {
+            "url": portal_url
+            + "/?workflowResultHandle=auth&state=state"
+        }
+        responses = base_responses(
+            {"stepId": "end-of-workflow-success", "redirect": redirect}
+        )
+        responses[2] = response(
+            {
+                "redirectUrl": (
+                    "https://eu-central-1.signin.aws/platform/"
+                    "d-99674db463/login?workflowStateHandle=wh-1"
+                ),
+                "csrfToken": "csrf",
+            }
+        )
+        client, transport = self.make_client(responses + tail_responses())
+
+        result = await client.login(
+            "admin-user",
+            "existing-password",
+            EnterpriseHttpSettings(portal_url, "eu-central-1"),
+        )
+
+        self.assertEqual("d-99674db463", result.directory_id)
+        self.assertEqual(
+            "https://oidc.eu-central-1.amazonaws.com/client/register",
+            transport.requests[0][1],
+        )
+        self.assertIn(
+            "https://portal.sso.eu-central-1.amazonaws.com/login",
+            transport.requests[2][1],
+        )
+        self.assertIn(
+            "https://eu-central-1.signin.aws/platform/"
+            "d-99674db463/api/execute",
+            transport.requests[4][1],
+        )
+
     async def test_new_sso_instance_portal_discovers_directory_and_signin_endpoint(self):
         portal_url = (
             "https://ssoins-7223a15405d7b4ec.portal.us-east-1.app.aws/"

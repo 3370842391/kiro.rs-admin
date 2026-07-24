@@ -173,15 +173,26 @@ class AccountManagerService:
             raise AccountManagerServiceError("导入预览已失效，请重新解析")
         if not preview.entries:
             raise AccountManagerServiceError("没有可保存的有效账号")
+        normalized_region = self._validated_region(region)
         try:
             accounts = self.repository.upsert_entries(
                 preview.entries,
                 login_mode=preview.login_mode,
-                region=region,
+                region=normalized_region,
             )
         except AccountRepositoryError as error:
             raise AccountManagerServiceError(str(error)) from error
         return ImportReport(len(accounts), tuple(accounts))
+
+    @staticmethod
+    def _validated_region(region: str) -> str:
+        normalized = region.strip().lower()
+        if not normalized or any(
+            character not in "abcdefghijklmnopqrstuvwxyz0123456789-"
+            for character in normalized
+        ):
+            raise AccountManagerServiceError("Region 格式无效")
+        return normalized
 
     def list_accounts(
         self,

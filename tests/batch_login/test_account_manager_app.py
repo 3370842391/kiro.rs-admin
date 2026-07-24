@@ -123,6 +123,20 @@ class FakeMenu:
 
 
 class AccountManagerAppTests(unittest.TestCase):
+    def test_import_region_defaults_to_saved_setting(self):
+        app = object.__new__(AccountManagerApp)
+        app._settings_store = lambda: SimpleNamespace(
+            load=lambda: SimpleNamespace(region="eu-central-1")
+        )
+
+        self.assertEqual("eu-central-1", app._default_import_region())
+
+    def test_import_region_falls_back_when_settings_are_missing(self):
+        app = object.__new__(AccountManagerApp)
+        app._settings_store = lambda: SimpleNamespace(load=lambda: None)
+
+        self.assertEqual("us-east-1", app._default_import_region())
+
     def test_extract_api_key_entry_passes_selected_concurrency(self):
         calls = []
 

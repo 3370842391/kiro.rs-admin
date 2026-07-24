@@ -101,6 +101,7 @@ def form_from_saved_settings(
     credential_path: Path,
     checkpoint_path: Path,
     home_proxies_override: str | None = None,
+    region_override: str | None = None,
 ) -> GuiFormState:
     def integer(value: str, default: int) -> int:
         return int(value) if value.strip() else default
@@ -113,7 +114,7 @@ def form_from_saved_settings(
         password_vault_path=saved.password_vault_path or (
             saved.credential_path + ".passwords.sqlite3"
         ),
-        region=saved.region,
+        region=saved.region if region_override is None else region_override,
         headless=saved.headless,
         timeout_seconds=saved.timeout_seconds,
         mfa_timeout_seconds=saved.mfa_timeout_seconds,
@@ -170,6 +171,20 @@ class AccountLoginCoordinator:
         )
         self.token_refresher = token_refresher
         self.now = now
+
+    @staticmethod
+    def _login_batches(accounts) -> list[tuple[LoginMode, str, list]]:
+        grouped: dict[tuple[LoginMode, str], list] = {}
+        for mode in LoginMode:
+            for account in accounts:
+                if account.login_mode is not mode:
+                    continue
+                region = account.region.strip().lower()
+                grouped.setdefault((mode, region), []).append(account)
+        return [
+            (mode, region, batch)
+            for (mode, region), batch in grouped.items()
+        ]
 
     def sync_saved_passwords(self, account_ids: list[int]) -> int:
         saved = self.settings_store.load()
@@ -295,18 +310,19 @@ class AccountLoginCoordinator:
         tasks: list = []
         try:
             with tempfile.TemporaryDirectory(prefix="kiro-login-") as tmp:
-                for mode in LoginMode:
-                    batch = [item for item in pending if item.login_mode is mode]
-                    if not batch:
-                        continue
+                for group_index, (mode, region, batch) in enumerate(
+                    self._login_batches(pending),
+                    start=1,
+                ):
                     self.repository.mark_login_running([item.id for item in batch])
                     for item in batch:
                         notify(item, "running")
                     form = form_from_saved_settings(
                         saved, mode=mode,
-                        credential_path=Path(tmp) / f"cred-{mode.value}.json",
-                        checkpoint_path=Path(tmp) / f"ckpt-{mode.value}.jsonl",
+                        credential_path=Path(tmp) / f"cred-{mode.value}-{group_index}.json",
+                        checkpoint_path=Path(tmp) / f"ckpt-{mode.value}-{group_index}.jsonl",
                         home_proxies_override=home_proxies_override,
+                        region_override=region,
                     )
                     runtime = self.runtime_factory(form, runtime_event_sink)
                     await runtime.open_for_concurrent()
@@ -767,16 +783,17 @@ class AccountLoginCoordinator:
         runtimes: list = []
         try:
             with tempfile.TemporaryDirectory(prefix="kiro-pipeline-") as tmp:
-                for mode in LoginMode:
-                    batch = [a for a in pending if a.login_mode is mode]
-                    if not batch:
-                        continue
+                for group_index, (mode, region, batch) in enumerate(
+                    self._login_batches(pending),
+                    start=1,
+                ):
                     self.repository.mark_login_running([a.id for a in batch])
                     form = form_from_saved_settings(
                         saved, mode=mode,
-                        credential_path=Path(tmp) / f"cred-{mode.value}.json",
-                        checkpoint_path=Path(tmp) / f"ckpt-{mode.value}.jsonl",
+                        credential_path=Path(tmp) / f"cred-{mode.value}-{group_index}.json",
+                        checkpoint_path=Path(tmp) / f"ckpt-{mode.value}-{group_index}.jsonl",
                         home_proxies_override=home_proxies_override,
+                        region_override=region,
                     )
                     runtime = self.runtime_factory(form, emit)
                     await runtime.open_for_concurrent()

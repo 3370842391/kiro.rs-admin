@@ -51,7 +51,7 @@ class Runtime:
         return CredentialRecord(
             email=entry.account, auth_method="idc", provider="Enterprise",
             refresh_token="refresh-" + entry.account, start_url=entry.start_url,
-            region="us-east-1",
+            region=self.form.region,
         )
     async def close(self): pass
 
@@ -97,6 +97,43 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(2, report.logged_in)
         self.assertEqual(2, report.exported)
         self.assertEqual("refresh-first", self.repo.load_credential(self.accounts[0].id).refresh_token)
+
+    async def test_login_uses_each_accounts_saved_region(self):
+        eu_account = self.repo.upsert_entries(
+            [
+                AccountEntry(
+                    3,
+                    "eu-account",
+                    "secret",
+                    "https://d-99674db463.awsapps.com/start",
+                )
+            ],
+            login_mode=LoginMode.ENTERPRISE,
+            region="eu-central-1",
+        )[0]
+        forms = []
+
+        def runtime_factory(form, emit):
+            forms.append(form)
+            return Runtime(form, emit, [])
+
+        coordinator = AccountLoginCoordinator(
+            self.repo,
+            SettingsStore(self.settings),
+            exporter=Exporter(),
+            runtime_factory=runtime_factory,
+        )
+
+        report = await coordinator.run(
+            [self.accounts[0].id, eu_account.id],
+            export_files=False,
+        )
+
+        self.assertEqual(2, report.logged_in)
+        self.assertEqual(
+            {"us-east-1", "eu-central-1"},
+            {form.region for form in forms},
+        )
 
     async def test_login_only_stores_credentials_without_exporting_files(self):
         calls=[]; exporter=Exporter()

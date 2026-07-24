@@ -73,6 +73,36 @@ class AccountManagerServiceTests(unittest.TestCase):
         self.assertEqual(2, len(preview.issues))
         self.assertEqual(1, len(self.repo.list_accounts()))
 
+    def test_confirm_import_normalizes_and_saves_region(self):
+        preview = self.service.preview_import(
+            "enterprise-user|secret|https://d-99674db463.awsapps.com/start",
+            "{account}|{password}|{start_url}",
+            LoginMode.ENTERPRISE,
+        )
+
+        report = self.service.confirm_import(
+            preview,
+            region=" EU-CENTRAL-1 ",
+        )
+
+        self.assertEqual("eu-central-1", report.accounts[0].region)
+
+    def test_confirm_import_rejects_invalid_region_before_saving(self):
+        preview = self.service.preview_import(
+            "enterprise-user|secret|https://d-99674db463.awsapps.com/start",
+            "{account}|{password}|{start_url}",
+            LoginMode.ENTERPRISE,
+        )
+
+        for region in ("", "../eu-central-1", "eu central 1"):
+            with self.subTest(region=region):
+                with self.assertRaisesRegex(
+                    AccountManagerServiceError,
+                    "Region",
+                ):
+                    self.service.confirm_import(preview, region=region)
+        self.assertEqual([], self.repo.list_accounts())
+
     def test_legacy_login_format_uses_uniform_enterprise_start_url(self):
         preview = self.service.preview_import(
             "\n".join(
