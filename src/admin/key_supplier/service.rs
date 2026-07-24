@@ -1,11 +1,26 @@
+use std::fmt;
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
-use crate::admin::key_supplier::client::SupplierClient;
-use crate::admin::key_supplier::store::{ProcessSummary, StoredSupplierEvent};
+use chrono::{Duration as ChronoDuration, Utc};
+use serde::Serialize;
+use serde_json::Value;
+
+use crate::admin::key_supplier::client::{Profile, Stock, SupplierClient, SupplierStatus};
+use crate::admin::key_supplier::config::{
+    SupplierConfigUpdate, SupplierConfigView, SupplierRuntimeConfig,
+};
+use crate::admin::key_supplier::store::{
+    IncomingSupplierEvent, InsertOutcome, ProcessSummary, StoredSupplierEvent, SupplierEventStore,
+};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::region::API_KEY_AUTH_REGION;
 use crate::kiro::token_manager::MultiTokenManager;
+use crate::model::config::Config;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CountDecision {
@@ -167,6 +182,23 @@ pub struct KeySupplierService {
     runtime: parking_lot::RwLock<SupplierRuntimeConfig>,
     importer: Option<Arc<dyn CredentialImporter>>,
     processing_lock: tokio::sync::Mutex<()>,
+    config_path: Option<PathBuf>,
+    config_update_lock: parking_lot::Mutex<()>,
+    processor_started: AtomicBool,
+}
+
+impl fmt::Debug for KeySupplierService {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("KeySupplierService")
+            .field("runtime", &*self.runtime.read())
+            .field("config_path", &self.config_path)
+            .field(
+                "processor_started",
+                &self.processor_started.load(Ordering::Relaxed),
+            )
+            .finish()
+    }
 }
 
 impl KeySupplierService {
@@ -176,6 +208,9 @@ impl KeySupplierService {
             runtime: parking_lot::RwLock::new(runtime),
             importer: None,
             processing_lock: tokio::sync::Mutex::new(()),
+            config_path: None,
+            config_update_lock: parking_lot::Mutex::new(()),
+            processor_started: AtomicBool::new(false),
         }
     }
 
@@ -189,6 +224,9 @@ impl KeySupplierService {
             runtime: parking_lot::RwLock::new(runtime),
             importer: Some(importer),
             processing_lock: tokio::sync::Mutex::new(()),
+            config_path: None,
+            config_update_lock: parking_lot::Mutex::new(()),
+            processor_started: AtomicBool::new(false),
         }
     }
 
@@ -208,12 +246,156 @@ impl KeySupplierService {
         self.runtime.read().clone()
     }
 
+    pub fn with_config_path(mut self, config_path: impl AsRef<Path>) -> Self {
+        self.config_path = Some(config_path.as_ref().to_path_buf());
+        self
+    }
+
     pub fn set_runtime_config(&self, runtime: SupplierRuntimeConfig) {
         *self.runtime.write() = runtime;
     }
 
     pub fn store(&self) -> Arc<SupplierEventStore> {
         self.store.clone()
+    }
+
+    pub fn config_view(&self) -> SupplierConfigView {
+        SupplierConfigView::from(&self.runtime_config())
+    }
+
+    pub fn update_config(
+        &self,
+        update: SupplierConfigUpdate,
+    ) -> Result<SupplierConfigView, SupplierServiceError> {
+        let _guard = self.config_update_lock.lock();
+        let path = self
+            .config_path
+            .as_ref()
+            .ok_or(SupplierServiceError::ConfigPathUnavailable)?;
+        let mut config = Config::load(path).map_err(|_| SupplierServiceError::ConfigPersistence)?;
+        let runtime = SupplierRuntimeConfig::apply(&mut config, update)
+            .map_err(|_| SupplierServiceError::SupplierConfiguration)?;
+        config
+            .save()
+            .map_err(|_| SupplierServiceError::ConfigPersistence)?;
+        *self.runtime.write() = runtime.clone();
+        Ok(SupplierConfigView::from(&runtime))
+    }
+
+    fn supplier_client(&self) -> Result<SupplierClient, SupplierServiceError> {
+        let runtime = self.runtime_config();
+        if runtime.base_url.trim().is_empty() || runtime.api_key.trim().is_empty() {
+            return Err(SupplierServiceError::SupplierConfiguration);
+        }
+        SupplierClient::new(&runtime.base_url, &runtime.api_key)
+            .map_err(|_| SupplierServiceError::SupplierConfiguration)
+    }
+
+    pub async fn overview(&self) -> Result<SupplierOverview, SupplierServiceError> {
+        let client = self.supplier_client()?;
+        let profile = client
+            .profile()
+            .await
+            .map_err(|_| SupplierServiceError::SupplierApi)?;
+        let stock = client
+            .stock()
+            .await
+            .map_err(|_| SupplierServiceError::SupplierApi)?;
+        let status = client
+            .status()
+            .await
+            .map_err(|_| SupplierServiceError::SupplierApi)?;
+        Ok(SupplierOverview {
+            profile,
+            stock,
+            status,
+        })
+    }
+
+    pub fn callback_url(&self) -> Result<String, SupplierServiceError> {
+        let runtime = self.runtime_config();
+        if runtime.webhook_token.len() != 64
+            || !runtime
+                .webhook_token
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || runtime.public_base_url.trim().is_empty()
+        {
+            return Err(SupplierServiceError::SupplierConfiguration);
+        }
+        SupplierClient::new(&runtime.public_base_url, "callback-validation")
+            .map_err(|_| SupplierServiceError::SupplierConfiguration)?;
+        let mut callback = reqwest::Url::parse(&runtime.public_base_url)
+            .map_err(|_| SupplierServiceError::SupplierConfiguration)?;
+        callback.set_path(&format!(
+            "/api/admin/key-supplier/webhook/{}",
+            runtime.webhook_token
+        ));
+        callback.set_query(None);
+        callback.set_fragment(None);
+        Ok(callback.into())
+    }
+
+    pub async fn register_webhook(&self) -> Result<String, SupplierServiceError> {
+        let callback = self.callback_url()?;
+        self.supplier_client()?
+            .register_webhook(&callback)
+            .await
+            .map_err(|_| SupplierServiceError::SupplierApi)?;
+        Ok(callback)
+    }
+
+    pub async fn test_webhook(&self) -> Result<(), SupplierServiceError> {
+        self.supplier_client()?
+            .test_webhook()
+            .await
+            .map_err(|_| SupplierServiceError::SupplierApi)
+    }
+
+    pub fn retry_event(&self, id: i64) -> Result<(), SupplierServiceError> {
+        self.store
+            .retry(id)
+            .map_err(|_| SupplierServiceError::Store)
+    }
+
+    pub async fn run_processing_cycle(&self) -> Result<usize, SupplierServiceError> {
+        self.store
+            .recover_stale_processing(Utc::now() - ChronoDuration::minutes(5))
+            .map_err(|_| SupplierServiceError::Store)?;
+        self.process_pending().await
+    }
+
+    pub fn start_processor(self: &Arc<Self>) -> bool {
+        if self
+            .processor_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        let service = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(error) = service.run_processing_cycle().await {
+                tracing::warn!(
+                    kind = processing_error_kind(&error),
+                    "supplier processor cycle failed"
+                );
+            }
+            let mut interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + Duration::from_secs(30),
+                Duration::from_secs(30),
+            );
+            loop {
+                interval.tick().await;
+                if let Err(error) = service.run_processing_cycle().await {
+                    tracing::warn!(
+                        kind = processing_error_kind(&error),
+                        "supplier processor cycle failed"
+                    );
+                }
+            }
+        });
+        true
     }
 
     pub fn ingest<B: AsRef<[u8]>>(
@@ -347,8 +529,7 @@ impl KeySupplierService {
             .ok_or(SupplierServiceError::ImporterUnavailable)?;
         let (count, client) = match event.event_type.as_str() {
             "new_keys_available" => {
-                let client = SupplierClient::new(&runtime.base_url, &runtime.api_key)
-                    .map_err(|_| SupplierServiceError::SupplierConfiguration)?;
+                let client = self.supplier_client()?;
                 let stock = client
                     .stock()
                     .await
@@ -368,8 +549,7 @@ impl KeySupplierService {
             "manual_purchase" => {
                 let count = u32::try_from(event.quantity)
                     .map_err(|_| SupplierServiceError::InvalidEvent)?;
-                let client = SupplierClient::new(&runtime.base_url, &runtime.api_key)
-                    .map_err(|_| SupplierServiceError::SupplierConfiguration)?;
+                let client = self.supplier_client()?;
                 (count, client)
             }
             _ => unreachable!("event type was validated before purchase"),
@@ -502,6 +682,35 @@ impl fmt::Debug for IngestResult {
     }
 }
 
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupplierOverview {
+    pub profile: Profile,
+    pub stock: Stock,
+    pub status: SupplierStatus,
+}
+
+impl fmt::Debug for SupplierOverview {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SupplierOverview")
+            .field("profile", &self.profile)
+            .field("stock_max", &self.stock.max)
+            .field("status", &self.status)
+            .finish()
+    }
+}
+
+fn processing_error_kind(error: &SupplierServiceError) -> &'static str {
+    match error {
+        SupplierServiceError::Store => "store",
+        SupplierServiceError::SupplierApi => "supplier_api",
+        SupplierServiceError::SupplierConfiguration => "configuration",
+        SupplierServiceError::ImporterUnavailable => "importer",
+        _ => "other",
+    }
+}
+
 pub enum SupplierServiceError {
     Unauthorized,
     InvalidJson,
@@ -512,6 +721,8 @@ pub enum SupplierServiceError {
     SupplierApi,
     ImporterUnavailable,
     Store,
+    ConfigPathUnavailable,
+    ConfigPersistence,
 }
 
 impl fmt::Display for SupplierServiceError {
@@ -528,6 +739,8 @@ impl fmt::Display for SupplierServiceError {
             Self::SupplierApi => "supplier API request failed",
             Self::ImporterUnavailable => "credential importer is unavailable",
             Self::Store => "supplier event store unavailable",
+            Self::ConfigPathUnavailable => "supplier configuration path is unavailable",
+            Self::ConfigPersistence => "supplier configuration could not be persisted",
         })
     }
 }
@@ -544,6 +757,8 @@ impl fmt::Debug for SupplierServiceError {
             Self::SupplierApi => "SupplierApi",
             Self::ImporterUnavailable => "ImporterUnavailable",
             Self::Store => "Store",
+            Self::ConfigPathUnavailable => "ConfigPathUnavailable",
+            Self::ConfigPersistence => "ConfigPersistence",
         })
     }
 }
@@ -553,17 +768,22 @@ impl std::error::Error for SupplierServiceError {}
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::admin::key_supplier::config::SupplierRuntimeConfig;
-    use crate::admin::key_supplier::store::{SupplierEventStatus, SupplierEventStore};
+    use crate::admin::key_supplier::config::{SupplierConfigUpdate, SupplierRuntimeConfig};
+    use crate::admin::key_supplier::store::{
+        IncomingSupplierEvent, SupplierEventStatus, SupplierEventStore,
+    };
     use crate::kiro::model::credentials::KiroCredentials;
+    use crate::model::config::{Config, KeySupplierConfig};
     use axum::{
         Router,
         response::IntoResponse,
-        routing::{get, post},
+        routing::{get, post, put},
     };
+    use chrono::{Duration, Utc};
     use tokio::net::TcpListener;
 
     const TOKEN: &str = "webhook-token-canary";
@@ -635,6 +855,44 @@ mod tests {
         let store = Arc::new(SupplierEventStore::open_in_memory().unwrap());
         let service = KeySupplierService::new(store.clone(), runtime(token));
         (service, store)
+    }
+
+    fn supplier_update(runtime: &SupplierRuntimeConfig) -> SupplierConfigUpdate {
+        SupplierConfigUpdate {
+            base_url: runtime.base_url.clone(),
+            api_key: None,
+            public_base_url: runtime.public_base_url.clone(),
+            webhook_token: None,
+            auto_purchase: runtime.auto_purchase,
+            min_purchase: u64::from(runtime.min_purchase),
+            max_purchase: u64::from(runtime.max_purchase),
+            api_region: runtime.api_region.clone(),
+            rpm_limit: u64::from(runtime.rpm_limit),
+            priority: u64::from(runtime.priority),
+            groups: runtime.groups.clone(),
+            source_channel: runtime.source_channel.clone(),
+            nickname_prefix: runtime.nickname_prefix.clone(),
+        }
+    }
+
+    fn temp_config_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "kiro-supplier-service-{label}-{}-{}.json",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    fn persistent_service(runtime: SupplierRuntimeConfig) -> (Arc<KeySupplierService>, PathBuf) {
+        let path = temp_config_path("config");
+        let mut config = Config::load(&path).unwrap();
+        config.key_supplier = KeySupplierConfig::from(&runtime);
+        config.save().unwrap();
+        let store = Arc::new(SupplierEventStore::open_in_memory().unwrap());
+        (
+            Arc::new(KeySupplierService::new(store, runtime).with_config_path(&path)),
+            path,
+        )
     }
 
     fn queued_event(
@@ -1099,11 +1357,202 @@ mod tests {
             SupplierEventStatus::Failed
         );
     }
+
+    #[test]
+    fn config_view_and_update_persist_without_revealing_secrets() {
+        let mut initial = runtime(&"a".repeat(64));
+        initial.base_url = "https://supplier.example".to_string();
+        initial.public_base_url = "https://admin.example".to_string();
+        initial.api_key = "api-key-canary".to_string();
+        let (service, path) = persistent_service(initial.clone());
+
+        let view = service.config_view();
+        let encoded = serde_json::to_string(&view).unwrap();
+        assert!(view.api_key_configured && view.webhook_token_configured);
+        assert!(!encoded.contains(&initial.api_key));
+        assert!(!encoded.contains(&initial.webhook_token));
+
+        let mut update = supplier_update(&initial);
+        update.min_purchase = 2;
+        update.max_purchase = 3;
+        let updated = service.update_config(update).unwrap();
+        let persisted = Config::load(&path).unwrap();
+        assert_eq!(updated.min_purchase, 2);
+        assert_eq!(persisted.key_supplier.min_purchase, 2);
+        assert_eq!(persisted.key_supplier.api_key, initial.api_key);
+        assert_eq!(persisted.key_supplier.webhook_token, initial.webhook_token);
+        assert_eq!(service.runtime_config().min_purchase, updated.min_purchase);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_config_update_leaves_runtime_and_file_unchanged() {
+        let mut initial = runtime(&"b".repeat(64));
+        initial.base_url = "https://supplier.example".to_string();
+        initial.public_base_url = "https://admin.example".to_string();
+        let (service, path) = persistent_service(initial.clone());
+        let before_file = std::fs::read_to_string(&path).unwrap();
+        let mut update = supplier_update(&initial);
+        update.min_purchase = 0;
+
+        assert!(service.update_config(update).is_err());
+        assert_eq!(service.runtime_config(), initial);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before_file);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn concurrent_config_updates_leave_runtime_consistent_with_disk() {
+        let mut initial = runtime(&"c".repeat(64));
+        initial.base_url = "https://supplier.example".to_string();
+        initial.public_base_url = "https://admin.example".to_string();
+        let (service, path) = persistent_service(initial.clone());
+        let mut first = supplier_update(&initial);
+        first.min_purchase = 2;
+        first.max_purchase = 4;
+        let mut second = supplier_update(&initial);
+        second.min_purchase = 3;
+        second.max_purchase = 5;
+
+        let left = Arc::clone(&service);
+        let right = Arc::clone(&service);
+        let one = std::thread::spawn(move || left.update_config(first).unwrap());
+        let two = std::thread::spawn(move || right.update_config(second).unwrap());
+        one.join().unwrap();
+        two.join().unwrap();
+
+        let persisted = Config::load(&path).unwrap();
+        assert_eq!(
+            service.runtime_config().base_url,
+            persisted.key_supplier.base_url
+        );
+        assert_eq!(
+            service.runtime_config().min_purchase,
+            persisted.key_supplier.min_purchase
+        );
+        assert_eq!(
+            service.runtime_config().max_purchase,
+            persisted.key_supplier.max_purchase
+        );
+        assert_eq!(persisted.key_supplier.api_key, initial.api_key);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn callback_url_requires_an_origin_and_hex_token() {
+        let mut config = runtime(&"d".repeat(64));
+        config.public_base_url = "https://admin.example/".to_string();
+        let service = KeySupplierService::new(
+            Arc::new(SupplierEventStore::open_in_memory().unwrap()),
+            config.clone(),
+        );
+        let url = service.callback_url().unwrap();
+        assert_eq!(
+            url,
+            format!(
+                "https://admin.example/api/admin/key-supplier/webhook/{}",
+                config.webhook_token
+            )
+        );
+        assert!(!format!("{service:?}").contains(&config.webhook_token));
+
+        config.public_base_url = "https://admin.example/path".to_string();
+        let service = KeySupplierService::new(
+            Arc::new(SupplierEventStore::open_in_memory().unwrap()),
+            config.clone(),
+        );
+        assert!(service.callback_url().is_err());
+        config.public_base_url = "https://admin.example".to_string();
+        config.webhook_token = "not-hex".to_string();
+        let service = KeySupplierService::new(
+            Arc::new(SupplierEventStore::open_in_memory().unwrap()),
+            config,
+        );
+        assert!(service.callback_url().is_err());
+    }
+
+    #[tokio::test]
+    async fn overview_and_webhook_operations_use_the_supplier_client() {
+        let registered = Arc::new(Mutex::new(Vec::new()));
+        let registered_clone = registered.clone();
+        let app = Router::new()
+            .route("/api/my/profile", get(|| async { axum::Json(serde_json::json!({"name":"demo","quota":9,"remaining":7,"used_quota":2,"webhook_url":"https://private.example/hook"})) }))
+            .route("/api/my/stock", get(|| async { axum::Json(serde_json::json!({"max":4})) }))
+            .route("/api/status", get(|| async { axum::Json(serde_json::json!({"keys_active":3,"keys_dead":1})) }))
+            .route("/api/my/webhook", put(move |request: axum::http::Request<axum::body::Body>| {
+                let registered = registered_clone.clone();
+                async move {
+                    let body = axum::body::to_bytes(request.into_body(), usize::MAX).await.unwrap();
+                    registered.lock().unwrap().push(String::from_utf8(body.to_vec()).unwrap());
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            }))
+            .route("/api/my/webhook/test", post(|| async { axum::http::StatusCode::NO_CONTENT }));
+        let mut config = runtime(&"e".repeat(64));
+        config.base_url = server(app).await;
+        config.public_base_url = "https://admin.example".to_string();
+        let service = KeySupplierService::new(
+            Arc::new(SupplierEventStore::open_in_memory().unwrap()),
+            config.clone(),
+        );
+
+        let overview = service.overview().await.unwrap();
+        assert_eq!(overview.profile.name, "demo");
+        assert_eq!(overview.stock.max, 4);
+        assert_eq!(overview.status.keys_active, 3);
+        assert!(!format!("{overview:?}").contains(&config.webhook_token));
+        let callback = service.register_webhook().await.unwrap();
+        service.test_webhook().await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&registered.lock().unwrap()[0]).unwrap()["webhook_url"],
+            callback
+        );
+    }
+
+    #[tokio::test]
+    async fn processing_cycle_recovers_stale_work_and_processor_starts_once() {
+        let path = temp_config_path("events");
+        let store = Arc::new(SupplierEventStore::open(&path).unwrap());
+        store
+            .insert_event(IncomingSupplierEvent {
+                event_id: "stale-event".to_string(),
+                event_type: "all_keys_dead".to_string(),
+                purchase_order_id: None,
+                message: Some("stale".to_string()),
+                quantity: 1,
+            })
+            .unwrap();
+        let claimed = store.claim_next().unwrap().unwrap();
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE supplier_events SET processing_started_at=?1 WHERE id=?2",
+                rusqlite::params![(Utc::now() - Duration::minutes(6)).to_rfc3339(), claimed.id],
+            )
+            .unwrap();
+        let service = Arc::new(KeySupplierService::new(store.clone(), runtime(TOKEN)));
+
+        assert_eq!(service.run_processing_cycle().await.unwrap(), 1);
+        assert_eq!(
+            store.list(1, None).unwrap().items[0].status,
+            SupplierEventStatus::Succeeded
+        );
+        assert!(service.start_processor());
+        assert!(!service.start_processor());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn retry_event_delegates_to_store() {
+        let (service, store) = service(TOKEN);
+        queued_event(&store, "all_keys_dead", None, 1);
+        let claimed = store.claim_next().unwrap().unwrap();
+        store.fail(claimed.id, "failed").unwrap();
+
+        service.retry_event(claimed.id).unwrap();
+        assert_eq!(
+            store.list(1, None).unwrap().items[0].status,
+            SupplierEventStatus::Received
+        );
+    }
 }
-use std::fmt;
-use std::sync::Arc;
-
-use serde_json::Value;
-
-use crate::admin::key_supplier::config::SupplierRuntimeConfig;
-use crate::admin::key_supplier::store::{IncomingSupplierEvent, InsertOutcome, SupplierEventStore};

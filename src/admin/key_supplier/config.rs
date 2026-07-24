@@ -146,8 +146,8 @@ impl SupplierRuntimeConfig {
         validate_number_range(update.rpm_limit, "rpmLimit", 0, MAX_RPM_LIMIT)?;
         validate_number_range(update.priority, "priority", 0, MAX_PRIORITY)?;
 
-        let base_url = normalize_http_url(&update.base_url, "baseUrl")?;
-        let public_base_url = normalize_http_url(&update.public_base_url, "publicBaseUrl")?;
+        let base_url = normalize_http_origin(&update.base_url, "baseUrl")?;
+        let public_base_url = normalize_http_origin(&update.public_base_url, "publicBaseUrl")?;
         let api_region = validate_api_region(&update.api_region)?.to_string();
         let api_key = normalize_secret(
             update
@@ -260,7 +260,7 @@ fn normalize_persisted(value: &KeySupplierConfig) -> anyhow::Result<SupplierRunt
     SupplierRuntimeConfig::normalize(&config, update, false)
 }
 
-fn normalize_http_url(value: &str, field: &str) -> anyhow::Result<String> {
+fn normalize_http_origin(value: &str, field: &str) -> anyhow::Result<String> {
     let value = normalize_text(value, field, MAX_URL_CHARS)?;
     if value.is_empty() {
         return Ok(value);
@@ -268,6 +268,14 @@ fn normalize_http_url(value: &str, field: &str) -> anyhow::Result<String> {
     let parsed = reqwest::Url::parse(&value).with_context(|| format!("{field} 不是有效 URL"))?;
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
         anyhow::bail!("{field} 必须为空或使用 http(s) URL");
+    }
+    if (parsed.path() != "" && parsed.path() != "/")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        anyhow::bail!("{field} must contain only an http(s) origin");
     }
     Ok(value.trim_end_matches('/').to_string())
 }
@@ -319,7 +327,7 @@ mod tests {
 
     fn valid_update() -> SupplierConfigUpdate {
         SupplierConfigUpdate {
-            base_url: " https://supplier.example/api/ ".to_string(),
+            base_url: " https://supplier.example/ ".to_string(),
             api_key: Some(" supplier-secret ".to_string()),
             public_base_url: " https://public.example/ ".to_string(),
             webhook_token: None,
@@ -375,11 +383,37 @@ mod tests {
     }
 
     #[test]
+    fn rejects_urls_that_are_not_origins() {
+        for value in [
+            "https://supplier.example/api",
+            "https://user:pass@supplier.example",
+            "https://supplier.example/?query=1",
+            "https://supplier.example/#fragment",
+        ] {
+            let mut update = valid_update();
+            update.base_url = value.to_string();
+            let mut config = Config::default();
+            assert!(
+                SupplierRuntimeConfig::apply(&mut config, update).is_err(),
+                "{value}"
+            );
+
+            let mut update = valid_update();
+            update.public_base_url = value.to_string();
+            let mut config = Config::default();
+            assert!(
+                SupplierRuntimeConfig::apply(&mut config, update).is_err(),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
     fn apply_normalizes_values_and_generates_missing_webhook_token() {
         let mut config = Config::default();
         let runtime = SupplierRuntimeConfig::apply(&mut config, valid_update()).unwrap();
 
-        assert_eq!(runtime.base_url, "https://supplier.example/api");
+        assert_eq!(runtime.base_url, "https://supplier.example");
         assert_eq!(runtime.public_base_url, "https://public.example");
         assert_eq!(runtime.api_region, "us-east-1");
         assert_eq!(runtime.groups, vec!["production", "backup"]);
