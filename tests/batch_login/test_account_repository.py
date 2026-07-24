@@ -47,6 +47,54 @@ class AccountRepositoryTests(unittest.TestCase):
             protector=protector or FakeProtector(),
         )
 
+    def test_delete_accounts_removes_selected_rows_and_cascades(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self.make_repo(tmp)
+            first, second = repo.upsert_entries(
+                [entry(account="first"), entry(account="second")],
+                login_mode=LoginMode.ENTERPRISE,
+                region="us-east-1",
+            )
+            repo.save_credential(
+                first.id,
+                CredentialRecord(
+                    email="first",
+                    auth_method="idc",
+                    provider="Enterprise",
+                    access_token="secret-token",
+                ),
+            )
+            repo.save_quota(
+                first.id,
+                remaining=9000,
+                total=10000,
+                used=1000,
+                subscription="KIRO POWER",
+                free_trial=False,
+                next_reset=None,
+            )
+
+            deleted = repo.delete_accounts([first.id])
+
+            self.assertEqual(1, deleted)
+            self.assertEqual([second.id], [item.id for item in repo.list_accounts()])
+            self.assertIsNone(repo.load_credential(first.id))
+            self.assertIsNone(repo.load_quota(first.id))
+
+    def test_delete_accounts_is_atomic_when_any_id_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self.make_repo(tmp)
+            saved = repo.upsert_entries(
+                [entry(account="keep-me")],
+                login_mode=LoginMode.ENTERPRISE,
+                region="us-east-1",
+            )[0]
+
+            with self.assertRaises(AccountRepositoryError):
+                repo.delete_accounts([saved.id, 999999])
+
+            self.assertEqual([saved.id], [item.id for item in repo.list_accounts()])
+
     def test_upsert_encrypts_password_and_list_hides_secrets(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = self.make_repo(tmp)

@@ -189,6 +189,22 @@ class AccountRepository:
             raise AccountRepositoryError("账号批量保存失败") from error
         return [self.get(account_id) for account_id in saved_ids]
 
+    def delete_accounts(self, account_ids: Sequence[int]) -> int:
+        ids = self._unique_ids(account_ids)
+        try:
+            with self._transaction() as connection:
+                self._require_ids(connection, ids)
+                placeholders = ",".join("?" for _ in ids)
+                cursor = connection.execute(
+                    f"DELETE FROM accounts WHERE id IN ({placeholders})",
+                    tuple(ids),
+                )
+                return int(cursor.rowcount)
+        except AccountRepositoryError:
+            raise
+        except sqlite3.Error as error:
+            raise AccountRepositoryError("账号删除失败") from error
+
     def list_accounts(
         self,
         *,

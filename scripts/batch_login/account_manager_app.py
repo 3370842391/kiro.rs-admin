@@ -210,6 +210,7 @@ class AccountManagerApp:
         "导出账号密码",
         "标记已售",
         "恢复管理",
+        "删除选中",
     )
     CONTEXT_MENU_LABELS = (
         "登录（存 token）",
@@ -228,6 +229,7 @@ class AccountManagerApp:
         "导出账号密码",
         "标记已售",
         "恢复管理",
+        "删除选中",
     )
     STATUS_VALUES = {
         "管理中": "managed",
@@ -314,6 +316,7 @@ class AccountManagerApp:
             self.open_export_dialog,
             self.mark_sold,
             self.restore_managed,
+            self.delete_selected_accounts,
         )
         for text, command in zip(
             self.SELECTION_TOOLBAR_LABELS, selection_commands, strict=True
@@ -375,11 +378,12 @@ class AccountManagerApp:
             self.open_export_dialog,
             self.mark_sold,
             self.restore_managed,
+            self.delete_selected_accounts,
         )
         for index, (label, command) in enumerate(
             zip(self.CONTEXT_MENU_LABELS, context_commands, strict=True)
         ):
-            if index in {3, 8, 11, 14}:
+            if index in {3, 8, 11, 14, 16}:
                 self.context_menu.add_separator()
             self.context_menu.add_command(label=label, command=command)
 
@@ -523,6 +527,35 @@ class AccountManagerApp:
     def clear_selection(self) -> None:
         self.service.clear_selected()
         self.refresh()
+
+    def delete_selected_accounts(self) -> None:
+        if self.login_running:
+            messagebox.showinfo(
+                "删除账号",
+                "任务运行中，停止或等待任务结束后再删除账号",
+                parent=self.root,
+            )
+            return
+        ids = self._selected_action_ids()
+        if not ids:
+            messagebox.showinfo("删除账号", "请先选择账号", parent=self.root)
+            return
+        if not messagebox.askyesno(
+            "永久删除账号",
+            f"确定永久删除选中的 {len(ids)} 个账号吗？\n"
+            "关联的登录凭据、API Key、额度和历史记录也会一起删除，且无法恢复。",
+            parent=self.root,
+        ):
+            return
+        try:
+            deleted = self.service.delete_accounts(ids)
+        except AccountManagerServiceError as error:
+            self._error(error)
+            return
+        for account_id in ids:
+            self.json_status_by_id.pop(account_id, None)
+        self.refresh()
+        self.status_var.set(f"已永久删除 {deleted} 个账号")
 
     def open_start_url_manager(self) -> None:
         try:

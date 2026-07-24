@@ -268,6 +268,7 @@ class AccountManagerAppTests(unittest.TestCase):
                 "导出账号密码",
                 "标记已售",
                 "恢复管理",
+                "删除选中",
             ),
             AccountManagerApp.SELECTION_TOOLBAR_LABELS,
         )
@@ -495,9 +496,43 @@ class AccountManagerAppTests(unittest.TestCase):
                 "导出账号密码",
                 "标记已售",
                 "恢复管理",
+                "删除选中",
             ),
             AccountManagerApp.CONTEXT_MENU_LABELS,
         )
+
+    def test_delete_selected_accounts_requires_confirmation_then_refreshes(self):
+        class Service(FakeSelectionService):
+            def __init__(self):
+                super().__init__((1, 2))
+                self.deleted = []
+
+            def delete_accounts(self, ids):
+                self.deleted.append(list(ids))
+                self.set_selected(())
+                return len(ids)
+
+        app = object.__new__(AccountManagerApp)
+        app.root = None
+        app.login_running = False
+        app.service = Service()
+        app.status_var = FakeVar("")
+        app.json_status_by_id = {1: "失败", 2: "成功", 3: "成功"}
+        refreshed = []
+        app.refresh = lambda: refreshed.append(True)
+
+        with patch.object(
+            account_manager_module.messagebox,
+            "askyesno",
+            return_value=True,
+        ) as confirm:
+            app.delete_selected_accounts()
+
+        confirm.assert_called_once()
+        self.assertEqual([[1, 2]], app.service.deleted)
+        self.assertEqual({3: "成功"}, app.json_status_by_id)
+        self.assertEqual([True], refreshed)
+        self.assertEqual("已永久删除 2 个账号", app.status_var.get())
 
     def test_copy_account_info_uses_all_checked_ids(self):
         class Service(FakeSelectionService):

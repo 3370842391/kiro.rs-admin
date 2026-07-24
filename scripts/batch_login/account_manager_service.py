@@ -252,6 +252,15 @@ class AccountManagerService:
     def clear_selected(self) -> None:
         self._selected_ids.clear()
 
+    def delete_accounts(self, ids: Sequence[int]) -> int:
+        unique_ids = list(dict.fromkeys(int(item) for item in ids))
+        try:
+            deleted = self.repository.delete_accounts(unique_ids)
+        except AccountRepositoryError as error:
+            raise AccountManagerServiceError(str(error)) from error
+        self._selected_ids.difference_update(unique_ids)
+        return deleted
+
     def update_password(self, ids: Sequence[int], password: str) -> int:
         accounts = self._load_managed(ids, include_secrets=False)
         if not password:

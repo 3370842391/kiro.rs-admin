@@ -361,6 +361,16 @@ class AccountManagerServiceTests(unittest.TestCase):
         self.service.clear_selected()
         self.assertEqual(set(), self.service.selected_ids)
 
+    def test_delete_accounts_removes_rows_and_clears_deleted_selection(self):
+        first, second = self.import_accounts().accounts
+        self.service.set_selected([first.id, second.id])
+
+        deleted = self.service.delete_accounts([first.id])
+
+        self.assertEqual(1, deleted)
+        self.assertEqual({second.id}, self.service.selected_ids)
+        self.assertEqual([second.id], [item.id for item in self.repo.list_accounts()])
+
     def test_update_password_rejects_sold_accounts(self):
         first, _second = self.import_accounts().accounts
         self.repo.mark_sold([first.id], "客户 A")
