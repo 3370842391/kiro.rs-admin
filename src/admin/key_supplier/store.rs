@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS supplier_events (
     purchased INTEGER NOT NULL DEFAULT 0,
     imported INTEGER NOT NULL DEFAULT 0,
     duplicate_count INTEGER NOT NULL DEFAULT 0,
+    webhook_duplicate_count INTEGER NOT NULL DEFAULT 0,
     failed_count INTEGER NOT NULL DEFAULT 0,
     read_at TEXT,
     processing_started_at TEXT
@@ -42,6 +43,7 @@ const MIGRATION_COLUMNS: &[(&str, &str)] = &[
     ("purchased", "INTEGER NOT NULL DEFAULT 0"),
     ("imported", "INTEGER NOT NULL DEFAULT 0"),
     ("duplicate_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("webhook_duplicate_count", "INTEGER NOT NULL DEFAULT 0"),
     ("failed_count", "INTEGER NOT NULL DEFAULT 0"),
     ("read_at", "TEXT"),
     ("processing_started_at", "TEXT"),
@@ -110,6 +112,7 @@ pub struct StoredSupplierEvent {
     pub purchased_count: i64,
     pub imported_count: i64,
     pub duplicate_count: i64,
+    pub webhook_duplicate_count: i64,
     pub failed_count: i64,
     pub read_at: Option<String>,
     pub processing_started_at: Option<String>,
@@ -166,12 +169,13 @@ impl SupplierEventStore {
     }
 
     pub fn insert_event(&self, event: IncomingSupplierEvent) -> rusqlite::Result<InsertOutcome> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let received_at = Utc::now().to_rfc3339();
         let message = event
             .message
             .map(|value| truncate_chars(&value, MAX_MESSAGE_CHARS));
-        let inserted = conn.execute(
+        let inserted = tx.execute(
             "INSERT OR IGNORE INTO supplier_events
              (event_id,event_type,purchase_order_id,message,quantity,received_at,status)
              VALUES (?1,?2,?3,?4,?5,?6,'received')",
@@ -184,6 +188,13 @@ impl SupplierEventStore {
                 received_at
             ],
         )?;
+        if inserted == 0 {
+            tx.execute(
+                "UPDATE supplier_events SET webhook_duplicate_count=webhook_duplicate_count+1 WHERE event_id=?1",
+                params![event.event_id],
+            )?;
+        }
+        tx.commit()?;
         let stored = Self::query_by_event_id(&conn, &event.event_id)?
             .expect("inserted or duplicate event must be queryable");
         if inserted == 1 {
@@ -302,7 +313,7 @@ impl SupplierEventStore {
         let limit = limit.clamp(1, 200) as i64;
         let mut stmt = conn.prepare(
             "SELECT id,event_id,event_type,purchase_order_id,message,quantity,received_at,status,attempts,last_error,
-                    purchased,imported,duplicate_count,failed_count,read_at,processing_started_at
+                    purchased,imported,duplicate_count,webhook_duplicate_count,failed_count,read_at,processing_started_at
              FROM supplier_events WHERE (?1 IS NULL OR id < ?1) ORDER BY id DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![before, limit], Self::row_to_event)?;
@@ -374,14 +385,14 @@ impl SupplierEventStore {
         conn: &Connection,
         event_id: &str,
     ) -> rusqlite::Result<Option<StoredSupplierEvent>> {
-        conn.query_row("SELECT id,event_id,event_type,purchase_order_id,message,quantity,received_at,status,attempts,last_error,purchased,imported,duplicate_count,failed_count,read_at,processing_started_at FROM supplier_events WHERE event_id=?1", params![event_id], Self::row_to_event).optional()
+        conn.query_row("SELECT id,event_id,event_type,purchase_order_id,message,quantity,received_at,status,attempts,last_error,purchased,imported,duplicate_count,webhook_duplicate_count,failed_count,read_at,processing_started_at FROM supplier_events WHERE event_id=?1", params![event_id], Self::row_to_event).optional()
     }
 
     fn query_by_id(
         conn: &rusqlite::Transaction<'_>,
         id: i64,
     ) -> rusqlite::Result<Option<StoredSupplierEvent>> {
-        conn.query_row("SELECT id,event_id,event_type,purchase_order_id,message,quantity,received_at,status,attempts,last_error,purchased,imported,duplicate_count,failed_count,read_at,processing_started_at FROM supplier_events WHERE id=?1", params![id], Self::row_to_event).optional()
+        conn.query_row("SELECT id,event_id,event_type,purchase_order_id,message,quantity,received_at,status,attempts,last_error,purchased,imported,duplicate_count,webhook_duplicate_count,failed_count,read_at,processing_started_at FROM supplier_events WHERE id=?1", params![id], Self::row_to_event).optional()
     }
 
     fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredSupplierEvent> {
@@ -399,9 +410,10 @@ impl SupplierEventStore {
             purchased_count: row.get(10)?,
             imported_count: row.get(11)?,
             duplicate_count: row.get(12)?,
-            failed_count: row.get(13)?,
-            read_at: row.get(14)?,
-            processing_started_at: row.get(15)?,
+            webhook_duplicate_count: row.get(13)?,
+            failed_count: row.get(14)?,
+            read_at: row.get(15)?,
+            processing_started_at: row.get(16)?,
         })
     }
 
@@ -656,7 +668,7 @@ mod tests {
         ));
         let items = store.list(10, None).unwrap().items;
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].duplicate_count, 0);
+        assert_eq!(items[0].webhook_duplicate_count, 1);
     }
 
     #[test]
