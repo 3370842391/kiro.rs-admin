@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::admin::key_supplier::client::{Profile, Stock, SupplierClient, SupplierStatus};
 use crate::admin::key_supplier::config::{
-    SupplierConfigUpdate, SupplierConfigView, SupplierRuntimeConfig,
+    SupplierConfigUpdate, SupplierConfigView, SupplierRuntimeConfig, is_valid_webhook_token,
 };
 use crate::admin::key_supplier::store::{
     IncomingSupplierEvent, InsertOutcome, ProcessSummary, StoredSupplierEvent, SupplierEventStore,
@@ -296,15 +296,15 @@ impl KeySupplierService {
         let profile = client
             .profile()
             .await
-            .map_err(|_| SupplierServiceError::SupplierApi)?;
+            .map_err(SupplierServiceError::supplier_api)?;
         let stock = client
             .stock()
             .await
-            .map_err(|_| SupplierServiceError::SupplierApi)?;
+            .map_err(SupplierServiceError::supplier_api)?;
         let status = client
             .status()
             .await
-            .map_err(|_| SupplierServiceError::SupplierApi)?;
+            .map_err(SupplierServiceError::supplier_api)?;
         Ok(SupplierOverview {
             profile,
             stock,
@@ -341,7 +341,7 @@ impl KeySupplierService {
         self.supplier_client()?
             .register_webhook(&callback)
             .await
-            .map_err(|_| SupplierServiceError::SupplierApi)?;
+            .map_err(SupplierServiceError::supplier_api)?;
         Ok(callback)
     }
 
@@ -349,7 +349,7 @@ impl KeySupplierService {
         self.supplier_client()?
             .test_webhook()
             .await
-            .map_err(|_| SupplierServiceError::SupplierApi)
+            .map_err(SupplierServiceError::supplier_api)
     }
 
     pub fn retry_event(&self, id: i64) -> Result<(), SupplierServiceError> {
@@ -359,10 +359,11 @@ impl KeySupplierService {
     }
 
     pub async fn run_processing_cycle(&self) -> Result<usize, SupplierServiceError> {
+        let _guard = self.processing_lock.lock().await;
         self.store
             .recover_stale_processing(Utc::now() - ChronoDuration::minutes(5))
             .map_err(|_| SupplierServiceError::Store)?;
-        self.process_pending().await
+        self.process_pending_locked().await
     }
 
     pub fn start_processor(self: &Arc<Self>) -> bool {
@@ -404,7 +405,7 @@ impl KeySupplierService {
         body: B,
     ) -> Result<IngestResult, SupplierServiceError> {
         let runtime = self.runtime_config();
-        if runtime.webhook_token.is_empty()
+        if !is_valid_webhook_token(&runtime.webhook_token)
             || !crate::common::auth::constant_time_eq(&runtime.webhook_token, token)
         {
             return Err(SupplierServiceError::Unauthorized);
@@ -430,13 +431,22 @@ impl KeySupplierService {
 
     pub async fn process_pending(&self) -> Result<usize, SupplierServiceError> {
         let _guard = self.processing_lock.lock().await;
+        self.process_pending_locked().await
+    }
+
+    async fn process_pending_locked(&self) -> Result<usize, SupplierServiceError> {
         let mut processed = 0;
         while let Some(event) = self
             .store
             .claim_next()
             .map_err(|_| SupplierServiceError::Store)?
         {
-            self.process_claimed(event).await?;
+            if let Err(error) = self.process_claimed(event).await {
+                tracing::warn!(
+                    kind = processing_error_kind(&error),
+                    "supplier event processing failed"
+                );
+            }
             processed += 1;
         }
         Ok(processed)
@@ -495,17 +505,24 @@ impl KeySupplierService {
                     .map_err(|_| SupplierServiceError::Store)?;
                 Ok(empty_summary())
             }
+            Ok(ProcessAction::Failed { summary, error }) => {
+                self.store
+                    .fail_with_summary(
+                        event.id,
+                        summary.clone(),
+                        &sanitize_error(&error.persistence_detail(), &self.runtime_config()),
+                    )
+                    .map_err(|_| SupplierServiceError::Store)?;
+                Err(error)
+            }
             Err(error) => {
                 self.store
                     .fail(
                         event.id,
-                        &sanitize_error(&error.to_string(), &self.runtime_config()),
+                        &sanitize_error(&error.persistence_detail(), &self.runtime_config()),
                     )
                     .map_err(|_| SupplierServiceError::Store)?;
-                Ok(ProcessSummary {
-                    failed_count: 1,
-                    ..empty_summary()
-                })
+                Err(error)
             }
         }
     }
@@ -538,7 +555,7 @@ impl KeySupplierService {
                 let stock = client
                     .stock()
                     .await
-                    .map_err(|_| SupplierServiceError::SupplierApi)?;
+                    .map_err(SupplierServiceError::supplier_api)?;
                 let event_count = u32::try_from(event.quantity)
                     .map_err(|_| SupplierServiceError::InvalidEvent)?;
                 match select_purchase_count(
@@ -567,11 +584,12 @@ impl KeySupplierService {
         let purchase = client
             .purchase(count, order_id)
             .await
-            .map_err(|_| SupplierServiceError::SupplierApi)?;
+            .map_err(SupplierServiceError::supplier_api)?;
         let mut summary = ProcessSummary {
             purchased_count: i64::from(purchase.purchased),
             ..empty_summary()
         };
+        let mut import_failed = false;
         for (index, key) in purchase.keys.into_iter().enumerate() {
             let credential =
                 credential_from_supplier_key(key.into_inner(), &runtime, order_id, index + 1);
@@ -580,16 +598,30 @@ impl KeySupplierService {
                 Err(error) if is_duplicate_error(&error.to_string()) => {
                     summary.duplicate_count += 1
                 }
-                Err(_) => summary.failed_count += 1,
+                Err(_) => {
+                    summary.failed_count += 1;
+                    import_failed = true;
+                }
             }
         }
-        Ok(ProcessAction::Complete(summary))
+        if import_failed {
+            Ok(ProcessAction::Failed {
+                summary,
+                error: SupplierServiceError::ImportFailed,
+            })
+        } else {
+            Ok(ProcessAction::Complete(summary))
+        }
     }
 }
 
 enum ProcessAction {
     Complete(ProcessSummary),
     Skip,
+    Failed {
+        summary: ProcessSummary,
+        error: SupplierServiceError,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -725,7 +757,7 @@ impl fmt::Debug for SupplierOverview {
 fn processing_error_kind(error: &SupplierServiceError) -> &'static str {
     match error {
         SupplierServiceError::Store => "store",
-        SupplierServiceError::SupplierApi => "supplier_api",
+        SupplierServiceError::SupplierApi { .. } => "supplier_api",
         SupplierServiceError::SupplierConfiguration => "configuration",
         SupplierServiceError::ImporterUnavailable => "importer",
         _ => "other",
@@ -739,8 +771,9 @@ pub enum SupplierServiceError {
     InvalidEvent,
     InvalidPurchaseQuantity,
     SupplierConfiguration,
-    SupplierApi,
+    SupplierApi { diagnostic: String },
     ImporterUnavailable,
+    ImportFailed,
     Store,
     ConfigPathUnavailable,
     ConfigPersistence,
@@ -757,8 +790,9 @@ impl fmt::Display for SupplierServiceError {
                 "manual purchase quantity is outside configured bounds"
             }
             Self::SupplierConfiguration => "supplier configuration is invalid",
-            Self::SupplierApi => "supplier API request failed",
+            Self::SupplierApi { .. } => "supplier API request failed",
             Self::ImporterUnavailable => "credential importer is unavailable",
+            Self::ImportFailed => "credential import failed",
             Self::Store => "supplier event store unavailable",
             Self::ConfigPathUnavailable => "supplier configuration path is unavailable",
             Self::ConfigPersistence => "supplier configuration could not be persisted",
@@ -775,8 +809,9 @@ impl fmt::Debug for SupplierServiceError {
             Self::InvalidEvent => "InvalidEvent",
             Self::InvalidPurchaseQuantity => "InvalidPurchaseQuantity",
             Self::SupplierConfiguration => "SupplierConfiguration",
-            Self::SupplierApi => "SupplierApi",
+            Self::SupplierApi { .. } => "SupplierApi",
             Self::ImporterUnavailable => "ImporterUnavailable",
+            Self::ImportFailed => "ImportFailed",
             Self::Store => "Store",
             Self::ConfigPathUnavailable => "ConfigPathUnavailable",
             Self::ConfigPersistence => "ConfigPersistence",
@@ -785,6 +820,21 @@ impl fmt::Debug for SupplierServiceError {
 }
 
 impl std::error::Error for SupplierServiceError {}
+
+impl SupplierServiceError {
+    fn supplier_api(error: crate::admin::key_supplier::client::SupplierError) -> Self {
+        Self::SupplierApi {
+            diagnostic: error.to_string(),
+        }
+    }
+
+    fn persistence_detail(&self) -> String {
+        match self {
+            Self::SupplierApi { diagnostic } => diagnostic.clone(),
+            _ => self.to_string(),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -807,7 +857,7 @@ mod tests {
     use chrono::{Duration, Utc};
     use tokio::net::TcpListener;
 
-    const TOKEN: &str = "webhook-token-canary";
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const EVENT_ID: &str = "0123456789abcdef0123456789abcdef";
     const ORDER_ID: &str = "fedcba9876543210fedcba9876543210";
 
@@ -835,6 +885,27 @@ mod tests {
             self.credentials.lock().unwrap().push(credential);
             let outcome = self.outcomes.lock().unwrap().pop_front().unwrap_or(Ok(()));
             Box::pin(async move { outcome })
+        }
+    }
+
+    struct BlockingImporter {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl CredentialImporter for BlockingImporter {
+        fn import(
+            &self,
+            _credential: KiroCredentials,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>>
+        {
+            let started = self.started.clone();
+            let release = self.release.clone();
+            Box::pin(async move {
+                started.notify_one();
+                release.notified().await;
+                Ok(())
+            })
         }
     }
 
@@ -1007,8 +1078,22 @@ mod tests {
     }
 
     #[test]
+    fn ingest_rejects_invalid_runtime_webhook_token() {
+        let (service, store) = service("weak-token");
+        let body = format!(
+            r#"{{"event":"all_keys_dead","event_id":"{EVENT_ID}","message":"body","dead":1}}"#
+        );
+
+        assert!(matches!(
+            service.ingest("weak-token", body.as_bytes()),
+            Err(SupplierServiceError::Unauthorized)
+        ));
+        assert!(store.list(1, None).unwrap().items.is_empty());
+    }
+
+    #[test]
     fn sanitize_error_removes_runtime_webhook_token() {
-        let mut config = runtime("webhook-token-canary");
+        let mut config = runtime(TOKEN);
         config.api_key = "supplier-api-key-canary".to_owned();
         let error = format!(
             "supplier={} webhook={} discovered=ksk_untrusted_canary",
@@ -1030,7 +1115,7 @@ mod tests {
     fn webhook_message_is_redacted_before_storage_listing_and_debug() {
         let path = temp_config_path("webhook-redaction");
         let store = Arc::new(SupplierEventStore::open(&path).unwrap());
-        let mut config = runtime("webhook-token-canary");
+        let mut config = runtime(TOKEN);
         config.api_key = "supplier-api-key-canary".to_owned();
         let service = KeySupplierService::new(store.clone(), config.clone());
         let message = format!(
@@ -1195,7 +1280,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn import_outcomes_are_counted_without_rolling_back_purchase() {
+    async fn nonduplicate_import_failure_persists_counts_and_retry_is_idempotent() {
+        let orders = Arc::new(Mutex::new(Vec::new()));
+        let seen_orders = orders.clone();
         let app = Router::new()
             .route(
                 "/api/my/stock",
@@ -1203,15 +1290,27 @@ mod tests {
             )
             .route(
                 "/api/my/purchase",
-                post(|| async {
-                    purchase_json(
-                        ORDER_ID,
-                        &[
-                            "ksk_success_canary",
-                            "ksk_duplicate_canary",
-                            "ksk_failed_canary",
-                        ],
-                    )
+                post(move |request: axum::http::Request<axum::body::Body>| {
+                    let seen_orders = seen_orders.clone();
+                    async move {
+                        let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+                            .await
+                            .unwrap();
+                        let order_id = serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+                            ["client_order_id"]
+                            .as_str()
+                            .unwrap()
+                            .to_owned();
+                        seen_orders.lock().unwrap().push(order_id.clone());
+                        purchase_json(
+                            &order_id,
+                            &[
+                                "ksk_success_canary",
+                                "ksk_duplicate_canary",
+                                "ksk_failed_canary",
+                            ],
+                        )
+                    }
                 }),
             );
         let mut config = runtime(TOKEN);
@@ -1221,23 +1320,41 @@ mod tests {
             Ok(()),
             Err(anyhow::anyhow!("凭据已存在")),
             Err(anyhow::anyhow!("other failure")),
+            Err(anyhow::anyhow!("凭据已存在")),
+            Err(anyhow::anyhow!("凭据已存在")),
+            Err(anyhow::anyhow!("凭据已存在")),
         ]));
         let store = Arc::new(SupplierEventStore::open_in_memory().unwrap());
         queued_event(&store, "new_keys_available", Some(ORDER_ID), 3);
         let service = KeySupplierService::with_importer(store.clone(), config, importer);
 
         service.process_pending().await.unwrap();
-        let item = &store.list(1, None).unwrap().items[0];
+        let failed = store.list(1, None).unwrap().items.remove(0);
         assert_eq!(
             (
-                item.purchased_count,
-                item.imported_count,
-                item.duplicate_count,
-                item.failed_count
+                failed.purchased_count,
+                failed.imported_count,
+                failed.duplicate_count,
+                failed.failed_count
             ),
             (3, 1, 1, 1)
         );
-        assert_eq!(item.status, SupplierEventStatus::Succeeded);
+        assert_eq!(failed.status, SupplierEventStatus::Failed);
+
+        service.retry_event(failed.id).unwrap();
+        service.process_pending().await.unwrap();
+        let retried = &store.list(1, None).unwrap().items[0];
+        assert_eq!(retried.status, SupplierEventStatus::Succeeded);
+        assert_eq!(
+            (
+                retried.purchased_count,
+                retried.imported_count,
+                retried.duplicate_count,
+                retried.failed_count
+            ),
+            (3, 0, 3, 0)
+        );
+        assert_eq!(*orders.lock().unwrap(), vec![ORDER_ID, ORDER_ID]);
     }
 
     #[tokio::test]
@@ -1351,6 +1468,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_purchase_persists_configuration_api_and_import_failures_before_returning_error()
+    {
+        let configuration_store = Arc::new(SupplierEventStore::open_in_memory().unwrap());
+        let configuration_service = KeySupplierService::with_importer(
+            configuration_store.clone(),
+            runtime(TOKEN),
+            Arc::new(FakeImporter::default()),
+        );
+        assert!(configuration_service.manual_purchase(1).await.is_err());
+        let configuration_event = &configuration_store.list(1, None).unwrap().items[0];
+        assert_eq!(configuration_event.status, SupplierEventStatus::Failed);
+        assert_eq!(
+            (
+                configuration_event.purchased_count,
+                configuration_event.imported_count,
+                configuration_event.duplicate_count,
+                configuration_event.failed_count
+            ),
+            (0, 0, 0, 1)
+        );
+
+        let api_app = Router::new().route(
+            "/api/my/purchase",
+            post(|| async { (axum::http::StatusCode::BAD_GATEWAY, "supplier unavailable") }),
+        );
+        let mut api_config = runtime(TOKEN);
+        api_config.base_url = server(api_app).await;
+        let api_store = Arc::new(SupplierEventStore::open_in_memory().unwrap());
+        let api_service = KeySupplierService::with_importer(
+            api_store.clone(),
+            api_config,
+            Arc::new(FakeImporter::default()),
+        );
+        assert!(api_service.manual_purchase(1).await.is_err());
+        let api_event = &api_store.list(1, None).unwrap().items[0];
+        assert_eq!(api_event.status, SupplierEventStatus::Failed);
+        assert_eq!(
+            (
+                api_event.purchased_count,
+                api_event.imported_count,
+                api_event.duplicate_count,
+                api_event.failed_count
+            ),
+            (0, 0, 0, 1)
+        );
+
+        let import_app = Router::new().route(
+            "/api/my/purchase",
+            post(
+                |request: axum::http::Request<axum::body::Body>| async move {
+                    let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    let order_id = serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+                    ["client_order_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                    purchase_json(&order_id, &["ksk_manual_failed_import"])
+                },
+            ),
+        );
+        let mut import_config = runtime(TOKEN);
+        import_config.base_url = server(import_app).await;
+        let import_store = Arc::new(SupplierEventStore::open_in_memory().unwrap());
+        let import_service = KeySupplierService::with_importer(
+            import_store.clone(),
+            import_config,
+            Arc::new(FakeImporter::with_outcomes(vec![Err(anyhow::anyhow!(
+                "import failure"
+            ))])),
+        );
+        assert!(import_service.manual_purchase(1).await.is_err());
+        let import_event = &import_store.list(1, None).unwrap().items[0];
+        assert_eq!(import_event.status, SupplierEventStatus::Failed);
+        assert_eq!(
+            (
+                import_event.purchased_count,
+                import_event.imported_count,
+                import_event.duplicate_count,
+                import_event.failed_count
+            ),
+            (1, 0, 0, 1)
+        );
+    }
+
+    #[tokio::test]
     async fn api_failures_are_retriable_and_errors_never_contain_keys() {
         let attempts = Arc::new(Mutex::new(0));
         let state = attempts.clone();
@@ -1398,6 +1602,45 @@ mod tests {
             store.list(1, None).unwrap().items[0].status,
             SupplierEventStatus::Succeeded
         );
+    }
+
+    #[tokio::test]
+    async fn supplier_http_diagnostics_are_persisted_without_exposing_secrets() {
+        let app = Router::new().route(
+            "/api/my/purchase",
+            post(|| async {
+                (
+                    axum::http::StatusCode::BAD_GATEWAY,
+                    "safe supplier summary supplier-api-secret webhook-token-canary ksk_response_secret",
+                )
+            }),
+        );
+        let mut config = runtime("webhook-token-canary");
+        config.api_key = "supplier-api-secret".to_owned();
+        config.base_url = server(app).await;
+        let store = Arc::new(SupplierEventStore::open_in_memory().unwrap());
+        let service = KeySupplierService::with_importer(
+            store.clone(),
+            config,
+            Arc::new(FakeImporter::default()),
+        );
+
+        let error = service.manual_purchase(1).await.unwrap_err();
+        let external = format!("{error} {error:?}");
+        let event = &store.list(1, None).unwrap().items[0];
+        let stored = event.last_error.as_deref().unwrap();
+
+        assert!(stored.contains("supplier HTTP 502"));
+        assert!(stored.contains("safe supplier summary"));
+        for secret in [
+            "supplier-api-secret",
+            "webhook-token-canary",
+            "ksk_response_secret",
+        ] {
+            assert!(!stored.contains(secret));
+            assert!(!external.contains(secret));
+        }
+        assert!(!external.contains("safe supplier summary"));
     }
 
     #[tokio::test]
@@ -1622,6 +1865,67 @@ mod tests {
         );
         assert!(service.start_processor());
         assert!(!service.start_processor());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn stale_recovery_does_not_reclaim_event_running_under_processing_lock() {
+        let app = Router::new()
+            .route(
+                "/api/my/stock",
+                get(|| async { axum::Json(serde_json::json!({"max": 1})) }),
+            )
+            .route(
+                "/api/my/purchase",
+                post(|| async { purchase_json(ORDER_ID, &["ksk_blocking_canary"]) }),
+            );
+        let path = temp_config_path("stale-lock");
+        let store = Arc::new(SupplierEventStore::open(&path).unwrap());
+        queued_event(&store, "new_keys_available", Some(ORDER_ID), 1);
+        let mut config = runtime(TOKEN);
+        config.base_url = server(app).await;
+        config.auto_purchase = true;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let service = Arc::new(KeySupplierService::with_importer(
+            store.clone(),
+            config,
+            Arc::new(BlockingImporter {
+                started: started.clone(),
+                release: release.clone(),
+            }),
+        ));
+
+        let started_wait = started.notified();
+        let running_service = service.clone();
+        let running = tokio::spawn(async move { running_service.process_pending().await });
+        started_wait.await;
+        let id = store.list(1, None).unwrap().items[0].id;
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE supplier_events SET processing_started_at=?1 WHERE id=?2",
+                rusqlite::params![(Utc::now() - Duration::minutes(6)).to_rfc3339(), id],
+            )
+            .unwrap();
+
+        let recovery_service = service.clone();
+        let recovery = tokio::spawn(async move { recovery_service.run_processing_cycle().await });
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert_eq!(
+            store.list(1, None).unwrap().items[0].status,
+            SupplierEventStatus::Processing
+        );
+
+        release.notify_one();
+        assert_eq!(running.await.unwrap().unwrap(), 1);
+        assert_eq!(recovery.await.unwrap().unwrap(), 0);
+        assert_eq!(
+            store.list(1, None).unwrap().items[0].status,
+            SupplierEventStatus::Succeeded
+        );
+        drop(service);
+        drop(store);
         let _ = std::fs::remove_file(path);
     }
 

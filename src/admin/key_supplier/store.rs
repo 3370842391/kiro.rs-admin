@@ -272,15 +272,31 @@ impl SupplierEventStore {
     }
 
     pub fn fail(&self, id: i64, error: &str) -> rusqlite::Result<()> {
-        self.transition_processing(
+        self.fail_with_summary(
             id,
-            "failed",
             ProcessSummary {
                 purchased_count: 0,
                 imported_count: 0,
                 duplicate_count: 0,
                 failed_count: 1,
+                message: None,
+            },
+            error,
+        )
+    }
+
+    pub fn fail_with_summary(
+        &self,
+        id: i64,
+        summary: ProcessSummary,
+        error: &str,
+    ) -> rusqlite::Result<()> {
+        self.transition_processing(
+            id,
+            "failed",
+            ProcessSummary {
                 message: Some(truncate_chars(error, 300)),
+                ..summary
             },
         )
     }

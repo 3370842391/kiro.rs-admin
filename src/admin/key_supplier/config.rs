@@ -156,12 +156,11 @@ impl SupplierRuntimeConfig {
                 .unwrap_or(&config.key_supplier.api_key),
             "apiKey",
         )?;
-        let mut webhook_token = normalize_secret(
+        let mut webhook_token = normalize_webhook_token(
             update
                 .webhook_token
                 .as_deref()
                 .unwrap_or(&config.key_supplier.webhook_token),
-            "webhookToken",
         )?;
         if generate_missing_webhook_token && webhook_token.is_empty() {
             webhook_token = generate_webhook_token();
@@ -239,6 +238,10 @@ pub fn generate_webhook_token() -> String {
     format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
 
+pub fn is_valid_webhook_token(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn normalize_persisted(value: &KeySupplierConfig) -> anyhow::Result<SupplierRuntimeConfig> {
     let update = SupplierConfigUpdate {
         base_url: value.base_url.clone(),
@@ -282,6 +285,14 @@ fn normalize_http_origin(value: &str, field: &str) -> anyhow::Result<String> {
 
 fn normalize_secret(value: &str, field: &str) -> anyhow::Result<String> {
     normalize_text(value, field, MAX_SECRET_CHARS)
+}
+
+fn normalize_webhook_token(value: &str) -> anyhow::Result<String> {
+    let token = normalize_secret(value, "webhookToken")?;
+    if !token.is_empty() && !is_valid_webhook_token(&token) {
+        anyhow::bail!("webhookToken must be empty or 64 hexadecimal characters");
+    }
+    Ok(token)
 }
 
 fn normalize_text(value: &str, field: &str, max_chars: usize) -> anyhow::Result<String> {
@@ -426,6 +437,36 @@ mod tests {
         );
         assert_eq!(config.key_supplier.base_url, runtime.base_url);
         assert_eq!(config.key_supplier.webhook_token, runtime.webhook_token);
+    }
+
+    #[test]
+    fn webhook_token_must_be_empty_or_64_hex_when_loading_and_updating() {
+        for token in ["webhook-token".to_owned(), "a".repeat(63), "g".repeat(64)] {
+            let mut config = Config::default();
+            let mut update = valid_update();
+            update.webhook_token = Some(token.clone());
+            assert!(SupplierRuntimeConfig::apply(&mut config, update).is_err());
+
+            config.key_supplier.webhook_token = token;
+            assert!(SupplierRuntimeConfig::from_config(&config).is_err());
+        }
+
+        let mut config = Config::default();
+        let mut update = valid_update();
+        let valid = "a".repeat(64);
+        update.webhook_token = Some(valid.clone());
+        assert_eq!(
+            SupplierRuntimeConfig::apply(&mut config, update)
+                .unwrap()
+                .webhook_token,
+            valid
+        );
+        assert!(
+            SupplierRuntimeConfig::from_config(&Config::default())
+                .unwrap()
+                .webhook_token
+                .is_empty()
+        );
     }
 
     #[test]
