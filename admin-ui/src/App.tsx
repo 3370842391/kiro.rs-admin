@@ -260,7 +260,7 @@ function AppHeader({
 }: AppHeaderProps) {
   return (
     <header className="sticky top-0 z-50 w-full glass">
-      <div className="mx-auto flex h-14 max-w-[1400px] min-w-0 items-center gap-2 px-3 sm:h-16 sm:px-4 xl:px-8">
+      <div className="mx-auto flex h-14 max-w-[1400px] min-w-0 items-center gap-2 px-3 sm:h-16 sm:px-4 xl:px-8 2xl:max-w-[1600px]">
         <HeaderBrand tab={tab} supplierUnread={supplierUnread} onSwitchTab={onSwitchTab} />
         <HeaderActions
           darkMode={darkMode}

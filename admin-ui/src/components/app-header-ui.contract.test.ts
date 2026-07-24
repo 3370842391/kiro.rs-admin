@@ -9,6 +9,7 @@ describe('admin header responsive layout contract', () => {
   test('keeps the compact two-row header until the full controls fit', async () => {
     const app = await readAppSource()
 
+    expect(app).toContain('max-w-[1400px] min-w-0 items-center gap-2 px-3 sm:h-16 sm:px-4 xl:px-8 2xl:max-w-[1600px]')
     expect(app).toContain('rounded-full border border-border/60 p-0.5 2xl:flex')
     expect(app).toContain('className="2xl:hidden"')
     expect(app).toContain('hidden items-center gap-1 2xl:flex')
