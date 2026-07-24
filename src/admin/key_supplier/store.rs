@@ -4,6 +4,8 @@ use std::sync::Mutex;
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::Type};
 
+const MAX_MESSAGE_CHARS: usize = 2000;
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS supplier_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -164,6 +166,9 @@ impl SupplierEventStore {
     pub fn insert_event(&self, event: IncomingSupplierEvent) -> rusqlite::Result<InsertOutcome> {
         let conn = self.conn.lock().unwrap();
         let received_at = Utc::now().to_rfc3339();
+        let message = event
+            .message
+            .map(|value| truncate_chars(&value, MAX_MESSAGE_CHARS));
         let inserted = conn.execute(
             "INSERT OR IGNORE INTO supplier_events
              (event_id,event_type,purchase_order_id,message,quantity,received_at,status)
@@ -172,7 +177,7 @@ impl SupplierEventStore {
                 event.event_id,
                 event.event_type,
                 event.purchase_order_id,
-                event.message,
+                message,
                 event.quantity,
                 received_at
             ],
@@ -220,14 +225,22 @@ impl SupplierEventStore {
         self.transition_processing(
             id,
             "succeeded",
-            summary.message,
+            summary
+                .message
+                .map(|value| truncate_chars(&value, MAX_MESSAGE_CHARS)),
             summary.purchased,
             summary.imported,
         )
     }
 
     pub fn skip(&self, id: i64, message: Option<&str>) -> rusqlite::Result<()> {
-        self.transition_processing(id, "skipped", message.map(str::to_owned), false, false)
+        self.transition_processing(
+            id,
+            "skipped",
+            message.map(|value| truncate_chars(value, MAX_MESSAGE_CHARS)),
+            false,
+            false,
+        )
     }
 
     pub fn fail(&self, id: i64, error: &str) -> rusqlite::Result<()> {
@@ -375,13 +388,6 @@ fn initialize_schema(conn: &Connection) -> rusqlite::Result<()> {
             )?;
         }
     }
-    conn.execute(
-        "DELETE FROM supplier_events
-         WHERE id NOT IN (
-             SELECT MIN(id) FROM supplier_events GROUP BY event_id
-         )",
-        [],
-    )?;
     conn.execute_batch(INDEXES)
 }
 
@@ -491,28 +497,86 @@ mod tests {
             .unwrap();
         }
 
-        let store = SupplierEventStore::open(&path).unwrap();
-        let page = store.list(10, None).unwrap();
-        assert_eq!(page.items.len(), 1);
-        assert_eq!(page.items[0].id, 1);
-        assert!(matches!(
-            store.insert_event(event("duplicate-1")).unwrap(),
-            InsertOutcome::Duplicate(_)
-        ));
-        let error = store
-            .conn
-            .lock()
+        assert!(SupplierEventStore::open(&path).is_err());
+        let conn = Connection::open(&path).unwrap();
+        let rows: Vec<(i64, String)> = conn
+            .prepare("SELECT id,event_id FROM supplier_events ORDER BY id")
             .unwrap()
-            .execute(
-                "INSERT INTO supplier_events
-                 (event_id,event_type,quantity,received_at,status)
-                 VALUES ('duplicate-1','purchase.requested',1,'2026-01-03T00:00:00Z','received')",
-                [],
-            )
-            .unwrap_err();
-        assert!(matches!(error, rusqlite::Error::SqliteFailure(_, _)));
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (1, "duplicate-1".to_string()),
+                (2, "duplicate-1".to_string())
+            ]
+        );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn messages_are_truncated_without_splitting_unicode() {
+        let store = SupplierEventStore::open_in_memory().unwrap();
+        let message = format!("{}{}", "中".repeat(MAX_MESSAGE_CHARS), "😀");
+        let inserted = store
+            .insert_event(IncomingSupplierEvent {
+                message: Some(message.clone()),
+                ..event("message-insert")
+            })
+            .unwrap();
+        let inserted = match inserted {
+            InsertOutcome::Inserted(value) => value,
+            InsertOutcome::Duplicate(_) => panic!("event must be inserted"),
+        };
+        assert_eq!(
+            inserted.message.as_ref().unwrap().chars().count(),
+            MAX_MESSAGE_CHARS
+        );
+        assert!(!inserted.message.as_ref().unwrap().ends_with('\u{fffd}'));
+
+        let claimed = store.claim_next().unwrap().unwrap();
+        let complete_message = format!("{}😀", "界".repeat(MAX_MESSAGE_CHARS));
+        store
+            .complete(
+                claimed.id,
+                ProcessSummary {
+                    purchased: false,
+                    imported: false,
+                    message: Some(complete_message),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.list(1, None).unwrap().items[0]
+                .message
+                .as_ref()
+                .unwrap()
+                .chars()
+                .count(),
+            MAX_MESSAGE_CHARS
+        );
+
+        store
+            .insert_event(IncomingSupplierEvent {
+                event_id: "message-skip".to_string(),
+                ..event("message-skip")
+            })
+            .unwrap();
+        let skipped = store.claim_next().unwrap().unwrap();
+        let skip_message = format!("{}🚀", "好".repeat(MAX_MESSAGE_CHARS));
+        store.skip(skipped.id, Some(&skip_message)).unwrap();
+        assert_eq!(
+            store.list(1, None).unwrap().items[0]
+                .message
+                .as_ref()
+                .unwrap()
+                .chars()
+                .count(),
+            MAX_MESSAGE_CHARS
+        );
     }
 
     #[test]
