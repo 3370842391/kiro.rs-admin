@@ -374,21 +374,23 @@ impl SupplierEventStore {
 }
 
 fn initialize_schema(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(SCHEMA)?;
-    let columns: std::collections::HashSet<String> = conn
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(SCHEMA)?;
+    let columns: std::collections::HashSet<String> = tx
         .prepare("PRAGMA table_info(supplier_events)")?
         .query_map([], |row| row.get(1))?
         .collect::<rusqlite::Result<_>>()?;
 
     for (name, definition) in MIGRATION_COLUMNS {
         if !columns.contains(*name) {
-            conn.execute(
+            tx.execute(
                 &format!("ALTER TABLE supplier_events ADD COLUMN {name} {definition}"),
                 [],
             )?;
         }
     }
-    conn.execute_batch(INDEXES)
+    tx.execute_batch(INDEXES)?;
+    tx.commit()
 }
 
 fn truncate_chars(value: &str, max: usize) -> String {
@@ -513,6 +515,15 @@ mod tests {
                 (2, "duplicate-1".to_string())
             ]
         );
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(supplier_events)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(!columns.contains(&"purchase_order_id".to_string()));
+        assert!(!columns.contains(&"processing_started_at".to_string()));
 
         let _ = std::fs::remove_file(path);
     }
