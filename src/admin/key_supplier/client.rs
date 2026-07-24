@@ -6,6 +6,7 @@ mod tests {
         routing::{get, post, put},
     };
     use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     async fn server(router: Router) -> String {
@@ -27,12 +28,27 @@ mod tests {
                     axum::Json(serde_json::json!({"name":"demo","quota":10,"remaining":7,"used_quota":3,"webhook_url":"http://hook"}))
                 }
             }))
-            .route("/api/my/stock", get(|| async { axum::Json(serde_json::json!({"max": 9})) }))
-            .route("/api/status", get(|| async { axum::Json(serde_json::json!({"ok":true})) }));
+            .route(
+                "/api/my/stock",
+                get(|request: axum::http::Request<axum::body::Body>| async move {
+                    assert_eq!(request.headers().get("x-api-key").unwrap(), "secret");
+                    axum::Json(serde_json::json!({"max": 9}))
+                }),
+            )
+            .route(
+                "/api/status",
+                get(|request: axum::http::Request<axum::body::Body>| async move {
+                    assert_eq!(request.headers().get("x-api-key").unwrap(), "secret");
+                    axum::Json(serde_json::json!({"keys_active":2,"extra_state":"kept"}))
+                }),
+            );
         let client = SupplierClient::new(server(app).await, "secret").unwrap();
         assert_eq!(client.profile().await.unwrap().remaining, 7);
         assert_eq!(client.stock().await.unwrap().max, 9);
-        assert_eq!(client.status().await.unwrap()["ok"], true);
+        let status = client.status().await.unwrap();
+        assert_eq!(status.keys_active, 2);
+        assert_eq!(status.keys_dead, 0);
+        assert_eq!(status.extra["extra_state"], "kept");
         assert_eq!(seen.lock().unwrap()[0].1, "secret");
     }
 
@@ -43,6 +59,7 @@ mod tests {
         let app = Router::new().route("/api/my/purchase", post(move |request: axum::http::Request<axum::body::Body>| {
             let state = state.clone();
             async move {
+                assert_eq!(request.headers().get("x-api-key").unwrap(), "secret");
                 let content_type = request.headers().get("content-type").unwrap().to_str().unwrap().to_owned();
                 let body = axum::body::to_bytes(request.into_body(), usize::MAX).await.unwrap();
                 state.lock().unwrap().push((String::from_utf8(body.to_vec()).unwrap(), content_type));
@@ -92,8 +109,8 @@ mod tests {
         let paths_test = paths.clone();
         let app = Router::new()
             .route("/api/my/purchase", post(|| async { axum::Json(serde_json::json!({"client_order_id":"fedcba9876543210fedcba9876543210","purchased":1,"remaining":2,"keys":[{"key":"bad"}]})) }))
-            .route("/api/my/webhook", put(move |request: axum::http::Request<axum::body::Body>| { let paths = paths_clone.clone(); async move { paths.lock().unwrap().push(request.uri().path().to_owned()); axum::http::StatusCode::NO_CONTENT } }))
-            .route("/api/my/webhook/test", post(move |request: axum::http::Request<axum::body::Body>| { let paths = paths_test.clone(); async move { paths.lock().unwrap().push(request.uri().path().to_owned()); axum::http::StatusCode::NO_CONTENT } }));
+            .route("/api/my/webhook", put(move |request: axum::http::Request<axum::body::Body>| { let paths = paths_clone.clone(); async move { assert_eq!(request.headers().get("x-api-key").unwrap(), "secret"); assert_eq!(request.headers().get("content-type").unwrap(), "application/json"); paths.lock().unwrap().push(request.uri().path().to_owned()); axum::http::StatusCode::NO_CONTENT } }))
+            .route("/api/my/webhook/test", post(move |request: axum::http::Request<axum::body::Body>| { let paths = paths_test.clone(); async move { assert_eq!(request.headers().get("x-api-key").unwrap(), "secret"); assert!(request.headers().get("content-type").is_none()); paths.lock().unwrap().push(request.uri().path().to_owned()); axum::http::StatusCode::NO_CONTENT } }));
         let client = SupplierClient::new(server(app).await, "secret").unwrap();
         assert!(
             client
@@ -115,6 +132,125 @@ mod tests {
         assert!(SupplierClient::new("http://localhost/", " ").is_err());
         let client = SupplierClient::new("http://localhost/", "secret").unwrap();
         assert!(!format!("{client:?}").contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn retries_server_errors_exactly_three_times_and_returns_last_error() {
+        let calls = Arc::new(Mutex::new(0));
+        let state = calls.clone();
+        let app = Router::new().route(
+            "/api/my/webhook/test",
+            post(move || {
+                let state = state.clone();
+                async move {
+                    let mut calls = state.lock().unwrap();
+                    *calls += 1;
+                    (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("last body {calls}"),
+                    )
+                }
+            }),
+        );
+        let client = SupplierClient::new(server(app).await, "usr secret").unwrap();
+        let error = client.test_webhook().await.unwrap_err();
+        assert_eq!(*calls.lock().unwrap(), 3);
+        assert!(error.to_string().contains("last body 3"));
+    }
+
+    #[tokio::test]
+    async fn retries_transport_failures_until_third_request_succeeds() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for attempt in 1..=3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                if attempt < 3 {
+                    drop(stream);
+                } else {
+                    let mut request = [0_u8; 512];
+                    let _ = stream.read(&mut request).await;
+                    stream
+                        .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let client = SupplierClient::new(format!("http://{address}"), "secret").unwrap();
+        client.test_webhook().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retries_response_body_read_failures() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for attempt in 1..=3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 512];
+                let _ = stream.read(&mut request).await;
+                if attempt < 3 {
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort")
+                        .await
+                        .unwrap();
+                } else {
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let client = SupplierClient::new(format!("http://{address}"), "secret").unwrap();
+        assert_eq!(client.status().await.unwrap().keys_active, 0);
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_webhook_urls_before_sending() {
+        let calls = Arc::new(Mutex::new(0));
+        let state = calls.clone();
+        let app = Router::new().fallback(move || {
+            let state = state.clone();
+            async move {
+                *state.lock().unwrap() += 1;
+                axum::http::StatusCode::NO_CONTENT
+            }
+        });
+        let client = SupplierClient::new(server(app).await, "secret").unwrap();
+        for url in ["ftp://hook", "/relative", ""] {
+            assert!(client.register_webhook(url).await.is_err());
+        }
+        assert_eq!(*calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn supplier_error_display_and_debug_redact_and_bound_untrusted_body() {
+        let secret = "usr secret";
+        let token = "ksk_current_token";
+        let body = format!("{secret} {token} {}", "界".repeat(400));
+        let error = SupplierError::http(500, &body, secret);
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        for output in [&display, &debug] {
+            assert!(!output.contains(secret));
+            assert!(!output.contains(token));
+            assert!(output.chars().count() <= 384);
+        }
+    }
+
+    #[test]
+    fn purchase_and_supplier_key_debug_redact_key_values() {
+        let key = SupplierKey("ksk_private".to_owned());
+        let purchase = Purchase {
+            client_order_id: "0123456789abcdef0123456789abcdef".to_owned(),
+            purchased: 1,
+            remaining: 2,
+            keys: vec![key.clone()],
+        };
+        assert!(!format!("{key:?}").contains("ksk_private"));
+        assert!(!format!("{purchase:?}").contains("ksk_private"));
     }
 }
 use reqwest::{Method, Url};
@@ -171,7 +307,7 @@ impl SupplierClient {
         self.request(Method::GET, "/api/my/stock", None).await
     }
 
-    pub async fn status(&self) -> Result<serde_json::Value, SupplierError> {
+    pub async fn status(&self) -> Result<SupplierStatus, SupplierError> {
         self.request(Method::GET, "/api/status", None).await
     }
 
@@ -299,10 +435,17 @@ impl SupplierClient {
                 }
             };
             let status = response.status();
-            let text = response
-                .text()
-                .await
-                .map_err(|error| SupplierError::network(&error.to_string(), &self.api_key.0))?;
+            let text = match response.text().await {
+                Ok(text) => text,
+                Err(error) => {
+                    last_network =
+                        Some(SupplierError::network(&error.to_string(), &self.api_key.0));
+                    if attempt + 1 < MAX_ATTEMPTS {
+                        continue;
+                    }
+                    return Err(last_network.unwrap());
+                }
+            };
             if status.is_server_error() && attempt + 1 < MAX_ATTEMPTS {
                 continue;
             }
@@ -330,6 +473,20 @@ pub struct Profile {
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Stock {
     pub max: u64,
+}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SupplierStatus {
+    #[serde(default)]
+    pub keys_active: u64,
+    #[serde(default)]
+    pub keys_dead: u64,
+    #[serde(default)]
+    pub keys_stock: u64,
+    #[serde(default)]
+    pub generating: u64,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
