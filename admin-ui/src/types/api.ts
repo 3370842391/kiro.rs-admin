@@ -1024,3 +1024,117 @@ export interface ImageBudgetConfig {
   retryHistoryMaxDimension: number
   retryHistoryJpegQuality: number
 }
+
+// ============ Supplier key automation ============
+
+export interface SupplierConfigView {
+  baseUrl: string
+  publicBaseUrl: string
+  autoPurchase: boolean
+  minPurchase: number
+  maxPurchase: number
+  apiRegion: string
+  rpmLimit: number
+  priority: number
+  groups: string[]
+  sourceChannel: string
+  nicknamePrefix: string
+  apiKeyConfigured: boolean
+  webhookTokenConfigured: boolean
+}
+
+/** Secrets are write-only and are never present in SupplierConfigView. */
+export interface SupplierConfigUpdate {
+  baseUrl: string
+  publicBaseUrl: string
+  autoPurchase: boolean
+  minPurchase: number
+  maxPurchase: number
+  apiRegion: string
+  rpmLimit: number
+  priority: number
+  groups: string[]
+  sourceChannel: string
+  nicknamePrefix: string
+  apiKey?: string
+  webhookToken?: string
+}
+
+export type SupplierConfigPayload = Omit<SupplierConfigUpdate, 'apiKey' | 'webhookToken'> &
+  Partial<Pick<SupplierConfigUpdate, 'apiKey' | 'webhookToken'>>
+
+export interface SupplierOverview {
+  profile: {
+    name: string
+    quota: number
+    remaining: number
+    usedQuota: number
+  }
+  stockMax: number
+  status: {
+    keysActive: number
+    keysDead: number
+    keysStock: number
+    generating: number
+  }
+}
+
+export type SupplierEventStatus = 'received' | 'processing' | 'succeeded' | 'skipped' | 'failed'
+
+export interface SupplierEvent {
+  id: number
+  eventId: string
+  eventType: string
+  purchaseOrderId: string | null
+  message: string | null
+  quantity: number
+  receivedAt: string
+  status: SupplierEventStatus
+  attempts: number
+  lastError: string | null
+  purchasedCount: number
+  importedCount: number
+  duplicateCount: number
+  webhookDuplicateCount: number
+  failedCount: number
+  readAt: string | null
+}
+
+export interface SupplierEventPage {
+  items: SupplierEvent[]
+  unreadCount: number
+}
+
+export interface SupplierEventQuery {
+  limit?: number
+  before?: number
+}
+
+export interface PurchaseResponse {
+  orderId: string
+  requested: number
+  purchased: number
+  imported: number
+  duplicate: number
+  failed: number
+}
+
+export interface SupplierWebhookRegisterResponse {
+  callbackUrl: string
+}
+
+export interface SupplierWebhookTestResponse {
+  success: boolean
+}
+
+export type SupplierMarkEventsReadRequest =
+  | { ids: number[]; markAll?: false }
+  | { markAll: true; ids?: never }
+
+export interface SupplierMarkEventsReadResponse {
+  updated: number
+}
+
+export interface SupplierRetryEventResponse {
+  retried: boolean
+}
