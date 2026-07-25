@@ -18,6 +18,7 @@ pub enum EventType {
     ContextUsage,
     /// 推理内容事件
     ReasoningContent,
+    Metadata,
     /// 未知事件类型
     Unknown,
 }
@@ -31,6 +32,7 @@ impl EventType {
             "meteringEvent" => Self::Metering,
             "contextUsageEvent" => Self::ContextUsage,
             "reasoningContentEvent" => Self::ReasoningContent,
+            "metadataEvent" => Self::Metadata,
             _ => Self::Unknown,
         }
     }
@@ -43,6 +45,7 @@ impl EventType {
             Self::Metering => "meteringEvent",
             Self::ContextUsage => "contextUsageEvent",
             Self::ReasoningContent => "reasoningContentEvent",
+            Self::Metadata => "metadataEvent",
             Self::Unknown => "unknown",
         }
     }
@@ -77,6 +80,7 @@ pub enum Event {
     ContextUsage(super::ContextUsageEvent),
     /// 推理内容
     ReasoningContent(super::ReasoningContentEvent),
+    Metadata(super::MetadataEvent),
     /// 未知事件 (保留原始帧数据)
     Unknown {},
     /// 服务端错误
@@ -134,6 +138,10 @@ impl Event {
                 let payload = super::ReasoningContentEvent::from_frame(&frame)?;
                 Ok(Self::ReasoningContent(payload))
             }
+            EventType::Metadata => {
+                let payload = super::MetadataEvent::from_frame(&frame)?;
+                Ok(Self::Metadata(payload))
+            }
             EventType::Unknown => Ok(Self::Unknown {}),
         }
     }
@@ -172,6 +180,7 @@ impl Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kiro::parser::header::{HeaderValue, Headers};
 
     #[test]
     fn test_event_type_from_str() {
@@ -189,6 +198,7 @@ mod tests {
             EventType::from_str("reasoningContentEvent"),
             EventType::ReasoningContent
         );
+        assert_eq!(EventType::from_str("metadataEvent"), EventType::Metadata);
         assert_eq!(EventType::from_str("unknown_type"), EventType::Unknown);
     }
 
@@ -199,5 +209,29 @@ mod tests {
             "assistantResponseEvent"
         );
         assert_eq!(EventType::ToolUse.as_str(), "toolUseEvent");
+        assert_eq!(EventType::Metadata.as_str(), "metadataEvent");
+    }
+
+    #[test]
+    fn parses_metadata_stop_reason_event() {
+        let mut headers = Headers::new();
+        headers.insert(
+            ":message-type".to_string(),
+            HeaderValue::String("event".to_string()),
+        );
+        headers.insert(
+            ":event-type".to_string(),
+            HeaderValue::String("metadataEvent".to_string()),
+        );
+        let frame = Frame {
+            headers,
+            payload: br#"{"stopReason":"CONTENT_FILTERED"}"#.to_vec(),
+        };
+
+        let event = Event::from_frame(frame).expect("metadata event should parse");
+        let Event::Metadata(metadata) = event else {
+            panic!("expected metadata event");
+        };
+        assert_eq!(metadata.stop_reason, "CONTENT_FILTERED");
     }
 }

@@ -236,6 +236,7 @@ pub(crate) enum AttemptFailure {
     InvalidToolSchema {
         failure: super::tool_schema::ToolSchemaFailure,
     },
+    ContentFiltered,
     EmptyResponse,
     ContextWindowExceeded,
     UpstreamError {
@@ -245,6 +246,10 @@ pub(crate) enum AttemptFailure {
 }
 
 impl AttemptFailure {
+    pub(crate) fn is_client_error(&self) -> bool {
+        matches!(self, Self::ContentFiltered)
+    }
+
     /// 映射为稳定的客户端错误；显式上游异常不回显其正文。
     pub(crate) fn public_error(&self) -> (&'static str, String) {
         match self {
@@ -252,6 +257,10 @@ impl AttemptFailure {
             Self::InvalidToolSchema { failure } => {
                 ("upstream_tool_schema_error", failure.public_message())
             }
+            Self::ContentFiltered => (
+                "invalid_request_error",
+                "Request was blocked by upstream content filtering".to_string(),
+            ),
             Self::EmptyResponse => (
                 "upstream_empty_response",
                 "Upstream returned no assistant content after one retry".to_string(),
@@ -288,6 +297,7 @@ impl AttemptFailure {
 pub(crate) struct AttemptObservation {
     saw_frame: bool,
     semantic_output_started: bool,
+    content_filtered: bool,
     context_window_exceeded: bool,
     upstream_error: Option<(String, String)>,
 }
@@ -311,6 +321,11 @@ impl AttemptObservation {
             }
             Event::ContextUsage(context_usage) => {
                 self.context_window_exceeded |= context_usage.context_usage_percentage >= 100.0;
+            }
+            Event::Metadata(metadata) => {
+                self.content_filtered |= metadata
+                    .stop_reason
+                    .eq_ignore_ascii_case("CONTENT_FILTERED");
             }
             Event::Error {
                 error_code,
@@ -351,6 +366,9 @@ impl AttemptObservation {
     ) -> Option<AttemptFailure> {
         if let Some(error) = tool_json_error {
             return Some(AttemptFailure::IncompleteToolJson(error));
+        }
+        if self.content_filtered && !self.semantic_output_started && !tool_semantic_output {
+            return Some(AttemptFailure::ContentFiltered);
         }
         if self.context_window_exceeded {
             return Some(AttemptFailure::ContextWindowExceeded);
@@ -435,7 +453,7 @@ where
 mod tests {
     use super::*;
     use crate::anthropic::stream::{SseEvent, ToolJsonAccumulatorError};
-    use crate::kiro::model::events::{AssistantResponseEvent, Event, ToolUseEvent};
+    use crate::kiro::model::events::{AssistantResponseEvent, Event, MetadataEvent, ToolUseEvent};
     use serde_json::json;
     use std::collections::VecDeque;
 
@@ -712,6 +730,49 @@ mod tests {
         });
 
         assert_eq!(observation.failure(None, false), None);
+    }
+
+    #[test]
+    fn content_filtered_requires_zero_semantic_output() {
+        let filtered = Event::Metadata(MetadataEvent {
+            stop_reason: "CONTENT_FILTERED".into(),
+        });
+
+        let mut empty = AttemptObservation::default();
+        empty.observe(&filtered);
+        assert_eq!(
+            empty.failure(None, false),
+            Some(AttemptFailure::ContentFiltered)
+        );
+
+        let mut with_text = AttemptObservation::default();
+        with_text.observe(&filtered);
+        let mut response = AssistantResponseEvent::default();
+        response.content = "I cannot help with that request.".into();
+        with_text.observe(&Event::AssistantResponse(response));
+        assert_eq!(with_text.failure(None, false), None);
+
+        let mut with_tool = AttemptObservation::default();
+        with_tool.observe(&filtered);
+        assert_eq!(with_tool.failure(None, true), None);
+    }
+
+    #[test]
+    fn content_filtered_is_stable_and_never_retried() {
+        let (error_type, message) = AttemptFailure::ContentFiltered.public_error();
+        assert_eq!(error_type, "invalid_request_error");
+        assert_eq!(message, "Request was blocked by upstream content filtering");
+
+        assert!(
+            !ToolAttemptState {
+                attempt_index: 0,
+                termination: AttemptTermination::Eof,
+                failure: Some(AttemptFailure::ContentFiltered),
+                semantic_output_started: false,
+                tool_forwarded: false,
+            }
+            .should_retry()
+        );
     }
 
     #[test]

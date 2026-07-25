@@ -885,7 +885,8 @@ where
         let terminal_failure = attempt.attempt_failure.clone().filter(|failure| {
             matches!(
                 failure,
-                super::tool_attempt::AttemptFailure::ContextWindowExceeded
+                super::tool_attempt::AttemptFailure::ContentFiltered
+                    | super::tool_attempt::AttemptFailure::ContextWindowExceeded
                     | super::tool_attempt::AttemptFailure::UpstreamError { .. }
             )
         });
@@ -927,7 +928,7 @@ where
 fn strict_json_terminal_failure_response(failure: super::tool_attempt::AttemptFailure) -> Response {
     let (error_type, message) = failure.public_error();
     (
-        StatusCode::BAD_GATEWAY,
+        attempt_failure_status(&failure),
         Json(ErrorResponse::new(error_type, message)),
     )
         .into_response()
@@ -3107,7 +3108,11 @@ fn classify_stream_completion(
 ) -> Option<StreamStartFailure> {
     if let Some((error_type, message)) = terminal_error {
         return Some(StreamStartFailure {
-            status: StatusCode::BAD_GATEWAY,
+            status: if error_type == "invalid_request_error" {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::BAD_GATEWAY
+            },
             error_type: error_type.to_string(),
             message: message.to_string(),
         });
@@ -3284,6 +3289,26 @@ mod stream_gate_tests {
 
         assert_eq!(failure.status, StatusCode::BAD_GATEWAY);
         assert_eq!(failure.error_type, "upstream_empty_response");
+    }
+
+    #[test]
+    fn content_filter_http_mapping_is_bad_request_before_response_headers() {
+        let filtered = super::super::tool_attempt::AttemptFailure::ContentFiltered;
+        let (error_type, message) = filtered.public_error();
+        let failure = classify_stream_completion(
+            &super::super::tool_attempt::AttemptTermination::Eof,
+            false,
+            Some((error_type, &message)),
+        )
+        .expect("content filtering must terminate before streaming headers");
+
+        assert_eq!(failure.status, StatusCode::BAD_REQUEST);
+        assert_eq!(failure.error_type, "invalid_request_error");
+
+        let (status, non_stream_type, non_stream_message) = non_stream_attempt_error(&filtered, 1);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(non_stream_type, "invalid_request_error");
+        assert_eq!(non_stream_message, message);
     }
 
     #[test]
@@ -4168,7 +4193,15 @@ fn non_stream_attempt_error(
     {
         message = format!("Upstream tool input still violated schema after one retry: {message}");
     }
-    (StatusCode::BAD_GATEWAY, error_type, message)
+    (attempt_failure_status(failure), error_type, message)
+}
+
+fn attempt_failure_status(failure: &super::tool_attempt::AttemptFailure) -> StatusCode {
+    if failure.is_client_error() {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::BAD_GATEWAY
+    }
 }
 
 fn normalize_and_validate_non_stream_content(
@@ -7670,6 +7703,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn strict_json_content_filter_stops_without_retry() {
+        let mut calls = 0;
+        let failure = recover_strict_json_attempts(|_| {
+            calls += 1;
+            futures::future::ready(Ok(BufferedAttempt {
+                events: Vec::new(),
+                credential_id: 1,
+                usage: TraceUsage::zero(),
+                credits: 0.0,
+                terminal_error: Some("content filtered".into()),
+                attempt_failure: Some(super::super::tool_attempt::AttemptFailure::ContentFiltered),
+            }))
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(calls, 1);
+        assert!(matches!(
+            failure.terminal_failure,
+            Some(super::super::tool_attempt::AttemptFailure::ContentFiltered)
+        ));
+    }
+
+    #[tokio::test]
     async fn strict_json_recovery_reports_second_empty_attempt_stably() {
         let mut calls = 0;
         let failure = recover_strict_json_attempts(|_| {
@@ -7701,6 +7758,21 @@ mod tests {
             super::super::tool_attempt::AttemptFailure::EmptyResponse,
         );
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_ne!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+    }
+
+    #[test]
+    fn strict_json_content_filter_returns_http_400_before_stream_commit() {
+        let response = strict_json_terminal_failure_response(
+            super::super::tool_attempt::AttemptFailure::ContentFiltered,
+        );
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_ne!(
             response
                 .headers()

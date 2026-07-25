@@ -3794,6 +3794,73 @@ mod tests {
     use super::*;
 
     #[test]
+    fn metadata_content_filter_sequence_ends_with_typed_error() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-5",
+            10,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_kiro_event(&Event::Metadata(
+            crate::kiro::model::events::MetadataEvent {
+                stop_reason: "CONTENT_FILTERED".into(),
+            },
+        ));
+        let _ = ctx.process_kiro_event(&Event::ContextUsage(
+            crate::kiro::model::events::ContextUsageEvent {
+                context_usage_percentage: 12.5,
+            },
+        ));
+        let _ = ctx.process_kiro_event(&Event::Metering(
+            crate::kiro::model::events::MeteringEvent { usage: 0.25 },
+        ));
+
+        let events = ctx.generate_final_events();
+
+        assert!(matches!(
+            ctx.terminal_attempt_failure(),
+            Some(super::super::tool_attempt::AttemptFailure::ContentFiltered)
+        ));
+        assert!(events.iter().any(|event| {
+            event.event == "error"
+                && event.data["error"]["type"] == "invalid_request_error"
+                && event.data["error"]["message"]
+                    == "Request was blocked by upstream content filtering"
+        }));
+        assert!(!events.iter().any(|event| event.event == "message_delta"));
+        assert!(!events.iter().any(|event| event.event == "message_stop"));
+        assert_eq!(ctx.credits, 0.25);
+    }
+
+    #[test]
+    fn metadata_content_filter_after_text_preserves_success() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-5",
+            10,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let mut response = crate::kiro::model::events::AssistantResponseEvent::default();
+        response.content = "I cannot help with that request.".into();
+        let _ = ctx.process_kiro_event(&Event::AssistantResponse(response));
+        let _ = ctx.process_kiro_event(&Event::Metadata(
+            crate::kiro::model::events::MetadataEvent {
+                stop_reason: "CONTENT_FILTERED".into(),
+            },
+        ));
+
+        let events = ctx.generate_final_events();
+
+        assert!(ctx.terminal_attempt_failure().is_none());
+        assert!(!events.iter().any(|event| event.event == "error"));
+        assert!(events.iter().any(|event| event.event == "message_stop"));
+    }
+
+    #[test]
     fn required_any_stream_ends_with_error_without_tool_use() {
         let mut ctx = StreamContext::new_with_constraints(
             "claude-opus-4-8",
