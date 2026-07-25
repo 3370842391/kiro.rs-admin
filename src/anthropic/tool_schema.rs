@@ -36,8 +36,20 @@ const MAX_SAFE_VIOLATION_CHARS: usize = 256;
 const MAX_TOOL_DESCRIPTION_CHARS: usize = 10_000;
 const MAX_SCHEMA_PATTERN_BYTES: usize = 4 * 1024;
 const MAX_SCHEMA_REGEX_SIZE_BYTES: usize = 512 * 1024;
+const MAX_JSON_ENCODED_ARRAY_BYTES: usize = 256 * 1024;
 const SAFE_REQUIRED_PROPERTY_ALIASES: &[(&str, &str)] = &[
     ("file_path", "path"),
+    ("path", "file_path"),
+    ("filePath", "file_path"),
+    ("file_path", "filePath"),
+    ("old_string", "oldStr"),
+    ("new_string", "newStr"),
+    ("old_string", "oldString"),
+    ("new_string", "newString"),
+    ("oldStr", "old_string"),
+    ("newStr", "new_string"),
+    ("oldString", "old_string"),
+    ("newString", "new_string"),
     ("name_path", "name_path_pattern"),
     ("content", "contents"),
     ("pattern", "glob_pattern"),
@@ -425,6 +437,7 @@ fn validate_value(
     repairs: &mut Vec<String>,
     violations: &mut Vec<ToolInputViolation>,
 ) {
+    repair_json_encoded_required_array(schema, value, path, required_property, repairs);
     repair_or_validate_fixed_value(schema, value, path, required_property, repairs, violations);
 
     let Some(expected_type) = schema.get("type") else {
@@ -472,6 +485,43 @@ fn validate_composite(
             }
         }
     }
+}
+
+fn repair_json_encoded_required_array(
+    schema: &serde_json::Value,
+    value: &mut serde_json::Value,
+    path: &str,
+    required_property: bool,
+    repairs: &mut Vec<String>,
+) {
+    if !required_property {
+        return;
+    }
+    let declares_array = match schema.get("type") {
+        Some(serde_json::Value::String(kind)) => kind == "array",
+        Some(serde_json::Value::Array(kinds)) => kinds
+            .iter()
+            .any(|kind| kind.as_str().is_some_and(|kind| kind == "array")),
+        _ => false,
+    };
+    if !declares_array {
+        return;
+    }
+    let Some(encoded) = value
+        .as_str()
+        .filter(|encoded| encoded.len() <= MAX_JSON_ENCODED_ARRAY_BYTES)
+    else {
+        return;
+    };
+    let Ok(decoded) = serde_json::from_str::<serde_json::Value>(encoded) else {
+        return;
+    };
+    if !decoded.is_array() {
+        return;
+    }
+
+    *value = decoded;
+    repairs.push(path.to_string());
 }
 
 fn validate_all_of(
@@ -974,6 +1024,112 @@ mod tests {
                 )]))
             );
         }
+    }
+
+    #[test]
+    fn repairs_bidirectional_tool_field_aliases() {
+        for (source, target) in [
+            ("path", "file_path"),
+            ("filePath", "file_path"),
+            ("file_path", "filePath"),
+            ("old_string", "oldStr"),
+            ("new_string", "newStr"),
+            ("old_string", "oldString"),
+            ("new_string", "newString"),
+            ("oldStr", "old_string"),
+            ("newStr", "new_string"),
+            ("oldString", "old_string"),
+            ("newString", "new_string"),
+        ] {
+            let mut schema = serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": [target],
+                "additionalProperties": false
+            });
+            schema["properties"][target] = serde_json::json!({"type": "string"});
+            let mut input = serde_json::json!({source: "unchanged-value"});
+
+            assert_eq!(
+                validate_and_repair(&schema, &mut input),
+                ToolInputOutcome::Repaired {
+                    paths: vec![format!("$.{target}")]
+                },
+                "{source} -> {target}"
+            );
+            assert_eq!(input, serde_json::json!({target: "unchanged-value"}));
+        }
+    }
+
+    #[test]
+    fn repairs_json_encoded_required_array() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"content": {"type": "string"}},
+                        "required": ["content"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["todos"],
+            "additionalProperties": false
+        });
+        let mut input = serde_json::json!({"todos": r#"[{"content":"ship"}]"#});
+
+        assert_eq!(
+            validate_and_repair(&schema, &mut input),
+            ToolInputOutcome::Repaired {
+                paths: vec!["$.todos".to_string()]
+            }
+        );
+        assert_eq!(input, serde_json::json!({"todos": [{"content": "ship"}]}));
+    }
+
+    #[test]
+    fn json_encoded_array_repair_remains_transactional_when_items_are_invalid() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"content": {"type": "string"}},
+                        "required": ["content"]
+                    }
+                }
+            },
+            "required": ["todos"]
+        });
+        let original = serde_json::json!({"todos": r#"[{"content":7}]"#});
+        let mut input = original.clone();
+
+        assert!(matches!(
+            validate_and_repair(&schema, &mut input),
+            ToolInputOutcome::Invalid { violations }
+                if violations == vec![ToolInputViolation::TypeMismatch {
+                    path: "$.todos[0].content".to_string(),
+                    expected: "string".to_string(),
+                }]
+        ));
+        assert_eq!(input, original);
+
+        let mut plain_text = serde_json::json!({"todos": "finish the task"});
+        let original_plain_text = plain_text.clone();
+        assert!(matches!(
+            validate_and_repair(&schema, &mut plain_text),
+            ToolInputOutcome::Invalid { violations }
+                if violations == vec![ToolInputViolation::TypeMismatch {
+                    path: "$.todos".to_string(),
+                    expected: "array".to_string(),
+                }]
+        ));
+        assert_eq!(plain_text, original_plain_text);
     }
 
     #[test]

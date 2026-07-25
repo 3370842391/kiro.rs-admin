@@ -116,6 +116,14 @@ fn is_content_length_threshold_error(error: &anyhow::Error) -> bool {
         .contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD")
 }
 
+fn is_terminal_fallback_response(
+    endpoint: &dyn KiroEndpoint,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> bool {
+    status == reqwest::StatusCode::BAD_REQUEST || endpoint.is_client_validation_error(body)
+}
+
 async fn call_with_content_length_retry<T, F, Fut>(
     primary_body: &str,
     threshold_retry_body: Option<&str>,
@@ -1807,6 +1815,35 @@ impl KiroProvider {
                                     body: &fb_body,
                                 });
                             }
+
+                            if is_terminal_fallback_response(
+                                fb_endpoint.as_ref(),
+                                fb_status,
+                                &fb_body,
+                            ) {
+                                Self::emit_attempt(
+                                    sink,
+                                    attempt,
+                                    ctx.id,
+                                    fb_name,
+                                    Some(fb_status.as_u16()),
+                                    outcome::BAD_REQUEST,
+                                    Some(&fb_body),
+                                    fb_start,
+                                );
+                                tracing::warn!(
+                                    "备用端点 [{}] 返回确定性的请求错误（{}），终止降级链",
+                                    fb_name,
+                                    fb_status
+                                );
+                                anyhow::bail!(
+                                    "{} API 请求失败: {} {}",
+                                    api_type,
+                                    fb_status,
+                                    fb_body
+                                );
+                            }
+
                             Self::emit_attempt(
                                 sink,
                                 attempt,
@@ -2338,6 +2375,32 @@ mod tests {
     fn best_endpoint_chain_has_runtime_primary_and_three_legacy_fallbacks() {
         assert_eq!(best_endpoint_name(), "runtime");
         assert_eq!(best_endpoint_chain(), &["ide", "codewhisperer", "amazonq"]);
+    }
+
+    #[test]
+    fn fallback_stops_on_request_wide_errors_but_keeps_transient_failover() {
+        let endpoint = crate::kiro::endpoint::IdeEndpoint;
+
+        assert!(is_terminal_fallback_response(
+            &endpoint,
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#,
+        ));
+        assert!(is_terminal_fallback_response(
+            &endpoint,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"reason":"TOOL_USE_RESULT_MISMATCH"}"#,
+        ));
+        assert!(!is_terminal_fallback_response(
+            &endpoint,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            r#"{"reason":"USER_REQUEST_RATE_EXCEEDED"}"#,
+        ));
+        assert!(!is_terminal_fallback_response(
+            &endpoint,
+            reqwest::StatusCode::BAD_GATEWAY,
+            "temporary upstream failure",
+        ));
     }
 
     #[test]
