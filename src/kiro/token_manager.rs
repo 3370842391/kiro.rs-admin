@@ -753,9 +753,15 @@ pub(crate) async fn create_kiro_api_key(
 
     let mut body = serde_json::Map::new();
     if let Some(arn) = profile_arn {
-        body.insert("profileArn".to_string(), serde_json::Value::String(arn.to_string()));
+        body.insert(
+            "profileArn".to_string(),
+            serde_json::Value::String(arn.to_string()),
+        );
     }
-    body.insert("label".to_string(), serde_json::Value::String(label.to_string()));
+    body.insert(
+        "label".to_string(),
+        serde_json::Value::String(label.to_string()),
+    );
     let body = serde_json::Value::Object(body);
 
     let client = build_client(proxy, 60, config.tls_backend)?;
@@ -1340,6 +1346,14 @@ pub struct MultiTokenManager {
     max_bucket_attempts_per_request: AtomicUsize,
     /// 流式空闲超时秒数（运行时可修改，0 = 关闭 idle watchdog）。
     stream_idle_timeout_secs: AtomicU64,
+    /// 纯文本 max_tokens 自动续写（运行时可修改）。
+    auto_continue_enabled: AtomicBool,
+    /// 单条响应最大自动续写轮数。
+    auto_continue_max: AtomicU32,
+    /// 可疑半截流是否自动恢复。
+    partial_stream_recovery_enabled: AtomicBool,
+    /// 首个语义输出后的半截流判定窗口（毫秒）。
+    partial_stream_recovery_window_ms: AtomicU64,
     /// 空 user 请求兼容开关（运行时可修改）。
     empty_user_message_compat: AtomicBool,
     /// 缓存命中率整形下界（百分比 0..=100，运行时可修改）。min==0 && max==0 = 关闭整形。
@@ -1582,6 +1596,10 @@ impl MultiTokenManager {
         let endpoint_mode = config.endpoint_mode;
         let max_bucket_attempts = config.max_bucket_attempts_per_request;
         let stream_idle_timeout_secs = config.stream_idle_timeout_secs;
+        let auto_continue_enabled = config.auto_continue_enabled;
+        let auto_continue_max = config.auto_continue_max;
+        let partial_stream_recovery_enabled = config.partial_stream_recovery_enabled;
+        let partial_stream_recovery_window_ms = config.partial_stream_recovery_window_ms;
         let empty_user_message_compat = config.empty_user_message_compat;
         let cache_hit_rate_min_pct = config.cache_hit_rate_min_pct.min(100);
         let cache_hit_rate_max_pct = config.cache_hit_rate_max_pct.min(100);
@@ -1618,6 +1636,10 @@ impl MultiTokenManager {
             session_affinity: Mutex::new(HashMap::new()),
             max_bucket_attempts_per_request: AtomicUsize::new(max_bucket_attempts),
             stream_idle_timeout_secs: AtomicU64::new(stream_idle_timeout_secs),
+            auto_continue_enabled: AtomicBool::new(auto_continue_enabled),
+            auto_continue_max: AtomicU32::new(auto_continue_max),
+            partial_stream_recovery_enabled: AtomicBool::new(partial_stream_recovery_enabled),
+            partial_stream_recovery_window_ms: AtomicU64::new(partial_stream_recovery_window_ms),
             empty_user_message_compat: AtomicBool::new(empty_user_message_compat),
             cache_hit_rate_min_pct: AtomicU32::new(cache_hit_rate_min_pct),
             cache_hit_rate_max_pct: AtomicU32::new(cache_hit_rate_max_pct),
@@ -5027,6 +5049,97 @@ impl MultiTokenManager {
         self.stream_idle_timeout_secs.load(Ordering::Relaxed)
     }
 
+    pub fn auto_continue_enabled(&self) -> bool {
+        self.auto_continue_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn auto_continue_max(&self) -> u32 {
+        self.auto_continue_max.load(Ordering::Relaxed)
+    }
+
+    pub fn partial_stream_recovery_enabled(&self) -> bool {
+        self.partial_stream_recovery_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn partial_stream_recovery_window_ms(&self) -> u64 {
+        self.partial_stream_recovery_window_ms
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn set_auto_continue_config(
+        &self,
+        enabled: bool,
+        max_rounds: u32,
+        partial_recovery_enabled: bool,
+        partial_window_ms: u64,
+    ) -> anyhow::Result<()> {
+        if max_rounds > 10 {
+            anyhow::bail!("自动续写轮数必须在 0..=10 之间: {}", max_rounds);
+        }
+        if !(100..=10_000).contains(&partial_window_ms) {
+            anyhow::bail!(
+                "半截流判定窗口必须在 100..=10000 毫秒之间: {}",
+                partial_window_ms
+            );
+        }
+
+        let previous = (
+            self.auto_continue_enabled.swap(enabled, Ordering::Relaxed),
+            self.auto_continue_max.swap(max_rounds, Ordering::Relaxed),
+            self.partial_stream_recovery_enabled
+                .swap(partial_recovery_enabled, Ordering::Relaxed),
+            self.partial_stream_recovery_window_ms
+                .swap(partial_window_ms, Ordering::Relaxed),
+        );
+        if let Err(error) = self.persist_auto_continue_config(
+            enabled,
+            max_rounds,
+            partial_recovery_enabled,
+            partial_window_ms,
+        ) {
+            self.auto_continue_enabled
+                .store(previous.0, Ordering::Relaxed);
+            self.auto_continue_max.store(previous.1, Ordering::Relaxed);
+            self.partial_stream_recovery_enabled
+                .store(previous.2, Ordering::Relaxed);
+            self.partial_stream_recovery_window_ms
+                .store(previous.3, Ordering::Relaxed);
+            return Err(error);
+        }
+        tracing::info!(
+            enabled,
+            max_rounds,
+            partial_recovery_enabled,
+            partial_window_ms,
+            "自动续写配置已更新"
+        );
+        Ok(())
+    }
+
+    fn persist_auto_continue_config(
+        &self,
+        enabled: bool,
+        max_rounds: u32,
+        partial_recovery_enabled: bool,
+        partial_window_ms: u64,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let Some(config_path) = self.config.config_path() else {
+            tracing::warn!("配置文件路径未知，自动续写配置仅在当前进程生效");
+            return Ok(());
+        };
+        let mut config = Config::load(config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.auto_continue_enabled = enabled;
+        config.auto_continue_max = max_rounds;
+        config.partial_stream_recovery_enabled = partial_recovery_enabled;
+        config.partial_stream_recovery_window_ms = partial_window_ms;
+        config
+            .save()
+            .with_context(|| format!("持久化自动续写配置失败: {}", config_path.display()))
+    }
+
     /// 读取空 user 请求兼容开关。
     pub fn get_empty_user_message_compat(&self) -> bool {
         self.empty_user_message_compat.load(Ordering::Relaxed)
@@ -7936,7 +8049,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(manager.delete_credential_on_forbidden(1).unwrap(), Some(true));
+        assert_eq!(
+            manager.delete_credential_on_forbidden(1).unwrap(),
+            Some(true)
+        );
         assert_eq!(
             manager
                 .clone_all_credentials()
@@ -8284,6 +8400,44 @@ mod tests {
         assert!(persisted.endpoint_chains.is_none());
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn auto_continue_config_persists_and_updates_runtime_state() {
+        let path = tmp_creds_path("auto_continue_config");
+        let config = Config::load(&path).unwrap();
+        config.save().unwrap();
+        let manager = MultiTokenManager::new(config, Vec::new(), None, None, false).unwrap();
+
+        assert!(!manager.auto_continue_enabled());
+        assert!(!manager.partial_stream_recovery_enabled());
+        manager
+            .set_auto_continue_config(true, 2, true, 900)
+            .unwrap();
+
+        assert!(manager.auto_continue_enabled());
+        assert_eq!(manager.auto_continue_max(), 2);
+        assert!(manager.partial_stream_recovery_enabled());
+        assert_eq!(manager.partial_stream_recovery_window_ms(), 900);
+        let persisted = Config::load(&path).unwrap();
+        assert!(persisted.auto_continue_enabled);
+        assert_eq!(persisted.auto_continue_max, 2);
+        assert!(persisted.partial_stream_recovery_enabled);
+        assert_eq!(persisted.partial_stream_recovery_window_ms, 900);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn auto_continue_config_rejects_unsafe_bounds() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(config, Vec::new(), None, None, false).unwrap();
+        assert!(
+            manager
+                .set_auto_continue_config(true, 11, false, 750)
+                .is_err()
+        );
+        assert!(manager.set_auto_continue_config(true, 3, true, 99).is_err());
     }
 
     #[test]

@@ -301,10 +301,7 @@ impl KiroProvider {
                 .delete_credential_on_forbidden(credential_id)
             {
                 Ok(Some(has_available)) => {
-                    tracing::warn!(
-                        "凭据 #{} 收到上游 403，已按自动采购策略删除",
-                        credential_id
-                    );
+                    tracing::warn!("凭据 #{} 收到上游 403，已按自动采购策略删除", credential_id);
                     return has_available;
                 }
                 Ok(None) => {}
@@ -475,6 +472,22 @@ impl KiroProvider {
     /// 的修改立即作用于流层 watchdog。HTTP client 仅保留 720 秒绝对超时。
     pub fn stream_idle_timeout_secs(&self) -> u64 {
         self.token_manager.get_stream_idle_timeout_secs()
+    }
+
+    pub fn auto_continue_enabled(&self) -> bool {
+        self.token_manager.auto_continue_enabled()
+    }
+
+    pub fn auto_continue_max(&self) -> u32 {
+        self.token_manager.auto_continue_max()
+    }
+
+    pub fn partial_stream_recovery_enabled(&self) -> bool {
+        self.token_manager.partial_stream_recovery_enabled()
+    }
+
+    pub fn partial_stream_recovery_window_ms(&self) -> u64 {
+        self.token_manager.partial_stream_recovery_window_ms()
     }
 
     /// 是否在等待 Kiro 上游响应时提前提交 SSE 连接注释。

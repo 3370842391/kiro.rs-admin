@@ -574,6 +574,9 @@ const STRAY_INVOKE_TOKENS: &[&str] = &["call", "count", "card"];
 /// 设为 16 可在客户端出现大面积刷屏前止血；比较保留行首缩进，避免把正常嵌套代码
 /// 中不同层级的闭合括号误判为同一行。
 const REPEAT_GUARD_TRIP_THRESHOLD: u32 = 16;
+/// Thinking 不是最终正文；相同短单元连续出现 4 次已经足以判定上游退化。
+/// 使用更低阈值可显著减少客户先看到的复读，同时正文仍沿用保守阈值 16。
+const REPEAT_GUARD_THINKING_TRIP_THRESHOLD: u32 = 4;
 /// 只对短候选做连续比较，避免复制和比较超大正文。
 const REPEAT_GUARD_MAX_UNIT_BYTES: usize = 512;
 
@@ -1285,6 +1288,16 @@ impl SseStateManager {
         }
     }
 
+    /// 开始同一条 Anthropic message 的下一轮上游续写。
+    /// 保留 message_start 与单调块索引，只重置本轮终态。
+    fn reset_for_continuation(&mut self) {
+        self.message_delta_sent = false;
+        self.message_ended = false;
+        self.stop_reason = None;
+        self.active_blocks
+            .retain(|_, block| block.started && !block.stopped);
+    }
+
     /// 处理 message_start 事件
     pub fn handle_message_start(&mut self, event: serde_json::Value) -> Option<SseEvent> {
         if self.message_started {
@@ -1444,6 +1457,77 @@ impl SseStateManager {
 
 use super::converter::get_context_window_size;
 
+const CONTINUATION_OVERLAP_MAX_BYTES: usize = 8 * 1024;
+
+#[derive(Debug)]
+struct ContinuationOverlapFilter {
+    previous_tail: String,
+    pending: String,
+    resolved: bool,
+}
+
+impl ContinuationOverlapFilter {
+    fn new(previous: &str) -> Self {
+        let start = find_char_boundary(
+            previous,
+            previous
+                .len()
+                .saturating_sub(CONTINUATION_OVERLAP_MAX_BYTES),
+        );
+        Self {
+            previous_tail: previous[start..].to_string(),
+            pending: String::new(),
+            resolved: false,
+        }
+    }
+
+    fn push(&mut self, text: &str) -> String {
+        if self.resolved {
+            return text.to_string();
+        }
+        self.pending.push_str(text);
+        if self.pending.len() < CONTINUATION_OVERLAP_MAX_BYTES
+            && self.pending_can_extend_existing_suffix()
+        {
+            return String::new();
+        }
+        self.resolve()
+    }
+
+    fn finish(mut self) -> String {
+        self.resolve()
+    }
+
+    fn pending_can_extend_existing_suffix(&self) -> bool {
+        if self.pending.is_empty() {
+            return true;
+        }
+        self.previous_tail
+            .char_indices()
+            .map(|(index, _)| &self.previous_tail[index..])
+            .any(|suffix| suffix.len() > self.pending.len() && suffix.starts_with(&self.pending))
+    }
+
+    fn resolve(&mut self) -> String {
+        if self.resolved {
+            return std::mem::take(&mut self.pending);
+        }
+        let overlap = self
+            .previous_tail
+            .char_indices()
+            .map(|(index, _)| &self.previous_tail[index..])
+            .filter(|suffix| self.pending.starts_with(*suffix))
+            .map(str::len)
+            .max()
+            .unwrap_or(0);
+        let overlap = find_char_boundary(&self.pending, overlap);
+        let output = self.pending[overlap..].to_string();
+        self.pending.clear();
+        self.resolved = true;
+        output
+    }
+}
+
 /// 流处理上下文
 pub struct StreamContext {
     /// SSE 状态管理器
@@ -1544,6 +1628,10 @@ pub struct StreamContext {
     attempt_observation: super::tool_attempt::AttemptObservation,
     /// 收尾后统一得到的 attempt 失败分类。
     terminal_attempt_failure: Option<super::tool_attempt::AttemptFailure>,
+    /// 已真实发送给客户端的正文。用于构造纯文本续写请求，不包含 thinking/tool_use。
+    accumulated_text: String,
+    /// 续写首段接缝去重器；只在自动续写轮启用。
+    continuation_overlap: Option<ContinuationOverlapFilter>,
 }
 
 fn events_have_visible_output(events: &[SseEvent]) -> bool {
@@ -1622,6 +1710,62 @@ impl StreamContext {
     /// 上游是否已被通用复读熔断器判定为退化输出。
     pub fn repetition_guard_tripped(&self) -> bool {
         self.repeat_guard_tripped
+    }
+
+    pub(crate) fn accumulated_text(&self) -> &str {
+        &self.accumulated_text
+    }
+
+    pub(crate) fn current_stop_reason(&self) -> String {
+        self.state_manager.get_stop_reason()
+    }
+
+    pub(crate) fn saw_tool_use(&self) -> bool {
+        self.saw_upstream_tool_use || self.state_manager.has_tool_use()
+    }
+
+    pub(crate) fn saw_reasoning_output(&self) -> bool {
+        self.saw_reasoning_output
+    }
+
+    pub(crate) fn has_terminal_error(&self) -> bool {
+        self.terminal_error_message().is_some()
+    }
+
+    pub(crate) fn begin_continuation(&mut self) {
+        self.continuation_overlap = Some(ContinuationOverlapFilter::new(&self.accumulated_text));
+    }
+
+    pub(crate) fn flush_continuation_overlap(&mut self) -> Vec<SseEvent> {
+        let Some(filter) = self.continuation_overlap.take() else {
+            return Vec::new();
+        };
+        let content = filter.finish();
+        if content.is_empty() {
+            Vec::new()
+        } else {
+            self.process_filtered_assistant_content(&content)
+        }
+    }
+
+    /// 已发送中间轮的 content_block_stop 后调用；不重复发送 message_start。
+    pub(crate) fn prepare_for_continuation(&mut self) {
+        self.state_manager.reset_for_continuation();
+        self.text_block_index = None;
+        self.thinking_block_index = None;
+        self.in_thinking_block = false;
+        self.thinking_extracted = false;
+        self.thinking_buffer.clear();
+        self.invoke_sniff_buffer.clear();
+        self.tool_json_accumulator = ToolJsonAccumulator::new();
+        self.tool_json_error = None;
+        self.tool_use_xml_filter = ToolUseXmlLeakFilter::default();
+        self.saw_upstream_tool_use = false;
+        self.has_visible_output = false;
+        self.terminal_protocol_error = None;
+        self.terminal_protocol_error_type = None;
+        self.terminal_attempt_failure = None;
+        self.attempt_observation = super::tool_attempt::AttemptObservation::default();
     }
 
     /// 返回工具 JSON 的 typed 终态，供 handler 精确区分可重试的 EOF 半截与其他错误。
@@ -1708,6 +1852,8 @@ impl StreamContext {
             strict_thinking_validation,
             attempt_observation: super::tool_attempt::AttemptObservation::default(),
             terminal_attempt_failure: None,
+            accumulated_text: String::new(),
+            continuation_overlap: None,
         }
     }
 
@@ -1869,6 +2015,22 @@ impl StreamContext {
             return Vec::new();
         }
 
+        let continuation_out = self
+            .continuation_overlap
+            .as_mut()
+            .map(|filter| filter.push(content));
+        let content = match &continuation_out {
+            Some(value) => value.as_str(),
+            None => content,
+        };
+        if content.is_empty() {
+            return Vec::new();
+        }
+
+        self.process_filtered_assistant_content(content)
+    }
+
+    fn process_filtered_assistant_content(&mut self, content: &str) -> Vec<SseEvent> {
         if self.tool_choice_policy.is_required()
             && !self.saw_upstream_tool_use
             && !self.required_tool_preamble_released
@@ -2221,7 +2383,7 @@ impl StreamContext {
     /// - 把输入按行切，只去掉行尾空白，保留行首缩进；
     /// - 空行忽略且不重置，覆盖 `}\n\n}\n\n` 形态；
     /// - 不超过 `REPEAT_GUARD_MAX_UNIT_BYTES` 的相同候选在同一通道连续达到阈值即跳闸；
-    /// - 跳闸后本轮后续 text/thinking 一律丢弃，并以 `max_tokens` 正常收尾。
+    /// - 跳闸后本轮后续 text/thinking 一律丢弃，并以独立错误终态收尾。
     ///
     /// 返回应当继续吐出的文本（跳闸时返回空串）。
     fn repeat_guard_filter(&mut self, text: &str, channel: &'static str) -> String {
@@ -2248,9 +2410,13 @@ impl StreamContext {
                     self.repeat_guard_last_line = line.to_string();
                     self.repeat_guard_run = 1;
                 }
-                if self.repeat_guard_run >= REPEAT_GUARD_TRIP_THRESHOLD {
+                let trip_threshold = if channel == "thinking" {
+                    REPEAT_GUARD_THINKING_TRIP_THRESHOLD
+                } else {
+                    REPEAT_GUARD_TRIP_THRESHOLD
+                };
+                if self.repeat_guard_run >= trip_threshold {
                     self.repeat_guard_tripped = true;
-                    self.state_manager.set_stop_reason("max_tokens");
                     tracing::warn!(
                         message_id = %self.message_id,
                         channel = %channel,
@@ -2283,6 +2449,7 @@ impl StreamContext {
         }
         let text: &str = &kept;
         self.has_visible_output = true;
+        self.accumulated_text.push_str(text);
 
         // 🅱 维护跨流的代码围栏奇偶状态：所有真正作为「文本」吐出的内容都过这里，
         // 在此累进围栏状态，使后续 <invoke> 能判断自己是否落在代码块内。
@@ -3077,6 +3244,29 @@ impl StreamContext {
                     "error": {
                         "type": error_type,
                         "message": message
+                    }
+                }),
+            ));
+            return events;
+        }
+
+        if self.repeat_guard_tripped {
+            let (final_input_tokens, cache_creation, cache_read) = self.resolved_usage();
+            let mut terminal_events = self.state_manager.generate_final_events(
+                final_input_tokens,
+                self.output_tokens,
+                cache_creation,
+                cache_read,
+            );
+            terminal_events.retain(|event| event.event == "content_block_stop");
+            events.extend(terminal_events);
+            events.push(SseEvent::new(
+                "error",
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": "upstream_repetition_guard",
+                        "message": "Repeated upstream output was truncated"
                     }
                 }),
             ));
@@ -6585,11 +6775,11 @@ mod tests {
             "generic flood was not stopped: {text:?}"
         );
         assert!(ctx.repetition_guard_tripped());
-        let message_delta = events
-            .iter()
-            .find(|event| event.event == "message_delta")
-            .expect("guarded stream must end with message_delta");
-        assert_eq!(message_delta.data["delta"]["stop_reason"], "max_tokens");
+        assert!(!events.iter().any(|event| event.event == "message_delta"));
+        assert!(!events.iter().any(|event| event.event == "message_stop"));
+        assert!(events.iter().any(|event| {
+            event.event == "error" && event.data["error"]["type"] == "upstream_repetition_guard"
+        }));
     }
 
     #[test]
@@ -6620,11 +6810,118 @@ mod tests {
             "thinking flood was not stopped: {thinking:?}"
         );
         assert!(ctx.repetition_guard_tripped());
-        let message_delta = events
-            .iter()
-            .find(|event| event.event == "message_delta")
-            .expect("guarded thinking stream must end with message_delta");
-        assert_eq!(message_delta.data["delta"]["stop_reason"], "max_tokens");
+        assert!(!events.iter().any(|event| event.event == "message_delta"));
+        assert!(!events.iter().any(|event| event.event == "message_stop"));
+        assert!(events.iter().any(|event| {
+            event.event == "error" && event.data["error"]["type"] == "upstream_repetition_guard"
+        }));
+    }
+
+    #[test]
+    fn repeat_guard_stops_native_thinking_before_fifth_duplicate() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let mut events = Vec::new();
+        for _ in 0..20 {
+            events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+                crate::kiro::model::events::ReasoningContentEvent {
+                    text: Some("用户要求直接实现。\n".into()),
+                    signature: None,
+                    redacted_content: None,
+                },
+            )));
+        }
+
+        let thinking = collect_thinking_content(&events);
+        assert!(
+            thinking.matches("用户要求直接实现。").count() <= 4,
+            "thinking 复读应在第五次前停止，实际内容: {thinking:?}"
+        );
+        assert!(ctx.repetition_guard_tripped());
+    }
+
+    #[test]
+    fn continuation_overlap_removes_replayed_suffix_across_chunks() {
+        let mut filter = ContinuationOverlapFilter::new("alpha beta gamma");
+        assert_eq!(filter.push("beta "), "");
+        assert_eq!(filter.push("gamma delta"), " delta");
+        assert_eq!(filter.push(" epsilon"), " epsilon");
+    }
+
+    #[test]
+    fn continuation_overlap_preserves_fresh_text() {
+        let mut filter = ContinuationOverlapFilter::new("alpha beta gamma");
+        assert_eq!(filter.push("completely new"), "completely new");
+    }
+
+    #[test]
+    fn continuation_keeps_one_message_and_deduplicates_the_seam() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let mut events = ctx.generate_initial_events();
+        let mut first = crate::kiro::model::events::AssistantResponseEvent::default();
+        first.content = "alpha beta".into();
+        events.extend(ctx.process_kiro_event(&Event::AssistantResponse(first)));
+        let mut intermediate = ctx.generate_final_events();
+        intermediate
+            .retain(|event| !matches!(event.event.as_str(), "message_delta" | "message_stop"));
+        events.extend(intermediate);
+
+        ctx.prepare_for_continuation();
+        ctx.begin_continuation();
+        let mut second = crate::kiro::model::events::AssistantResponseEvent::default();
+        second.content = "beta gamma".into();
+        events.extend(ctx.process_kiro_event(&Event::AssistantResponse(second)));
+        events.extend(ctx.flush_continuation_overlap());
+        events.extend(ctx.generate_final_events());
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event == "message_start")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event == "message_stop")
+                .count(),
+            1
+        );
+        assert_eq!(collect_text_content(&events), "alpha beta gamma");
+    }
+
+    #[test]
+    fn reasoning_output_is_visible_to_the_auto_continue_gate() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: Some("reasoning".into()),
+                signature: None,
+                redacted_content: None,
+            },
+        ));
+
+        assert!(ctx.saw_reasoning_output());
     }
 
     #[test]

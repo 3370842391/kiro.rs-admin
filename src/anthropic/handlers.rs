@@ -2445,6 +2445,7 @@ pub async fn post_messages(
             threshold_retry_body,
             &payload.model,
             total_input_tokens,
+            payload.max_tokens,
             context_window_size,
             thinking_enabled,
             tool_name_map,
@@ -2494,6 +2495,7 @@ struct StreamAttemptSetup {
     threshold_retry_body: Option<String>,
     model: String,
     input_tokens: i32,
+    requested_max_tokens: i32,
     context_window_size: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
@@ -2504,6 +2506,10 @@ struct StreamAttemptSetup {
     group: Option<String>,
     identity_normalization: bool,
     strict_thinking_validation: bool,
+    auto_continue_enabled: bool,
+    auto_continue_max: u32,
+    partial_stream_recovery_enabled: bool,
+    partial_stream_recovery_window_ms: u64,
 }
 
 fn prepare_retry_request_body(
@@ -2522,6 +2528,57 @@ fn prepare_retry_request_body(
         }
         _ => Some(request_body.to_owned()),
     }
+}
+
+const AUTO_CONTINUE_PROMPT: &str = "Continue exactly where the previous assistant response stopped. Output only the continuation. Do not repeat previous text, do not call tools, and do not add an explanation.";
+
+/// 把已完成的当前轮与已生成正文转成历史，再创建一个无图片、无工具的新 user turn。
+/// 仅供显式开启的纯文本自动续写使用。
+fn prepare_auto_continue_request_body(request_body: &str, generated_text: &str) -> Option<String> {
+    if generated_text.trim().is_empty() {
+        return None;
+    }
+
+    let mut root: serde_json::Value = serde_json::from_str(request_body).ok()?;
+    let state = root.get_mut("conversationState")?.as_object_mut()?;
+    let original_user = state
+        .get("currentMessage")?
+        .get("userInputMessage")?
+        .clone();
+
+    let history = state
+        .entry("history")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()?;
+    history.push(serde_json::json!({"userInputMessage": original_user.clone()}));
+    history.push(serde_json::json!({
+        "assistantResponseMessage": {"content": generated_text}
+    }));
+
+    let mut continuation_user = original_user;
+    let continuation = continuation_user.as_object_mut()?;
+    continuation.insert(
+        "content".to_string(),
+        serde_json::Value::String(AUTO_CONTINUE_PROMPT.to_string()),
+    );
+    continuation.insert("images".to_string(), serde_json::json!([]));
+    let context = continuation
+        .entry("userInputMessageContext")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()?;
+    context.insert("tools".to_string(), serde_json::json!([]));
+    context.insert("toolResults".to_string(), serde_json::json!([]));
+
+    state.insert(
+        "currentMessage".to_string(),
+        serde_json::json!({"userInputMessage": continuation_user}),
+    );
+    state.insert(
+        "chatTriggerType".to_string(),
+        serde_json::Value::String("AUTO".to_string()),
+    );
+
+    serde_json::to_string(&root).ok()
 }
 
 impl StreamAttemptSetup {
@@ -2580,6 +2637,7 @@ async fn handle_stream_request(
     threshold_retry_body: Option<&str>,
     model: &str,
     input_tokens: i32,
+    requested_max_tokens: i32,
     context_window_size: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
@@ -2600,6 +2658,7 @@ async fn handle_stream_request(
             threshold_retry_body.map(str::to_owned),
             model.to_owned(),
             input_tokens,
+            requested_max_tokens,
             context_window_size,
             thinking_enabled,
             tool_name_map,
@@ -2646,6 +2705,7 @@ async fn handle_stream_request(
         threshold_retry_body: threshold_retry_body.map(str::to_owned),
         model: model.to_owned(),
         input_tokens,
+        requested_max_tokens,
         context_window_size,
         thinking_enabled,
         tool_name_map,
@@ -2656,6 +2716,10 @@ async fn handle_stream_request(
         group,
         identity_normalization,
         strict_thinking_validation: provider.strict_thinking_validation(),
+        auto_continue_enabled: provider.auto_continue_enabled(),
+        auto_continue_max: provider.auto_continue_max(),
+        partial_stream_recovery_enabled: provider.partial_stream_recovery_enabled(),
+        partial_stream_recovery_window_ms: provider.partial_stream_recovery_window_ms(),
     };
 
     // 创建 SSE 流（带 idle watchdog：上游首字节前挂死 / 中途停流超阈值主动收尾）
@@ -2678,6 +2742,7 @@ fn create_early_sse_stream(
     threshold_retry_body: Option<String>,
     model: String,
     input_tokens: i32,
+    requested_max_tokens: i32,
     context_window_size: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
@@ -2715,6 +2780,7 @@ fn create_early_sse_stream(
             threshold_retry_body,
             model,
             input_tokens,
+            requested_max_tokens,
             context_window_size,
             thinking_enabled,
             tool_name_map,
@@ -2725,6 +2791,10 @@ fn create_early_sse_stream(
             group,
             identity_normalization,
             strict_thinking_validation: provider.strict_thinking_validation(),
+            auto_continue_enabled: provider.auto_continue_enabled(),
+            auto_continue_max: provider.auto_continue_max(),
+            partial_stream_recovery_enabled: provider.partial_stream_recovery_enabled(),
+            partial_stream_recovery_window_ms: provider.partial_stream_recovery_window_ms(),
         },
         hook,
         tracer,
@@ -3047,6 +3117,107 @@ fn signal_stream_start_failure(
 mod stream_gate_tests {
     use super::*;
 
+    fn continuation_fixture() -> String {
+        serde_json::json!({
+            "conversationState": {
+                "agentContinuationId": "agent-old",
+                "agentTaskType": "vibe",
+                "chatTriggerType": "MANUAL",
+                "conversationId": "conversation-old",
+                "history": [],
+                "currentMessage": {
+                    "userInputMessage": {
+                        "content": "请写完整实现",
+                        "modelId": "claude-opus-5",
+                        "origin": "AI_EDITOR",
+                        "images": [{"format":"png","source":{"bytes":"abc"}}],
+                        "userInputMessageContext": {
+                            "envState": {"operatingSystem":"macos","currentWorkingDirectory":"/tmp"},
+                            "tools": [{"toolSpecification":{"name":"bash"}}],
+                            "toolResults": [{"toolUseId":"tool-1","content":[{"text":"ok"}],"status":"success"}]
+                        }
+                    }
+                }
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn continuation_request_preserves_original_turn_and_disables_tools() {
+        let body = prepare_auto_continue_request_body(&continuation_fixture(), "已经生成的正文")
+            .expect("continuation body");
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let state = &value["conversationState"];
+
+        assert_eq!(state["history"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            state["history"][0]["userInputMessage"]["content"],
+            "请写完整实现"
+        );
+        assert_eq!(
+            state["history"][1]["assistantResponseMessage"]["content"],
+            "已经生成的正文"
+        );
+        assert_eq!(
+            state["currentMessage"]["userInputMessage"]["images"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            state["currentMessage"]["userInputMessage"]["userInputMessageContext"]["tools"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            state["currentMessage"]["userInputMessage"]["userInputMessageContext"]["toolResults"],
+            serde_json::json!([])
+        );
+        assert_eq!(state["chatTriggerType"], "AUTO");
+        assert_eq!(state["conversationId"], "conversation-old");
+        assert_eq!(state["agentContinuationId"], "agent-old");
+    }
+
+    #[test]
+    fn continuation_request_rejects_empty_generated_text() {
+        assert!(prepare_auto_continue_request_body(&continuation_fixture(), "").is_none());
+    }
+
+    #[test]
+    fn auto_continue_stop_reason_rejects_terminal_protocol_outcomes() {
+        for reason in [
+            "model_context_window_exceeded",
+            "error",
+            "tool_use",
+            "upstream_repetition_guard",
+        ] {
+            assert!(
+                !auto_continue_stop_reason_allows(reason, true),
+                "{reason} must never trigger transparent continuation"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_continue_stop_reason_only_allows_partial_end_turn_when_enabled() {
+        assert!(auto_continue_stop_reason_allows("max_tokens", false));
+        assert!(auto_continue_stop_reason_allows("max_tokens", true));
+        assert!(!auto_continue_stop_reason_allows("end_turn", false));
+        assert!(auto_continue_stop_reason_allows("end_turn", true));
+    }
+
+    #[test]
+    fn auto_continue_rejects_thinking_mode_before_reasoning_is_emitted() {
+        let ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            std::collections::HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+
+        assert!(!auto_continue_is_plain_text_mode(true, &ctx));
+        assert!(auto_continue_is_plain_text_mode(false, &ctx));
+    }
+
     #[test]
     fn empty_eof_is_a_gateway_failure_before_response_headers() {
         let failure = classify_stream_completion(
@@ -3073,12 +3244,14 @@ mod stream_gate_tests {
 
     #[test]
     fn stream_with_visible_content_can_start_http_response() {
-        assert!(classify_stream_completion(
-            &super::super::tool_attempt::AttemptTermination::Eof,
-            true,
-            None,
-        )
-        .is_none());
+        assert!(
+            classify_stream_completion(
+                &super::super::tool_attempt::AttemptTermination::Eof,
+                true,
+                None,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -3187,6 +3360,193 @@ async fn send_sse_events(
     true
 }
 
+fn is_incomplete_text_ending(text: &str) -> bool {
+    let trimmed = text.trim_end();
+    let Some(last) = trimmed.chars().next_back() else {
+        return false;
+    };
+    !matches!(
+        last,
+        '.' | '!' | '?' | '。' | '！' | '？' | ';' | '；' | ':' | '：' | '}' | ']' | ')' | '`'
+    )
+}
+
+fn auto_continue_stop_reason_allows(
+    stop_reason: &str,
+    partial_stream_recovery_enabled: bool,
+) -> bool {
+    stop_reason == "max_tokens" || (partial_stream_recovery_enabled && stop_reason == "end_turn")
+}
+
+fn auto_continue_is_plain_text_mode(thinking_enabled: bool, ctx: &StreamContext) -> bool {
+    !thinking_enabled && !ctx.saw_tool_use() && !ctx.saw_reasoning_output()
+}
+
+fn should_auto_continue_round(
+    setup: &StreamAttemptSetup,
+    ctx: &StreamContext,
+    termination: &AttemptTermination,
+    continuation_count: u32,
+    semantic_started_at: Option<TokioInstant>,
+    round_credits: f64,
+    round_output_tokens: i32,
+) -> bool {
+    if !setup.auto_continue_enabled
+        || continuation_count >= setup.auto_continue_max
+        || !matches!(termination, AttemptTermination::Eof)
+        || ctx.accumulated_text().trim().is_empty()
+        || !auto_continue_is_plain_text_mode(setup.thinking_enabled, ctx)
+        || ctx.repetition_guard_tripped()
+        || ctx.has_terminal_error()
+    {
+        return false;
+    }
+
+    let stop_reason = ctx.current_stop_reason();
+    if !auto_continue_stop_reason_allows(&stop_reason, setup.partial_stream_recovery_enabled) {
+        return false;
+    }
+
+    if stop_reason == "max_tokens" {
+        return true;
+    }
+
+    if setup.requested_max_tokens > 0
+        && i64::from(round_output_tokens) * 100 >= i64::from(setup.requested_max_tokens) * 95
+    {
+        return true;
+    }
+
+    setup.partial_stream_recovery_enabled
+        && round_credits.abs() < f64::EPSILON
+        && semantic_started_at.is_some_and(|started| {
+            started.elapsed()
+                <= Duration::from_millis(setup.partial_stream_recovery_window_ms.max(100))
+        })
+        && is_incomplete_text_ending(ctx.accumulated_text())
+}
+
+struct ContinuationReadResult {
+    termination: AttemptTermination,
+    credential_id: u64,
+    received_bytes: u64,
+    semantic_started_at: Option<TokioInstant>,
+}
+
+async fn read_continuation_round(
+    call_result: crate::kiro::provider::KiroCallResult,
+    ctx: &mut StreamContext,
+    probation: &mut ProbationBuffer,
+    tracer: &RequestTracer,
+    idle_timeout_secs: u64,
+    sender: &tokio::sync::mpsc::Sender<Result<Bytes, Infallible>>,
+    start_tx: &mut Option<tokio::sync::oneshot::Sender<StreamStart>>,
+    continuation_round: u32,
+) -> ContinuationReadResult {
+    let credential_id = call_result.credential_id;
+    let mut body_stream = Box::pin(call_result.response.bytes_stream());
+    let mut decoder = EventStreamDecoder::new();
+    let mut ping_interval = interval(Duration::from_secs(PING_INTERVAL_SECS));
+    let mut received_bytes = 0_u64;
+    let mut semantic_started_at = None;
+    let mut idle_deadline = TokioInstant::now() + Duration::from_secs(idle_timeout_secs.max(1));
+
+    let termination = loop {
+        let idle_fut = async {
+            if idle_timeout_secs == 0 {
+                std::future::pending::<()>().await;
+            } else {
+                tokio::time::sleep_until(idle_deadline).await;
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = sender.closed() => break AttemptTermination::ClientClosed,
+            chunk_result = body_stream.next() => match chunk_result {
+                Some(Ok(chunk)) => {
+                    tracer.record_stream_chunk(&chunk);
+                    received_bytes += chunk.len() as u64;
+                    idle_deadline = TokioInstant::now() + Duration::from_secs(idle_timeout_secs.max(1));
+                    if let Err(error) = decoder.feed(&chunk) {
+                        tracing::warn!(%error, continuation_round, "续写流解码缓冲区溢出");
+                        tracer.record_protocol_error("sse_state_error", &error.to_string());
+                    }
+                    let mut events = Vec::new();
+                    for result in decoder.decode_iter() {
+                        match result {
+                            Ok(frame) => match Event::from_frame(frame) {
+                                Ok(event) => events.extend(ctx.process_kiro_event(&event)),
+                                Err(error) => {
+                                    tracing::warn!(%error, continuation_round, "续写流事件解码失败");
+                                    tracer.record_protocol_error("sse_state_error", &error.to_string());
+                                }
+                            },
+                            Err(error) => {
+                                tracing::warn!(%error, continuation_round, "续写流 frame 解码失败");
+                                tracer.record_protocol_error("sse_state_error", &error.to_string());
+                            }
+                        }
+                    }
+                    if semantic_started_at.is_none() && events.iter().any(is_client_visible_content) {
+                        semantic_started_at = Some(TokioInstant::now());
+                    }
+                    let visible = probation.push_all(events);
+                    if !send_sse_events(sender, tracer, visible, start_tx).await {
+                        break AttemptTermination::ClientClosed;
+                    }
+                    if ctx.repetition_guard_tripped() {
+                        tracer.record_protocol_error(
+                            "upstream_repetition_guard",
+                            "repeated upstream output was truncated",
+                        );
+                        break AttemptTermination::Eof;
+                    }
+                }
+                Some(Err(error)) => {
+                    tracer.record_protocol_error("stream_read_error", &error.to_string());
+                    break AttemptTermination::ReadError(error.to_string());
+                }
+                None => break AttemptTermination::Eof,
+            },
+            _ = ping_interval.tick() => {
+                if sender.send(Ok(create_ping_sse())).await.is_err() {
+                    break AttemptTermination::ClientClosed;
+                }
+            }
+            _ = idle_fut => {
+                tracer.record_protocol_error(
+                    "stream_idle_timeout",
+                    &format!("stream idle timeout after {idle_timeout_secs}s"),
+                );
+                break AttemptTermination::IdleTimeout;
+            }
+        }
+    };
+
+    let overlap_events = ctx.flush_continuation_overlap();
+    if !overlap_events.is_empty() {
+        if semantic_started_at.is_none() {
+            semantic_started_at = Some(TokioInstant::now());
+        }
+        let visible = probation.push_all(overlap_events);
+        if !send_sse_events(sender, tracer, visible, start_tx).await {
+            return ContinuationReadResult {
+                termination: AttemptTermination::ClientClosed,
+                credential_id,
+                received_bytes,
+                semantic_started_at,
+            };
+        }
+    }
+
+    ContinuationReadResult {
+        termination,
+        credential_id,
+        received_bytes,
+        semantic_started_at,
+    }
+}
+
 async fn run_realtime_sse_attempts(
     first_call: crate::kiro::provider::KiroCallResult,
     setup: StreamAttemptSetup,
@@ -3251,7 +3611,7 @@ async fn run_realtime_sse_attempts(
                 }
             }
         };
-        let credential_id = call_result.credential_id;
+        let mut credential_id = call_result.credential_id;
         let mut body_stream = Box::pin(call_result.response.bytes_stream());
         let mut ctx = setup.new_context();
         let mut probation = ProbationBuffer::default();
@@ -3263,9 +3623,10 @@ async fn run_realtime_sse_attempts(
         let mut decoder = EventStreamDecoder::new();
         let mut ping_interval = interval(Duration::from_secs(PING_INTERVAL_SECS));
         let mut received_bytes = 0_u64;
+        let mut semantic_started_at = None;
         let mut idle_deadline = TokioInstant::now() + Duration::from_secs(idle_timeout_secs.max(1));
 
-        let termination = loop {
+        let mut termination = loop {
             let idle_fut = async {
                 if idle_timeout_secs == 0 {
                     std::future::pending::<()>().await;
@@ -3305,6 +3666,11 @@ async fn run_realtime_sse_attempts(
                                     tracer.record_protocol_error("sse_state_error", &error.to_string());
                                 }
                             }
+                        }
+                        if semantic_started_at.is_none()
+                            && events.iter().any(is_client_visible_content)
+                        {
+                            semantic_started_at = Some(TokioInstant::now());
                         }
                         let visible = probation.push_all(events);
                         if !send_sse_events(&sender, tracer.as_ref(), visible, &mut start_tx).await {
@@ -3374,7 +3740,9 @@ async fn run_realtime_sse_attempts(
         }
 
         let final_events = ctx.generate_final_events_for(&termination);
-        let visible = probation.push_all(final_events);
+        let mut visible = probation.push_all(final_events);
+        let mut round_credits = ctx.credits;
+        let mut round_output_tokens = ctx.output_tokens;
         let attempt_failure = ctx.terminal_attempt_failure().cloned();
         if let Some(super::tool_attempt::AttemptFailure::InvalidToolSchema { failure }) =
             &attempt_failure
@@ -3433,7 +3801,112 @@ async fn run_realtime_sse_attempts(
             }
         }
 
-        let mut visible = visible;
+        let mut continuation_count = 0_u32;
+        while should_auto_continue_round(
+            &setup,
+            &ctx,
+            &termination,
+            continuation_count,
+            semantic_started_at,
+            round_credits,
+            round_output_tokens,
+        ) {
+            let Some(continuation_body) =
+                prepare_auto_continue_request_body(&setup.request_body, ctx.accumulated_text())
+            else {
+                break;
+            };
+
+            visible
+                .retain(|event| !matches!(event.event.as_str(), "message_delta" | "message_stop"));
+            visible.extend(probation.take_pending());
+            if !send_sse_events(&sender, tracer.as_ref(), visible, &mut start_tx).await {
+                finalize_realtime_client_disconnected(
+                    &hook,
+                    tracer.as_ref(),
+                    &ctx,
+                    credential_id,
+                    received_bytes,
+                );
+                return;
+            }
+
+            continuation_count += 1;
+            tracing::warn!(
+                continuation_count,
+                max_rounds = setup.auto_continue_max,
+                stop_reason = %ctx.current_stop_reason(),
+                "纯文本响应触发自动续写"
+            );
+            ctx.prepare_for_continuation();
+            ctx.begin_continuation();
+            let credits_before = ctx.credits;
+            let output_tokens_before = ctx.output_tokens;
+            let next_call = tokio::select! {
+                biased;
+                _ = sender.closed() => {
+                    finalize_realtime_client_disconnected(
+                        &hook,
+                        tracer.as_ref(),
+                        &ctx,
+                        credential_id,
+                        received_bytes,
+                    );
+                    return;
+                },
+                result = setup.call_retry(&continuation_body, tracer.as_ref()) => result,
+            };
+            let next_call = match next_call {
+                Ok(call) => call,
+                Err(error) => {
+                    let message = error.to_string();
+                    record_stream_usage(&hook, &ctx, credential_id, "error");
+                    tracer.finalize(
+                        "interrupted",
+                        Some("auto_continue_upstream_error"),
+                        Some(&message),
+                        Some(received_bytes),
+                        stream_trace_usage(&ctx),
+                    );
+                    let _ = sender
+                        .send(Ok(provider_error_sse(error, tracer.last_http_status())))
+                        .await;
+                    return;
+                }
+            };
+
+            let read = read_continuation_round(
+                next_call,
+                &mut ctx,
+                &mut probation,
+                tracer.as_ref(),
+                idle_timeout_secs,
+                &sender,
+                &mut start_tx,
+                continuation_count,
+            )
+            .await;
+            credential_id = read.credential_id;
+            received_bytes = received_bytes.saturating_add(read.received_bytes);
+            semantic_started_at = read.semantic_started_at;
+            termination = read.termination;
+            round_credits = (ctx.credits - credits_before).max(0.0);
+            round_output_tokens = ctx.output_tokens.saturating_sub(output_tokens_before);
+
+            if matches!(termination, AttemptTermination::ClientClosed) {
+                finalize_realtime_client_disconnected(
+                    &hook,
+                    tracer.as_ref(),
+                    &ctx,
+                    credential_id,
+                    received_bytes,
+                );
+                return;
+            }
+
+            visible = probation.push_all(ctx.generate_final_events_for(&termination));
+        }
+
         visible.extend(probation.take_pending());
         if !send_sse_events(&sender, tracer.as_ref(), visible, &mut start_tx).await {
             finalize_realtime_client_disconnected(
@@ -3447,7 +3920,16 @@ async fn run_realtime_sse_attempts(
         }
         match termination {
             AttemptTermination::Eof => {
-                if let Some(message) = ctx.terminal_error_message() {
+                if ctx.repetition_guard_tripped() {
+                    record_stream_usage(&hook, &ctx, credential_id, "error");
+                    tracer.finalize(
+                        "interrupted",
+                        Some("upstream_repetition_guard"),
+                        Some("Repeated upstream output was truncated"),
+                        Some(received_bytes),
+                        stream_trace_usage(&ctx),
+                    );
+                } else if let Some(message) = ctx.terminal_error_message() {
                     record_stream_usage(&hook, &ctx, credential_id, "error");
                     tracer.finalize(
                         "error",
@@ -4933,6 +5415,7 @@ async fn handle_stream_request_buffered(
         threshold_retry_body: threshold_retry_body.map(str::to_owned),
         model: model.to_owned(),
         input_tokens: fallback_input_tokens,
+        requested_max_tokens: 0,
         context_window_size,
         thinking_enabled,
         tool_name_map,
@@ -4943,6 +5426,10 @@ async fn handle_stream_request_buffered(
         group,
         identity_normalization,
         strict_thinking_validation: provider.strict_thinking_validation(),
+        auto_continue_enabled: provider.auto_continue_enabled(),
+        auto_continue_max: provider.auto_continue_max(),
+        partial_stream_recovery_enabled: provider.partial_stream_recovery_enabled(),
+        partial_stream_recovery_window_ms: provider.partial_stream_recovery_window_ms(),
     };
 
     // 创建缓冲 SSE 流
@@ -5410,19 +5897,13 @@ mod tests {
 
     #[test]
     fn usage_hook_carries_request_trace_id() {
-        let dir = std::env::temp_dir().join(format!(
-            "kiro-rs-usage-hook-{}",
-            Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir().join(format!("kiro-rs-usage-hook-{}", Uuid::new_v4()));
         let recorder = Arc::new(crate::admin::usage_stats::UsageRecorder::with_retention(
             dir.clone(),
             1,
         ));
-        let state = AppState::new(
-            false,
-            crate::model::config::ToolCompatibilityMode::Raw,
-        )
-        .with_usage(None, Some(recorder.clone()), None);
+        let state = AppState::new(false, crate::model::config::ToolCompatibilityMode::Raw)
+            .with_usage(None, Some(recorder.clone()), None);
         let key_ctx = KeyContext {
             key_id: 7,
             group: None,
@@ -5443,7 +5924,10 @@ mod tests {
         let now = Utc::now().timestamp();
         let result = recorder.query_range(now - 5, now + 5).unwrap();
         assert_eq!(result.records.len(), 1);
-        assert_eq!(result.records[0].trace_id.as_deref(), Some(trace_id.as_str()));
+        assert_eq!(
+            result.records[0].trace_id.as_deref(),
+            Some(trace_id.as_str())
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }

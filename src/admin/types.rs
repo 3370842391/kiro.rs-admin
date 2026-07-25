@@ -719,6 +719,14 @@ pub struct EndpointChainsResponse {
     pub max_bucket_attempts_per_request: usize,
     /// 流式空闲超时（秒，0 = 关闭）。上游返回 200 后连续该秒数无字节即主动收尾。
     pub stream_idle_timeout_secs: u64,
+    /// 纯文本响应截断后自动续写。
+    pub auto_continue_enabled: bool,
+    /// 单条响应最大自动续写轮数。
+    pub auto_continue_max: u32,
+    /// 可疑半截流自动恢复。
+    pub partial_stream_recovery_enabled: bool,
+    /// 首个语义输出后的半截流判定窗口（毫秒）。
+    pub partial_stream_recovery_window_ms: u64,
 }
 
 /// 更新 429 降级桶链配置
@@ -735,6 +743,14 @@ pub struct SetEndpointChainsRequest {
     /// 流式空闲超时（秒，0 = 关闭）；省略则不改。
     #[serde(default)]
     pub stream_idle_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub auto_continue_enabled: Option<bool>,
+    #[serde(default)]
+    pub auto_continue_max: Option<u32>,
+    #[serde(default)]
+    pub partial_stream_recovery_enabled: Option<bool>,
+    #[serde(default)]
+    pub partial_stream_recovery_window_ms: Option<u64>,
 }
 
 /// 全局端点运行模式。

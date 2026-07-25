@@ -58,6 +58,10 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
   const [draft, setDraft] = useState<Record<string, string[]>>({})
   const [maxAttempts, setMaxAttempts] = useState<number>(6)
   const [idleTimeout, setIdleTimeout] = useState<number>(120)
+  const [autoContinue, setAutoContinue] = useState(false)
+  const [autoContinueMax, setAutoContinueMax] = useState(3)
+  const [partialRecovery, setPartialRecovery] = useState(false)
+  const [partialWindowMs, setPartialWindowMs] = useState(750)
 
   // 载入服务端当前值到编辑态
   useEffect(() => {
@@ -65,6 +69,10 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
     setDraft(JSON.parse(JSON.stringify(data.chains)))
     setMaxAttempts(data.maxBucketAttemptsPerRequest)
     setIdleTimeout(data.streamIdleTimeoutSecs)
+    setAutoContinue(data.autoContinueEnabled)
+    setAutoContinueMax(data.autoContinueMax)
+    setPartialRecovery(data.partialStreamRecoveryEnabled)
+    setPartialWindowMs(data.partialStreamRecoveryWindowMs)
   }, [data])
 
   const primaries = useMemo(
@@ -100,7 +108,15 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
 
   const handleSave = () => {
     save(
-      { chains: draft, maxBucketAttemptsPerRequest: maxAttempts, streamIdleTimeoutSecs: idleTimeout },
+      {
+        chains: draft,
+        maxBucketAttemptsPerRequest: maxAttempts,
+        streamIdleTimeoutSecs: idleTimeout,
+        autoContinueEnabled: autoContinue,
+        autoContinueMax,
+        partialStreamRecoveryEnabled: partialRecovery,
+        partialStreamRecoveryWindowMs: partialWindowMs,
+      },
       {
         onSuccess: () => {
           toast.success('降级桶链已保存')
@@ -276,6 +292,69 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
               />
               <span className="text-xs text-muted-foreground">上游 200 后连续无字节多久主动收尾；0 = 关闭（仅靠绝对超时兜底）</span>
             </label>
+
+            <div className="space-y-3 border-t pt-4">
+              <div>
+                <div className="text-sm font-medium">流式自动恢复</div>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  默认关闭。开启后纯文本截断会自动请求续写，可能增加上游调用次数、总耗时和费用；
+                  不会续写工具调用、空流、复读熔断或显式错误。
+                </p>
+              </div>
+              <div className="flex flex-col gap-2 text-sm sm:flex-row sm:flex-wrap sm:items-center sm:gap-3">
+                <label className="flex min-h-8 items-center gap-2">
+                  <Checkbox
+                    checked={autoContinue}
+                    onCheckedChange={(checked) => setAutoContinue(checked === true)}
+                  />
+                  <span>启用纯文本自动续写</span>
+                </label>
+                <label className="flex items-center gap-2">
+                  <span className="text-xs text-muted-foreground">最大轮数</span>
+                  <Input
+                    type="number"
+                    min={0}
+                    max={10}
+                    value={autoContinueMax}
+                    onChange={(event) => setAutoContinueMax(
+                      Math.min(10, Math.max(0, Number(event.target.value) || 0)),
+                    )}
+                    className="h-8 w-20"
+                    disabled={!autoContinue}
+                  />
+                  <span className="text-xs text-muted-foreground">0–10</span>
+                </label>
+              </div>
+              <div className="flex flex-col gap-2 text-sm sm:flex-row sm:flex-wrap sm:items-center sm:gap-3">
+                <label className="flex min-h-8 items-center gap-2">
+                  <Checkbox
+                    checked={partialRecovery}
+                    onCheckedChange={(checked) => setPartialRecovery(checked === true)}
+                    disabled={!autoContinue}
+                  />
+                  <span>恢复可疑半截流</span>
+                </label>
+                <label className="flex items-center gap-2">
+                  <span className="text-xs text-muted-foreground">判定窗口</span>
+                  <Input
+                    type="number"
+                    min={100}
+                    max={10000}
+                    step={50}
+                    value={partialWindowMs}
+                    onChange={(event) => setPartialWindowMs(
+                      Math.min(10000, Math.max(100, Number(event.target.value) || 750)),
+                    )}
+                    className="h-8 w-24"
+                    disabled={!autoContinue || !partialRecovery}
+                  />
+                  <span className="text-xs text-muted-foreground">毫秒</span>
+                </label>
+                <span className="text-xs text-muted-foreground">
+                  可能误判正常短答，建议从 750 开始灰度
+                </span>
+              </div>
+            </div>
           </div>
         )}
 

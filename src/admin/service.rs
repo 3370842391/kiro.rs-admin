@@ -1023,9 +1023,7 @@ impl AdminService {
     ) -> Result<crate::admin::usage_stats::UsageRangeRead, AdminServiceError> {
         self.usage_recorder
             .as_ref()
-            .ok_or_else(|| {
-                AdminServiceError::InternalError("usage 计费账本未启用".to_string())
-            })?
+            .ok_or_else(|| AdminServiceError::InternalError("usage 计费账本未启用".to_string()))?
             .query_range(start_epoch, end_epoch)
             .map_err(|error| {
                 AdminServiceError::InternalError(format!("读取 usage 计费账本失败: {error}"))
@@ -2915,6 +2913,12 @@ impl AdminService {
             available_buckets,
             max_bucket_attempts_per_request: self.token_manager.max_bucket_attempts_per_request(),
             stream_idle_timeout_secs: self.token_manager.get_stream_idle_timeout_secs(),
+            auto_continue_enabled: self.token_manager.auto_continue_enabled(),
+            auto_continue_max: self.token_manager.auto_continue_max(),
+            partial_stream_recovery_enabled: self.token_manager.partial_stream_recovery_enabled(),
+            partial_stream_recovery_window_ms: self
+                .token_manager
+                .partial_stream_recovery_window_ms(),
         })
     }
 
@@ -2993,6 +2997,25 @@ impl AdminService {
         if let Some(secs) = req.stream_idle_timeout_secs {
             self.token_manager
                 .set_stream_idle_timeout_secs(secs)
+                .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+        }
+
+        if req.auto_continue_enabled.is_some()
+            || req.auto_continue_max.is_some()
+            || req.partial_stream_recovery_enabled.is_some()
+            || req.partial_stream_recovery_window_ms.is_some()
+        {
+            self.token_manager
+                .set_auto_continue_config(
+                    req.auto_continue_enabled
+                        .unwrap_or_else(|| self.token_manager.auto_continue_enabled()),
+                    req.auto_continue_max
+                        .unwrap_or_else(|| self.token_manager.auto_continue_max()),
+                    req.partial_stream_recovery_enabled
+                        .unwrap_or_else(|| self.token_manager.partial_stream_recovery_enabled()),
+                    req.partial_stream_recovery_window_ms
+                        .unwrap_or_else(|| self.token_manager.partial_stream_recovery_window_ms()),
+                )
                 .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
         }
 
@@ -4970,10 +4993,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_usage_records_reads_injected_ledger() {
-        let dir = std::env::temp_dir().join(format!(
-            "kiro-rs-profit-service-{}",
-            Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir().join(format!("kiro-rs-profit-service-{}", Uuid::new_v4()));
         let recorder = Arc::new(crate::admin::usage_stats::UsageRecorder::with_retention(
             dir.clone(),
             1,
@@ -4998,7 +5018,10 @@ mod tests {
         let result = service.query_usage_records(now - 5, now + 5).unwrap();
 
         assert_eq!(result.records.len(), 1);
-        assert_eq!(result.records[0].trace_id.as_deref(), Some("profit-service-trace"));
+        assert_eq!(
+            result.records[0].trace_id.as_deref(),
+            Some("profit-service-trace")
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

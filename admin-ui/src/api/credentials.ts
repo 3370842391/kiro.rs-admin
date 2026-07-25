@@ -539,12 +539,20 @@ export interface EndpointChainsConfig {
   availableBuckets: Record<string, EndpointBucketOption[]>
   maxBucketAttemptsPerRequest: number
   streamIdleTimeoutSecs: number
+  autoContinueEnabled: boolean
+  autoContinueMax: number
+  partialStreamRecoveryEnabled: boolean
+  partialStreamRecoveryWindowMs: number
 }
 
 export interface SetEndpointChainsRequest {
   chains?: Record<string, string[]> | null
   maxBucketAttemptsPerRequest?: number
   streamIdleTimeoutSecs?: number
+  autoContinueEnabled?: boolean
+  autoContinueMax?: number
+  partialStreamRecoveryEnabled?: boolean
+  partialStreamRecoveryWindowMs?: number
 }
 
 export async function getEndpointChains(): Promise<EndpointChainsConfig> {

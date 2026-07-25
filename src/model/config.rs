@@ -511,6 +511,23 @@ pub struct Config {
     #[serde(default)]
     pub early_stream_handshake: bool,
 
+    /// 纯文本响应因 `max_tokens` 截断时是否自动向 Kiro 发起续写。
+    /// 默认关闭；开启后可能增加上游调用次数、总耗时和计费。
+    #[serde(default)]
+    pub auto_continue_enabled: bool,
+
+    /// 单条响应最多自动续写的轮数。仅在 `auto_continue_enabled` 开启时生效。
+    #[serde(default = "default_auto_continue_max")]
+    pub auto_continue_max: u32,
+
+    /// 对“已输出少量正文后过早 EOF”的流启用自动恢复。默认关闭，避免误判正常短答。
+    #[serde(default)]
+    pub partial_stream_recovery_enabled: bool,
+
+    /// 首个语义输出后多快结束才视为可疑半截流（毫秒）。
+    #[serde(default = "default_partial_stream_recovery_window_ms")]
+    pub partial_stream_recovery_window_ms: u64,
+
     /// 身份归一化：把 Kiro 网关注入的品牌自述（"I'm Kiro" / "made by AWS"）改写回
     /// Claude / Anthropic。默认 true（开启）——底层本就是真实 Claude 模型，用户已授权
     /// 还原对外身份一致性以通过验真检测。设 false 保留上游原始品牌措辞。见 anthropic::identity。
@@ -725,6 +742,14 @@ fn default_stream_idle_timeout_secs() -> u64 {
     120
 }
 
+fn default_auto_continue_max() -> u32 {
+    3
+}
+
+fn default_partial_stream_recovery_window_ms() -> u64 {
+    750
+}
+
 fn default_max_bucket_attempts_per_request() -> usize {
     6
 }
@@ -850,6 +875,10 @@ impl Default for Config {
             error_snapshot_min_free_disk_gb: default_error_snapshot_min_free_disk_gb(),
             stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
             early_stream_handshake: false,
+            auto_continue_enabled: false,
+            auto_continue_max: default_auto_continue_max(),
+            partial_stream_recovery_enabled: false,
+            partial_stream_recovery_window_ms: default_partial_stream_recovery_window_ms(),
             identity_normalization: true,
             endpoint_chains: None,
             max_bucket_attempts_per_request: default_max_bucket_attempts_per_request(),
@@ -1172,6 +1201,23 @@ mod tests {
     fn early_stream_handshake_accepts_camel_case_json() {
         let config: Config = serde_json::from_str(r#"{"earlyStreamHandshake":true}"#).unwrap();
         assert!(config.early_stream_handshake);
+    }
+
+    #[test]
+    fn auto_continue_defaults_off_with_three_round_limit() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(!config.auto_continue_enabled);
+        assert_eq!(config.auto_continue_max, 3);
+        assert!(!config.partial_stream_recovery_enabled);
+        assert_eq!(config.partial_stream_recovery_window_ms, 750);
+    }
+
+    #[test]
+    fn auto_continue_accepts_camel_case_json() {
+        let config: Config =
+            serde_json::from_str(r#"{"autoContinueEnabled":true,"autoContinueMax":2}"#).unwrap();
+        assert!(config.auto_continue_enabled);
+        assert_eq!(config.auto_continue_max, 2);
     }
 
     #[test]
