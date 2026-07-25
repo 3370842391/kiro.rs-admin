@@ -2,9 +2,10 @@
 //!
 //! 实现 Kiro → Anthropic 流式响应转换和 SSE 状态管理
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::kiro::model::events::Event;
@@ -579,6 +580,143 @@ const REPEAT_GUARD_TRIP_THRESHOLD: u32 = 16;
 const REPEAT_GUARD_THINKING_TRIP_THRESHOLD: u32 = 4;
 /// 只对短候选做连续比较，避免复制和比较超大正文。
 const REPEAT_GUARD_MAX_UNIT_BYTES: usize = 512;
+/// 多行周期最多覆盖 8 行；截图中的 `user/assist` 退化循环周期为 4 行。
+const REPEAT_GUARD_MAX_PERIOD: usize = 8;
+/// 至少观察 16 个重复行，避免正常短列表或强调段落触发熔断。
+const REPEAT_GUARD_MIN_PERIODIC_LINES: usize = 16;
+/// 长周期至少完整重复 4 轮才判定退化。
+const REPEAT_GUARD_MIN_PERIODIC_CYCLES: usize = 4;
+/// 8 行周期乘 4 轮；固定上限避免按输出长度增长内存。
+const REPEAT_GUARD_PERIODIC_HISTORY: usize =
+    REPEAT_GUARD_MAX_PERIOD * REPEAT_GUARD_MIN_PERIODIC_CYCLES;
+const LONG_THINKING_DEDUP_MIN_BYTES: usize = 256;
+const LONG_THINKING_DEDUP_MAX_BYTES: usize = 64 * 1024;
+const LONG_THINKING_DEDUP_HISTORY: usize = 4;
+
+#[derive(Debug, Clone, Copy)]
+struct PeriodicRepeatMatch {
+    period: usize,
+    cycles: usize,
+}
+
+#[derive(Debug, Default)]
+struct PeriodicRepeatGuard {
+    channel: &'static str,
+    recent_lines: VecDeque<String>,
+    partial_line: String,
+    partial_oversized: bool,
+    code_fence_marker: Option<char>,
+}
+
+impl PeriodicRepeatGuard {
+    fn reset_for_channel(&mut self, channel: &'static str) {
+        self.channel = channel;
+        self.recent_lines.clear();
+        self.partial_line.clear();
+        self.partial_oversized = false;
+        self.code_fence_marker = None;
+    }
+
+    fn observe_segment(
+        &mut self,
+        segment: &str,
+        channel: &'static str,
+    ) -> Option<PeriodicRepeatMatch> {
+        if self.channel != channel {
+            self.reset_for_channel(channel);
+        }
+
+        let complete = segment.ends_with('\n');
+        let body = segment.strip_suffix('\n').unwrap_or(segment);
+        let body = body.strip_suffix('\r').unwrap_or(body);
+
+        if !self.partial_oversized {
+            if self.partial_line.len().saturating_add(body.len()) <= REPEAT_GUARD_MAX_UNIT_BYTES {
+                self.partial_line.push_str(body);
+            } else {
+                self.partial_line.clear();
+                self.partial_oversized = true;
+                self.recent_lines.clear();
+            }
+        }
+
+        if !complete {
+            return None;
+        }
+        if self.partial_oversized {
+            self.partial_line.clear();
+            self.partial_oversized = false;
+            return None;
+        }
+
+        let line = std::mem::take(&mut self.partial_line)
+            .trim_end()
+            .to_string();
+        let trimmed = line.trim_start();
+        let fence = if trimmed.starts_with("```") {
+            Some('`')
+        } else if trimmed.starts_with("~~~") {
+            Some('~')
+        } else {
+            None
+        };
+        if let Some(marker) = fence {
+            match self.code_fence_marker {
+                Some(open) if open == marker => self.code_fence_marker = None,
+                None => self.code_fence_marker = Some(marker),
+                _ => {}
+            }
+            self.recent_lines.clear();
+            return None;
+        }
+        if self.code_fence_marker.is_some() {
+            self.recent_lines.clear();
+            return None;
+        }
+        if line.is_empty() {
+            return None;
+        }
+
+        self.recent_lines.push_back(line);
+        while self.recent_lines.len() > REPEAT_GUARD_PERIODIC_HISTORY {
+            self.recent_lines.pop_front();
+        }
+        self.detect_suffix_cycle()
+    }
+
+    fn detect_suffix_cycle(&self) -> Option<PeriodicRepeatMatch> {
+        let lines: Vec<&String> = self.recent_lines.iter().collect();
+        for period in 2..=REPEAT_GUARD_MAX_PERIOD {
+            let cycles = REPEAT_GUARD_MIN_PERIODIC_CYCLES
+                .max(REPEAT_GUARD_MIN_PERIODIC_LINES.div_ceil(period));
+            let required = period * cycles;
+            if lines.len() < required {
+                continue;
+            }
+            let suffix = &lines[lines.len() - required..];
+            let pattern = &suffix[..period];
+            if pattern.iter().all(|line| line == &pattern[0]) {
+                continue;
+            }
+            let alpha_numeric = pattern
+                .iter()
+                .flat_map(|line| line.chars())
+                .filter(|ch| ch.is_alphanumeric())
+                .count();
+            if alpha_numeric < 8 {
+                continue;
+            }
+            if suffix
+                .iter()
+                .enumerate()
+                .all(|(index, line)| line == &pattern[index % period])
+            {
+                return Some(PeriodicRepeatMatch { period, cycles });
+            }
+        }
+        None
+    }
+}
 
 /// 块级复读折叠：对「已完整的整段文本」做一次性复读熔断。
 ///
@@ -1592,8 +1730,12 @@ pub struct StreamContext {
     repeat_guard_last_line: String,
     /// 复读熔断：当前尾行已连续重复的次数。
     repeat_guard_run: u32,
+    /// 多行周期复读检测；只保存少量完整短行，不保存整段响应。
+    repeat_guard_periodic: PeriodicRepeatGuard,
     /// 复读熔断：是否已经触发过熔断（触发后本轮后续文本一律丢弃，不再吐、不写历史）。
     repeat_guard_tripped: bool,
+    /// 同一上游流内最近长 Thinking delta 的定长指纹，用于跨事件来源精确抑制完整重放。
+    long_thinking_fingerprints: VecDeque<(usize, [u8; 32])>,
     /// 工具调用参数 JSON 累积器：按 tool_use_id 缓冲分片，`stop` 时整体解析，
     /// 避免把“流式半截 JSON”当成完整工具调用转发。
     tool_json_accumulator: ToolJsonAccumulator,
@@ -1757,6 +1899,12 @@ impl StreamContext {
         self.thinking_extracted = false;
         self.thinking_buffer.clear();
         self.invoke_sniff_buffer.clear();
+        self.repeat_guard_last_channel = "";
+        self.repeat_guard_last_line.clear();
+        self.repeat_guard_run = 0;
+        self.repeat_guard_periodic = PeriodicRepeatGuard::default();
+        self.repeat_guard_tripped = false;
+        self.long_thinking_fingerprints.clear();
         self.tool_json_accumulator = ToolJsonAccumulator::new();
         self.tool_json_error = None;
         self.tool_use_xml_filter = ToolUseXmlLeakFilter::default();
@@ -1835,7 +1983,9 @@ impl StreamContext {
             repeat_guard_last_channel: "",
             repeat_guard_last_line: String::new(),
             repeat_guard_run: 0,
+            repeat_guard_periodic: PeriodicRepeatGuard::default(),
             repeat_guard_tripped: false,
+            long_thinking_fingerprints: VecDeque::new(),
             tool_json_accumulator: ToolJsonAccumulator::new(),
             tool_json_error: None,
             tool_use_xml_filter: ToolUseXmlLeakFilter::default(),
@@ -2426,13 +2576,24 @@ impl StreamContext {
                     );
                     return kept;
                 }
-                kept.push_str(segment);
             } else {
                 self.repeat_guard_last_channel = channel;
                 self.repeat_guard_last_line.clear();
                 self.repeat_guard_run = 0;
-                kept.push_str(segment);
             }
+
+            if let Some(cycle) = self.repeat_guard_periodic.observe_segment(segment, channel) {
+                self.repeat_guard_tripped = true;
+                tracing::warn!(
+                    message_id = %self.message_id,
+                    channel = %channel,
+                    period_lines = cycle.period,
+                    cycle_count = cycle.cycles,
+                    "upstream periodic repetition guard tripped"
+                );
+                return kept;
+            }
+            kept.push_str(segment);
         }
         kept
     }
@@ -2615,10 +2776,18 @@ impl StreamContext {
             && !text.is_empty()
         {
             self.output_tokens += estimate_tokens(text);
-            events.extend(self.ensure_thinking_block());
-            if let Some(idx) = self.thinking_block_index {
-                if let Some(event) = self.create_guarded_thinking_delta_event(idx, text) {
-                    events.push(event);
+            if self.has_seen_long_thinking(text) {
+                tracing::warn!(
+                    message_id = %self.message_id,
+                    event_bytes = text.len(),
+                    "suppressed exact duplicate native reasoning event"
+                );
+            } else {
+                events.extend(self.ensure_thinking_block());
+                if let Some(idx) = self.thinking_block_index {
+                    if let Some(event) = self.create_guarded_thinking_delta_event(idx, text) {
+                        events.push(event);
+                    }
                 }
             }
         }
@@ -2632,6 +2801,40 @@ impl StreamContext {
         }
 
         events
+    }
+
+    fn long_thinking_fingerprint(text: &str) -> Option<(usize, [u8; 32])> {
+        if !(LONG_THINKING_DEDUP_MIN_BYTES..=LONG_THINKING_DEDUP_MAX_BYTES).contains(&text.len()) {
+            return None;
+        }
+
+        let digest: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+        Some((text.len(), digest))
+    }
+
+    fn has_seen_long_thinking(&self, text: &str) -> bool {
+        Self::long_thinking_fingerprint(text)
+            .is_some_and(|fingerprint| self.long_thinking_fingerprints.contains(&fingerprint))
+    }
+
+    fn remember_long_thinking(&mut self, text: &str) -> bool {
+        let Some(fingerprint) = Self::long_thinking_fingerprint(text) else {
+            return false;
+        };
+        if self.long_thinking_fingerprints.contains(&fingerprint) {
+            tracing::warn!(
+                message_id = %self.message_id,
+                event_bytes = text.len(),
+                "suppressed exact duplicate long thinking delta"
+            );
+            return true;
+        }
+
+        self.long_thinking_fingerprints.push_back(fingerprint);
+        while self.long_thinking_fingerprints.len() > LONG_THINKING_DEDUP_HISTORY {
+            self.long_thinking_fingerprints.pop_front();
+        }
+        false
     }
 
     fn create_redacted_thinking_events(&mut self, data: &str) -> Vec<SseEvent> {
@@ -2666,6 +2869,9 @@ impl StreamContext {
     ) -> Option<SseEvent> {
         if thinking.is_empty() {
             return Some(self.create_thinking_delta_event(index, ""));
+        }
+        if self.remember_long_thinking(thinking) {
+            return None;
         }
         let kept = self.repeat_guard_filter(thinking, "thinking");
         if kept.is_empty() {
@@ -6754,6 +6960,85 @@ mod tests {
     }
 
     #[test]
+    fn repeat_guard_trips_on_four_line_cycle_across_chunks() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let cycle = [
+            ("user", "继续\n"),
+            ("assistStill ", "down.\n"),
+            ("user", "继续\n"),
+            ("assistNo ", "change.\n"),
+        ];
+        let mut events = Vec::new();
+        for _ in 0..8 {
+            for (prefix, suffix) in cycle {
+                events.extend(ctx.process_assistant_response(prefix));
+                events.extend(ctx.process_assistant_response(suffix));
+            }
+        }
+        events.extend(ctx.generate_final_events());
+
+        assert!(
+            ctx.repetition_guard_tripped(),
+            "four-line upstream cycle must trip the repetition guard"
+        );
+        assert!(events.iter().any(|event| {
+            event.event == "error" && event.data["error"]["type"] == "upstream_repetition_guard"
+        }));
+        assert!(!events.iter().any(|event| event.event == "message_stop"));
+    }
+
+    #[test]
+    fn repeat_guard_preserves_short_cycle_and_fenced_code() {
+        let mut short = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = short.generate_initial_events();
+        let mut short_events = Vec::new();
+        for _ in 0..3 {
+            short_events.extend(short.process_assistant_response("alpha\nbeta\ngamma\ndelta\n"));
+        }
+        assert!(!short.repetition_guard_tripped());
+        assert_eq!(
+            collect_text_content(&short_events),
+            "alpha\nbeta\ngamma\ndelta\n".repeat(3)
+        );
+
+        let mut fenced = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = fenced.generate_initial_events();
+        let mut fenced_events = Vec::new();
+        fenced_events.extend(fenced.process_assistant_response("```text\n"));
+        for _ in 0..10 {
+            fenced_events.extend(fenced.process_assistant_response("alpha\nbeta\n"));
+        }
+        fenced_events.extend(fenced.process_assistant_response("```\n"));
+
+        assert!(!fenced.repetition_guard_tripped());
+        assert_eq!(
+            collect_text_content(&fenced_events)
+                .matches("alpha\nbeta\n")
+                .count(),
+            10
+        );
+    }
+
+    #[test]
     fn repeat_guard_trips_on_generic_brace_flood() {
         let mut ctx = StreamContext::new_with_thinking(
             "test-model",
@@ -6844,6 +7129,183 @@ mod tests {
             "thinking 复读应在第五次前停止，实际内容: {thinking:?}"
         );
         assert!(ctx.repetition_guard_tripped());
+    }
+
+    #[test]
+    fn native_reasoning_drops_exact_duplicate_long_event() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let reasoning = format!("{}\n", "inspect the built bundle carefully. ".repeat(16));
+        assert!(reasoning.len() >= 256);
+        let event = Event::ReasoningContent(crate::kiro::model::events::ReasoningContentEvent {
+            text: Some(reasoning.clone()),
+            signature: None,
+            redacted_content: None,
+        });
+
+        let mut events = ctx.process_kiro_event(&event);
+        events.extend(ctx.process_kiro_event(&event));
+
+        assert_eq!(collect_thinking_content(&events), reasoning);
+        assert!(!ctx.repetition_guard_tripped());
+    }
+
+    #[test]
+    fn long_reasoning_dedup_applies_across_assistant_and_native_sources() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let reasoning = "inspect the built bundle carefully. ".repeat(16);
+        let wrapped = format!("<thinking>\n{reasoning}</thinking>\n\n");
+
+        let mut events = ctx.process_assistant_response(&wrapped);
+        events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: Some(reasoning.clone()),
+                signature: None,
+                redacted_content: None,
+            },
+        )));
+        events.extend(ctx.process_kiro_event(&Event::ToolUse(tool_evt(
+            "tool_1",
+            "exec_command",
+            r#"{"cmd":"pwd"}"#,
+            true,
+        ))));
+        events.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_thinking_content(&events), reasoning);
+        let tools = collect_tool_uses(&events);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].0, "exec_command");
+        assert!(!events.iter().any(|event| event.event == "error"));
+    }
+
+    #[test]
+    fn native_reasoning_keeps_short_and_distinct_events() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let short = "same short fragment";
+        let long_a = "A".repeat(300);
+        let long_b = "B".repeat(300);
+        let mut events = Vec::new();
+        for text in [
+            short.to_string(),
+            short.to_string(),
+            long_a.clone(),
+            long_b.clone(),
+        ] {
+            events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+                crate::kiro::model::events::ReasoningContentEvent {
+                    text: Some(text),
+                    signature: None,
+                    redacted_content: None,
+                },
+            )));
+        }
+
+        assert_eq!(
+            collect_thinking_content(&events),
+            format!("{short}{short}{long_a}{long_b}")
+        );
+        assert!(!ctx.repetition_guard_tripped());
+    }
+
+    #[test]
+    fn native_reasoning_dedup_preserves_following_tool_use() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let reasoning = "inspect before calling the tool. ".repeat(16);
+        let event = Event::ReasoningContent(crate::kiro::model::events::ReasoningContentEvent {
+            text: Some(reasoning.clone()),
+            signature: None,
+            redacted_content: None,
+        });
+        let mut events = ctx.process_kiro_event(&event);
+        events.extend(ctx.process_kiro_event(&event));
+        events.extend(ctx.process_kiro_event(&Event::ToolUse(tool_evt(
+            "tool_1",
+            "exec_command",
+            r#"{"cmd":"pwd"}"#,
+            true,
+        ))));
+        events.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_thinking_content(&events), reasoning);
+        let tools = collect_tool_uses(&events);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].0, "exec_command");
+        assert!(!events.iter().any(|event| event.event == "error"));
+    }
+
+    #[test]
+    fn long_thinking_dedup_resets_at_continuation_boundary() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let reasoning = "repeatable reasoning in a separate upstream round. ".repeat(12);
+        let event = Event::ReasoningContent(crate::kiro::model::events::ReasoningContentEvent {
+            text: Some(reasoning.clone()),
+            signature: None,
+            redacted_content: None,
+        });
+
+        let mut events = ctx.process_kiro_event(&event);
+        let _ = ctx.generate_final_events();
+        ctx.prepare_for_continuation();
+        events.extend(ctx.process_kiro_event(&event));
+
+        assert_eq!(collect_thinking_content(&events), reasoning.repeat(2));
+    }
+
+    #[test]
+    fn periodic_repeat_guard_resets_at_continuation_boundary() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let cycle = "alpha item\nbeta item\ngamma item\ndelta item\n";
+
+        for _ in 0..3 {
+            let _ = ctx.repeat_guard_filter(cycle, "text");
+        }
+        ctx.prepare_for_continuation();
+        for _ in 0..3 {
+            let _ = ctx.repeat_guard_filter(cycle, "text");
+        }
+
+        assert!(!ctx.repetition_guard_tripped());
     }
 
     #[test]
