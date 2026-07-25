@@ -1149,10 +1149,12 @@ async fn handle_strict_json_request(
                     Ok(Some((recovery_body, stats))) => {
                         tracing::warn!(
                             retry_body_variant = "strict_json_empty_response_recovery",
+                            primary_body_bytes = body.len(),
                             retry_body_bytes = recovery_body.len(),
                             resized_history_images = stats.resized_history_images,
                             resized_current_images = stats.resized_current_images,
                             omitted_history_images = stats.omitted_history_images,
+                            truncated_tool_results = stats.truncated_tool_results,
                             "prepared strict JSON empty-response recovery body"
                         );
                         body = recovery_body;
@@ -2547,6 +2549,7 @@ fn prepare_retry_request_body(
                 Ok(Some((body, stats))) => {
                     tracing::warn!(
                         retry_body_variant = "empty_response_recovery",
+                        primary_body_bytes = request_body.len(),
                         retry_body_bytes = body.len(),
                         resized_history_images = stats.resized_history_images,
                         resized_current_images = stats.resized_current_images,

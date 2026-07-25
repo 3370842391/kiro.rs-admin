@@ -4,9 +4,12 @@ use crate::image_resize::{ResizeTarget, shrink_image_with_target};
 use crate::kiro::model::requests::{
     conversation::{KiroImage, Message},
     kiro::KiroRequest,
+    tool::ToolResult,
 };
 
 const EMPTY_RESPONSE_TOOL_RESULT_MAX_CHARS: usize = 512;
+const EMPTY_RESPONSE_HISTORY_TOOL_RESULT_MAX_CHARS: usize = 1_024;
+const EMPTY_RESPONSE_RECENT_HISTORY_TOOL_RESULTS_TO_KEEP: usize = 8;
 const EMPTY_RESPONSE_TOOL_RESULT_TRUNCATION_NOTICE: &str =
     "\n[Tool result truncated during empty-response recovery]";
 const EMPTY_RESPONSE_MIN_HISTORY_IMAGES: usize = 3;
@@ -265,6 +268,24 @@ fn shrink_image_if_smaller(
     true
 }
 
+fn truncate_tool_result_text(result: &mut ToolResult, max_chars: usize) -> bool {
+    let mut truncated_result = false;
+    for content in &mut result.content {
+        let Some(serde_json::Value::String(text)) = content.get_mut("text") else {
+            continue;
+        };
+        if text.chars().count() <= max_chars {
+            continue;
+        }
+
+        let mut truncated = text.chars().take(max_chars).collect::<String>();
+        truncated.push_str(EMPTY_RESPONSE_TOOL_RESULT_TRUNCATION_NOTICE);
+        *text = truncated;
+        truncated_result = true;
+    }
+    truncated_result
+}
+
 fn apply_empty_response_recovery(
     request: &mut KiroRequest,
     policy: ImageBudgetPolicy,
@@ -338,6 +359,43 @@ fn apply_empty_response_recovery(
         }
     }
 
+    let historical_result_count = request
+        .conversation_state
+        .history
+        .iter()
+        .map(|message| match message {
+            Message::User(user) => user
+                .user_input_message
+                .user_input_message_context
+                .tool_results
+                .len(),
+            Message::Assistant(_) => 0,
+        })
+        .sum::<usize>();
+    let mut old_results_left =
+        historical_result_count.saturating_sub(EMPTY_RESPONSE_RECENT_HISTORY_TOOL_RESULTS_TO_KEEP);
+    for message in &mut request.conversation_state.history {
+        if old_results_left == 0 {
+            break;
+        }
+        let Message::User(user) = message else {
+            continue;
+        };
+        for result in &mut user
+            .user_input_message
+            .user_input_message_context
+            .tool_results
+        {
+            if old_results_left == 0 {
+                break;
+            }
+            if truncate_tool_result_text(result, EMPTY_RESPONSE_HISTORY_TOOL_RESULT_MAX_CHARS) {
+                stats.truncated_tool_results += 1;
+            }
+            old_results_left -= 1;
+        }
+    }
+
     for result in &mut request
         .conversation_state
         .current_message
@@ -345,24 +403,7 @@ fn apply_empty_response_recovery(
         .user_input_message_context
         .tool_results
     {
-        let mut truncated_result = false;
-        for content in &mut result.content {
-            let Some(serde_json::Value::String(text)) = content.get_mut("text") else {
-                continue;
-            };
-            if text.chars().count() <= EMPTY_RESPONSE_TOOL_RESULT_MAX_CHARS {
-                continue;
-            }
-
-            let mut truncated = text
-                .chars()
-                .take(EMPTY_RESPONSE_TOOL_RESULT_MAX_CHARS)
-                .collect::<String>();
-            truncated.push_str(EMPTY_RESPONSE_TOOL_RESULT_TRUNCATION_NOTICE);
-            *text = truncated;
-            truncated_result = true;
-        }
-        if truncated_result {
+        if truncate_tool_result_text(result, EMPTY_RESPONSE_TOOL_RESULT_MAX_CHARS) {
             stats.truncated_tool_results += 1;
         }
     }
@@ -731,6 +772,104 @@ mod tests {
             prepare_empty_response_retry_body(&prepared.primary_body, ImageBudgetPolicy::default())
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn empty_response_retry_compacts_old_history_tool_results_and_keeps_recent_eight() {
+        let mut request = request_with_current_tool_results(Vec::new());
+        for index in 0..10 {
+            let mut historical = HistoryUserMessage::new(format!("history-{index}"), "model");
+            historical.user_input_message.user_input_message_context =
+                UserInputMessageContext::new().with_tool_results(vec![ToolResult {
+                    tool_use_id: format!("tool-{index}"),
+                    content: vec![serde_json::Map::from_iter([
+                        (
+                            "text".to_string(),
+                            serde_json::Value::String(format!(
+                                "result-{index}:{}",
+                                "界".repeat(1_500)
+                            )),
+                        ),
+                        ("kind".to_string(), serde_json::json!("stdout")),
+                    ])],
+                    status: Some("success".to_string()),
+                    is_error: false,
+                }]);
+            request
+                .conversation_state
+                .history
+                .push(Message::User(historical));
+        }
+        let primary_body = serde_json::to_string(&request).unwrap();
+
+        let (recovery_body, stats) = prepare_empty_response_retry_body(
+            &primary_body,
+            ImageBudgetPolicy {
+                enabled: false,
+                ..ImageBudgetPolicy::default()
+            },
+        )
+        .unwrap()
+        .expect("older long tool results should produce a smaller recovery body");
+        let recovery: KiroRequest = serde_json::from_str(&recovery_body).unwrap();
+
+        assert!(recovery_body.len() < primary_body.len());
+        assert_eq!(stats.truncated_tool_results, 2);
+        for (index, message) in recovery.conversation_state.history.iter().enumerate() {
+            let Message::User(message) = message else {
+                panic!("fixture must contain historical user messages");
+            };
+            let result = &message
+                .user_input_message
+                .user_input_message_context
+                .tool_results[0];
+            assert_eq!(result.tool_use_id, format!("tool-{index}"));
+            assert_eq!(result.status.as_deref(), Some("success"));
+            assert!(!result.is_error);
+            assert_eq!(result.content[0]["kind"], "stdout");
+            let text = result.content[0]["text"].as_str().unwrap();
+            if index < 2 {
+                assert!(text.ends_with(EMPTY_RESPONSE_TOOL_RESULT_TRUNCATION_NOTICE));
+                assert_eq!(
+                    text.trim_end_matches(EMPTY_RESPONSE_TOOL_RESULT_TRUNCATION_NOTICE)
+                        .chars()
+                        .count(),
+                    1_024
+                );
+            } else {
+                assert_eq!(text, format!("result-{index}:{}", "界".repeat(1_500)));
+            }
+        }
+    }
+
+    #[test]
+    fn empty_response_retry_keeps_all_history_tool_results_when_only_eight_exist() {
+        let mut request = request_with_current_tool_results(Vec::new());
+        for index in 0..8 {
+            let mut historical = HistoryUserMessage::new(format!("history-{index}"), "model");
+            historical.user_input_message.user_input_message_context =
+                UserInputMessageContext::new().with_tool_results(vec![ToolResult::success(
+                    format!("tool-{index}"),
+                    "x".repeat(2_000),
+                )]);
+            request
+                .conversation_state
+                .history
+                .push(Message::User(historical));
+        }
+        let primary_body = serde_json::to_string(&request).unwrap();
+
+        assert!(
+            prepare_empty_response_retry_body(
+                &primary_body,
+                ImageBudgetPolicy {
+                    enabled: false,
+                    ..ImageBudgetPolicy::default()
+                },
+            )
+            .unwrap()
+            .is_none()
         );
     }
 
