@@ -1760,6 +1760,11 @@ pub struct StreamContext {
     required_tool_preamble_released: bool,
     /// 已实际发送给客户端的工具名。
     emitted_tool_names: Vec<String>,
+    /// 客户端禁用并行工具时，首个原始工具分片占用的本轮唯一工具 ID。
+    /// 在 JSON 拼接前占位，避免后续非法或半截工具污染首个工具的成功响应。
+    single_tool_slot_id: Option<String>,
+    /// 唯一工具是否已经完成解析或进入过 Schema 校验；关闭后同 ID 重放也必须抑制。
+    single_tool_slot_closed: bool,
     /// 终止协议错误的 Anthropic 错误类型。
     terminal_protocol_error_type: Option<&'static str>,
     /// 是否观察到真实 thinking 或 redacted_thinking 输出。
@@ -1997,6 +2002,8 @@ impl StreamContext {
             required_tool_preamble: String::new(),
             required_tool_preamble_released: false,
             emitted_tool_names: Vec::new(),
+            single_tool_slot_id: None,
+            single_tool_slot_closed: false,
             terminal_protocol_error_type: None,
             saw_reasoning_output: false,
             strict_thinking_validation,
@@ -2932,6 +2939,21 @@ impl StreamContext {
     /// 依次发 `content_block_start{name, input:{}}` → 单个完整 `input_json_delta` → `content_block_stop`。
     fn emit_completed_tool_use(&mut self, mut completed: CompletedToolUse) -> Vec<SseEvent> {
         let mut events = Vec::new();
+        if self.tool_choice_policy.disables_parallel_tool_use() {
+            if !self.tool_choice_policy.accepts_tool_fragment(
+                &mut self.single_tool_slot_id,
+                self.single_tool_slot_closed,
+                &completed.id,
+            ) {
+                tracing::warn!(
+                    tool_id = %completed.id,
+                    tool_name = %completed.name,
+                    "suppressed additional upstream tool call because the client disabled parallel tool use"
+                );
+                return events;
+            }
+            self.single_tool_slot_closed = true;
+        }
         if self.tool_contracts_initialized {
             let Some(contract) = self.tool_contracts.get(&completed.name) else {
                 let error = super::tool_schema::ToolSchemaError {
@@ -3059,6 +3081,18 @@ impl StreamContext {
             input_bytes = tool_use.input.len(),
             "received upstream tool_use fragment"
         );
+        if !self.tool_choice_policy.accepts_tool_fragment(
+            &mut self.single_tool_slot_id,
+            self.single_tool_slot_closed,
+            &tool_use.tool_use_id,
+        ) {
+            tracing::warn!(
+                tool_id = %tool_use.tool_use_id,
+                tool_name = %tool_use.name,
+                "suppressed additional upstream tool fragment because the client disabled parallel tool use"
+            );
+            return events;
+        }
 
         if self.is_thinking_block_open() && !self.in_thinking_block {
             events.extend(self.close_open_thinking_block());
@@ -3131,6 +3165,9 @@ impl StreamContext {
             Ok(None) => return events,
             Err(e) => {
                 tracing::error!("{}", e);
+                if self.tool_choice_policy.disables_parallel_tool_use() {
+                    self.single_tool_slot_closed = true;
+                }
                 self.tool_json_error = Some(e);
                 self.state_manager.set_stop_reason("error");
                 return events;
@@ -3777,6 +3814,261 @@ mod tests {
             event.event == "error" && event.data["error"]["type"] == "upstream_tool_choice_error"
         }));
         assert!(!events.iter().any(|event| event.event == "message_stop"));
+    }
+
+    #[test]
+    fn disable_parallel_stream_emits_only_first_tool_and_finishes_successfully() {
+        let policies = [
+            super::super::converter::ToolChoicePolicy::Auto {
+                disable_parallel_tool_use: true,
+            },
+            super::super::converter::ToolChoicePolicy::RequiredAny {
+                disable_parallel_tool_use: true,
+            },
+            super::super::converter::ToolChoicePolicy::RequiredSpecific {
+                name: "first_tool".to_string(),
+                disable_parallel_tool_use: true,
+            },
+        ];
+
+        for policy in policies {
+            let known = ["first_tool".to_string(), "second_tool".to_string()]
+                .into_iter()
+                .collect();
+            let mut ctx = StreamContext::new_with_constraints(
+                "claude-opus-4-8",
+                10,
+                false,
+                false,
+                HashMap::new(),
+                known,
+                policy.clone(),
+            );
+
+            let mut events = ctx.generate_initial_events();
+            events.extend(ctx.process_tool_use(&tool_evt(
+                "tool_1",
+                "first_tool",
+                r#"{"value":1}"#,
+                true,
+            )));
+            events.extend(ctx.process_tool_use(&tool_evt(
+                "tool_2",
+                "second_tool",
+                r#"{"value":2}"#,
+                true,
+            )));
+            events.extend(ctx.generate_final_events());
+
+            let tool_starts = events
+                .iter()
+                .filter(|event| {
+                    event.event == "content_block_start"
+                        && event.data["content_block"]["type"] == "tool_use"
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(tool_starts.len(), 1, "policy: {policy:?}");
+            assert_eq!(
+                tool_starts[0].data["content_block"]["id"], "tool_1",
+                "policy: {policy:?}"
+            );
+            assert!(
+                !events.iter().any(|event| event.event == "error"),
+                "policy: {policy:?}"
+            );
+            assert!(
+                events.iter().any(|event| event.event == "message_stop"),
+                "policy: {policy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn disable_parallel_stream_reserves_first_tool_before_schema_validation() {
+        let mut ctx = StreamContext::new_with_constraints(
+            "claude-opus-4-8",
+            10,
+            false,
+            false,
+            HashMap::new(),
+            ["first_tool".to_string(), "second_tool".to_string()]
+                .into_iter()
+                .collect(),
+            super::super::converter::ToolChoicePolicy::Auto {
+                disable_parallel_tool_use: true,
+            },
+        );
+        ctx.set_tool_contracts(HashMap::from([
+            (
+                "first_tool".to_string(),
+                super::super::tool_schema::ToolContract {
+                    client_name: "first_tool".to_string(),
+                    schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
+                        "required": ["value"]
+                    }),
+                },
+            ),
+            (
+                "second_tool".to_string(),
+                super::super::tool_schema::ToolContract {
+                    client_name: "second_tool".to_string(),
+                    schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
+                        "required": ["value"]
+                    }),
+                },
+            ),
+        ]));
+
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_tool_use(&tool_evt("tool_1", "first_tool", r#"{}"#, true)));
+        events.extend(ctx.process_tool_use(&tool_evt(
+            "tool_2",
+            "second_tool",
+            r#"{"value":"ok"}"#,
+            true,
+        )));
+        events.extend(ctx.generate_final_events());
+
+        assert!(!events.iter().any(|event| {
+            event.event == "content_block_start"
+                && event.data["content_block"]["type"] == "tool_use"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event == "error" && event.data["error"]["type"] == "upstream_tool_schema_error"
+        }));
+    }
+
+    #[test]
+    fn disable_parallel_stream_ignores_malformed_later_tool_fragments() {
+        for (input, stop) in [(r#"{"broken":}"#, true), (r#"{"half":"#, false)] {
+            let mut ctx = StreamContext::new_with_constraints(
+                "claude-opus-4-8",
+                10,
+                false,
+                false,
+                HashMap::new(),
+                ["first_tool".to_string(), "second_tool".to_string()]
+                    .into_iter()
+                    .collect(),
+                super::super::converter::ToolChoicePolicy::Auto {
+                    disable_parallel_tool_use: true,
+                },
+            );
+
+            let mut events = ctx.generate_initial_events();
+            events.extend(ctx.process_tool_use(&tool_evt(
+                "tool_1",
+                "first_tool",
+                r#"{"value":1}"#,
+                true,
+            )));
+            events.extend(ctx.process_tool_use(&tool_evt("tool_2", "second_tool", input, stop)));
+            events.extend(ctx.generate_final_events());
+
+            let tool_starts = events
+                .iter()
+                .filter(|event| {
+                    event.event == "content_block_start"
+                        && event.data["content_block"]["type"] == "tool_use"
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(tool_starts.len(), 1, "input={input:?}, stop={stop}");
+            assert_eq!(tool_starts[0].data["content_block"]["id"], "tool_1");
+            assert!(
+                !events.iter().any(|event| event.event == "error"),
+                "input={input:?}, stop={stop}"
+            );
+            assert!(events.iter().any(|event| event.event == "message_stop"));
+        }
+    }
+
+    #[test]
+    fn disable_parallel_stream_does_not_replace_invalid_first_tool_with_same_id_replay() {
+        let mut ctx = StreamContext::new_with_constraints(
+            "claude-opus-4-8",
+            10,
+            false,
+            false,
+            HashMap::new(),
+            ["first_tool".to_string()].into_iter().collect(),
+            super::super::converter::ToolChoicePolicy::Auto {
+                disable_parallel_tool_use: true,
+            },
+        );
+        ctx.set_tool_contracts(HashMap::from([(
+            "first_tool".to_string(),
+            super::super::tool_schema::ToolContract {
+                client_name: "first_tool".to_string(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"]
+                }),
+            },
+        )]));
+
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_tool_use(&tool_evt("tool_1", "first_tool", r#"{}"#, true)));
+        events.extend(ctx.process_tool_use(&tool_evt(
+            "tool_1",
+            "first_tool",
+            r#"{"value":"replay"}"#,
+            true,
+        )));
+        events.extend(ctx.generate_final_events());
+
+        assert!(!events.iter().any(|event| {
+            event.event == "content_block_start"
+                && event.data["content_block"]["type"] == "tool_use"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event == "error" && event.data["error"]["type"] == "upstream_tool_schema_error"
+        }));
+    }
+
+    #[test]
+    fn disable_parallel_stream_suppresses_same_id_after_first_tool_completed() {
+        let mut ctx = StreamContext::new_with_constraints(
+            "claude-opus-4-8",
+            10,
+            false,
+            false,
+            HashMap::new(),
+            ["first_tool".to_string()].into_iter().collect(),
+            super::super::converter::ToolChoicePolicy::Auto {
+                disable_parallel_tool_use: true,
+            },
+        );
+
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_tool_use(&tool_evt(
+            "tool_1",
+            "first_tool",
+            r#"{"value":1}"#,
+            true,
+        )));
+        events.extend(ctx.process_tool_use(&tool_evt(
+            "tool_1",
+            "first_tool",
+            r#"{"value":2}"#,
+            true,
+        )));
+        events.extend(ctx.generate_final_events());
+
+        let tool_starts = events
+            .iter()
+            .filter(|event| {
+                event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "tool_use"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tool_starts.len(), 1);
+        assert!(!events.iter().any(|event| event.event == "error"));
+        assert!(events.iter().any(|event| event.event == "message_stop"));
     }
 
     #[test]

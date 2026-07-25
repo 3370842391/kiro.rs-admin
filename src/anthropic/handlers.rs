@@ -12,7 +12,10 @@ use crate::admin::trace_db::{
     outcome,
 };
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
-use crate::kiro::image_budget::{ImageBudgetError, PreparedKiroBodies, prepare_kiro_bodies};
+use crate::kiro::image_budget::{
+    ImageBudgetError, ImageBudgetPolicy, PreparedKiroBodies, prepare_empty_response_retry_body,
+    prepare_kiro_bodies,
+};
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
@@ -842,13 +845,18 @@ fn visible_text_from_events(events: &[SseEvent]) -> Option<String> {
 
 #[cfg(test)]
 async fn recover_strict_json_attempts<F, Fut>(
-    collect: F,
+    mut collect: F,
 ) -> Result<StrictJsonRecovery, StrictJsonRecoveryFailure>
 where
     F: FnMut(usize) -> Fut,
     Fut: Future<Output = anyhow::Result<BufferedAttempt>>,
 {
-    recover_strict_json_attempts_with_validator(collect, false, |_| true).await
+    recover_strict_json_attempts_with_validator(
+        |attempt_index, _| collect(attempt_index),
+        false,
+        |_| true,
+    )
+    .await
 }
 
 async fn recover_strict_json_attempts_with_validator<F, Fut, V>(
@@ -857,13 +865,14 @@ async fn recover_strict_json_attempts_with_validator<F, Fut, V>(
     mut validate: V,
 ) -> Result<StrictJsonRecovery, StrictJsonRecoveryFailure>
 where
-    F: FnMut(usize) -> Fut,
+    F: FnMut(usize, Option<super::tool_attempt::AttemptFailure>) -> Fut,
     Fut: Future<Output = anyhow::Result<BufferedAttempt>>,
     V: FnMut(&str) -> bool,
 {
     let mut attempts = Vec::with_capacity(2);
+    let mut previous_failure = None;
     for attempt_index in 0..2 {
-        let attempt = match collect(attempt_index).await {
+        let attempt = match collect(attempt_index, previous_failure.take()).await {
             Ok(attempt) => attempt,
             Err(source) => {
                 return Err(StrictJsonRecoveryFailure {
@@ -880,6 +889,7 @@ where
                     | super::tool_attempt::AttemptFailure::UpstreamError { .. }
             )
         });
+        previous_failure = attempt.attempt_failure.clone();
         let json = attempt
             .terminal_error
             .is_none()
@@ -912,6 +922,15 @@ where
         source: None,
         terminal_failure,
     })
+}
+
+fn strict_json_terminal_failure_response(failure: super::tool_attempt::AttemptFailure) -> Response {
+    let (error_type, message) = failure.public_error();
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(ErrorResponse::new(error_type, message)),
+    )
+        .into_response()
 }
 
 async fn collect_buffered_attempt(
@@ -1108,10 +1127,11 @@ async fn handle_strict_json_request(
         threshold_retry_bodies,
     } = prepared;
     let model = payload.model.clone();
+    let image_budget_policy = provider.image_budget_policy();
     let recovery = recover_strict_json_attempts_with_validator(
-        |attempt_index| {
+        |attempt_index, previous_failure| {
             let provider = provider.clone();
-            let (body, threshold_retry_body) = if attempt_index == 0 {
+            let (mut body, threshold_retry_body) = if attempt_index == 0 {
                 (bodies[0].clone(), threshold_retry_bodies[0].clone())
             } else {
                 (
@@ -1121,6 +1141,29 @@ async fn handle_strict_json_request(
                     None,
                 )
             };
+            if matches!(
+                previous_failure,
+                Some(super::tool_attempt::AttemptFailure::EmptyResponse)
+            ) {
+                match prepare_empty_response_retry_body(&body, image_budget_policy) {
+                    Ok(Some((recovery_body, stats))) => {
+                        tracing::warn!(
+                            retry_body_variant = "strict_json_empty_response_recovery",
+                            retry_body_bytes = recovery_body.len(),
+                            resized_history_images = stats.resized_history_images,
+                            resized_current_images = stats.resized_current_images,
+                            omitted_history_images = stats.omitted_history_images,
+                            "prepared strict JSON empty-response recovery body"
+                        );
+                        body = recovery_body;
+                    }
+                    Ok(None) => {}
+                    Err(error) => tracing::warn!(
+                        %error,
+                        "failed to prepare strict JSON empty-response recovery body"
+                    ),
+                }
+            }
             let model = model.clone();
             let tracer = tracer.clone();
             let group = group.clone();
@@ -1267,26 +1310,7 @@ async fn handle_strict_json_request(
                     None,
                     trace_usage,
                 );
-                if payload.stream {
-                    let body = SseEvent::new(
-                        "error",
-                        json!({
-                            "type": "error",
-                            "error": {"type": error_type, "message": message}
-                        }),
-                    )
-                    .to_sse_string();
-                    return Response::builder()
-                        .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, "text/event-stream")
-                        .body(Body::from(body))
-                        .unwrap();
-                }
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    Json(ErrorResponse::new(error_type, message)),
-                )
-                    .into_response();
+                return strict_json_terminal_failure_response(attempt_failure);
             }
 
             let (error_type, message) = if structured_format.is_some() {
@@ -2492,7 +2516,6 @@ pub async fn post_messages(
 struct StreamAttemptSetup {
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: String,
-    threshold_retry_body: Option<String>,
     model: String,
     input_tokens: i32,
     requested_max_tokens: i32,
@@ -2514,11 +2537,42 @@ struct StreamAttemptSetup {
 
 fn prepare_retry_request_body(
     request_body: &str,
-    _threshold_retry_body: Option<&str>,
+    image_budget_policy: ImageBudgetPolicy,
     failure: Option<&super::tool_attempt::AttemptFailure>,
     tool_name_map: &std::collections::HashMap<String, String>,
 ) -> Option<String> {
     match failure {
+        Some(super::tool_attempt::AttemptFailure::EmptyResponse) => {
+            match prepare_empty_response_retry_body(request_body, image_budget_policy) {
+                Ok(Some((body, stats))) => {
+                    tracing::warn!(
+                        retry_body_variant = "empty_response_recovery",
+                        retry_body_bytes = body.len(),
+                        resized_history_images = stats.resized_history_images,
+                        resized_current_images = stats.resized_current_images,
+                        omitted_history_images = stats.omitted_history_images,
+                        truncated_tool_results = stats.truncated_tool_results,
+                        "prepared empty-response recovery body after the first upstream attempt failed"
+                    );
+                    Some(body)
+                }
+                Ok(None) => {
+                    tracing::debug!(
+                        retry_body_variant = "primary",
+                        "empty-response recovery made no safe request-body changes"
+                    );
+                    Some(request_body.to_owned())
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        retry_body_variant = "primary",
+                        "failed to prepare empty-response recovery body; retrying the primary body"
+                    );
+                    Some(request_body.to_owned())
+                }
+            }
+        }
         Some(super::tool_attempt::AttemptFailure::InvalidToolSchema { failure }) => {
             super::tool_schema::append_tool_schema_retry_instruction(
                 request_body,
@@ -2702,7 +2756,6 @@ async fn handle_stream_request(
     let attempt_setup = StreamAttemptSetup {
         provider: provider.clone(),
         request_body: request_body.to_owned(),
-        threshold_retry_body: threshold_retry_body.map(str::to_owned),
         model: model.to_owned(),
         input_tokens,
         requested_max_tokens,
@@ -2777,7 +2830,6 @@ fn create_early_sse_stream(
         attempt: StreamAttemptSetup {
             provider: provider.clone(),
             request_body,
-            threshold_retry_body,
             model,
             input_tokens,
             requested_max_tokens,
@@ -3758,7 +3810,7 @@ async fn run_realtime_sse_attempts(
             .then(|| {
                 prepare_retry_request_body(
                     &setup.request_body,
-                    setup.threshold_retry_body.as_deref(),
+                    setup.provider.image_budget_policy(),
                     attempt_failure.as_ref(),
                     &setup.tool_name_map,
                 )
@@ -4122,10 +4174,21 @@ fn normalize_and_validate_non_stream_content(
     known_tool_names: &std::collections::HashSet<String>,
     tool_name_map: &std::collections::HashMap<String, String>,
     tool_contracts: &std::collections::HashMap<String, super::tool_schema::ToolContract>,
+    tool_choice_policy: &super::converter::ToolChoicePolicy,
 ) -> (
     Vec<serde_json::Value>,
     Result<Vec<String>, super::tool_schema::ToolSchemaError>,
 ) {
+    let preferred_native_tool_id = tool_choice_policy
+        .disables_parallel_tool_use()
+        .then(|| {
+            native_tool_uses
+                .first()
+                .and_then(|block| block.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .flatten();
     let native_tool_ids: std::collections::HashSet<String> = native_tool_uses
         .iter()
         .filter_map(|block| block.get("id").and_then(serde_json::Value::as_str))
@@ -4136,6 +4199,11 @@ fn normalize_and_validate_non_stream_content(
         native_tool_uses,
         known_tool_names,
         tool_name_map,
+    );
+    suppress_additional_tool_calls(
+        &mut content,
+        tool_choice_policy,
+        preferred_native_tool_id.as_deref(),
     );
     let validation = super::tool_schema::validate_tool_use_blocks(tool_contracts, &mut content);
     if validation.is_ok() {
@@ -4175,6 +4243,7 @@ async fn collect_non_stream_tool_attempt(
     tool_name_map: &std::collections::HashMap<String, String>,
     known_tool_names: &std::collections::HashSet<String>,
     tool_contracts: &std::collections::HashMap<String, super::tool_schema::ToolContract>,
+    tool_choice_policy: &super::converter::ToolChoicePolicy,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<&str>,
     attempt_index: u8,
@@ -4224,6 +4293,8 @@ async fn collect_non_stream_tool_attempt(
     let mut native_thinking_signature = None;
     let mut native_redacted_thinking = Vec::new();
     let mut tool_uses = Vec::new();
+    let mut single_tool_slot_id = None;
+    let mut single_tool_slot_closed = false;
     let mut upstream_signalled_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
     let mut upstream_context_tokens = None;
@@ -4268,12 +4339,31 @@ async fn collect_non_stream_tool_attempt(
                                 attempt = attempt_index + 1,
                                 "received upstream non-stream tool_use fragment"
                             );
+                            if !tool_choice_policy.accepts_tool_fragment(
+                                &mut single_tool_slot_id,
+                                single_tool_slot_closed,
+                                &tool_use.tool_use_id,
+                            ) {
+                                tracing::warn!(
+                                    tool_id = %tool_use.tool_use_id,
+                                    tool_name = %tool_use.name,
+                                    attempt = attempt_index + 1,
+                                    "suppressed additional upstream non-stream tool fragment because the client disabled parallel tool use"
+                                );
+                                continue;
+                            }
                             match tool_accumulator.push(&tool_use, tool_name_map) {
                                 Ok(Some(completed)) => {
+                                    if tool_choice_policy.disables_parallel_tool_use() {
+                                        single_tool_slot_closed = true;
+                                    }
                                     tool_uses.push(completed.to_anthropic_block());
                                 }
                                 Ok(None) => {}
                                 Err(error) => {
+                                    if tool_choice_policy.disables_parallel_tool_use() {
+                                        single_tool_slot_closed = true;
+                                    }
                                     tracing::error!(%error, attempt = attempt_index + 1);
                                     tracer.record_protocol_error(
                                         "upstream_tool_protocol_error",
@@ -4358,6 +4448,7 @@ async fn collect_non_stream_tool_attempt(
         known_tool_names,
         tool_name_map,
         tool_contracts,
+        tool_choice_policy,
     );
     let schema_failure = match validation {
         Ok(repaired) => {
@@ -4463,6 +4554,7 @@ async fn handle_non_stream_request(
                 &tool_name_map,
                 &known_tool_names,
                 &tool_contracts,
+                &tool_choice_policy,
                 tracer.clone(),
                 group.as_deref(),
                 attempt_index,
@@ -4487,7 +4579,7 @@ async fn handle_non_stream_request(
             if attempt.state.should_retry()
                 && let Some(body) = prepare_retry_request_body(
                     request_body,
-                    threshold_retry_body,
+                    provider.image_budget_policy(),
                     attempt.state.failure.as_ref(),
                     &tool_name_map,
                 )
@@ -4772,20 +4864,56 @@ fn validate_non_stream_content(content: &[serde_json::Value]) -> Result<(), &'st
 }
 
 fn normalize_required_tool_content(
-    content: Vec<serde_json::Value>,
+    mut content: Vec<serde_json::Value>,
     policy: &super::converter::ToolChoicePolicy,
 ) -> Vec<serde_json::Value> {
     let has_tool = content
         .iter()
         .any(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("tool_use"));
-    if policy.is_required() && has_tool {
-        content
-            .into_iter()
-            .filter(|block| block.get("type").and_then(serde_json::Value::as_str) != Some("text"))
-            .collect()
-    } else {
-        content
+    let strip_text = policy.is_required() && has_tool;
+    suppress_additional_tool_calls(&mut content, policy, None);
+
+    content
+        .into_iter()
+        .filter(|block| {
+            let block_type = block.get("type").and_then(serde_json::Value::as_str);
+            if strip_text && block_type == Some("text") {
+                return false;
+            }
+            true
+        })
+        .collect()
+}
+
+fn suppress_additional_tool_calls(
+    content: &mut Vec<serde_json::Value>,
+    policy: &super::converter::ToolChoicePolicy,
+    preferred_tool_id: Option<&str>,
+) {
+    if !policy.disables_parallel_tool_use() {
+        return;
     }
+    let mut kept_tool = false;
+    content.retain(|block| {
+        if block.get("type").and_then(serde_json::Value::as_str) != Some("tool_use") {
+            return true;
+        }
+        let tool_id = block
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let keep = !kept_tool && preferred_tool_id.is_none_or(|preferred| preferred == tool_id);
+        if !keep {
+            tracing::warn!(
+                tool_id,
+                tool_name = block.get("name").and_then(serde_json::Value::as_str).unwrap_or(""),
+                "suppressed additional upstream tool call because the client disabled parallel tool use"
+            );
+            return false;
+        }
+        kept_tool = true;
+        true
+    });
 }
 
 fn validate_required_thinking(
@@ -5412,7 +5540,6 @@ async fn handle_stream_request_buffered(
     let attempt_setup = StreamAttemptSetup {
         provider: provider.clone(),
         request_body: request_body.to_owned(),
-        threshold_retry_body: threshold_retry_body.map(str::to_owned),
         model: model.to_owned(),
         input_tokens: fallback_input_tokens,
         requested_max_tokens: 0,
@@ -5654,7 +5781,7 @@ async fn run_buffered_sse_attempts(
             .then(|| {
                 prepare_retry_request_body(
                     &setup.request_body,
-                    setup.threshold_retry_body.as_deref(),
+                    setup.provider.image_budget_policy(),
                     attempt_failure.as_ref(),
                     &setup.tool_name_map,
                 )
@@ -5961,7 +6088,7 @@ mod tests {
     }
 
     #[test]
-    fn handler_retries_keep_primary_body_for_empty_transport_and_schema_failures() {
+    fn handler_uses_empty_response_recovery_body_only_for_empty_response() {
         fn body(description: &str, marker: &str) -> String {
             serde_json::json!({
                 "marker": marker,
@@ -5980,7 +6107,34 @@ mod tests {
             .to_string()
         }
         let primary = body("primary description", "marker_primary");
-        let threshold = body("threshold description", "marker_threshold");
+        let empty_primary = serde_json::to_string(&crate::kiro::model::requests::kiro::KiroRequest {
+            conversation_state: crate::kiro::model::requests::conversation::ConversationState::new(
+                "conv",
+            )
+            .with_current_message(
+                crate::kiro::model::requests::conversation::CurrentMessage::new(
+                    crate::kiro::model::requests::conversation::UserInputMessage::new(
+                        "current", "model",
+                    )
+                    .with_context(
+                        crate::kiro::model::requests::conversation::UserInputMessageContext::new()
+                            .with_tool_results(vec![
+                                crate::kiro::model::requests::tool::ToolResult::success(
+                                    "tool-long",
+                                    "x".repeat(700),
+                                ),
+                            ]),
+                    ),
+                ),
+            ),
+            profile_arn: None,
+            additional_model_request_fields: None,
+        })
+        .unwrap();
+        let image_policy = crate::kiro::image_budget::ImageBudgetPolicy {
+            enabled: false,
+            ..crate::kiro::image_budget::ImageBudgetPolicy::default()
+        };
 
         let transport_cases = [
             (
@@ -6008,14 +6162,17 @@ mod tests {
             };
             assert!(state.should_retry(), "{case} should enter handler retry");
             let retry = prepare_retry_request_body(
-                &primary,
-                Some(&threshold),
+                &empty_primary,
+                image_policy,
                 state.failure.as_ref(),
                 &std::collections::HashMap::new(),
             )
             .expect("transport retry body");
-            assert!(retry.contains("marker_primary"), "{case}");
-            assert!(!retry.contains("marker_threshold"), "{case}");
+            assert!(
+                retry.contains("[Tool result truncated during empty-response recovery]"),
+                "{case}"
+            );
+            assert!(!retry.contains(&"x".repeat(700)), "{case}");
         }
 
         let failure = super::super::tool_schema::ToolSchemaFailure::from_error_and_input(
@@ -6045,7 +6202,7 @@ mod tests {
 
         let retry = prepare_retry_request_body(
             &primary,
-            Some(&threshold),
+            image_policy,
             state.failure.as_ref(),
             &std::collections::HashMap::new(),
         )
@@ -6535,21 +6692,168 @@ mod tests {
     }
 
     #[test]
-    fn disable_parallel_rejects_multiple_non_stream_tool_calls() {
+    fn disable_parallel_keeps_only_first_non_stream_tool_call() {
         let content = vec![
-            serde_json::json!({"type": "tool_use", "name": "first_tool", "input": {}}),
-            serde_json::json!({"type": "tool_use", "name": "second_tool", "input": {}}),
+            serde_json::json!({"type": "text", "text": "working"}),
+            serde_json::json!({"type": "tool_use", "id": "tool_1", "name": "first_tool", "input": {"value": 1}}),
+            serde_json::json!({"type": "tool_use", "id": "tool_2", "name": "second_tool", "input": {"value": 2}}),
         ];
-        assert!(
-            validate_tool_choice_content(
-                &crate::anthropic::converter::ToolChoicePolicy::RequiredAny {
-                    disable_parallel_tool_use: true,
+        let policies = [
+            crate::anthropic::converter::ToolChoicePolicy::Auto {
+                disable_parallel_tool_use: true,
+            },
+            crate::anthropic::converter::ToolChoicePolicy::RequiredAny {
+                disable_parallel_tool_use: true,
+            },
+            crate::anthropic::converter::ToolChoicePolicy::RequiredSpecific {
+                name: "first_tool".to_string(),
+                disable_parallel_tool_use: true,
+            },
+        ];
+
+        for policy in policies {
+            let normalized = normalize_required_tool_content(content.clone(), &policy);
+            let tools = normalized
+                .iter()
+                .filter(|block| block["type"] == "tool_use")
+                .collect::<Vec<_>>();
+            assert_eq!(tools.len(), 1, "policy: {policy:?}");
+            assert_eq!(tools[0]["id"], "tool_1", "policy: {policy:?}");
+            assert_eq!(tools[0]["input"]["value"], 1, "policy: {policy:?}");
+            assert!(validate_tool_choice_content(&policy, &normalized).is_ok());
+        }
+    }
+
+    #[test]
+    fn disable_parallel_non_stream_drops_later_tools_before_schema_validation() {
+        let known = ["first_tool".to_string(), "second_tool".to_string()]
+            .into_iter()
+            .collect();
+        let contracts = std::collections::HashMap::from([
+            (
+                "first_tool".to_string(),
+                super::super::tool_schema::ToolContract {
+                    client_name: "first_tool".to_string(),
+                    schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
+                        "required": ["value"]
+                    }),
                 },
-                &content,
-            )
-            .unwrap_err()
-            .contains("parallel")
+            ),
+            (
+                "second_tool".to_string(),
+                super::super::tool_schema::ToolContract {
+                    client_name: "second_tool".to_string(),
+                    schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
+                        "required": ["value"]
+                    }),
+                },
+            ),
+        ]);
+        let native = vec![
+            serde_json::json!({
+                "type": "tool_use",
+                "id": "tool_1",
+                "name": "first_tool",
+                "input": {"value": "ok"}
+            }),
+            serde_json::json!({
+                "type": "tool_use",
+                "id": "tool_2",
+                "name": "second_tool",
+                "input": {}
+            }),
+        ];
+        let disabled = super::super::converter::ToolChoicePolicy::Auto {
+            disable_parallel_tool_use: true,
+        };
+
+        let (content, validation) = normalize_and_validate_non_stream_content(
+            Vec::new(),
+            native.clone(),
+            &known,
+            &std::collections::HashMap::new(),
+            &contracts,
+            &disabled,
         );
+
+        assert!(validation.is_ok());
+        let tools = content
+            .iter()
+            .filter(|block| block["type"] == "tool_use")
+            .collect::<Vec<_>>();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["id"], "tool_1");
+
+        let allowed = super::super::converter::ToolChoicePolicy::Auto {
+            disable_parallel_tool_use: false,
+        };
+        let (_, validation) = normalize_and_validate_non_stream_content(
+            Vec::new(),
+            native,
+            &known,
+            &std::collections::HashMap::new(),
+            &contracts,
+            &allowed,
+        );
+        assert!(validation.is_err());
+    }
+
+    #[test]
+    fn disable_parallel_non_stream_prefers_native_tool_over_textual_invoke_leak() {
+        let known = ["first_tool".to_string(), "second_tool".to_string()]
+            .into_iter()
+            .collect();
+        let contracts = std::collections::HashMap::from([
+            (
+                "first_tool".to_string(),
+                super::super::tool_schema::ToolContract {
+                    client_name: "first_tool".to_string(),
+                    schema: serde_json::json!({"type": "object"}),
+                },
+            ),
+            (
+                "second_tool".to_string(),
+                super::super::tool_schema::ToolContract {
+                    client_name: "second_tool".to_string(),
+                    schema: serde_json::json!({"type": "object"}),
+                },
+            ),
+        ]);
+        let base = vec![serde_json::json!({
+            "type": "text",
+            "text": "leak\n<invoke name=\"second_tool\"></invoke>"
+        })];
+        let native = vec![serde_json::json!({
+            "type": "tool_use",
+            "id": "tool_1",
+            "name": "first_tool",
+            "input": {}
+        })];
+        let disabled = super::super::converter::ToolChoicePolicy::Auto {
+            disable_parallel_tool_use: true,
+        };
+
+        let (content, validation) = normalize_and_validate_non_stream_content(
+            base,
+            native,
+            &known,
+            &std::collections::HashMap::new(),
+            &contracts,
+            &disabled,
+        );
+
+        assert!(validation.is_ok());
+        let tools = content
+            .iter()
+            .filter(|block| block["type"] == "tool_use")
+            .collect::<Vec<_>>();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["id"], "tool_1");
+        assert_eq!(tools[0]["name"], "first_tool");
     }
 
     #[test]
@@ -6578,6 +6882,9 @@ mod tests {
             &known,
             &std::collections::HashMap::new(),
             &contracts,
+            &super::super::converter::ToolChoicePolicy::Auto {
+                disable_parallel_tool_use: false,
+            },
         );
         let error = validation.unwrap_err();
 
@@ -6614,6 +6921,9 @@ mod tests {
             &known,
             &std::collections::HashMap::new(),
             &contracts,
+            &super::super::converter::ToolChoicePolicy::Auto {
+                disable_parallel_tool_use: false,
+            },
         );
         let error = validation.unwrap_err();
         let state = super::super::tool_attempt::ToolAttemptState {
@@ -6707,6 +7017,9 @@ mod tests {
             &known,
             &std::collections::HashMap::new(),
             &contracts,
+            &super::super::converter::ToolChoicePolicy::Auto {
+                disable_parallel_tool_use: false,
+            },
         );
 
         assert!(validation.is_ok());
@@ -7165,6 +7478,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn strict_json_retry_receives_previous_empty_response_failure() {
+        let empty = BufferedAttempt {
+            events: Vec::new(),
+            credential_id: 1,
+            usage: TraceUsage::zero(),
+            credits: 0.0,
+            terminal_error: Some("upstream returned no assistant content".to_string()),
+            attempt_failure: Some(super::super::tool_attempt::AttemptFailure::EmptyResponse),
+        };
+        let valid = BufferedAttempt {
+            events: build_local_text_stream_events(
+                "claude-opus-4-8",
+                "{\"a\":1}",
+                20,
+                crate::anthropic::cache_metering::CacheUsage::default(),
+            ),
+            credential_id: 1,
+            usage: TraceUsage::zero(),
+            credits: 0.0,
+            terminal_error: None,
+            attempt_failure: None,
+        };
+        let mut attempts = std::collections::VecDeque::from([empty, valid]);
+        let mut previous_failures = Vec::new();
+
+        let recovered = recover_strict_json_attempts_with_validator(
+            |_, previous_failure| {
+                previous_failures.push(previous_failure);
+                futures::future::ready(Ok(attempts.pop_front().unwrap()))
+            },
+            false,
+            |_| true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(recovered.json, "{\"a\":1}");
+        assert_eq!(previous_failures.len(), 2);
+        assert!(previous_failures[0].is_none());
+        assert!(matches!(
+            previous_failures[1],
+            Some(super::super::tool_attempt::AttemptFailure::EmptyResponse)
+        ));
+    }
+
+    #[tokio::test]
     async fn strict_json_recovery_retries_syntactically_valid_constraint_violation() {
         let request: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model": "claude-opus-4-8",
@@ -7194,7 +7553,7 @@ mod tests {
         ]);
         let mut calls = 0;
         let recovered = recover_strict_json_attempts_with_validator(
-            |_| {
+            |_, _| {
                 calls += 1;
                 futures::future::ready(Ok(attempts.pop_front().unwrap()))
             },
@@ -7236,7 +7595,7 @@ mod tests {
             std::collections::VecDeque::from([attempt("```json\n{\"answer\":42}\n```")]);
         let mut calls = 0;
         let recovered = recover_strict_json_attempts_with_validator(
-            |_| {
+            |_, _| {
                 calls += 1;
                 futures::future::ready(Ok(attempts.pop_front().unwrap()))
             },
@@ -7331,6 +7690,21 @@ mod tests {
             super::super::tool_attempt::AttemptFailure::EmptyResponse
         ));
         assert_eq!(terminal_failure.public_error().0, "upstream_empty_response");
+    }
+
+    #[test]
+    fn strict_json_terminal_failure_returns_real_http_502_before_stream_commit() {
+        let response = strict_json_terminal_failure_response(
+            super::super::tool_attempt::AttemptFailure::EmptyResponse,
+        );
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_ne!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
     }
 
     #[test]

@@ -620,12 +620,50 @@ impl ToolChoicePolicy {
             Self::RequiredAny { .. } | Self::RequiredSpecific { .. }
         )
     }
+
+    pub(crate) fn disables_parallel_tool_use(&self) -> bool {
+        match self {
+            Self::Auto {
+                disable_parallel_tool_use,
+            }
+            | Self::RequiredAny {
+                disable_parallel_tool_use,
+            }
+            | Self::RequiredSpecific {
+                disable_parallel_tool_use,
+                ..
+            } => *disable_parallel_tool_use,
+            Self::Disabled => false,
+        }
+    }
+
+    pub(crate) fn accepts_tool_fragment(
+        &self,
+        reserved_tool_id: &mut Option<String>,
+        slot_closed: bool,
+        tool_id: &str,
+    ) -> bool {
+        if !self.disables_parallel_tool_use() {
+            return true;
+        }
+        if slot_closed {
+            return false;
+        }
+        match reserved_tool_id {
+            Some(reserved) => reserved == tool_id,
+            slot @ None => {
+                *slot = Some(tool_id.to_owned());
+                true
+            }
+        }
+    }
 }
 
 const REQUIRED_TOOL_NUDGE: &str =
     " (Client requirement: you MUST call this tool before answering.)";
 const REQUIRED_ANY_NUDGE: &str =
     " (Client requirement: you MUST call at least one of the provided tools before answering.)";
+const SINGLE_TOOL_NUDGE: &str = " (Client requirement: call at most one tool in this response.)";
 const REQUIRED_SCHEMA_METADATA_NUDGE: &str =
     " Input is expected to include every property marked required by the schema.";
 
@@ -880,6 +918,13 @@ pub fn convert_request_with_mode(
             }
         }
         ToolChoicePolicy::Auto { .. } => {}
+    }
+    if tool_choice_policy.disables_parallel_tool_use() {
+        for tool in &mut tools {
+            tool.tool_specification
+                .description
+                .push_str(SINGLE_TOOL_NUDGE);
+        }
     }
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
@@ -2411,6 +2456,51 @@ mod tests {
             disable_parallel_tool_use: false,
         }));
         assert_eq!(explicit_auto, "Get current weather.");
+    }
+
+    #[test]
+    fn disable_parallel_tool_use_adds_single_tool_nudge() {
+        use super::super::types::ToolChoice;
+
+        for choice in [
+            ToolChoice::Auto {
+                disable_parallel_tool_use: true,
+            },
+            ToolChoice::Any {
+                disable_parallel_tool_use: true,
+            },
+            ToolChoice::Tool {
+                name: "get_weather".to_string(),
+                disable_parallel_tool_use: true,
+            },
+        ] {
+            let description = converted_weather_description(Some(choice));
+            assert!(
+                description.contains("at most one tool in this response"),
+                "missing single-tool nudge: {description}"
+            );
+        }
+    }
+
+    #[test]
+    fn disable_parallel_reserves_first_observed_tool_id_across_fragments() {
+        let disabled = ToolChoicePolicy::Auto {
+            disable_parallel_tool_use: true,
+        };
+        let mut reserved = None;
+        assert!(disabled.accepts_tool_fragment(&mut reserved, false, "tool_1"));
+        assert!(disabled.accepts_tool_fragment(&mut reserved, false, "tool_1"));
+        assert!(!disabled.accepts_tool_fragment(&mut reserved, false, "tool_2"));
+        assert!(!disabled.accepts_tool_fragment(&mut reserved, true, "tool_1"));
+        assert_eq!(reserved.as_deref(), Some("tool_1"));
+
+        let allowed = ToolChoicePolicy::Auto {
+            disable_parallel_tool_use: false,
+        };
+        let mut unrestricted = None;
+        assert!(allowed.accepts_tool_fragment(&mut unrestricted, false, "tool_1"));
+        assert!(allowed.accepts_tool_fragment(&mut unrestricted, true, "tool_2"));
+        assert!(unrestricted.is_none());
     }
 
     #[test]

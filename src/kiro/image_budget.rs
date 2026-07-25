@@ -9,6 +9,8 @@ use crate::kiro::model::requests::{
 const EMPTY_RESPONSE_TOOL_RESULT_MAX_CHARS: usize = 512;
 const EMPTY_RESPONSE_TOOL_RESULT_TRUNCATION_NOTICE: &str =
     "\n[Tool result truncated during empty-response recovery]";
+const EMPTY_RESPONSE_MIN_HISTORY_IMAGES: usize = 3;
+const EMPTY_RESPONSE_OMITTED_IMAGE_NOTICE: &str = "[Historical image omitted during recovery]";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -94,16 +96,18 @@ pub struct ImageBudgetStats {
     pub after_base64_bytes: usize,
     pub resized_history_images: usize,
     pub unshrinkable_history_images: usize,
+    pub resized_current_images: usize,
+    pub unshrinkable_current_images: usize,
+    pub omitted_history_images: usize,
+    pub truncated_tool_results: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct PreparedKiroBodies {
     pub primary_body: String,
     pub threshold_retry_body: Option<String>,
-    pub empty_response_retry_body: Option<String>,
     pub primary_stats: ImageBudgetStats,
     pub retry_stats: Option<ImageBudgetStats>,
-    pub empty_response_retry_stats: Option<ImageBudgetStats>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -286,7 +290,51 @@ fn apply_empty_response_recovery(
             .user_input_message
             .images
         {
-            shrink_image_if_smaller(image, retry_policy, &mut stats);
+            if shrink_image_if_smaller(image, retry_policy, &mut stats) {
+                stats.resized_current_images += 1;
+            } else {
+                stats.unshrinkable_current_images += 1;
+            }
+        }
+
+        let mut images_left_to_omit = stats
+            .history_image_count
+            .saturating_sub(EMPTY_RESPONSE_MIN_HISTORY_IMAGES);
+        for message in &mut request.conversation_state.history {
+            if stats.after_base64_bytes <= policy.total_base64_budget_bytes
+                || images_left_to_omit == 0
+            {
+                break;
+            }
+            let Message::User(user) = message else {
+                continue;
+            };
+            let mut omitted_from_message = false;
+            while stats.after_base64_bytes > policy.total_base64_budget_bytes
+                && images_left_to_omit > 0
+                && !user.user_input_message.images.is_empty()
+            {
+                let omitted = user.user_input_message.images.remove(0);
+                stats.after_base64_bytes = stats
+                    .after_base64_bytes
+                    .saturating_sub(omitted.source.bytes.len());
+                stats.image_count = stats.image_count.saturating_sub(1);
+                stats.history_image_count = stats.history_image_count.saturating_sub(1);
+                stats.omitted_history_images += 1;
+                images_left_to_omit -= 1;
+                omitted_from_message = true;
+            }
+            if omitted_from_message
+                && user.user_input_message.images.is_empty()
+                && user.user_input_message.content.trim().is_empty()
+                && user
+                    .user_input_message
+                    .user_input_message_context
+                    .tool_results
+                    .is_empty()
+            {
+                user.user_input_message.content = EMPTY_RESPONSE_OMITTED_IMAGE_NOTICE.to_string();
+            }
         }
     }
 
@@ -297,6 +345,7 @@ fn apply_empty_response_recovery(
         .user_input_message_context
         .tool_results
     {
+        let mut truncated_result = false;
         for content in &mut result.content {
             let Some(serde_json::Value::String(text)) = content.get_mut("text") else {
                 continue;
@@ -311,26 +360,28 @@ fn apply_empty_response_recovery(
                 .collect::<String>();
             truncated.push_str(EMPTY_RESPONSE_TOOL_RESULT_TRUNCATION_NOTICE);
             *text = truncated;
+            truncated_result = true;
+        }
+        if truncated_result {
+            stats.truncated_tool_results += 1;
         }
     }
 
     stats
 }
 
-fn empty_response_retry(
-    request: &KiroRequest,
-    policy: ImageBudgetPolicy,
+pub fn prepare_empty_response_retry_body(
     primary_body: &str,
-) -> Result<(Option<String>, Option<ImageBudgetStats>), ImageBudgetError> {
-    let mut recovery = request.clone();
+    policy: ImageBudgetPolicy,
+) -> Result<Option<(String, ImageBudgetStats)>, ImageBudgetError> {
+    let policy = policy.validate()?;
+    let mut recovery: KiroRequest = serde_json::from_str(primary_body)
+        .map_err(|error| ImageBudgetError::Serialization(error.to_string()))?;
     let recovery_stats = apply_empty_response_recovery(&mut recovery, policy);
     let recovery_body = serde_json::to_string(&recovery)
         .map_err(|error| ImageBudgetError::Serialization(error.to_string()))?;
     let changed = recovery_body != primary_body;
-    Ok((
-        changed.then_some(recovery_body),
-        changed.then_some(recovery_stats),
-    ))
+    Ok(changed.then_some((recovery_body, recovery_stats)))
 }
 
 /// 从同一个原始请求生成普通请求体、阈值重试体和空响应恢复体。
@@ -347,15 +398,11 @@ pub fn prepare_kiro_bodies(
         let stats = collect_stats(request);
         let body = serde_json::to_string(request)
             .map_err(|error| ImageBudgetError::Serialization(error.to_string()))?;
-        let (empty_response_retry_body, empty_response_retry_stats) =
-            empty_response_retry(request, policy, &body)?;
         return Ok(PreparedKiroBodies {
             primary_body: body,
             threshold_retry_body: None,
-            empty_response_retry_body,
             primary_stats: stats,
             retry_stats: None,
-            empty_response_retry_stats,
         });
     }
 
@@ -374,27 +421,19 @@ pub fn prepare_kiro_bodies(
 
     if primary_stats.after_base64_bytes <= policy.hard_base64_limit_bytes {
         let retry_fits = retry_stats.after_base64_bytes <= policy.hard_base64_limit_bytes;
-        let (empty_response_retry_body, empty_response_retry_stats) =
-            empty_response_retry(request, policy, &primary_body)?;
         return Ok(PreparedKiroBodies {
             primary_body,
             threshold_retry_body: (has_useful_retry && retry_fits).then_some(retry_body),
-            empty_response_retry_body,
             primary_stats,
             retry_stats: (has_useful_retry && retry_fits).then_some(retry_stats),
-            empty_response_retry_stats,
         });
     }
     if has_useful_retry && retry_stats.after_base64_bytes <= policy.hard_base64_limit_bytes {
-        let (empty_response_retry_body, empty_response_retry_stats) =
-            empty_response_retry(request, policy, &retry_body)?;
         return Ok(PreparedKiroBodies {
             primary_body: retry_body,
             threshold_retry_body: None,
-            empty_response_retry_body,
             primary_stats: retry_stats,
             retry_stats: None,
-            empty_response_retry_stats,
         });
     }
 
@@ -492,26 +531,21 @@ mod tests {
         let historical = make_png(640, 640);
         let current = make_png(640, 640);
         let request = request_with_images(vec![historical.clone()], vec![current.clone()]);
-        let prepared = prepare_kiro_bodies(
-            &request,
-            ImageBudgetPolicy {
-                total_base64_budget_bytes: 8 * 1024 * 1024,
-                hard_base64_limit_bytes: 8 * 1024 * 1024,
-                retry_history_max_dimension: 480,
-                retry_history_jpeg_quality: 45,
-                ..ImageBudgetPolicy::default()
-            },
-        )
-        .unwrap();
+        let policy = ImageBudgetPolicy {
+            total_base64_budget_bytes: 8 * 1024 * 1024,
+            hard_base64_limit_bytes: 8 * 1024 * 1024,
+            retry_history_max_dimension: 480,
+            retry_history_jpeg_quality: 45,
+            ..ImageBudgetPolicy::default()
+        };
+        let prepared = prepare_kiro_bodies(&request, policy).unwrap();
 
         let primary: KiroRequest = serde_json::from_str(&prepared.primary_body).unwrap();
-        let recovery: KiroRequest = serde_json::from_str(
-            prepared
-                .empty_response_retry_body
-                .as_deref()
-                .expect("current images should produce an empty-response recovery body"),
-        )
-        .unwrap();
+        let (recovery_body, recovery_stats) =
+            prepare_empty_response_retry_body(&prepared.primary_body, policy)
+                .unwrap()
+                .expect("current images should produce an empty-response recovery body");
+        let recovery: KiroRequest = serde_json::from_str(&recovery_body).unwrap();
 
         assert_eq!(count_images(&recovery), count_images(&primary));
         assert_eq!(
@@ -541,9 +575,66 @@ mod tests {
             },
             &historical
         );
-        let recovery_stats = prepared.empty_response_retry_stats.unwrap();
         assert_eq!(recovery_stats.image_count, count_images(&recovery));
         assert!(recovery_stats.after_base64_bytes < recovery_stats.before_base64_bytes);
+    }
+
+    #[test]
+    fn empty_response_retry_omits_oldest_history_images_but_keeps_three() {
+        let history = (0..6)
+            .map(|index| make_png(640 + index * 8, 640 + index * 8))
+            .collect::<Vec<_>>();
+        let current = make_png(704, 704);
+        let mut request = request_with_images(history, vec![current]);
+        for message in &mut request.conversation_state.history {
+            let Message::User(message) = message else {
+                continue;
+            };
+            message.user_input_message.content.clear();
+        }
+        let policy = ImageBudgetPolicy {
+            total_base64_budget_bytes: 256 * 1024,
+            hard_base64_limit_bytes: 8 * 1024 * 1024,
+            retry_history_max_dimension: 480,
+            retry_history_jpeg_quality: 30,
+            ..ImageBudgetPolicy::default()
+        };
+        let prepared = prepare_kiro_bodies(&request, policy).unwrap();
+        let (recovery_body, stats) =
+            prepare_empty_response_retry_body(&prepared.primary_body, policy)
+                .unwrap()
+                .expect("oversized history should produce a recovery body");
+        let recovery: KiroRequest = serde_json::from_str(&recovery_body).unwrap();
+
+        assert_eq!(
+            recovery
+                .conversation_state
+                .current_message
+                .user_input_message
+                .images
+                .len(),
+            1
+        );
+        let history_messages = &recovery.conversation_state.history;
+        for message in &history_messages[..3] {
+            let Message::User(message) = message else {
+                panic!("fixture must contain historical user messages");
+            };
+            assert!(message.user_input_message.images.is_empty());
+            assert_eq!(
+                message.user_input_message.content,
+                "[Historical image omitted during recovery]"
+            );
+        }
+        for message in &history_messages[3..] {
+            let Message::User(message) = message else {
+                panic!("fixture must contain historical user messages");
+            };
+            assert_eq!(message.user_input_message.images.len(), 1);
+        }
+        assert_eq!(stats.history_image_count, 3);
+        assert_eq!(stats.current_image_count, 1);
+        assert_eq!(stats.omitted_history_images, 3);
     }
 
     #[test]
@@ -578,21 +669,19 @@ mod tests {
             .push(Message::User(historical));
         let original_body = serde_json::to_string(&request).unwrap();
 
-        let prepared = prepare_kiro_bodies(
-            &request,
-            ImageBudgetPolicy {
-                enabled: false,
-                ..ImageBudgetPolicy::default()
-            },
-        )
-        .unwrap();
+        let policy = ImageBudgetPolicy {
+            enabled: false,
+            ..ImageBudgetPolicy::default()
+        };
+        let prepared = prepare_kiro_bodies(&request, policy).unwrap();
         assert_eq!(prepared.primary_body, original_body);
 
-        let recovery: KiroRequest =
-            serde_json::from_str(prepared.empty_response_retry_body.as_deref().expect(
-                "long tool text must create a recovery body even when images are disabled",
-            ))
-            .unwrap();
+        let (recovery_body, recovery_stats) =
+            prepare_empty_response_retry_body(&prepared.primary_body, policy)
+                .unwrap()
+                .expect("long tool text must create a recovery body even when images are disabled");
+        let recovery: KiroRequest = serde_json::from_str(&recovery_body).unwrap();
+        assert_eq!(recovery_stats.truncated_tool_results, 1);
         let results = &recovery
             .conversation_state
             .current_message
@@ -638,8 +727,11 @@ mod tests {
 
         let prepared = prepare_kiro_bodies(&request, ImageBudgetPolicy::default()).unwrap();
 
-        assert!(prepared.empty_response_retry_body.is_none());
-        assert!(prepared.empty_response_retry_stats.is_none());
+        assert!(
+            prepare_empty_response_retry_body(&prepared.primary_body, ImageBudgetPolicy::default())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
