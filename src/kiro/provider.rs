@@ -52,9 +52,32 @@ const MAX_POLICY_TOTAL_RETRIES: usize = 30;
 /// 代理池条目较多时，避免每个不同代理都常驻一个 reqwest::Client 导致内存无界增长。
 const CLIENT_CACHE_CAP: usize = 64;
 
-/// 默认最好模式：Kiro Runtime 首选，随后依次尝试三个 Legacy IDE 协议端点。
-pub const BEST_ENDPOINT_NAME: &str = "runtime";
-pub const BEST_ENDPOINT_CHAIN: &[&str] = &["ide", "codewhisperer", "amazonq"];
+/// 默认最好模式：`ide`（`q.amazonaws.com`）首选，429 时降级到 `runtime`
+/// （`runtime.kiro.dev` —— 独立域名，是最独立的限流桶）。
+///
+/// 顺序与桶数量由生产实测确定（2026-07-25，24h / 41 万 trace / 115 万 attempt）：
+///
+/// | 端点 | attempt | 成功率 | 429 率 |
+/// |---|---|---|---|
+/// | ide | 50,997 | 94.1% | **0.055%** |
+/// | runtime | 114,022 | 54.0% | **44.4%**（高峰 69.4%） |
+/// | amazonq | 2,849 | 20.9% | 0.4% |
+/// | codewhisperer | 3,027 | 5.9% | 77.8% |
+///
+/// 此前 `runtime` 做首跳，24h 内产生 51,089 次纯浪费的首跳 429（平均 224ms/次，
+/// 累计 191 分钟空转），其中约 4/5 靠降级到 `ide` 救回，平均每请求 1.93 次上游调用。
+/// 翻转后首跳落在 429 率低三个数量级的桶上：线上实测同长度窗口对照，上游 429 占比
+/// 25.0% → 0%，平均 attempt/请求 1.37 → 1.03。
+///
+/// `codewhisperer` / `amazonq` 不入链：成功率仅 5.9% / 20.9%，留在链里只是在首跳失败后
+/// 继续消耗 `maxBucketAttemptsPerRequest` 预算并拉长客户端等待。两者仍在 endpoint
+/// 注册表中，可通过 `config.endpointChains` 单独配回。
+///
+/// 注意：本常量只决定「凭据未显式指定 endpoint 时的首跳」，不影响 [`EndpointMode::Best`]
+/// 的调度能力（会话粘性 / 强制 least_conn / TTFB 评分）—— 那些以 `EndpointMode` 取值为
+/// 条件，与端点名无关。
+pub const BEST_ENDPOINT_NAME: &str = "ide";
+pub const BEST_ENDPOINT_CHAIN: &[&str] = &["runtime"];
 
 pub fn best_endpoint_name() -> &'static str {
     BEST_ENDPOINT_NAME
@@ -62,6 +85,31 @@ pub fn best_endpoint_name() -> &'static str {
 
 pub fn best_endpoint_chain() -> &'static [&'static str] {
     BEST_ENDPOINT_CHAIN
+}
+
+/// 解析某个主端点的 429 降级链，优先级从高到低：
+///
+/// 1. `configured` —— 运行时覆盖 `config.endpointChains`（管理面板可改）。对 best 模式的
+///    主端点**同样生效**。此前调用点把 best 主端点无条件锁死成 [`BEST_ENDPOINT_CHAIN`]，
+///    使面板上那个「429 降级桶链」在最常见的路径（best 模式首跳）上是死代码 —— 运营改了
+///    不生效，且无任何提示。`Some(vec![])` 是有效值，表示「显式配置为无兜底」，不可与
+///    「未配置」混同。
+/// 2. best 模式主端点的内置链 [`BEST_ENDPOINT_CHAIN`]。
+/// 3. 该 endpoint 的静态 `fallback_chain()`。
+fn resolve_fallback_chain(
+    primary: &str,
+    static_chain: &'static [&'static str],
+    configured: Option<Vec<String>>,
+    mode: EndpointMode,
+) -> Vec<String> {
+    configured.unwrap_or_else(|| {
+        let builtin = if mode == EndpointMode::Best && primary == BEST_ENDPOINT_NAME {
+            BEST_ENDPOINT_CHAIN
+        } else {
+            static_chain
+        };
+        builtin.iter().map(|s| (*s).to_string()).collect()
+    })
 }
 
 /// 业务流的空闲截止由 Anthropic 适配层的 watchdog 单独负责。
@@ -1735,27 +1783,13 @@ impl KiroProvider {
                 // 沿降级链依次尝试每个备用桶（换桶不换号），命中第一个 2xx 即返回；
                 // 整条链都失败才落回下方的账号风控/瞬态重试逻辑。参考 demo 的多端点重试。
                 //
-                // 降级链来源：运行时覆盖（config.endpointChains，管理面板可改）优先，
-                // 未配置该主端点时回退各 endpoint 的静态 fallback_chain()（零行为变化）。
-                let fallback_chain: Vec<String> = if self.token_manager.get_endpoint_mode()
-                    == EndpointMode::Best
-                    && endpoint.name() == BEST_ENDPOINT_NAME
-                {
-                    BEST_ENDPOINT_CHAIN
-                        .iter()
-                        .map(|s| (*s).to_string())
-                        .collect()
-                } else {
-                    self.token_manager
-                        .endpoint_chain_for(endpoint.name())
-                        .unwrap_or_else(|| {
-                            endpoint
-                                .fallback_chain()
-                                .iter()
-                                .map(|s| s.to_string())
-                                .collect()
-                        })
-                };
+                // 降级链来源见 resolve_fallback_chain：面板覆盖 > best 内置链 > 静态链。
+                let fallback_chain: Vec<String> = resolve_fallback_chain(
+                    endpoint.name(),
+                    endpoint.fallback_chain(),
+                    self.token_manager.endpoint_chain_for(endpoint.name()),
+                    self.token_manager.get_endpoint_mode(),
+                );
                 for fb_name in &fallback_chain {
                     // 单请求桶尝试总数硬上限（跨 attempt 累计）：防止「链长 × attempt 数」
                     // 把单请求放大成上百次上游调用。0 = 不限。
@@ -2384,10 +2418,83 @@ mod tests {
         assert_eq!(calls, 2);
     }
 
+    /// best 模式必须以 429 率最低的桶起手。生产实测 `runtime` 首跳 429 率 44.4%
+    /// （高峰 69.4%），`ide` 仅 0.055%；链外的 codewhisperer / amazonq 成功率只有
+    /// 5.9% / 20.9%。回归此断言即回归到「首跳必被限流」的形状。
     #[test]
-    fn best_endpoint_chain_has_runtime_primary_and_three_legacy_fallbacks() {
-        assert_eq!(best_endpoint_name(), "runtime");
-        assert_eq!(best_endpoint_chain(), &["ide", "codewhisperer", "amazonq"]);
+    fn best_endpoint_chain_is_ide_primary_with_runtime_fallback() {
+        assert_eq!(best_endpoint_name(), "ide");
+        assert_eq!(best_endpoint_chain(), &["runtime"]);
+        assert!(
+            !best_endpoint_chain().contains(&"codewhisperer"),
+            "低成功率桶不应入 best 链，否则白烧 maxBucketAttemptsPerRequest 预算"
+        );
+        assert!(!best_endpoint_chain().contains(&"amazonq"));
+    }
+
+    /// 回归：best 模式主端点此前无条件用内置链，面板配的覆盖被静默丢弃（死代码）。
+    #[test]
+    fn configured_chain_overrides_builtin_even_for_best_primary() {
+        assert_eq!(
+            resolve_fallback_chain(
+                BEST_ENDPOINT_NAME,
+                &["runtime"],
+                Some(vec!["amazonq".to_string()]),
+                EndpointMode::Best,
+            ),
+            vec!["amazonq".to_string()],
+            "面板配置必须能覆盖 best 主端点的内置链"
+        );
+    }
+
+    /// 未配置覆盖时：best 主端点用内置链，其它端点用各自静态链。
+    #[test]
+    fn unconfigured_chain_falls_back_to_builtin_then_static() {
+        assert_eq!(
+            resolve_fallback_chain(
+                BEST_ENDPOINT_NAME,
+                &["should-not-be-used"],
+                None,
+                EndpointMode::Best,
+            ),
+            vec!["runtime".to_string()],
+            "best 主端点无覆盖时用 BEST_ENDPOINT_CHAIN，而非该 endpoint 的静态链"
+        );
+        // 非 best 主端点（best 模式下凭据仍可显式指定别的端点）走静态链
+        assert_eq!(
+            resolve_fallback_chain(
+                "codewhisperer",
+                &["runtime", "ide"],
+                None,
+                EndpointMode::Best,
+            ),
+            vec!["runtime".to_string(), "ide".to_string()]
+        );
+        // manual 模式下即使端点名等于 BEST_ENDPOINT_NAME，也走静态链
+        assert_eq!(
+            resolve_fallback_chain(
+                BEST_ENDPOINT_NAME,
+                &["runtime", "codewhisperer"],
+                None,
+                EndpointMode::Manual,
+            ),
+            vec!["runtime".to_string(), "codewhisperer".to_string()]
+        );
+    }
+
+    /// 显式配空数组 = 「该端点无兜底」，不能被误当作未配置而回退到内置链。
+    #[test]
+    fn explicit_empty_chain_means_no_fallback() {
+        assert!(
+            resolve_fallback_chain(
+                BEST_ENDPOINT_NAME,
+                &["runtime"],
+                Some(Vec::new()),
+                EndpointMode::Best,
+            )
+            .is_empty(),
+            "Some(vec![]) 是有效配置，表示显式关闭降级"
+        );
     }
 
     #[test]

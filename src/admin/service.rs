@@ -1243,7 +1243,18 @@ impl AdminService {
     pub fn get_all_credentials(&self) -> CredentialsStatusResponse {
         let snapshot = self.token_manager.snapshot();
         let rpm_summary = calculate_rpm_summary(&snapshot.entries);
-        let default_endpoint = self.token_manager.config().default_endpoint.clone();
+        // 凭据未显式配置 endpoint 时的**真实**首跳端点。
+        //
+        // 必须与 `KiroProvider::endpoint_for()` 的解析顺序一致：
+        // 凭据自身字段 > best 模式内置首跳 > config.defaultEndpoint。
+        // 此前这里无条件回退 `defaultEndpoint`，而 best 模式实际会忽略它、强制走内置首跳 ——
+        // 面板于是给每张 endpoint 为空的凭据显示了一个请求根本没去过的端点
+        // （配 defaultEndpoint="ide" 却实走 runtime），排查 429 时严重误导。
+        let default_endpoint = if self.token_manager.get_endpoint_mode() == EndpointMode::Best {
+            crate::kiro::provider::best_endpoint_name().to_string()
+        } else {
+            self.token_manager.config().default_endpoint.clone()
+        };
 
         // 一次性快照余额缓存，避免 N 次加锁
         let balance_snapshot: HashMap<u64, CachedBalance> = {
@@ -4826,15 +4837,16 @@ impl AdminService {
 
 fn endpoint_mode_response(mode: EndpointMode) -> EndpointModeResponse {
     match mode {
+        // 首跳 / 降级链取自 provider 的单一事实源，避免展示值与真实路由分叉
+        // （改了常量却忘改这段，面板就会显示一条不存在的路由）。
         EndpointMode::Best => EndpointModeResponse {
             mode: "best".to_string(),
             label: "默认最好模式".to_string(),
-            primary_endpoint: "runtime".to_string(),
-            fallback_endpoints: vec![
-                "ide".to_string(),
-                "codewhisperer".to_string(),
-                "amazonq".to_string(),
-            ],
+            primary_endpoint: crate::kiro::provider::best_endpoint_name().to_string(),
+            fallback_endpoints: crate::kiro::provider::best_endpoint_chain()
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
             adaptive_scheduling: true,
         },
         EndpointMode::Manual => EndpointModeResponse {
