@@ -140,11 +140,7 @@ impl UsageRecorder {
     }
 
     /// 顺序读取时间窗口涉及的 JSONL 文件；读取前 flush 当前 writer，保证最新记录可见。
-    pub fn query_range(
-        &self,
-        start_epoch: i64,
-        end_epoch: i64,
-    ) -> std::io::Result<UsageRangeRead> {
+    pub fn query_range(&self, start_epoch: i64, end_epoch: i64) -> std::io::Result<UsageRangeRead> {
         if start_epoch > end_epoch {
             return Ok(UsageRangeRead::default());
         }
@@ -805,10 +801,8 @@ mod tests {
     }
 
     fn temp_usage_dir(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "kiro-rs-usage-{name}-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("kiro-rs-usage-{name}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&path).unwrap();
         path
     }
@@ -846,10 +840,7 @@ mod tests {
 
         let mut current = legacy;
         current.trace_id = Some("trace-1".to_string());
-        assert_eq!(
-            serde_json::to_value(current).unwrap()["traceId"],
-            "trace-1"
-        );
+        assert_eq!(serde_json::to_value(current).unwrap()["traceId"], "trace-1");
     }
 
     #[test]
@@ -871,25 +862,20 @@ mod tests {
                     1.0,
                 ))
                 .unwrap(),
-                serde_json::to_string(&usage_test_record(
-                    &included.to_rfc3339(),
-                    None,
-                    2.0,
-                ))
-                .unwrap(),
-                serde_json::to_string(&usage_test_record(
-                    &end.to_rfc3339(),
-                    Some("end"),
-                    3.0,
-                ))
-                .unwrap(),
+                serde_json::to_string(&usage_test_record(&included.to_rfc3339(), None, 2.0))
+                    .unwrap(),
+                serde_json::to_string(&usage_test_record(&end.to_rfc3339(), Some("end"), 3.0))
+                    .unwrap(),
                 "{not-json".to_string(),
                 serde_json::to_string(&invalid_timestamp).unwrap(),
             ],
         );
 
         let result = recorder
-            .query_range((before + Duration::minutes(30)).timestamp(), end.timestamp())
+            .query_range(
+                (before + Duration::minutes(30)).timestamp(),
+                end.timestamp(),
+            )
             .unwrap();
         assert_eq!(result.records.len(), 2);
         assert_eq!(result.records[0].credits, 2.0);
@@ -905,16 +891,9 @@ mod tests {
         let recorder = UsageRecorder::with_retention(dir.clone(), 31);
         let date = NaiveDate::from_ymd_opt(2026, 7, 23).unwrap();
         let base = local_time(date, 12, 0, 0);
-        let later = usage_test_record(
-            &base.with_nanosecond(200).unwrap().to_rfc3339(),
-            None,
-            2.0,
-        );
-        let earlier = usage_test_record(
-            &base.with_nanosecond(100).unwrap().to_rfc3339(),
-            None,
-            1.0,
-        );
+        let later = usage_test_record(&base.with_nanosecond(200).unwrap().to_rfc3339(), None, 2.0);
+        let earlier =
+            usage_test_record(&base.with_nanosecond(100).unwrap().to_rfc3339(), None, 1.0);
         write_usage_lines(
             &dir,
             date,
@@ -965,7 +944,9 @@ mod tests {
         }
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
 
-        let result = recorder.query_range(ts.timestamp(), ts.timestamp()).unwrap();
+        let result = recorder
+            .query_range(ts.timestamp(), ts.timestamp())
+            .unwrap();
         assert_eq!(result.records.len(), 1);
         assert_eq!(result.records[0].trace_id.as_deref(), Some("buffered"));
         drop(recorder);
@@ -982,22 +963,17 @@ mod tests {
         let end = local_time(second_date, 0, 0, 1);
         let first = usage_test_record(&start.to_rfc3339(), None, 1.0);
         let second = usage_test_record(&end.to_rfc3339(), None, 2.0);
-        let unrelated = usage_test_record(
-            &(start + Duration::seconds(1)).to_rfc3339(),
-            None,
-            99.0,
-        );
-        write_usage_lines(
-            &dir,
-            first_date,
-            &[serde_json::to_string(&first).unwrap()],
-        );
+        let unrelated = usage_test_record(&(start + Duration::seconds(1)).to_rfc3339(), None, 99.0);
+        write_usage_lines(&dir, first_date, &[serde_json::to_string(&first).unwrap()]);
         write_usage_lines(
             &dir,
             second_date,
             &[serde_json::to_string(&second).unwrap()],
         );
-        for date in [first_date.pred_opt().unwrap(), second_date.succ_opt().unwrap()] {
+        for date in [
+            first_date.pred_opt().unwrap(),
+            second_date.succ_opt().unwrap(),
+        ] {
             write_usage_lines(
                 &dir,
                 date,
@@ -1031,11 +1007,8 @@ mod tests {
         let date = NaiveDate::from_ymd_opt(2026, 7, 23).unwrap();
         let end = local_time(date, 12, 0, 0);
         let exact_end = usage_test_record(&end.to_rfc3339(), None, 1.0);
-        let after_end = usage_test_record(
-            &(end + Duration::milliseconds(999)).to_rfc3339(),
-            None,
-            2.0,
-        );
+        let after_end =
+            usage_test_record(&(end + Duration::milliseconds(999)).to_rfc3339(), None, 2.0);
         write_usage_lines(
             &dir,
             date,

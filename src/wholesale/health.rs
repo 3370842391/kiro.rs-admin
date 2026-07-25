@@ -53,8 +53,8 @@ impl AccountHealth {
 /// `403 Forbidden {"message":"Your User ID is temporarily su[spended]..."}`
 /// 注意日志常被截断成 `temporarily su`，也要覆盖。
 const BAN_MARKERS: &[&str] = &[
-    "suspend",          // suspended / suspension（完整词）
-    "temporarily su",   // 截断日志：temporarily su[spended]
+    "suspend",        // suspended / suspension（完整词）
+    "temporarily su", // 截断日志：temporarily su[spended]
     "banned",
     "account is disabled",
     "account has been disabled",
@@ -116,7 +116,11 @@ fn extract_http_status(text: &str) -> Option<u16> {
 /// 叠加额度维度：号活着（200）时，若剩余额度 <= 阈值则降级为 `LowQuota`。
 ///
 /// `remaining` 为 None 表示未探到额度信息，保持 `Active`。
-pub fn classify_with_quota(base: AccountHealth, remaining: Option<i64>, low_threshold: i64) -> AccountHealth {
+pub fn classify_with_quota(
+    base: AccountHealth,
+    remaining: Option<i64>,
+    low_threshold: i64,
+) -> AccountHealth {
     match base {
         AccountHealth::Active => match remaining {
             Some(r) if r <= low_threshold => AccountHealth::LowQuota,
@@ -148,23 +152,35 @@ mod tests {
     fn cross_region_403_without_ban_is_transient() {
         // 跨区兼容 403：body 里没有封禁字样 → 可重试，绝不能判死
         let body = r#"{"message":"Invalid token for this region"}"#;
-        assert_eq!(classify_account_health(403, body), AccountHealth::TransientAuth);
+        assert_eq!(
+            classify_account_health(403, body),
+            AccountHealth::TransientAuth
+        );
     }
 
     #[test]
     fn improperly_formed_400_is_unknown() {
         let body = r#"{"message":"Improperly formed request"}"#;
-        assert_eq!(classify_account_health(400, body), AccountHealth::Unknown(400));
+        assert_eq!(
+            classify_account_health(400, body),
+            AccountHealth::Unknown(400)
+        );
     }
 
     #[test]
     fn plain_401_is_transient() {
-        assert_eq!(classify_account_health(401, "unauthorized"), AccountHealth::TransientAuth);
+        assert_eq!(
+            classify_account_health(401, "unauthorized"),
+            AccountHealth::TransientAuth
+        );
     }
 
     #[test]
     fn ok_200_is_active() {
-        assert_eq!(classify_account_health(200, r#"{"models":[]}"#), AccountHealth::Active);
+        assert_eq!(
+            classify_account_health(200, r#"{"models":[]}"#),
+            AccountHealth::Active
+        );
     }
 
     #[test]
@@ -175,7 +191,8 @@ mod tests {
 
     #[test]
     fn error_text_403_suspended_parses_dead() {
-        let err = r#"ListAvailableModels HTTP 403: {"message":"Your User ID is temporarily suspended"}"#;
+        let err =
+            r#"ListAvailableModels HTTP 403: {"message":"Your User ID is temporarily suspended"}"#;
         assert_eq!(classify_from_error_text(err), AccountHealth::Dead);
     }
 

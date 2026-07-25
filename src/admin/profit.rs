@@ -348,7 +348,9 @@ pub fn aggregate_ledger_report(
             } else {
                 return None;
             };
-            key_by_id.contains_key(&attribution.key_id).then_some(attribution)
+            key_by_id
+                .contains_key(&attribution.key_id)
+                .then_some(attribution)
         })
         .collect();
 
@@ -717,12 +719,7 @@ mod tests {
         }
     }
 
-    fn usage(
-        trace_id: Option<&str>,
-        key_id: u64,
-        credits: f64,
-        status: &str,
-    ) -> UsageRecord {
+    fn usage(trace_id: Option<&str>, key_id: u64, credits: f64, status: &str) -> UsageRecord {
         UsageRecord {
             ts: "2026-07-23T01:00:00Z".to_string(),
             trace_id: trace_id.map(str::to_string),

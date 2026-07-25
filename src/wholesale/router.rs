@@ -10,11 +10,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
+    Router,
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json},
     routing::{get, post},
-    Router,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -51,7 +51,9 @@ impl WholesaleState {
 
     fn sync_lock_for(&self, customer_id: i64) -> Arc<AsyncMutex<()>> {
         let mut map = self.sync_locks.lock();
-        map.entry(customer_id).or_insert_with(|| Arc::new(AsyncMutex::new(()))).clone()
+        map.entry(customer_id)
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
     }
 }
 
@@ -103,17 +105,22 @@ pub fn verify_password(password: &str, stored: &str) -> bool {
 
 /// 生成 wsk_ key / uid
 fn gen_wsk_key() -> String {
-    let raw: String = (0..32).map(|_| {
-        let c = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"[fastrand::usize(..62)];
-        c as char
-    }).collect();
+    let raw: String = (0..32)
+        .map(|_| {
+            let c = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+                [fastrand::usize(..62)];
+            c as char
+        })
+        .collect();
     format!("wsk_{raw}")
 }
 fn gen_uid() -> String {
-    let raw: String = (0..8).map(|_| {
-        let c = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789"[fastrand::usize(..32)];
-        c as char
-    }).collect();
+    let raw: String = (0..8)
+        .map(|_| {
+            let c = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789"[fastrand::usize(..32)];
+            c as char
+        })
+        .collect();
     format!("u_{raw}")
 }
 
@@ -124,7 +131,10 @@ fn extract_wsk(headers: &HeaderMap) -> Option<String> {
             return Some(rest.trim().to_string());
         }
     }
-    headers.get("x-api-key").and_then(|h| h.to_str().ok()).map(|s| s.to_string())
+    headers
+        .get("x-api-key")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string())
 }
 
 fn err(code: StatusCode, msg: &str) -> (StatusCode, Json<serde_json::Value>) {
@@ -134,7 +144,11 @@ fn err(code: StatusCode, msg: &str) -> (StatusCode, Json<serde_json::Value>) {
 // ───────────────────────── 客户接口 ─────────────────────────
 
 #[derive(Deserialize)]
-struct RegisterReq { username: String, password: String, email: Option<String> }
+struct RegisterReq {
+    username: String,
+    password: String,
+    email: Option<String>,
+}
 
 async fn register(
     State(st): State<WholesaleState>,
@@ -144,30 +158,45 @@ async fn register(
     if username.len() < 3 || req.password.len() < 6 {
         return err(StatusCode::BAD_REQUEST, "用户名至少3位、密码至少6位").into_response();
     }
-    if st.store.customer_by_username(username).ok().flatten().is_some() {
+    if st
+        .store
+        .customer_by_username(username)
+        .ok()
+        .flatten()
+        .is_some()
+    {
         return err(StatusCode::CONFLICT, "用户名已存在").into_response();
     }
     let uid = gen_uid();
     let key = gen_wsk_key();
     let pw = hash_password(&req.password);
-    match st.store.create_customer(&uid, &key, username, &pw, req.email.as_deref()) {
+    match st
+        .store
+        .create_customer(&uid, &key, username, &pw, req.email.as_deref())
+    {
         Ok(c) => Json(json!({
             "uid": c.uid, "apiKey": key, "username": c.username,
             "target": c.target, "balanceCents": 0,
             "note": "apiKey 只显示一次，请妥善保存"
-        })).into_response(),
+        }))
+        .into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &format!("注册失败: {e}")).into_response(),
     }
 }
 
 #[derive(Deserialize)]
-struct LoginReq { username: String, password: String }
+struct LoginReq {
+    username: String,
+    password: String,
+}
 
-async fn login(
-    State(st): State<WholesaleState>,
-    Json(req): Json<LoginReq>,
-) -> impl IntoResponse {
-    let c = match st.store.customer_by_username(req.username.trim()).ok().flatten() {
+async fn login(State(st): State<WholesaleState>, Json(req): Json<LoginReq>) -> impl IntoResponse {
+    let c = match st
+        .store
+        .customer_by_username(req.username.trim())
+        .ok()
+        .flatten()
+    {
         Some(c) => c,
         None => return err(StatusCode::UNAUTHORIZED, "用户名或密码错误").into_response(),
     };
@@ -181,7 +210,8 @@ async fn login(
     Json(json!({
         "uid": c.uid, "apiKey": c.api_key, "username": c.username,
         "target": c.target, "balanceCents": c.balance_cents
-    })).into_response()
+    }))
+    .into_response()
 }
 
 // 鉴权：从 wsk_ key 定位客户；uid 若提供必须匹配
@@ -191,7 +221,11 @@ fn auth_customer(
     uid_hint: Option<&str>,
 ) -> Result<super::store::Customer, (StatusCode, Json<serde_json::Value>)> {
     let key = extract_wsk(headers).ok_or_else(|| err(StatusCode::UNAUTHORIZED, "缺少 wsk_ key"))?;
-    let c = st.store.customer_by_api_key(&key).ok().flatten()
+    let c = st
+        .store
+        .customer_by_api_key(&key)
+        .ok()
+        .flatten()
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "无效 key"))?;
     if c.disabled {
         return Err(err(StatusCode::FORBIDDEN, "账户已停用"));
@@ -230,7 +264,11 @@ async fn sync(
     // 归一化排除母号（接受 directory id 或 start url）
     let excludes = normalize_mothers(&req.exclude_mothers);
     let label = format!("wsk{}", c.id);
-    match st.service.sync_pool(c.id, req.target, req.region.as_deref(), &excludes, &label).await {
+    match st
+        .service
+        .sync_pool(c.id, req.target, req.region.as_deref(), &excludes, &label)
+        .await
+    {
         Ok(res) => Json(res).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &format!("同步失败: {e}")).into_response(),
     }
@@ -238,7 +276,8 @@ async fn sync(
 
 async fn pool(State(st): State<WholesaleState>, headers: HeaderMap) -> impl IntoResponse {
     let c = match auth_customer(&st, &headers, None) {
-        Ok(c) => c, Err(e) => return e.into_response(),
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
     };
     match st.service.current_pool(c.id, true) {
         Ok(items) => Json(json!({
@@ -246,20 +285,24 @@ async fn pool(State(st): State<WholesaleState>, headers: HeaderMap) -> impl Into
             "alive": items.iter().filter(|i| i.status == "active").count(),
             "balanceCents": c.balance_cents,
             "pool": items
-        })).into_response(),
+        }))
+        .into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e).into_response(),
     }
 }
 
 async fn balance(State(st): State<WholesaleState>, headers: HeaderMap) -> impl IntoResponse {
     let c = match auth_customer(&st, &headers, None) {
-        Ok(c) => c, Err(e) => return e.into_response(),
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
     };
     Json(json!({ "balanceCents": c.balance_cents, "uid": c.uid })).into_response()
 }
 
 #[derive(Deserialize)]
-struct RedeemReq { code: String }
+struct RedeemReq {
+    code: String,
+}
 
 async fn redeem(
     State(st): State<WholesaleState>,
@@ -267,7 +310,8 @@ async fn redeem(
     Json(req): Json<RedeemReq>,
 ) -> impl IntoResponse {
     let c = match auth_customer(&st, &headers, None) {
-        Ok(c) => c, Err(e) => return e.into_response(),
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
     };
     match st.store.redeem_cdk(req.code.trim(), c.id) {
         Ok(bal) => Json(json!({ "ok": true, "balanceCents": bal })).into_response(),
@@ -281,9 +325,14 @@ async fn mothers(State(st): State<WholesaleState>, headers: HeaderMap) -> impl I
     }
     match st.store.available_by_mother() {
         Ok(rows) => {
-            let list: Vec<_> = rows.into_iter().map(|(id, state, region, avail)| json!({
-                "motherId": id, "state": state, "region": region, "available": avail
-            })).collect();
+            let list: Vec<_> = rows
+                .into_iter()
+                .map(|(id, state, region, avail)| {
+                    json!({
+                        "motherId": id, "state": state, "region": region, "available": avail
+                    })
+                })
+                .collect();
             Json(json!({ "mothers": list })).into_response()
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()).into_response(),
@@ -291,7 +340,9 @@ async fn mothers(State(st): State<WholesaleState>, headers: HeaderMap) -> impl I
 }
 
 #[derive(Deserialize)]
-struct ReportBanReq { public_id: String }
+struct ReportBanReq {
+    public_id: String,
+}
 
 async fn report_ban(
     State(st): State<WholesaleState>,
@@ -299,21 +350,29 @@ async fn report_ban(
     Json(req): Json<ReportBanReq>,
 ) -> impl IntoResponse {
     let c = match auth_customer(&st, &headers, None) {
-        Ok(c) => c, Err(e) => return e.into_response(),
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
     };
     // 找到该客户名下这个 public_id 的活 holding
     let holdings = match st.store.holdings_for_customer(c.id, true) {
-        Ok(h) => h, Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()).into_response(),
+        Ok(h) => h,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()).into_response(),
     };
-    let target = holdings.into_iter().find(|h| h.public_id == req.public_id.trim() && h.status != "dead");
+    let target = holdings
+        .into_iter()
+        .find(|h| h.public_id == req.public_id.trim() && h.status != "dead");
     let target = match target {
         Some(t) => t,
         None => return err(StatusCode::NOT_FOUND, "未找到该号或已判死").into_response(),
     };
     // 服务端核实：拿号自己凭据探一次，真死才认
-    let health = st.service.probe_credential(target.credential_id as u64).await;
+    let health = st
+        .service
+        .probe_credential(target.credential_id as u64)
+        .await;
     if !health.is_dead() {
-        return Json(json!({ "ok": false, "verified": false, "note": "核实号仍存活，不予质保" })).into_response();
+        return Json(json!({ "ok": false, "verified": false, "note": "核实号仍存活，不予质保" }))
+            .into_response();
     }
     match st.store.mark_holding_dead(target.id) {
         Ok(refunded) => {
@@ -327,21 +386,30 @@ async fn report_ban(
 /// 归一化母号标识：从 start url 抽 directory id，否则原样。
 fn normalize_mothers(input: &[String]) -> Vec<String> {
     let re = regex::Regex::new(r"(d-[0-9a-f]{10})").unwrap();
-    input.iter().filter_map(|s| {
-        let s = s.trim();
-        if s.is_empty() { return None; }
-        if let Some(cap) = re.captures(s) {
-            Some(cap[1].to_string())
-        } else {
-            Some(s.to_string())
-        }
-    }).collect()
+    input
+        .iter()
+        .filter_map(|s| {
+            let s = s.trim();
+            if s.is_empty() {
+                return None;
+            }
+            if let Some(cap) = re.captures(s) {
+                Some(cap[1].to_string())
+            } else {
+                Some(s.to_string())
+            }
+        })
+        .collect()
 }
 
 // ───────────────────────── 管理端接口 ─────────────────────────
 
-fn auth_admin(st: &WholesaleState, headers: &HeaderMap) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    let key = extract_wsk(headers).ok_or_else(|| err(StatusCode::UNAUTHORIZED, "缺少 admin key"))?;
+fn auth_admin(
+    st: &WholesaleState,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let key =
+        extract_wsk(headers).ok_or_else(|| err(StatusCode::UNAUTHORIZED, "缺少 admin key"))?;
     let want = st.admin_api_key.read().clone();
     if crate::common::auth::constant_time_eq(&key, &want) {
         Ok(())
@@ -350,18 +418,26 @@ fn auth_admin(st: &WholesaleState, headers: &HeaderMap) -> Result<(), (StatusCod
     }
 }
 
-async fn admin_list_customers(State(st): State<WholesaleState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(e) = auth_admin(&st, &headers) { return e.into_response(); }
+async fn admin_list_customers(
+    State(st): State<WholesaleState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = auth_admin(&st, &headers) {
+        return e.into_response();
+    }
     match st.store.list_customers() {
         Ok(list) => {
-            let rows: Vec<_> = list.into_iter().map(|c| {
-                let alive = st.store.active_count(c.id).unwrap_or(0);
-                json!({
-                    "id": c.id, "uid": c.uid, "username": c.username, "email": c.email,
-                    "balanceCents": c.balance_cents, "target": c.target, "disabled": c.disabled,
-                    "aliveCount": alive, "createdAt": c.created_at
+            let rows: Vec<_> = list
+                .into_iter()
+                .map(|c| {
+                    let alive = st.store.active_count(c.id).unwrap_or(0);
+                    json!({
+                        "id": c.id, "uid": c.uid, "username": c.username, "email": c.email,
+                        "balanceCents": c.balance_cents, "target": c.target, "disabled": c.disabled,
+                        "aliveCount": alive, "createdAt": c.created_at
+                    })
                 })
-            }).collect();
+                .collect();
             Json(json!({ "customers": rows })).into_response()
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()).into_response(),
@@ -370,15 +446,27 @@ async fn admin_list_customers(State(st): State<WholesaleState>, headers: HeaderM
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct AdjustBalanceReq { customer_id: i64, delta_cents: i64, reason: String }
+struct AdjustBalanceReq {
+    customer_id: i64,
+    delta_cents: i64,
+    reason: String,
+}
 
 async fn admin_adjust_balance(
     State(st): State<WholesaleState>,
     headers: HeaderMap,
     Json(req): Json<AdjustBalanceReq>,
 ) -> impl IntoResponse {
-    if let Err(e) = auth_admin(&st, &headers) { return e.into_response(); }
-    match st.store.apply_wallet_delta(req.customer_id, req.delta_cents, "admin_adjust", Some(&req.reason), Some("admin")) {
+    if let Err(e) = auth_admin(&st, &headers) {
+        return e.into_response();
+    }
+    match st.store.apply_wallet_delta(
+        req.customer_id,
+        req.delta_cents,
+        "admin_adjust",
+        Some(&req.reason),
+        Some("admin"),
+    ) {
         Ok(bal) => Json(json!({ "ok": true, "balanceCents": bal })).into_response(),
         Err(e) => err(StatusCode::BAD_REQUEST, &e.to_string()).into_response(),
     }
@@ -386,11 +474,18 @@ async fn admin_adjust_balance(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SetTargetReq { customer_id: i64, target: i64 }
+struct SetTargetReq {
+    customer_id: i64,
+    target: i64,
+}
 async fn admin_set_target(
-    State(st): State<WholesaleState>, headers: HeaderMap, Json(req): Json<SetTargetReq>,
+    State(st): State<WholesaleState>,
+    headers: HeaderMap,
+    Json(req): Json<SetTargetReq>,
 ) -> impl IntoResponse {
-    if let Err(e) = auth_admin(&st, &headers) { return e.into_response(); }
+    if let Err(e) = auth_admin(&st, &headers) {
+        return e.into_response();
+    }
     match st.store.set_customer_target(req.customer_id, req.target) {
         Ok(_) => Json(json!({ "ok": true })).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()).into_response(),
@@ -399,12 +494,22 @@ async fn admin_set_target(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SetDisabledReq { customer_id: i64, disabled: bool }
+struct SetDisabledReq {
+    customer_id: i64,
+    disabled: bool,
+}
 async fn admin_set_disabled(
-    State(st): State<WholesaleState>, headers: HeaderMap, Json(req): Json<SetDisabledReq>,
+    State(st): State<WholesaleState>,
+    headers: HeaderMap,
+    Json(req): Json<SetDisabledReq>,
 ) -> impl IntoResponse {
-    if let Err(e) = auth_admin(&st, &headers) { return e.into_response(); }
-    match st.store.set_customer_disabled(req.customer_id, req.disabled) {
+    if let Err(e) = auth_admin(&st, &headers) {
+        return e.into_response();
+    }
+    match st
+        .store
+        .set_customer_disabled(req.customer_id, req.disabled)
+    {
         Ok(_) => Json(json!({ "ok": true })).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()).into_response(),
     }
@@ -412,27 +517,45 @@ async fn admin_set_disabled(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct GenCdkReq { value_cents: i64, count: i64, batch: Option<String> }
+struct GenCdkReq {
+    value_cents: i64,
+    count: i64,
+    batch: Option<String>,
+}
 
 async fn admin_gen_cdks(
-    State(st): State<WholesaleState>, headers: HeaderMap, Json(req): Json<GenCdkReq>,
+    State(st): State<WholesaleState>,
+    headers: HeaderMap,
+    Json(req): Json<GenCdkReq>,
 ) -> impl IntoResponse {
-    if let Err(e) = auth_admin(&st, &headers) { return e.into_response(); }
+    if let Err(e) = auth_admin(&st, &headers) {
+        return e.into_response();
+    }
     if req.value_cents <= 0 || req.count <= 0 || req.count > 10000 {
         return err(StatusCode::BAD_REQUEST, "面额需>0，数量1~10000").into_response();
     }
     let codes: Vec<String> = (0..req.count).map(|_| gen_cdk_code()).collect();
-    match st.store.create_cdks(&codes, req.value_cents, Some("admin"), req.batch.as_deref()) {
+    match st
+        .store
+        .create_cdks(&codes, req.value_cents, Some("admin"), req.batch.as_deref())
+    {
         Ok(n) => Json(json!({ "ok": true, "generated": n, "codes": codes })).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()).into_response(),
     }
 }
 
 async fn admin_list_cdks(
-    State(st): State<WholesaleState>, headers: HeaderMap, Query(q): Query<HashMap<String, String>>,
+    State(st): State<WholesaleState>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    if let Err(e) = auth_admin(&st, &headers) { return e.into_response(); }
-    let only_unused = q.get("unused").map(|v| v == "1" || v == "true").unwrap_or(false);
+    if let Err(e) = auth_admin(&st, &headers) {
+        return e.into_response();
+    }
+    let only_unused = q
+        .get("unused")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
     let limit: i64 = q.get("limit").and_then(|v| v.parse().ok()).unwrap_or(200);
     match st.store.list_cdks(only_unused, limit) {
         Ok(list) => Json(json!({ "cdks": list })).into_response(),
@@ -441,7 +564,9 @@ async fn admin_list_cdks(
 }
 
 async fn admin_mothers(State(st): State<WholesaleState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(e) = auth_admin(&st, &headers) { return e.into_response(); }
+    if let Err(e) = auth_admin(&st, &headers) {
+        return e.into_response();
+    }
     match st.store.list_mothers() {
         Ok(list) => Json(json!({ "mothers": list })).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()).into_response(),
@@ -450,11 +575,18 @@ async fn admin_mothers(State(st): State<WholesaleState>, headers: HeaderMap) -> 
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SetMotherStateReq { directory_id: String, state: String }
+struct SetMotherStateReq {
+    directory_id: String,
+    state: String,
+}
 async fn admin_set_mother_state(
-    State(st): State<WholesaleState>, headers: HeaderMap, Json(req): Json<SetMotherStateReq>,
+    State(st): State<WholesaleState>,
+    headers: HeaderMap,
+    Json(req): Json<SetMotherStateReq>,
 ) -> impl IntoResponse {
-    if let Err(e) = auth_admin(&st, &headers) { return e.into_response(); }
+    if let Err(e) = auth_admin(&st, &headers) {
+        return e.into_response();
+    }
     match st.store.set_mother_state(&req.directory_id, &req.state) {
         Ok(_) => Json(json!({ "ok": true })).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()).into_response(),
@@ -479,32 +611,48 @@ struct UploadAccount {
 }
 
 async fn admin_upload_test(
-    State(st): State<WholesaleState>, headers: HeaderMap, Json(req): Json<UploadTestReq>,
+    State(st): State<WholesaleState>,
+    headers: HeaderMap,
+    Json(req): Json<UploadTestReq>,
 ) -> impl IntoResponse {
-    if let Err(e) = auth_admin(&st, &headers) { return e.into_response(); }
+    if let Err(e) = auth_admin(&st, &headers) {
+        return e.into_response();
+    }
     let mut results = Vec::new();
     for a in req.accounts {
         // 母号：优先显式 mother_id，否则从 start_url 抽
         let mother_id = a.mother_id.clone().or_else(|| {
             a.start_url.as_deref().and_then(|u| {
-                regex::Regex::new(r"(d-[0-9a-f]{10})").ok()
+                regex::Regex::new(r"(d-[0-9a-f]{10})")
+                    .ok()
                     .and_then(|re| re.captures(u).map(|c| c[1].to_string()))
             })
         });
         let mother_id = match mother_id {
             Some(m) => m,
-            None => { results.push(json!({ "credentialId": a.credential_id, "ok": false, "note": "缺母号(mother_id/start_url)" })); continue; }
+            None => {
+                results.push(json!({ "credentialId": a.credential_id, "ok": false, "note": "缺母号(mother_id/start_url)" }));
+                continue;
+            }
         };
         // 建母号档
-        let start_url = a.start_url.clone().unwrap_or_else(|| format!("https://{mother_id}.awsapps.com/start"));
-        let _ = st.store.upsert_mother(&mother_id, &start_url, a.region.as_deref());
+        let start_url = a
+            .start_url
+            .clone()
+            .unwrap_or_else(|| format!("https://{mother_id}.awsapps.com/start"));
+        let _ = st
+            .store
+            .upsert_mother(&mother_id, &start_url, a.region.as_deref());
         // 探活
         let health = st.service.probe_credential(a.credential_id as u64).await;
         if !health.is_alive() {
             results.push(json!({ "credentialId": a.credential_id, "ok": false, "health": health.as_status_str() }));
             continue;
         }
-        let public_id = a.public_id.clone().unwrap_or_else(|| format!("{mother_id}-{}", a.credential_id));
+        let public_id = a
+            .public_id
+            .clone()
+            .unwrap_or_else(|| format!("{mother_id}-{}", a.credential_id));
         match st.store.add_sale_account(a.credential_id, &mother_id, a.region.as_deref(), &public_id) {
             Ok(_) => results.push(json!({ "credentialId": a.credential_id, "ok": true, "publicId": public_id, "motherId": mother_id })),
             Err(e) => results.push(json!({ "credentialId": a.credential_id, "ok": false, "note": e.to_string() })),
@@ -515,7 +663,9 @@ async fn admin_upload_test(
 
 fn gen_cdk_code() -> String {
     let seg = || -> String {
-        (0..4).map(|_| b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789"[fastrand::usize(..32)] as char).collect()
+        (0..4)
+            .map(|_| b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789"[fastrand::usize(..32)] as char)
+            .collect()
     };
     format!("CDK-{}-{}-{}", seg(), seg(), seg())
 }
@@ -528,15 +678,25 @@ async fn page_dashboard() -> impl IntoResponse {
     axum::response::Html(include_str!("assets/dashboard.html"))
 }
 async fn asset_dashboard_js() -> impl IntoResponse {
-    ([(axum::http::header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
-     include_str!("assets/dashboard.js"))
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        include_str!("assets/dashboard.js"),
+    )
 }
 async fn page_admin() -> impl IntoResponse {
     axum::response::Html(include_str!("assets/admin.html"))
 }
 async fn asset_admin_js() -> impl IntoResponse {
-    ([(axum::http::header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
-     include_str!("assets/admin.js"))
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        include_str!("assets/admin.js"),
+    )
 }
 
 /// 客户 + 管理端合并路由，挂在 `/wholesale` 下。
@@ -594,6 +754,9 @@ mod tests {
             "d-1234567890".to_string(),
             "  ".to_string(),
         ]);
-        assert_eq!(out, vec!["d-9066765b2d".to_string(), "d-1234567890".to_string()]);
+        assert_eq!(
+            out,
+            vec!["d-9066765b2d".to_string(), "d-1234567890".to_string()]
+        );
     }
 }

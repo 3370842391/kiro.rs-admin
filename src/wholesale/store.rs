@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use parking_lot::Mutex;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 pub type SharedWholesaleStore = Arc<WholesaleStore>;
@@ -148,13 +148,17 @@ impl WholesaleStore {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         Self::migrate(&conn)?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     pub fn open_in_memory() -> rusqlite::Result<Self> {
         let conn = Connection::open_in_memory()?;
         Self::migrate(&conn)?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     fn migrate(conn: &Connection) -> rusqlite::Result<()> {
@@ -411,7 +415,11 @@ impl WholesaleStore {
         )
     }
 
-    pub fn list_wallet_entries(&self, customer_id: i64, limit: i64) -> rusqlite::Result<Vec<WalletEntry>> {
+    pub fn list_wallet_entries(
+        &self,
+        customer_id: i64,
+        limit: i64,
+    ) -> rusqlite::Result<Vec<WalletEntry>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, customer_id, delta_cents, balance_after, reason, reference, operator, created_at
@@ -542,14 +550,22 @@ impl WholesaleStore {
 
     pub fn disable_cdk(&self, code: &str) -> rusqlite::Result<()> {
         let conn = self.conn.lock();
-        conn.execute("UPDATE cdks SET disabled = 1 WHERE code = ?1", params![code])?;
+        conn.execute(
+            "UPDATE cdks SET disabled = 1 WHERE code = ?1",
+            params![code],
+        )?;
         Ok(())
     }
 
     // ───────── 母号 ─────────
 
     /// upsert 母号：入库子号时自动建档（新母号默认 fresh）。
-    pub fn upsert_mother(&self, directory_id: &str, start_url: &str, region: Option<&str>) -> rusqlite::Result<()> {
+    pub fn upsert_mother(
+        &self,
+        directory_id: &str,
+        start_url: &str,
+        region: Option<&str>,
+    ) -> rusqlite::Result<()> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock();
         conn.execute(
@@ -604,7 +620,11 @@ impl WholesaleStore {
     }
 
     /// 若某母号近 1h 死亡数达到阈值,则置为 dead。返回是否已置 dead。
-    pub fn set_mother_state_if_dying(&self, directory_id: &str, threshold_1h: i64) -> rusqlite::Result<bool> {
+    pub fn set_mother_state_if_dying(
+        &self,
+        directory_id: &str,
+        threshold_1h: i64,
+    ) -> rusqlite::Result<bool> {
         let since = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
         let conn = self.conn.lock();
         let deaths: i64 = conn.query_row(
@@ -662,7 +682,9 @@ impl WholesaleStore {
     }
 
     /// 各母号可售余量（sale_state='available'），仅统计新鲜/活跃母号。
-    pub fn available_by_mother(&self) -> rusqlite::Result<Vec<(String, String, Option<String>, i64)>> {
+    pub fn available_by_mother(
+        &self,
+    ) -> rusqlite::Result<Vec<(String, String, Option<String>, i64)>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT m.directory_id, m.state, m.region, COUNT(s.credential_id)
@@ -698,7 +720,11 @@ impl WholesaleStore {
             &["fresh", "active"]
         };
         let state_ph = states.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let excl_ph = exclude_mothers.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let excl_ph = exclude_mothers
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
 
         let mut sql = format!(
             "SELECT s.credential_id, s.mother_id, s.region
@@ -770,7 +796,12 @@ impl WholesaleStore {
         .optional()
     }
 
-    fn set_sale_state(&self, conn: &Connection, credential_id: i64, state: &str) -> rusqlite::Result<()> {
+    fn set_sale_state(
+        &self,
+        conn: &Connection,
+        credential_id: i64,
+        state: &str,
+    ) -> rusqlite::Result<()> {
         conn.execute(
             "UPDATE sale_accounts SET sale_state = ?1 WHERE credential_id = ?2",
             params![state, credential_id],
@@ -803,15 +834,22 @@ impl WholesaleStore {
         let tx = conn.transaction().map_err(|e| e.to_string())?;
 
         let current: i64 = tx
-            .query_row("SELECT balance_cents FROM customers WHERE id = ?1", params![customer_id], |r| r.get(0))
+            .query_row(
+                "SELECT balance_cents FROM customers WHERE id = ?1",
+                params![customer_id],
+                |r| r.get(0),
+            )
             .map_err(|e| e.to_string())?;
         if current < price_cents {
             tx.rollback().ok();
             return Err("insufficient_balance".to_string());
         }
         let after = current - price_cents;
-        tx.execute("UPDATE customers SET balance_cents = ?1 WHERE id = ?2", params![after, customer_id])
-            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "UPDATE customers SET balance_cents = ?1 WHERE id = ?2",
+            params![after, customer_id],
+        )
+        .map_err(|e| e.to_string())?;
         tx.execute(
             "INSERT INTO wallet_entries (customer_id, delta_cents, balance_after, reason, reference, operator, created_at)
              VALUES (?1, ?2, ?3, 'acquire', ?4, 'system', ?5)",
@@ -854,7 +892,11 @@ impl WholesaleStore {
     }
 
     /// 客户当前号池：默认排除已过墓碑期(purge_at 已到)的死号。
-    pub fn holdings_for_customer(&self, customer_id: i64, include_purged: bool) -> rusqlite::Result<Vec<Holding>> {
+    pub fn holdings_for_customer(
+        &self,
+        customer_id: i64,
+        include_purged: bool,
+    ) -> rusqlite::Result<Vec<Holding>> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock();
         let sql = if include_purged {
@@ -884,20 +926,34 @@ impl WholesaleStore {
 
     /// 所有仍需探活的 holdings：活着(active/low_quota)且未过保 → 探封号+额度;
     /// 也含过保但仍活的(继续更新界面状态但不再退款)。返回 (holding_id, credential_id, mother_id, customer_id, warranty_until, status)。
-    pub fn holdings_to_probe(&self) -> rusqlite::Result<Vec<(i64, i64, String, i64, String, String)>> {
+    pub fn holdings_to_probe(
+        &self,
+    ) -> rusqlite::Result<Vec<(i64, i64, String, i64, String, String)>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, credential_id, mother_id, customer_id, warranty_until, status
              FROM holdings WHERE status IN ('active','low_quota') ORDER BY last_probe_at IS NULL DESC, last_probe_at",
         )?;
         let rows = stmt.query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
         })?;
         rows.collect()
     }
 
     /// 更新探活结果:status + last_quota + last_probe_at(号还活着时用)。
-    pub fn update_holding_probe(&self, holding_id: i64, status: &str, last_quota: Option<&str>) -> rusqlite::Result<()> {
+    pub fn update_holding_probe(
+        &self,
+        holding_id: i64,
+        status: &str,
+        last_quota: Option<&str>,
+    ) -> rusqlite::Result<()> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock();
         conn.execute(
@@ -927,13 +983,14 @@ impl WholesaleStore {
             .optional()
             .map_err(|e| e.to_string())?;
 
-        let (customer_id, credential_id, charged, warranty_until, claim_refunded, public_id) = match row {
-            Some(v) => v,
-            None => {
-                tx.rollback().ok();
-                return Ok(false); // 已是 dead 或不存在
-            }
-        };
+        let (customer_id, credential_id, charged, warranty_until, claim_refunded, public_id) =
+            match row {
+                Some(v) => v,
+                None => {
+                    tx.rollback().ok();
+                    return Ok(false); // 已是 dead 或不存在
+                }
+            };
 
         tx.execute(
             "UPDATE holdings SET status = 'dead', died_at = ?1, purge_at = ?2, last_probe_at = ?1 WHERE id = ?3",
@@ -952,19 +1009,29 @@ impl WholesaleStore {
         let mut refunded = false;
         if in_warranty && claim_refunded == 0 {
             let current: i64 = tx
-                .query_row("SELECT balance_cents FROM customers WHERE id = ?1", params![customer_id], |r| r.get(0))
+                .query_row(
+                    "SELECT balance_cents FROM customers WHERE id = ?1",
+                    params![customer_id],
+                    |r| r.get(0),
+                )
                 .map_err(|e| e.to_string())?;
             let after = current + charged;
-            tx.execute("UPDATE customers SET balance_cents = ?1 WHERE id = ?2", params![after, customer_id])
-                .map_err(|e| e.to_string())?;
+            tx.execute(
+                "UPDATE customers SET balance_cents = ?1 WHERE id = ?2",
+                params![after, customer_id],
+            )
+            .map_err(|e| e.to_string())?;
             tx.execute(
                 "INSERT INTO wallet_entries (customer_id, delta_cents, balance_after, reason, reference, operator, created_at)
                  VALUES (?1, ?2, ?3, 'warranty_refund', ?4, 'system', ?5)",
                 params![customer_id, charged, after, public_id, now_s],
             )
             .map_err(|e| e.to_string())?;
-            tx.execute("UPDATE holdings SET claim_refunded = 1 WHERE id = ?1", params![holding_id])
-                .map_err(|e| e.to_string())?;
+            tx.execute(
+                "UPDATE holdings SET claim_refunded = 1 WHERE id = ?1",
+                params![holding_id],
+            )
+            .map_err(|e| e.to_string())?;
             refunded = true;
         }
 
@@ -1004,30 +1071,47 @@ mod tests {
     }
 
     fn seed_pool(s: &WholesaleStore, mother: &str, region: &str, n: i64) {
-        s.upsert_mother(mother, &format!("https://{mother}.awsapps.com/start"), Some(region)).unwrap();
+        s.upsert_mother(
+            mother,
+            &format!("https://{mother}.awsapps.com/start"),
+            Some(region),
+        )
+        .unwrap();
         for i in 0..n {
             let cid = 1000 + i + (mother.bytes().map(|b| b as i64).sum::<i64>() * 100);
-            s.add_sale_account(cid, mother, Some(region), &format!("{mother}-{i:04}")).unwrap();
+            s.add_sale_account(cid, mother, Some(region), &format!("{mother}-{i:04}"))
+                .unwrap();
         }
     }
 
     #[test]
     fn register_and_lookup_customer() {
         let s = store();
-        let c = s.create_customer("u_1", "wsk_abc", "alice", "hash", Some("a@b.com")).unwrap();
+        let c = s
+            .create_customer("u_1", "wsk_abc", "alice", "hash", Some("a@b.com"))
+            .unwrap();
         assert_eq!(c.balance_cents, 0);
         assert_eq!(c.target, DEFAULT_TARGET);
-        assert_eq!(s.customer_by_api_key("wsk_abc").unwrap().unwrap().uid, "u_1");
+        assert_eq!(
+            s.customer_by_api_key("wsk_abc").unwrap().unwrap().uid,
+            "u_1"
+        );
         assert_eq!(s.customer_by_username("alice").unwrap().unwrap().id, c.id);
         // 重名拒绝
-        assert!(s.create_customer("u_2", "wsk_xyz", "alice", "h", None).is_err());
+        assert!(
+            s.create_customer("u_2", "wsk_xyz", "alice", "h", None)
+                .is_err()
+        );
     }
 
     #[test]
     fn cdk_redeem_adds_balance_once() {
         let s = store();
-        let c = s.create_customer("u_1", "wsk_a", "alice", "h", None).unwrap();
-        s.create_cdks(&["CDK-1".into()], 5000, Some("admin"), Some("b1")).unwrap();
+        let c = s
+            .create_customer("u_1", "wsk_a", "alice", "h", None)
+            .unwrap();
+        s.create_cdks(&["CDK-1".into()], 5000, Some("admin"), Some("b1"))
+            .unwrap();
         let bal = s.redeem_cdk("CDK-1", c.id).unwrap();
         assert_eq!(bal, 5000);
         // 二次兑换被拒
@@ -1039,9 +1123,15 @@ mod tests {
     #[test]
     fn wallet_rejects_negative() {
         let s = store();
-        let c = s.create_customer("u_1", "wsk_a", "alice", "h", None).unwrap();
-        assert!(s.apply_wallet_delta(c.id, -100, "acquire", None, None).is_err());
-        s.apply_wallet_delta(c.id, 1000, "admin_adjust", None, Some("admin")).unwrap();
+        let c = s
+            .create_customer("u_1", "wsk_a", "alice", "h", None)
+            .unwrap();
+        assert!(
+            s.apply_wallet_delta(c.id, -100, "acquire", None, None)
+                .is_err()
+        );
+        s.apply_wallet_delta(c.id, 1000, "admin_adjust", None, Some("admin"))
+            .unwrap();
         assert_eq!(s.customer_balance(c.id).unwrap(), 1000);
     }
 
@@ -1054,7 +1144,10 @@ mod tests {
         seed_pool(&s, "d-bbbbbbbbbb", "us-east-1", 2);
 
         // 都是 fresh,应挑更新的 d-bbb
-        let r = s.reserve_account(Some("us-east-1"), &[], false).unwrap().unwrap();
+        let r = s
+            .reserve_account(Some("us-east-1"), &[], false)
+            .unwrap()
+            .unwrap();
         assert_eq!(r.mother_id, "d-bbbbbbbbbb");
 
         // 排除 d-bbb → 只能挑 d-aaa（补号换母号场景）
@@ -1079,29 +1172,55 @@ mod tests {
     #[test]
     fn deliver_charges_and_creates_holding() {
         let s = store();
-        let c = s.create_customer("u_1", "wsk_a", "alice", "h", None).unwrap();
-        s.apply_wallet_delta(c.id, 2000, "cdk_redeem", None, None).unwrap();
+        let c = s
+            .create_customer("u_1", "wsk_a", "alice", "h", None)
+            .unwrap();
+        s.apply_wallet_delta(c.id, 2000, "cdk_redeem", None, None)
+            .unwrap();
         seed_pool(&s, "d-aaaaaaaaaa", "us-east-1", 3);
         let acc = s.reserve_account(None, &[], false).unwrap().unwrap();
 
         let h = s
-            .deliver_holding(c.id, acc.credential_id, &acc.mother_id, "d-aaaaaaaaaa-0000",
-                Some("kskid_1"), Some(b"cipher"), Some("us-east-1"), DEFAULT_PRICE_CENTS, DEFAULT_WARRANTY_SECS)
+            .deliver_holding(
+                c.id,
+                acc.credential_id,
+                &acc.mother_id,
+                "d-aaaaaaaaaa-0000",
+                Some("kskid_1"),
+                Some(b"cipher"),
+                Some("us-east-1"),
+                DEFAULT_PRICE_CENTS,
+                DEFAULT_WARRANTY_SECS,
+            )
             .unwrap();
         assert_eq!(h.status, "active");
-        assert_eq!(s.customer_balance(c.id).unwrap(), 2000 - DEFAULT_PRICE_CENTS);
+        assert_eq!(
+            s.customer_balance(c.id).unwrap(),
+            2000 - DEFAULT_PRICE_CENTS
+        );
         assert_eq!(s.active_count(c.id).unwrap(), 1);
     }
 
     #[test]
     fn deliver_insufficient_balance_rolls_back() {
         let s = store();
-        let c = s.create_customer("u_1", "wsk_a", "alice", "h", None).unwrap();
+        let c = s
+            .create_customer("u_1", "wsk_a", "alice", "h", None)
+            .unwrap();
         seed_pool(&s, "d-aaaaaaaaaa", "us-east-1", 1);
         let acc = s.reserve_account(None, &[], false).unwrap().unwrap();
         let err = s
-            .deliver_holding(c.id, acc.credential_id, &acc.mother_id, "p", None, None, None,
-                DEFAULT_PRICE_CENTS, DEFAULT_WARRANTY_SECS)
+            .deliver_holding(
+                c.id,
+                acc.credential_id,
+                &acc.mother_id,
+                "p",
+                None,
+                None,
+                None,
+                DEFAULT_PRICE_CENTS,
+                DEFAULT_WARRANTY_SECS,
+            )
             .unwrap_err();
         assert_eq!(err, "insufficient_balance");
         assert_eq!(s.active_count(c.id).unwrap(), 0);
@@ -1110,19 +1229,34 @@ mod tests {
     #[test]
     fn mark_dead_in_warranty_refunds_once() {
         let s = store();
-        let c = s.create_customer("u_1", "wsk_a", "alice", "h", None).unwrap();
-        s.apply_wallet_delta(c.id, 2000, "cdk_redeem", None, None).unwrap();
+        let c = s
+            .create_customer("u_1", "wsk_a", "alice", "h", None)
+            .unwrap();
+        s.apply_wallet_delta(c.id, 2000, "cdk_redeem", None, None)
+            .unwrap();
         seed_pool(&s, "d-aaaaaaaaaa", "us-east-1", 1);
         let acc = s.reserve_account(None, &[], false).unwrap().unwrap();
         let h = s
-            .deliver_holding(c.id, acc.credential_id, &acc.mother_id, "p", None, None, None,
-                DEFAULT_PRICE_CENTS, DEFAULT_WARRANTY_SECS)
+            .deliver_holding(
+                c.id,
+                acc.credential_id,
+                &acc.mother_id,
+                "p",
+                None,
+                None,
+                None,
+                DEFAULT_PRICE_CENTS,
+                DEFAULT_WARRANTY_SECS,
+            )
             .unwrap();
         let bal_after_buy = s.customer_balance(c.id).unwrap();
 
         let refunded = s.mark_holding_dead(h.id).unwrap();
         assert!(refunded);
-        assert_eq!(s.customer_balance(c.id).unwrap(), bal_after_buy + DEFAULT_PRICE_CENTS);
+        assert_eq!(
+            s.customer_balance(c.id).unwrap(),
+            bal_after_buy + DEFAULT_PRICE_CENTS
+        );
         // 再次判死不重复退(已是 dead)
         assert!(!s.mark_holding_dead(h.id).unwrap());
     }
@@ -1130,13 +1264,26 @@ mod tests {
     #[test]
     fn mark_dead_out_of_warranty_no_refund() {
         let s = store();
-        let c = s.create_customer("u_1", "wsk_a", "alice", "h", None).unwrap();
-        s.apply_wallet_delta(c.id, 2000, "cdk_redeem", None, None).unwrap();
+        let c = s
+            .create_customer("u_1", "wsk_a", "alice", "h", None)
+            .unwrap();
+        s.apply_wallet_delta(c.id, 2000, "cdk_redeem", None, None)
+            .unwrap();
         seed_pool(&s, "d-aaaaaaaaaa", "us-east-1", 1);
         let acc = s.reserve_account(None, &[], false).unwrap().unwrap();
         // 质保 0 秒 → 立刻过保
         let h = s
-            .deliver_holding(c.id, acc.credential_id, &acc.mother_id, "p", None, None, None, DEFAULT_PRICE_CENTS, 0)
+            .deliver_holding(
+                c.id,
+                acc.credential_id,
+                &acc.mother_id,
+                "p",
+                None,
+                None,
+                None,
+                DEFAULT_PRICE_CENTS,
+                0,
+            )
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
         let bal = s.customer_balance(c.id).unwrap();
@@ -1148,12 +1295,25 @@ mod tests {
     #[test]
     fn dead_holding_hidden_after_purge() {
         let s = store();
-        let c = s.create_customer("u_1", "wsk_a", "alice", "h", None).unwrap();
-        s.apply_wallet_delta(c.id, 2000, "cdk_redeem", None, None).unwrap();
+        let c = s
+            .create_customer("u_1", "wsk_a", "alice", "h", None)
+            .unwrap();
+        s.apply_wallet_delta(c.id, 2000, "cdk_redeem", None, None)
+            .unwrap();
         seed_pool(&s, "d-aaaaaaaaaa", "us-east-1", 1);
         let acc = s.reserve_account(None, &[], false).unwrap().unwrap();
         let h = s
-            .deliver_holding(c.id, acc.credential_id, &acc.mother_id, "p", None, None, None, DEFAULT_PRICE_CENTS, DEFAULT_WARRANTY_SECS)
+            .deliver_holding(
+                c.id,
+                acc.credential_id,
+                &acc.mother_id,
+                "p",
+                None,
+                None,
+                None,
+                DEFAULT_PRICE_CENTS,
+                DEFAULT_WARRANTY_SECS,
+            )
             .unwrap();
         s.mark_holding_dead(h.id).unwrap();
         // 刚死,墓碑期内 → 仍显示

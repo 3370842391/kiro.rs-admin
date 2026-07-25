@@ -1076,8 +1076,7 @@ mod tests {
         assert!(matches!(dead, IncomingWebhook::AllKeysDead { dead: 2, .. }));
 
         let test = IncomingWebhook::parse(
-            format!(r#"{{"event":"test","event_id":"{EVENT_ID}","message":"test"}}"#)
-                .as_bytes(),
+            format!(r#"{{"event":"test","event_id":"{EVENT_ID}","message":"test"}}"#).as_bytes(),
         )
         .unwrap();
         assert!(matches!(test, IncomingWebhook::Test { .. }));

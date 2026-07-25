@@ -413,42 +413,48 @@ async fn main() {
 
     // ───── 批发号池系统（wholesale）─────
     // 独立 SQLite（wholesale.db）+ 复用 token_manager 探活/建 ksk。
-    let wholesale_state: Option<wholesale::WholesaleState> = match wholesale::WholesaleStore::open(
-        cache_dir.join("wholesale.db"),
-    ) {
-        Ok(store) => {
-            let store = std::sync::Arc::new(store);
-            let ws_config = wholesale::WholesaleConfig::default();
-            let probe_interval = ws_config.probe_interval_secs;
-            let service = std::sync::Arc::new(wholesale::WholesaleService::new(
-                store.clone(),
-                token_manager.clone(),
-                ws_config,
-            ));
-            // 后台探活轮询：更新号池状态 + 母号死亡联动 + 质保退款
-            {
-                let svc = service.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                    loop {
-                        svc.probe_round().await;
-                        // 加 jitter，避免整点对上游齐发
-                        let jitter = fastrand::u64(0..(probe_interval / 5 + 1));
-                        tokio::time::sleep(std::time::Duration::from_secs(probe_interval + jitter)).await;
-                    }
-                });
+    let wholesale_state: Option<wholesale::WholesaleState> =
+        match wholesale::WholesaleStore::open(cache_dir.join("wholesale.db")) {
+            Ok(store) => {
+                let store = std::sync::Arc::new(store);
+                let ws_config = wholesale::WholesaleConfig::default();
+                let probe_interval = ws_config.probe_interval_secs;
+                let service = std::sync::Arc::new(wholesale::WholesaleService::new(
+                    store.clone(),
+                    token_manager.clone(),
+                    ws_config,
+                ));
+                // 后台探活轮询：更新号池状态 + 母号死亡联动 + 质保退款
+                {
+                    let svc = service.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        loop {
+                            svc.probe_round().await;
+                            // 加 jitter，避免整点对上游齐发
+                            let jitter = fastrand::u64(0..(probe_interval / 5 + 1));
+                            tokio::time::sleep(std::time::Duration::from_secs(
+                                probe_interval + jitter,
+                            ))
+                            .await;
+                        }
+                    });
+                }
+                let admin_key_arc = std::sync::Arc::new(parking_lot::RwLock::new(
+                    config.admin_api_key.clone().unwrap_or_default(),
+                ));
+                tracing::info!("批发号池系统已启用: /wholesale");
+                Some(wholesale::WholesaleState::new(
+                    service,
+                    store,
+                    admin_key_arc,
+                ))
             }
-            let admin_key_arc = std::sync::Arc::new(parking_lot::RwLock::new(
-                config.admin_api_key.clone().unwrap_or_default(),
-            ));
-            tracing::info!("批发号池系统已启用: /wholesale");
-            Some(wholesale::WholesaleState::new(service, store, admin_key_arc))
-        }
-        Err(e) => {
-            tracing::warn!("打开 wholesale.db 失败，批发号池系统不可用: {}", e);
-            None
-        }
-    };
+            Err(e) => {
+                tracing::warn!("打开 wholesale.db 失败，批发号池系统不可用: {}", e);
+                None
+            }
+        };
 
     let anthropic_app = anthropic::create_router(
         Some(kiro_provider.clone()),

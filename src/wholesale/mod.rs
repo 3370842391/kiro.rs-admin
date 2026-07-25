@@ -20,7 +20,7 @@ pub mod router;
 pub mod service;
 pub mod store;
 
-pub use health::{classify_account_health, AccountHealth};
-pub use router::{create_wholesale_router, WholesaleState};
+pub use health::{AccountHealth, classify_account_health};
+pub use router::{WholesaleState, create_wholesale_router};
 pub use service::{WholesaleConfig, WholesaleService};
 pub use store::{SharedWholesaleStore, WholesaleStore};
