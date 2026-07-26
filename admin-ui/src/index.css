@@ -3,6 +3,10 @@
 
 @layer base {
   :root {
+    /* 告诉浏览器当前配色，滚动条、原生 select / date 控件才会跟着切换。
+       缺这一条时暗色模式下的 <input type="date"> 和滚动条仍是亮色。 */
+    color-scheme: light;
+
     /* Apple light theme — macOS Sonoma inspired */
     --background: 220 20% 97%;
     --foreground: 220 10% 12%;
@@ -16,7 +20,10 @@
     --secondary: 220 14% 94%;
     --secondary-foreground: 220 10% 12%;
     --muted: 220 14% 94%;
-    --muted-foreground: 220 8% 45%;
+    /* 45% → 40%：原值对 --background 的对比度只有 4.63:1，刚过 4.5:1 的线。
+       但本项目的次要文字大量使用 11–12px（统计卡片副标题、图表脚注、表格元信息），
+       在这个字号上 4.6 读起来非常吃力。40% 把对比度提到约 5.5:1。 */
+    --muted-foreground: 220 9% 40%;
     --accent: 211 100% 96%;
     --accent-foreground: 211 100% 35%;
     /* Apple system red (#FF3B30) */
@@ -29,6 +36,8 @@
   }
 
   .dark {
+    color-scheme: dark;
+
     /* Apple dark theme — macOS Sonoma inspired */
     --background: 220 14% 8%;
     --foreground: 220 10% 96%;
@@ -68,6 +77,15 @@
       sans-serif;
     font-feature-settings: "rlig" 1, "calt" 1, "ss01" 1;
     letter-spacing: 0;
+  }
+  /* 去掉移动端点击的 300ms 双击缩放延迟，并让点击高亮由各控件的 hover/active 自己表达。 */
+  button,
+  a,
+  [role="button"],
+  label,
+  summary {
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
   }
   label:not(.flex):not(.inline-flex) {
     display: block;
@@ -155,5 +173,19 @@
     .chart-range-fade {
       animation: none;
     }
+  }
+}
+
+/* 全局降级：单独给每个动画写 reduced-motion 变体容易漏，这里统一兜底。
+   Radix 弹层的开合动画、按钮的 active:scale、卡片 hover 位移都会一并停掉，
+   但保留极短时长而不是 0，避免依赖 transitionend / animationend 的组件收不到事件。 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
   }
 }

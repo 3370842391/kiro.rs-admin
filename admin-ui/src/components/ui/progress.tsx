@@ -23,7 +23,7 @@ const Progress = React.forwardRef<HTMLDivElement, ProgressProps>(
         {...props}
       >
         <div
-          className={cn('h-full transition-all duration-500 ease-apple rounded-full', tone)}
+          className={cn('h-full transition-[width] duration-500 ease-apple rounded-full', tone)}
           style={{ width: `${percentage}%` }}
         />
       </div>

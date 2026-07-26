@@ -8,7 +8,9 @@ const Card = React.forwardRef<
   <div
     ref={ref}
     className={cn(
-      'rounded-2xl border border-border/60 bg-card/80 backdrop-blur-xl backdrop-saturate-150 text-card-foreground shadow-apple transition-all duration-200 ease-apple',
+      // 只过渡 hover 实际会变的属性；`transition-all` 会把卡片高度变化也动画化，
+      // 列表增删时整块跟着抖。
+      'rounded-2xl border border-border/60 bg-card/80 backdrop-blur-xl backdrop-saturate-150 text-card-foreground shadow-apple transition-[box-shadow,transform,border-color,background-color] duration-200 ease-apple',
       className
     )}
     {...props}

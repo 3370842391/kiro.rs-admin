@@ -4,6 +4,10 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/png" href="/kirors.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- 与 --background 对齐，避免移动端地址栏和页面之间出现割裂的色带。
+         手动切换主题时 applyThemeColor() 会覆盖 content。 -->
+    <meta name="theme-color" content="#f6f7fa" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#121417" media="(prefers-color-scheme: dark)" />
     <title>Kiro Admin</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
