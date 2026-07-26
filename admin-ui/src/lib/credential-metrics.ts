@@ -69,6 +69,55 @@ export function formatBalanceFreshness(updatedAt: number | undefined, nowMs = Da
   return `${Math.floor(hours / 24)}天前`
 }
 
+/** 把毫秒时长写成「3 天 / 5 小时 / 42 分钟 / 30 秒」这种一眼能读的粒度。 */
+function humanizeDuration(ms: number): string {
+  const seconds = Math.floor(Math.max(0, ms) / 1000)
+  if (seconds < 60) return `${seconds} 秒`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes} 分钟`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours} 小时`
+  return `${Math.floor(hours / 24)} 天`
+}
+
+/** 账号存活状态。`unknown` 表示后端没给出加入时间，界面上不能编一个数出来。 */
+export interface CredentialLifespan {
+  /** 已判死则为死亡时刻的存活时长，否则为「至今」的存活时长。 */
+  label: string
+  kind: 'alive' | 'dead' | 'unknown'
+}
+
+/**
+ * 计算账号存活时长。
+ *
+ * 判死的号用 `diedAt - addedAt`（定格在死亡瞬间，不再随时间增长）；活着的号用
+ * `now - addedAt`。两者文案必须能区分，否则「存活 58 分钟」到底是还活着还是已经
+ * 死了看不出来。
+ *
+ * `addedAt` 缺失时返回 `unknown` 而不是回退到 0——号池升级前的凭据由后端回填
+ * 加入时间，那种情况下这里能拿到值；真的拿不到值时显示「未知」比显示一个假数字好。
+ */
+export function formatCredentialLifespan(
+  addedAt: string | undefined,
+  diedAt: string | undefined,
+  nowMs = Date.now(),
+): CredentialLifespan {
+  const addedMs = addedAt ? Date.parse(addedAt) : NaN
+  if (!Number.isFinite(addedMs)) return { kind: 'unknown', label: '未知' }
+
+  const diedMs = diedAt ? Date.parse(diedAt) : NaN
+  if (Number.isFinite(diedMs)) {
+    // 时钟回拨或数据异常导致死亡早于加入时，按 0 处理而不是显示负数
+    return {
+      kind: 'dead',
+      label: `存活 ${humanizeDuration(diedMs - addedMs)}后死亡`,
+    }
+  }
+
+  if (!Number.isFinite(nowMs)) return { kind: 'unknown', label: '未知' }
+  return { kind: 'alive', label: `已存活 ${humanizeDuration(nowMs - addedMs)}` }
+}
+
 export function connectionLabel(hasProxy: boolean): string {
   return hasProxy ? '代理' : '直连'
 }

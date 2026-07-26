@@ -1152,6 +1152,12 @@ enum DisabledReason {
     InvalidRefreshToken,
     /// 凭据配置无效（如 authMethod=api_key 但缺少 kiroApiKey）
     InvalidConfig,
+    /// 上游 403 且响应体命中封禁标记 —— 账号已死。
+    ///
+    /// 与 `TooManyFailures` 的区别：这是**终态**，不参与
+    /// `acquire_context_excluding_with_affinity` 里「全灭时重置失败计数自愈」那段逻辑
+    /// （账号真被封了，重置计数再试也只是白打一轮请求）。
+    Forbidden,
 }
 
 /// 统计数据持久化条目
@@ -1219,6 +1225,10 @@ pub struct CredentialEntrySnapshot {
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
+    /// 加入号池的时间（RFC3339）。升级前的旧凭据为加载时回填值。
+    pub added_at: Option<String>,
+    /// 判死时间（RFC3339）。非空即表示该号已被封禁。
+    pub died_at: Option<String>,
     /// 是否配置了凭据级代理
     pub has_proxy: bool,
     /// 代理 URL（用于前端展示）
@@ -1512,6 +1522,25 @@ impl MultiTokenManager {
                         Some(machine_id::generate_from_credentials(&cred, config_ref));
                     has_new_machine_ids = true;
                 }
+                // 升级前的凭据文件没有 added_at，按「首次见到」回填并落盘。
+                // 回填值不是真实加入时间，展示层靠 `added_at_backfilled` 之类的推断
+                // 无从判断，因此这里只保证字段非空、由文案提示口径（见 credential-card）。
+                if cred.added_at.is_none() {
+                    cred.added_at = Some(Utc::now().to_rfc3339());
+                    has_new_ids = true; // 复用「需要回写」标志，触发一次持久化
+                }
+                // disabled_reason 是运行时状态、不持久化。重启后已判死的凭据只剩
+                // disabled=true，会退化成 Manual。用 died_at 是否存在把它还原成
+                // Forbidden，否则保留期清理在重启后就再也认不出这些死号。
+                let disabled_reason = if cred.disabled {
+                    if cred.died_at.is_some() {
+                        Some(DisabledReason::Forbidden)
+                    } else {
+                        Some(DisabledReason::Manual)
+                    }
+                } else {
+                    None
+                };
                 CredentialEntry {
                     id,
                     credentials: cred.clone(),
@@ -1519,11 +1548,7 @@ impl MultiTokenManager {
                     total_failure_count: 0,
                     refresh_failure_count: 0,
                     disabled: cred.disabled, // 从配置文件读取 disabled 状态
-                    disabled_reason: if cred.disabled {
-                        Some(DisabledReason::Manual)
-                    } else {
-                        None
-                    },
+                    disabled_reason,
                     success_count: 0,
                     balance_count: 0,
                     last_used_at: None,
@@ -3025,9 +3050,12 @@ impl MultiTokenManager {
                             DisabledReason::QuotaExceeded => "QuotaExceeded",
                             DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
                             DisabledReason::InvalidConfig => "InvalidConfig",
+                            DisabledReason::Forbidden => "Forbidden",
                         }
                         .to_string()
                     }),
+                    added_at: e.credentials.added_at.clone(),
+                    died_at: e.credentials.died_at.clone(),
                     throttled_remaining_secs: e
                         .throttled_until
                         .and_then(|t| t.checked_duration_since(now))
@@ -3959,6 +3987,10 @@ impl MultiTokenManager {
 
         // 5. 设置 ID 并保留用户输入的元数据
         validated_cred.id = Some(new_id);
+        // 存活时长的计时起点。这里是全项目唯一的新增凭据入口（admin 手工添加、
+        // key_supplier 自动采购、批量导入都经过本函数），所以打一处即可。
+        validated_cred.added_at = Some(Utc::now().to_rfc3339());
+        validated_cred.died_at = None;
         validated_cred.priority = new_cred.priority;
         validated_cred.rpm_limit = new_cred.rpm_limit;
         validated_cred.auth_method = new_cred.auth_method.as_deref().map(|m| {
@@ -4467,20 +4499,75 @@ impl MultiTokenManager {
     ///
     /// `Ok(None)` 表示凭证不存在或未启用自动删除，调用方应继续原有失败处理；
     /// `Ok(Some(has_available))` 表示删除成功，并返回是否仍有可用凭证。
-    pub fn delete_credential_on_forbidden(&self, id: u64) -> anyhow::Result<Option<bool>> {
-        let should_delete = self
+    /// 403 判死：禁用凭据并记录死亡时间，返回池中是否还有可用凭据。
+    ///
+    /// 取代早期的 `delete_credential_on_forbidden`（403 立刻删除）。改为禁用是为了
+    /// 保住「加入时间 → 死亡时间」这段记录——号被删掉后就无法回答「这批号平均活多久」。
+    /// 实际删除交给 [`Self::cleanup_dead_credentials`] 在保留期结束后执行。
+    ///
+    /// 返回值沿用被取代函数的形状（`Ok(None)` = 未做处理，`Ok(Some(has_available))`
+    /// = 已判死且告知池中是否还有可用号），这样 provider 的重试仲裁逻辑不用改。
+    pub fn mark_credential_dead(&self, id: u64) -> anyhow::Result<Option<bool>> {
+        let died_at = Utc::now().to_rfc3339();
+        {
+            let mut entries = self.entries.lock();
+            let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) else {
+                return Ok(None);
+            };
+            // 已经判过死的不重复处理，否则同一账号的多个并发请求会把 died_at
+            // 一路后推，存活时长越算越长。
+            if entry.credentials.died_at.is_some() {
+                return Ok(None);
+            }
+            entry.disabled = true;
+            entry.disabled_reason = Some(DisabledReason::Forbidden);
+            entry.credentials.disabled = true;
+            entry.credentials.died_at = Some(died_at);
+        }
+
+        if let Err(error) = self.persist_credentials() {
+            // 落盘失败不回滚内存状态：号确实已经死了，继续调度只会白打请求。
+            // 代价是进程重启后这条记录会退回「手动禁用」，可接受。
+            tracing::warn!(%error, "凭据 #{} 判死后持久化失败", id);
+        }
+
+        let has_available = self.entries.lock().iter().any(|entry| !entry.disabled);
+        Ok(Some(has_available))
+    }
+
+    /// 清理已过保留期的死号，返回删除条数。
+    ///
+    /// 三个条件同时满足才删：判死禁用（`Forbidden`）、`died_at` 早于保留期、
+    /// 且凭据带 `delete_on_forbidden`。最后一条让手工添加的号只禁用不自动删——
+    /// 那些通常是运营手上唯一一份，删掉不可恢复。
+    pub fn cleanup_dead_credentials(&self, retention: StdDuration) -> usize {
+        let cutoff = Utc::now() - chrono::Duration::from_std(retention).unwrap_or_default();
+        let expired: Vec<u64> = self
             .entries
             .lock()
             .iter()
-            .find(|entry| entry.id == id)
-            .is_some_and(|entry| entry.credentials.delete_on_forbidden);
-        if !should_delete {
-            return Ok(None);
-        }
+            .filter(|entry| {
+                entry.disabled
+                    && entry.disabled_reason == Some(DisabledReason::Forbidden)
+                    && entry.credentials.delete_on_forbidden
+                    && entry
+                        .credentials
+                        .died_at
+                        .as_deref()
+                        .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+                        .is_some_and(|died| died < cutoff)
+            })
+            .map(|entry| entry.id)
+            .collect();
 
-        self.delete_credential(id)?;
-        let has_available = self.entries.lock().iter().any(|entry| !entry.disabled);
-        Ok(Some(has_available))
+        let mut removed = 0;
+        for id in expired {
+            match self.delete_credential(id) {
+                Ok(()) => removed += 1,
+                Err(error) => tracing::warn!(%error, "清理过期死号 #{} 失败", id),
+            }
+        }
+        removed
     }
 
     /// 更新指定凭据的 refreshToken（Admin API）
@@ -8024,49 +8111,162 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    fn api_key_credential(id: u64, key: &str, delete_on_forbidden: bool) -> KiroCredentials {
+        let mut cred = KiroCredentials::default();
+        cred.id = Some(id);
+        cred.kiro_api_key = Some(key.to_string());
+        cred.auth_method = Some("api_key".to_string());
+        cred.api_region = Some("us-east-1".to_string());
+        cred.delete_on_forbidden = delete_on_forbidden;
+        cred
+    }
+
+    /// 判死不再删除凭据，而是禁用 + 记录 `died_at`，把存活记录留给运营查看。
     #[test]
-    fn delete_credential_on_forbidden_only_removes_flagged_credentials() {
-        let path = tmp_creds_path("delete_on_forbidden");
-        let mut flagged = KiroCredentials::default();
-        flagged.id = Some(1);
-        flagged.kiro_api_key = Some("ksk_delete_on_forbidden".to_string());
-        flagged.auth_method = Some("api_key".to_string());
-        flagged.api_region = Some("us-east-1".to_string());
-        flagged.delete_on_forbidden = true;
-
-        let mut normal = KiroCredentials::default();
-        normal.id = Some(2);
-        normal.kiro_api_key = Some("ksk_keep_on_forbidden".to_string());
-        normal.auth_method = Some("api_key".to_string());
-        normal.api_region = Some("us-east-1".to_string());
-
+    fn mark_credential_dead_disables_and_records_death_time() {
+        let path = tmp_creds_path("mark_dead");
         let manager = MultiTokenManager::new(
             Config::default(),
-            vec![flagged, normal],
+            vec![
+                api_key_credential(1, "ksk_dead", true),
+                api_key_credential(2, "ksk_alive", true),
+            ],
             None,
             Some(path.clone()),
             true,
         )
         .unwrap();
 
-        assert_eq!(
-            manager.delete_credential_on_forbidden(1).unwrap(),
-            Some(true)
-        );
-        assert_eq!(
-            manager
-                .clone_all_credentials()
-                .iter()
-                .map(|credential| credential.id.unwrap())
-                .collect::<Vec<_>>(),
-            vec![2]
-        );
-        assert_eq!(manager.delete_credential_on_forbidden(2).unwrap(), None);
+        assert_eq!(manager.mark_credential_dead(1).unwrap(), Some(true));
 
+        // 号还在池子里，只是被禁用了
+        let ids: Vec<u64> = manager
+            .clone_all_credentials()
+            .iter()
+            .map(|c| c.id.unwrap())
+            .collect();
+        assert_eq!(ids, vec![1, 2], "判死不应删除凭据");
+
+        let snapshot = manager.snapshot();
+        let dead = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(dead.disabled);
+        assert_eq!(dead.disabled_reason.as_deref(), Some("Forbidden"));
+        assert!(dead.died_at.is_some(), "必须记录死亡时间");
+        assert!(dead.added_at.is_some(), "加载时应回填加入时间");
+
+        // died_at 已落盘，重启后保留期清理才认得出这些死号
         let persisted: Vec<KiroCredentials> =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(persisted.len(), 1);
-        assert_eq!(persisted[0].id, Some(2));
+        let persisted_dead = persisted.iter().find(|c| c.id == Some(1)).unwrap();
+        assert!(persisted_dead.died_at.is_some());
+        assert!(persisted_dead.disabled);
+
+        // 重复判死不应把 died_at 往后推（并发请求会重复触发）
+        let first_death = persisted_dead.died_at.clone();
+        assert_eq!(manager.mark_credential_dead(1).unwrap(), None);
+        let after = manager.snapshot();
+        assert_eq!(
+            after.entries.iter().find(|e| e.id == 1).unwrap().died_at,
+            first_death
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 重启后 `disabled_reason` 是运行时状态会丢；靠持久化的 `died_at` 还原成
+    /// `Forbidden`，否则保留期清理再也认不出这些死号。
+    #[test]
+    fn dead_credentials_keep_forbidden_reason_across_reload() {
+        let mut dead = api_key_credential(1, "ksk_reloaded_dead", true);
+        dead.disabled = true;
+        dead.died_at = Some(Utc::now().to_rfc3339());
+        let mut manual = api_key_credential(2, "ksk_manual_off", true);
+        manual.disabled = true;
+
+        let path = tmp_creds_path("dead_reload");
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![dead, manual], None, Some(path.clone()), true)
+                .unwrap();
+
+        let snapshot = manager.snapshot();
+        let reasons: Vec<Option<&str>> = [1, 2]
+            .iter()
+            .map(|id| {
+                snapshot
+                    .entries
+                    .iter()
+                    .find(|e| e.id == *id)
+                    .unwrap()
+                    .disabled_reason
+                    .as_deref()
+            })
+            .collect();
+        assert_eq!(reasons, vec![Some("Forbidden"), Some("Manual")]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 清理只动「判死 + 超过保留期 + 带 delete_on_forbidden」三者同时成立的凭据。
+    #[test]
+    fn cleanup_dead_credentials_respects_retention_and_flag() {
+        let long_ago = (Utc::now() - chrono::Duration::hours(48)).to_rfc3339();
+
+        // 1: 判死、48h 前、带删除标志 → 应被清理
+        let mut expired = api_key_credential(1, "ksk_expired", true);
+        expired.disabled = true;
+        expired.died_at = Some(long_ago.clone());
+
+        // 2: 判死、48h 前、但未带删除标志（手工添加）→ 保留
+        let mut expired_manual = api_key_credential(2, "ksk_expired_manual", false);
+        expired_manual.disabled = true;
+        expired_manual.died_at = Some(long_ago);
+
+        // 3: 判死但刚死（未过保留期）→ 保留
+        let mut fresh_dead = api_key_credential(3, "ksk_fresh_dead", true);
+        fresh_dead.disabled = true;
+        fresh_dead.died_at = Some(Utc::now().to_rfc3339());
+
+        // 4: 手动禁用、无 died_at → 与判死无关，保留
+        let mut manual = api_key_credential(4, "ksk_manual", true);
+        manual.disabled = true;
+
+        let path = tmp_creds_path("cleanup_dead");
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![expired, expired_manual, fresh_dead, manual],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+
+        let removed = manager.cleanup_dead_credentials(StdDuration::from_secs(24 * 3600));
+        assert_eq!(removed, 1);
+
+        let remaining: Vec<u64> = manager
+            .clone_all_credentials()
+            .iter()
+            .map(|c| c.id.unwrap())
+            .collect();
+        assert_eq!(remaining, vec![2, 3, 4]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 旧凭据文件没有 `added_at`，加载时必须回填，否则存活时长无从计算。
+    #[test]
+    fn missing_added_at_is_backfilled_on_load() {
+        let path = tmp_creds_path("backfill_added_at");
+        let cred = api_key_credential(1, "ksk_no_added_at", false);
+        assert!(cred.added_at.is_none());
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![cred], None, Some(path.clone()), true)
+                .unwrap();
+
+        let added = manager.snapshot().entries[0].added_at.clone();
+        assert!(added.is_some(), "加载时应回填 added_at");
+        assert!(DateTime::parse_from_rfc3339(&added.unwrap()).is_ok());
 
         let _ = std::fs::remove_file(&path);
     }

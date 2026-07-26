@@ -477,6 +477,15 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub error_snapshot_enabled: bool,
 
+    /// 判死凭据的保留时长（小时）。
+    ///
+    /// 403 命中封禁标记后凭据先被禁用并记录 `died_at`，供运营查看存活时长与死因；
+    /// 超过本时长后由后台清理删除（仅限带 `deleteOnForbidden` 的凭据，手工添加的
+    /// 只禁用不自动删）。用小时而非天：线上封号速率约每小时 5 个，按天保留会在
+    /// 凭据列表里积压上百条死号。
+    #[serde(default = "default_dead_credential_retention_hours")]
+    pub dead_credential_retention_hours: u32,
+
     /// 普通错误快照保留天数。critical 与手动 pin 不参加自动过期清理。
     #[serde(default = "default_error_snapshot_retention_days")]
     pub error_snapshot_retention_days: u32,
@@ -735,6 +744,10 @@ fn default_error_snapshot_retention_days() -> u32 {
     7
 }
 
+fn default_dead_credential_retention_hours() -> u32 {
+    24
+}
+
 fn default_error_snapshot_max_storage_gb() -> u64 {
     5
 }
@@ -877,6 +890,7 @@ impl Default for Config {
             profit_quota_per_unit: default_profit_quota_per_unit(),
             key_supplier: KeySupplierConfig::default(),
             error_snapshot_enabled: true,
+            dead_credential_retention_hours: default_dead_credential_retention_hours(),
             error_snapshot_retention_days: default_error_snapshot_retention_days(),
             error_snapshot_max_storage_gb: default_error_snapshot_max_storage_gb(),
             error_snapshot_capture_recovered: false,

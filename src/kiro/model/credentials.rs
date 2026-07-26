@@ -168,10 +168,31 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
 
-    /// 上游返回 403 时自动删除该凭证。仅由受控导入流程显式开启。
+    /// 上游返回封号 403 后，该凭据在保留期结束时自动删除。仅由受控导入流程显式开启。
+    ///
+    /// 语义变更（见 `token_manager::mark_credential_dead`）：早期是「403 立刻删除」，
+    /// 现在是「403 判死先禁用并记录 `died_at`，保留期到点再删」。判死本身与该开关无关，
+    /// 开关只决定过期后是否自动清理。
     #[serde(default)]
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub delete_on_forbidden: bool,
+
+    /// 加入号池的时间（RFC3339）。
+    ///
+    /// 升级前就存在的凭据文件没有该字段，`MultiTokenManager::new` 会在加载时按
+    /// 「首次见到」回填。回填值不是真实加入时间，展示层需要能区分（否则会把
+    /// 「升级后经过的时长」误读成账号存活时长）。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub added_at: Option<String>,
+
+    /// 判定死亡的时间（RFC3339）。
+    ///
+    /// 仅在上游 403 且响应体命中封禁标记时写入，同时作为保留期清理的计时起点。
+    /// 跨区兼容性 403 不会写这个字段。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub died_at: Option<String>,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -998,6 +1019,8 @@ mod tests {
             groups: vec![],
             source_channel: None,
             delete_on_forbidden: false,
+            added_at: None,
+            died_at: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -1240,6 +1263,8 @@ mod tests {
             groups: vec![],
             source_channel: None,
             delete_on_forbidden: false,
+            added_at: None,
+            died_at: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -1281,6 +1306,8 @@ mod tests {
             groups: vec![],
             source_channel: None,
             delete_on_forbidden: false,
+            added_at: None,
+            died_at: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -1405,6 +1432,8 @@ mod tests {
             groups: vec![],
             source_channel: None,
             delete_on_forbidden: false,
+            added_at: None,
+            died_at: None,
         };
 
         let json = original.to_pretty_json().unwrap();

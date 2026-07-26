@@ -32,6 +32,7 @@ use crate::kiro::model_catalog::{DynamicModelCatalog, ModelCatalogError};
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::{EndpointMode, RetryMode, RetryPolicy, TlsBackend};
+use crate::wholesale::health::AccountHealth;
 use parking_lot::{Mutex, RwLock};
 
 /// 每个凭据的最大重试次数
@@ -342,22 +343,37 @@ pub struct KiroProvider {
 }
 
 impl KiroProvider {
-    fn handle_auth_failure(&self, credential_id: u64, status: u16) -> bool {
+    /// 处理 401/403 认证类失败。
+    ///
+    /// 403 分两种，必须区分：账号真被封（终态，该号已死）与跨区 / token 刷新类的
+    /// 兼容性 403（瞬态，重试可过）。早期实现把所有 403 一律当作账号已死并直接删除，
+    /// 于是**一次跨区 403 就会删掉一个好号**——`wholesale::health` 的模块注释早就
+    /// 记录了这个缺陷，只是当时只在批发探活路径上修了。
+    ///
+    /// 这里复用那个已测过的分类器，不另写一套判定：封号文案会变，规则只应有一处。
+    fn handle_auth_failure(&self, credential_id: u64, status: u16, body: &str) -> bool {
         if status == 403 {
-            match self
-                .token_manager
-                .delete_credential_on_forbidden(credential_id)
-            {
-                Ok(Some(has_available)) => {
-                    tracing::warn!("凭据 #{} 收到上游 403，已按自动采购策略删除", credential_id);
-                    return has_available;
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::error!(
-                        "凭据 #{} 收到上游 403，但自动删除失败: {}",
+            match crate::wholesale::health::classify_account_health(status, body) {
+                AccountHealth::Dead => match self.token_manager.mark_credential_dead(credential_id)
+                {
+                    Ok(Some(has_available)) => {
+                        tracing::warn!(
+                            "凭据 #{} 收到封号 403，已判死并禁用（保留期后自动清理）",
+                            credential_id
+                        );
+                        return has_available;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::error!(%error, "凭据 #{} 判死处理失败", credential_id);
+                    }
+                },
+                other => {
+                    // 落到下面的 report_failure 走常规瞬态重试，不判死、不禁用。
+                    tracing::debug!(
+                        "凭据 #{} 收到 403 但未命中封禁标记（{:?}），按瞬态处理",
                         credential_id,
-                        error
+                        other
                     );
                 }
             }
@@ -1302,7 +1318,7 @@ impl KiroProvider {
                     tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
                 }
 
-                let has_available = self.handle_auth_failure(ctx.id, status.as_u16());
+                let has_available = self.handle_auth_failure(ctx.id, status.as_u16(), &body);
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
                 }
@@ -1688,7 +1704,7 @@ impl KiroProvider {
                     tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
                 }
 
-                let has_available = self.handle_auth_failure(ctx.id, status.as_u16());
+                let has_available = self.handle_auth_failure(ctx.id, status.as_u16(), &body);
                 if !has_available {
                     anyhow::bail!(
                         "{} API 请求失败（所有凭据已用尽）: {} {}",

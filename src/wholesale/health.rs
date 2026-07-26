@@ -148,6 +148,15 @@ mod tests {
         assert_eq!(classify_account_health(403, body), AccountHealth::Dead);
     }
 
+    /// 2026-07-26 生产环境抓到的完整报文。语序与上面那条不同
+    /// （`temporarily is suspended` 而非 `is temporarily suspended`），且带 User ID
+    /// 与后半句安全提示——主号池的 403 判死路径就是靠它，必须钉住。
+    #[test]
+    fn production_locked_account_403_is_dead() {
+        let body = r#"{"message":"Your User ID (842882713699) temporarily is suspended. We've locked your account as a security precaution. To restore access, please contact our support team to verify your identity: https://aws.amazon.com/contact-us/","reason":null}"#;
+        assert_eq!(classify_account_health(403, body), AccountHealth::Dead);
+    }
+
     #[test]
     fn cross_region_403_without_ban_is_transient() {
         // 跨区兼容 403：body 里没有封禁字样 → 可重试，绝不能判死

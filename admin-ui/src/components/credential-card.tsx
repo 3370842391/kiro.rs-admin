@@ -55,6 +55,7 @@ import {
   formatBalanceFreshness,
   formatSuccessRate,
   formatTokenState,
+  formatCredentialLifespan,
 } from "@/lib/credential-metrics";
 import {
   concurrencyFillRatio,
@@ -212,6 +213,8 @@ function getDisabledReasonStyle(reason?: string | null): {
       return { label: "Token 失效", variant: "destructive" };
     case "InvalidConfig":
       return { label: "配置无效", variant: "destructive" };
+    case "Forbidden":
+      return { label: "已封号", variant: "destructive" };
     case "Manual":
       return { label: "手动禁用", variant: "secondary" };
     default:
@@ -328,6 +331,19 @@ function CredentialMetaLine({ credential }: { credential: CredentialStatusItem }
     items.push({
       text: credential.sourceChannel,
       hint: `来源渠道：${credential.sourceChannel}`,
+    });
+  }
+  // 存活时长：判死的号定格在死亡瞬间，活着的号持续增长。
+  // 号池升级前就存在的凭据，addedAt 是后端加载时的回填值——那种情况下这里显示的
+  // 是「升级后经过的时长」而非真实存活时长，用 hint 说清楚，避免被当成账号寿命。
+  const lifespan = formatCredentialLifespan(credential.addedAt, credential.diedAt);
+  if (lifespan.kind !== "unknown") {
+    items.push({
+      text: lifespan.label,
+      hint:
+        lifespan.kind === "dead"
+          ? `加入于 ${credential.addedAt}，封号于 ${credential.diedAt}`
+          : `加入于 ${credential.addedAt}。若该账号在本功能上线前就已存在，此处为回填时间，不代表真实加入时刻`,
     });
   }
 
