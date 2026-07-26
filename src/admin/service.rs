@@ -3104,6 +3104,8 @@ impl AdminService {
             history_jpeg_quality: req.history_jpeg_quality,
             retry_history_max_dimension: req.retry_history_max_dimension,
             retry_history_jpeg_quality: req.retry_history_jpeg_quality,
+            // 尺寸硬上限暂不进 admin 请求体，沿用当前值（默认 2000），避免改动前端契约。
+            hard_max_dimension: current_policy.hard_max_dimension,
         }
         .validate()
         .map_err(|error| AdminServiceError::InvalidCredential(error.to_string()))?;
@@ -3120,6 +3122,7 @@ impl AdminService {
         config.image_history_jpeg_quality = policy.history_jpeg_quality;
         config.image_retry_history_max_dimension = policy.retry_history_max_dimension;
         config.image_retry_history_jpeg_quality = policy.retry_history_jpeg_quality;
+        config.image_hard_max_dimension = policy.hard_max_dimension;
         config
             .save()
             .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;

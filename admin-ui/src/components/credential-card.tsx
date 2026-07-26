@@ -51,11 +51,14 @@ import { rpmLoadState } from "@/lib/rpm-operations";
 import {
   connectionLabel,
   formatBalanceFreshness,
-  formatRpmMetric,
-  formatRpmUtilization,
   formatSuccessRate,
   formatTokenState,
 } from "@/lib/credential-metrics";
+import {
+  concurrencyFillRatio,
+  concurrencyHint,
+  concurrencyTone,
+} from "@/lib/credential-concurrency";
 import {
   useSetDisabled,
   useSetPriority,
@@ -214,56 +217,135 @@ function getDisabledReasonStyle(reason?: string | null): {
   }
 }
 
-function CredentialMetric({ label, value }: { label: string; value: string }) {
+const CONCURRENCY_TONE: Record<
+  ReturnType<typeof concurrencyTone>,
+  { dot: string; value: string; fill: string }
+> = {
+  idle: {
+    dot: "bg-muted-foreground/30",
+    value: "text-muted-foreground",
+    fill: "bg-muted-foreground/30",
+  },
+  active: {
+    dot: "bg-emerald-500",
+    value: "text-emerald-600 dark:text-emerald-400",
+    fill: "bg-emerald-500",
+  },
+  busy: {
+    dot: "bg-amber-500",
+    value: "text-amber-600 dark:text-amber-400",
+    fill: "bg-amber-500",
+  },
+  hot: {
+    dot: "bg-destructive",
+    value: "text-destructive",
+    fill: "bg-destructive",
+  },
+};
+
+/**
+ * 「当前并发」计量表 —— 账号列表里最需要一眼看到的实时量：
+ * 此刻有多少个请求正压在这个号上。数字 + 呼吸点 + 相对量条。
+ */
+function ConcurrencyGauge({ inFlight }: { inFlight: number }) {
+  const value = Number.isFinite(inFlight) && inFlight > 0 ? Math.floor(inFlight) : 0;
+  const tone = CONCURRENCY_TONE[concurrencyTone(value)];
+  const hint = concurrencyHint(value);
+  const ratio = concurrencyFillRatio(value);
+
   return (
-    <div
-      className="flex min-w-0 items-center justify-between gap-1 rounded-md border border-border/50 bg-secondary/30 px-1.5 py-1 sm:justify-start sm:gap-1.5"
-      title={`${label}: ${value}`}
-      aria-label={`${label}: ${value}`}
-    >
-      <span className="shrink-0 text-[10px] text-muted-foreground">{label}</span>
-      <span className="min-w-0 truncate text-[11px] font-medium tabular-nums text-foreground">
-        {value}
-      </span>
+    <div className="min-w-0" title={hint}>
+      <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+        并发
+      </div>
+      <div className="mt-1 flex items-center gap-1.5">
+        <span
+          aria-hidden="true"
+          className={`h-1.5 w-1.5 shrink-0 rounded-full ${tone.dot} ${
+            value > 0 ? "motion-safe:animate-pulse" : ""
+          }`}
+        />
+        <span
+          className={`text-[17px] font-semibold leading-none tabular-nums ${tone.value}`}
+          aria-label={hint}
+        >
+          {value}
+        </span>
+      </div>
+      <div className="mt-1.5 h-1 w-full overflow-hidden rounded-full bg-border/60">
+        <div
+          className={`h-full rounded-full transition-all duration-500 ${tone.fill}`}
+          style={{ width: `${Math.round(ratio * 100)}%` }}
+        />
+      </div>
     </div>
   );
 }
 
-function CredentialMetricsStrip({ credential }: { credential: CredentialStatusItem }) {
-  const rpmCurrent = credential.rpmCurrent ?? 0;
-  const rpmLimit = credential.rpmLimit ?? 0;
-  const tokenValue =
-    credential.authMethod === "api_key"
-      ? "API Key"
-      : formatTokenState(credential.expiresAt);
+/**
+ * 次要元信息单行 —— 从前是 5~7 个徽章挤在标题下换行成三排，
+ * 这里压成一行低对比度文本，信息密度不减但视觉噪音大幅下降。
+ */
+function CredentialMetaLine({ credential }: { credential: CredentialStatusItem }) {
+  const region =
+    credential.authRegion && credential.apiRegion
+      ? credential.authRegion === credential.apiRegion
+        ? credential.authRegion
+        : `${credential.authRegion} → ${credential.apiRegion}`
+      : credential.authRegion || credential.apiRegion || null;
+
+  const items: { text: string; hint: string }[] = [];
+  if (region) {
+    items.push({
+      text: region,
+      hint:
+        credential.authRegion === credential.apiRegion
+          ? `认证与数据区域：${region}`
+          : `认证区域 ${credential.authRegion} → 数据区域 ${credential.apiRegion}`,
+    });
+  }
+  if (credential.endpoint) {
+    items.push({ text: credential.endpoint, hint: `端点：${credential.endpoint}` });
+  }
+  if (credential.hasProfileArn) {
+    items.push({ text: "ARN", hint: "已配置 Profile ARN" });
+  }
+  items.push({
+    text: connectionLabel(credential.hasProxy),
+    hint: credential.hasProxy
+      ? `经代理：${maskProxyUrl(credential.proxyUrl ?? "")}`
+      : "不经代理，直连上游",
+  });
+  if (credential.authMethod !== "api_key") {
+    items.push({
+      text: `Token ${formatTokenState(credential.expiresAt)}`,
+      hint: "访问令牌剩余有效期",
+    });
+  }
+  if (credential.sourceChannel) {
+    items.push({
+      text: credential.sourceChannel,
+      hint: `来源渠道：${credential.sourceChannel}`,
+    });
+  }
 
   return (
     <div
-      data-credential-metrics
-      className="mt-1 grid min-w-0 grid-cols-2 gap-1 text-[11px] sm:grid-cols-4 xl:flex xl:flex-wrap"
+      data-credential-meta
+      className="mt-1.5 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground"
     >
-      <CredentialMetric
-        label="近1分钟 RPM"
-        value={formatRpmMetric(rpmCurrent, rpmLimit)}
-      />
-      <CredentialMetric
-        label="RPM 使用率"
-        value={formatRpmUtilization(rpmCurrent, rpmLimit)}
-      />
-      <CredentialMetric
-        label="成功率"
-        value={formatSuccessRate(
-          credential.successCount,
-          credential.totalFailureCount,
-        )}
-      />
-      <CredentialMetric label="进行中" value={String(credential.inFlight ?? 0)} />
-      <CredentialMetric label="Token" value={tokenValue} />
-      <CredentialMetric
-        label="余额更新"
-        value={formatBalanceFreshness(credential.balanceUpdatedAt)}
-      />
-      <CredentialMetric label="连接" value={connectionLabel(credential.hasProxy)} />
+      {items.map((item, index) => (
+        <span key={`${item.text}-${index}`} className="flex min-w-0 items-center gap-2">
+          {index > 0 && (
+            <span aria-hidden="true" className="text-border">
+              ·
+            </span>
+          )}
+          <span className="min-w-0 truncate" title={item.hint}>
+            {item.text}
+          </span>
+        </span>
+      ))}
     </div>
   );
 }
@@ -488,6 +570,23 @@ export function CredentialCard({
         : rpmState === "warning"
           ? `${rpmCurrent} / ${rpmLimit} · 接近满载`
           : `${rpmCurrent} / ${rpmLimit}`;
+  const rpmBarClass =
+    rpmState === "saturated"
+      ? "bg-destructive"
+      : rpmState === "warning"
+        ? "bg-amber-500"
+        : rpmState === "unlimited"
+          ? "bg-muted-foreground/30"
+          : "bg-primary";
+  // 不限速账号没有分母，条留空（只有数字有意义）
+  const rpmFillPercent =
+    rpmState === "unlimited" || rpmLimit <= 0
+      ? 0
+      : Math.min(100, Math.round((rpmCurrent / rpmLimit) * 100));
+  const successRateLabel = formatSuccessRate(
+    credential.successCount,
+    credential.totalFailureCount,
+  );
 
   // 卡片与列表行共用的状态描边 / 灰化（活跃 · 超额 · 冷却 · 禁用）
   const stateClasses = [
@@ -517,11 +616,6 @@ export function CredentialCard({
         />
       )}
       {credential.isCurrent && <Badge variant="success">活跃</Badge>}
-      {credential.inFlight > 0 && (
-        <Badge variant="secondary" className="tabular-nums" title="当前进行中的请求数">
-          进行中 {credential.inFlight}
-        </Badge>
-      )}
       {/* 禁用状态：合并 "已禁用" + 中文化的原因，单个 Badge 更醒目 */}
       {credential.disabled && reasonStyle && (
         <Badge variant={reasonStyle.variant}>已禁用 · {reasonStyle.label}</Badge>
@@ -554,42 +648,12 @@ export function CredentialCard({
         </Badge>
       )}
       {credential.authMethod && <Badge variant="secondary">{authLabel}</Badge>}
-      {(credential.authRegion || credential.apiRegion || credential.authMethod === "api_key") && (
-        <>
-          <Badge variant="outline" title="Token 刷新使用的认证区域">
-            Auth Region: {credential.authRegion || "未配置"}
-          </Badge>
-          <Badge variant="outline" title="模型、用量与生成请求使用的数据区域">
-            API Region: {credential.apiRegion || "未配置"}
-          </Badge>
-        </>
-      )}
-      {/* 配置元信息合并为单个徽章，减少换行：endpoint · ARN */}
-      {(credential.endpoint || credential.hasProfileArn) && (
-        <Badge
-          variant="outline"
-          className="max-w-full truncate"
-          title={
-            credential.hasProfileArn ? "endpoint / 已配置 Profile ARN" : "endpoint"
-          }
-        >
-          {[credential.endpoint, credential.hasProfileArn ? "ARN" : null]
-            .filter(Boolean)
-            .join(" · ")}
-        </Badge>
-      )}
       {/* 账号所属分组 */}
       {(credential.groups ?? []).map((g) => (
         <Badge key={g} variant="outline" title="账号分组">
           {g}
         </Badge>
       ))}
-      {/* 账号来源渠道 */}
-      {credential.sourceChannel && (
-        <Badge variant="outline" title="账号来源渠道">
-          来源: {credential.sourceChannel}
-        </Badge>
-      )}
     </>
   );
 
@@ -705,7 +769,7 @@ export function CredentialCard({
       ref={setNodeRef}
       style={dragStyle}
       data-credential-id={credential.id}
-      className={`group flex min-w-0 items-center gap-2 rounded-2xl border bg-card px-2 py-2 transition-all sm:gap-3 sm:px-3 ${
+      className={`group flex min-w-0 items-center gap-2.5 rounded-2xl border bg-card px-2.5 py-3 transition-all sm:gap-4 sm:px-4 ${
         isDragging
           ? "shadow-apple-lg opacity-80"
           : "hover:bg-accent/40 hover:shadow-apple-sm"
@@ -743,14 +807,47 @@ export function CredentialCard({
         <div className="truncate text-sm font-medium leading-5">
           {displayName}
         </div>
-        <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1 gap-y-1 [&>*]:shrink-0">
+        <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 [&>*]:shrink-0">
+          {/* 超小屏没有并发列的位置，改用行内徽章兜住这条信息 */}
+          {(credential.inFlight ?? 0) > 0 && (
+            <Badge
+              variant="secondary"
+              className="tabular-nums sm:hidden"
+              title={concurrencyHint(credential.inFlight ?? 0)}
+            >
+              并发 {credential.inFlight}
+            </Badge>
+          )}
           {badges}
         </div>
-        <CredentialMetricsStrip credential={credential} />
+        <CredentialMetaLine credential={credential} />
+      </div>
+
+      {/* 当前并发 —— 小屏起就常驻，是列表里最该一眼看到的实时量 */}
+      <div className="hidden w-16 shrink-0 sm:block">
+        <ConcurrencyGauge inFlight={credential.inFlight ?? 0} />
       </div>
 
       {/* 关键指标（中大屏） */}
-      <div className="hidden shrink-0 items-center gap-5 lg:flex">
+      <div className="hidden shrink-0 items-center gap-6 lg:flex">
+        <div className="w-28 min-w-0">
+          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+            RPM
+          </div>
+          <div
+            className={`mt-1 break-words text-xs font-medium tabular-nums ${rpmValueClass}`}
+            title={rpmTitle}
+          >
+            {rpmDisplay}
+          </div>
+          <div className="mt-1.5 h-1 w-full overflow-hidden rounded-full bg-border/60">
+            <div
+              className={`h-full rounded-full transition-all duration-500 ${rpmBarClass}`}
+              style={{ width: `${rpmFillPercent}%` }}
+            />
+          </div>
+        </div>
+
         <div className="relative w-14 shrink-0 text-center">
           <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
             优先级
@@ -821,7 +918,7 @@ export function CredentialCard({
             type="button"
             onClick={() => setShowFailuresDialog(true)}
             className="mt-0.5 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-sm font-medium tabular-nums transition-colors hover:bg-accent"
-            title="鉴权失败 / 账号风控 / 其他（额度·瞬态·网络等）。点击查看失败日志详情"
+            title={`鉴权失败 / 账号风控 / 其他（额度·瞬态·网络等）· Token 刷新失败 ${credential.refreshFailureCount} 次。点击查看失败日志详情`}
           >
             {failureStats ? (
               <span className="tabular-nums">
@@ -858,23 +955,11 @@ export function CredentialCard({
             type="button"
             onClick={handleResetSuccess}
             className="mt-0.5 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-sm font-medium tabular-nums transition-colors hover:bg-accent hover:text-primary"
-            title="点击重置成功次数"
+            title={`成功率 ${successRateLabel} · 点击重置成功次数`}
           >
             {credential.successCount}
             <RotateCcw className="h-3 w-3 opacity-70" />
           </button>
-        </div>
-
-        <div className="w-28 min-w-0 text-center">
-          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
-            RPM
-          </div>
-          <div
-            className={`mt-0.5 break-words text-xs font-medium tabular-nums ${rpmValueClass}`}
-            title={rpmTitle}
-          >
-            {rpmDisplay}
-          </div>
         </div>
       </div>
 
@@ -1012,10 +1097,10 @@ export function CredentialCard({
               <CardTitle className="truncate text-[15px] leading-5">
                 {displayName}
               </CardTitle>
-              <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-1 overflow-hidden">
+              <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 [&>*]:shrink-0">
                 {badges}
               </div>
-              <CredentialMetricsStrip credential={credential} />
+              <CredentialMetaLine credential={credential} />
             </div>
             <Switch
               className="mt-0.5"
@@ -1028,8 +1113,30 @@ export function CredentialCard({
         </CardHeader>
 
         <CardContent className="flex flex-1 flex-col space-y-3 px-4 pb-4 sm:space-y-4 sm:px-5 sm:pb-5">
+          {/* 实时负载：当前并发 + 滚动窗口 RPM */}
+          <div className="grid grid-cols-[4.5rem_1fr] items-start gap-4 rounded-xl border border-border/60 bg-secondary/40 px-3 py-2.5">
+            <ConcurrencyGauge inFlight={credential.inFlight ?? 0} />
+            <div className="min-w-0">
+              <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                RPM
+              </div>
+              <div
+                className={`mt-1 break-words text-[13px] font-medium leading-none tabular-nums ${rpmValueClass}`}
+                title={rpmTitle}
+              >
+                {rpmDisplay}
+              </div>
+              <div className="mt-2 h-1 w-full overflow-hidden rounded-full bg-border/60">
+                <div
+                  className={`h-full rounded-full transition-all duration-500 ${rpmBarClass}`}
+                  style={{ width: `${rpmFillPercent}%` }}
+                />
+              </div>
+            </div>
+          </div>
+
           {/* 信息行 */}
-          <dl className="grid grid-cols-1 gap-2 text-[13px] min-[420px]:grid-cols-2 min-[420px]:gap-x-4">
+          <dl className="grid grid-cols-1 gap-2.5 text-[13px] min-[420px]:grid-cols-2 min-[420px]:gap-x-5">
             <div className="flex min-w-0 items-center justify-between gap-2">
               <dt className="shrink-0 text-muted-foreground">优先级</dt>
               <dd className="min-w-0">
@@ -1083,7 +1190,7 @@ export function CredentialCard({
                   type="button"
                   onClick={() => setShowFailuresDialog(true)}
                   className="inline-flex cursor-pointer items-center gap-1 rounded px-1.5 py-0.5 font-medium tabular-nums transition-colors hover:bg-accent"
-                  title="鉴权失败 / 账号风控 / 其他（额度·瞬态·网络等）。点击查看失败日志详情"
+                  title={`鉴权失败 / 账号风控 / 其他（额度·瞬态·网络等）· Token 刷新失败 ${credential.refreshFailureCount} 次。点击查看失败日志详情`}
                 >
                   {failureStats ? (
                     <span className="tabular-nums">
@@ -1111,14 +1218,6 @@ export function CredentialCard({
               </dd>
             </div>
             <div className="flex min-w-0 items-center justify-between gap-2">
-              <dt className="shrink-0 text-muted-foreground">刷新失败</dt>
-              <dd
-                className={`tabular-nums font-medium ${credential.refreshFailureCount > 0 ? "text-destructive" : ""}`}
-              >
-                {credential.refreshFailureCount}
-              </dd>
-            </div>
-            <div className="flex min-w-0 items-center justify-between gap-2">
               <dt className="shrink-0 text-muted-foreground">成功次数</dt>
               <dd className="min-w-0">
                 <button
@@ -1132,13 +1231,7 @@ export function CredentialCard({
                 </button>
               </dd>
             </div>
-            <div className="flex min-w-0 items-center justify-between gap-2" title={rpmTitle}>
-              <dt className="shrink-0 text-muted-foreground">RPM（60秒/上限）</dt>
-              <dd className={`min-w-0 text-right font-medium tabular-nums ${rpmValueClass}`}>
-                {rpmDisplay}
-              </dd>
-            </div>
-            <div className="flex min-w-0 items-center justify-between gap-2 border-t border-border/50 pt-2 min-[420px]:col-span-2">
+            <div className="flex min-w-0 items-center justify-between gap-2 border-t border-border/50 pt-2.5 min-[420px]:col-span-2">
               <dt className="shrink-0 text-muted-foreground">最后调用</dt>
               <dd className="min-w-0 truncate text-right font-medium">
                 {formatLastUsed(credential.lastUsedAt)}
@@ -1223,10 +1316,15 @@ export function CredentialCard({
                     </span>
                   </div>
                 </div>
-                <div className="break-words border-t border-border/50 pt-2 text-[11px] text-muted-foreground">
-                  下次重置：
-                  <span className="font-medium text-foreground">
-                    {formatResetDate(balance.nextResetAt)}
+                <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 border-t border-border/50 pt-2 text-[11px] text-muted-foreground">
+                  <span className="break-words">
+                    下次重置：
+                    <span className="font-medium text-foreground">
+                      {formatResetDate(balance.nextResetAt)}
+                    </span>
+                  </span>
+                  <span title="余额缓存的更新时间">
+                    更新于 {formatBalanceFreshness(credential.balanceUpdatedAt)}
                   </span>
                 </div>
               </div>

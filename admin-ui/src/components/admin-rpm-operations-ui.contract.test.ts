@@ -136,7 +136,9 @@ describe('admin RPM operations UI wiring', () => {
     expect(card).toContain('最近60秒滚动窗口')
     expect(card).toContain('已满载')
     expect(card).toContain('不限速')
-    expect(card).toContain('进行中')
+    // 并发不再是一个可有可无的徽章，而是常驻计量表
+    expect(card).toContain('并发')
+    expect(card).toContain('ConcurrencyGauge')
   })
 
   test('credential cards show warning text and reserve enough list width for maximum RPM', async () => {
@@ -151,5 +153,13 @@ describe('admin RPM operations UI wiring', () => {
     expect(listRpm?.[1]).toContain('min-w-0')
     expect(listRpm?.[2]).toContain('text-xs')
     expect(listRpm?.[2]).toContain('break-words')
+  })
+
+  test('RPM load has a visual bar that stays empty for unlimited accounts', async () => {
+    const card = await readSource('src/components/credential-card.tsx')
+
+    expect(card).toContain('rpmBarClass')
+    expect(card).toContain('rpmFillPercent')
+    expect(card).toMatch(/rpmState === "unlimited" \|\| rpmLimit <= 0\s*\?\s*0/)
   })
 })

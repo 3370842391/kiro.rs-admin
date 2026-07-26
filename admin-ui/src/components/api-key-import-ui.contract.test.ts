@@ -82,8 +82,9 @@ describe('API Key import UI wiring', () => {
     expect(card).toContain('credential.nickname?.trim() ||')
     expect(card).toContain('credential.authRegion')
     expect(card).toContain('credential.apiRegion')
-    expect(card).toContain('Auth Region')
-    expect(card).toContain('API Region')
+    // 两区域相同时折成一个值，不同才展开为 "auth → api"；悬浮仍标注哪个是认证区域、哪个是数据区域
+    expect(card).toContain('认证与数据区域')
+    expect(card).toContain('认证区域 ${credential.authRegion} → 数据区域 ${credential.apiRegion}')
   })
 
   test('available models dialog supports optional routing diagnostics', async () => {

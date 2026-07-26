@@ -232,6 +232,56 @@ fn find_real_thinking_end_tag(buffer: &str) -> Option<usize> {
     None
 }
 
+/// 找出缓冲区**末尾那一串连续结束标签**的起始位置。
+///
+/// 上游 opus 在 thinking 通道复读退化时会连着吐多个 `</thinking>`（线上熔断日志
+/// `channel=thinking repeat_count=4 unit_bytes=22`，22 字节正是两个标签）。这些标签后面
+/// 都没有 `\n\n`，`find_real_thinking_end_tag` 一个都不认，于是被当正文泄漏给客户端。
+///
+/// 「一串」的定义：一个或多个 `</thinking>`，彼此之间只隔空白，且**延伸到缓冲区末尾**。
+/// 要求延伸到末尾是关键——这样绝不会把思考正文中间提到的标签当成结尾。被引号包裹的
+/// 标签（模型在讨论这个标签）不计入。
+///
+/// 返回 `None` 表示末尾不是这种标签串。
+fn trailing_end_tag_run_start(buffer: &str) -> Option<usize> {
+    const TAG: &str = "</thinking>";
+    // 从末尾往前剥：先去掉尾部空白，再要求紧邻的是一个未被引号包裹的完整标签。
+    let mut cursor = buffer.trim_end().len();
+    let mut run_start = None;
+
+    loop {
+        if cursor < TAG.len() {
+            return run_start;
+        }
+        let candidate = cursor - TAG.len();
+        // 必须用 get()：thinking 正文是任意 UTF-8，按字节回退可能落在多字节字符中间，
+        // 直接 `&buffer[candidate..cursor]` 会 panic（例："内容</thinking>后面还有"）。
+        if buffer.get(candidate..cursor) != Some(TAG) {
+            return run_start;
+        }
+        // 引号包裹说明模型在讨论这个标签，不算结束标签，停止回剥。
+        //
+        // 注意：`QUOTE_CHARS` 里含 `>`，而**紧邻的前一个标签正好以 `>` 结尾**，
+        // 若直接查前一字符会把「标签紧跟标签」误判成被引号包裹。因此先判定前面
+        // （跳过空白后）是否就是另一个结束标签；是则属于同一串，不做引号检查。
+        let before = buffer[..candidate].trim_end();
+        let preceded_by_tag = before.ends_with(TAG);
+        if !preceded_by_tag {
+            let quoted_before = !before.is_empty() && is_quote_char(buffer, before.len() - 1);
+            if quoted_before {
+                return run_start;
+            }
+        }
+        // 后侧：串内标签的后面是下一个标签或空白，只需在**串尾**那次检查。
+        if run_start.is_none() && is_quote_char(buffer, cursor) {
+            return None;
+        }
+        run_start = Some(candidate);
+        // 继续往前，跳过标签之间的空白
+        cursor = buffer[..candidate].trim_end().len();
+    }
+}
+
 /// 查找缓冲区末尾的 thinking 结束标签（允许末尾只有空白字符）
 ///
 /// 用于“边界事件”场景：例如 thinking 结束后立刻进入 tool_use，或流结束，
@@ -241,6 +291,11 @@ fn find_real_thinking_end_tag(buffer: &str) -> Option<usize> {
 /// 以避免在 thinking 内容中提到 `</thinking>`（非结束标签）时误判。
 fn find_real_thinking_end_tag_at_buffer_end(buffer: &str) -> Option<usize> {
     const TAG: &str = "</thinking>";
+    // 复读退化：末尾可能是一串连续标签。原逻辑从左往右扫、只认「后面全是空白」的那个，
+    // 于是 `内容</thinking></thinking>` 会返回**第二个**，`buffer[..end_pos]` 里就带着
+    // 字面的第一个标签。取两者较小值把整串一次收掉；单个标签时两者结果完全相同，
+    // 故对既有行为是纯增量。
+    let run_start = trailing_end_tag_run_start(buffer);
     let mut search_start = 0;
 
     while let Some(pos) = buffer[search_start..].find(TAG) {
@@ -260,13 +315,26 @@ fn find_real_thinking_end_tag_at_buffer_end(buffer: &str) -> Option<usize> {
 
         // 只有当标签后面全部是空白字符时才认定为结束标签
         if buffer[after_pos..].trim().is_empty() {
-            return Some(absolute_pos);
+            return Some(run_start.map_or(absolute_pos, |run| run.min(absolute_pos)));
         }
 
         search_start = absolute_pos + 1;
     }
 
-    None
+    run_start
+}
+
+/// 从 `end_pos`（`find_real_thinking_end_tag_at_buffer_end` 的返回值）算出应跳过的字节数。
+///
+/// 若 `end_pos` 正是末尾标签串的起点，就跳过**整串**；否则退化为单个标签长度，与原行为一致。
+/// 不这样做的话，剥离只推进一个标签的长度，串里剩下的标签会作为普通文本泄漏出去。
+fn end_tag_skip_len(buffer: &str, end_pos: usize) -> usize {
+    const TAG: &str = "</thinking>";
+    if trailing_end_tag_run_start(buffer) == Some(end_pos) {
+        // 标签串按定义延伸到缓冲区末尾，故整段跳完。
+        return buffer.len() - end_pos;
+    }
+    TAG.len()
 }
 
 /// 查找真正的 thinking 开始标签（不被引用字符包裹）
@@ -876,7 +944,7 @@ pub(crate) fn extract_thinking_from_complete_text(text: &str) -> (Option<String>
             &after_open[end_pos + "</thinking>\n\n".len()..],
         )
     } else if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(after_open) {
-        let after_tag = end_pos + "</thinking>".len();
+        let after_tag = end_pos + end_tag_skip_len(after_open, end_pos);
         (&after_open[..end_pos], after_open[after_tag..].trim_start())
     } else {
         // 找不到有效的结束标签，不做提取
@@ -1234,6 +1302,11 @@ impl ToolJsonAccumulator {
     ///   等价于无参工具调用（如 `EnterPlanMode`）。按 `{}` **打捞**成完整工具调用返回，
     ///   与 base 版（首片即发 `content_block_start{input:{}}`、收尾补 `content_block_stop`）
     ///   行为一致——避免把合法的无参调用整个丢弃、连累整轮失败。
+    ///
+    ///   **但仅限该工具的客户端 schema 没有 required 字段时**。若客户端声明了 required
+    ///   （如 `Read.file_path`、`Bash.command`），`{}` 必然撞 missing required，把本可
+    ///   透明重试的 `IncompleteJson` 降级成**不可重试**的 schema 硬失败（线上 29 次/天）。
+    ///   这种情况改报 `IncompleteJson`，让 EOF 重试路径正常生效。
     /// - **完整 JSON**：把流结束视作隐式 `stop`，打捞成完整工具调用。
     /// - **错误 JSON**：EOF 截断记为 `IncompleteJson`，其他语法错误记为 `InvalidJson`。
     ///
@@ -1242,6 +1315,7 @@ impl ToolJsonAccumulator {
     pub fn finish(
         &mut self,
         tool_name_map: &HashMap<String, String>,
+        tool_contracts: &HashMap<String, super::tool_schema::ToolContract>,
     ) -> (Vec<CompletedToolUse>, Option<ToolJsonAccumulatorError>) {
         // 稳定顺序：按 tool_use_id 排序，保证多缓冲时输出与代表错误选取的确定性。
         let mut entries: Vec<(String, (String, String))> = self.buffers.drain().collect();
@@ -1251,6 +1325,18 @@ impl ToolJsonAccumulator {
         let mut error = None;
         for (tool_use_id, (kiro_name, input_json)) in entries {
             let input = if input_json.trim().is_empty() {
+                // 空入参只在「客户端 schema 无 required 字段」时才按无参工具打捞。
+                // 否则 {} 必然 missing required → 不可重试硬失败，改报可重试的 IncompleteJson。
+                if contract_requires_fields(tool_name_map, tool_contracts, &kiro_name) {
+                    if error.is_none() {
+                        error = Some(ToolJsonAccumulatorError::IncompleteJson {
+                            tool_use_id,
+                            name: kiro_name,
+                            bytes: 0,
+                        });
+                    }
+                    continue;
+                }
                 serde_json::json!({})
             } else {
                 match serde_json::from_str::<serde_json::Value>(&input_json) {
@@ -1290,6 +1376,27 @@ impl ToolJsonAccumulator {
             .collect();
         (completed, None)
     }
+}
+
+/// 该 Kiro 侧工具名对应的**客户端契约**是否声明了 required 字段。
+///
+/// 名字解析与 [`CompletedToolUse::from_kiro`] 保持同一口径（`tool_name_map`: kiro名→客户端名），
+/// 保证「打捞判定」和「后续 schema 校验」看的是同一份契约。契约缺失（未声明工具）时返回
+/// false——那条路由由 `emit_completed_tool_use` 的未声明分支处理，不在这里抢先报错。
+fn contract_requires_fields(
+    tool_name_map: &HashMap<String, String>,
+    tool_contracts: &HashMap<String, super::tool_schema::ToolContract>,
+    kiro_name: &str,
+) -> bool {
+    let client_name = tool_name_map
+        .get(kiro_name)
+        .map(String::as_str)
+        .unwrap_or(kiro_name);
+    tool_contracts
+        .get(client_name)
+        .and_then(|contract| contract.schema.get("required"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|required| !required.is_empty())
 }
 
 /// SSE 事件
@@ -1746,6 +1853,9 @@ pub struct StreamContext {
     tool_use_xml_filter: ToolUseXmlLeakFilter,
     /// 身份归一化流式过滤器（跨 chunk 把整词 Kiro→Claude）。仅在 config 开启时生效。
     identity_filter: Option<super::identity::IdentityStreamFilter>,
+    /// 是否发生过「未声明工具降级成文本」。用于让 `saw_upstream_tool_use` 那条
+    /// 「收到 tool_use 却没发出工具块」的协议守卫放行本策略。
+    degraded_undeclared_tool: bool,
     /// 是否收到过上游 toolUseEvent；与实际发出工具块分开记录。
     saw_upstream_tool_use: bool,
     /// 是否实际向客户端发出过非空文本、thinking、redacted thinking 或工具块。
@@ -1972,6 +2082,7 @@ impl StreamContext {
             known_tool_names,
             tool_contracts: HashMap::new(),
             tool_contracts_initialized: false,
+            degraded_undeclared_tool: false,
             code_fence_open: false,
             fence_scan_partial: String::new(),
             thinking_enabled,
@@ -2336,10 +2447,20 @@ impl StreamContext {
                     // 因此保留区必须覆盖 `</thinking>\n\n` 的完整长度（13 字节），
                     // 否则当 `</thinking>` 已在 buffer 但 `\n\n` 尚未到达时，
                     // 标签的前几个字符会被错误地作为 thinking_delta 发出。
+                    //
+                    // 复读退化补充：上游会连着吐多个 `</thinking>`（见
+                    // trailing_end_tag_run_start）。固定 13 字节的保留区挡不住整串，
+                    // 会把前面几个完整标签当正文发出。这里改成「13 字节」与「末尾标签串
+                    // 长度」取较大者——**只放大、不缩小**，故不会让原本该发的正文被扣住，
+                    // 更不会造成提前截断；多留的部分由收尾 flush 统一剥离。
+                    let default_hold = "</thinking>\n\n".len();
+                    let run_hold = trailing_end_tag_run_start(&self.thinking_buffer)
+                        .map(|start| self.thinking_buffer.len() - start)
+                        .unwrap_or(0);
                     let target_len = self
                         .thinking_buffer
                         .len()
-                        .saturating_sub("</thinking>\n\n".len());
+                        .saturating_sub(default_hold.max(run_hold));
                     let safe_len = find_char_boundary(&self.thinking_buffer, target_len);
                     if safe_len > 0 {
                         let safe_content = self.thinking_buffer[..safe_len].to_string();
@@ -2955,37 +3076,65 @@ impl StreamContext {
             self.single_tool_slot_closed = true;
         }
         if self.tool_contracts_initialized {
-            let Some(contract) = self.tool_contracts.get(&completed.name) else {
-                let error = super::tool_schema::ToolSchemaError {
-                    tool_name: completed.name.clone(),
-                    violations: vec![super::tool_schema::ToolInputViolation::UndeclaredTool],
-                };
-                tracing::warn!(tool = %completed.name, "上游返回了未声明工具");
-                self.terminal_attempt_failure =
-                    Some(super::tool_attempt::AttemptFailure::InvalidToolSchema {
-                        failure: super::tool_schema::ToolSchemaFailure::from_error_and_input(
-                            error,
-                            &completed.input,
-                        ),
-                    });
-                self.state_manager.set_stop_reason("error");
+            // 未声明工具：先试解析成客户端已声明的等价名（大小写 / 语义同义词）。
+            if !self.tool_contracts.contains_key(&completed.name)
+                && let Some(resolved) = super::tool_schema::resolve_undeclared_tool_name(
+                    &self.tool_contracts,
+                    &completed.name,
+                )
+            {
+                tracing::warn!(
+                    upstream_tool = %completed.name,
+                    client_tool = %resolved,
+                    "上游未声明工具已解析为客户端等价工具"
+                );
+                completed.name = resolved;
+            }
+            // 解析不到等价工具 → **降级成文本**而非整轮失败（此前是零重试 502）。
+            // 客户端至少能看到模型意图并继续对话；靠系统提示词描述工具的客户端
+            // （Cline / Codex 系）自己会从文本里解析。
+            // 先在此处判定并 return，之后再取 contract 引用，避免为规避借用冲突而克隆契约。
+            if !self.tool_contracts.contains_key(&completed.name) {
+                tracing::warn!(
+                    tool = %completed.name,
+                    "上游返回了未声明工具，降级为文本交付"
+                );
+                let rendered = format!(
+                    "\n[未声明工具调用 {}]\n{}\n",
+                    completed.name,
+                    serde_json::to_string_pretty(&completed.input)
+                        .unwrap_or_else(|_| completed.input.to_string())
+                );
+                self.degraded_undeclared_tool = true;
+                events.extend(self.emit_text_delta_raw(&rendered));
                 return events;
+            }
+            // 借用只活到校验结束：把结果与 client_name 取出后即释放，之后才写 self。
+            let (outcome, client_name) = {
+                let contract = self
+                    .tool_contracts
+                    .get(&completed.name)
+                    .expect("contract presence checked above");
+                let client_name = contract.client_name.clone();
+                let outcome =
+                    super::tool_schema::validate_and_repair(&contract.schema, &mut completed.input);
+                (outcome, client_name)
             };
-            match super::tool_schema::validate_and_repair(&contract.schema, &mut completed.input) {
+            match outcome {
                 super::tool_schema::ToolInputOutcome::Valid => {}
                 super::tool_schema::ToolInputOutcome::Repaired { paths } => {
                     tracing::warn!(
-                        tool = %contract.client_name,
+                        tool = %client_name,
                         paths = ?paths,
                         "确定性修复上游工具固定字段"
                     );
                 }
                 super::tool_schema::ToolInputOutcome::Invalid { violations } => {
                     let error = super::tool_schema::ToolSchemaError {
-                        tool_name: contract.client_name.clone(),
+                        tool_name: client_name.clone(),
                         violations,
                     };
-                    tracing::warn!(tool = %contract.client_name, "上游工具参数不满足客户端Schema");
+                    tracing::warn!(tool = %client_name, "上游工具参数不满足客户端Schema");
                     self.terminal_attempt_failure =
                         Some(super::tool_attempt::AttemptFailure::InvalidToolSchema {
                             failure: super::tool_schema::ToolSchemaFailure::from_error_and_input(
@@ -3133,7 +3282,7 @@ impl StreamContext {
                 }
 
                 // 把结束标签后的内容当作普通文本（通常为空或空白）
-                let after_pos = end_pos + "</thinking>".len();
+                let after_pos = end_pos + end_tag_skip_len(&self.thinking_buffer, end_pos);
                 let remaining = self.thinking_buffer[after_pos..].trim_start().to_string();
                 self.thinking_buffer.clear();
                 if !remaining.is_empty() {
@@ -3259,7 +3408,7 @@ impl StreamContext {
                     }
 
                     // 把结束标签后的内容当作普通文本（通常为空或空白）
-                    let after_pos = end_pos + "</thinking>".len();
+                    let after_pos = end_pos + end_tag_skip_len(&self.thinking_buffer, end_pos);
                     let remaining = self.thinking_buffer[after_pos..].trim_start().to_string();
                     self.thinking_buffer.clear();
                     self.in_thinking_block = false;
@@ -3328,7 +3477,8 @@ impl StreamContext {
         // process_tool_use 中已置位的错误保持不变。
         if self.tool_json_error.is_none() {
             let map = self.tool_name_map.clone();
-            let (salvaged, incomplete) = self.tool_json_accumulator.finish(&map);
+            let contracts = self.tool_contracts.clone();
+            let (salvaged, incomplete) = self.tool_json_accumulator.finish(&map, &contracts);
             if !salvaged.is_empty() {
                 // 兜底：若 thinking 块此刻仍开着（罕见：in_thinking_block 为 true 且缓冲为空、
                 // 上面各分支都没关它），先把它关掉，避免 tool_use 块发出后才补 thinking 的
@@ -3373,8 +3523,11 @@ impl StreamContext {
                 })
                 .cloned();
         }
+        // 未声明工具被**主动降级成文本**时不算协议异常：确实没发 tool_use 块，但那是既定策略，
+        // 内容已作为文本交付。不排除的话降级路径会被这条守卫重新打成 upstream_protocol_error。
         if self.saw_upstream_tool_use
             && !self.state_manager.has_tool_use()
+            && !self.degraded_undeclared_tool
             && self.tool_json_error.is_none()
             && self.terminal_attempt_failure.is_none()
         {
@@ -4721,7 +4874,9 @@ mod tests {
     }
 
     #[test]
-    fn stream_rejects_undeclared_tool_when_contracts_exist() {
+    /// 未声明且无等价工具 → 降级成文本交付，**不得**发出 tool_use（否则客户端会去执行
+    /// 一个它没声明的工具），也不再整轮报错（此前是零重试 502）。
+    fn stream_degrades_undeclared_tool_to_text_when_contracts_exist() {
         let mut ctx = StreamContext::new_with_thinking(
             "test-model",
             1,
@@ -4735,14 +4890,30 @@ mod tests {
             ctx.process_tool_use(&tool_evt("tool_1", "delete_everything", r#"{}"#, true));
         let final_events = ctx.generate_final_events();
 
-        assert!(tool_events.is_empty());
-        assert!(final_events.iter().any(|event| {
-            event.event == "error" && event.data["error"]["type"] == "upstream_tool_schema_error"
-        }));
+        let all: Vec<_> = tool_events.iter().chain(final_events.iter()).collect();
+        let errors: Vec<_> = all.iter().filter(|e| e.event == "error").collect();
+        assert!(errors.is_empty(), "降级路径不应再报错: {errors:?}");
+        assert!(
+            !all.iter()
+                .any(|event| event.data.pointer("/content_block/type")
+                    == Some(&json!("tool_use"))),
+            "绝不能把未声明工具当 tool_use 发给客户端"
+        );
+        let text: String = all
+            .iter()
+            .filter(|event| event.data["delta"]["type"] == "text_delta")
+            .filter_map(|event| event.data["delta"]["text"].as_str())
+            .collect();
+        assert!(
+            text.contains("delete_everything"),
+            "应把工具意图以文本呈现: {text:?}"
+        );
     }
 
     #[test]
-    fn stream_rejects_unrequested_tool_after_empty_contracts_are_initialized() {
+    /// 客户端一个工具都没声明（Cline / Codex 系靠系统提示词描述工具）时同样走降级，
+    /// 而不是把整轮打成 502——这类客户端本来就从文本里自己解析工具调用。
+    fn stream_degrades_unrequested_tool_after_empty_contracts_are_initialized() {
         let mut ctx = StreamContext::new_with_thinking(
             "test-model",
             1,
@@ -4756,10 +4927,16 @@ mod tests {
             ctx.process_tool_use(&tool_evt("tool_1", "delete_everything", r#"{}"#, true));
         let final_events = ctx.generate_final_events();
 
-        assert!(tool_events.is_empty());
-        assert!(final_events.iter().any(|event| {
-            event.event == "error" && event.data["error"]["type"] == "upstream_tool_schema_error"
-        }));
+        let all: Vec<_> = tool_events.iter().chain(final_events.iter()).collect();
+        assert!(
+            !all.iter().any(|event| event.event == "error"),
+            "空 contracts 也不应整轮报错"
+        );
+        assert!(
+            !all.iter()
+                .any(|event| event.data.pointer("/content_block/type")
+                    == Some(&json!("tool_use"))),
+        );
     }
 
     #[test]
@@ -4797,6 +4974,69 @@ mod tests {
         assert_eq!(completed.input, serde_json::json!({}));
     }
 
+    /// 断流（未收 stop=true）+ 空入参：**有 required 字段**的工具不能按 `{}` 打捞，
+    /// 否则必然 missing required → 不可重试硬失败。应报可重试的 IncompleteJson。
+    #[test]
+    fn finish_reports_incomplete_json_for_empty_input_when_schema_has_required_fields() {
+        let contracts = HashMap::from([(
+            "Read".to_string(),
+            crate::anthropic::tool_schema::ToolContract {
+                client_name: "Read".to_string(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"],
+                    "additionalProperties": false
+                }),
+            },
+        )]);
+        let mut acc = ToolJsonAccumulator::new();
+        // stop=false 模拟断流：块开出来了但没写任何参数。
+        assert!(
+            acc.push(&tool_evt("t1", "Read", "", false), &HashMap::new())
+                .unwrap()
+                .is_none()
+        );
+
+        let (salvaged, err) = acc.finish(&HashMap::new(), &contracts);
+
+        assert!(salvaged.is_empty(), "有 required 字段时不应打捞成 {{}}");
+        assert!(
+            matches!(err, Some(ToolJsonAccumulatorError::IncompleteJson { .. })),
+            "应报可重试的 IncompleteJson，实际: {err:?}"
+        );
+    }
+
+    /// 反面：无 required 字段的无参工具（如 EnterPlanMode）仍按 `{}` 正常打捞，
+    /// 不能因为上面的收敛把合法无参调用打掉。
+    #[test]
+    fn finish_still_salvages_empty_input_for_tools_without_required_fields() {
+        let contracts = HashMap::from([(
+            "EnterPlanMode".to_string(),
+            crate::anthropic::tool_schema::ToolContract {
+                client_name: "EnterPlanMode".to_string(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": false
+                }),
+            },
+        )]);
+        let mut acc = ToolJsonAccumulator::new();
+        assert!(
+            acc.push(&tool_evt("t1", "EnterPlanMode", "", false), &HashMap::new())
+                .unwrap()
+                .is_none()
+        );
+
+        let (salvaged, err) = acc.finish(&HashMap::new(), &contracts);
+
+        assert!(err.is_none(), "无参工具不应报错: {err:?}");
+        assert_eq!(salvaged.len(), 1);
+        assert_eq!(salvaged[0].input, serde_json::json!({}));
+    }
+
     #[test]
     fn tool_json_accumulator_invalid_json_errors() {
         let mut acc = ToolJsonAccumulator::new();
@@ -4822,7 +5062,7 @@ mod tests {
             .unwrap()
             .is_none()
         );
-        let (salvaged, err) = acc.finish(&HashMap::new());
+        let (salvaged, err) = acc.finish(&HashMap::new(), &HashMap::new());
         assert!(salvaged.is_empty(), "半截 JSON 不应被打捞");
         let err = err.expect("半截 JSON 应报 IncompleteJson");
         assert!(matches!(
@@ -4830,7 +5070,7 @@ mod tests {
             ToolJsonAccumulatorError::IncompleteJson { .. }
         ));
         // 已取出残留后再 finish() 应无错误、无打捞。
-        let (salvaged, err) = acc.finish(&HashMap::new());
+        let (salvaged, err) = acc.finish(&HashMap::new(), &HashMap::new());
         assert!(salvaged.is_empty() && err.is_none());
     }
 
@@ -4844,7 +5084,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let (salvaged, err) = acc.finish(&HashMap::new());
+        let (salvaged, err) = acc.finish(&HashMap::new(), &HashMap::new());
         assert!(err.is_none(), "空入参不应报错");
         assert_eq!(salvaged.len(), 1);
         assert_eq!(salvaged[0].id, "t1");
@@ -4868,7 +5108,7 @@ mod tests {
         )
         .unwrap();
 
-        let (completed, err) = acc.finish(&map);
+        let (completed, err) = acc.finish(&map, &HashMap::new());
         assert!(err.is_none(), "完整 JSON 残留应按隐式 stop 打捞");
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].id, "write1");
@@ -4888,7 +5128,7 @@ mod tests {
                 &HashMap::new(),
             )
             .unwrap();
-        let (completed, err) = incomplete.finish(&HashMap::new());
+        let (completed, err) = incomplete.finish(&HashMap::new(), &HashMap::new());
         assert!(completed.is_empty());
         assert!(matches!(
             err,
@@ -4902,7 +5142,7 @@ mod tests {
                 &HashMap::new(),
             )
             .unwrap();
-        let (completed, err) = invalid.finish(&HashMap::new());
+        let (completed, err) = invalid.finish(&HashMap::new(), &HashMap::new());
         assert!(completed.is_empty());
         assert!(matches!(
             err,
@@ -4925,7 +5165,7 @@ mod tests {
             &HashMap::new(),
         )
         .unwrap();
-        let (completed, err) = acc.finish(&HashMap::new());
+        let (completed, err) = acc.finish(&HashMap::new(), &HashMap::new());
         assert!(completed.is_empty(), "错误批次不得部分提交工具调用");
         assert!(
             matches!(err, Some(ToolJsonAccumulatorError::IncompleteJson { .. })),
@@ -4947,7 +5187,7 @@ mod tests {
         )
         .unwrap();
 
-        let (completed, err) = acc.finish(&HashMap::new());
+        let (completed, err) = acc.finish(&HashMap::new(), &HashMap::new());
         assert!(completed.is_empty(), "非法 JSON 批次不得部分提交空参工具");
         assert!(matches!(
             err,
@@ -5657,6 +5897,198 @@ mod tests {
         assert_eq!(find_real_thinking_end_tag("</thinking>"), None);
         assert_eq!(find_real_thinking_end_tag("</thinking>\n"), None);
         assert_eq!(find_real_thinking_end_tag("</thinking> more"), None);
+    }
+
+    /// 复读退化回归：上游连吐多个 `</thinking>` 时，末尾整串都要被识别成结束标签，
+    /// 否则前面几个会作为字面文本泄漏给客户端（线上 `unit_bytes=22` 即两个标签）。
+    #[test]
+    fn trailing_end_tag_run_collapses_repeated_tags() {
+        // 连续两个 / 三个：都应指向**第一个**标签的位置
+        assert_eq!(trailing_end_tag_run_start("内容</thinking></thinking>"), Some(6));
+        assert_eq!(
+            trailing_end_tag_run_start("内容</thinking></thinking></thinking>"),
+            Some(6)
+        );
+        // 标签之间夹空白也算同一串
+        assert_eq!(
+            trailing_end_tag_run_start("内容</thinking>\n\n</thinking>"),
+            Some(6)
+        );
+        // 串后面允许尾随空白
+        assert_eq!(
+            trailing_end_tag_run_start("内容</thinking></thinking>\n\n"),
+            Some(6)
+        );
+        // 单个标签：与原行为一致（这是保证「纯增量」的关键）
+        assert_eq!(trailing_end_tag_run_start("内容</thinking>"), Some(6));
+        // 标签后有真实内容 → 不是末尾串
+        assert_eq!(trailing_end_tag_run_start("内容</thinking>后面还有"), None);
+        // 完全没有标签
+        assert_eq!(trailing_end_tag_run_start("纯文本"), None);
+        // 被反引号包裹（模型在讨论这个标签）→ 不认
+        assert_eq!(trailing_end_tag_run_start("提到 `</thinking>`"), None);
+    }
+
+    /// 量化 thinking 标签串检测在**流式热路径**上的开销。
+    ///
+    /// `trailing_end_tag_run_start` 跑在每个 chunk 的 else 分支上，是全项目最高频的新增
+    /// 调用点，必须确认它不是 O(buffer)。纯度量、不断言耗时。
+    #[test]
+    fn measure_thinking_hot_path_overhead() {
+        // 模拟一段长 thinking：2000 个 chunk，累计约 100 KiB
+        let chunk = "这是一段思考内容，用来模拟真实的流式分片输出。".repeat(2);
+        let rounds = 2_000;
+
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_assistant_response("<thinking>");
+
+        let started = std::time::Instant::now();
+        let mut total_bytes = 0usize;
+        for _ in 0..rounds {
+            total_bytes += chunk.len();
+            let _ = ctx.process_assistant_response(&chunk);
+        }
+        let elapsed = started.elapsed();
+
+        println!(
+            "thinking 热路径：{} 个 chunk / {} KiB，总耗时 {:?}，单 chunk 均摊 {:?}",
+            rounds,
+            total_bytes / 1024,
+            elapsed,
+            elapsed / rounds
+        );
+    }
+
+    /// UTF-8 边界压测：thinking 正文是任意 Unicode，回剥时按字节切片极易切进多字节字符
+    /// 中间导致 panic（开发中真实踩到过）。这里穷举各种多字节前缀 × 标签串组合，
+    /// 只要求**不 panic**，把崩溃类回归钉死。
+    #[test]
+    fn trailing_end_tag_run_never_panics_on_multibyte_boundaries() {
+        let prefixes = [
+            "",
+            "内容",
+            "后",
+            "🙂",
+            "a内",
+            "日本語テキスト",
+            "emoji🙂混排",
+            "①②③",
+        ];
+        let suffixes = [
+            "",
+            "</thinking>",
+            "</thinking></thinking>",
+            "</thinking>\n\n</thinking>  ",
+            "</thinking>后面",
+            "`</thinking>`",
+            "</think",
+            "thinking>",
+        ];
+        for prefix in prefixes {
+            for suffix in suffixes {
+                let buffer = format!("{prefix}{suffix}");
+                // 两个函数都要在任意输入下安全返回
+                let run = trailing_end_tag_run_start(&buffer);
+                if let Some(start) = run {
+                    assert!(
+                        buffer.is_char_boundary(start),
+                        "返回位置必须是字符边界: {buffer:?} -> {start}"
+                    );
+                    let skip = end_tag_skip_len(&buffer, start);
+                    assert!(
+                        buffer.is_char_boundary(start + skip),
+                        "跳过后的位置必须是字符边界: {buffer:?}"
+                    );
+                }
+                let _ = find_real_thinking_end_tag_at_buffer_end(&buffer);
+                let _ = find_real_thinking_end_tag(&buffer);
+            }
+        }
+    }
+
+    /// `find_real_thinking_end_tag_at_buffer_end` 对连续标签必须返回**串首**，
+    /// 这样 `buffer[..end_pos]` 里才不会夹带字面标签。
+    #[test]
+    fn buffer_end_lookup_returns_run_start_for_repeated_tags() {
+        let buffer = "思考内容</thinking></thinking>";
+        let end_pos = find_real_thinking_end_tag_at_buffer_end(buffer).expect("应识别为结束标签");
+        assert_eq!(&buffer[..end_pos], "思考内容", "thinking 正文不得夹带字面标签");
+        // 跳过整串后应无残留
+        let after = end_pos + end_tag_skip_len(buffer, end_pos);
+        assert_eq!(
+            buffer[after..].trim(),
+            "",
+            "整串标签都应被跳过，不得作为文本泄漏"
+        );
+    }
+
+    /// 单标签场景下新旧路径结果必须完全一致——回归「不引发其他 bug」这条约束。
+    #[test]
+    fn buffer_end_lookup_unchanged_for_single_tag() {
+        for buffer in [
+            "内容</thinking>",
+            "内容</thinking>   ",
+            "内容</thinking>\n\n",
+            "</thinking>",
+        ] {
+            let end_pos =
+                find_real_thinking_end_tag_at_buffer_end(buffer).expect("单标签应被识别");
+            let after = end_pos + end_tag_skip_len(buffer, end_pos);
+            assert_eq!(buffer[after..].trim(), "", "剥离后不应有残留: {buffer:?}");
+            assert!(
+                !buffer[..end_pos].contains("</thinking>"),
+                "正文不得含字面标签: {buffer:?}"
+            );
+        }
+    }
+
+    /// 端到端：流式吐出带重复结束标签的 thinking，客户端不应看到任何字面 `</thinking>`，
+    /// 且 thinking 正文要完整保留。
+    #[test]
+    fn stream_does_not_leak_literal_end_tags_on_repetition() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_assistant_response(
+            "<thinking>我在更新失败提示。</thinking></thinking></thinking>",
+        ));
+        events.extend(ctx.generate_final_events());
+
+        let thinking: String = events
+            .iter()
+            .filter(|e| e.data["delta"]["type"] == "thinking_delta")
+            .filter_map(|e| e.data["delta"]["thinking"].as_str())
+            .collect();
+        let text: String = events
+            .iter()
+            .filter(|e| e.data["delta"]["type"] == "text_delta")
+            .filter_map(|e| e.data["delta"]["text"].as_str())
+            .collect();
+
+        assert!(
+            !thinking.contains("</thinking>"),
+            "thinking 正文泄漏了字面标签: {thinking:?}"
+        );
+        assert!(
+            !text.contains("</thinking>"),
+            "正文泄漏了字面标签: {text:?}"
+        );
+        assert!(
+            thinking.contains("我在更新失败提示。"),
+            "thinking 内容丢失: {thinking:?}"
+        );
     }
 
     #[test]

@@ -11,6 +11,10 @@ pub(crate) enum ToolInputViolation {
     TypeMismatch { path: String, expected: String },
     ConstMismatch { path: String },
     EnumMismatch { path: String },
+    /// 多余字段。**生产路径已不再构造它**：`additionalProperties: false` 下的多余字段
+    /// 改为丢弃（见 `validate_object` 的 `dropped_properties`），只有既有错误快照里的
+    /// 历史记录和展示/测试路径还会用到，故保留该变体以免破坏 `display_violation` 口径。
+    #[allow(dead_code)]
     AdditionalProperty(String),
     ConstraintViolation { path: String, keyword: &'static str },
 }
@@ -54,7 +58,60 @@ const SAFE_REQUIRED_PROPERTY_ALIASES: &[(&str, &str)] = &[
     ("content", "contents"),
     ("pattern", "glob_pattern"),
     ("query", "pattern"),
+    // 以下 6 条按线上实测补齐（见 traces `tool ... input violates schema`）：
+    // 上游按自身方言吐参，客户端 schema 用另一套命名，此前无别名可用而整轮硬失败。
+    ("content", "text"),      // fs_write：上游 content → 客户端 text
+    ("pattern", "query"),     // grep_search：`query→pattern` 的反向缺失
+    ("old_string", "old_str"), // Edit：全称 → 缩写（snake_case）
+    ("new_string", "new_str"),
+    ("oldString", "oldStr"), // edit：全称 → 缩写（camelCase）
+    ("newString", "newStr"),
 ];
+
+/// 上游未声明工具 → 客户端已声明工具的**语义等价族**。
+///
+/// 上游会按自身训练习惯吐客户端没声明的工具名（线上长尾：`execute_command` / `Shell` /
+/// `shell` / `terminal_execute_command` / `bash` …）。这些都是「跑一条命令」的同义词，
+/// 参数主键都是 `command`，改名到客户端真实声明的同族工具即可正常执行。
+///
+/// 只列**参数主键一致**的族。`apply_patch`（统一 diff 单字段）刻意不在此列——它需要真正解析
+/// diff 才能落到 Edit/str_replace，解析错会静默改错文件，宁可降级成文本。
+const SEMANTIC_TOOL_FAMILIES: &[&[&str]] = &[&[
+    "bash",
+    "shell",
+    "execute_bash",
+    "execute_command",
+    "run_command",
+    "terminal_execute_command",
+    "runcommand",
+]];
+
+/// 把上游吐的工具名解析成**客户端已声明**的等价工具名。
+///
+/// 顺序：精确命中 → 大小写不敏感命中 → 语义等价族命中。都不中返回 `None`，由调用方走
+/// 「降级成文本」而不是硬失败。解析成功后仍会走正常 schema 校验，所以改错名不会静默通过。
+pub(crate) fn resolve_undeclared_tool_name(
+    contracts: &std::collections::HashMap<String, ToolContract>,
+    upstream_name: &str,
+) -> Option<String> {
+    if contracts.contains_key(upstream_name) {
+        return Some(upstream_name.to_string());
+    }
+    let lowered = upstream_name.to_ascii_lowercase();
+    if let Some(hit) = contracts
+        .keys()
+        .find(|declared| declared.to_ascii_lowercase() == lowered)
+    {
+        return Some(hit.clone());
+    }
+    let family = SEMANTIC_TOOL_FAMILIES
+        .iter()
+        .find(|family| family.contains(&lowered.as_str()))?;
+    contracts
+        .keys()
+        .find(|declared| family.contains(&declared.to_ascii_lowercase().as_str()))
+        .cloned()
+}
 
 /// 工具 Schema 失败的安全副本。
 ///
@@ -792,6 +849,10 @@ fn validate_object(
         .into_iter()
         .flat_map(|properties| properties.keys().map(String::as_str))
         .collect();
+    // `additionalProperties: false` 下的多余字段改为**丢弃**而非违规：上游按自身方言多带
+    // 一两个字段（如 Grep 多发 $.glob）本不该让整轮失败。语义有损（丢 glob 等于搜索范围
+    // 从过滤变全量），故记入 repairs 由调用方打日志。
+    let mut dropped_properties = Vec::new();
     for (name, value) in object.iter_mut() {
         if property_names.contains(name.as_str()) {
             continue;
@@ -799,7 +860,8 @@ fn validate_object(
         let child_path = property_path(path, name);
         match additional {
             Some(serde_json::Value::Bool(false)) => {
-                violations.push(ToolInputViolation::AdditionalProperty(child_path));
+                dropped_properties.push(name.clone());
+                repairs.push(child_path);
             }
             Some(additional_schema @ serde_json::Value::Object(_)) => validate_value(
                 additional_schema,
@@ -811,6 +873,9 @@ fn validate_object(
             ),
             _ => {}
         }
+    }
+    for name in dropped_properties {
+        object.remove(&name);
     }
 }
 
@@ -1040,6 +1105,13 @@ mod tests {
             ("newStr", "new_string"),
             ("oldString", "old_string"),
             ("newString", "new_string"),
+            // 线上实测补齐的 6 条（见 SAFE_REQUIRED_PROPERTY_ALIASES 注释）
+            ("content", "text"),
+            ("pattern", "query"),
+            ("old_string", "old_str"),
+            ("new_string", "new_str"),
+            ("oldString", "oldStr"),
+            ("newString", "newStr"),
         ] {
             let mut schema = serde_json::json!({
                 "type": "object",
@@ -1144,15 +1216,13 @@ mod tests {
             "path": "/tmp/a.txt",
             "file_path": "/tmp/b.txt"
         });
-        let original_conflict = conflict.clone();
+        // path 已存在 → 别名不搬运；file_path 作为多余字段被丢弃（不再算违规）。
+        // 关键不变量：path 的值绝不能被 file_path 覆盖。
         assert!(matches!(
             validate_and_repair(&schema, &mut conflict),
-            ToolInputOutcome::Invalid { violations }
-                if violations.iter().any(|violation| {
-                    display_violation(violation).contains("$.file_path")
-                })
+            ToolInputOutcome::Repaired { .. }
         ));
-        assert_eq!(conflict, original_conflict);
+        assert_eq!(conflict, serde_json::json!({"path": "/tmp/a.txt"}));
 
         let mut non_string = serde_json::json!({"file_path": 7});
         let original_non_string = non_string.clone();
@@ -1171,16 +1241,20 @@ mod tests {
             "required": ["contents"],
             "additionalProperties": false
         });
+        // 目标已存在时别名绝不能覆盖它；源字段作为多余字段被丢弃（不再算违规）。
         let mut conflict = serde_json::json!({
             "content": "source",
             "contents": "target"
         });
-        let original_conflict = conflict.clone();
         assert!(matches!(
             validate_and_repair(&target_schema, &mut conflict),
-            ToolInputOutcome::Invalid { .. }
+            ToolInputOutcome::Repaired { .. }
         ));
-        assert_eq!(conflict, original_conflict);
+        assert_eq!(
+            conflict,
+            serde_json::json!({"contents": "target"}),
+            "目标值必须保持为 target，不得被 source 覆盖"
+        );
 
         let both_declared = serde_json::json!({
             "type": "object",
@@ -1222,13 +1296,17 @@ mod tests {
             "required": [],
             "additionalProperties": false
         });
+        // 目标非 required 时不做别名搬运：source 被当多余字段丢弃，绝不能凭空造出 contents。
         let mut optional = serde_json::json!({"content": "source"});
-        let original_optional = optional.clone();
         assert!(matches!(
             validate_and_repair(&optional_target, &mut optional),
-            ToolInputOutcome::Invalid { .. }
+            ToolInputOutcome::Repaired { .. }
         ));
-        assert_eq!(optional, original_optional);
+        assert_eq!(
+            optional,
+            serde_json::json!({}),
+            "非 required 目标不得被别名填充"
+        );
     }
 
     #[test]
@@ -1595,6 +1673,8 @@ mod tests {
         assert_eq!(input, serde_json::json!({}));
     }
 
+    /// 类型 / enum 违规照报且不做强制转换；多余字段不再计入违规（改为丢弃，
+    /// 见 `additional_property_is_dropped_instead_of_failing_the_turn`）。
     #[test]
     fn reports_type_enum_and_additional_property_violations_without_coercion() {
         let schema = serde_json::json!({
@@ -1620,11 +1700,10 @@ mod tests {
                     ToolInputViolation::EnumMismatch {
                         path: "$.mode".to_string()
                     },
-                    ToolInputViolation::AdditionalProperty("$.extra".to_string()),
                 ]
             }
         );
-        assert_eq!(input, original);
+        assert_eq!(input, original, "违规时入参不得被改写");
     }
 
     #[test]
@@ -1701,11 +1780,157 @@ mod tests {
 
         let error = validate_tool_use_blocks(&contracts, &mut blocks).unwrap_err();
 
-        assert_eq!(blocks[0], original);
+        assert_eq!(blocks[0], original, "校验失败时不得改写原始块");
         assert_eq!(error.tool_name, "get_weather");
         assert!(error.to_string().contains("$.city"));
-        assert!(error.to_string().contains("$.secret_customer_value"));
+        // 多余字段现在被**丢弃**而非报违规（见 validate_object 的 dropped_properties），
+        // 所以不再出现在错误里；真正的违规（$.city 类型错）仍然照报。
+        assert!(!error.to_string().contains("$.secret_customer_value"));
         assert!(!error.to_string().contains("do-not-echo"));
+    }
+
+    /// 线上真实失败形状回归：上游按自身方言吐参、客户端 schema 用另一套命名。
+    /// 每条都对应 traces 里 `tool ... input violates schema` 的一类，修复前整轮 400。
+    #[test]
+    fn repairs_observed_production_dialect_mismatches() {
+        // fs_write：上游 {content, file_path} → 客户端 {text, path}
+        let fs_write = serde_json::json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "text": {"type": "string"}},
+            "required": ["path", "text"],
+            "additionalProperties": false
+        });
+        let mut input = serde_json::json!({"content": "hello", "file_path": "/tmp/a.txt"});
+        assert!(matches!(
+            validate_and_repair(&fs_write, &mut input),
+            ToolInputOutcome::Repaired { .. }
+        ));
+        assert_eq!(
+            input,
+            serde_json::json!({"path": "/tmp/a.txt", "text": "hello"})
+        );
+
+        // grep_search：上游 {glob, pattern} → 客户端 required query（glob 未声明，丢弃）
+        let grep_search = serde_json::json!({
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+            "additionalProperties": false
+        });
+        let mut input = serde_json::json!({"glob": "*.rs", "pattern": "fn main"});
+        assert!(matches!(
+            validate_and_repair(&grep_search, &mut input),
+            ToolInputOutcome::Repaired { .. }
+        ));
+        assert_eq!(input, serde_json::json!({"query": "fn main"}));
+
+        // Edit：上游 {old_string, new_string} → 客户端 {old_str, new_str}
+        let edit = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "old_str": {"type": "string"},
+                "new_str": {"type": "string"}
+            },
+            "required": ["path", "old_str", "new_str"],
+            "additionalProperties": false
+        });
+        let mut input = serde_json::json!({
+            "path": "/tmp/a.rs", "old_string": "a", "new_string": "b"
+        });
+        assert!(matches!(
+            validate_and_repair(&edit, &mut input),
+            ToolInputOutcome::Repaired { .. }
+        ));
+        assert_eq!(
+            input,
+            serde_json::json!({"path": "/tmp/a.rs", "old_str": "a", "new_str": "b"})
+        );
+    }
+
+    /// 未声明工具解析：大小写 / 语义同义词命中客户端已声明工具；无等价则返回 None
+    /// （由调用方降级成文本）。`apply_patch` 刻意不可解析——见 SEMANTIC_TOOL_FAMILIES。
+    #[test]
+    fn resolves_undeclared_tool_to_declared_equivalent() {
+        let contracts = std::collections::HashMap::from([(
+            "Bash".to_string(),
+            ToolContract {
+                client_name: "Bash".to_string(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                    "additionalProperties": false
+                }),
+            },
+        )]);
+
+        for upstream in [
+            "bash",
+            "BASH",
+            "execute_command",
+            "shell",
+            "terminal_execute_command",
+        ] {
+            assert_eq!(
+                resolve_undeclared_tool_name(&contracts, upstream).as_deref(),
+                Some("Bash"),
+                "{upstream} 应解析到已声明的 Bash"
+            );
+        }
+
+        for unmappable in ["apply_patch", "mcp__browser__preview_start", "ToolSearch"] {
+            assert_eq!(
+                resolve_undeclared_tool_name(&contracts, unmappable),
+                None,
+                "{unmappable} 不应被猜成 Bash"
+            );
+        }
+    }
+
+    /// execute_command 的多余字段（requires_approval / task_progress）在解析成 Bash 后
+    /// 由丢弃逻辑清掉，command 原样保留——这是线上 51 次/天那条的完整链路。
+    #[test]
+    fn resolved_shell_tool_drops_upstream_only_fields() {
+        let bash = serde_json::json!({
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+            "additionalProperties": false
+        });
+        let mut input = serde_json::json!({
+            "command": "ls -la",
+            "requires_approval": false,
+            "task_progress": "step 1"
+        });
+        assert!(matches!(
+            validate_and_repair(&bash, &mut input),
+            ToolInputOutcome::Repaired { .. }
+        ));
+        assert_eq!(input, serde_json::json!({"command": "ls -la"}));
+    }
+
+    #[test]
+    fn additional_property_is_dropped_instead_of_failing_the_turn() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"pattern": {"type": "string"}},
+            "required": ["pattern"],
+            "additionalProperties": false
+        });
+        let mut input = serde_json::json!({"pattern": "fn main", "glob": "*.rs"});
+
+        assert_eq!(
+            validate_and_repair(&schema, &mut input),
+            ToolInputOutcome::Repaired {
+                paths: vec!["$.glob".to_string()]
+            }
+        );
+        assert_eq!(
+            input,
+            serde_json::json!({"pattern": "fn main"}),
+            "多余字段应被移除，声明字段原样保留"
+        );
     }
 
     #[test]

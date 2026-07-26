@@ -4241,11 +4241,59 @@ fn normalize_and_validate_non_stream_content(
         tool_choice_policy,
         preferred_native_tool_id.as_deref(),
     );
+    // 未声明工具：与流式路径同一口径——先解析成客户端等价名，解析不到就降级成文本，
+    // 不再整轮 502（`UndeclaredTool` 本就被排除在重试之外，硬失败等于零重试）。
+    if !tool_contracts.is_empty() {
+        resolve_or_degrade_undeclared_tool_blocks(&mut content, tool_contracts);
+    }
     let validation = super::tool_schema::validate_tool_use_blocks(tool_contracts, &mut content);
     if validation.is_ok() {
         super::stream::dedupe_reclaimed_tools_after_repair(&mut content, &native_tool_ids);
     }
     (content, validation)
+}
+
+/// 把未声明的 `tool_use` 块就地解析成客户端等价工具名；解析不到的整块换成 `text` 块。
+///
+/// 与 `StreamContext::emit_completed_tool_use` 的未声明分支保持同一策略，避免流式/非流式
+/// 对同一次上游输出给出不同结论。改名后仍会进 `validate_tool_use_blocks`，错名不会静默通过。
+fn resolve_or_degrade_undeclared_tool_blocks(
+    content: &mut [serde_json::Value],
+    tool_contracts: &std::collections::HashMap<String, super::tool_schema::ToolContract>,
+) {
+    for block in content.iter_mut() {
+        if block.get("type").and_then(serde_json::Value::as_str) != Some("tool_use") {
+            continue;
+        }
+        let Some(name) = block
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        if tool_contracts.contains_key(&name) {
+            continue;
+        }
+        if let Some(resolved) =
+            super::tool_schema::resolve_undeclared_tool_name(tool_contracts, &name)
+        {
+            tracing::warn!(
+                upstream_tool = %name,
+                client_tool = %resolved,
+                "上游未声明工具已解析为客户端等价工具"
+            );
+            block["name"] = serde_json::Value::String(resolved);
+            continue;
+        }
+        tracing::warn!(tool = %name, "上游返回了未声明工具，降级为文本交付");
+        let input = block.get("input").cloned().unwrap_or(serde_json::json!({}));
+        let rendered = format!(
+            "\n[未声明工具调用 {name}]\n{}\n",
+            serde_json::to_string_pretty(&input).unwrap_or_else(|_| input.to_string())
+        );
+        *block = serde_json::json!({"type": "text", "text": rendered});
+    }
 }
 
 fn non_stream_content_has_non_tool_semantic_output(content: &[serde_json::Value]) -> bool {
@@ -4447,7 +4495,7 @@ async fn collect_non_stream_tool_attempt(
     }
 
     if tool_json_error.is_none() {
-        let (completed, error) = tool_accumulator.finish(tool_name_map);
+        let (completed, error) = tool_accumulator.finish(tool_name_map, tool_contracts);
         if error.is_none() {
             for tool_use in completed {
                 tracing::warn!(

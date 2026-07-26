@@ -402,6 +402,7 @@ impl KiroProvider {
             history_jpeg_quality: token_manager.config().image_history_jpeg_quality,
             retry_history_max_dimension: token_manager.config().image_retry_history_max_dimension,
             retry_history_jpeg_quality: token_manager.config().image_retry_history_jpeg_quality,
+            hard_max_dimension: token_manager.config().image_hard_max_dimension,
         };
         let image_budget_policy = configured_image_budget.validate().unwrap_or_else(|error| {
             tracing::warn!(%error, "图片预算配置无效，回退内置默认值");

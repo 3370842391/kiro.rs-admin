@@ -617,6 +617,11 @@ pub struct Config {
     #[serde(default = "default_image_retry_quality")]
     pub image_retry_history_jpeg_quality: u8,
 
+    /// 图片长边硬上限（像素），历史图与当前轮图都封顶，与字节预算解耦。
+    /// 对齐上游多图请求的像素约束（2000）。
+    #[serde(default = "default_image_hard_max_dimension")]
+    pub image_hard_max_dimension: u32,
+
     /// 端点特定的配置
     ///
     /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
@@ -806,6 +811,10 @@ fn default_image_retry_quality() -> u8 {
     60
 }
 
+fn default_image_hard_max_dimension() -> u32 {
+    2_000
+}
+
 fn default_usage_log_retention_days() -> u32 {
     31
 }
@@ -898,6 +907,7 @@ impl Default for Config {
             image_history_jpeg_quality: default_image_history_quality(),
             image_retry_history_max_dimension: default_image_retry_dimension(),
             image_retry_history_jpeg_quality: default_image_retry_quality(),
+            image_hard_max_dimension: default_image_hard_max_dimension(),
             endpoints: HashMap::new(),
             config_path: None,
         }

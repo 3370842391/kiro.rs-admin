@@ -25,6 +25,17 @@ pub struct ImageBudgetPolicy {
     pub history_jpeg_quality: u8,
     pub retry_history_max_dimension: u32,
     pub retry_history_jpeg_quality: u8,
+    /// **尺寸硬上限（长边像素）**，与字节预算完全解耦：历史图和当前轮图都封顶到这里。
+    ///
+    /// 上游对多图请求另有像素约束（`image dimensions exceed max allowed size for
+    /// many-image requests: 2000 pixels`），跟字节数无关。此前只有 `history_max_dimension`
+    /// 且被字节预算 gate 住，当前轮的图从不压缩，单张超大图必然 400。默认 2000 对齐上游。
+    #[serde(default = "default_hard_max_dimension")]
+    pub hard_max_dimension: u32,
+}
+
+fn default_hard_max_dimension() -> u32 {
+    2_000
 }
 
 impl Default for ImageBudgetPolicy {
@@ -37,6 +48,7 @@ impl Default for ImageBudgetPolicy {
             history_jpeg_quality: 72,
             retry_history_max_dimension: 960,
             retry_history_jpeg_quality: 60,
+            hard_max_dimension: default_hard_max_dimension(),
         }
     }
 }
@@ -76,6 +88,11 @@ impl ImageBudgetPolicy {
         if !(30..=self.history_jpeg_quality).contains(&self.retry_history_jpeg_quality) {
             return Err(ImageBudgetError::InvalidPolicy(
                 "retryHistoryJpegQuality 必须在 30–historyJpegQuality 之间".to_string(),
+            ));
+        }
+        if !(512..=4_096).contains(&self.hard_max_dimension) {
+            return Err(ImageBudgetError::InvalidPolicy(
+                "hardMaxDimension 必须在 512–4096 之间".to_string(),
             ));
         }
         Ok(self)
@@ -212,9 +229,15 @@ fn apply_image_budget_inner(
     force_history_reencode: bool,
 ) -> ImageBudgetStats {
     let mut stats = collect_stats(request);
-    if !policy.enabled
-        || (!force_history_reencode && stats.after_base64_bytes <= policy.total_base64_budget_bytes)
-    {
+    if !policy.enabled {
+        return stats;
+    }
+
+    // 尺寸硬封顶：**先于**字节预算判定，且不受其 gate。上游的像素约束与字节数无关，
+    // 总量没超时单张超大图同样会被 400；当前轮的图也必须覆盖（历史图走下面的字节预算路径）。
+    cap_image_dimensions(request, policy, &mut stats);
+
+    if !force_history_reencode && stats.after_base64_bytes <= policy.total_base64_budget_bytes {
         return stats;
     }
 
@@ -237,6 +260,70 @@ fn apply_image_budget_inner(
     }
 
     stats
+}
+
+/// 把历史图与当前轮图的长边一律封顶到 `policy.hard_max_dimension`。
+///
+/// 先用只读图片头的 `peek_dimensions` 判定，未超限不重编码（省 CPU）；头解析失败时保守跳过，
+/// 不猜、不丢图。与字节预算无关，故不看 `total_base64_budget_bytes`。
+fn cap_image_dimensions(
+    request: &mut KiroRequest,
+    policy: ImageBudgetPolicy,
+    stats: &mut ImageBudgetStats,
+) {
+    let target = ResizeTarget {
+        max_long_side: policy.hard_max_dimension,
+        jpeg_quality: policy.history_jpeg_quality,
+    };
+
+    let mut cap_one = |image: &mut KiroImage, is_history: bool| {
+        let Some((width, height)) =
+            crate::image_resize::peek_dimensions(&image.format, &image.source.bytes)
+        else {
+            return;
+        };
+        if width.max(height) <= policy.hard_max_dimension {
+            return;
+        }
+        let original_len = image.source.bytes.len();
+        let Ok(processed) =
+            shrink_image_with_target(&image.format, &image.source.bytes, target)
+        else {
+            if is_history {
+                stats.unshrinkable_history_images += 1;
+            } else {
+                stats.unshrinkable_current_images += 1;
+            }
+            return;
+        };
+        stats.after_base64_bytes = stats
+            .after_base64_bytes
+            .saturating_sub(original_len)
+            .saturating_add(processed.data_base64.len());
+        image.format = processed.format;
+        image.source.bytes = processed.data_base64;
+        if is_history {
+            stats.resized_history_images += 1;
+        } else {
+            stats.resized_current_images += 1;
+        }
+    };
+
+    for message in &mut request.conversation_state.history {
+        if let Message::User(user) = message {
+            for image in &mut user.user_input_message.images {
+                cap_one(image, true);
+            }
+        }
+    }
+    for image in &mut request
+        .conversation_state
+        .current_message
+        .user_input_message
+        .images
+    {
+        cap_one(image, false);
+    }
 }
 
 fn shrink_image_if_smaller(
@@ -943,6 +1030,122 @@ mod tests {
             current
         );
         assert!(stats.after_base64_bytes <= policy.total_base64_budget_bytes);
+        assert_eq!(stats.resized_history_images, 1);
+    }
+
+    #[test]
+    /// 量化尺寸封顶给「全部未超限」请求带来的额外开销。
+    ///
+    /// 这是纯度量、不断言性能（CI 机器负载不可控），只把数字打出来供人判断。
+    /// 关注点：封顶被放在字节预算 early-return **之前**，所以原本完全跳过图片处理的
+    /// 请求现在也要为每张图做一次 `peek_dimensions`（含整张图 base64 全量解码）。
+    #[test]
+    fn measure_dimension_cap_overhead_on_within_limit_images() {
+        // 噪点 PNG 不可压缩，尺寸要小到总量不触发字节预算路径，才能量到「纯封顶」开销。
+        let images: Vec<String> = (0..8).map(|_| make_png(700, 500)).collect();
+        let total_b64: usize = images.iter().map(String::len).sum();
+        let request = request_with_images(images.clone(), images);
+        let policy = ImageBudgetPolicy {
+            total_base64_budget_bytes: 32 * 1024 * 1024,
+            hard_base64_limit_bytes: 32 * 1024 * 1024,
+            hard_max_dimension: 2_000,
+            ..ImageBudgetPolicy::default()
+        };
+
+        let started = std::time::Instant::now();
+        let mut cloned = request.clone();
+        let stats = apply_image_budget(&mut cloned, policy).unwrap();
+        let elapsed = started.elapsed();
+
+        println!(
+            "16 张 1200x900 全部未超限：base64 总量 {} KiB，耗时 {:?}，重编码 {} 张",
+            total_b64 / 1024,
+            elapsed,
+            stats.resized_history_images + stats.resized_current_images
+        );
+        assert_eq!(
+            stats.resized_history_images + stats.resized_current_images,
+            0,
+            "未超限不应重编码"
+        );
+    }
+
+    /// 当前轮的超尺寸图必须被封顶。
+    ///
+    /// 回归线上 400：`image dimensions exceed max allowed size for many-image requests:
+    /// 2000 pixels`。修复前 `apply_image_budget_inner` 只遍历 history、且被字节预算 gate 住，
+    /// 当前轮的图从不压缩，单张超大图必然被上游拒。
+    #[test]
+    fn caps_oversized_current_turn_image_dimensions() {
+        let oversized = make_png(2_600, 900);
+        let mut request = request_with_images(Vec::new(), vec![oversized.clone()]);
+        // 故意把字节预算放到远超实际总量：证明封顶不依赖字节预算触发。
+        let policy = ImageBudgetPolicy {
+            total_base64_budget_bytes: 32 * 1024 * 1024,
+            hard_base64_limit_bytes: 32 * 1024 * 1024,
+            hard_max_dimension: 2_000,
+            ..ImageBudgetPolicy::default()
+        };
+
+        let stats = apply_image_budget(&mut request, policy).unwrap();
+
+        assert_eq!(stats.resized_current_images, 1, "当前轮图应被封顶");
+        let capped = &request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .images[0];
+        let (width, height) =
+            crate::image_resize::peek_dimensions(&capped.format, &capped.source.bytes)
+                .expect("封顶后应仍是可解析图片");
+        assert!(
+            width.max(height) <= 2_000,
+            "长边应 <= 2000，实际 {width}x{height}"
+        );
+    }
+
+    /// 未超尺寸的图不重编码：避免为所有请求白烧 CPU。
+    #[test]
+    fn leaves_within_limit_images_untouched() {
+        let small = make_png(800, 600);
+        let mut request = request_with_images(Vec::new(), vec![small.clone()]);
+        let policy = ImageBudgetPolicy {
+            total_base64_budget_bytes: 32 * 1024 * 1024,
+            hard_base64_limit_bytes: 32 * 1024 * 1024,
+            hard_max_dimension: 2_000,
+            ..ImageBudgetPolicy::default()
+        };
+
+        let stats = apply_image_budget(&mut request, policy).unwrap();
+
+        assert_eq!(stats.resized_current_images, 0);
+        assert_eq!(
+            request
+                .conversation_state
+                .current_message
+                .user_input_message
+                .images[0]
+                .source
+                .bytes,
+            small,
+            "未超限的图必须字节级不变"
+        );
+    }
+
+    /// 历史里的超尺寸图同样封顶（此前只在字节预算超标时才压，且目标是 1280 而非硬上限）。
+    #[test]
+    fn caps_oversized_history_image_even_when_bytes_are_within_budget() {
+        let oversized = make_png(2_400, 1_000);
+        let mut request = request_with_images(vec![oversized], Vec::new());
+        let policy = ImageBudgetPolicy {
+            total_base64_budget_bytes: 32 * 1024 * 1024,
+            hard_base64_limit_bytes: 32 * 1024 * 1024,
+            hard_max_dimension: 2_000,
+            ..ImageBudgetPolicy::default()
+        };
+
+        let stats = apply_image_budget(&mut request, policy).unwrap();
+
         assert_eq!(stats.resized_history_images, 1);
     }
 

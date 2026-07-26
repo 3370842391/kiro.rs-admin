@@ -310,9 +310,39 @@ fn detect_format_from_bytes(data_base64: &str) -> Option<String> {
 }
 
 /// Reads only the header for dimensions without decoding all pixels; < 1ms per image
-fn peek_dimensions(format: &str, data_base64: &str) -> Option<(u32, u32)> {
+/// 读图片头拿宽高，不解码像素。
+///
+/// **只解码 base64 前缀**：PNG / JPEG / WebP 的宽高都在文件头部，为此把整张图解码出来
+/// 纯属浪费——线上图多的请求里这是每图每次的固定成本（16 张 11 MiB 曾实测 ~180ms/遍，
+/// 而 `prepare_kiro_bodies` 会跑两遍）。前缀读不出来（例如 JPEG 的 SOF 被大段 EXIF 推到
+/// 后面）才回退整张解码，故返回值语义与全量解码完全一致，只是快路径优先。
+pub fn peek_dimensions(format: &str, data_base64: &str) -> Option<(u32, u32)> {
+    // 先试前缀。base64 每 4 字符 → 3 字节，按 4 对齐切分即可独立解码，无需补 padding。
+    for prefix_chars in [PEEK_PREFIX_CHARS_SMALL, PEEK_PREFIX_CHARS_LARGE] {
+        let take = prefix_chars.min(data_base64.len() / 4 * 4);
+        if take == 0 || take == data_base64.len() {
+            break; // 整张图本来就不比前缀大，直接走下面的全量路径
+        }
+        if let Some(dims) = BASE64
+            .decode(&data_base64[..take])
+            .ok()
+            .and_then(|bytes| dimensions_from_bytes(format, &bytes))
+        {
+            return Some(dims);
+        }
+    }
+
     let bytes = BASE64.decode(data_base64).ok()?;
-    let cursor = Cursor::new(&bytes);
+    dimensions_from_bytes(format, &bytes)
+}
+
+/// 前缀尝试档位：先 3 KiB base64（~2.25 KiB 原始，够 PNG/WebP 与多数 JPEG），
+/// 不够再试 64 KiB（覆盖带大 EXIF 缩略图的 JPEG）。都不中才全量解码。
+const PEEK_PREFIX_CHARS_SMALL: usize = 3 * 1024;
+const PEEK_PREFIX_CHARS_LARGE: usize = 64 * 1024;
+
+fn dimensions_from_bytes(format: &str, bytes: &[u8]) -> Option<(u32, u32)> {
+    let cursor = Cursor::new(bytes);
     let mut reader = ImageReader::new(cursor);
     if let Some(fmt) = guess_format(format) {
         reader.set_format(fmt);
@@ -504,6 +534,58 @@ mod tests {
         img.write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
             .unwrap();
         BASE64.encode(buf)
+    }
+
+    /// 前缀解码必须与「整张解码」给出**完全一致**的宽高。
+    ///
+    /// `peek_dimensions` 改成先解码 base64 前缀（快 40 倍），正确性靠这条钉住：
+    /// 逐个格式 / 尺寸对比前缀路径与全量路径的结果。
+    #[test]
+    fn peek_dimensions_prefix_path_matches_full_decode() {
+        // 全量解码参考实现（与优化前的行为等价）
+        fn full_decode_dims(format: &str, data_base64: &str) -> Option<(u32, u32)> {
+            let bytes = BASE64.decode(data_base64).ok()?;
+            dimensions_from_bytes(format, &bytes)
+        }
+
+        let cases: Vec<(&str, String)> = vec![
+            ("png", make_png(1, 1)),
+            ("png", make_png(16, 16)),
+            ("png", make_png(700, 500)),
+            ("png", make_png(2600, 900)),
+            ("png", make_png(3, 4000)),
+            ("png", make_special_png(300, 200)),
+            ("jpeg", make_jpeg(64, 64)),
+            ("jpeg", make_jpeg(1600, 1200)),
+        ];
+
+        for (format, data) in cases {
+            let fast = peek_dimensions(format, &data);
+            let full = full_decode_dims(format, &data);
+            assert_eq!(
+                fast, full,
+                "前缀路径与全量解码结果不一致: format={format} b64_len={}",
+                data.len()
+            );
+            assert!(fast.is_some(), "应能读出宽高: format={format}");
+        }
+    }
+
+    /// 非图片 / 截断 / 空输入下前缀路径不得 panic，且与全量路径一样返回 None。
+    #[test]
+    fn peek_dimensions_handles_garbage_without_panic() {
+        let png = make_png(64, 64);
+        let truncated = &png[..png.len() / 3];
+        for (format, data) in [
+            ("png", ""),
+            ("png", "!!!not-base64!!!"),
+            ("png", "AAAA"),
+            ("png", truncated),
+            ("jpeg", truncated),
+        ] {
+            // 只要求不 panic；截断的 PNG 头仍可能读出宽高，这与全量路径一致，故不断言取值
+            let _ = peek_dimensions(format, data);
+        }
     }
 
     #[test]

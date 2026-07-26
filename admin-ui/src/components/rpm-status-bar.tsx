@@ -15,9 +15,11 @@ interface StatusItemProps {
   value: string | number
   detail?: string
   tone?: 'default' | 'warning' | 'danger'
+  /** 实时量（如全池在飞请求数）加一个呼吸点，和统计快照区分开 */
+  live?: boolean
 }
 
-function StatusItem({ label, value, detail, tone = 'default' }: StatusItemProps) {
+function StatusItem({ label, value, detail, tone = 'default', live = false }: StatusItemProps) {
   const toneClass =
     tone === 'danger'
       ? 'text-destructive'
@@ -28,7 +30,19 @@ function StatusItem({ label, value, detail, tone = 'default' }: StatusItemProps)
   return (
     <div className="min-w-0 py-1">
       <div className="text-[11px] text-muted-foreground">{label}</div>
-      <div className={`min-w-0 break-words text-sm font-semibold tabular-nums ${toneClass}`}>
+      <div
+        className={`flex min-w-0 items-center gap-1.5 break-words text-sm font-semibold tabular-nums ${toneClass}`}
+      >
+        {live && (
+          <span
+            aria-hidden="true"
+            className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+              tone === 'default'
+                ? 'bg-muted-foreground/30'
+                : 'bg-current motion-safe:animate-pulse'
+            }`}
+          />
+        )}
         {value}
       </div>
       {detail ? (
@@ -79,6 +93,8 @@ export function RpmStatusBar({
           label="进行中请求"
           value={totalInFlight}
           tone={totalInFlight > 0 ? 'warning' : 'default'}
+          live
+          detail="全池当前在飞请求数"
         />
         <StatusItem
           label="可用积分"
