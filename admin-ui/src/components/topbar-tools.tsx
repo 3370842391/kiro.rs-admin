@@ -205,6 +205,8 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
                   onClick={() => setShowPlain((v) => !v)}
                   disabled={updating}
                   title={showPlain ? '隐藏' : '显示'}
+                  aria-label={showPlain ? '隐藏密钥明文' : '显示密钥明文'}
+                  aria-pressed={showPlain}
                 >
                   {showPlain ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
                 </Button>
@@ -227,6 +229,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
                   }}
                   disabled={updating}
                   title="复制"
+                  aria-label="复制密钥到剪贴板"
                 >
                   <Copy className="h-3.5 w-3.5" />
                 </Button>
@@ -330,7 +333,7 @@ function CompactTools({ controls }: { controls: ToolControls }) {
   return (
     <DropdownMenu modal={false}>
       <DropdownMenuTrigger asChild>
-        <Button variant="outline" size="icon" title="更多操作">
+        <Button variant="outline" size="icon" title="更多操作" aria-label="更多操作">
           <MoreHorizontal className="h-4 w-4" />
         </Button>
       </DropdownMenuTrigger>
@@ -677,7 +680,7 @@ function retryPolicySummary(policy: RetryPolicy) {
 
 function RefreshButton({ onRefresh }: { onRefresh: () => void }) {
   return (
-    <Button variant="ghost" size="icon" onClick={onRefresh} title="刷新">
+    <Button variant="ghost" size="icon" onClick={onRefresh} title="刷新" aria-label="刷新凭据列表">
       <RefreshCw className="h-4 w-4" />
     </Button>
   )
@@ -690,6 +693,7 @@ function ImageUpdateButton({ controls }: { controls: ToolControls }) {
       size="icon"
       onClick={controls.openImageUpdate}
       title={imageUpdateTitle(controls.updateCheck)}
+      aria-label={imageUpdateTitle(controls.updateCheck)}
       className="relative"
     >
       <UploadCloud className="h-4 w-4" />
@@ -718,7 +722,7 @@ function KeySettingsMenu({
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <Button variant="ghost" size="icon" title="设置">
+        <Button variant="ghost" size="icon" title="设置" aria-label="设置">
           <Settings className="h-4 w-4" />
         </Button>
       </DropdownMenuTrigger>

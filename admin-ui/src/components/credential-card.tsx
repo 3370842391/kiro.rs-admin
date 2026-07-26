@@ -16,6 +16,8 @@ import {
   Boxes,
   Wallet,
   MessageCircle,
+  Check,
+  X,
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -274,7 +276,7 @@ function ConcurrencyGauge({ inFlight }: { inFlight: number }) {
       </div>
       <div className="mt-1.5 h-1 w-full overflow-hidden rounded-full bg-border/60">
         <div
-          className={`h-full rounded-full transition-all duration-500 ${tone.fill}`}
+          className={`h-full rounded-full transition-[width] duration-500 ${tone.fill}`}
           style={{ width: `${Math.round(ratio * 100)}%` }}
         />
       </div>
@@ -397,7 +399,7 @@ export function CredentialCard({
   } = useSortable({ id: credential.id });
   const dragStyle: React.CSSProperties = {
     transform: CSS.Transform.toString(transform),
-    // 拖拽中关掉过渡，避免 Card 基类的 transition-all 把每帧 transform 动画化导致"不跟手"；
+    // 拖拽中关掉过渡：Card 基类会过渡 transform，逐帧动画化会让卡片跟不上指针。
     // 非拖拽态保留 dnd-kit 的归位过渡。
     transition: isDragging ? "none" : transition,
     zIndex: isDragging ? 20 : undefined,
@@ -664,7 +666,7 @@ export function CredentialCard({
     // 导致整页渲染错乱或横向位移——这正是移动端点击"更多操作"后页面异常的根因。
     <DropdownMenu modal={false}>
       <DropdownMenuTrigger asChild>
-        <Button size="icon" variant="ghost" title="更多操作">
+        <Button size="icon" variant="ghost" title="更多操作" aria-label="更多操作">
           <MoreHorizontal className="h-4 w-4" />
         </Button>
       </DropdownMenuTrigger>
@@ -769,7 +771,7 @@ export function CredentialCard({
       ref={setNodeRef}
       style={dragStyle}
       data-credential-id={credential.id}
-      className={`group flex min-w-0 items-center gap-2.5 rounded-2xl border bg-card px-2.5 py-3 transition-all sm:gap-4 sm:px-4 ${
+      className={`group flex min-w-0 items-center gap-2.5 rounded-2xl border bg-card px-2.5 py-3 transition-[background-color,border-color,box-shadow,opacity] sm:gap-4 sm:px-4 ${
         isDragging
           ? "shadow-apple-lg opacity-80"
           : "hover:bg-accent/40 hover:shadow-apple-sm"
@@ -783,6 +785,7 @@ export function CredentialCard({
         data-no-rect-select
         className="h-8 w-8 shrink-0 cursor-grab touch-none active:cursor-grabbing"
         title="拖拽调整优先级"
+        aria-label={`拖拽调整 ${displayName} 的优先级`}
         {...attributes}
         {...listeners}
       >
@@ -842,7 +845,7 @@ export function CredentialCard({
           </div>
           <div className="mt-1.5 h-1 w-full overflow-hidden rounded-full bg-border/60">
             <div
-              className={`h-full rounded-full transition-all duration-500 ${rpmBarClass}`}
+              className={`h-full rounded-full transition-[width] duration-500 ${rpmBarClass}`}
               style={{ width: `${rpmFillPercent}%` }}
             />
           </div>
@@ -880,8 +883,9 @@ export function CredentialCard({
                   onClick={handlePriorityChange}
                   disabled={setPriority.isPending}
                   title="确认"
+                  aria-label="确认优先级修改"
                 >
-                  ✓
+                  <Check />
                 </Button>
                 <Button
                   size="icon"
@@ -892,8 +896,9 @@ export function CredentialCard({
                     setPriorityValue(String(credential.priority));
                   }}
                   title="取消"
+                  aria-label="取消优先级修改"
                 >
-                  ✕
+                  <X />
                 </Button>
               </div>
             ) : (
@@ -1023,6 +1028,7 @@ export function CredentialCard({
                 ? "已禁用"
                 : "强制刷新 Token"
           }
+          aria-label={`强制刷新 ${displayName} 的 Token`}
         >
           <RefreshCw
             className={`h-4 w-4 ${forceRefresh.isPending ? "animate-spin" : ""}`}
@@ -1035,6 +1041,7 @@ export function CredentialCard({
           onClick={onRefreshBalance}
           disabled={loadingBalance || credential.disabled}
           title={credential.disabled ? "已禁用" : "刷新余额"}
+          aria-label={`刷新 ${displayName} 的余额`}
         >
           {loadingBalance ? (
             <Loader2 className="h-4 w-4 animate-spin" />
@@ -1054,6 +1061,7 @@ export function CredentialCard({
           className="h-9 w-9"
           onClick={() => setShowEditDialog(true)}
           title="编辑"
+          aria-label={`编辑 ${displayName}`}
         >
           <Pencil className="h-4 w-4" />
         </Button>
@@ -1128,7 +1136,7 @@ export function CredentialCard({
               </div>
               <div className="mt-2 h-1 w-full overflow-hidden rounded-full bg-border/60">
                 <div
-                  className={`h-full rounded-full transition-all duration-500 ${rpmBarClass}`}
+                  className={`h-full rounded-full transition-[width] duration-500 ${rpmBarClass}`}
                   style={{ width: `${rpmFillPercent}%` }}
                 />
               </div>
@@ -1155,8 +1163,10 @@ export function CredentialCard({
                       className="h-7 w-7"
                       onClick={handlePriorityChange}
                       disabled={setPriority.isPending}
+                      title="确认"
+                      aria-label="确认优先级修改"
                     >
-                      ✓
+                      <Check />
                     </Button>
                     <Button
                       size="icon"
@@ -1166,8 +1176,10 @@ export function CredentialCard({
                         setEditingPriority(false);
                         setPriorityValue(String(credential.priority));
                       }}
+                      title="取消"
+                      aria-label="取消优先级修改"
                     >
-                      ✕
+                      <X />
                     </Button>
                   </div>
                 ) : (
@@ -1345,6 +1357,7 @@ export function CredentialCard({
                 data-no-rect-select
                 className="w-full cursor-grab touch-none active:cursor-grabbing min-[420px]:w-9"
                 title="拖拽调整优先级"
+                aria-label={`拖拽调整 ${displayName} 的优先级`}
                 {...attributes}
                 {...listeners}
               >

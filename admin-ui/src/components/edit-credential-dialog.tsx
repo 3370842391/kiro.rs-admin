@@ -274,7 +274,7 @@ export function EditCredentialDialog({
                 }}
                 disabled={isPending}
               >
-                <SelectTrigger className="h-10 rounded-xl px-3.5">
+                <SelectTrigger className="h-10 rounded-xl px-3.5" aria-label="代理设置">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>

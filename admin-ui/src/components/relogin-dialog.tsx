@@ -581,7 +581,7 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
               </a>
               <div className="flex items-center justify-center gap-2">
                 <span className="font-mono text-2xl font-bold tracking-widest">{idcSession.userCode}</span>
-                <Button variant="ghost" size="icon" className="h-7 w-7" onClick={copyIdcCode}>
+                <Button variant="ghost" size="icon" className="h-7 w-7" onClick={copyIdcCode} title="复制" aria-label="复制设备验证码">
                   <Copy className="h-3.5 w-3.5" />
                 </Button>
               </div>

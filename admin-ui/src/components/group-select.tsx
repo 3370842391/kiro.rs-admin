@@ -67,7 +67,7 @@ export function GroupSingleSelect({
         disabled={disabled}
         onValueChange={(v) => onChange(v === NONE_VALUE ? '' : v)}
       >
-        <SelectTrigger className="h-10 rounded-xl px-3.5">
+        <SelectTrigger className="h-10 rounded-xl px-3.5" aria-label="选择账号分组">
           <SelectValue />
         </SelectTrigger>
         <SelectContent>

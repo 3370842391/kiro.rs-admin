@@ -389,6 +389,7 @@ export function ClientKeysPage() {
                           className="h-7 w-7"
                           onClick={() => startEdit(k)}
                           title="编辑"
+                          aria-label={`编辑 ${k.name}`}
                         >
                           <Pencil className="h-3.5 w-3.5" />
                         </Button>
@@ -398,6 +399,7 @@ export function ClientKeysPage() {
                           className="h-7 w-7"
                           onClick={() => handleToggleDisabled(k)}
                           title={k.disabled ? '启用' : '禁用'}
+                          aria-label={`${k.disabled ? '启用' : '禁用'} ${k.name}`}
                         >
                           <Power className={`h-3.5 w-3.5 ${k.disabled ? 'text-emerald-500' : 'text-amber-500'}`} />
                         </Button>
@@ -407,6 +409,7 @@ export function ClientKeysPage() {
                           className="h-7 w-7"
                           onClick={() => handleReset(k)}
                           title="重置统计"
+                          aria-label={`重置 ${k.name} 的统计`}
                         >
                           <RotateCcw className="h-3.5 w-3.5" />
                         </Button>
@@ -417,6 +420,7 @@ export function ClientKeysPage() {
                             className="h-7 w-7"
                             onClick={() => handleDelete(k)}
                             title="删除"
+                            aria-label={`删除 ${k.name}`}
                           >
                             <Trash2 className="h-3.5 w-3.5 text-destructive" />
                           </Button>
@@ -480,7 +484,7 @@ export function ClientKeysPage() {
                 onValueChange={(value) => setCreateResponseMode(value as ClientResponseMode)}
                 disabled={createKey.isPending}
               >
-                <SelectTrigger>
+                <SelectTrigger aria-label="回复模式">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -499,7 +503,7 @@ export function ClientKeysPage() {
                 onValueChange={(value) => setCreateCacheHitRateMode(value as ClientKeyCacheHitRateMode)}
                 disabled={createKey.isPending}
               >
-                <SelectTrigger>
+                <SelectTrigger aria-label="缓存命中率策略">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -573,6 +577,8 @@ export function ClientKeysPage() {
                   className="h-7 w-7"
                   onClick={() => setShowCreatedPlain((v) => !v)}
                   title={showCreatedPlain ? '隐藏' : '显示'}
+                  aria-label={showCreatedPlain ? '隐藏 Key 明文' : '显示 Key 明文'}
+                  aria-pressed={showCreatedPlain}
                 >
                   {showCreatedPlain ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
                 </Button>
@@ -583,6 +589,7 @@ export function ClientKeysPage() {
                   className="h-7 w-7"
                   onClick={() => createdKey && copyText(createdKey.key)}
                   title="复制"
+                  aria-label="复制新建的 Key 到剪贴板"
                 >
                   <Copy className="h-3.5 w-3.5" />
                 </Button>
@@ -642,7 +649,7 @@ export function ClientKeysPage() {
                 onValueChange={(value) => setEditResponseMode(value as ClientResponseMode)}
                 disabled={updateKey.isPending}
               >
-                <SelectTrigger>
+                <SelectTrigger aria-label="回复模式">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -661,7 +668,7 @@ export function ClientKeysPage() {
                 onValueChange={(value) => setEditCacheHitRateMode(value as ClientKeyCacheHitRateMode)}
                 disabled={updateKey.isPending}
               >
-                <SelectTrigger>
+                <SelectTrigger aria-label="缓存命中率策略">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>

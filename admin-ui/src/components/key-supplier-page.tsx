@@ -353,7 +353,7 @@ export function KeySupplierPage() {
           <Card>
             <CardHeader className="pb-3"><CardTitle className="flex flex-wrap items-center gap-2"><Webhook className="h-4 w-4" />Webhook<Badge variant={overviewQuery.data?.webhookRegistered ? 'success' : 'warning'}>{overviewQuery.data?.webhookRegistered ? 'Webhook 已注册' : 'Webhook 未注册'}</Badge></CardTitle><CardDescription>注册状态来自供应商账号；测试消息只验证连通性，不会购买。</CardDescription></CardHeader>
             <CardContent className="space-y-3">
-              {registerWebhook.data?.callbackUrl && <div className="flex min-w-0 gap-2"><Input aria-label="Webhook callback URL" value={registerWebhook.data.callbackUrl} readOnly /><Button size="icon" variant="outline" title="复制回调地址" onClick={copyCallbackUrl}><Clipboard className="h-3.5 w-3.5" /></Button></div>}
+              {registerWebhook.data?.callbackUrl && <div className="flex min-w-0 gap-2"><Input aria-label="Webhook callback URL" value={registerWebhook.data.callbackUrl} readOnly /><Button size="icon" variant="outline" title="复制回调地址" aria-label="复制回调地址到剪贴板" onClick={copyCallbackUrl}><Clipboard className="h-3.5 w-3.5" /></Button></div>}
               <div className="flex flex-wrap gap-2"><Button variant="outline" onClick={() => registerWebhook.mutate()} disabled={registerWebhook.isPending}><Webhook className="h-3.5 w-3.5" />{overviewQuery.data?.webhookRegistered ? '重新注册 Webhook' : '注册 Webhook'}</Button><Button variant="outline" onClick={() => testWebhook.mutate()} disabled={testWebhook.isPending}><Send className="h-3.5 w-3.5" />测试 Webhook</Button></div>
             </CardContent>
           </Card>

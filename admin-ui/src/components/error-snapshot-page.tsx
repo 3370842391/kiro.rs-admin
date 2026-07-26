@@ -85,7 +85,7 @@ function FilterSelect({
   const all = '__all__'
   return (
     <Select value={value || all} onValueChange={(next) => onChange(next === all ? '' : next)}>
-      <SelectTrigger className="h-9 min-w-[130px]">
+      <SelectTrigger className="h-9 min-w-[130px]" aria-label={placeholder}>
         <SelectValue placeholder={placeholder} />
       </SelectTrigger>
       <SelectContent>
@@ -183,13 +183,13 @@ function SnapshotActions({
 
   return (
     <div className="flex items-center gap-1">
-      <Button size="icon" variant="ghost" className="h-8 w-8" title="查看" onClick={onView}>
+      <Button size="icon" variant="ghost" className="h-8 w-8" title="查看" aria-label={`查看 ${record.model} 的错误快照`} onClick={onView}>
         <Eye className="h-3.5 w-3.5" />
       </Button>
-      <Button size="icon" variant="ghost" className="h-8 w-8" title={record.pinned ? '取消固定' : '固定保留'} disabled={pending} onClick={togglePin}>
+      <Button size="icon" variant="ghost" className="h-8 w-8" title={record.pinned ? '取消固定' : '固定保留'} aria-label={`${record.pinned ? '取消固定' : '固定保留'} ${record.model} 的错误快照`} aria-pressed={record.pinned} disabled={pending} onClick={togglePin}>
         {record.pinned ? <PinOff className="h-3.5 w-3.5" /> : <Pin className="h-3.5 w-3.5" />}
       </Button>
-      <Button size="icon" variant="ghost" className="h-8 w-8 text-destructive hover:text-destructive" title="删除" disabled={pending} onClick={handleDelete}>
+      <Button size="icon" variant="ghost" className="h-8 w-8 text-destructive hover:text-destructive" title="删除" aria-label={`删除 ${record.model} 的错误快照`} disabled={pending} onClick={handleDelete}>
         <Trash2 className="h-3.5 w-3.5" />
       </Button>
     </div>

@@ -221,6 +221,8 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
                             className="h-6 w-6"
                             disabled={idx === 0}
                             onClick={() => move(primary, idx, -1)}
+                            title="上移"
+                            aria-label={`将 ${bucket} 上移一位`}
                           >
                             <ArrowUp className="h-3.5 w-3.5" />
                           </Button>
@@ -231,6 +233,8 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
                             className="h-6 w-6"
                             disabled={idx === selected.length - 1}
                             onClick={() => move(primary, idx, 1)}
+                            title="下移"
+                            aria-label={`将 ${bucket} 下移一位`}
                           >
                             <ArrowDown className="h-3.5 w-3.5" />
                           </Button>

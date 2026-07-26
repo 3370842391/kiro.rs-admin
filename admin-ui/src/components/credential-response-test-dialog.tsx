@@ -210,7 +210,7 @@ export function CredentialResponseTestDialog({
           <div className="grid gap-2 sm:grid-cols-[1fr_auto]">
             {models.length > 0 ? (
               <Select value={model} onValueChange={setModel} disabled={testing}>
-                <SelectTrigger className="h-10 rounded-xl px-3.5">
+                <SelectTrigger className="h-10 rounded-xl px-3.5" aria-label="选择测试模型">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>

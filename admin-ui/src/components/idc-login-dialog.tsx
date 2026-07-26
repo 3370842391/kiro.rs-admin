@@ -87,7 +87,7 @@ function RegionSelect({ value, onChange }: { value: string; onChange: (v: string
   return (
     <div className="flex gap-2">
       <Select value={selectValue} onValueChange={handleSelectChange}>
-        <SelectTrigger className="flex-1 h-10">
+        <SelectTrigger className="flex-1 h-10" aria-label="选择登录区域">
           <SelectValue />
         </SelectTrigger>
         <SelectContent>
@@ -357,7 +357,7 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess, mode = 'builder-
                 <span className="font-mono text-2xl font-bold tracking-widest">
                   {session.userCode}
                 </span>
-                <Button variant="ghost" size="icon" className="h-7 w-7" onClick={copyCode}>
+                <Button variant="ghost" size="icon" className="h-7 w-7" onClick={copyCode} title="复制" aria-label="复制设备验证码">
                   <Copy className="h-3.5 w-3.5" />
                 </Button>
               </div>

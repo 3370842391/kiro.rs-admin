@@ -1089,7 +1089,7 @@ export function BatchImportDialog({
                 </div>
                 <div className="w-full bg-secondary rounded-full h-2">
                   <div
-                    className="bg-primary h-2 rounded-full transition-all"
+                    className="bg-primary h-2 rounded-full transition-[width]"
                     style={{ width: `${progress.total > 0 ? (finalizedCount / progress.total) * 100 : 0}%` }}
                   />
                 </div>

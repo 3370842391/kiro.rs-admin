@@ -178,7 +178,7 @@ export function GroupsPage() {
                     )}
                   </div>
                   <div className="flex shrink-0 items-center gap-1">
-                    <Button size="icon" variant="ghost" className="h-7 w-7" onClick={() => openEdit(g)} title="编辑">
+                    <Button size="icon" variant="ghost" className="h-7 w-7" onClick={() => openEdit(g)} title="编辑" aria-label={`编辑分组 ${g.name}`}>
                       <Pencil className="h-3.5 w-3.5" />
                     </Button>
                     <Button
@@ -187,6 +187,7 @@ export function GroupsPage() {
                       className="h-7 w-7 text-destructive hover:text-destructive"
                       onClick={() => handleDelete(g)}
                       title="删除"
+                      aria-label={`删除分组 ${g.name}`}
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                     </Button>

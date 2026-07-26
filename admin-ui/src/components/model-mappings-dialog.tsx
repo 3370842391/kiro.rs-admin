@@ -126,6 +126,7 @@ export function ModelMappingsDialog({ open, onOpenChange }: ModelMappingsDialogP
                   className="h-7 w-7 shrink-0 text-muted-foreground hover:text-destructive"
                   onClick={() => handleDelete(m.source)}
                   title="删除"
+                  aria-label={`删除映射 ${m.source}`}
                 >
                   <Trash2 className="h-3.5 w-3.5" />
                 </Button>
