@@ -134,9 +134,32 @@ impl UsageRecorder {
                 tracing::warn!("写入 usage_log 失败: {}", e);
                 return;
             }
-            // 立即 flush，保证崩溃时不丢失最近一条
-            let _ = w.flush();
+            // 只写进 BufWriter，不在请求路径上 flush。
+            //
+            // 原先每条记录都 `flush()`，即每个请求一次同步磁盘写。请求路径跑在 Tokio
+            // worker 上，高并发时所有 worker 都卡在这里，整个运行时会停转（与 trace
+            // 同类问题，见 `trace_db::spawn_writer` 的说明）。
+            //
+            // 落盘改由 [`Self::spawn_flusher`] 定时完成，代价是崩溃最多丢一个刷盘周期
+            // 的用量记录。计费口径以上游 meteringEvent 为准，这点损失可接受；
+            // `query_range` 读取前会主动 flush，管理端查询仍能看到最新数据。
         }
+    }
+
+    /// 定时把 usage_log 缓冲刷到磁盘。
+    ///
+    /// 与请求路径解耦：请求只往 BufWriter 里写（内存操作），真正的磁盘 I/O 在这里发生。
+    pub fn spawn_flusher(self: Arc<Self>, interval: std::time::Duration) {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                if let Some(writer) = self.inner.lock().writer.as_mut() {
+                    if let Err(error) = writer.flush() {
+                        tracing::warn!(%error, "usage_log 定时刷盘失败");
+                    }
+                }
+            }
+        });
     }
 
     /// 顺序读取时间窗口涉及的 JSONL 文件；读取前 flush 当前 writer，保证最新记录可见。

@@ -171,6 +171,11 @@ pub struct ClientKey {
 pub struct ClientKeyManager {
     inner: RwLock<Inner>,
     path: Option<PathBuf>,
+    /// 用量计数有未落盘的变更。
+    ///
+    /// 只服务于 [`Self::record_usage`] 这一条热路径：管理类改动（创建 / 删除 / 轮换 /
+    /// 编辑）仍然立即落盘，因为那些是低频且不可丢的。
+    usage_dirty: std::sync::atomic::AtomicBool,
 }
 
 struct Inner {
@@ -188,6 +193,7 @@ impl ClientKeyManager {
                 next_id: 1,
             }),
             path: None,
+            usage_dirty: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -221,6 +227,7 @@ impl ClientKeyManager {
                 next_id: max_id + 1,
             }),
             path: Some(path),
+            usage_dirty: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -787,7 +794,33 @@ impl ClientKeyManager {
             }
             entry.last_used_at = Some(Utc::now().to_rfc3339());
         }
-        self.save_locked(&inner);
+        // 不在这里写盘。
+        //
+        // 原先每个请求都把整个 client_api_keys.json 序列化并写一遍，而且是在持有写锁
+        // 的状态下、跑在 Tokio worker 上。并发一高，所有 worker 都堵在这次同步磁盘写
+        // 上，运行时会整体停转（与 trace 同类问题）。
+        //
+        // 改为置脏标记，由 [`Self::spawn_flusher`] 定时落盘。崩溃最多丢一个刷盘周期的
+        // 累计计数；权威用量数据在 usage_log.jsonl 与聚合器里，这里的总数只用于展示。
+        drop(inner);
+        self.usage_dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 定时把用量计数落盘。仅在确有变更时写，空闲期不产生 I/O。
+    pub fn spawn_flusher(self: std::sync::Arc<Self>, interval: std::time::Duration) {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                if self
+                    .usage_dirty
+                    .swap(false, std::sync::atomic::Ordering::Relaxed)
+                {
+                    let inner = self.inner.read();
+                    self.save_locked(&inner);
+                }
+            }
+        });
     }
 
     /// 获取统计后的 active Key 数（未禁用）

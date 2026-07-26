@@ -308,6 +308,20 @@ async fn main() {
         }
     };
 
+    // ───── 把请求路径上的同步磁盘 I/O 全部挪到后台 ─────
+    //
+    // 这三处此前都在 Tokio worker 上做同步写：trace 是 SQLite 事务、usage_log 是每条
+    // 记录一次 flush、客户端 Key 是每个请求重写整个 JSON。并发一高，worker 全部堵在
+    // 磁盘上，运行时整体停转——线上表现为上游一条 TCP 连接都没有、入站连接堆积、
+    // 吞吐从 219/分钟塌到个位数，只有重启才能恢复。
+    if let Some(store) = &trace_store {
+        store.spawn_writer();
+    }
+    usage_recorder.clone().spawn_flusher(std::time::Duration::from_secs(2));
+    client_key_manager
+        .clone()
+        .spawn_flusher(std::time::Duration::from_secs(5));
+
     let snapshot_policy = admin::error_snapshot_db::ErrorSnapshotPolicy::from_config(&config);
     let error_snapshot_store = match admin::ErrorSnapshotStore::open(
         cache_dir.join("error_snapshots.db"),

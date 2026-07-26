@@ -249,6 +249,18 @@ pub struct TraceQuery {
     pub offset: usize,
 }
 
+/// 落库队列容量。
+///
+/// 队列满时**丢弃新记录而不是阻塞请求**：trace 是可观测性数据，任何情况下都不该
+/// 让它拖慢真实流量。丢弃会计数并周期性告警，便于发现写入侧跟不上。
+const TRACE_QUEUE_CAPACITY: usize = 4096;
+
+/// 单个事务最多合并多少条记录。
+///
+/// 一条记录一个事务时，每次都要走一遍 WAL 追加 + 锁获取；批量合并后同样的锁只付
+/// 一次代价。上限存在是为了不让单次事务持锁过久，阻塞 Admin 页面的查询。
+const TRACE_BATCH_SIZE: usize = 256;
+
 /// SQLite 持久化存储
 pub struct TraceStore {
     conn: Mutex<Connection>,
@@ -256,6 +268,13 @@ pub struct TraceStore {
     enabled: AtomicBool,
     /// 记录保留天数（运行时可改），cleanup 时读取。
     retention_days: AtomicU64,
+    /// 异步写入队列的发送端。
+    ///
+    /// `None` 表示未启动后台写入器（单测、以及 `spawn_writer` 之前的窗口），
+    /// 此时 [`Self::insert`] 退化为同步写，保证测试里「写完立刻能查到」的语义不变。
+    writer: Mutex<Option<tokio::sync::mpsc::Sender<TraceRecord>>>,
+    /// 因队列满而丢弃的记录数（只增）。
+    dropped: AtomicU64,
 }
 
 impl TraceStore {
@@ -283,6 +302,8 @@ impl TraceStore {
             conn: Mutex::new(conn),
             enabled: AtomicBool::new(enabled),
             retention_days: AtomicU64::new(retention_days.max(1) as u64),
+            writer: Mutex::new(None),
+            dropped: AtomicU64::new(0),
         })
     }
 
@@ -295,6 +316,8 @@ impl TraceStore {
             conn: Mutex::new(conn),
             enabled: AtomicBool::new(true),
             retention_days: AtomicU64::new(DEFAULT_RETENTION_DAYS),
+            writer: Mutex::new(None),
+            dropped: AtomicU64::new(0),
         })
     }
 
@@ -371,10 +394,114 @@ impl TraceStore {
 
     /// 写入一条完整链路（traces + attempts 在一个事务里）。失败仅 warn，不阻塞请求。
     /// trace 关闭时直接短路。
+    /// 启动后台写入器，把落库从请求路径上摘下来。
+    ///
+    /// 改造前 [`Self::insert`] 直接在异步请求路径上做「加全局 Mutex + 同步 SQLite 事务」。
+    /// 库涨到几百 MB 后单次写入耗时上升，而 Tokio worker 线程数有限：并发一高，
+    /// 所有 worker 都卡在这把锁上，**整个运行时停转**——线上表现是上游一条 TCP 连接
+    /// 都没有、入站连接堆积、吞吐从 219/分钟塌到个位数，重启才恢复。
+    ///
+    /// 现在请求侧只做一次 `try_send`（纳秒级，且队列满时直接丢弃而不是等待），
+    /// 真正的写入在独立任务里批量完成，并且跑在 `spawn_blocking` 上，不占 worker。
+    pub fn spawn_writer(self: &Arc<Self>) {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TraceRecord>(TRACE_QUEUE_CAPACITY);
+        *self.writer.lock() = Some(tx);
+
+        let store = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut batch = Vec::with_capacity(TRACE_BATCH_SIZE);
+            let mut reported_drops = 0u64;
+            loop {
+                // recv_many 会尽量一次取走多条；返回 0 表示所有发送端已关闭。
+                if rx.recv_many(&mut batch, TRACE_BATCH_SIZE).await == 0 {
+                    break;
+                }
+                let records = std::mem::take(&mut batch);
+                let writer = Arc::clone(&store);
+                // 阻塞式 SQLite 写必须离开 worker 线程，否则等于把问题从
+                // 请求路径挪到了后台任务，运行时照样会被堵住。
+                if let Err(error) =
+                    tokio::task::spawn_blocking(move || writer.insert_batch_blocking(&records))
+                        .await
+                {
+                    tracing::warn!(%error, "trace 批量写入任务异常");
+                }
+                batch = Vec::with_capacity(TRACE_BATCH_SIZE);
+
+                let dropped = store.dropped.load(Ordering::Relaxed);
+                if dropped > reported_drops {
+                    tracing::warn!(
+                        dropped,
+                        "trace 队列已满，丢弃了部分链路记录（写入侧跟不上，请考虑缩短保留期或关闭 trace）"
+                    );
+                    reported_drops = dropped;
+                }
+            }
+        });
+    }
+
+    /// 因队列满被丢弃的 trace 条数。
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// 记录一条链路。
+    ///
+    /// 后台写入器已启动时只入队即返回；未启动（单测、以及启动早期）时退化为同步写，
+    /// 保证「写完立刻能查到」的既有语义。
     pub fn insert(&self, rec: &TraceRecord) {
         if !self.is_enabled() {
             return;
         }
+        let queued = {
+            let writer = self.writer.lock();
+            match writer.as_ref() {
+                Some(tx) => match tx.try_send(rec.clone()) {
+                    Ok(()) => true,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        // 关键：不等待。宁可丢一条可观测性数据，也不让请求为它排队。
+                        self.dropped.fetch_add(1, Ordering::Relaxed);
+                        true
+                    }
+                    // 写入器已退出（进程收尾），回退同步写避免静默丢数据。
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+                },
+                None => false,
+            }
+        };
+        if !queued {
+            self.insert_blocking(rec);
+        }
+    }
+
+    /// 批量落库：整批共用一个事务，把 WAL 追加与锁获取的固定开销摊薄。
+    fn insert_batch_blocking(&self, records: &[TraceRecord]) {
+        if records.is_empty() {
+            return;
+        }
+        let mut conn = self.conn.lock();
+        let tx = match conn.transaction() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("trace 批量事务开启失败: {}", e);
+                return;
+            }
+        };
+        let mut failed = 0usize;
+        for rec in records {
+            if let Err(e) = Self::write_record(&tx, rec) {
+                failed += 1;
+                tracing::warn!("trace 写入失败: {}", e);
+            }
+        }
+        if let Err(e) = tx.commit() {
+            tracing::warn!("trace 批量提交失败（{} 条）: {}", records.len(), e);
+        } else if failed > 0 {
+            tracing::warn!("trace 批量提交完成，其中 {} 条失败", failed);
+        }
+    }
+
+    fn insert_blocking(&self, rec: &TraceRecord) {
         let mut conn = self.conn.lock();
         let tx = match conn.transaction() {
             Ok(t) => t,
@@ -383,10 +510,22 @@ impl TraceStore {
                 return;
             }
         };
+        match Self::write_record(&tx, rec) {
+            Ok(()) => {
+                if let Err(e) = tx.commit() {
+                    tracing::warn!("trace 提交失败: {}", e);
+                }
+            }
+            Err(e) => tracing::warn!("trace 写入失败: {}", e),
+        }
+    }
+
+    /// 把一条记录写进给定事务。批量与单条路径共用，避免 SQL 两处维护。
+    fn write_record(tx: &rusqlite::Transaction<'_>, rec: &TraceRecord) -> rusqlite::Result<()> {
         let ts_epoch = chrono::DateTime::parse_from_rfc3339(&rec.ts)
             .map(|d| d.timestamp())
             .unwrap_or_else(|_| Utc::now().timestamp());
-        let res = (|| -> rusqlite::Result<()> {
+        {
             tx.execute(
                 "INSERT OR REPLACE INTO traces (trace_id, ts, ts_epoch, key_id, key_source, response_mode, model, \
                  is_stream, final_status, final_credential_id, error_type, error_message, \
@@ -448,18 +587,8 @@ impl TraceStore {
                     ],
                 )?;
             }
-            Ok(())
-        })();
-        match res {
-            Ok(()) => {
-                if let Err(e) = tx.commit() {
-                    tracing::warn!("trace 提交失败: {}", e);
-                }
-            }
-            Err(e) => {
-                tracing::warn!("trace 写入失败: {}", e);
-            }
         }
+        Ok(())
     }
 
     /// 把已落库的 trace 与错误快照关联。相同关联可重复写入，冲突关联 fail-closed。
@@ -980,11 +1109,64 @@ mod tests {
     fn mem_store() -> TraceStore {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA).unwrap();
+        // writer 为 None：单测走同步写路径，保证「insert 后立刻能查到」。
         TraceStore {
             conn: Mutex::new(conn),
             enabled: AtomicBool::new(true),
             retention_days: AtomicU64::new(DEFAULT_RETENTION_DAYS),
+            writer: Mutex::new(None),
+            dropped: AtomicU64::new(0),
         }
+    }
+
+    /// 启动写入器后，`insert` 必须只入队、不碰磁盘。
+    ///
+    /// 这是 2026-07-26 线上事故的回归守卫：当时 `insert` 在异步请求路径上做
+    /// 「全局 Mutex + 同步 SQLite 事务」，traces.db 涨到 681MB 后，高并发下所有
+    /// Tokio worker 都堵在这把锁上，运行时整体停转——上游一条 TCP 连接都建不起来，
+    /// 入站连接堆到 500+，吞吐从 219/分钟塌到个位数，只能靠重启恢复。
+    ///
+    /// 用「持有 conn 锁的同时调用 insert」来证明它不再走同步写：若 insert 仍然去锁
+    /// conn，这里会直接死锁；能返回就说明它把记录交给了队列。
+    #[tokio::test]
+    async fn insert_does_not_touch_the_database_lock_once_writer_is_running() {
+        let store = Arc::new(mem_store());
+        store.spawn_writer();
+
+        let held = store.conn.lock();
+        // 若 insert 内部仍尝试 self.conn.lock()，此处会永久阻塞。
+        store.insert(&sample(TraceSample {
+            trace_id: "queued-1",
+            status: outcome::SUCCESS,
+            credential_id: 1,
+            model: "claude-opus-4-8",
+        }));
+        drop(held);
+
+        assert_eq!(store.dropped_count(), 0, "队列未满时不应丢弃");
+    }
+
+    /// 队列满时丢弃而不是阻塞——可观测性数据永远不能拖慢真实流量。
+    #[tokio::test]
+    async fn full_queue_drops_records_instead_of_blocking_the_request() {
+        let store = Arc::new(mem_store());
+        // 只建通道、不启动消费者，让队列必然填满。
+        let (tx, _rx) = tokio::sync::mpsc::channel::<TraceRecord>(2);
+        *store.writer.lock() = Some(tx);
+
+        for _ in 0..64 {
+            store.insert(&sample(TraceSample {
+                trace_id: "flood",
+                status: outcome::SUCCESS,
+                credential_id: 1,
+                model: "claude-opus-4-8",
+            }));
+        }
+
+        assert!(
+            store.dropped_count() > 0,
+            "队列填满后必须计数丢弃，而不是等待消费者"
+        );
     }
 
     #[test]
