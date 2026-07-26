@@ -113,11 +113,10 @@ describe('admin RPM operations UI wiring', () => {
     expect(status).toContain('unlimitedAccounts')
     expect(status).toContain('saturatedAccounts')
     expect(status).toContain('totalInFlight')
-    expect(status).toContain('grid-cols-2')
-    expect(status).toContain('sm:grid-cols-3')
-    // 只断言响应式档位存在，不锁死具体列数——每加一个指标列数就要变，
-    // 把数字写进断言会让「加指标」这件事无谓地牵连测试。
-    expect(status).toMatch(/xl:grid-cols-\d+/)
+    // 断言「窄屏能换行、不会挤成一条」这个意图，不锁具体实现：
+    // 布局已从七个等宽列改为按语义分组的 flex 簇，整簇换行而不是把相关指标拆散。
+    expect(status).toContain('flex-wrap')
+    expect(status).toMatch(/gap-x-\d/)
   })
 
   test('status bar shows the live credit burn rate next to remaining credits', async () => {
@@ -137,9 +136,12 @@ describe('admin RPM operations UI wiring', () => {
 
     expect(status).toContain("hasUnlimitedCapacity ? '总容量' : '有限容量'")
     expect(status).toContain("hasUnlimitedCapacity ? '不限速' : limitedCapacity")
-    expect(status).toContain("hasUnlimitedCapacity ? '有限账号剩余' : '剩余'")
-    expect(status).toContain('有限账号容量 ${limitedCapacity}')
-    expect(status).toContain('不限速账号 ${unlimitedAccounts}')
+    // 存在不限速账号时，「剩余」必须显式限定到有限账号，否则会读成「全池只剩这些」。
+    // 只钉住 true 分支的限定语，else 分支的措辞可以改。
+    expect(status).toMatch(/hasUnlimitedCapacity \? '有限账号剩余' : '[^']+'/)
+    // 明细里两类账号都要出现，避免「不限速」把有限容量藏掉
+    expect(status).toContain('${limitedCapacity}')
+    expect(status).toContain('${unlimitedAccounts}')
   })
 
   test('credential cards show rolling RPM load and in-flight work', async () => {

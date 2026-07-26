@@ -24,10 +24,10 @@ describe('admin credential observability UI wiring', () => {
     expect(status).toContain('label="可用积分"')
     expect(status).toContain('value={creditDisplay.value}')
     expect(status).toContain('detail={creditDisplay.detail}')
-    expect(status).toContain('sm:grid-cols-3')
-    // 只断言响应式档位存在，不锁死具体列数——每加一个指标列数就要变，
-    // 把数字写进断言会让「加指标」这件事无谓地牵连测试。
-    expect(status).toMatch(/xl:grid-cols-\d+/)
+    // 断言「窄屏能换行、不会挤成一条」这个意图，不锁具体实现：
+    // 布局已从七个等宽列改为按语义分组的 flex 簇，整簇换行而不是把相关指标拆散。
+    expect(status).toContain('flex-wrap')
+    expect(status).toMatch(/gap-x-\d/)
   })
 
   test('credential identity badges wrap without clipping', async () => {
