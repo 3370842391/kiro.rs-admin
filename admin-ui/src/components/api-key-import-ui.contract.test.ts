@@ -56,7 +56,9 @@ describe('API Key import UI wiring', () => {
     expect(addDialog).toContain('批量添加 API Key')
     expect(batchDialog).toContain('initialMode?: ImportMode')
     expect(batchDialog).toContain("initialMode = 'json'")
-    expect(dashboard).toContain('initialMode={batchImportInitialMode}')
+    // 只断言「打开模式被透传给了弹窗」这件事，不锁死承载它的变量名——
+    // 该状态已随其余弹窗开关一起收进 useDashboardDialogs。
+    expect(dashboard).toMatch(/initialMode=\{[\w.]*batchImportMode\}/)
     expect(dashboard).toContain('openBatchImport("api-key")')
     expect(dashboard).toContain('批量导入凭据 / API Key / KAM')
   })

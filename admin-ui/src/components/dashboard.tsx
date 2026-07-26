@@ -30,7 +30,7 @@ import {
 
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { storage, type CredentialView } from "@/lib/storage";
+import { storage } from "@/lib/storage";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -43,6 +43,11 @@ import {
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import { CredentialCard } from "@/components/credential-card";
+import {
+  useCredentialFilters,
+  useCredentialViewPrefs,
+  useDashboardDialogs,
+} from "@/hooks/use-dashboard-state";
 import { DashboardStatsCards } from "@/components/dashboard-stats-cards";
 import { AddCredentialDialog } from "@/components/add-credential-dialog";
 import { BatchImportDialog } from "@/components/batch-import-dialog";
@@ -55,7 +60,7 @@ import {
   type VerifyResult,
 } from "@/components/batch-verify-dialog";
 import { CredentialResponseTestDialog } from "@/components/credential-response-test-dialog";
-import { detectTier, type Tier } from "@/components/subscription-badge";
+import { type Tier } from "@/components/subscription-badge";
 import { ProxyPoolDialog } from "@/components/proxy-pool-dialog";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import {
@@ -134,21 +139,8 @@ const PAGE_SIZE_OPTIONS = [12, 24, 48, 96] as const;
 
 export function Dashboard({ onLogout }: DashboardProps) {
   const confirm = useConfirm();
-  const [addDialogOpen, setAddDialogOpen] = useState(false);
-  const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false);
-  const [batchImportInitialMode, setBatchImportInitialMode] = useState<
-    "json" | "api-key"
-  >("json");
-  const openBatchImport = (mode: "json" | "api-key") => {
-    setBatchImportInitialMode(mode);
-    setBatchImportDialogOpen(true);
-  };
-  const [batchEditDialogOpen, setBatchEditDialogOpen] = useState(false);
-  const [idcLoginDialogOpen, setIdcLoginDialogOpen] = useState(false);
-  const [enterpriseLoginDialogOpen, setEnterpriseLoginDialogOpen] =
-    useState(false);
-  const [socialLoginDialogOpen, setSocialLoginDialogOpen] = useState(false);
-  const [proxyPoolDialogOpen, setProxyPoolDialogOpen] = useState(false);
+  const dialogs = useDashboardDialogs();
+  const { openBatchImport } = dialogs;
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false);
   const [verifying, setVerifying] = useState(false);
@@ -180,27 +172,18 @@ export function Dashboard({ onLogout }: DashboardProps) {
   });
   const cancelVerifyRef = useRef(false);
   const [currentPage, setCurrentPage] = useState(1);
-  // 展示形态（卡片 / 列表）与每页数量，均持久化到 localStorage
-  const [viewMode, setViewMode] = useState<CredentialView>(() =>
-    storage.getCredentialView(),
-  );
-  const [pageSize, setPageSize] = useState<number>(() =>
-    storage.getCredentialPageSize(),
-  );
-  const [privacyMode, setPrivacyMode] = useState<boolean>(() =>
-    storage.getPrivacyMode(),
-  );
-  const changeViewMode = (v: CredentialView) => {
-    setViewMode(v);
-    storage.setCredentialView(v);
-  };
-  const changePrivacyMode = (enabled: boolean) => {
-    setPrivacyMode(enabled);
-    storage.setPrivacyMode(enabled);
-  };
+  // 展示偏好持久化到 localStorage，由 hook 保证 setState 与写盘成对
+  const {
+    pageSize,
+    privacyMode,
+    setPageSize,
+    setPrivacyMode: changePrivacyMode,
+    setViewMode: changeViewMode,
+    viewMode,
+  } = useCredentialViewPrefs();
+  // 每页数量变化后回到第 1 页——翻页游标不归 hook 管，在这里组合
   const changePageSize = (n: number) => {
     setPageSize(n);
-    storage.setCredentialPageSize(n);
     setCurrentPage(1);
   };
   const queryClient = useQueryClient();
@@ -221,46 +204,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
     balanceMap,
   );
 
-  // 分组筛选：'' = 全部；'__none__' = 仅显示未分组；其他 = 按分组名筛选
-  const [groupFilter, setGroupFilter] = useState<string>("");
-  // 订阅分级筛选（多选）：空集合 = 全部分级；否则只显示集合内的分级
-  const [tierFilter, setTierFilter] = useState<Set<Tier>>(new Set());
-  // 模糊搜索：按来源渠道（备注）/ 邮箱做大小写不敏感的子串匹配；空串 = 不限
-  const [searchQuery, setSearchQuery] = useState("");
-  const toggleTier = (t: Tier) => {
-    setTierFilter((prev) => {
-      const next = new Set(prev);
-      if (next.has(t)) next.delete(t);
-      else next.add(t);
-      return next;
-    });
-  };
+  // 分组 / 订阅分级 / 模糊搜索：状态与过滤逻辑一起放在 hook 里
+  const filters = useCredentialFilters();
+  const { groupFilter, searchQuery, tierFilter, toggleTier } = filters;
+  const setGroupFilter = filters.setGroupFilter;
+  const setSearchQuery = filters.setSearchQuery;
 
-  // 应用分组 + 分级筛选后的凭据全集（分页前先过滤，确保翻页粒度正确）
-  const filteredCredentials = (() => {
-    const all = data?.credentials ?? [];
-    let out = all;
-    if (groupFilter) {
-      out =
-        groupFilter === "__none__"
-          ? out.filter((c) => !c.groups || c.groups.length === 0)
-          : out.filter((c) => c.groups?.includes(groupFilter));
-    }
-    if (tierFilter.size > 0) {
-      out = out.filter((c) =>
-        tierFilter.has(detectTier(c.balance?.subscriptionTitle)),
-      );
-    }
-    const q = searchQuery.trim().toLowerCase();
-    if (q) {
-      out = out.filter(
-        (c) =>
-          (c.sourceChannel ?? "").toLowerCase().includes(q) ||
-          (c.email ?? "").toLowerCase().includes(q),
-      );
-    }
-    return out;
-  })();
+  // 分页前先过滤，确保翻页粒度对应筛选结果而不是全集
+  const filteredCredentials = filters.apply(data?.credentials ?? []);
 
   // 切换分组 / 分级筛选 / 搜索时复位到第 1 页，避免空页
   useEffect(() => {
@@ -1137,7 +1088,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 <button
                   type="button"
                   className="ml-1 rounded-full text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/45"
-                  onClick={() => setTierFilter(new Set())}
+                  onClick={() => filters.clearTiers()}
                   title="清除分级筛选"
                   aria-label="清除分级筛选"
                 >
@@ -1287,7 +1238,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                       <DropdownMenuItem
                         onSelect={(e) => {
                           e.preventDefault();
-                          setTierFilter(new Set());
+                          filters.clearTiers();
                         }}
                         className="text-muted-foreground"
                       >
@@ -1352,7 +1303,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
               {selectedCount > 0 && (
                 <>
                   <Button
-                    onClick={() => setBatchEditDialogOpen(true)}
+                    onClick={() => dialogs.setBatchEditOpen(true)}
                     size="sm"
                     variant="outline"
                     title="批量编辑 RPM / 分组 / 来源渠道"
@@ -1377,7 +1328,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
               {/* 主操作 */}
               <Button
-                onClick={() => setAddDialogOpen(true)}
+                onClick={() => dialogs.setAddOpen(true)}
                 size="sm"
                 className="w-full sm:w-auto"
               >
@@ -1400,25 +1351,25 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 <DropdownMenuContent align="end">
                   <DropdownMenuLabel>登录</DropdownMenuLabel>
                   <DropdownMenuItem
-                    onSelect={() => setSocialLoginDialogOpen(true)}
+                    onSelect={() => dialogs.setSocialLoginOpen(true)}
                   >
                     <LogIn />
                     Kiro Hosted 登录 (Google / GitHub)
                   </DropdownMenuItem>
                   <DropdownMenuItem
-                    onSelect={() => setSocialLoginDialogOpen(true)}
+                    onSelect={() => dialogs.setSocialLoginOpen(true)}
                   >
                     <Building2 />
                     企业 SSO (Entra ID / Azure AD) 登录
                   </DropdownMenuItem>
                   <DropdownMenuItem
-                    onSelect={() => setIdcLoginDialogOpen(true)}
+                    onSelect={() => dialogs.setIdcLoginOpen(true)}
                   >
                     <Key />
                     AWS SSO (IdC) 登录
                   </DropdownMenuItem>
                   <DropdownMenuItem
-                    onSelect={() => setEnterpriseLoginDialogOpen(true)}
+                    onSelect={() => dialogs.setEnterpriseLoginOpen(true)}
                   >
                     <Building2 />
                     Enterprise (IAM Identity Center) 登录
@@ -1519,7 +1470,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                       : "刷新当前页余额"}
                   </DropdownMenuItem>
                   <DropdownMenuItem
-                    onSelect={() => setProxyPoolDialogOpen(true)}
+                    onSelect={() => dialogs.setProxyPoolOpen(true)}
                   >
                     <Globe />
                     IP 代理池管理
@@ -1744,47 +1695,47 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
       {/* 弹窗们 */}
       <AddCredentialDialog
-        open={addDialogOpen}
-        onOpenChange={setAddDialogOpen}
+        open={dialogs.addOpen}
+        onOpenChange={dialogs.setAddOpen}
         onBatchApiKeyImport={() => openBatchImport("api-key")}
       />
       <BatchImportDialog
-        open={batchImportDialogOpen}
-        onOpenChange={setBatchImportDialogOpen}
-        initialMode={batchImportInitialMode}
+        open={dialogs.batchImportOpen}
+        onOpenChange={dialogs.setBatchImportOpen}
+        initialMode={dialogs.batchImportMode}
       />
       <BatchEditCredentialDialog
-        open={batchEditDialogOpen}
-        onOpenChange={setBatchEditDialogOpen}
+        open={dialogs.batchEditOpen}
+        onOpenChange={dialogs.setBatchEditOpen}
         credentials={selectedCredentials}
         groupOptions={groupOptions}
         onDone={deselectAll}
       />
       <SocialLoginDialog
-        open={socialLoginDialogOpen}
-        onOpenChange={setSocialLoginDialogOpen}
+        open={dialogs.socialLoginOpen}
+        onOpenChange={dialogs.setSocialLoginOpen}
         onSuccess={() =>
           queryClient.invalidateQueries({ queryKey: ["credentials"] })
         }
       />
       <IdcLoginDialog
-        open={idcLoginDialogOpen}
-        onOpenChange={setIdcLoginDialogOpen}
+        open={dialogs.idcLoginOpen}
+        onOpenChange={dialogs.setIdcLoginOpen}
         onSuccess={() =>
           queryClient.invalidateQueries({ queryKey: ["credentials"] })
         }
       />
       <IdcLoginDialog
         mode="enterprise"
-        open={enterpriseLoginDialogOpen}
-        onOpenChange={setEnterpriseLoginDialogOpen}
+        open={dialogs.enterpriseLoginOpen}
+        onOpenChange={dialogs.setEnterpriseLoginOpen}
         onSuccess={() =>
           queryClient.invalidateQueries({ queryKey: ["credentials"] })
         }
       />
       <ProxyPoolDialog
-        open={proxyPoolDialogOpen}
-        onOpenChange={setProxyPoolDialogOpen}
+        open={dialogs.proxyPoolOpen}
+        onOpenChange={dialogs.setProxyPoolOpen}
       />
       {/* 镜像在线更新与「修改登录API密钥」两个弹窗已移除：
           它们的唯一入口是本文件此前那段独立模式顶栏，而该顶栏是死代码
