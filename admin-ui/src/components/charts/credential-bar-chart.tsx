@@ -2,6 +2,7 @@ import { memo, useMemo } from 'react'
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts'
 import type { CredentialDistribution } from '@/types/api'
 import { tooltipContentStyle, tooltipCursorStyle, tooltipItemStyle, tooltipLabelStyle } from './tooltip-style'
+import { CHART_FONT_SIZE, SERIES_COLORS } from './chart-theme'
 import { formatNumber } from '@/lib/utils'
 
 interface Props {
@@ -28,17 +29,22 @@ function CredentialBarChartImpl({ data }: Props) {
 }
 
 function buildChartData(data: CredentialDistribution[]): ChartDatum[] {
-  return data.slice(0, 12).map((d) => {
-    const fullLabel = d.email ?? `#${d.credentialId}`
-    return {
-      calls: d.calls,
-      errors: d.errors,
-      fullLabel,
-      inputTokens: d.inputTokens,
-      label: d.email ? truncateEmail(d.email) : fullLabel,
-      outputTokens: d.outputTokens,
-    }
-  })
+  // 显式按总 Token 降序：条形图对比的前提是有序，依赖接口返回顺序不可靠，
+  // 而且 slice(0,12) 截断的必须是「最小的那些」而不是「碰巧排在后面的」。
+  return [...data]
+    .sort((a, b) => b.inputTokens + b.outputTokens - (a.inputTokens + a.outputTokens))
+    .slice(0, 12)
+    .map((d) => {
+      const fullLabel = d.email ?? `#${d.credentialId}`
+      return {
+        calls: d.calls,
+        errors: d.errors,
+        fullLabel,
+        inputTokens: d.inputTokens,
+        label: d.email ? truncateEmail(d.email) : fullLabel,
+        outputTokens: d.outputTokens,
+      }
+    })
 }
 
 function EmptyCredentialChart() {
@@ -56,7 +62,12 @@ function CredentialChartContent({ data }: { data: ChartDatum[] }) {
         <BarChart data={data} margin={{ top: 8, right: 8, left: -10, bottom: 52 }}>
           {credentialChartAxes()}
           {credentialChartTooltip()}
-          <Legend verticalAlign="top" align="right" height={28} wrapperStyle={{ fontSize: 12 }} />
+          <Legend
+        verticalAlign="top"
+        align="right"
+        height={28}
+        wrapperStyle={{ fontSize: CHART_FONT_SIZE.legend }}
+      />
           {credentialChartBars()}
         </BarChart>
       </ResponsiveContainer>
@@ -70,13 +81,18 @@ function credentialChartAxes() {
     <XAxis
       key="x"
       dataKey="label"
-      tick={{ fontSize: 10 }}
+      tick={{ fontSize: CHART_FONT_SIZE.axis }}
       angle={-30}
       textAnchor="end"
       interval={0}
       height={64}
     />,
-    <YAxis key="y" tick={{ fontSize: 11 }} tickFormatter={(v: number) => formatNumber(v)} width={42} />,
+    <YAxis
+      key="y"
+      tick={{ fontSize: CHART_FONT_SIZE.axis }}
+      tickFormatter={(v: number) => formatNumber(v)}
+      width={42}
+    />,
   ]
 }
 
@@ -99,8 +115,24 @@ function formatTooltipLabel(label: string, payload?: ReadonlyArray<{ payload?: C
 
 function credentialChartBars() {
   return [
-    <Bar key="input" dataKey="inputTokens" name="输入" stackId="a" fill="#3b82f6" isAnimationActive={false} />,
-    <Bar key="output" dataKey="outputTokens" name="输出" stackId="a" fill="#10b981" isAnimationActive={false} />,
+    // 颜色取自共享主题：这里的「输入 / 输出」必须和趋势图里同名序列同色，
+    // 否则同一页两张图对同一个概念用两种颜色。
+    <Bar
+      key="input"
+      dataKey="inputTokens"
+      name="输入"
+      stackId="a"
+      fill={SERIES_COLORS.input}
+      isAnimationActive={false}
+    />,
+    <Bar
+      key="output"
+      dataKey="outputTokens"
+      name="输出"
+      stackId="a"
+      fill={SERIES_COLORS.output}
+      isAnimationActive={false}
+    />,
   ]
 }
 

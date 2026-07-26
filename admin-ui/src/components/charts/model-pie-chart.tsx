@@ -2,6 +2,12 @@ import { memo, useMemo } from 'react'
 import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer, Legend } from 'recharts'
 import type { ModelDistribution } from '@/types/api'
 import { tooltipContentStyle, tooltipItemStyle, tooltipLabelStyle } from './tooltip-style'
+import {
+  CATEGORICAL_COLORS,
+  CHART_FONT_SIZE,
+  MAX_PIE_SLICES,
+  OTHER_COLOR,
+} from './chart-theme'
 import { formatNumber } from '@/lib/utils'
 
 interface Props {
@@ -15,11 +21,6 @@ interface ChartDatum {
   value: number
 }
 
-const PALETTE = [
-  '#3b82f6', '#10b981', '#a855f7', '#f59e0b', '#ec4899',
-  '#06b6d4', '#84cc16', '#f97316', '#6366f1', '#14b8a6',
-]
-
 function ModelPieChartImpl({ data }: Props) {
   const { chartData, total } = useMemo(() => buildChartData(data), [data])
 
@@ -30,15 +31,41 @@ function ModelPieChartImpl({ data }: Props) {
   return <ModelChartContent chartData={chartData} total={total} />
 }
 
+/**
+ * 按调用量降序取前 N 个模型，其余合并成「其他」。
+ *
+ * 之前是全量渲染 + 10 色循环：号池里跑十几个模型时，环形图变成一圈分不清的细条，
+ * 图例还会把卡片撑开。完整明细本来就在下方的 ModelTable 里，环形图只需要表达
+ * 「谁占大头」。
+ */
 function buildChartData(data: ModelDistribution[]) {
   const total = data.reduce((s, d) => s + d.calls, 0) || 1
-  const chartData = data.map((d) => ({
+  const sorted = [...data].sort((a, b) => b.calls - a.calls)
+  const head = sorted.slice(0, MAX_PIE_SLICES)
+  const tail = sorted.slice(MAX_PIE_SLICES)
+
+  const chartData: ChartDatum[] = head.map((d) => ({
     inputTokens: d.inputTokens,
     name: d.model,
     outputTokens: d.outputTokens,
     value: d.calls,
   }))
+
+  if (tail.length > 0) {
+    chartData.push({
+      inputTokens: tail.reduce((s, d) => s + d.inputTokens, 0),
+      name: `其他 ${tail.length} 个模型`,
+      outputTokens: tail.reduce((s, d) => s + d.outputTokens, 0),
+      value: tail.reduce((s, d) => s + d.calls, 0),
+    })
+  }
+
   return { chartData, total }
+}
+
+/** 「其他」聚合项固定用中性灰，不占用语义色。 */
+function sliceColor(index: number, name: string): string {
+  return name.startsWith('其他 ') ? OTHER_COLOR : CATEGORICAL_COLORS[index % CATEGORICAL_COLORS.length]
 }
 
 function EmptyModelChart() {
@@ -71,8 +98,8 @@ function ModelChartContent({
             paddingAngle={2}
             isAnimationActive={false}
           >
-          {chartData.map((_, i) => (
-            <Cell key={i} fill={PALETTE[i % PALETTE.length]} />
+          {chartData.map((d, i) => (
+            <Cell key={d.name} fill={sliceColor(i, d.name)} />
           ))}
         </Pie>
           <Tooltip
@@ -83,7 +110,7 @@ function ModelChartContent({
             formatter={(value: number, _name, item) =>
               formatTooltipValue({ item, total, value })}
           />
-          <Legend wrapperStyle={{ fontSize: 11 }} iconSize={8} />
+          <Legend wrapperStyle={{ fontSize: CHART_FONT_SIZE.legend }} iconSize={8} />
         </PieChart>
       </ResponsiveContainer>
     </div>

@@ -11,6 +11,7 @@ import {
 } from 'recharts'
 import type { TimeSeriesPoint, StatsGranularity } from '@/types/api'
 import { tooltipCursorStyle } from './tooltip-style'
+import { CHART_FONT_SIZE, SERIES_COLORS } from './chart-theme'
 import { formatCredits, formatNumber } from '@/lib/utils'
 
 interface Props {
@@ -18,14 +19,7 @@ interface Props {
   granularity: StatsGranularity
 }
 
-const COLORS = {
-  input: '#3b82f6',
-  output: '#10b981',
-  cacheCreation: '#f59e0b',
-  cacheRead: '#06b6d4',
-  cacheHitRate: '#a855f7',
-  credits: '#ec4899',
-} as const
+const COLORS = SERIES_COLORS
 
 const SERIES = [
   { key: 'inputTokens', name: '输入', color: COLORS.input, axis: 'left' as const, kind: 'tokens' as const },
@@ -93,7 +87,7 @@ const TOOLTIP_STYLE: React.CSSProperties = {
   borderRadius: 10,
   boxShadow: '0 8px 24px rgba(0,0,0,0.25)',
   color: '#fff',
-  fontSize: 12,
+  fontSize: CHART_FONT_SIZE.tooltip,
   minWidth: 180,
   padding: '10px 14px',
 }
@@ -201,14 +195,14 @@ function chartAxes({
     <XAxis
       key="x"
       dataKey="label"
-      tick={{ fontSize: 11 }}
+      tick={{ fontSize: CHART_FONT_SIZE.axis }}
       className="fill-muted-foreground"
       interval={interval}
     />,
     <YAxis
       key="left"
       yAxisId="left"
-      tick={{ fontSize: 11 }}
+      tick={{ fontSize: CHART_FONT_SIZE.axis }}
       className="fill-muted-foreground"
       tickFormatter={(v: number) => formatNumber(v)}
       width={48}
@@ -220,7 +214,7 @@ function chartAxes({
       key="right"
       yAxisId="right"
       orientation="right"
-      tick={{ fontSize: 11, fill: COLORS.cacheHitRate }}
+      tick={{ fontSize: CHART_FONT_SIZE.axis, fill: COLORS.cacheHitRate }}
       domain={[0, 100]}
       ticks={[0, 20, 40, 60, 80, 100]}
       tickFormatter={(v: number) => `${v}%`}
@@ -234,11 +228,23 @@ function chartLegend() {
 }
 
 const LEGEND_STYLE: React.CSSProperties = {
-  fontSize: 12,
+  fontSize: CHART_FONT_SIZE.legend,
   paddingBottom: 8,
 }
 
+/**
+ * recharts 的入场动画由 JS 逐帧驱动，不是 CSS transition，
+ * 所以 index.css 里那条全局 `prefers-reduced-motion` 兜底对它无效，必须显式判断。
+ */
+function prefersReducedMotion(): boolean {
+  return (
+    typeof window !== 'undefined' &&
+    window.matchMedia('(prefers-reduced-motion: reduce)').matches
+  )
+}
+
 function chartLines() {
+  const animate = !prefersReducedMotion()
   return SERIES.map((s) => (
     <Line
       key={s.key}
@@ -250,7 +256,7 @@ function chartLines() {
       dot={false}
       strokeWidth={s.kind === 'percent' ? 1.8 : 2}
       strokeDasharray={s.kind === 'percent' ? '4 4' : undefined}
-      isAnimationActive
+      isAnimationActive={animate}
       animationDuration={550}
       animationEasing="ease-out"
     />
