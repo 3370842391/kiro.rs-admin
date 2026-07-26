@@ -13,88 +13,97 @@ interface RpmStatusBarProps {
   creditsPerMinute?: number
 }
 
-/**
- * 状态色。与 badge.tsx 的 variant 取值保持一致，避免同一语义在两处用不同的绿/黄。
- *
- * `ok` 是显式的「健康」而不是「无状态」：满载账号为 0、剩余容量充足这类好消息
- * 值得被看见，全用默认前景色会让好坏都长一个样。
- */
+/** 与 badge.tsx 的 variant 同色，避免同一语义在两处用不同的绿/黄。 */
 type Tone = 'neutral' | 'ok' | 'warning' | 'danger'
 
-const TONE_CLASS: Record<Tone, string> = {
+const VALUE_TONE: Record<Tone, string> = {
   neutral: 'text-foreground',
   ok: 'text-emerald-600 dark:text-emerald-400',
   warning: 'text-amber-600 dark:text-amber-400',
   danger: 'text-destructive',
 }
 
-interface StatusItemProps {
-  label: string
-  value: string | number
-  detail?: string
-  tone?: Tone
-  /** 实时量（60 秒滑动窗口）加呼吸点，与静态容量快照区分开 */
-  live?: boolean
-  /** 该簇的主指标：字号更大，让每组有一个视觉落点 */
-  primary?: boolean
+/** 实时指标的呼吸点颜色。neutral 时用弱色，避免静止值也在闪。 */
+const DOT_TONE: Record<Tone, string> = {
+  neutral: 'bg-muted-foreground/40',
+  ok: 'bg-emerald-500',
+  warning: 'bg-amber-500',
+  danger: 'bg-destructive',
 }
 
-function StatusItem({
-  label,
-  value,
-  detail,
-  tone = 'neutral',
-  live = false,
-  primary = false,
-}: StatusItemProps) {
+interface MetricProps {
+  label: string
+  value: string
+  /** 单位单独传，用更小更淡的字号排在数值后面 —— 混进 value 会和数字抢注意力。 */
+  unit?: string
+  detail?: string
+  tone?: Tone
+  /** 60 秒滑动窗口的实时量，加呼吸点与静态快照区分 */
+  live?: boolean
+}
+
+function Metric({ label, value, unit, detail, tone = 'neutral', live = false }: MetricProps) {
   return (
     <div className="min-w-0">
-      <div className="flex items-center gap-1 text-[11px] leading-tight text-muted-foreground">
+      <div className="flex items-center gap-1.5">
         {live && (
-          // 呼吸点挪到标签行：原先放在数值前面，会把数字挤得左右不对齐，
-          // 一组数字扫下来时基线是歪的。
           <span
             aria-hidden="true"
-            className={`h-1.5 w-1.5 shrink-0 rounded-full bg-current motion-safe:animate-pulse ${TONE_CLASS[tone]}`}
+            className={`h-1.5 w-1.5 shrink-0 rounded-full ${DOT_TONE[tone]} motion-safe:animate-pulse`}
           />
         )}
-        <span className="truncate">{label}</span>
+        {/* 标签压到 uppercase + tracking：小字号下更像"字段名"而不是内容，
+            视觉重量让给数值。 */}
+        <span className="truncate text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+          {label}
+        </span>
       </div>
-      <div
-        className={`min-w-0 truncate tabular-nums ${TONE_CLASS[tone]} ${
-          primary ? 'text-lg font-semibold leading-snug' : 'text-sm font-semibold leading-snug'
-        }`}
-      >
-        {value}
+      <div className="mt-1 flex min-w-0 items-baseline gap-1">
+        <span
+          className={`truncate text-xl font-semibold leading-none tracking-tight tabular-nums ${VALUE_TONE[tone]}`}
+        >
+          {value}
+        </span>
+        {unit ? (
+          <span className="shrink-0 text-[11px] font-normal text-muted-foreground">{unit}</span>
+        ) : null}
       </div>
       {detail ? (
-        <div className="min-w-0 truncate text-[11px] leading-tight tabular-nums text-muted-foreground">
-          {detail}
-        </div>
+        <div className="mt-1 truncate text-[11px] leading-tight text-muted-foreground">{detail}</div>
       ) : null}
     </div>
   )
 }
 
 /**
- * 一组语义相关的指标。组间用竖线分隔——七个等宽列摆在一起时，
- * 「满载账号」和「可用积分」看上去是同一类东西，实际一个是限流、一个是钱。
+ * 一张指标卡。
+ *
+ * 上一版用「细边框条 + 竖线分隔」，实际渲染下分隔线几乎看不见，七个指标读起来
+ * 仍是一条平铺的流水线。改成独立卡片：靠 surface 与留白分组，比 1px 竖线可靠得多，
+ * 也和页面上其它 Card 的语言一致。
  */
-function StatusGroup({
+function MetricCard({
   children,
-  label,
+  columns,
+  title,
 }: {
   children: React.ReactNode
-  label: string
+  /** 卡内指标数，决定内部网格列数 */
+  columns: number
+  title: string
 }) {
   return (
-    <div
-      role="group"
-      aria-label={label}
-      className="flex min-w-0 items-start gap-x-5 gap-y-2 border-border/70 sm:gap-x-6 [&:not(:first-child)]:sm:border-l [&:not(:first-child)]:sm:pl-5 xl:[&:not(:first-child)]:pl-6"
+    <section
+      aria-label={title}
+      className="min-w-0 flex-1 rounded-xl border border-border/60 bg-card/70 px-4 py-3 backdrop-blur-sm"
     >
-      {children}
-    </div>
+      <div
+        className="grid gap-x-5 gap-y-3"
+        style={{ gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))` }}
+      >
+        {children}
+      </div>
+    </section>
   )
 }
 
@@ -112,63 +121,54 @@ export function RpmStatusBar({
   const hasUnlimitedCapacity = unlimitedAccounts > 0
   const creditDisplay = formatAvailableCreditSummary(availableCreditSummary)
   const burnRate = Number.isFinite(creditsPerMinute) ? Math.max(0, creditsPerMinute) : 0
-
   const capacityExhausted = remainingLimitedCapacity === 0 && limitedCapacity > 0
 
   return (
-    <section
-      aria-label="号池实时状态"
-      className="mb-4 border-y border-border/70 bg-muted/40 px-3 py-2.5 sm:px-4"
-    >
-      {/* 三簇按语义分组，整簇换行——七个等宽列在窄屏会拆成毫无关系的碎片。 */}
-      <div className="flex flex-wrap items-start gap-x-5 gap-y-3 sm:gap-x-6">
-        <StatusGroup label="吞吐与容量">
-          <StatusItem label="最近 60 秒 RPM" value={current} primary />
-          <StatusItem
-            label={hasUnlimitedCapacity ? '总容量' : '有限容量'}
-            value={hasUnlimitedCapacity ? '不限速' : limitedCapacity}
-            detail={`有限 ${limitedCapacity} · 不限速 ${unlimitedAccounts} 个账号`}
-          />
-          <StatusItem
-            label={hasUnlimitedCapacity ? '有限账号剩余' : '剩余容量'}
-            value={remainingLimitedCapacity}
-            tone={capacityExhausted ? 'warning' : 'neutral'}
-          />
-          <StatusItem
-            label="满载账号"
-            value={saturatedAccounts}
-            // 0 个满载是好消息，值得显式标绿，而不是和其它数字一样的黑色
-            tone={saturatedAccounts > 0 ? 'danger' : 'ok'}
-          />
-        </StatusGroup>
+    // mb-5：与下方凭据列表拉开距离。上一版 mb-4 加上无边距的条状容器，
+    // 整块和列表粘在一起，没有呼吸感。
+    <div className="mb-5 flex flex-col gap-3 lg:flex-row">
+      <MetricCard title="吞吐与容量" columns={4}>
+        <Metric label="RPM" value={String(current)} unit="次/分" detail="最近 60 秒" live />
+        <Metric
+          label={hasUnlimitedCapacity ? '总容量' : '有限容量'}
+          value={hasUnlimitedCapacity ? '不限速' : String(limitedCapacity)}
+          detail={`有限 ${limitedCapacity} · 不限速 ${unlimitedAccounts}`}
+        />
+        <Metric
+          label={hasUnlimitedCapacity ? '有限账号剩余' : '剩余容量'}
+          value={String(remainingLimitedCapacity)}
+          tone={capacityExhausted ? 'warning' : 'neutral'}
+          detail={capacityExhausted ? '已打满' : '可继续接量'}
+        />
+        <Metric
+          label="满载账号"
+          value={String(saturatedAccounts)}
+          // 0 个满载是好消息，显式标绿；全用默认色的话好坏长一个样
+          tone={saturatedAccounts > 0 ? 'danger' : 'ok'}
+          detail={saturatedAccounts > 0 ? '需要扩容' : '无满载'}
+        />
+      </MetricCard>
 
-        <StatusGroup label="实时负载">
-          <StatusItem
-            label="进行中请求"
-            value={totalInFlight}
-            tone={totalInFlight > 0 ? 'warning' : 'neutral'}
-            live
-            primary
-            detail="全池当前在飞"
-          />
-        </StatusGroup>
-
-        <StatusGroup label="额度">
-          <StatusItem
-            label="可用积分"
-            value={creditDisplay.value}
-            detail={creditDisplay.detail}
-            primary
-          />
-          <StatusItem
-            label="积分消耗"
-            value={`${formatCredits(burnRate)} /分钟`}
-            tone={burnRate > 0 ? 'warning' : 'neutral'}
-            live
-            detail="最近 60 秒实际"
-          />
-        </StatusGroup>
-      </div>
-    </section>
+      <MetricCard title="实时负载与额度" columns={3}>
+        <Metric
+          label="进行中"
+          value={String(totalInFlight)}
+          unit="请求"
+          tone={totalInFlight > 0 ? 'warning' : 'neutral'}
+          detail="全池在飞"
+          live
+        />
+        {/* 可用积分与消耗速率相邻：余量 ÷ 速率 = 还能撑多久 */}
+        <Metric label="可用积分" value={creditDisplay.value} detail={creditDisplay.detail} />
+        <Metric
+          label="积分消耗"
+          value={formatCredits(burnRate)}
+          unit="/分钟"
+          tone={burnRate > 0 ? 'warning' : 'neutral'}
+          detail="最近 60 秒"
+          live
+        />
+      </MetricCard>
+    </div>
   )
 }

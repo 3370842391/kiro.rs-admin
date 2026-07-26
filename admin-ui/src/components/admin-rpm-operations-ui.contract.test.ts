@@ -113,10 +113,9 @@ describe('admin RPM operations UI wiring', () => {
     expect(status).toContain('unlimitedAccounts')
     expect(status).toContain('saturatedAccounts')
     expect(status).toContain('totalInFlight')
-    // 断言「窄屏能换行、不会挤成一条」这个意图，不锁具体实现：
-    // 布局已从七个等宽列改为按语义分组的 flex 簇，整簇换行而不是把相关指标拆散。
-    expect(status).toContain('flex-wrap')
-    expect(status).toMatch(/gap-x-\d/)
+    // 断言「窄屏不会挤成一条」这个意图，不锁具体布局实现：
+    // 指标已从七个等宽列改为两张卡片，窄屏整卡纵向堆叠而不是把相关指标拆散。
+    expect(status).toMatch(/flex-col[\s\S]{0,40}lg:flex-row/)
   })
 
   test('status bar shows the live credit burn rate next to remaining credits', async () => {
@@ -135,7 +134,9 @@ describe('admin RPM operations UI wiring', () => {
     const status = await readSource('src/components/rpm-status-bar.tsx')
 
     expect(status).toContain("hasUnlimitedCapacity ? '总容量' : '有限容量'")
-    expect(status).toContain("hasUnlimitedCapacity ? '不限速' : limitedCapacity")
+    // 不锁类型转换的写法（可能是裸变量也可能是 String(...)），只钉住
+    // 「有不限速账号时显示『不限速』，否则显示具体容量数」这个分支语义。
+    expect(status).toMatch(/hasUnlimitedCapacity \? '不限速' : [^,\n]*limitedCapacity/)
     // 存在不限速账号时，「剩余」必须显式限定到有限账号，否则会读成「全池只剩这些」。
     // 只钉住 true 分支的限定语，else 分支的措辞可以改。
     expect(status).toMatch(/hasUnlimitedCapacity \? '有限账号剩余' : '[^']+'/)
