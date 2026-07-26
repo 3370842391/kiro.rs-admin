@@ -134,6 +134,26 @@ pub fn build_client_with_read_timeout(
     build_client_with_redirect_policy(proxy, timeout_secs, read_timeout_secs, tls_backend, None)
 }
 
+/// 是否允许对上游使用 HTTP/2 多路复用。
+///
+/// 默认关闭（见 `build_client_with_redirect_policy` 里的说明）。仅在需要临时回退
+/// 验证时通过环境变量打开，读一次并缓存，避免每次建 client 都查环境变量。
+fn upstream_http2_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let on = std::env::var("KIRO_UPSTREAM_HTTP2")
+            .map(|v| matches!(v.trim(), "1" | "true" | "TRUE"))
+            .unwrap_or(false);
+        if on {
+            tracing::warn!(
+                "KIRO_UPSTREAM_HTTP2 已开启：上游将复用单条 h2 连接，高并发下可能出现流槽排队"
+            );
+        }
+        on
+    })
+}
+
 fn build_client_with_redirect_policy(
     proxy: Option<&ProxyConfig>,
     timeout_secs: u64,
@@ -149,6 +169,26 @@ fn build_client_with_redirect_policy(
         .timeout(Duration::from_secs(timeout_secs))
         .pool_idle_timeout(Duration::from_secs(120))
         .pool_max_idle_per_host(128);
+
+    // 强制 HTTP/1.1，不走 HTTP/2 多路复用。
+    //
+    // 上游 `q.{region}.amazonaws.com` 支持 h2，而 hyper 默认把同一 host 的所有请求
+    // 复用到**一条** TCP 连接上。一旦并发流数超过服务端的 SETTINGS_MAX_CONCURRENT_STREAMS，
+    // 多出来的请求就在客户端排队等流槽 —— 不报错、不返回 429、纯粹干等。
+    //
+    // 线上实测（2026-07-26）：320 个并发入站请求对应上游**仅 1 条**连接，延迟呈明显
+    // 双峰 —— 抢到流槽的 1.5s 返回，没抢到的排队 50s+。这也解释了几个反直觉现象：
+    // 重启后好几分钟才复发（新连接流表是空的，流式请求会长时间占着槽位慢慢填满）、
+    // 加账号完全无效（同一 host 共用同一条连接，账号数不增加流槽）。
+    //
+    // 改用 HTTP/1.1 后，连接池按需开多条独立连接（`pool_max_idle_per_host` 只限制
+    // 空闲保活数，不限制并发上限），每个请求独占一条，不存在队头阻塞。代价是多一些
+    // TLS 握手，但有连接池复用摊薄，远小于排队几十秒的损失。
+    //
+    // 逃生阀：设 `KIRO_UPSTREAM_HTTP2=1` 可恢复 h2，无需重新构建。
+    if !upstream_http2_enabled() {
+        builder = builder.http1_only();
+    }
 
     // read timeout 仅在显式给出且 > 0 时设置；否则保持旧行为（仅绝对超时）。
     if let Some(secs) = read_timeout_secs {
@@ -198,6 +238,30 @@ fn build_client_with_redirect_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 上游客户端必须禁用 h2 多路复用。
+    ///
+    /// 2026-07-26 线上事故回归守卫：hyper 默认把同一 host 的所有请求复用到一条
+    /// h2 连接，超过服务端流槽上限的请求会在客户端静默排队。当时 320 个并发入站
+    /// 请求只对应上游 1 条连接，延迟双峰（1.5s vs 50s+），加账号完全无效。
+    ///
+    /// 这条断言看的是源码而非行为——reqwest 没有暴露"当前是否 http1_only"的查询接口，
+    /// 而这个设置一旦被误删不会有任何报错，只会在高并发时重新变慢。
+    #[test]
+    fn upstream_client_disables_http2_multiplexing_by_default() {
+        let source = include_str!("http_client.rs");
+        assert!(
+            source.contains("builder.http1_only()"),
+            "上游客户端必须 http1_only，否则高并发会在单条 h2 连接上排队"
+        );
+        assert!(
+            source.contains("KIRO_UPSTREAM_HTTP2"),
+            "保留环境变量逃生阀，便于不重新构建即可回退验证"
+        );
+        // 默认必须是关闭 h2
+        unsafe { std::env::remove_var("KIRO_UPSTREAM_HTTP2") };
+        assert!(!upstream_http2_enabled(), "默认不得启用 h2");
+    }
 
     #[test]
     fn test_proxy_config_new() {
