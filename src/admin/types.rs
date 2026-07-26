@@ -22,6 +22,11 @@ pub struct CredentialsStatusResponse {
     pub credentials: Vec<CredentialStatusItem>,
     /// 当前 RPM 容量汇总
     pub rpm_summary: RpmSummary,
+    /// 最近 60 秒的 credit 消耗速率（credits / 分钟）。
+    ///
+    /// 与 `rpm_summary` 同为实时窗口指标。小时桶算不出这个数——整点刚过时分母
+    /// 只有几分钟，读数会失真。
+    pub credits_per_minute: f64,
 }
 
 /// 当前 RPM 容量汇总
@@ -89,6 +94,15 @@ pub struct CredentialStatusItem {
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
+    /// 加入号池的时间（RFC3339）。存活时长的计时起点。
+    ///
+    /// 升级前就存在的凭据是加载时回填值，前端需按「回填」口径提示，不可当作真实
+    /// 加入时间展示（否则显示的是「升级后经过的时长」）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub added_at: Option<String>,
+    /// 判死时间（RFC3339）。非空即代表该号已被上游封禁。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub died_at: Option<String>,
     /// 是否配置了凭据级代理
     pub has_proxy: bool,
     /// 代理 URL（用于前端展示）

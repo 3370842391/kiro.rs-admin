@@ -563,6 +563,8 @@ pub struct AdminService {
     trace_store: Option<crate::admin::trace_db::SharedTraceStore>,
     /// 用量日志记录器（用于日志治理：保留天数运行时可改）
     usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
+    /// 用量聚合器。只用于读取实时 credit 消耗速率，与落盘的 recorder 是两个东西。
+    usage_aggregator: Option<crate::admin::usage_stats::SharedAggregator>,
     /// 失败请求完整脱敏现场存储与容量治理。
     error_snapshot_store: Option<crate::admin::error_snapshot_db::SharedErrorSnapshotStore>,
     /// 与 Anthropic 路由共享的 KiroProvider，用于 Admin 显式响应测试。
@@ -971,6 +973,7 @@ impl AdminService {
             login_credential_lock: tokio::sync::Mutex::new(()),
             trace_store: None,
             usage_recorder: None,
+            usage_aggregator: None,
             error_snapshot_store: None,
             kiro_provider: None,
             cache_meter: None,
@@ -1012,6 +1015,15 @@ impl AdminService {
         self.trace_store = trace_store;
         self.usage_recorder = usage_recorder;
         self.error_snapshot_store = error_snapshot_store;
+        self
+    }
+
+    /// 注入用量聚合器，用于在凭据状态响应里带上实时 credit 消耗速率。
+    pub fn with_usage_aggregator(
+        mut self,
+        aggregator: crate::admin::usage_stats::SharedAggregator,
+    ) -> Self {
+        self.usage_aggregator = Some(aggregator);
         self
     }
 
@@ -1297,6 +1309,8 @@ impl AdminService {
                     api_region: entry.api_region,
                     success_count: entry.success_count,
                     last_used_at: entry.last_used_at.clone(),
+                    added_at: entry.added_at.clone(),
+                    died_at: entry.died_at.clone(),
                     has_proxy: entry.has_proxy,
                     proxy_url: entry.proxy_url,
                     refresh_failure_count: entry.refresh_failure_count,
@@ -1321,6 +1335,12 @@ impl AdminService {
             current_id: snapshot.current_id,
             credentials,
             rpm_summary,
+            // 聚合器未注入时返回 0：这只是个展示用的速率，缺它不该让整个凭据接口失败。
+            credits_per_minute: self
+                .usage_aggregator
+                .as_ref()
+                .map(|a| a.credits_per_minute())
+                .unwrap_or(0.0),
         }
     }
 
@@ -1924,6 +1944,10 @@ impl AdminService {
             groups: req.groups,
             source_channel: req.source_channel,
             delete_on_forbidden: false,
+            // 两个时间戳都由 token_manager::add_credential 统一打，
+            // 这里留空避免多个入口各写一套导致口径不一致。
+            added_at: None,
+            died_at: None,
         };
 
         // 调用 token_manager 添加凭据
@@ -5118,6 +5142,8 @@ mod tests {
             api_region: None,
             success_count: 0,
             last_used_at: None,
+            added_at: None,
+            died_at: None,
             has_proxy: false,
             proxy_url: None,
             refresh_failure_count: 0,

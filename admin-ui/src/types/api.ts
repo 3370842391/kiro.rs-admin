@@ -14,6 +14,13 @@ export interface CredentialsStatusResponse {
   available: number
   currentId: number
   rpmSummary: RpmSummary
+  /**
+   * 最近 60 秒的 credit 消耗速率（credits / 分钟）。
+   *
+   * 与 rpmSummary 同为实时窗口指标，会随流量跳动。不要用小时聚合去算这个数——
+   * 整点刚过时分母只有几分钟，读数会失真。
+   */
+  creditsPerMinute: number
   credentials: CredentialStatusItem[]
 }
 
@@ -45,6 +52,15 @@ export interface CredentialStatusItem {
   maskedApiKey?: string
   successCount: number
   lastUsedAt: string | null
+  /**
+   * 加入号池的时间（RFC3339）。存活时长的计时起点。
+   *
+   * 升级前就存在的凭据是后端加载时的回填值，不是真实加入时间——展示时必须按
+   * 「回填」口径提示，否则用户看到的是「升级后经过的时长」。
+   */
+  addedAt?: string
+  /** 判死时间（RFC3339）。非空即代表该号已被上游封禁。 */
+  diedAt?: string
   hasProxy: boolean
   proxyUrl?: string
   refreshFailureCount: number

@@ -6,7 +6,7 @@
 //!
 //! 启动时扫描历史 JSONL 文件重建聚合，保证重启后趋势图不丢数据。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -302,7 +302,15 @@ struct AggregatorInner {
     hour_buckets: Vec<BucketEntry>,
     /// 天桶（按本地日期），最近 31 天
     day_buckets: Vec<BucketEntry>,
+    /// 最近 60 秒的 credit 消耗事件 `(记录时刻 unix 秒, credits)`。
+    ///
+    /// 小时桶算不出「此刻烧得多快」——整点刚过时分母只有几分钟，读数会失真。
+    /// 这里单独留一个滑动窗口，口径与凭据级 RPM 窗口一致（同为 60 秒实时窗）。
+    recent_credits: VecDeque<(i64, f64)>,
 }
+
+/// 实时消耗速率的窗口长度，与 `RPM_WINDOW_SECONDS` 同为 60 秒。
+const CREDIT_RATE_WINDOW_SECONDS: i64 = 60;
 
 /// 预设聚合查询时间范围
 #[derive(Debug, Clone, Copy)]
@@ -421,8 +429,24 @@ impl UsageAggregator {
             inner: parking_lot::RwLock::new(AggregatorInner {
                 hour_buckets: Vec::new(),
                 day_buckets: Vec::new(),
+                recent_credits: VecDeque::new(),
             }),
         }
+    }
+
+    /// 最近 60 秒的 credit 消耗速率（credits / 分钟）。
+    ///
+    /// 窗口即一分钟，所以窗口内求和就是「每分钟消耗」，不用再做换算。
+    /// 与凭据级 RPM 同口径：反映此刻的真实燃烧速度，会随流量跳动。
+    pub fn credits_per_minute(&self) -> f64 {
+        let cutoff = Utc::now().timestamp() - CREDIT_RATE_WINDOW_SECONDS;
+        self.inner
+            .read()
+            .recent_credits
+            .iter()
+            .filter(|(ts, _)| *ts > cutoff)
+            .map(|(_, credits)| *credits)
+            .sum()
     }
 
     /// 启动时从历史 JSONL 重建聚合
@@ -497,6 +521,22 @@ impl UsageAggregator {
         let day_ts = day_start.map(|d| d.timestamp()).unwrap_or(0);
 
         let mut inner = self.inner.write();
+
+        // 实时速率窗口。用记录自身的时间戳判定，不用 now：
+        // `rebuild_from_logs` 启动时会把最近 31 天的历史全部走一遍 ingest，
+        // 按 now 入队会让重启后的第一分钟读数暴涨到几万。
+        let record_ts = dt.timestamp();
+        let cutoff = Utc::now().timestamp() - CREDIT_RATE_WINDOW_SECONDS;
+        if record_ts > cutoff && rec.credits > 0.0 {
+            inner.recent_credits.push_back((record_ts, rec.credits));
+        }
+        while inner
+            .recent_credits
+            .front()
+            .is_some_and(|(ts, _)| *ts <= cutoff)
+        {
+            inner.recent_credits.pop_front();
+        }
 
         upsert_bucket(&mut inner.hour_buckets, hour_ts, rec, HOUR_BUCKETS);
         upsert_bucket(&mut inner.day_buckets, day_ts, rec, DAY_BUCKETS);
@@ -798,6 +838,56 @@ mod tests {
             duration_ms: 100,
             status: "success".to_string(),
         }
+    }
+
+    /// 实时速率窗口只统计最近 60 秒，且必须按记录自身的时间戳判定。
+    ///
+    /// 这是本功能最容易踩的坑：`rebuild_from_logs` 启动时会把最近 31 天的历史
+    /// 全部走一遍 `ingest`，若按 `now` 入队，重启后的第一分钟读数会暴涨到几万。
+    #[test]
+    fn credits_per_minute_ignores_records_outside_the_window() {
+        let aggregator = UsageAggregator::new();
+        let now = Utc::now();
+
+        // 窗口内两条：应计入
+        aggregator.ingest(&usage_test_record(
+            &(now - Duration::seconds(5)).to_rfc3339(),
+            None,
+            1.5,
+        ));
+        aggregator.ingest(&usage_test_record(
+            &(now - Duration::seconds(30)).to_rfc3339(),
+            None,
+            2.5,
+        ));
+        // 刚好越界与远古历史：都不该计入
+        aggregator.ingest(&usage_test_record(
+            &(now - Duration::seconds(120)).to_rfc3339(),
+            None,
+            100.0,
+        ));
+        aggregator.ingest(&usage_test_record(
+            &(now - Duration::days(7)).to_rfc3339(),
+            None,
+            9999.0,
+        ));
+
+        let rate = aggregator.credits_per_minute();
+        assert!(
+            (rate - 4.0).abs() < 1e-9,
+            "窗口内应只有 1.5 + 2.5 = 4.0，实际 {rate}"
+        );
+    }
+
+    /// 零 credit 的请求（失败、缓存命中等）不占窗口容量。
+    #[test]
+    fn credits_per_minute_skips_zero_credit_records() {
+        let aggregator = UsageAggregator::new();
+        let now = Utc::now();
+        for _ in 0..100 {
+            aggregator.ingest(&usage_test_record(&now.to_rfc3339(), None, 0.0));
+        }
+        assert_eq!(aggregator.credits_per_minute(), 0.0);
     }
 
     fn temp_usage_dir(name: &str) -> PathBuf {

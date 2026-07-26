@@ -1565,6 +1565,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
           summary={data ? data.rpmSummary : undefined}
           totalInFlight={inFlightRequestCount}
           availableCreditSummary={availableCreditSummary}
+          creditsPerMinute={data?.creditsPerMinute}
         />
 
         {/* 列表 */}

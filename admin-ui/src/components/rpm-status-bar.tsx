@@ -3,11 +3,14 @@ import {
   formatAvailableCreditSummary,
   type AvailableCreditSummary,
 } from '@/lib/credential-summary'
+import { formatCredits } from '@/lib/utils'
 
 interface RpmStatusBarProps {
   summary?: RpmSummary
   totalInFlight: number
   availableCreditSummary: AvailableCreditSummary
+  /** 最近 60 秒的 credit 消耗速率（credits / 分钟） */
+  creditsPerMinute?: number
 }
 
 interface StatusItemProps {
@@ -58,6 +61,7 @@ export function RpmStatusBar({
   summary,
   totalInFlight,
   availableCreditSummary,
+  creditsPerMinute = 0,
 }: RpmStatusBarProps) {
   const current = summary?.current ?? 0
   const limitedCapacity = summary?.limitedCapacity ?? 0
@@ -66,13 +70,14 @@ export function RpmStatusBar({
   const saturatedAccounts = summary?.saturatedAccounts ?? 0
   const hasUnlimitedCapacity = unlimitedAccounts > 0
   const creditDisplay = formatAvailableCreditSummary(availableCreditSummary)
+  const burnRate = Number.isFinite(creditsPerMinute) ? Math.max(0, creditsPerMinute) : 0
 
   return (
     <section
-      aria-label="最近60秒 RPM 状态"
+      aria-label="号池实时状态"
       className="mb-4 border-y border-border/70 bg-muted/40 px-3 py-2 sm:px-4"
     >
-      <div className="grid grid-cols-2 gap-x-4 gap-y-1 sm:grid-cols-3 xl:grid-cols-6">
+      <div className="grid grid-cols-2 gap-x-4 gap-y-1 sm:grid-cols-3 xl:grid-cols-7">
         <StatusItem label="最近60秒 RPM" value={current} />
         <StatusItem
           label={hasUnlimitedCapacity ? '总容量' : '有限容量'}
@@ -100,6 +105,15 @@ export function RpmStatusBar({
           label="可用积分"
           value={creditDisplay.value}
           detail={creditDisplay.detail}
+        />
+        {/* 紧挨「可用积分」：两个数放一起才有意义——余量 ÷ 速率就是还能撑多久。
+            与 RPM 同为 60 秒滑动窗口，所以同样带呼吸点标成实时量。 */}
+        <StatusItem
+          label="积分消耗"
+          value={`${formatCredits(burnRate)} /分钟`}
+          tone={burnRate > 0 ? 'warning' : 'default'}
+          live
+          detail="最近 60 秒实际消耗"
         />
       </div>
     </section>

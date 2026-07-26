@@ -351,6 +351,30 @@ async fn main() {
         });
     }
 
+    // 判死凭据的保留期清理：403 封号后凭据先禁用留档，过期再删。
+    // 每小时一轮 —— 与线上约每小时一次的封号节奏同量级，不必更频繁。
+    {
+        let manager = token_manager.clone();
+        let retention =
+            std::time::Duration::from_secs(u64::from(config.dead_credential_retention_hours) * 3600);
+        tokio::spawn(async move {
+            let hour = std::time::Duration::from_secs(3600);
+            // 启动后先等一会：此时 credentials.json 刚加载完，让回填的持久化先落地
+            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+            loop {
+                let removed = manager.cleanup_dead_credentials(retention);
+                if removed > 0 {
+                    tracing::info!(
+                        "已清理 {} 个超过 {} 小时保留期的判死凭据",
+                        removed,
+                        retention.as_secs() / 3600
+                    );
+                }
+                tokio::time::sleep(hour).await;
+            }
+        });
+    }
+
     // 每次启动幂等确保 config.apiKey 对应的系统 Key 存在（不可删除 / 不可轮换）。
     // 老部署升级时会把已有的 apiKey 补成系统 Key，保证根密钥始终可用于 /v1 流量。
     if let Some(initial_key) = bootstrap_key.as_ref() {
@@ -498,7 +522,8 @@ async fn main() {
                 Some(admin_trace_store.clone()),
                 Some(usage_recorder.clone()),
                 Some(error_snapshot_store.clone()),
-            );
+            )
+            .with_usage_aggregator(usage_aggregator.clone());
             let admin_state = admin::AdminState::new(
                 admin_key,
                 admin_service,

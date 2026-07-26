@@ -115,7 +115,21 @@ describe('admin RPM operations UI wiring', () => {
     expect(status).toContain('totalInFlight')
     expect(status).toContain('grid-cols-2')
     expect(status).toContain('sm:grid-cols-3')
-    expect(status).toContain('xl:grid-cols-6')
+    // 只断言响应式档位存在，不锁死具体列数——每加一个指标列数就要变，
+    // 把数字写进断言会让「加指标」这件事无谓地牵连测试。
+    expect(status).toMatch(/xl:grid-cols-\d+/)
+  })
+
+  test('status bar shows the live credit burn rate next to remaining credits', async () => {
+    const status = await readSource('src/components/rpm-status-bar.tsx')
+
+    // 余量与速率必须一起看：可用积分 ÷ 每分钟消耗 = 还能撑多久。
+    expect(status).toContain("label=\"积分消耗\"")
+    expect(status).toContain('creditsPerMinute')
+    // 与 RPM 同为 60 秒滑动窗口，因此标成实时量（带呼吸点）
+    expect(status).toMatch(/label="积分消耗"[\s\S]{0,200}?live/)
+    // 负数或 NaN 不能直接渲染出去
+    expect(status).toContain('Math.max(0, creditsPerMinute)')
   })
 
   test('status bar labels unlimited aggregate capacity without contradicting finite capacity', async () => {
