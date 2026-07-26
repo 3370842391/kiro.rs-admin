@@ -66,6 +66,10 @@ const SAFE_REQUIRED_PROPERTY_ALIASES: &[(&str, &str)] = &[
     ("new_string", "new_str"),
     ("oldString", "oldStr"), // edit：全称 → 缩写（camelCase）
     ("newString", "newStr"),
+    // Monitor：上游按 Bash 的习惯吐 `timeout`，客户端 schema 要 `timeout_ms`。
+    // 两边同为毫秒且同为 number，`matches_declared_type` 会再校一次类型；
+    // 若客户端自己也声明了 `timeout`，上面的 `properties.contains_key(source)` 会拦下不改名。
+    ("timeout", "timeout_ms"),
 ];
 
 /// 上游未声明工具 → 客户端已声明工具的**语义等价族**。

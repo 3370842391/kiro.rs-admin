@@ -947,8 +947,25 @@ pub fn convert_request_with_mode(
     if normalization.deduplicated_tool_uses > 0 {
         tracing::warn!(
             count = normalization.deduplicated_tool_uses,
-            "去重同一助手消息内完全相同的历史工具调用"
+            "去重完全相同的历史工具调用"
         );
+    }
+    // 有损修复单独打一条：这些请求过去会整轮 400，客户端带着同一份坏历史无限重试而
+    // 永久卡死。现在放行，但要能从日志定位是哪个客户端在持续送坏配对。
+    if normalization.dropped_anything() {
+        tracing::warn!(
+            conflicting_tool_uses = normalization.dropped_conflicting_tool_uses,
+            orphan_results = normalization.dropped_orphan_results,
+            duplicate_results = normalization.dropped_duplicate_results,
+            "历史工具配对损坏，已丢弃损坏部分并继续（此前为整轮拒绝）"
+        );
+        // 只携带 tool_result 的历史 user 消息在结果被丢弃后会变成完全空的消息，
+        // 而 Kiro 会拒收空 user 消息（`apply_empty_user_message_compat` 只兜当前消息，
+        // 管不到历史）。补一句最小占位文本，避免修好配对反而换来一个 400。
+        let backfilled = backfill_emptied_history_user_messages(&mut history);
+        if backfilled > 0 {
+            tracing::debug!(count = backfilled, "为被清空的历史 user 消息补入占位文本");
+        }
     }
 
     let (validated_tool_results, orphaned_tool_use_ids) =
@@ -983,7 +1000,19 @@ pub fn convert_request_with_mode(
 
     // 12. 构建当前消息
     // 保留文本内容，即使有工具结果也不丢弃用户文本
-    let content = text_content;
+    let mut content = text_content;
+
+    // 当前消息若只装着 tool_result 且这些结果全被判为孤立/重复丢掉，这里会剩下一条
+    // 空消息。handlers 的 `apply_empty_user_message_compat` 跑在转换之前，看到的还是
+    // 带 tool_result 的非空消息，兜不住这种"转换后才变空"，所以在这里补一次。
+    if normalization.dropped_anything()
+        && content.trim().is_empty()
+        && images.is_empty()
+        && context.tool_results.is_empty()
+    {
+        content = "(tool result omitted)".to_string();
+        tracing::debug!("当前消息的 tool_result 全部被丢弃，补入占位文本");
+    }
 
     let mut user_input = UserInputMessage::new(content, &model_id)
         .with_context(context)
@@ -1336,6 +1365,31 @@ fn validate_tool_pairing(
     }
 
     (filtered_results, unpaired_tool_use_ids)
+}
+
+/// 历史 user 消息被工具配对修复清空后，补一句占位文本。
+///
+/// 触发条件很窄：正文为空 + 无图片 + 无 tool_result。这只会发生在"该消息原本只装着
+/// tool_result，而这些结果全被判为孤立/重复丢掉了"的情况下。返回补写的条数。
+fn backfill_emptied_history_user_messages(history: &mut [Message]) -> usize {
+    const PLACEHOLDER: &str = "(tool result omitted)";
+
+    let mut backfilled = 0;
+    for message in history.iter_mut() {
+        let Message::User(user_message) = message else {
+            continue;
+        };
+        let inner = &mut user_message.user_input_message;
+        if !inner.content.trim().is_empty()
+            || !inner.images.is_empty()
+            || !inner.user_input_message_context.tool_results.is_empty()
+        {
+            continue;
+        }
+        inner.content = PLACEHOLDER.to_string();
+        backfilled += 1;
+    }
+    backfilled
 }
 
 /// 从历史消息中移除孤立的 tool_use
@@ -4326,8 +4380,12 @@ mod tests {
         );
     }
 
+    /// 同一个 tool_use id 出现两次且内容不同：保留首个，丢弃其余，请求照常发出。
+    ///
+    /// 早期实现在这里返回 400。客户端会带着同一份坏历史无限重试，会话永久卡死，
+    /// 所以改成有损修复 —— 详见 `tool_history::normalize_tool_history_ids`。
     #[test]
-    fn convert_request_rejects_duplicate_tool_use_id_locally() {
+    fn convert_request_repairs_duplicate_tool_use_id_locally() {
         use super::super::types::Message as AnthropicMessage;
 
         let req = tool_history_request(vec![
@@ -4352,15 +4410,23 @@ mod tests {
             },
         ]);
 
-        assert!(matches!(
-            convert_request(&req),
-            Err(ConversionError::InvalidToolHistory(reason))
-                if reason.contains("duplicate tool_use id")
-        ));
+        let converted = convert_request(&req).expect("duplicate id must not fail the turn");
+        let tool_uses = converted.conversation_state.history[1].clone();
+        let Message::Assistant(assistant) = tool_uses else {
+            panic!("expected assistant message");
+        };
+        let tool_uses = assistant
+            .assistant_response_message
+            .tool_uses
+            .expect("tool uses");
+        assert_eq!(tool_uses.len(), 1, "first occurrence wins");
+        assert_eq!(tool_uses[0].name, "first");
     }
 
+    /// 只有 tool_result、找不到 tool_use（OpenAI ↔ Anthropic 转换常见丢失）：
+    /// 丢掉孤立结果继续，而不是整轮拒绝。
     #[test]
-    fn convert_request_rejects_orphan_tool_result_locally() {
+    fn convert_request_drops_orphan_tool_result_locally() {
         use super::super::types::Message as AnthropicMessage;
 
         let req = tool_history_request(vec![AnthropicMessage {
@@ -4372,11 +4438,59 @@ mod tests {
             }]),
         }]);
 
-        assert!(matches!(
-            convert_request(&req),
-            Err(ConversionError::InvalidToolHistory(reason))
-                if reason.contains("unknown tool_use id")
-        ));
+        let converted = convert_request(&req).expect("orphan result must not fail the turn");
+        let current = &converted.conversation_state.current_message.user_input_message;
+        assert!(
+            current.user_input_message_context.tool_results.is_empty(),
+            "orphan result is dropped rather than forwarded to Kiro"
+        );
+        // 丢完就空了；Kiro 拒收空 user 消息，所以必须补上占位文本。
+        assert!(
+            !current.content.trim().is_empty(),
+            "dropping the only tool_result must not leave an empty current message"
+        );
+    }
+
+    /// 修好配对不能反过来换来一个空 user 消息 400：历史里只装孤立 tool_result 的那条
+    /// 消息被清空后要补占位文本。
+    #[test]
+    fn convert_request_backfills_history_user_message_emptied_by_repair() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = tool_history_request(vec![
+            AnthropicMessage {
+                role: "user".into(),
+                content: serde_json::json!([{
+                    "type": "tool_result",
+                    "tool_use_id": "call_lost_in_translation",
+                    "content": "orphan"
+                }]),
+            },
+            AnthropicMessage {
+                role: "assistant".into(),
+                content: serde_json::json!("ok"),
+            },
+            AnthropicMessage {
+                role: "user".into(),
+                content: serde_json::json!("继续"),
+            },
+        ]);
+
+        let converted = convert_request(&req).expect("orphan result must not fail the turn");
+        for message in &converted.conversation_state.history {
+            if let Message::User(user_message) = message {
+                assert!(
+                    !user_message.user_input_message.content.trim().is_empty()
+                        || !user_message.user_input_message.images.is_empty()
+                        || !user_message
+                            .user_input_message
+                            .user_input_message_context
+                            .tool_results
+                            .is_empty(),
+                    "no history user message may be left completely empty"
+                );
+            }
+        }
     }
 
     #[test]
