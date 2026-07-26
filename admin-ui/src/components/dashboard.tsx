@@ -1,9 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import {
   RefreshCw,
-  LogOut,
-  Moon,
-  Sun,
   Server,
   Plus,
   Upload,
@@ -15,8 +12,6 @@ import {
   LogIn,
   Key,
   Building2,
-  Settings,
-  UploadCloud,
   MoreHorizontal,
   Activity,
   ChevronLeft,
@@ -24,8 +19,6 @@ import {
   AlertTriangle,
   Eye,
   EyeOff,
-  Copy,
-  Wand2,
   Zap,
   Tags,
   ChevronDown,
@@ -35,33 +28,12 @@ import {
   X,
 } from "lucide-react";
 
-function GithubIcon({ className }: { className?: string }) {
-  return (
-    <svg
-      viewBox="0 0 24 24"
-      fill="currentColor"
-      className={className}
-      aria-hidden="true"
-    >
-      <path d="M12 .5C5.65.5.5 5.65.5 12.02c0 5.1 3.29 9.42 7.86 10.95.58.11.79-.25.79-.55 0-.27-.01-.99-.02-1.95-3.2.7-3.87-1.54-3.87-1.54-.52-1.32-1.27-1.67-1.27-1.67-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.18 1.76 1.18 1.02 1.76 2.69 1.25 3.34.95.1-.74.4-1.25.72-1.54-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.29 1.18-3.09-.12-.29-.51-1.46.11-3.05 0 0 .96-.31 3.16 1.18a10.95 10.95 0 0 1 5.75 0c2.2-1.49 3.16-1.18 3.16-1.18.62 1.59.23 2.76.12 3.05.74.8 1.18 1.83 1.18 3.09 0 4.42-2.69 5.39-5.26 5.68.41.36.78 1.06.78 2.14 0 1.55-.01 2.79-.01 3.17 0 .31.21.67.8.55A11.51 11.51 0 0 0 23.5 12.02C23.5 5.65 18.35.5 12 .5Z" />
-    </svg>
-  );
-}
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { storage, type CredentialView } from "@/lib/storage";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { Input } from "@/components/ui/input";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogFooter,
-  DialogDescription,
-} from "@/components/ui/dialog";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -71,6 +43,7 @@ import {
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import { CredentialCard } from "@/components/credential-card";
+import { DashboardStatsCards } from "@/components/dashboard-stats-cards";
 import { AddCredentialDialog } from "@/components/add-credential-dialog";
 import { BatchImportDialog } from "@/components/batch-import-dialog";
 import { BatchEditCredentialDialog } from "@/components/batch-edit-credential-dialog";
@@ -84,18 +57,14 @@ import {
 import { CredentialResponseTestDialog } from "@/components/credential-response-test-dialog";
 import { detectTier, type Tier } from "@/components/subscription-badge";
 import { ProxyPoolDialog } from "@/components/proxy-pool-dialog";
-import { ImageUpdateDialog } from "@/components/image-update-dialog";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import {
   useCredentials,
   useDeleteCredential,
   useResetFailure,
-  useLoadBalancingMode,
-  useSetLoadBalancingMode,
   useResetAllSuccessCount,
   useSetPriority,
 } from "@/hooks/use-credentials";
-import { useUpdateCheck } from "@/hooks/use-update-check";
 import { useFailureStats } from "@/hooks/use-traces";
 import { useGroupOptions } from "@/hooks/use-groups";
 import { useRectSelect } from "@/hooks/use-rect-select";
@@ -129,17 +98,11 @@ import {
   disableQuotaExceeded,
   enableOverageForAllCapable,
   exportKamCredentials,
-  updateAdminKey,
   type CredentialsExportResponse,
-  type LoadBalancingMode,
-  LB_LABEL,
-  nextLbMode,
 } from "@/api/credentials";
 import {
   extractErrorMessage,
   parseError,
-  generateApiKey,
-  formatNumber,
   overageFailureMessage,
 } from "@/lib/utils";
 import type { BalanceResponse } from "@/types/api";
@@ -169,7 +132,7 @@ const TIER_LABELS: Record<Tier, string> = {
 // 每页数量可选项；另有“全部”（pageSize = 0）由下拉单独追加
 const PAGE_SIZE_OPTIONS = [12, 24, 48, 96] as const;
 
-export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
+export function Dashboard({ onLogout }: DashboardProps) {
   const confirm = useConfirm();
   const [addDialogOpen, setAddDialogOpen] = useState(false);
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false);
@@ -186,11 +149,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     useState(false);
   const [socialLoginDialogOpen, setSocialLoginDialogOpen] = useState(false);
   const [proxyPoolDialogOpen, setProxyPoolDialogOpen] = useState(false);
-  const [imageUpdateDialogOpen, setImageUpdateDialogOpen] = useState(false);
-  const [adminKeyDialogOpen, setAdminKeyDialogOpen] = useState(false);
-  const [newAdminKey, setNewAdminKey] = useState("");
-  const [updatingAdminKey, setUpdatingAdminKey] = useState(false);
-  const [showAdminKeyPlain, setShowAdminKeyPlain] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false);
   const [verifying, setVerifying] = useState(false);
@@ -245,24 +203,12 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     storage.setCredentialPageSize(n);
     setCurrentPage(1);
   };
-  const [darkMode, setDarkMode] = useState(() => {
-    if (typeof window !== "undefined") {
-      return document.documentElement.classList.contains("dark");
-    }
-    return false;
-  });
-
   const queryClient = useQueryClient();
   const { data, isLoading, error, refetch } = useCredentials();
   const { mutate: deleteCredential } = useDeleteCredential();
   const { mutate: resetFailure } = useResetFailure();
-  const { data: loadBalancingData, isLoading: isLoadingMode } =
-    useLoadBalancingMode();
-  const { mutate: setLoadBalancingMode, isPending: isSettingMode } =
-    useSetLoadBalancingMode();
   const resetAllSuccess = useResetAllSuccessCount();
   const setPriority = useSetPriority();
-  const { data: updateCheck } = useUpdateCheck();
   const { data: failureStatsMap } = useFailureStats();
   const groupOptions = useGroupOptions();
   const selectedCredentials = (data?.credentials ?? []).filter((credential) =>
@@ -402,7 +348,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       });
   };
 
-  const gridRef = useRef<HTMLElement | null>(null);
+  const gridRef = useRef<HTMLDivElement | null>(null);
   const rectSelection = useRectSelect({
     containerRef: gridRef,
     itemSelector: "[data-credential-id]",
@@ -481,16 +427,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       return next.size === prev.size ? prev : next;
     });
   }, [data?.credentials]);
-
-  const toggleDarkMode = () => {
-    setDarkMode(!darkMode);
-    document.documentElement.classList.toggle("dark");
-  };
-
-  const handleRefresh = () => {
-    refetch();
-    toast.success("已刷新凭据列表");
-  };
 
   const handleLogout = () => {
     storage.removeApiKey();
@@ -1034,27 +970,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     null,
   );
 
-  const handleUpdateAdminKey = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const key = newAdminKey.trim();
-    if (!key) {
-      toast.error("新登录API密钥不能为空");
-      return;
-    }
-    setUpdatingAdminKey(true);
-    try {
-      await updateAdminKey({ newKey: key });
-      storage.setApiKey(key);
-      toast.success("登录API密钥已更新，已自动切换到新 Key");
-      setAdminKeyDialogOpen(false);
-      setNewAdminKey("");
-    } catch (error) {
-      toast.error(`更新失败: ${extractErrorMessage(error)}`);
-    } finally {
-      setUpdatingAdminKey(false);
-    }
-  };
-
   const exportTimestamp = () =>
     new Date()
       .toISOString()
@@ -1133,15 +1048,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     }
   };
 
-  const handleToggleLoadBalancing = () => {
-    const cur = (loadBalancingData?.mode ?? "priority") as LoadBalancingMode;
-    const next = nextLbMode(cur);
-    setLoadBalancingMode(next, {
-      onSuccess: () => toast.success(`已切换到${LB_LABEL[next]}模式`),
-      onError: (err) => toast.error(`切换失败: ${extractErrorMessage(err)}`),
-    });
-  };
-
   if (isLoading) {
     return (
       <div className="min-h-screen flex items-center justify-center">
@@ -1175,120 +1081,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   }
 
   return (
-    <div className={embedded ? "" : "min-h-screen"}>
-      {/* 顶部毛玻璃导航条（仅独立模式渲染；嵌入模式由外层 App 提供顶栏） */}
-      {!embedded && (
-        <header className="sticky top-0 z-40 w-full glass">
-          <div className="mx-auto max-w-[1400px] flex h-16 items-center justify-between px-4 md:px-8">
-            <div className="flex items-center gap-2.5">
-              <img
-                src="/admin/kirors.png"
-                alt="Kiro"
-                className="h-10 w-10 object-contain"
-                draggable={false}
-              />
-              <span className="font-semibold tracking-tight">Kiro Admin</span>
-            </div>
-            <div className="flex items-center gap-1.5">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={handleToggleLoadBalancing}
-                disabled={isLoadingMode || isSettingMode}
-                title="切换负载均衡模式"
-              >
-                <Activity className="h-3.5 w-3.5" />
-                {isLoadingMode
-                  ? "加载中…"
-                  : LB_LABEL[(loadBalancingData?.mode ?? "priority") as LoadBalancingMode]}
-              </Button>
-              <Button variant="ghost" size="icon" asChild title="GitHub 仓库">
-                <a
-                  href="https://github.com/ZyphrZero/kiro.rs"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  aria-label="GitHub 仓库"
-                >
-                  <GithubIcon className="h-4 w-4" />
-                </a>
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={toggleDarkMode}
-                title="切换主题"
-              >
-                {darkMode ? (
-                  <Sun className="h-4 w-4" />
-                ) : (
-                  <Moon className="h-4 w-4" />
-                )}
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={handleRefresh}
-                title="刷新"
-              >
-                <RefreshCw className="h-4 w-4" />
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={() => setImageUpdateDialogOpen(true)}
-                title={
-                  updateCheck?.hasUpdate
-                    ? `发现新版本 v${updateCheck.latestVersion}（当前 v${updateCheck.currentVersion}）`
-                    : "镜像在线更新"
-                }
-                className="relative"
-              >
-                <UploadCloud className="h-4 w-4" />
-                {updateCheck?.hasUpdate && (
-                  <span className="absolute right-1 top-1 inline-flex h-2 w-2 items-center justify-center">
-                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-red-400 opacity-75" />
-                    <span className="relative inline-flex h-2 w-2 rounded-full bg-red-500" />
-                  </span>
-                )}
-              </Button>
-              <DropdownMenu modal={false}>
-                <DropdownMenuTrigger asChild>
-                  <Button variant="ghost" size="icon" title="设置">
-                    <Settings className="h-4 w-4" />
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end">
-                  <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
-                  <DropdownMenuItem
-                    onSelect={() => {
-                      setNewAdminKey("");
-                      setShowAdminKeyPlain(false);
-                      setAdminKeyDialogOpen(true);
-                    }}
-                  >
-                    <Key />
-                    修改登录API密钥（管理面板登录）
-                  </DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={handleLogout}
-                title="退出登录"
-              >
-                <LogOut className="h-4 w-4" />
-              </Button>
-            </div>
-          </div>
-        </header>
-      )}
-
-      {/* 主内容 */}
-      <main
-        ref={gridRef}
-        className={embedded ? "" : "mx-auto max-w-[1400px] px-4 md:px-8 py-8"}
-      >
+    <>
+      {/* 这里不能再用 <main>：App 已经渲染了 <main id="main-content">，
+          嵌套两个 main 地标会让读屏的「跳到主要内容」出现两个候选。 */}
+      <div ref={gridRef}>
         {/* 大标题 */}
         <div className="mb-5 flex items-end justify-between gap-4 sm:mb-6">
           <div>
@@ -1301,42 +1097,11 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           </div>
         </div>
 
-        {/* 统计卡片 */}
-        <div className="mb-5 grid grid-cols-3 gap-2 sm:mb-6 sm:gap-4">
-          <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
-            <CardContent className="p-3 sm:p-5">
-              <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">
-                凭据总数
-              </div>
-              <div className="mt-1.5 text-2xl font-semibold tracking-tight tabular-nums sm:mt-2 sm:text-3xl">
-                {formatNumber(data?.total)}
-              </div>
-            </CardContent>
-          </Card>
-          <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
-            <CardContent className="p-3 sm:p-5">
-              <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">
-                可用凭据
-              </div>
-              <div className="mt-1.5 text-2xl font-semibold tracking-tight tabular-nums text-emerald-600 dark:text-emerald-400 sm:mt-2 sm:text-3xl">
-                {formatNumber(data?.available)}
-              </div>
-            </CardContent>
-          </Card>
-          <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
-            <CardContent className="p-3 sm:p-5">
-              <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">
-                当前活跃
-              </div>
-              <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-1.5 sm:mt-2 sm:gap-2">
-                <span className="truncate text-2xl font-semibold tracking-tight tabular-nums sm:text-3xl">
-                  #{data?.currentId || "-"}
-                </span>
-                {data?.currentId && <Badge variant="success">活跃</Badge>}
-              </div>
-            </CardContent>
-          </Card>
-        </div>
+        <DashboardStatsCards
+          available={data?.available}
+          currentId={data?.currentId}
+          total={data?.total}
+        />
 
         {/* 工具栏 */}
         <div className="mb-5 flex flex-col gap-3">
@@ -1354,11 +1119,12 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 筛选：{groupFilter === "__none__" ? "未分组" : groupFilter}
                 <button
                   type="button"
-                  className="ml-1 text-muted-foreground hover:text-foreground"
+                  className="ml-1 rounded-full text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/45"
                   onClick={() => setGroupFilter("")}
                   title="清除筛选"
+                  aria-label="清除分组筛选"
                 >
-                  ×
+                  <X className="h-3 w-3" />
                 </button>
               </Badge>
             )}
@@ -1370,11 +1136,12 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   .join("、")}
                 <button
                   type="button"
-                  className="ml-1 text-muted-foreground hover:text-foreground"
+                  className="ml-1 rounded-full text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/45"
                   onClick={() => setTierFilter(new Set())}
                   title="清除分级筛选"
+                  aria-label="清除分级筛选"
                 >
-                  ×
+                  <X className="h-3 w-3" />
                 </button>
               </Badge>
             )}
@@ -1440,18 +1207,22 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               <div className="relative col-span-2 sm:col-span-1 sm:w-[200px]">
                 <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
                 <input
-                  type="text"
+                  type="search"
+                  aria-label="搜索凭据"
+                  autoComplete="off"
+                  spellCheck={false}
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="搜索来源渠道 / 备注 / 邮箱"
+                  placeholder="搜索来源渠道 / 备注 / 邮箱…"
                   className="h-8 w-full rounded-full border border-border bg-card/60 pl-5 pr-5 text-base backdrop-blur placeholder:text-muted-foreground/70 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring sm:text-sm"
                 />
                 {searchQuery && (
                   <button
                     type="button"
                     onClick={() => setSearchQuery("")}
-                    className="absolute right-2 top-1/2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                    className="absolute right-2 top-1/2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/45"
                     title="清除搜索"
+                    aria-label="清除搜索"
                   >
                     <X className="h-3.5 w-3.5" />
                   </button>
@@ -1464,6 +1235,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 <SelectTrigger
                   className="h-8 w-full rounded-full border-border bg-card/60 px-3 backdrop-blur sm:w-[140px]"
                   title="按分组筛选凭据"
+                  aria-label="按分组筛选凭据"
                 >
                   <SelectValue placeholder="全部分组" />
                 </SelectTrigger>
@@ -1792,12 +1564,14 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                         : `已开 ${overageStats.enabled} 个 / 未开 ${overageStats.disabledOff} 个 / 待确定 ${overageStats.unknown} 个`
                     }
                   >
+                    {/* 三元的两个分支原本颜色完全一样，只有 animate-pulse 有区别。
+                        顺便把 emerald-500 换成项目里 success 的既定取值
+                        （见 badge.tsx 的 success variant）——500 在浅色模式下
+                        对比度只有约 2.5:1，连图形元素的 3:1 门槛都不到。 */}
                     <Zap
-                      className={
-                        enablingOverage || refreshingOverage
-                          ? "animate-pulse text-emerald-500"
-                          : "text-emerald-500"
-                      }
+                      className={`text-emerald-600 dark:text-emerald-400 ${
+                        enablingOverage || refreshingOverage ? "animate-pulse" : ""
+                      }`}
                     />
                     {refreshingOverage
                       ? `刷新中… ${refreshingOverageProgress.current}/${refreshingOverageProgress.total}`
@@ -1913,6 +1687,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                     <SelectTrigger
                       className="h-8 w-[92px] rounded-full border-border bg-card/60 px-3 backdrop-blur"
                       title="设置每页显示数量"
+                      aria-label="设置每页显示数量"
                     >
                       <SelectValue />
                     </SelectTrigger>
@@ -1965,7 +1740,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
             )}
           </>
         )}
-      </main>
+      </div>
 
       {/* 弹窗们 */}
       <AddCredentialDialog
@@ -2011,117 +1786,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         open={proxyPoolDialogOpen}
         onOpenChange={setProxyPoolDialogOpen}
       />
-      <ImageUpdateDialog
-        open={imageUpdateDialogOpen}
-        onOpenChange={setImageUpdateDialogOpen}
-      />
-
-      {/* 修改登录API密钥对话框（adminApiKey —— 管理面板登录密钥） */}
-      <Dialog
-        open={adminKeyDialogOpen}
-        onOpenChange={(open) => {
-          if (!updatingAdminKey) setAdminKeyDialogOpen(open);
-        }}
-      >
-        <DialogContent className="sm:max-w-sm">
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
-              <Key className="h-4 w-4" />
-              修改登录API密钥
-            </DialogTitle>
-            <DialogDescription>
-              用于登录此管理面板。修改后将自动更新本地存储的 Key，无需重新登录。
-            </DialogDescription>
-          </DialogHeader>
-          <form onSubmit={handleUpdateAdminKey} className="space-y-4 py-2">
-            <div className="relative">
-              <Input
-                type={showAdminKeyPlain ? "text" : "password"}
-                placeholder="输入或生成新的登录API密钥"
-                value={newAdminKey}
-                onChange={(e) => setNewAdminKey(e.target.value)}
-                disabled={updatingAdminKey}
-                autoFocus
-                className="pr-20 font-mono text-[13px]"
-              />
-              <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-1.5">
-                <Button
-                  type="button"
-                  size="icon"
-                  variant="ghost"
-                  className="pointer-events-auto h-7 w-7"
-                  onClick={() => setShowAdminKeyPlain((v) => !v)}
-                  disabled={updatingAdminKey}
-                  title={showAdminKeyPlain ? "隐藏" : "显示"}
-                >
-                  {showAdminKeyPlain ? (
-                    <EyeOff className="h-3.5 w-3.5" />
-                  ) : (
-                    <Eye className="h-3.5 w-3.5" />
-                  )}
-                </Button>
-                <Button
-                  type="button"
-                  size="icon"
-                  variant="ghost"
-                  className="pointer-events-auto h-7 w-7"
-                  onClick={async () => {
-                    if (!newAdminKey.trim()) {
-                      toast.error("请先输入或生成 Key 再复制");
-                      return;
-                    }
-                    try {
-                      await navigator.clipboard.writeText(newAdminKey);
-                      toast.success("已复制到剪贴板");
-                    } catch {
-                      toast.error("复制失败，请手动选择文本");
-                    }
-                  }}
-                  disabled={updatingAdminKey}
-                  title="复制"
-                >
-                  <Copy className="h-3.5 w-3.5" />
-                </Button>
-              </div>
-            </div>
-            <div className="flex items-center justify-between gap-2">
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                onClick={() => {
-                  const key = generateApiKey("sk-admin-");
-                  setNewAdminKey(key);
-                  setShowAdminKeyPlain(true);
-                }}
-                disabled={updatingAdminKey}
-              >
-                <Wand2 className="h-3.5 w-3.5" />
-                生成随机 Key
-              </Button>
-              <p className="text-[11px] text-muted-foreground">
-                建议生成后立即复制保存，确认更新后即生效。
-              </p>
-            </div>
-            <DialogFooter>
-              <Button
-                type="button"
-                variant="outline"
-                onClick={() => setAdminKeyDialogOpen(false)}
-                disabled={updatingAdminKey}
-              >
-                取消
-              </Button>
-              <Button
-                type="submit"
-                disabled={updatingAdminKey || !newAdminKey.trim()}
-              >
-                {updatingAdminKey ? "更新中…" : "确认更新"}
-              </Button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
+      {/* 镜像在线更新与「修改登录API密钥」两个弹窗已移除：
+          它们的唯一入口是本文件此前那段独立模式顶栏，而该顶栏是死代码
+          （Dashboard 全项目只以 embedded 形式渲染一次）。同名功能由 App 顶栏的
+          TopbarTools 提供，那里有各自的 ImageUpdateDialog 与密钥表单。 */}
 
       {rectSelection.active && rectSelection.rect && (
         <div
@@ -2153,6 +1821,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         initialIds={responseTestIds}
         privacyMode={privacyMode}
       />
-    </div>
+    </>
   );
 }
