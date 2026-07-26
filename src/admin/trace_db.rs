@@ -449,28 +449,30 @@ impl TraceStore {
     ///
     /// 后台写入器已启动时只入队即返回；未启动（单测、以及启动早期）时退化为同步写，
     /// 保证「写完立刻能查到」的既有语义。
-    pub fn insert(&self, rec: &TraceRecord) {
+    pub fn insert(&self, rec: TraceRecord) {
         if !self.is_enabled() {
             return;
         }
-        let queued = {
+        // 取所有权而非借用：热路径因此不需要深拷贝 TraceRecord
+        //（它含多个 String 和一个 Vec<TraceAttempt>，每请求一次堆分配不划算）。
+        let returned = {
             let writer = self.writer.lock();
             match writer.as_ref() {
-                Some(tx) => match tx.try_send(rec.clone()) {
-                    Ok(()) => true,
+                Some(tx) => match tx.try_send(rec) {
+                    Ok(()) => None,
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                         // 关键：不等待。宁可丢一条可观测性数据，也不让请求为它排队。
                         self.dropped.fetch_add(1, Ordering::Relaxed);
-                        true
+                        None
                     }
                     // 写入器已退出（进程收尾），回退同步写避免静默丢数据。
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(rec)) => Some(rec),
                 },
-                None => false,
+                None => Some(rec),
             }
         };
-        if !queued {
-            self.insert_blocking(rec);
+        if let Some(rec) = returned {
+            self.insert_blocking(&rec);
         }
     }
 
@@ -1135,7 +1137,7 @@ mod tests {
 
         let held = store.conn.lock();
         // 若 insert 内部仍尝试 self.conn.lock()，此处会永久阻塞。
-        store.insert(&sample(TraceSample {
+        store.insert(sample(TraceSample {
             trace_id: "queued-1",
             status: outcome::SUCCESS,
             credential_id: 1,
@@ -1155,7 +1157,7 @@ mod tests {
         *store.writer.lock() = Some(tx);
 
         for _ in 0..64 {
-            store.insert(&sample(TraceSample {
+            store.insert(sample(TraceSample {
                 trace_id: "flood",
                 status: outcome::SUCCESS,
                 credential_id: 1,
@@ -1172,7 +1174,7 @@ mod tests {
     #[test]
     fn insert_and_query_roundtrip() {
         let store = mem_store();
-        store.insert(&sample(TraceSample {
+        store.insert(sample(TraceSample {
             trace_id: "t1",
             status: "success",
             credential_id: 5,
@@ -1222,14 +1224,14 @@ mod tests {
             .to_rfc3339();
         inside.key_id = 42;
         inside.credits = 0.75;
-        store.insert(&inside);
+        store.insert(inside.clone());
 
         let mut outside = inside.clone();
         outside.trace_id = "trace-outside".to_string();
         outside.ts = DateTime::<Utc>::from_timestamp(1_699_999_999, 0)
             .unwrap()
             .to_rfc3339();
-        store.insert(&outside);
+        store.insert(outside.clone());
 
         let rows = store
             .query_profit_traces(
@@ -1305,7 +1307,7 @@ mod tests {
             model: "claude-opus-4-8",
         });
         rec.snapshot_id = Some("snap-7".into());
-        store.insert(&rec);
+        store.insert(rec.clone());
         let out = store.query(&TraceQuery {
             limit: 10,
             ..Default::default()
@@ -1322,7 +1324,7 @@ mod tests {
             credential_id: 7,
             model: "claude-opus-4-8",
         });
-        store.insert(&rec);
+        store.insert(rec.clone());
         assert!(store.link_snapshot("trace-link", "snap-link"));
         assert!(store.link_snapshot("trace-link", "snap-link"));
         assert_eq!(
@@ -1340,7 +1342,7 @@ mod tests {
     fn disabled_skips_insert() {
         let store = mem_store();
         store.set_enabled(false);
-        store.insert(&sample(TraceSample {
+        store.insert(sample(TraceSample {
             trace_id: "t1",
             status: "success",
             credential_id: 5,
@@ -1353,7 +1355,7 @@ mod tests {
         assert_eq!(out.len(), 0, "trace 关闭时不应写入");
         // 重新开启后写入恢复
         store.set_enabled(true);
-        store.insert(&sample(TraceSample {
+        store.insert(sample(TraceSample {
             trace_id: "t2",
             status: "success",
             credential_id: 5,
@@ -1373,13 +1375,13 @@ mod tests {
     #[test]
     fn delete_for_credential_removes_failure_stats() {
         let store = mem_store();
-        store.insert(&sample(TraceSample {
+        store.insert(sample(TraceSample {
             trace_id: "old",
             status: "error",
             credential_id: 5,
             model: "m1",
         }));
-        store.insert(&sample(TraceSample {
+        store.insert(sample(TraceSample {
             trace_id: "keep",
             status: "error",
             credential_id: 6,
@@ -1407,19 +1409,19 @@ mod tests {
     #[test]
     fn filter_only_failed_and_status() {
         let store = mem_store();
-        store.insert(&sample(TraceSample {
+        store.insert(sample(TraceSample {
             trace_id: "ok",
             status: "success",
             credential_id: 5,
             model: "m1",
         }));
-        store.insert(&sample(TraceSample {
+        store.insert(sample(TraceSample {
             trace_id: "bad",
             status: "error",
             credential_id: 6,
             model: "m1",
         }));
-        store.insert(&sample(TraceSample {
+        store.insert(sample(TraceSample {
             trace_id: "cut",
             status: "interrupted",
             credential_id: 7,
@@ -1454,7 +1456,7 @@ mod tests {
     #[test]
     fn cleanup_removes_old() {
         let store = mem_store();
-        store.insert(&sample(TraceSample {
+        store.insert(sample(TraceSample {
             trace_id: "recent",
             status: "success",
             credential_id: 5,
@@ -1484,13 +1486,13 @@ mod tests {
     #[test]
     fn clear_all_removes_everything() {
         let store = mem_store();
-        store.insert(&sample(TraceSample {
+        store.insert(sample(TraceSample {
             trace_id: "a",
             status: "success",
             credential_id: 5,
             model: "m1",
         }));
-        store.insert(&sample(TraceSample {
+        store.insert(sample(TraceSample {
             trace_id: "b",
             status: "error",
             credential_id: 6,

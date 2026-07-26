@@ -423,7 +423,7 @@ impl RequestTracer {
             snapshot_id,
             attempts,
         };
-        store.insert(&rec);
+        store.insert(rec);
     }
 }
 
