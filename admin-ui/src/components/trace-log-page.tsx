@@ -313,18 +313,35 @@ function TokenCell({ rec }: { rec: TraceRecord }) {
 function TraceRow({ rec }: { rec: TraceRecord }) {
   const [open, setOpen] = useState(false)
   const errStyle = rec.errorType ? outcomeStyle(rec.errorType) : null
+  const detailId = `trace-detail-${rec.traceId}`
   return (
     <>
+      {/* 整行可点是鼠标用户的便利，但不能只有它：<tr onClick> 没有 tabindex、
+          不响应 Enter/Space、读屏也不会播报成可操作元素。真正的控件是第一格里的
+          展开按钮，行点击退化成纯粹的锦上添花。 */}
       <tr
         className="cursor-pointer whitespace-nowrap border-b border-border/40 hover:bg-accent/40"
         onClick={() => setOpen((v) => !v)}
       >
         <td className="py-2.5 pl-3 pr-2">
-          {open ? (
-            <ChevronDown className="h-4 w-4 text-muted-foreground" />
-          ) : (
-            <ChevronRight className="h-4 w-4 text-muted-foreground" />
-          )}
+          <button
+            type="button"
+            aria-expanded={open}
+            aria-controls={open ? detailId : undefined}
+            aria-label={`${open ? '收起' : '展开'} ${formatTime(rec.ts)} 的请求链路详情`}
+            className="inline-flex size-6 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/45"
+            onClick={(e) => {
+              // 行上也挂了同样的 onClick，不阻断冒泡会触发两次、等于没展开。
+              e.stopPropagation()
+              setOpen((v) => !v)
+            }}
+          >
+            {open ? (
+              <ChevronDown className="h-4 w-4" />
+            ) : (
+              <ChevronRight className="h-4 w-4" />
+            )}
+          </button>
         </td>
         <td className="py-2.5 pr-3 text-[13px] tabular-nums text-muted-foreground whitespace-nowrap">
           {formatTime(rec.ts)}
@@ -362,7 +379,7 @@ function TraceRow({ rec }: { rec: TraceRecord }) {
           {formatDuration(rec.durationMs)}
         </td>
       </tr>
-      {open && <ExpandedTraceRow rec={rec} />}
+      {open && <ExpandedTraceRow rec={rec} id={detailId} />}
     </>
   )
 }
@@ -377,9 +394,38 @@ function TraceCredentialCell({ rec }: { rec: TraceRecord }) {
   )
 }
 
-function ExpandedTraceRow({ rec }: { rec: TraceRecord }) {
+/**
+ * 加载骨架：保持与真实表格一致的行高和列宽比例，避免数据到达时整块跳动。
+ *
+ * 骨架条本身对读屏没有意义，用 aria-hidden 挡掉，再单独给一条 role=status 播报。
+ */
+function TraceTableSkeleton() {
+  const COLUMN_WIDTHS = ['w-28', 'w-40', 'w-20', 'w-16', 'w-24', 'w-20', 'w-14', 'w-16']
   return (
-    <tr className="border-b border-border/40 bg-secondary/20">
+    <div className="p-3">
+      <span className="sr-only" role="status" aria-live="polite">
+        正在加载请求日志…
+      </span>
+      <div aria-hidden="true" className="space-y-1">
+        {Array.from({ length: 8 }, (_, row) => (
+          <div key={row} className="flex items-center gap-3 px-1 py-2.5">
+            <div className="size-4 shrink-0 animate-pulse rounded bg-muted" />
+            {COLUMN_WIDTHS.map((width, col) => (
+              <div
+                key={col}
+                className={`h-3.5 animate-pulse rounded bg-muted ${width}`}
+              />
+            ))}
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function ExpandedTraceRow({ id, rec }: { id: string; rec: TraceRecord }) {
+  return (
+    <tr id={id} className="border-b border-border/40 bg-secondary/20">
       <td colSpan={12} className="px-3 py-3">
         <ExpandedDetail rec={rec} />
       </td>
@@ -432,10 +478,13 @@ function ExpandedDetail({ rec }: { rec: TraceRecord }) {
 
 /** 下拉筛选器 */
 function Select({
+  label,
   value,
   onChange,
   options,
 }: {
+  /** 无障碍名称。下拉只显示当前值、没有可见标签，缺了它读屏只会念「组合框」。 */
+  label: string
   value: string
   onChange: (v: string) => void
   options: { value: string; label: string }[]
@@ -447,7 +496,7 @@ function Select({
       value={value === '' ? SENTINEL : value}
       onValueChange={(v) => onChange(v === SENTINEL ? '' : v)}
     >
-      <UiSelectTrigger className="h-8 w-auto min-w-[120px]">
+      <UiSelectTrigger className="h-8 w-auto min-w-[120px]" aria-label={label}>
         <UiSelectValue />
       </UiSelectTrigger>
       <UiSelectContent>
@@ -772,17 +821,35 @@ export function TraceLogPage() {
           {total > 0 && <Badge variant="secondary">{total}</Badge>}
         </div>
         <div className="ml-auto flex flex-wrap items-center gap-2">
-          <Select value={keyId} onChange={resetTo(setKeyId)} options={keyOptions} />
-          <Select value={group} onChange={resetTo(setGroup)} options={groupSelectOptions} />
-          <Select value={status} onChange={resetTo(setStatus)} options={STATUS_OPTIONS} />
           <Select
+            label="按入口 Key 筛选"
+            value={keyId}
+            onChange={resetTo(setKeyId)}
+            options={keyOptions}
+          />
+          <Select
+            label="按账号分组筛选"
+            value={group}
+            onChange={resetTo(setGroup)}
+            options={groupSelectOptions}
+          />
+          <Select
+            label="按状态筛选"
+            value={status}
+            onChange={resetTo(setStatus)}
+            options={STATUS_OPTIONS}
+          />
+          <Select
+            label="按错误类型筛选"
             value={errorType}
             onChange={resetTo(setErrorType)}
             options={ERROR_TYPE_OPTIONS}
           />
+          {/* aria-pressed：这是个开关式按钮，选中态目前只靠 variant 换色表达 */}
           <Button
             size="sm"
             variant={onlyFailed ? 'default' : 'outline'}
+            aria-pressed={onlyFailed}
             onClick={() => {
               setOnlyFailed((v) => !v)
               setPage(0)
@@ -811,7 +878,7 @@ export function TraceLogPage() {
       <Card>
         <CardContent className="p-0">
           {isLoading ? (
-            <div className="p-6 text-sm text-muted-foreground">加载中…</div>
+            <TraceTableSkeleton />
           ) : records.length === 0 ? (
             <div className="p-6 text-sm text-muted-foreground">
               暂无记录。发起几次 /v1/messages 请求后即可看到链路。
@@ -819,20 +886,26 @@ export function TraceLogPage() {
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full min-w-[1080px] text-left">
+                <caption className="sr-only">
+                  请求链路日志：每行一次请求，展开可查看逐跳尝试详情
+                </caption>
+                {/* sticky 表头：这张表通常要往下翻几十行，列名滚出视野后每一列就都认不出了 */}
                 <thead>
-                  <tr className="whitespace-nowrap border-b border-border/60 text-[12px] uppercase tracking-wider text-muted-foreground">
-                    <th className="py-2 pl-3 pr-2 font-medium"></th>
-                    <th className="py-2 pr-3 font-medium">时间</th>
-                    <th className="py-2 pr-3 font-medium">模型</th>
-                    <th className="py-2 pr-3 font-medium">入口 Key</th>
-                    <th className="py-2 pr-3 font-medium">状态</th>
-                    <th className="py-2 pr-3 font-medium">最终凭据</th>
-                    <th className="py-2 pr-3 font-medium">Token</th>
-                    <th className="py-2 pr-3 font-medium">费用</th>
-                    <th className="py-2 pr-3 font-medium">首Token</th>
-                    <th className="py-2 pr-3 font-medium">错误类型</th>
-                    <th className="py-2 pr-3 font-medium">重试</th>
-                    <th className="py-2 pr-3 font-medium">耗时</th>
+                  <tr className="sticky top-0 z-10 whitespace-nowrap border-b border-border/60 bg-card text-[12px] uppercase tracking-wider text-muted-foreground">
+                    <th scope="col" className="py-2 pl-3 pr-2 font-medium">
+                      <span className="sr-only">展开详情</span>
+                    </th>
+                    <th scope="col" className="py-2 pr-3 font-medium">时间</th>
+                    <th scope="col" className="py-2 pr-3 font-medium">模型</th>
+                    <th scope="col" className="py-2 pr-3 font-medium">入口 Key</th>
+                    <th scope="col" className="py-2 pr-3 font-medium">状态</th>
+                    <th scope="col" className="py-2 pr-3 font-medium">最终凭据</th>
+                    <th scope="col" className="py-2 pr-3 font-medium">Token</th>
+                    <th scope="col" className="py-2 pr-3 font-medium">费用</th>
+                    <th scope="col" className="py-2 pr-3 font-medium">首 Token</th>
+                    <th scope="col" className="py-2 pr-3 font-medium">错误类型</th>
+                    <th scope="col" className="py-2 pr-3 font-medium">重试</th>
+                    <th scope="col" className="py-2 pr-3 font-medium">耗时</th>
                   </tr>
                 </thead>
                 <tbody>

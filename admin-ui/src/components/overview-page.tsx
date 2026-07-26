@@ -62,8 +62,18 @@ function presetStartDate(range: StatsRange, endDate: string): string {
   return toDateInputValue(d)
 }
 
+/** 跟随浏览器区域设置，而不是写死 `YYYY/MM/DD`。 */
+const DATE_LABEL_FORMAT = new Intl.DateTimeFormat(undefined, {
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+})
+
 function formatDateText(value: string): string {
-  return value.replace(/-/g, '/')
+  // 补 T00:00:00 走本地时区解析；只给 'YYYY-MM-DD' 会被当成 UTC，
+  // 在负时区下会显示成前一天。
+  const parsed = new Date(`${value}T00:00:00`)
+  return Number.isNaN(parsed.getTime()) ? value : DATE_LABEL_FORMAT.format(parsed)
 }
 
 function timeLabel(filter: StatsTimeFilter): string {
@@ -304,7 +314,8 @@ function KeyFilterCard({
           <div className="flex flex-col gap-2 sm:flex-row">
             {/* 入口 Key 筛选 */}
             <Select value={keyFilter} onValueChange={onChange}>
-              <SelectTrigger className="h-8 w-full sm:w-[180px]">
+              {/* 下拉只有当前值没有可见标签，读屏会念成「组合框」，必须补 aria-label */}
+              <SelectTrigger className="h-8 w-full sm:w-[180px]" aria-label="按入口 Key 筛选">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent align="end">
@@ -318,7 +329,7 @@ function KeyFilterCard({
             </Select>
             {/* 账号分组筛选 */}
             <Select value={groupFilter} onValueChange={onGroupChange}>
-              <SelectTrigger className="h-8 w-full sm:w-[180px]">
+              <SelectTrigger className="h-8 w-full sm:w-[180px]" aria-label="按账号分组筛选">
                 <SelectValue placeholder="全部分组" />
               </SelectTrigger>
               <SelectContent align="end">
@@ -447,12 +458,19 @@ function PresetRangeButtons({
   onChange: (value: StatsRange) => void
 }) {
   return (
-    <div className="grid grid-cols-3 gap-1 rounded-md border border-border/60 p-0.5 lg:flex lg:items-center">
+    // role=group + aria-label：读屏读到单个「7 天」按钮时才知道它属于「时间区间」这一组；
+    // aria-pressed 传达当前选中项——只靠 variant 换色是「仅用颜色表达状态」。
+    <div
+      role="group"
+      aria-label="时间区间"
+      className="grid grid-cols-3 gap-1 rounded-md border border-border/60 p-0.5 lg:flex lg:items-center"
+    >
       {RANGES.map((r) => (
         <Button
           key={r.value}
           size="sm"
           variant={currentRange === r.value ? 'default' : 'ghost'}
+          aria-pressed={currentRange === r.value}
           className="h-8 rounded-md px-2 text-xs lg:h-7 lg:px-3"
           onClick={() => onChange(r.value)}
         >
@@ -472,7 +490,7 @@ function GranularitySelect({
 }) {
   return (
     <Select value={value} onValueChange={(v) => onChange(v as StatsGranularity)}>
-      <SelectTrigger className="h-8 w-full lg:w-[96px]">
+      <SelectTrigger className="h-8 w-full lg:w-[96px]" aria-label="统计粒度">
         <SelectValue />
       </SelectTrigger>
       <SelectContent align="end">
@@ -499,29 +517,56 @@ function DateRangeInputs({
   onStartDateChange: (value: string) => void
   startDate: string
 }) {
+  const invalid = Boolean(startDate && endDate && endDate < startDate)
   return (
-    <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-2 max-[374px]:grid-cols-1 lg:flex lg:items-center">
-      <DateInput value={startDate} onChange={onStartDateChange} />
-      <span className="text-center text-xs text-muted-foreground max-[374px]:hidden">至</span>
-      <DateInput value={endDate} onChange={onEndDateChange} />
+    <div
+      role="group"
+      aria-label="自定义时间范围"
+      className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-2 max-[374px]:grid-cols-1 lg:flex lg:items-center"
+    >
+      <DateInput label="开始日期" value={startDate} invalid={invalid} onChange={onStartDateChange} />
+      <span aria-hidden="true" className="text-center text-xs text-muted-foreground max-[374px]:hidden">
+        至
+      </span>
+      <DateInput label="结束日期" value={endDate} invalid={invalid} onChange={onEndDateChange} />
       <Button
         size="sm"
         className="col-span-3 h-8 px-3 text-xs max-[374px]:col-span-1 lg:col-span-1"
-        disabled={!startDate || !endDate || endDate < startDate}
+        disabled={!startDate || !endDate || invalid}
         onClick={onApply}
       >
         应用
       </Button>
+      {/* 「结束早于开始」原本只体现为按钮变灰，用户看不出为什么点不动。
+          role=alert 让读屏也能拿到这条提示。 */}
+      {invalid && (
+        <p role="alert" className="col-span-3 text-xs text-destructive max-[374px]:col-span-1">
+          结束日期不能早于开始日期
+        </p>
+      )}
     </div>
   )
 }
 
-function DateInput({ onChange, value }: { onChange: (value: string) => void; value: string }) {
+function DateInput({
+  invalid,
+  label,
+  onChange,
+  value,
+}: {
+  invalid?: boolean
+  label: string
+  onChange: (value: string) => void
+  value: string
+}) {
   return (
     <div className="relative min-w-0">
       <Calendar className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+      {/* 日期框只有一个日历图标，没有可见标签；aria-label 补上无障碍名称。 */}
       <Input
         type="date"
+        aria-label={label}
+        aria-invalid={invalid || undefined}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         className="h-8 min-w-0 w-full rounded-md pl-8 text-xs lg:w-[145px]"
@@ -580,20 +625,31 @@ function ModelPanel({
 
 function ModelTable({ data }: { data: ModelDistribution[] }) {
   return (
-    <div className="mt-3 max-h-32 overflow-auto text-[12px]">
+    // tabIndex=0 + role=region：这块是可滚动容器，键盘用户需要能 Tab 进来用方向键滚动，
+    // 否则超出 max-h-32 的行只有鼠标能看到。
+    <div
+      className="mt-3 max-h-32 overflow-auto overscroll-contain rounded-md text-[12px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+      tabIndex={0}
+      role="region"
+      aria-label="按模型分布明细"
+    >
       <table className="min-w-[420px] w-full">
-        <thead className="text-muted-foreground">
+        <caption className="sr-only">各模型的调用次数与输入 / 输出 Token</caption>
+        {/* sticky 表头：滚动时列名不消失，data-dense 表格的基本要求 */}
+        <thead className="sticky top-0 bg-card text-muted-foreground">
           <tr>
-            <th className="text-left font-medium pb-1">模型</th>
-            <th className="text-right font-medium">调用</th>
-            <th className="text-right font-medium">输入</th>
-            <th className="text-right font-medium">输出</th>
+            <th scope="col" className="text-left font-medium pb-1">模型</th>
+            <th scope="col" className="text-right font-medium">调用</th>
+            <th scope="col" className="text-right font-medium">输入</th>
+            <th scope="col" className="text-right font-medium">输出</th>
           </tr>
         </thead>
         <tbody>
           {data.map((m) => (
-            <tr key={m.model} className="border-t border-border/40">
-              <td className="py-1 truncate">{m.model}</td>
+            <tr key={m.model} className="border-t border-border/40 hover:bg-accent/40">
+              <th scope="row" className="max-w-[180px] truncate py-1 text-left font-normal">
+                {m.model}
+              </th>
               <td className="text-right tabular-nums">{formatNumber(m.calls)}</td>
               <td className="text-right tabular-nums">{formatNumber(m.inputTokens)}</td>
               <td className="text-right tabular-nums">{formatNumber(m.outputTokens)}</td>
@@ -637,7 +693,9 @@ function StatCard({
   extra?: React.ReactNode
 }) {
   return (
-    <Card className={cn('hover:shadow-apple-lg hover:-translate-y-0.5', className)}>
+    // 统计卡片不可点击，所以不做 hover 抬升——上浮 + 加重投影是「这里能点」的暗示，
+    // 用在纯展示卡片上会让人反复去点。只保留一点边框提亮作为指针反馈。
+    <Card className={cn('hover:border-border', className)}>
       <CardContent className="p-4 sm:p-5">
         <div className="flex min-h-[34px] items-start gap-2">
           <div className="mt-0.5 shrink-0 text-muted-foreground">{icon}</div>
