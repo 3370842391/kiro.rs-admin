@@ -1,7 +1,10 @@
 /** @type {import('tailwindcss').Config} */
 export default {
   darkMode: 'class',
-  content: ['./index.html', './src/**/*.{js,ts,jsx,tsx}'],
+  // 排除测试文件：契约测试里会出现被断言的类名字符串（例如断言「不得使用某个
+  // 过渡工具类」），而扫描器是纯正则、不区分是用到还是提到，会把它们当成用到并
+  // 生成对应 CSS。测试文件不参与打包，本来也不该影响样式产物。
+  content: ['./index.html', './src/**/*.{js,ts,jsx,tsx}', '!./src/**/*.test.{ts,tsx}'],
   theme: {
     extend: {
       fontFamily: {

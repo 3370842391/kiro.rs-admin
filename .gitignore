@@ -4,30 +4,43 @@
 /.worktrees/
 /CLAUDE.md
 /AGENTS.md
-/config.json
-/credentials.json
 /.idea
 /test.json
 /admin-ui/node_modules/
 /admin-ui/dist/
 /admin-ui/tsconfig.tsbuildinfo
-/credentials.*
-/kiro_balance_cache.json
-/kiro_stats.json
-# 中转层缓存计量落盘（运行时产物，不入库）
-/cache_metering.json
-/prompt_cache.json
-# 客户端 Key 分发（含明文 csk_*，绝对不能提交）
-/client_api_keys.json
-# 账号分组注册表（运行时产物，不入库）
-/groups.json
+
+# ───── 运行时数据文件：**不带行首斜杠**，任意目录下都要忽略 ─────
+#
+# 这些文件的落盘位置由进程的工作目录决定（config 缺省路径、cache_dir 默认 "."）。
+# 从哪个目录起服务就在哪里生成一套——比如在 admin-ui/ 下跑一次后端，就会多出
+# admin-ui/config.json、admin-ui/client_api_keys.json 等。
+#
+# 原先这些规则都写成 `/config.json` 这种形式，只匹配仓库根：admin-ui/ 下的同名
+# 副本完全不被忽略，一次 `git add -A` 就会把明文密钥提交进去（已发生过一次）。
+# 去掉行首斜杠后规则对任意深度生效。
+config.json
+credentials.json
+credentials.*
+client_api_keys.json
+groups.json
+model_mappings.json
+model_profiles.json
+kiro_balance_cache.json
+kiro_stats.json
+proxy_pool.json
+# 中转层缓存计量落盘
+cache_metering.json
+prompt_cache.json
 # 按天滚动的请求用量日志
-/usage_log.*.jsonl
-/usage_stats.json
-# 请求链路追踪 SQLite 库（运行时产物，含 WAL 边车文件）
-/traces.db
-/traces.db-shm
-/traces.db-wal
+usage_log.*.jsonl
+usage_stats.json
+
+# SQLite 库与它们的 WAL 边车文件。此前只列了 traces.db，
+# error_snapshots / key_supplier / wholesale 三个库压根没有规则。
+*.db
+*.db-shm
+*.db-wal
 # 在线更新产生的暂存二进制和备份
 *.staged-*
 *.backup
@@ -40,8 +53,6 @@ demo/
 
 # oh-my-claudecode 运行时状态（不提交）
 .omc/
-# 模型映射运行时产物（无隐私但不入库，由管理面板生成）
-/model_mappings.json
 # 内部任务分析文档（含生产服务器 IP 等私密信息，不公开）
 /docs/
 /batch-login-*.jsonl
