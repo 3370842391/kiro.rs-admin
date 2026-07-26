@@ -741,10 +741,23 @@ impl KiroProvider {
             "实际发送请求体元数据"
         );
 
-        // 复用连接池的热 TLS 连接：从中转到 us-east-1 的 TLS 握手 1-3s，每请求
-        // Connection:close 等于废掉 client_for_proxy 的连接池，把整个握手 RTT 计入
-        // 首字节。改为 keep-alive 后同代理连接复用，是最大的 TFB 收益。空闲连接
-        // 竞态（发请求瞬间上游关闭）由 call_api_with_retry 的网络错误重试兜底。
+        // `Connection: close`：每个请求用完即断，与上游 ZyphrZero/kiro.rs 保持一致。
+        //
+        // 曾经改用 keep-alive + 连接池省握手（v0.7.0），理由写的是「到美国上游握手
+        // 1-3s，是首字延迟主要来源」。但连接可复用后 hyper 会与上游协商 HTTP/2，
+        // 把所有请求多路复用到**一条** TCP 连接上；并发流一旦超过服务端
+        // SETTINGS_MAX_CONCURRENT_STREAMS，多出来的请求就在客户端静默排队——
+        // 不报错、不返回 429、纯粹干等。
+        //
+        // 线上实测（2026-07-26）：320 个并发入站请求对应上游仅 1 条连接，延迟双峰
+        // （抢到流槽 1.5s / 没抢到 50s+），且加账号完全无效（同 host 共用一条连接）。
+        //
+        // 而那个「1-3s 握手」的前提也是错的：实测到 q.us-east-1.amazonaws.com 的
+        // TCP+TLS 握手只有约 141ms（TCP 66ms + TLS 75ms）。为省 141ms 去换 h2
+        // 多路复用的排队风险并不划算。
+        //
+        // 因此回到最保守的一请求一连接：固定多付约 141ms 首字节，换掉整类队头阻塞
+        // 与陈旧连接复用风险。
         let client = self.client_for_proxy(proxy.clone()).map_err(|error| {
             if let Some(sink) = sink {
                 sink.on_diagnostic(TraceDiagnosticEvent::NetworkError {
@@ -760,7 +773,7 @@ impl KiroProvider {
             .post(&url)
             .body(body)
             .header("content-type", endpoint.content_type())
-            .header("Connection", "keep-alive");
+            .header("Connection", "close");
         let request = endpoint.decorate_api(base, &rctx);
 
         // 打印实际发送的请求头（RUST_LOG=debug 时输出，便于排查问题）
@@ -925,7 +938,7 @@ impl KiroProvider {
                 .post(&url)
                 .body(body.clone())
                 .header("content-type", endpoint.content_type())
-                .header("Connection", "keep-alive");
+                .header("Connection", "close");
             let request = endpoint.decorate_mcp(base, &rctx);
             let header_timeout_secs = self.stream_idle_timeout_secs();
             let header_timeout =
