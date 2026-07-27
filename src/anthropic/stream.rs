@@ -161,10 +161,18 @@ fn find_char_boundary(s: &str, target: usize) -> usize {
 /// - 反引号 (`)：行内代码
 /// - 双引号 (")：字符串
 /// - 单引号 (')：字符串
-const QUOTE_CHARS: &[u8] = &[
-    b'`', b'"', b'\'', b'\\', b'#', b'!', b'@', b'$', b'%', b'^', b'&', b'*', b'(', b')', b'-',
-    b'_', b'=', b'+', b'[', b']', b'{', b'}', b';', b':', b'<', b'>', b',', b'.', b'?', b'/',
-];
+/// 只包含**真正表示引用**的字符。
+///
+/// 原表把 `.` `,` `;` `:` `-` `)` `/` `>` 等常见标点也算作引用字符，于是模型写完一句话
+/// 紧接着开标签（`done.<thinking>`、`note:<thinking>`）时，前一个字符命中标点就被判成
+/// 「模型在讨论这个标签」而整段跳过——开标签漏检，thinking 内容连同字面标签一起泄漏进
+/// 正文。实测 11 种常见形态里漏检 7 种：ASCII 的 `.` `:` `,` `;` `)` `-` 全中，标签**后面**
+/// 紧跟标点同样漏（`has_quote_after` 那道检查）。
+///
+/// Kiro-Go 的做法是裸 `strings.Index`、完全不做引用过滤（proxy/handler.go:1135），
+/// 保证真标签永不漏检。这里保留反引号/引号/反斜杠四个字符的判定，既留住「模型讨论标签」
+/// 的保护，又消除标点造成的大面积漏检——为防一个罕见误判而引入高频漏检，取舍是反的。
+const QUOTE_CHARS: &[u8] = &[b'`', b'"', b'\'', b'\\'];
 
 /// 检查指定位置的字符是否是引用字符
 fn is_quote_char(buffer: &str, pos: usize) -> bool {
@@ -663,7 +671,19 @@ const STRAY_INVOKE_TOKENS: &[&str] = &["call", "count", "card"];
 /// 取值权衡：正常工具调用前最多出现 1 个引导词行（偶有 2~3），绝不会连续几十次。
 /// 设为 16 可在客户端出现大面积刷屏前止血；比较保留行首缩进，避免把正常嵌套代码
 /// 中不同层级的闭合括号误判为同一行。
-const REPEAT_GUARD_TRIP_THRESHOLD: u32 = 16;
+/// 正文通道阈值。
+///
+/// 从 16 提到 40：此前连续行检测被上游分片打败（分片切在行中间，比较的是
+/// `"CHECK NE"` / `"XT ITEM"` 这类碎片，计数永不累积），正文通道的熔断**实际上从未
+/// 生效过**——线上实测 20 次连续相同行原样放行、无任何告警。修好行重组后它才第一次
+/// 真正开始工作，因此阈值要按「首次启用」重新取。
+///
+/// Kiro-Go 在这件事上有直接教训：他们做过内容级去重，把 `6666666666` 吃成 `666`、
+/// `abababab` 吃成 `abab`、`1833` 吃成 `183`，之后整个删掉并留下注释警告不要重新引入
+/// （proxy/kiro.go:608）。按完整行比较比他们删掉的分片级去重安全得多，但同一个风险仍在：
+/// 猜错就静默吃掉真实输出。16 行相同在合法输出里是可能的（日志转储、重复的测试输出），
+/// 40 行几乎不可能，而离「客户端大面积刷屏」仍有充足余量。
+const REPEAT_GUARD_TRIP_THRESHOLD: u32 = 40;
 /// Thinking 通道的连续复读阈值。
 ///
 /// 原值 4 太激进：正常推理里连续出现 4 个相同短行完全可能（分点枚举、重复的过渡词、
@@ -1906,6 +1926,14 @@ pub struct StreamContext {
     repeat_guard_last_channel: &'static str,
     /// 复读熔断：最近一次候选。只去掉行尾空白，保留行首缩进参与比较。
     repeat_guard_last_line: String,
+    /// 复读熔断：跨 chunk 的行重组缓冲。
+    ///
+    /// 上游分片不按行边界切（实测形态：`"NEXT ITEM."` → `"\nCHECK NE"` → `"XT ITEM"`），
+    /// 直接比较 `split_inclusive('\n')` 的产物等于在比较碎片，每次都不同，连续计数永不
+    /// 累积——正文通道的熔断因此从未生效。这里先攒够一整行再比较。
+    repeat_guard_partial: String,
+    /// 行重组缓冲是否已超过单行上限（超长行不参与比较，避免无界增长）。
+    repeat_guard_partial_oversized: bool,
     /// 复读熔断：当前尾行已连续重复的次数。
     repeat_guard_run: u32,
     /// 多行周期复读检测；只保存少量完整短行，不保存整段响应。
@@ -2121,6 +2149,8 @@ impl StreamContext {
         self.invoke_sniff_buffer.clear();
         self.repeat_guard_last_channel = "";
         self.repeat_guard_last_line.clear();
+        self.repeat_guard_partial.clear();
+        self.repeat_guard_partial_oversized = false;
         self.repeat_guard_run = 0;
         self.repeat_guard_periodic = PeriodicRepeatGuard::default();
         self.repeat_guard_tripped = false;
@@ -2207,6 +2237,8 @@ impl StreamContext {
             credits: 0.0,
             repeat_guard_last_channel: "",
             repeat_guard_last_line: String::new(),
+            repeat_guard_partial: String::new(),
+            repeat_guard_partial_oversized: false,
             repeat_guard_run: 0,
             repeat_guard_periodic: PeriodicRepeatGuard::default(),
             repeat_guard_tripped: false,
@@ -2811,7 +2843,61 @@ impl StreamContext {
         let mut kept = String::new();
         // 用 split_inclusive 保留换行符，确保放行的正常文本不丢字节。
         for segment in text.split_inclusive('\n') {
-            let line = segment.trim_end_matches(|ch: char| matches!(ch, '\r' | '\n' | ' ' | '\t'));
+            // 跨 chunk 重组成完整行再比较：上游分片不按行边界切，直接比较碎片会让连续
+            // 计数永不累积（正文通道的熔断此前因此从未生效）。
+            let complete = segment.ends_with('\n');
+            // 只剥换行符，**不能**剥空格/制表符：分片可能正好切在行内空格处
+            //（`"line 0 "` + `"distinct..."`），提前剥掉会把行内空格吃掉，重组出
+            // `"line 0distinct..."` 这种与原文不符的比较对象。行尾空白统一在行完整后
+            // 由下面的 trim_end 处理。
+            let body = segment.strip_suffix('\n').unwrap_or(segment);
+            let body = body.strip_suffix('\r').unwrap_or(body);
+            if !self.repeat_guard_partial_oversized {
+                if self.repeat_guard_partial.len().saturating_add(body.len())
+                    <= REPEAT_GUARD_MAX_UNIT_BYTES
+                {
+                    self.repeat_guard_partial.push_str(body);
+                } else {
+                    // 超长行不参与比较：既避免缓冲无界增长，也不会把长正文误判成复读。
+                    self.repeat_guard_partial.clear();
+                    self.repeat_guard_partial_oversized = true;
+                    self.repeat_guard_last_line.clear();
+                    self.repeat_guard_run = 0;
+                }
+            }
+            if !complete {
+                // 行还没结束，本片原样放行，等下一个 chunk 续上。
+                //
+                // 周期检测器必须在这里也喂一次：它有自己的 partial_line 重组，需要收到
+                // **每一个**分片。早退跳过 observe_segment 会把它饿死——只收到零星的完整
+                // 片段，拼成乱码行，乱码行凑巧形成周期而误判（实测 period=6 cycles=4）。
+                if let Some(cycle) = self.repeat_guard_periodic.observe_segment(segment, channel) {
+                    if channel == "thinking" {
+                        self.thinking_repeat_tripped = true;
+                    } else {
+                        self.repeat_guard_tripped = true;
+                    }
+                    tracing::warn!(
+                        message_id = %self.message_id,
+                        channel = %channel,
+                        period_lines = cycle.period,
+                        cycle_count = cycle.cycles,
+                        thinking_only = channel == "thinking",
+                        "upstream periodic repetition guard tripped"
+                    );
+                    return kept;
+                }
+                kept.push_str(segment);
+                continue;
+            }
+            let line_owned = if self.repeat_guard_partial_oversized {
+                self.repeat_guard_partial.clear();
+                self.repeat_guard_partial_oversized = false;
+                String::new()
+            } else {
+                std::mem::take(&mut self.repeat_guard_partial)
+            };
+            let line: &str = line_owned.trim_end();
             if line.is_empty() {
                 kept.push_str(segment);
                 continue;
@@ -5795,6 +5881,148 @@ mod tests {
     }
 
     #[test]
+    fn repeat_guard_trips_when_upstream_fragments_mid_line() {
+        // 回归（线上实测）：上游分片不按行边界切，实测形态
+        // `"NEXT ITEM."` → `"\nCHECK NE"` → `"XT ITEM"` → `".\n\nDONE OK"`。
+        // 旧实现直接比较 split_inclusive('\n') 的产物，等于在比较碎片，每次都不同，
+        // 连续计数永不累积——正文通道的熔断因此从未生效：线上 20 次连续相同行原样放行、
+        // 无任何告警。既有测试全按「整行投喂」构造，所以一直绿着却漏掉了这个形态。
+        let line = "CHECK NEXT ITEM.\n";
+        let flood: String = line.repeat(120);
+
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        // 按 5 字节硬切，故意让每片都跨行边界。
+        let bytes = flood.as_bytes();
+        let mut events = Vec::new();
+        let mut start = 0usize;
+        while start < bytes.len() {
+            let mut end = (start + 5).min(bytes.len());
+            while end < bytes.len() && !flood.is_char_boundary(end) {
+                end += 1;
+            }
+            events.extend(ctx.process_assistant_response(&flood[start..end]));
+            start = end;
+        }
+        events.extend(ctx.generate_final_events());
+
+        assert!(
+            ctx.repetition_guard_tripped(),
+            "分片投喂下熔断必须仍然跳闸"
+        );
+        let text = collect_text_content(&events);
+        let passed = text.matches("CHECK NEXT ITEM.").count();
+        assert!(
+            passed <= REPEAT_GUARD_TRIP_THRESHOLD as usize,
+            "放行数不应超过阈值，实际 {passed}"
+        );
+        assert!(
+            passed < 120,
+            "复读必须被截断，实际放行 {passed} / 120"
+        );
+    }
+
+    #[test]
+    fn repeat_guard_does_not_trip_on_fragmented_distinct_lines() {
+        // 反向保护：分片重组不得把「不同的行」误并成同一行而误判。
+        // Kiro-Go 因为内容级去重吃掉真实输出而删掉了整个机制
+        //（把 6666666666 吃成 666、1833 吃成 183，见 proxy/kiro.go:608），
+        // 这里确保按完整行比较不会重现那类误伤。
+        let mut body = String::new();
+        for i in 0..120 {
+            body.push_str(&format!("line {i} distinct content here\n"));
+        }
+
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let bytes = body.as_bytes();
+        let mut events = Vec::new();
+        let mut start = 0usize;
+        while start < bytes.len() {
+            let mut end = (start + 7).min(bytes.len());
+            while end < bytes.len() && !body.is_char_boundary(end) {
+                end += 1;
+            }
+            events.extend(ctx.process_assistant_response(&body[start..end]));
+            start = end;
+        }
+
+        assert!(
+            !ctx.repetition_guard_tripped(),
+            "不同内容的行不得触发熔断"
+        );
+        let text = collect_text_content(&events);
+        assert!(
+            text.contains("line 0 distinct") && text.contains("line 119 distinct"),
+            "所有正常行必须完整放行，不得丢字节"
+        );
+    }
+
+    #[test]
+    fn punctuation_before_open_tag_does_not_hide_it() {
+        // 回归：原 QUOTE_CHARS 含 `.` `,` `;` `:` `-` `)` `/` `>` 等标点，模型写完一句话
+        // 紧接着开标签时前一个字符命中标点，整段被跳过——开标签漏检，thinking 连同字面
+        // 标签一起泄漏进正文。实测 11 种形态漏检 7 种。
+        for input in [
+            "done.<thinking>reasoning",
+            "note:<thinking>reasoning",
+            "ok,<thinking>reasoning",
+            "ok;<thinking>reasoning",
+            "(x)<thinking>reasoning",
+            "a-<thinking>reasoning",
+            "path/<thinking>reasoning",
+            "quoted>%<thinking>reasoning",
+            "回答你后面几个问题。<thinking>autoflow",
+            "answer\n<thinking>reasoning",
+            "answer <thinking>reasoning",
+        ] {
+            assert!(
+                find_real_thinking_start_tag(input).is_some(),
+                "开标签必须被识别: {input:?}"
+            );
+        }
+
+        // 标签**后面**紧跟标点也不得漏检（原 has_quote_after 的锅）。
+        assert!(find_real_thinking_start_tag("answer\n<thinking>. reasoning").is_some());
+        assert!(find_real_thinking_start_tag("answer\n<thinking>- item").is_some());
+
+        // 真正的引用仍须跳过：模型在讨论这个标签。
+        for input in [
+            "talk about `<thinking>` tag",
+            "the \"<thinking>\" marker",
+            "it is '<thinking>' here",
+        ] {
+            assert!(
+                find_real_thinking_start_tag(input).is_none(),
+                "被引用包裹的标签不得当成开标签: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn punctuation_around_close_tag_does_not_hide_it() {
+        // 闭标签用同一张表，同样受影响。
+        assert!(find_real_thinking_end_tag("reasoning.</thinking>\n\nanswer").is_some());
+        assert!(find_real_thinking_end_tag("reasoning:</thinking>\n\nanswer").is_some());
+        assert!(find_real_thinking_end_tag("reasoning)</thinking>\n\nanswer").is_some());
+        // 引用形态仍跳过。
+        assert!(find_real_thinking_end_tag("about `</thinking>` tag\n\nmore").is_none());
+    }
+
+    #[test]
     fn thinking_source_locks_to_first_channel() {
         // 单元级：对齐 Kiro-Go 的 TestThinkingSourceReasoningFirst / TagFirst /
         // SameSourceRemainsAllowed 三个用例。
@@ -8288,8 +8516,9 @@ mod tests {
         events.extend(ctx.generate_final_events());
 
         let text = collect_text_content(&events);
+        // 相对阈值断言：跳闸后放行数不应超过阈值本身，调参时不必再改这里。
         assert!(
-            text.matches('}').count() < 32,
+            text.matches('}').count() <= REPEAT_GUARD_TRIP_THRESHOLD as usize,
             "generic flood was not stopped: {text:?}"
         );
         assert!(ctx.repetition_guard_tripped());
