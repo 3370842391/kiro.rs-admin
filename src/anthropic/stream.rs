@@ -228,13 +228,17 @@ fn find_real_thinking_end_tag(buffer: &str) -> Option<usize> {
             return None;
         }
 
-        // 真正的 thinking 结束标签后面会有双换行符 `\n\n`
-        if after_content.starts_with("\n\n") {
-            return Some(absolute_pos);
-        }
-
-        // 不是双换行符，跳过继续搜索
-        search_start = absolute_pos + 1;
+        // 只要不被引号包裹就认。
+        //
+        // 原先额外要求后面紧跟 `\n\n`，于是 `</thinking>\nDone.`、`</thinking>Done.`、
+        // `</thinking> Done.` 三种形态全部漏检——闭标签字面泄漏进 thinking 内容，块也
+        // 不能及时闭合（线上实测:thinking 内容里出现独立的一行 `</thinking>`）。
+        //
+        // Kiro-Go 在块内直接用裸 `strings.Index` 找第一个闭标签、零后缀要求
+        //（proxy/handler.go:1159）。这里保留引号判定（模型在讨论这个标签时不算闭合），
+        // 去掉后缀要求：为防一个罕见误判而引入高频漏检，取舍是反的。
+        let _ = after_content;
+        return Some(absolute_pos);
     }
 
     None
@@ -2611,9 +2615,18 @@ impl StreamContext {
                         }
                     }
 
-                    // 剥离 `</thinking>\n\n`（find_real_thinking_end_tag 已确认 \n\n 存在）
-                    self.thinking_buffer =
-                        self.thinking_buffer[end_pos + "</thinking>\n\n".len()..].to_string();
+                    // 剥离闭标签本身，再吃掉紧跟的换行（最多两个）。
+                    //
+                    // 不能再硬编码 `</thinking>\n\n` 的长度：闭标签检测已不要求后跟
+                    // `\n\n`，后面可能是 `\nDone.`、`Done.` 或 ` Done.`。按固定长度切会
+                    // 吃掉正文开头的字符。
+                    let mut after = end_pos + end_tag_skip_len(&self.thinking_buffer, end_pos);
+                    let mut eaten = 0;
+                    while eaten < 2 && self.thinking_buffer[after..].starts_with('\n') {
+                        after += 1;
+                        eaten += 1;
+                    }
+                    self.thinking_buffer = self.thinking_buffer[after..].to_string();
                 } else {
                     // 没有找到结束标签，发送当前缓冲区内容作为 thinking_delta。
                     // 保留末尾可能是部分 `</thinking>\n\n` 的内容：
@@ -5972,6 +5985,56 @@ mod tests {
     }
 
     #[test]
+    fn close_tag_followed_by_text_closes_block_and_keeps_text() {
+        // 线上实测形态：`Starting now.<thinking>\n...\n</thinking>\nDone.`
+        // 闭标签后只有单换行加正文。旧实现要求后跟 `\n\n`，于是闭标签字面泄漏进 thinking
+        // 内容（实测 thinking 里出现独立一行 `</thinking>`），块也不能及时闭合。
+        for (name, chunk, want_text) in [
+            ("单换行接正文", "Starting now.<thinking>\nreasoning\n</thinking>\nDone.", "Done."),
+            ("无换行接正文", "Starting now.<thinking>\nreasoning\n</thinking>Done.", "Done."),
+            ("空格接正文", "Starting now.<thinking>\nreasoning\n</thinking> Done.", " Done."),
+            ("双换行接正文", "Starting now.<thinking>\nreasoning\n</thinking>\n\nDone.", "Done."),
+        ] {
+            let mut ctx = StreamContext::new_with_thinking(
+                "test-model",
+                1,
+                true,
+                HashMap::new(),
+                test_known_tools(),
+            );
+            let _ = ctx.generate_initial_events();
+            let mut events = ctx.process_assistant_response(chunk);
+            events.extend(ctx.generate_final_events());
+
+            let thinking = collect_thinking_content(&events);
+            let text = collect_text_content(&events);
+
+            assert!(
+                thinking.contains("reasoning"),
+                "[{name}] 推理内容须进 thinking，实际 {thinking:?}"
+            );
+            assert!(
+                !thinking.contains("</thinking>"),
+                "[{name}] 闭标签不得泄漏进 thinking，实际 {thinking:?}"
+            );
+            assert!(
+                !text.contains("<thinking>") && !text.contains("</thinking>"),
+                "[{name}] 正文不得出现裸标签，实际 {text:?}"
+            );
+            assert!(
+                text.contains("Starting now."),
+                "[{name}] 开标签前的正文须保留，实际 {text:?}"
+            );
+            // 剥离长度按实际后缀计算，不得吃掉正文开头的字符。
+            assert!(
+                text.contains(want_text.trim_start()),
+                "[{name}] 闭标签后的正文须完整保留（期望含 {:?}），实际 {text:?}",
+                want_text.trim_start()
+            );
+        }
+    }
+
+    #[test]
     fn punctuation_before_open_tag_does_not_hide_it() {
         // 回归：原 QUOTE_CHARS 含 `.` `,` `;` `:` `-` `)` `/` `>` 等标点，模型写完一句话
         // 紧接着开标签时前一个字符命中标点，整段被跳过——开标签漏检，thinking 连同字面
@@ -6563,10 +6626,23 @@ mod tests {
             Some(9)
         );
 
-        // 没有双换行符的情况
+        // 流式守卫：标签后不足 2 字节时等下一个 chunk——要凑够上下文才能判断是否被引号
+        // 包裹。真正的流末尾由 find_real_thinking_end_tag_at_buffer_end 兜住。
         assert_eq!(find_real_thinking_end_tag("</thinking>"), None);
         assert_eq!(find_real_thinking_end_tag("</thinking>\n"), None);
-        assert_eq!(find_real_thinking_end_tag("</thinking> more"), None);
+
+        // 不再要求后跟 `\n\n`：单换行、无换行、空格接正文都必须识别为闭标签。
+        // 原先这三种全漏检，闭标签会字面泄漏进 thinking 内容且块不能及时闭合。
+        assert_eq!(find_real_thinking_end_tag("</thinking> more"), Some(0));
+        assert_eq!(find_real_thinking_end_tag("</thinking>\nDone."), Some(0));
+        assert_eq!(find_real_thinking_end_tag("</thinking>Done."), Some(0));
+        assert_eq!(
+            find_real_thinking_end_tag("reasoning</thinking>\nDone."),
+            Some(9)
+        );
+
+        // 被引号包裹仍不算闭合：模型在讨论这个标签。
+        assert_eq!(find_real_thinking_end_tag("about `</thinking>` tag"), None);
     }
 
     /// 复读退化回归：上游连吐多个 `</thinking>` 时，末尾整串都要被识别成结束标签，
