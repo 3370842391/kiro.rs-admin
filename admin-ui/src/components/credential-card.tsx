@@ -57,6 +57,7 @@ import {
   formatTokenState,
   formatCredentialLifespan,
 } from "@/lib/credential-metrics";
+import { formatCreditAmount } from "@/lib/credential-summary";
 import {
   concurrencyFillRatio,
   concurrencyHint,
@@ -110,13 +111,6 @@ function formatLastUsed(lastUsedAt: string | null): string {
   const h = Math.floor(m / 60);
   if (h < 24) return `${h} 小时前`;
   return `${Math.floor(h / 24)} 天前`;
-}
-
-function formatNumber(n: number): string {
-  return n.toLocaleString("zh-CN", {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  });
 }
 
 function formatResetDate(ts: number | null): string {
@@ -1004,14 +998,22 @@ export function CredentialCard({
                 }`}
               >
                 {balance.remaining < 0
-                  ? `-$${formatNumber(Math.abs(balance.remaining))}`
-                  : `$${formatNumber(balance.remaining)}`}
+                  ? `-${formatCreditAmount(Math.abs(balance.remaining))}`
+                  : formatCreditAmount(balance.remaining)}
               </span>
               <span className="text-muted-foreground">
                 {balance.usagePercentage.toFixed(0)}%
               </span>
             </div>
             <Progress value={balance.usagePercentage} className="mt-1 h-1.5" />
+            {/* 已消耗 / 总额度：上游 getUsageLimits 直接给了这两个值，
+                之前只显示剩余，看不出这个号到底用掉了多少。 */}
+            <div
+              className="mt-1 truncate text-[10px] tabular-nums text-muted-foreground"
+              title={`已消耗 ${formatCreditAmount(balance.currentUsage)} / 总额度 ${formatCreditAmount(balance.usageLimit)} 积分`}
+            >
+              已用 {formatCreditAmount(balance.currentUsage)} / {formatCreditAmount(balance.usageLimit)}
+            </div>
           </div>
         ) : (
           <div className="text-center text-[11px] text-muted-foreground">
@@ -1317,8 +1319,8 @@ export function CredentialCard({
                       }`}
                     >
                       {balance.remaining < 0
-                        ? `-$${formatNumber(Math.abs(balance.remaining))}`
-                        : `$${formatNumber(balance.remaining)}`}
+                        ? `-${formatCreditAmount(Math.abs(balance.remaining))}`
+                        : formatCreditAmount(balance.remaining)}
                     </div>
                   </div>
                   <div className="min-w-0 shrink-0 text-right">
@@ -1334,13 +1336,13 @@ export function CredentialCard({
                   <Progress value={balance.usagePercentage} />
                   <div className="grid grid-cols-3 gap-1 text-[11px] tabular-nums text-muted-foreground">
                     <span className="min-w-0 truncate">
-                      已用 ${formatNumber(balance.currentUsage)}
+                      已用 {formatCreditAmount(balance.currentUsage)}
                     </span>
                     <span className="text-center">
                       {balance.usagePercentage.toFixed(1)}%
                     </span>
                     <span className="min-w-0 truncate text-right">
-                      额度 ${formatNumber(balance.usageLimit)}
+                      额度 {formatCreditAmount(balance.usageLimit)} 积分
                     </span>
                   </div>
                 </div>

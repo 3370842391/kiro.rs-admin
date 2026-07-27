@@ -158,12 +158,18 @@ export function RpmStatusBar({
           detail="全池在飞"
           live
         />
-        {/* 可用积分与消耗速率相邻：余量 ÷ 速率 = 还能撑多久 */}
-        <Metric label="可用积分" value={creditDisplay.value} detail={creditDisplay.detail} />
+        {/* 可用积分与消耗速率相邻：余量 ÷ 速率 = 还能撑多久。
+            两者同为「积分」量纲，之前余量带 $ 而速率是裸数字，这个换算读起来不成立。 */}
+        <Metric
+          label="可用积分"
+          value={creditDisplay.value}
+          unit="积分"
+          detail={creditDisplay.detail}
+        />
         <Metric
           label="积分消耗"
           value={formatCredits(burnRate)}
-          unit="/分钟"
+          unit="积分/分"
           tone={burnRate > 0 ? 'warning' : 'neutral'}
           detail="最近 60 秒"
           live
