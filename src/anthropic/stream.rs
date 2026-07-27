@@ -436,10 +436,20 @@ fn open_tag_lt_pos(buffer: &str, name_pos: usize) -> Option<usize> {
     None
 }
 
-/// 查找未被引用字符包裹的 invoke 开标签，返回指向 `<` 的字节位置
+/// 查找 invoke 开标签，返回指向 `<` 的字节位置
 ///
 /// 兼容裸 `<invoke ...>` 与带命名空间前缀 `<prefix:invoke ...>` 两种写法。
-/// 复用 `is_quote_char`：若 `<` 前紧贴反引号/引号等包裹字符，视为引用，跳过。
+///
+/// **不做引用字符判定**。原先「`<` 前紧贴引号就跳过」是有害的：漏检一个真 invoke 意味着
+/// 工具永不执行、整块 XML 泄漏成正文（调用点在无法识别时直接把整段当文本，见
+/// `extract_invoke_content_blocks`），对话就此打断且无法恢复。
+///
+/// 误判方向反而是安全的：调用点后面有 5 道闸门——必须找到闭合 `</invoke>`、必须解析成功、
+/// 工具名必须在本次请求声明的工具表内（`known_tool_names`）、不能位于代码围栏内、
+/// 前文还要过 `invoke_looks_like_real_leak`。任一不过就安全退回当文本。模型「讨论」invoke
+/// 时几乎总在反引号或围栏里，正好被围栏那道拦住。
+///
+/// 判定该留在有兜底的那一侧，而不是放在没有兜底的入口。
 fn find_invoke_start(buffer: &str) -> Option<usize> {
     let mut search = 0;
     while let Some(rel) = buffer[search..].find("invoke") {
@@ -450,8 +460,7 @@ fn find_invoke_start(buffer: &str) -> Option<usize> {
             let next_ok = buffer.as_bytes().get(after).map_or(true, |c| {
                 c.is_ascii_whitespace() || *c == b'>' || *c == b'/'
             });
-            let has_quote_before = lt > 0 && is_quote_char(buffer, lt - 1);
-            if next_ok && !has_quote_before {
+            if next_ok {
                 return Some(lt);
             }
         }
@@ -484,9 +493,13 @@ fn find_next_invoke_open(buffer: &str, start: usize) -> Option<usize> {
         Some(rel) => start + rel + 1,
         None => return None,
     };
-    // 注意：不能复用 find_invoke_start——它对 `<` 前是 `>`（引用字符）的情况会拒绝，
-    // 而连发 burst 里 B 的 `<invoke` 恰好紧跟在 A 的 `</invoke>` 的 `>` 后面。
-    // 这里只认结构：`<invoke` 或 `<prefix:invoke`，开标签名后须是空白/`>`/`/` 边界。
+    // 只认结构：`<invoke` 或 `<prefix:invoke`，开标签名后须是空白/`>`/`/` 边界。
+    //
+    // 历史注记：这个函数当初是为绕开 find_invoke_start 的引用字符判定而写的——`>` 曾在
+    // QUOTE_CHARS 里，而连发 burst 里 B 的 `<invoke` 恰好紧跟在 A 的 `</invoke>` 的 `>`
+    // 后面，于是被判成「被引用」而漏检。那正是「入口加条件导致漏检」的又一例。
+    // 该判定已从 find_invoke_start 移除，两处逻辑现已一致；保留本函数是因为它还承担
+    // 「跳过当前块自身开标签」的语义，合并需要额外验证，暂不动。
     let region = &buffer[after_open..];
     let mut search = 0usize;
     while let Some(rel) = region[search..].find("invoke") {
@@ -5951,6 +5964,33 @@ mod tests {
             text.contains("line 0 distinct") && text.contains("line 119 distinct"),
             "所有正常行必须完整放行，不得丢字节"
         );
+    }
+
+    #[test]
+    fn invoke_start_is_found_regardless_of_preceding_char() {
+        // 漏检一个真 invoke 的后果远重于误判：工具永不执行、整块 XML 泄漏成正文，
+        // 对话打断且无法恢复。误判方向有 5 道下游闸门兜底（闭合标签/解析/工具表/围栏/
+        // 泄漏启发式），所以入口不再做引用字符判定。
+        for (name, input) in [
+            ("行首", "<invoke name=\"Read\">"),
+            ("紧跟反引号", "`<invoke name=\"Read\">"),
+            ("紧跟双引号", "\"<invoke name=\"Read\">"),
+            ("紧跟反斜杠", "\\<invoke name=\"Read\">"),
+            // 连发 burst：B 的开标签紧跟 A 的闭标签 `>`。这正是当初被引用判定漏掉、
+            // 逼出一个重复函数绕行的形态。
+            ("紧跟前一个闭标签", "</invoke><invoke name=\"Read\">"),
+            ("句中", "text <invoke name=\"Read\">"),
+            ("带命名空间前缀", "<invoke name=\"Read\">"),
+        ] {
+            assert!(
+                find_invoke_start(input).is_some(),
+                "[{name}] invoke 开标签必须被识别: {input:?}"
+            );
+        }
+
+        // 结构不成立的仍不认，避免误匹配 invoked / invoker 之类。
+        assert!(find_invoke_start("invoked the tool").is_none());
+        assert!(find_invoke_start("the invoker said").is_none());
     }
 
     #[test]
