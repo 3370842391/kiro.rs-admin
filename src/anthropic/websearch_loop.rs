@@ -299,6 +299,10 @@ async fn run_round(
                     "invalid_request_error",
                     format!("invalid tool choice: {}", reason),
                 ),
+                ConversionError::InvalidThinkingConfig(reason) => (
+                    "invalid_request_error",
+                    format!("invalid thinking config: {}", reason),
+                ),
                 ConversionError::InvalidImage { location, source } => (
                     "invalid_request_error",
                     format!("invalid image at {location}: {source}"),

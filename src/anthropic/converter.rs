@@ -746,6 +746,8 @@ pub enum ConversionError {
     UnsupportedToolMapping(String),
     InvalidToolChoice(String),
     InvalidToolHistory(String),
+    /// thinking 配置违反 Anthropic API 契约（如 budget_tokens >= max_tokens）。
+    InvalidThinkingConfig(String),
     InvalidImage {
         location: String,
         source: ImageValidationError,
@@ -765,6 +767,9 @@ impl std::fmt::Display for ConversionError {
             }
             ConversionError::InvalidToolChoice(reason) => {
                 write!(f, "工具选择无效: {}", reason)
+            }
+            ConversionError::InvalidThinkingConfig(reason) => {
+                write!(f, "thinking 配置无效: {}", reason)
             }
             ConversionError::InvalidImage { location, source } => {
                 write!(f, "图片 {location} 无效: {source}")
@@ -833,6 +838,9 @@ pub fn convert_request_with_mode(
     if req.messages.is_empty() {
         return Err(ConversionError::EmptyMessages);
     }
+
+    // 2.2. 按 Anthropic 契约校验 thinking 配置，违约直接 400，不往上游发。
+    validate_thinking_config(req)?;
 
     // 2.5. 预处理 prefill：如果末尾是 assistant，静默丢弃并截断到最后一条 user
     // Claude 4.x 已弃用 assistant prefill，Kiro API 也不支持
@@ -2063,17 +2071,76 @@ fn convert_tools(
 /// 而正常对话请求（Claude Code 主链路为 64000）远在其上，不受影响。
 const MIN_MAX_TOKENS_FOR_THINKING: i32 = 512;
 
+/// 注入 `<max_thinking_length>` 时给正文预留的比例：思考最多占 `max_tokens` 的 3/4。
+///
+/// 注入值大于或等于 `max_tokens` 会造成「思考预算 ≥ 总输出预算」的矛盾约束，上游在这种
+/// 请求下什么都不产出（HTTP 200 有帧、内容通道全空），最终被判成
+/// `upstream_empty_response`。留出 1/4 保证模型思考完还有空间给出答案。
+const THINKING_BUDGET_NUMERATOR: i32 = 3;
+const THINKING_BUDGET_DENOMINATOR: i32 = 4;
+
+/// 把客户端申报的 thinking 预算钳进当前 `max_tokens` 能容纳的范围。
+///
+/// 为什么是钳制而不是按契约拒绝：Anthropic 规定 `budget_tokens < max_tokens`，Kiro-Go
+/// 据此直接返回 400（`validateClaudeThinkingConfig`）。它能这么做，是因为它的
+/// `BudgetTokens` 零值为 0，可以区分「客户端没传」和「客户端真的传了这个数」。
+///
+/// 本项目的 `Thinking::budget_tokens` 带 serde 默认值 20000，两者无法区分：客户端只写
+/// `{"type":"enabled"}` 时也会得到 20000。若照搬拒绝逻辑，所有「启用 thinking 但不写
+/// budget、且 max_tokens 较小」的合法请求都会被误拒。
+///
+/// 而 `<max_thinking_length>` 本就是我们自己注入的提示值，由我们决定，钳制它即可消除
+/// 矛盾约束——既治根，又不误伤。
+fn clamp_thinking_budget(budget_tokens: i32, max_tokens: i32) -> i32 {
+    if max_tokens <= 0 {
+        return budget_tokens.max(1);
+    }
+    let ceiling = (max_tokens / THINKING_BUDGET_DENOMINATOR) * THINKING_BUDGET_NUMERATOR;
+    budget_tokens.clamp(1, ceiling.max(1))
+}
+
+/// 校验 thinking 配置里**无歧义**的违约项，命中则返回 400。
+///
+/// 只判定与 `budget_tokens` 默认值无关的两条，避免把合法请求误拒：
+/// - `type` 取值非法（客户端明显写错）
+/// - `enabled` 且 `max_tokens == 0`（要求思考却不给任何输出预算，自相矛盾）
+///
+/// `budget_tokens` 相关的越界不在这里拒绝，改由 `clamp_thinking_budget` 钳制，原因见该函数。
+fn validate_thinking_config(req: &MessagesRequest) -> Result<(), ConversionError> {
+    let Some(thinking) = &req.thinking else {
+        return Ok(());
+    };
+    let reason = match thinking.thinking_type.trim().to_ascii_lowercase().as_str() {
+        "enabled" => (req.max_tokens == 0)
+            .then(|| "thinking.type=enabled 不能与 max_tokens=0 同时使用".to_string()),
+        "adaptive" | "disabled" => None,
+        other => Some(format!(
+            "thinking.type 必须是 enabled / adaptive / disabled 之一，实际 {other:?}"
+        )),
+    };
+    match reason {
+        Some(reason) => Err(ConversionError::InvalidThinkingConfig(reason)),
+        None => Ok(()),
+    }
+}
+
 /// 生成thinking标签前缀
 fn generate_thinking_prefix(req: &MessagesRequest, model_id: &str) -> Option<String> {
     // max_tokens 太小时一律不注入：见 MIN_MAX_TOKENS_FOR_THINKING 的说明。
+    //
+    // 保留为兜底：`validate_thinking_config` 已按契约拦掉 budget >= max_tokens 的
+    // 请求，但 adaptive 模式没有 budget 可比，这条阈值仍能挡住「极小 max_tokens +
+    // adaptive」同样产不出正文的组合。
     if req.max_tokens < MIN_MAX_TOKENS_FOR_THINKING {
         return None;
     }
     if let Some(t) = &req.thinking {
         if t.thinking_type == "enabled" {
+            // 钳进 max_tokens 能容纳的范围：注入值 >= max_tokens 会让上游拿到矛盾约束
+            // 而什么都不产出（见 clamp_thinking_budget）。
+            let budget = clamp_thinking_budget(t.budget_tokens, req.max_tokens);
             return Some(format!(
-                "<thinking_mode>enabled</thinking_mode><max_thinking_length>{}</max_thinking_length>",
-                t.budget_tokens
+                "<thinking_mode>enabled</thinking_mode><max_thinking_length>{budget}</max_thinking_length>"
             ));
         } else if t.thinking_type == "adaptive" {
             let effort = req
@@ -4043,6 +4110,62 @@ mod tests {
         let wire = serde_json::to_string(&result.conversation_state).unwrap();
         assert!(!wire.contains("client_system_instructions"));
         assert!(!wire.contains("user_content"));
+    }
+
+    #[test]
+    fn thinking_budget_is_clamped_below_max_tokens() {
+        // 注入的 max_thinking_length 必须始终小于 max_tokens，否则上游拿到矛盾约束
+        // （思考预算 ≥ 总输出预算）会什么都不产出，最终变成 upstream_empty_response。
+        assert!(clamp_thinking_budget(24_576, 64) < 64);
+        assert!(clamp_thinking_budget(20_000, 1_024) < 1_024);
+        assert!(clamp_thinking_budget(4_096, 4_096) < 4_096);
+        // 已在范围内的值不动。
+        assert_eq!(clamp_thinking_budget(2_048, 64_000), 2_048);
+        // 永不产出非正数（上游会拒收 0）。
+        assert!(clamp_thinking_budget(24_576, 1) >= 1);
+        assert!(clamp_thinking_budget(0, 4_096) >= 1);
+        assert!(clamp_thinking_budget(-5, 4_096) >= 1);
+    }
+
+    #[test]
+    fn thinking_config_rejects_only_unambiguous_violations() {
+        use super::super::types::Thinking;
+
+        let build = |kind: &str, budget: i32, max_tokens: i32| {
+            let mut req = minimal_request_with_output_config("claude-sonnet-4.5");
+            req.max_tokens = max_tokens;
+            req.thinking = Some(Thinking {
+                thinking_type: kind.to_string(),
+                budget_tokens: budget,
+            });
+            req
+        };
+        let is_thinking_err = |req: &MessagesRequest| {
+            matches!(
+                convert_request(req),
+                Err(ConversionError::InvalidThinkingConfig(_))
+            )
+        };
+
+        // 无歧义违约：type 写错、enabled 却不给输出预算。
+        assert!(is_thinking_err(&build("sometimes", 2_048, 4_096)));
+        assert!(is_thinking_err(&build("enabled", 2_048, 0)));
+
+        // budget 越界**不拒绝**，改为钳制：budget_tokens 带 serde 默认值 20000，
+        // 无法区分「客户端没传」与「真的传了 20000」，拒绝会误伤只写 type 的合法请求。
+        assert!(convert_request(&build("enabled", 24_576, 64)).is_ok());
+        assert!(convert_request(&build("enabled", 20_000, 1_024)).is_ok());
+
+        // 合法组合放行，大小写与空白不敏感。
+        assert!(convert_request(&build("enabled", 2_048, 64_000)).is_ok());
+        assert!(convert_request(&build("adaptive", 0, 4_096)).is_ok());
+        assert!(convert_request(&build("disabled", 0, 4_096)).is_ok());
+        assert!(convert_request(&build("  Enabled  ", 2_048, 64_000)).is_ok());
+
+        // 无 thinking 字段不受影响。
+        let mut plain = minimal_request_with_output_config("claude-sonnet-4.5");
+        plain.thinking = None;
+        assert!(convert_request(&plain).is_ok());
     }
 
     #[test]

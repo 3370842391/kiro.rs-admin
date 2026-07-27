@@ -686,6 +686,43 @@ const REPEAT_GUARD_MIN_PERIODIC_CYCLES: usize = 4;
 /// 8 行周期乘 4 轮；固定上限避免按输出长度增长内存。
 const REPEAT_GUARD_PERIODIC_HISTORY: usize =
     REPEAT_GUARD_MAX_PERIOD * REPEAT_GUARD_MIN_PERIODIC_CYCLES;
+/// thinking 内容的来源通道。先到的通道独占本轮，另一条的内容一律丢弃，
+/// 避免上游同时下发原生 reasoning 事件和字面 `<thinking>` 标签时推理输出重复两遍。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ThinkingSource {
+    /// 尚未确定，两条通道都可争抢。
+    #[default]
+    Unknown,
+    /// 已锁定原生 `reasoningContentEvent`。
+    ReasoningEvent,
+    /// 已锁定正文里的字面 `<thinking>` 标签。
+    TagBlock,
+}
+
+impl ThinkingSource {
+    /// 原生 reasoning 事件是否可用。首次调用时锁定该通道。
+    fn allow_reasoning(&mut self) -> bool {
+        match self {
+            Self::TagBlock => false,
+            _ => {
+                *self = Self::ReasoningEvent;
+                true
+            }
+        }
+    }
+
+    /// 字面标签是否可用。首次调用时锁定该通道。
+    fn allow_tag(&mut self) -> bool {
+        match self {
+            Self::ReasoningEvent => false,
+            _ => {
+                *self = Self::TagBlock;
+                true
+            }
+        }
+    }
+}
+
 const LONG_THINKING_DEDUP_MIN_BYTES: usize = 256;
 const LONG_THINKING_DEDUP_MAX_BYTES: usize = 64 * 1024;
 const LONG_THINKING_DEDUP_HISTORY: usize = 4;
@@ -1920,6 +1957,18 @@ pub struct StreamContext {
     terminal_protocol_error_type: Option<&'static str>,
     /// 是否观察到真实 thinking 或 redacted_thinking 输出。
     saw_reasoning_output: bool,
+    /// thinking 内容的来源通道，先到者独占。
+    ///
+    /// 上游可能同时下发原生 `reasoningContentEvent` **和**正文里的字面 `<thinking>` 标签，
+    /// 两条路都会生成 thinking 块，客户端于是看到同一段推理出现两遍。互锁后只认先到的
+    /// 那条通道，另一条的内容直接丢弃。
+    ///
+    /// 三态设计来自 Kiro-Go 的 `thinkingStreamSource`（proxy/handler.go）。
+    thinking_source: ThinkingSource,
+    /// 当前字面 `<thinking>` 块的内容是否要丢弃（原生 reasoning 已占据通道）。
+    ///
+    /// 丢弃时标签仍照常解析消费，只是不建 thinking 块、不发 delta——否则标签会泄漏成正文。
+    drop_tag_thinking: bool,
     /// 缺少真实 reasoning 时是否按严格协议终止流。
     strict_thinking_validation: bool,
     /// AWS event-stream 的语义与显式失败信号。
@@ -2076,6 +2125,9 @@ impl StreamContext {
         self.repeat_guard_periodic = PeriodicRepeatGuard::default();
         self.repeat_guard_tripped = false;
         self.thinking_repeat_tripped = false;
+        // 只清块级的丢弃标记；`thinking_source` 的通道锁**跨续写保持**——续写是同一轮
+        // 逻辑响应的延续，重置会让另一条通道中途抢占，重新引入推理输出重复两遍。
+        self.drop_tag_thinking = false;
         self.long_thinking_fingerprints.clear();
         self.tool_json_accumulator = ToolJsonAccumulator::new();
         self.tool_json_error = None;
@@ -2175,6 +2227,8 @@ impl StreamContext {
             single_tool_slot_closed: false,
             terminal_protocol_error_type: None,
             saw_reasoning_output: false,
+            thinking_source: ThinkingSource::default(),
+            drop_tag_thinking: false,
             strict_thinking_validation,
             attempt_observation: super::tool_attempt::AttemptObservation::default(),
             terminal_attempt_failure: None,
@@ -2410,10 +2464,23 @@ impl StreamContext {
 
                     // 进入 thinking 块
                     self.in_thinking_block = true;
-                    self.saw_reasoning_output = true;
                     self.strip_thinking_leading_newline = true;
                     self.thinking_buffer =
                         self.thinking_buffer[start_pos + "<thinking>".len()..].to_string();
+
+                    // 通道互锁：原生 reasoning 事件已占据 thinking 通道时，本块内容全部
+                    // 丢弃——但标签仍要照常解析消费，否则会泄漏成正文。
+                    self.drop_tag_thinking = !self.thinking_source.allow_tag();
+                    if self.drop_tag_thinking {
+                        tracing::debug!(
+                            message_id = %self.message_id,
+                            "dropping tag thinking block: channel already owned by native reasoning"
+                        );
+                        self.thinking_block_index = None;
+                        continue;
+                    }
+
+                    self.saw_reasoning_output = true;
 
                     // 创建 thinking 块的 content_block_start 事件
                     let thinking_index = self.state_manager.next_block_index();
@@ -2495,6 +2562,8 @@ impl StreamContext {
                     // 结束 thinking 块
                     self.in_thinking_block = false;
                     self.thinking_extracted = true;
+                    // 下一个块重新判定归属（通道锁本身不变，仅清掉本块的丢弃标记）。
+                    self.drop_tag_thinking = false;
 
                     // 发送空的 thinking_delta 事件，然后发送 content_block_stop 事件
                     if let Some(thinking_index) = self.thinking_block_index {
@@ -2968,6 +3037,16 @@ impl StreamContext {
                 self.output_tokens += estimate_tokens(text);
                 return self.create_text_delta_events(text);
             }
+            return Vec::new();
+        }
+
+        // 通道互锁：正文标签已占据 thinking 通道时，原生事件一律丢弃，避免同一段推理
+        // 从两条路各输出一遍。
+        if !self.thinking_source.allow_reasoning() {
+            tracing::debug!(
+                message_id = %self.message_id,
+                "dropped native reasoning event: thinking channel already owned by tag blocks"
+            );
             return Vec::new();
         }
 
@@ -5712,6 +5791,106 @@ mod tests {
                     && e.data["delta"]["text"] == "hello"
             }),
             "should emit text_delta after restarting text block"
+        );
+    }
+
+    #[test]
+    fn thinking_source_locks_to_first_channel() {
+        // 单元级：对齐 Kiro-Go 的 TestThinkingSourceReasoningFirst / TagFirst /
+        // SameSourceRemainsAllowed 三个用例。
+        let mut source = ThinkingSource::default();
+        assert!(source.allow_reasoning());
+        assert_eq!(source, ThinkingSource::ReasoningEvent);
+        assert!(!source.allow_tag(), "原生先到后标签必须被拒");
+
+        let mut source = ThinkingSource::default();
+        assert!(source.allow_tag());
+        assert_eq!(source, ThinkingSource::TagBlock);
+        assert!(!source.allow_reasoning(), "标签先到后原生必须被拒");
+
+        // 同源可反复通过。
+        let mut source = ThinkingSource::default();
+        assert!(source.allow_tag());
+        assert!(source.allow_tag());
+        let mut source = ThinkingSource::default();
+        assert!(source.allow_reasoning());
+        assert!(source.allow_reasoning());
+    }
+
+    #[test]
+    fn native_reasoning_wins_and_tag_block_is_dropped_without_leaking() {
+        // 上游同时下发原生 reasoning 事件和正文里的字面 `<thinking>` 标签时，
+        // 只认先到的原生通道；标签块内容丢弃，且**不得泄漏成正文**。
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let mut events = ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: Some("native reasoning".into()),
+                signature: None,
+                redacted_content: None,
+            },
+        ));
+        events.extend(ctx.process_assistant_response(
+            "<thinking>\nduplicate via tag\n</thinking>\n\nvisible answer",
+        ));
+        events.extend(ctx.generate_final_events());
+
+        let thinking = collect_thinking_content(&events);
+        let text: String = events
+            .iter()
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
+            .filter_map(|e| e.data["delta"]["text"].as_str())
+            .collect();
+
+        assert!(thinking.contains("native reasoning"));
+        assert!(
+            !thinking.contains("duplicate via tag"),
+            "标签块内容不得再进 thinking，实际 thinking={thinking:?}"
+        );
+        assert!(
+            !text.contains("duplicate via tag") && !text.contains("<thinking>"),
+            "被丢弃的标签块不得泄漏成正文，实际 text={text:?}"
+        );
+        assert!(
+            text.contains("visible answer"),
+            "标签块之后的正文必须照常交付，实际 text={text:?}"
+        );
+    }
+
+    #[test]
+    fn tag_thinking_wins_and_later_native_reasoning_is_dropped() {
+        // 反向：标签先占据通道后，原生 reasoning 事件必须被丢弃。
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let mut events = ctx.process_assistant_response("<thinking>\nvia tag\n</thinking>\n\n");
+        events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: Some("duplicate via native".into()),
+                signature: None,
+                redacted_content: None,
+            },
+        )));
+        events.extend(ctx.generate_final_events());
+
+        let thinking = collect_thinking_content(&events);
+        assert!(thinking.contains("via tag"));
+        assert!(
+            !thinking.contains("duplicate via native"),
+            "标签已占据通道后原生事件须丢弃，实际 thinking={thinking:?}"
         );
     }
 

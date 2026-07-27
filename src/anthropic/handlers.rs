@@ -1919,10 +1919,12 @@ async fn prepare_request(
 }
 
 fn conversion_error_trace_type(error: &ConversionError) -> &'static str {
-    if matches!(error, ConversionError::InvalidImage { .. }) {
-        "image_validation_error"
-    } else {
-        "request_conversion_error"
+    match error {
+        ConversionError::InvalidImage { .. } => "image_validation_error",
+        // 单独分类：便于在错误快照里区分「客户端 thinking 配置违约」与其他转换失败，
+        // 这类请求过去会被原样转发并换回一个空响应，很难从日志定位。
+        ConversionError::InvalidThinkingConfig(_) => "thinking_config_error",
+        _ => "request_conversion_error",
     }
 }
 
@@ -2359,6 +2361,10 @@ pub async fn post_messages(
                 ConversionError::InvalidToolChoice(reason) => {
                     ("invalid_request_error", format!("工具选择无效: {}", reason))
                 }
+                ConversionError::InvalidThinkingConfig(reason) => (
+                    "invalid_request_error",
+                    format!("thinking 配置无效: {}", reason),
+                ),
                 ConversionError::InvalidImage { location, source } => (
                     "invalid_request_error",
                     format!("图片 {location} 无效: {source}"),
@@ -5422,6 +5428,10 @@ pub async fn post_messages_cc(
                 ConversionError::InvalidToolChoice(reason) => {
                     ("invalid_request_error", format!("工具选择无效: {}", reason))
                 }
+                ConversionError::InvalidThinkingConfig(reason) => (
+                    "invalid_request_error",
+                    format!("thinking 配置无效: {}", reason),
+                ),
                 ConversionError::InvalidImage { location, source } => (
                     "invalid_request_error",
                     format!("图片 {location} 无效: {source}"),
