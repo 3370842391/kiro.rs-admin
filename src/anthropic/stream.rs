@@ -337,6 +337,27 @@ fn end_tag_skip_len(buffer: &str, end_pos: usize) -> usize {
     TAG.len()
 }
 
+/// 缓冲区末尾有多少字节可能是半截的 `<thinking>` 开标签。
+///
+/// 返回「最长的、同时是 `<thinking>` 真前缀的后缀」的长度；没有则返回 0。
+/// 用于首个 thinking 块**之后**的正文：此时块间排序已定，不需要再无条件扣住 10 字节，
+/// 只有尾巴确实像半截开标签时才等下一个 chunk，其余立即吐出，避免短正文被永久扣住。
+fn partial_open_tag_suffix_len(buffer: &str) -> usize {
+    const TAG: &str = "<thinking>";
+    // 从最长可能的真前缀开始试，命中即返回；按字符边界安全切片。
+    let max = TAG.len().saturating_sub(1).min(buffer.len());
+    for len in (1..=max).rev() {
+        let start = buffer.len() - len;
+        if !buffer.is_char_boundary(start) {
+            continue;
+        }
+        if TAG.starts_with(&buffer[start..]) {
+            return len;
+        }
+    }
+    0
+}
+
 /// 查找真正的 thinking 开始标签（不被引用字符包裹）
 ///
 /// 与 `find_real_thinking_end_tag` 类似，跳过被引用字符包裹的开始标签。
@@ -947,8 +968,13 @@ pub(crate) fn extract_thinking_from_complete_text(text: &str) -> (Option<String>
         let after_tag = end_pos + end_tag_skip_len(after_open, end_pos);
         (&after_open[..end_pos], after_open[after_tag..].trim_start())
     } else {
-        // 找不到有效的结束标签，不做提取
-        return (None, text.to_string());
+        // 没有结束标签：模型在思考途中被 max_tokens 截断。此时开标签之后的全部内容
+        // 都是推理，应当作 thinking 交付。
+        //
+        // 原先在这里原样返回整段文本，字面 `<thinking>` 标签和整段推理会一起泄漏进正文
+        // （流式侧的同类泄漏见 process_content_with_thinking 的多块支持）。被引用字符
+        // 包裹的标签已由 find_real_thinking_start_tag 排除，不会误伤讨论该标签的正文。
+        (after_open, "")
     };
 
     // 剥离开头的换行符（与流式处理一致：模型输出 <thinking>\n）
@@ -2335,7 +2361,11 @@ impl StreamContext {
         self.thinking_buffer.push_str(content);
 
         loop {
-            if !self.in_thinking_block && !self.thinking_extracted {
+            // 不再要求 `!thinking_extracted`：一轮响应里 thinking 块可以出现多次
+            // （想一下 → 调工具 → 看结果 → 再想一下）。旧条件在第一个块闭合后永久
+            // 锁死入口，第二个及之后的 `<thinking>` 会落到 else 分支被当普通正文原样
+            // 吐出，客户端就会看到裸的 `<thinking>` 标签加整段推理内容。
+            if !self.in_thinking_block {
                 // 查找 <thinking> 开始标签（跳过被反引号包裹的）
                 if let Some(start_pos) = find_real_thinking_start_tag(&self.thinking_buffer) {
                     // 发送 <thinking> 之前的内容作为 text_delta
@@ -2372,10 +2402,15 @@ impl StreamContext {
                 } else {
                     // 没有找到 <thinking>，检查是否可能是部分标签
                     // 保留可能是部分标签的内容
-                    let target_len = self
-                        .thinking_buffer
-                        .len()
-                        .saturating_sub("<thinking>".len());
+                    // 首块之前：保守扣住整个标签长度，保证 text 块不会抢在 thinking 块前面。
+                    // 首块之后：排序已定，只扣真正像半截开标签的尾巴，否则短正文
+                    //（如仅 6 字节的「你好」）会被永久扣在缓冲区里等一个不会来的标签。
+                    let hold = if self.thinking_extracted {
+                        partial_open_tag_suffix_len(&self.thinking_buffer)
+                    } else {
+                        "<thinking>".len()
+                    };
+                    let target_len = self.thinking_buffer.len().saturating_sub(hold);
                     let safe_len = find_char_boundary(&self.thinking_buffer, target_len);
                     if safe_len > 0 {
                         let safe_content = self.thinking_buffer[..safe_len].to_string();
@@ -2384,7 +2419,13 @@ impl StreamContext {
                         // 这避免了 4.6 模型中 <thinking> 标签跨事件分割时，
                         // 前导空白（如 "\n\n"）被错误地创建为 text 块，
                         // 导致 text 块先于 thinking 块出现的问题。
-                        if !safe_content.is_empty() && !safe_content.trim().is_empty() {
+                        //
+                        // 该抑制**只在首个 thinking 块之前**成立：它要解决的是「text 块
+                        // 抢在 thinking 块前面」的排序问题。首块已提交后排序已定，此时
+                        // 继续抑制空白会让块间的换行被永久扣在缓冲区里，破坏正文排版。
+                        if !safe_content.is_empty()
+                            && (self.thinking_extracted || !safe_content.trim().is_empty())
+                        {
                             events.extend(self.create_text_delta_events(&safe_content));
                             self.thinking_buffer = self.thinking_buffer[safe_len..].to_string();
                         }
@@ -2478,14 +2519,6 @@ impl StreamContext {
                     }
                     break;
                 }
-            } else {
-                // thinking 已提取完成，剩余内容作为 text_delta
-                if !self.thinking_buffer.is_empty() {
-                    let remaining = self.thinking_buffer.clone();
-                    self.thinking_buffer.clear();
-                    events.extend(self.create_text_delta_events(&remaining));
-                }
-                break;
             }
         }
 
@@ -3293,12 +3326,12 @@ impl StreamContext {
 
         // thinking 模式下，process_content_with_thinking 可能会为了探测 `<thinking>` 而暂存一小段尾部文本。
         // 如果此时直接开始 tool_use，状态机会自动关闭 text block，导致这段"待输出文本"看起来被 tool_use 吞掉。
-        // 约束：只在尚未进入 thinking block、且 thinking 尚未被提取时，将缓冲区当作普通文本 flush。
-        if self.thinking_enabled
-            && !self.in_thinking_block
-            && !self.thinking_extracted
-            && !self.thinking_buffer.is_empty()
-        {
+        // 约束：只在尚未进入 thinking block 时，将缓冲区当作普通文本 flush。
+        //
+        // 原先还要求 `!thinking_extracted`。支持一轮多个 thinking 块后，「为嗅探
+        // `<thinking>` 而暂存尾部文本」这件事在首块之后同样会发生，旧条件会让这段
+        // 待输出文本在 tool_use 到来时被静默吞掉。
+        if self.thinking_enabled && !self.in_thinking_block && !self.thinking_buffer.is_empty() {
             let buffered = std::mem::take(&mut self.thinking_buffer);
             events.extend(self.create_text_delta_events(&buffered));
         }
@@ -5631,6 +5664,186 @@ mod tests {
                     && e.data["delta"]["text"] == "hello"
             }),
             "should emit text_delta after restarting text block"
+        );
+    }
+
+    #[test]
+    fn second_thinking_block_is_parsed_not_leaked_as_text() {
+        // 一轮响应里 thinking 可以出现多次（想一下 → 调工具 → 看结果 → 再想一下）。
+        // 回归：旧实现在首块闭合后永久锁死入口，第二个 `<thinking>` 会被当正文原样吐出，
+        // 客户端看到裸标签 + 整段推理内容。
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let mut events = ctx.process_assistant_response("<thinking>\nfirst pass\n</thinking>\n\n");
+        events.extend(ctx.process_assistant_response("visible answer\n\n"));
+        events.extend(ctx.process_assistant_response("<thinking>\nsecond pass\n</thinking>\n\n"));
+        events.extend(ctx.process_assistant_response("final answer"));
+        events.extend(ctx.generate_final_events());
+
+        let thinking_text: String = events
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "thinking_delta"
+            })
+            .filter_map(|e| e.data["delta"]["thinking"].as_str())
+            .collect();
+        let visible_text: String = events
+            .iter()
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
+            .filter_map(|e| e.data["delta"]["text"].as_str())
+            .collect();
+
+        assert!(
+            thinking_text.contains("second pass"),
+            "第二个 thinking 块必须走 thinking_delta，实际 thinking={thinking_text:?}"
+        );
+        assert!(
+            !visible_text.contains("<thinking>"),
+            "正文不得出现裸 thinking 标签，实际 text={visible_text:?}"
+        );
+        assert!(
+            !visible_text.contains("second pass"),
+            "第二块的推理内容不得泄漏进正文，实际 text={visible_text:?}"
+        );
+        assert!(
+            visible_text.contains("final answer"),
+            "第二块之后的正文必须照常交付，实际 text={visible_text:?}"
+        );
+
+        // 两个 thinking 块应各自拿到独立的 block index，并各自闭合。
+        let thinking_starts = events
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "thinking"
+            })
+            .count();
+        assert_eq!(thinking_starts, 2, "应产生两个独立的 thinking 块");
+    }
+
+    #[test]
+    fn unterminated_thinking_becomes_thinking_not_leaked_text() {
+        // 模型在思考途中被 max_tokens 截断，没吐出 `</thinking>`。
+        // 回归：旧实现原样返回整段文本，字面标签和推理内容一起泄漏进正文。
+        let (thinking, text) =
+            extract_thinking_from_complete_text("<thinking>\ncut off mid thought");
+        assert_eq!(thinking.as_deref(), Some("cut off mid thought"));
+        assert_eq!(text, "", "未闭合时不得把标签或推理内容留在正文里");
+
+        // 开标签前的正文仍须保留。
+        let (thinking, text) = extract_thinking_from_complete_text("preamble\n<thinking>\ncut off");
+        assert_eq!(thinking.as_deref(), Some("cut off"));
+        assert!(text.starts_with("preamble"));
+        assert!(!text.contains("<thinking>"));
+
+        // 被反引号包裹的标签是在讨论它，不算开标签，正文原样保留。
+        let (thinking, text) = extract_thinking_from_complete_text("talking about `<thinking>` tag");
+        assert!(thinking.is_none());
+        assert_eq!(text, "talking about `<thinking>` tag");
+    }
+
+    #[test]
+    fn tiny_max_tokens_requests_get_no_thinking_prefix() {
+        // 客户端辅助小请求（标题生成等）带着主会话的 thinking 配置但 max_tokens 极小，
+        // 注入 thinking 会让上游在矛盾约束下什么都不产出，线上表现为 100% 空响应失败。
+        use crate::anthropic::converter::convert_request;
+        use crate::anthropic::types::{Message as AnthropicMessage, MessagesRequest, Thinking};
+
+        let build = |max_tokens: i32| MessagesRequest {
+            force_web_search_loop: false,
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("give me a title"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "enabled".to_string(),
+                budget_tokens: 24_576,
+            }),
+            output_config: None,
+            metadata: None,
+        };
+
+        let tiny = convert_request(&build(64)).unwrap();
+        let wire = serde_json::to_string(&tiny.conversation_state).unwrap();
+        assert!(
+            !wire.contains("thinking_mode"),
+            "max_tokens=64 不得注入 thinking 前缀"
+        );
+
+        let normal = convert_request(&build(64_000)).unwrap();
+        let wire = serde_json::to_string(&normal.conversation_state).unwrap();
+        assert!(
+            wire.contains("thinking_mode"),
+            "正常请求仍须注入 thinking 前缀"
+        );
+    }
+
+    #[test]
+    fn short_text_after_thinking_is_not_held_hostage_by_tag_sniffing() {
+        // 回归：首块之后若仍无条件扣住 10 字节（`<thinking>` 长度），比它短的正文
+        // 会被永久扣在缓冲区里等一个不会到来的标签，直到收尾才吐出。
+        assert_eq!(partial_open_tag_suffix_len("你好"), 0);
+        assert_eq!(partial_open_tag_suffix_len("abc<thin"), 5);
+        assert_eq!(partial_open_tag_suffix_len("abc<"), 1);
+        // 完整标签不算「半截」，交给 find_real_thinking_start_tag 处理。
+        assert_eq!(partial_open_tag_suffix_len("<thinking>"), 0);
+        // 多字节字符不得 panic，也不得误判。
+        assert_eq!(partial_open_tag_suffix_len("内容中"), 0);
+
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let events = ctx.process_assistant_response("<thinking>\nabc</thinking>\n\n你好");
+        let text: String = events
+            .iter()
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
+            .filter_map(|e| e.data["delta"]["text"].as_str())
+            .collect();
+        assert_eq!(text, "你好", "首块之后的短正文须立即交付");
+    }
+
+    #[test]
+    fn text_mentioning_thinking_tag_after_first_block_is_not_reparsed() {
+        // 首块之后放开了入口，但被引用字符包裹的标签仍必须当普通正文处理，
+        // 否则模型讨论这个标签时会被误判为进入 thinking 块。
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let mut events = ctx.process_assistant_response("<thinking>\nreal\n</thinking>\n\n");
+        events.extend(ctx.process_assistant_response("talking about `<thinking>` as a tag here"));
+        events.extend(ctx.generate_final_events());
+
+        let visible_text: String = events
+            .iter()
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
+            .filter_map(|e| e.data["delta"]["text"].as_str())
+            .collect();
+        assert!(
+            visible_text.contains("as a tag here"),
+            "被反引号包裹的标签后的文本必须留在正文，实际 text={visible_text:?}"
         );
     }
 
