@@ -5,7 +5,6 @@
 use std::collections::{HashMap, VecDeque};
 
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::kiro::model::events::Event;
@@ -183,6 +182,27 @@ fn is_quote_char(buffer: &str, pos: usize) -> bool {
         .unwrap_or(false)
 }
 
+/// 标签是否被**同一个引号字符成对包裹** —— 即模型在讨论这个标签而非真的用它。
+///
+/// 判定必须看成对,不能看单侧。原实现「任一侧命中引号字符就跳过」会造成大量漏检:
+/// - `<thinking>` 后紧跟反引号（模型 thinking 第一句就引代码/命令/文件名）
+/// - `</thinking>` 前是反引号（模型 thinking 末尾刚引完一段代码）
+///
+/// 这两种在真实推理里极常见,实测 9 种引号相邻形态漏检 7 种。而真正的「讨论标签」写法
+/// 是两侧成对: `` `<thinking>` ``、`"<thinking>"`。
+///
+/// `open` 指向标签首字符,`close` 指向标签末字符之后一位。
+fn tag_is_quote_wrapped(buffer: &str, open: usize, close: usize) -> bool {
+    if open == 0 {
+        return false;
+    }
+    let bytes = buffer.as_bytes();
+    let (Some(&before), Some(&after)) = (bytes.get(open - 1), bytes.get(close)) else {
+        return false;
+    };
+    before == after && QUOTE_CHARS.contains(&before)
+}
+
 /// 查找真正的 thinking 结束标签（不被引用字符包裹，且后面有双换行符）
 ///
 /// 当模型在思考过程中提到 `</thinking>` 时，通常会用反引号、引号等包裹，
@@ -207,23 +227,17 @@ fn find_real_thinking_end_tag(buffer: &str) -> Option<usize> {
     while let Some(pos) = buffer[search_start..].find(TAG) {
         let absolute_pos = search_start + pos;
 
-        // 检查前面是否有引用字符
-        let has_quote_before = absolute_pos > 0 && is_quote_char(buffer, absolute_pos - 1);
-
-        // 检查后面是否有引用字符
         let after_pos = absolute_pos + TAG.len();
-        let has_quote_after = is_quote_char(buffer, after_pos);
 
-        // 如果被引用字符包裹，跳过
-        if has_quote_before || has_quote_after {
+        // 成对包裹才算「模型在讨论这个标签」，见 tag_is_quote_wrapped。
+        if tag_is_quote_wrapped(buffer, absolute_pos, after_pos) {
             search_start = absolute_pos + 1;
             continue;
         }
 
-        // 检查后面的内容
+        // 流式守卫：标签后不足 2 字节时等下一个 chunk——要凑够上下文才能判断成对包裹。
+        // 真正的流末尾由 find_real_thinking_end_tag_at_buffer_end 兜住。
         let after_content = &buffer[after_pos..];
-
-        // 如果标签后面内容不足以判断是否有双换行符，等待更多内容
         if after_content.len() < 2 {
             return None;
         }
@@ -313,14 +327,10 @@ fn find_real_thinking_end_tag_at_buffer_end(buffer: &str) -> Option<usize> {
     while let Some(pos) = buffer[search_start..].find(TAG) {
         let absolute_pos = search_start + pos;
 
-        // 检查前面是否有引用字符
-        let has_quote_before = absolute_pos > 0 && is_quote_char(buffer, absolute_pos - 1);
-
-        // 检查后面是否有引用字符
         let after_pos = absolute_pos + TAG.len();
-        let has_quote_after = is_quote_char(buffer, after_pos);
 
-        if has_quote_before || has_quote_after {
+        // 成对包裹才算「模型在讨论这个标签」，见 tag_is_quote_wrapped。
+        if tag_is_quote_wrapped(buffer, absolute_pos, after_pos) {
             search_start = absolute_pos + 1;
             continue;
         }
@@ -380,15 +390,11 @@ fn find_real_thinking_start_tag(buffer: &str) -> Option<usize> {
     while let Some(pos) = buffer[search_start..].find(TAG) {
         let absolute_pos = search_start + pos;
 
-        // 检查前面是否有引用字符
-        let has_quote_before = absolute_pos > 0 && is_quote_char(buffer, absolute_pos - 1);
-
-        // 检查后面是否有引用字符
+        // 成对包裹才算「模型在讨论这个标签」，见 tag_is_quote_wrapped。
+        // 单侧命中就跳过会造成大量漏检：模型 thinking 第一句常常直接引代码/命令，
+        // 形如 `<thinking>` 后紧跟反引号。
         let after_pos = absolute_pos + TAG.len();
-        let has_quote_after = is_quote_char(buffer, after_pos);
-
-        // 如果不被引用字符包裹，则是真正的开始标签
-        if !has_quote_before && !has_quote_after {
+        if !tag_is_quote_wrapped(buffer, absolute_pos, after_pos) {
             return Some(absolute_pos);
         }
 
@@ -747,9 +753,21 @@ impl ThinkingSource {
     }
 }
 
-const LONG_THINKING_DEDUP_MIN_BYTES: usize = 256;
-const LONG_THINKING_DEDUP_MAX_BYTES: usize = 64 * 1024;
-const LONG_THINKING_DEDUP_HISTORY: usize = 4;
+// 曾有一套「长 thinking 内容 SHA256 去重」：≥256 字节的 reasoning 事件若与最近 4 条中
+// 任意一条完全相同就整条丢弃。已移除，原因见下。
+//
+// 它与周期复读熔断是同一个提交加进来的（9ecb965），动机是压 thinking 刷屏——而那个问题
+// 现在由修好行重组的熔断器正经处理。真正的问题是它会**静默吃掉合法输出**：模型在推理里
+// 重复引用同一段代码（对比修改前后时很常见）、重述同一份清单，第二次就凭空消失，用户看到
+// 的是有缺口的推理。
+//
+// Kiro-Go 踩过完全一样的坑并留下警告（proxy/kiro.go:608）：「不要重新引入基于内容的去重。
+// 在字符串层面，重放的分片和自我重复的文本无法区分」——他们的旧实现把 6666666666 吃成
+// 666、abababab 吃成 abab、1833 吃成 183。同一段注释还指出上游**从不重放分片**（对真实
+// 流量验证过，TCP 已保证至多一次投递），也就是说每一次「重复」都是模型真实产出。
+//
+// 结论：诚实地重复输出优于静默丢失。真正的退化复读由熔断器按阈值处理，那条路会明确
+// 告知客户端（upstream_repetition_guard），不会让内容凭空消失。
 
 #[derive(Debug, Clone, Copy)]
 struct PeriodicRepeatMatch {
@@ -1951,8 +1969,6 @@ pub struct StreamContext {
     thinking_repeat_tripped: bool,
     /// 复读熔断：正文通道是否已跳闸（触发后本轮后续文本一律丢弃，不再吐、不写历史）。
     repeat_guard_tripped: bool,
-    /// 同一上游流内最近长 Thinking delta 的定长指纹，用于跨事件来源精确抑制完整重放。
-    long_thinking_fingerprints: VecDeque<(usize, [u8; 32])>,
     /// 工具调用参数 JSON 累积器：按 tool_use_id 缓冲分片，`stop` 时整体解析，
     /// 避免把“流式半截 JSON”当成完整工具调用转发。
     tool_json_accumulator: ToolJsonAccumulator,
@@ -2162,7 +2178,6 @@ impl StreamContext {
         // 只清块级的丢弃标记；`thinking_source` 的通道锁**跨续写保持**——续写是同一轮
         // 逻辑响应的延续，重置会让另一条通道中途抢占，重新引入推理输出重复两遍。
         self.drop_tag_thinking = false;
-        self.long_thinking_fingerprints.clear();
         self.tool_json_accumulator = ToolJsonAccumulator::new();
         self.tool_json_error = None;
         self.tool_use_xml_filter = ToolUseXmlLeakFilter::default();
@@ -2247,7 +2262,6 @@ impl StreamContext {
             repeat_guard_periodic: PeriodicRepeatGuard::default(),
             repeat_guard_tripped: false,
             thinking_repeat_tripped: false,
-            long_thinking_fingerprints: VecDeque::new(),
             tool_json_accumulator: ToolJsonAccumulator::new(),
             tool_json_error: None,
             tool_use_xml_filter: ToolUseXmlLeakFilter::default(),
@@ -3161,18 +3175,10 @@ impl StreamContext {
             && !text.is_empty()
         {
             self.output_tokens += estimate_tokens(text);
-            if self.has_seen_long_thinking(text) {
-                tracing::warn!(
-                    message_id = %self.message_id,
-                    event_bytes = text.len(),
-                    "suppressed exact duplicate native reasoning event"
-                );
-            } else {
-                events.extend(self.ensure_thinking_block());
-                if let Some(idx) = self.thinking_block_index {
-                    if let Some(event) = self.create_guarded_thinking_delta_event(idx, text) {
-                        events.push(event);
-                    }
+            events.extend(self.ensure_thinking_block());
+            if let Some(idx) = self.thinking_block_index {
+                if let Some(event) = self.create_guarded_thinking_delta_event(idx, text) {
+                    events.push(event);
                 }
             }
         }
@@ -3186,40 +3192,6 @@ impl StreamContext {
         }
 
         events
-    }
-
-    fn long_thinking_fingerprint(text: &str) -> Option<(usize, [u8; 32])> {
-        if !(LONG_THINKING_DEDUP_MIN_BYTES..=LONG_THINKING_DEDUP_MAX_BYTES).contains(&text.len()) {
-            return None;
-        }
-
-        let digest: [u8; 32] = Sha256::digest(text.as_bytes()).into();
-        Some((text.len(), digest))
-    }
-
-    fn has_seen_long_thinking(&self, text: &str) -> bool {
-        Self::long_thinking_fingerprint(text)
-            .is_some_and(|fingerprint| self.long_thinking_fingerprints.contains(&fingerprint))
-    }
-
-    fn remember_long_thinking(&mut self, text: &str) -> bool {
-        let Some(fingerprint) = Self::long_thinking_fingerprint(text) else {
-            return false;
-        };
-        if self.long_thinking_fingerprints.contains(&fingerprint) {
-            tracing::warn!(
-                message_id = %self.message_id,
-                event_bytes = text.len(),
-                "suppressed exact duplicate long thinking delta"
-            );
-            return true;
-        }
-
-        self.long_thinking_fingerprints.push_back(fingerprint);
-        while self.long_thinking_fingerprints.len() > LONG_THINKING_DEDUP_HISTORY {
-            self.long_thinking_fingerprints.pop_front();
-        }
-        false
     }
 
     fn create_redacted_thinking_events(&mut self, data: &str) -> Vec<SseEvent> {
@@ -3254,9 +3226,6 @@ impl StreamContext {
     ) -> Option<SseEvent> {
         if thinking.is_empty() {
             return Some(self.create_thinking_delta_event(index, ""));
-        }
-        if self.remember_long_thinking(thinking) {
-            return None;
         }
         let kept = self.repeat_guard_filter(thinking, "thinking");
         if kept.is_empty() {
@@ -5985,6 +5954,46 @@ mod tests {
     }
 
     #[test]
+    fn quote_adjacent_tags_are_not_hidden_by_single_side_check() {
+        // 回归：原实现「任一侧命中引号字符就跳过」，导致模型 thinking 里引代码时标签漏检。
+        // 实测 9 种引号相邻形态漏 7 种。判定改为成对包裹。
+
+        // 开标签后紧跟引号类字符——模型 thinking 第一句直接引代码/命令/文件名。
+        for input in [
+            "<thinking>`cargo test` 会失败",
+            "<thinking>\"foo\" 这个值",
+            "<thinking>'x' 变量",
+            "<thinking>\\n 转义",
+        ] {
+            assert!(
+                find_real_thinking_start_tag(input).is_some(),
+                "开标签后紧跟引号不得漏检: {input:?}"
+            );
+        }
+
+        // 闭标签前后紧跟引号类字符——thinking 末尾刚引完代码，或正文以代码开头。
+        for input in [
+            "见 `code`</thinking>\nDone",
+            "值是 \"x\"</thinking>\nDone",
+            "reasoning</thinking>`next`",
+        ] {
+            assert!(
+                find_real_thinking_end_tag(input).is_some(),
+                "闭标签紧邻引号不得漏检: {input:?}"
+            );
+        }
+
+        // 成对包裹仍须跳过：这才是「模型在讨论这个标签」。
+        assert!(find_real_thinking_start_tag("about `<thinking>` tag").is_none());
+        assert!(find_real_thinking_start_tag("the \"<thinking>\" marker").is_none());
+        assert!(find_real_thinking_end_tag("about `</thinking>` tag\n\n").is_none());
+        assert!(find_real_thinking_end_tag("the \"</thinking>\" one\n\n").is_none());
+
+        // 不同引号字符不构成成对，不算引用。
+        assert!(find_real_thinking_start_tag("`<thinking>\" mixed").is_some());
+    }
+
+    #[test]
     fn close_tag_followed_by_text_closes_block_and_keeps_text() {
         // 线上实测形态：`Starting now.<thinking>\n...\n</thinking>\nDone.`
         // 闭标签后只有单换行加正文。旧实现要求后跟 `\n\n`，于是闭标签字面泄漏进 thinking
@@ -6846,11 +6855,18 @@ mod tests {
             None
         );
 
-        // 只有前面有反引号
-        assert_eq!(find_real_thinking_end_tag("`</thinking>\n\n"), None);
-
-        // 只有后面有反引号
-        assert_eq!(find_real_thinking_end_tag("</thinking>`\n\n"), None);
+        // 单侧引号**不再**跳过：改为成对判定。
+        //
+        // 真实推理里单侧反引号更可能是真闭合——模型 thinking 末尾用行内代码收尾
+        // （`见 \`code\`</thinking>`），前一字符正是反引号；标签后紧跟反引号同理，
+        // 是正文以行内代码开头。按旧的单侧规则这些都会被跳过，闭标签泄漏进 thinking。
+        // 「在讨论这个标签」的真实写法是两侧成对，已由上面的用例覆盖。
+        assert_eq!(find_real_thinking_end_tag("`</thinking>\n\n"), Some(1));
+        assert_eq!(find_real_thinking_end_tag("</thinking>`\n\n"), Some(0));
+        assert_eq!(
+            find_real_thinking_end_tag("reasoning `code`</thinking>\nDone."),
+            Some(16)
+        );
     }
 
     #[test]
@@ -8724,7 +8740,13 @@ mod tests {
     }
 
     #[test]
-    fn native_reasoning_drops_exact_duplicate_long_event() {
+    fn native_reasoning_keeps_exact_duplicate_long_event() {
+        // 曾按内容 SHA256 丢弃「与最近 4 条完全相同」的长 reasoning 事件，已移除。
+        //
+        // 模型在推理里重复引用同一段代码（对比修改前后时很常见）、重述同一份清单，都是
+        // 合法输出；静默丢掉第二份会让用户看到有缺口的推理。Kiro-Go 踩过同一个坑并留下
+        // 警告（proxy/kiro.go:608），同时指出上游从不重放分片——所以每次「重复」都是模型
+        // 真实产出。真正的退化复读由熔断器按阈值处理，并明确告知客户端。
         let mut ctx = StreamContext::new_with_thinking(
             "test-model",
             1,
@@ -8744,7 +8766,11 @@ mod tests {
         let mut events = ctx.process_kiro_event(&event);
         events.extend(ctx.process_kiro_event(&event));
 
-        assert_eq!(collect_thinking_content(&events), reasoning);
+        assert_eq!(
+            collect_thinking_content(&events),
+            format!("{reasoning}{reasoning}"),
+            "重复的长 reasoning 必须原样交付，不得静默丢弃"
+        );
         assert!(!ctx.repetition_guard_tripped());
     }
 
@@ -8821,7 +8847,7 @@ mod tests {
     }
 
     #[test]
-    fn native_reasoning_dedup_preserves_following_tool_use() {
+    fn duplicate_native_reasoning_preserves_following_tool_use() {
         let mut ctx = StreamContext::new_with_thinking(
             "test-model",
             1,
@@ -8846,7 +8872,11 @@ mod tests {
         ))));
         events.extend(ctx.generate_final_events());
 
-        assert_eq!(collect_thinking_content(&events), reasoning);
+        // 重复内容原样交付（不再静默去重），且不得影响后续工具调用。
+        assert_eq!(
+            collect_thinking_content(&events),
+            format!("{reasoning}{reasoning}")
+        );
         let tools = collect_tool_uses(&events);
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].0, "exec_command");
@@ -8854,7 +8884,7 @@ mod tests {
     }
 
     #[test]
-    fn long_thinking_dedup_resets_at_continuation_boundary() {
+    fn repeated_reasoning_survives_continuation_boundary() {
         let mut ctx = StreamContext::new_with_thinking(
             "test-model",
             1,
