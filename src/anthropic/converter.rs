@@ -1145,6 +1145,15 @@ fn determine_chat_trigger_type(_req: &MessagesRequest) -> String {
 fn process_message_content(
     content: &serde_json::Value,
 ) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
+    process_message_content_dedup(content, None)
+}
+
+/// 同 `process_message_content`，但 `dedup` 为 `Some` 时对图片做跨轮 SHA256 去重。
+/// 只有历史消息才传 `Some`：当前轮的图必须原样送达，不能被历史里的同图挤掉。
+fn process_message_content_dedup(
+    content: &serde_json::Value,
+    mut dedup: Option<&mut std::collections::HashSet<String>>,
+) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
     let mut text_parts = Vec::new();
     let mut images = Vec::new();
     let mut tool_results = Vec::new();
@@ -1163,14 +1172,20 @@ fn process_message_content(
                             }
                         }
                         "image" => {
-                            if let Some(source) = block.source {
-                                extract_kiro_image(&source, &mut images);
+                            if let Some(source) = block.source
+                                && let Some(placeholder) =
+                                    extract_kiro_image(&source, &mut dedup, &mut images)
+                            {
+                                text_parts.push(placeholder);
                             }
                         }
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
-                                let result_content =
-                                    extract_tool_result_content(&block.content, &mut images);
+                                let result_content = extract_tool_result_content(
+                                    &block.content,
+                                    &mut dedup,
+                                    &mut images,
+                                );
                                 let is_error = block.is_error.unwrap_or(false);
 
                                 let mut result = if is_error {
@@ -1234,7 +1249,26 @@ fn get_image_format(media_type: &str) -> Option<String> {
 /// Converter only validates the format and preserves the exact bytes. Global history-only image
 /// budgeting runs after the complete Kiro request has been assembled, preventing double JPEG
 /// encoding and ensuring the current turn is never modified.
-fn extract_kiro_image(source: &ImageSource, images: &mut Vec<KiroImage>) {
+/// 历史图片重复出现时的占位文本。
+const DEDUPED_IMAGE_PLACEHOLDER: &str = "[image omitted: identical to an earlier screenshot]";
+
+/// 把图片块转成 `KiroImage` 并推入顶层 `images`。
+///
+/// `dedup` 为 `Some` 时按 base64 的 SHA256 跨轮去重：同一张图在历史里重复出现时只保留
+/// 首次那份，之后返回占位文本、不再推入 `images`。同一张截图在多轮对话里被反复以 base64
+/// 重发会让请求体线性膨胀，很快撞上上游对请求体字节数的硬限制
+///（`CONTENT_LENGTH_EXCEEDS_THRESHOLD`）——而 base64 的字节增长远快于 token 增长，
+/// 所以按 token 计的上下文护栏根本拦不住它。
+///
+/// 只做判重，**不碰图片字节**：压缩与降采样统一由 `kiro::image_budget` 预算器负责，
+/// converter 阶段必须保持字节原样（见 `test_repeated_history_images_are_preserved`）。
+///
+/// 返回 `Some(占位文本)` 表示命中去重、图片已省略；`None` 表示图片已正常推入。
+fn extract_kiro_image(
+    source: &ImageSource,
+    dedup: &mut Option<&mut std::collections::HashSet<String>>,
+    images: &mut Vec<KiroImage>,
+) -> Option<String> {
     let format = get_image_format(&source.media_type).unwrap_or_else(|| {
         source
             .media_type
@@ -1244,7 +1278,16 @@ fn extract_kiro_image(source: &ImageSource, images: &mut Vec<KiroImage>) {
             .unwrap_or("unknown")
             .to_ascii_lowercase()
     });
+    if let Some(seen) = dedup.as_deref_mut() {
+        let mut hasher = Sha256::new();
+        hasher.update(source.data.as_bytes());
+        let digest = format!("{:x}", hasher.finalize());
+        if !seen.insert(digest) {
+            return Some(DEDUPED_IMAGE_PLACEHOLDER.to_string());
+        }
+    }
     images.push(KiroImage::from_base64(format, source.data.clone()));
+    None
 }
 
 /// 提取工具结果内容
@@ -1254,6 +1297,7 @@ fn extract_kiro_image(source: &ImageSource, images: &mut Vec<KiroImage>) {
 /// If a tool_result has only images and no text, the placeholder text "[image attached]" is used.
 fn extract_tool_result_content(
     content: &Option<serde_json::Value>,
+    dedup: &mut Option<&mut std::collections::HashSet<String>>,
     images: &mut Vec<KiroImage>,
 ) -> String {
     match content {
@@ -1269,7 +1313,9 @@ fn extract_tool_result_content(
                     && let Some(source) = block.source
                 {
                     had_image = true;
-                    extract_kiro_image(&source, images);
+                    if let Some(placeholder) = extract_kiro_image(&source, dedup, images) {
+                        parts.push(placeholder);
+                    }
                 }
             }
             if parts.is_empty() && had_image {
@@ -2004,8 +2050,25 @@ fn convert_tools(
     Ok(out)
 }
 
+/// 注入 thinking 前缀所需的最小 `max_tokens`。
+///
+/// 客户端（Claude Code 等）会发一批辅助小请求——标题生成、话题判定之类，典型形态是
+/// `max_tokens=64` + `stream=false` + `message_count=2`，但仍带着上一轮的 thinking 配置
+/// 和完整 system prompt。给这种请求注入 `<thinking_mode>` 会让模型一开口就进 thinking，
+/// 64 个 token 全烧在推理里、可见正文一个字都吐不出来：上游正常返回 200 且有帧，但内容
+/// 通道全空，于是被判成 `upstream_empty_response`；空响应恢复对纯文本请求又无可压缩，
+/// 重试发出去的是逐字节相同的请求体，必然拿到同样的空响应。线上这类请求 100% 失败。
+///
+/// 512 的取值：低于此值时「思考 + 给出答案」不可能同时完成，注入 thinking 只有害处；
+/// 而正常对话请求（Claude Code 主链路为 64000）远在其上，不受影响。
+const MIN_MAX_TOKENS_FOR_THINKING: i32 = 512;
+
 /// 生成thinking标签前缀
 fn generate_thinking_prefix(req: &MessagesRequest, model_id: &str) -> Option<String> {
+    // max_tokens 太小时一律不注入：见 MIN_MAX_TOKENS_FOR_THINKING 的说明。
+    if req.max_tokens < MIN_MAX_TOKENS_FOR_THINKING {
+        return None;
+    }
     if let Some(t) = &req.thinking {
         if t.thinking_type == "enabled" {
             return Some(format!(
@@ -2126,6 +2189,8 @@ fn build_history(
     // 处理调用方已经与 currentMessage 分离的常规消息历史。
     let mut user_buffer: Vec<&super::types::Message> = Vec::new();
     let mut assistant_buffer: Vec<&super::types::Message> = Vec::new();
+    // 贯穿整个历史的图片指纹集合：同一张图只在首次出现时保留 base64。
+    let mut image_dedup: std::collections::HashSet<String> = std::collections::HashSet::new();
     for msg in messages {
         if msg.role == "user" {
             // 先处理累积的 assistant 消息
@@ -2138,7 +2203,8 @@ fn build_history(
         } else if msg.role == "assistant" {
             // 先处理累积的 user 消息
             if !user_buffer.is_empty() {
-                let merged_user = merge_user_messages(&user_buffer, model_id)?;
+                let merged_user =
+                    merge_user_messages(&user_buffer, model_id, &mut image_dedup)?;
                 history.push(Message::User(merged_user));
                 user_buffer.clear();
             }
@@ -2155,7 +2221,7 @@ fn build_history(
 
     // 刷新末尾累积的 user 消息，不生成客户端未提交的 assistant 内容。
     if !user_buffer.is_empty() {
-        let merged_user = merge_user_messages(&user_buffer, model_id)?;
+        let merged_user = merge_user_messages(&user_buffer, model_id, &mut image_dedup)?;
         history.push(Message::User(merged_user));
     }
 
@@ -2166,13 +2232,15 @@ fn build_history(
 fn merge_user_messages(
     messages: &[&super::types::Message],
     model_id: &str,
+    dedup: &mut std::collections::HashSet<String>,
 ) -> Result<HistoryUserMessage, ConversionError> {
     let mut content_parts = Vec::new();
     let mut all_images = Vec::new();
     let mut all_tool_results = Vec::new();
 
     for msg in messages {
-        let (text, images, tool_results) = process_message_content(&msg.content)?;
+        let (text, images, tool_results) =
+            process_message_content_dedup(&msg.content, Some(dedup))?;
         if !text.is_empty() {
             content_parts.push(text);
         }
@@ -5158,13 +5226,70 @@ mod tests {
             .flatten()
             .collect();
 
-        assert_eq!(history_images.len(), 2, "重复历史图片不得被去重删除");
+        // 同一张图跨轮重复出现时只保留首次那份：base64 的字节增长远快于 token 增长，
+        // 反复重发会让请求体线性膨胀并撞上上游的字节硬限制，而按 token 计的上下文
+        // 护栏拦不住它。
+        assert_eq!(history_images.len(), 1, "重复历史图片须去重，只保留首次");
         assert!(
             history_images
                 .iter()
                 .all(|image| image.source.bytes == TINY_PNG_B64),
             "历史图片在预算器运行前不得被 converter 重编码"
         );
+
+        // 被省略的那张须留下占位文本，模型才知道此处曾有一张与前文相同的图。
+        let history_text: String = result
+            .conversation_state
+            .history
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(message) => Some(message.user_input_message.content.as_str()),
+                Message::Assistant(_) => None,
+            })
+            .collect();
+        assert!(
+            history_text.contains(DEDUPED_IMAGE_PLACEHOLDER),
+            "去重掉的图片须留占位文本，实际 history_text={history_text:?}"
+        );
+    }
+
+    #[test]
+    fn current_turn_image_survives_history_dedup() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // 当前轮的图必须原样送达，不能因为历史里有同一张图而被挤掉——
+        // 用户这轮贴的就是它，模型必须看得见。
+        let image_content = || {
+            serde_json::json!([
+                {"type": "text", "text": "look"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": TINY_PNG_B64}}
+            ])
+        };
+        let mut req = minimal_request_with_output_config("claude-sonnet-4.5");
+        req.output_config = None;
+        req.messages = vec![
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: image_content(),
+            },
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!("first"),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: image_content(),
+            },
+        ];
+
+        let result = convert_request(&req).unwrap();
+        let current_images = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .images;
+        assert_eq!(current_images.len(), 1, "当前轮的图不得被历史去重挤掉");
+        assert_eq!(current_images[0].source.bytes, TINY_PNG_B64);
     }
 
     #[test]
