@@ -1,6 +1,6 @@
 [package]
 name = "kiro-rs"
-version = "0.9.35"
+version = "0.9.36"
 edition = "2024"
 # src/bin/anthropic_probe.rs 让这个 crate 有了两个 binary，裸跑 `cargo run` 会因为
 # 无法判断跑哪个而直接报错。主程序始终是 kiro-rs，显式声明掉这个摩擦。
