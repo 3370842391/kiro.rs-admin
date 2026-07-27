@@ -369,20 +369,17 @@ async fn main() {
     // 每小时一轮 —— 与线上约每小时一次的封号节奏同量级，不必更频繁。
     {
         let manager = token_manager.clone();
-        let retention =
-            std::time::Duration::from_secs(u64::from(config.dead_credential_retention_hours) * 3600);
         tokio::spawn(async move {
             let hour = std::time::Duration::from_secs(3600);
             // 启动后先等一会：此时 credentials.json 刚加载完，让回填的持久化先落地
             tokio::time::sleep(std::time::Duration::from_secs(120)).await;
             loop {
-                let removed = manager.cleanup_dead_credentials(retention);
+                // 每轮重新读取，管理端改完保留期后下一轮即生效，无需重启
+                let hours = u64::from(manager.dead_credential_retention_hours());
+                let removed = manager
+                    .cleanup_dead_credentials(std::time::Duration::from_secs(hours * 3600));
                 if removed > 0 {
-                    tracing::info!(
-                        "已清理 {} 个超过 {} 小时保留期的判死凭据",
-                        removed,
-                        retention.as_secs() / 3600
-                    );
+                    tracing::info!("已清理 {} 个超过 {} 小时保留期的判死凭据", removed, hours);
                 }
                 tokio::time::sleep(hour).await;
             }

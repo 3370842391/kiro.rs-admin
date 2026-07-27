@@ -15,6 +15,7 @@ function credential(partial: Partial<CredentialStatusItem>): CredentialStatusIte
 const NO_FILTER: CredentialFilterCriteria = {
   groupFilter: '',
   searchQuery: '',
+  showDisabled: true,
   tierFilter: new Set<Tier>(),
 }
 
@@ -62,6 +63,17 @@ describe('filterCredentials', () => {
       searchQuery: 'bob',
     })
     expect(ids(out)).toEqual([2])
+  })
+
+  test('hides disabled accounts when the toggle is off', () => {
+    // 判死账号会在保留期内留在池子里（按线上封号速率可能上百条），
+    // 关掉开关只看在服务的号。
+    const withDisabled = [
+      credential({ id: 1, email: 'live@mail.com' }),
+      credential({ id: 2, email: 'dead@mail.com', disabled: true }),
+    ]
+    expect(ids(filterCredentials(withDisabled, NO_FILTER))).toEqual([1, 2])
+    expect(ids(filterCredentials(withDisabled, { ...NO_FILTER, showDisabled: false }))).toEqual([1])
   })
 
   test('does not mutate the input array', () => {

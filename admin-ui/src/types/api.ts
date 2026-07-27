@@ -59,6 +59,19 @@ export interface CredentialStatusItem {
    * 「回填」口径提示，否则用户看到的是「升级后经过的时长」。
    */
   addedAt?: string
+  /**
+   * `addedAt` 是否为加载时回填值。
+   *
+   * 为真时不得把它当作真实加入时刻展示：本功能上线时所有存量凭据会拿到同一个
+   * 回填时间戳，界面若直接算差值，会把「升级后经过的时长」显示成账号存活时长。
+   */
+  addedAtBackfilled?: boolean
+  /**
+   * 判死后是否参与保留期自动清理。
+   *
+   * false 表示只禁用、不会被后台删除 —— 手工添加的账号通常是唯一一份，删掉不可恢复。
+   */
+  deleteOnForbidden?: boolean
   /** 判死时间（RFC3339）。非空即代表该号已被上游封禁。 */
   diedAt?: string
   hasProxy: boolean

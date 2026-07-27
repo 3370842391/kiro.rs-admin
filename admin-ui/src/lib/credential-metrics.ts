@@ -80,42 +80,84 @@ function humanizeDuration(ms: number): string {
   return `${Math.floor(hours / 24)} 天`
 }
 
-/** 账号存活状态。`unknown` 表示后端没给出加入时间，界面上不能编一个数出来。 */
+/** 账号存活状态。`unknown` 表示拿不到可信的加入时间，界面上不能编一个数出来。 */
 export interface CredentialLifespan {
-  /** 已判死则为死亡时刻的存活时长，否则为「至今」的存活时长。 */
   label: string
-  kind: 'alive' | 'dead' | 'unknown'
+  /**
+   * - `alive` 正在服务，时长持续增长
+   * - `dead` 403 判死，时长定格在死亡瞬间
+   * - `stopped` 已禁用但不是判死（手动禁用 / 额度耗尽等），停止计时
+   * - `unknown` 无可信加入时间，不展示时长
+   */
+  kind: 'alive' | 'dead' | 'stopped' | 'unknown'
+}
+
+export interface CredentialLifespanInput {
+  addedAt?: string
+  /** `addedAt` 是否为升级时回填值。为真时不能拿它算存活时长。 */
+  addedAtBackfilled?: boolean
+  diedAt?: string
+  /** 账号是否被禁用。禁用的号不该继续累加存活时长。 */
+  disabled?: boolean
 }
 
 /**
  * 计算账号存活时长。
  *
- * 判死的号用 `diedAt - addedAt`（定格在死亡瞬间，不再随时间增长）；活着的号用
- * `now - addedAt`。两者文案必须能区分，否则「存活 58 分钟」到底是还活着还是已经
- * 死了看不出来。
+ * 三条容易搞错的规则，都是线上踩出来的：
  *
- * `addedAt` 缺失时返回 `unknown` 而不是回退到 0——号池升级前的凭据由后端回填
- * 加入时间，那种情况下这里能拿到值；真的拿不到值时显示「未知」比显示一个假数字好。
+ * 1. **禁用的号不能继续计时。** 之前只看 `diedAt`，于是被手动禁用/额度耗尽禁用的
+ *    账号仍显示「已存活 N 小时」并一直往上涨——号早就不服务了。
+ * 2. **回填的 `addedAt` 不能当真实加入时间。** 本功能上线时所有存量凭据会拿到同一个
+ *    回填时间戳，直接算差值等于展示「升级后经过的时长」，线上出现过所有账号都显示
+ *    「已存活 10 小时」的情况。
+ * 3. **判死时长要定格。** 用 `diedAt - addedAt` 而非 `now - addedAt`，否则死号的
+ *    「存活时长」会随时间一直变大。
  */
 export function formatCredentialLifespan(
-  addedAt: string | undefined,
-  diedAt: string | undefined,
+  input: CredentialLifespanInput,
   nowMs = Date.now(),
 ): CredentialLifespan {
+  const { addedAt, addedAtBackfilled, diedAt, disabled } = input
   const addedMs = addedAt ? Date.parse(addedAt) : NaN
-  if (!Number.isFinite(addedMs)) return { kind: 'unknown', label: '未知' }
-
   const diedMs = diedAt ? Date.parse(diedAt) : NaN
+  const hasTrustedStart = Number.isFinite(addedMs) && !addedAtBackfilled
+
+  // 判死优先：即使 addedAt 不可信，「已封号」这个事实本身也要说出来
   if (Number.isFinite(diedMs)) {
-    // 时钟回拨或数据异常导致死亡早于加入时，按 0 处理而不是显示负数
-    return {
-      kind: 'dead',
-      label: `存活 ${humanizeDuration(diedMs - addedMs)}后死亡`,
-    }
+    if (!hasTrustedStart) return { kind: 'dead', label: '已封号' }
+    // 时钟回拨或数据异常导致死亡早于加入时按 0 处理，不显示负数
+    return { kind: 'dead', label: `存活 ${humanizeDuration(diedMs - addedMs)}后死亡` }
   }
 
-  if (!Number.isFinite(nowMs)) return { kind: 'unknown', label: '未知' }
+  // 禁用但没有 diedAt：不是 403 判死，是手动禁用或额度耗尽。停止计时。
+  if (disabled) return { kind: 'stopped', label: '已停用' }
+
+  if (!hasTrustedStart || !Number.isFinite(nowMs)) {
+    return { kind: 'unknown', label: '加入时间未知' }
+  }
   return { kind: 'alive', label: `已存活 ${humanizeDuration(nowMs - addedMs)}` }
+}
+
+/**
+ * 判死账号距离被自动清理还剩多久。
+ *
+ * 返回 `null` 表示不适用：没判死、或该账号不参与自动清理（手工添加的号只禁用不删）。
+ */
+export function formatCleanupCountdown(
+  diedAt: string | undefined,
+  retentionHours: number | undefined,
+  autoDelete: boolean | undefined,
+  nowMs = Date.now(),
+): string | null {
+  if (!diedAt || !autoDelete) return null
+  if (!Number.isFinite(retentionHours) || (retentionHours ?? 0) <= 0) return null
+  const diedMs = Date.parse(diedAt)
+  if (!Number.isFinite(diedMs) || !Number.isFinite(nowMs)) return null
+
+  const remaining = diedMs + (retentionHours as number) * 3_600_000 - nowMs
+  if (remaining <= 0) return '待清理'
+  return `${humanizeDuration(remaining)}后清理`
 }
 
 export function connectionLabel(hasProxy: boolean): string {

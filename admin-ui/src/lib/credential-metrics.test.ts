@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   connectionLabel,
   formatBalanceFreshness,
+  formatCleanupCountdown,
   formatCredentialLifespan,
   formatRpmMetric,
   formatRpmUtilization,
@@ -55,50 +56,117 @@ describe('credential metrics formatting', () => {
     const now = Date.parse('2026-07-22T12:00:00.000Z')
 
     test('counts up from the join time while the account is alive', () => {
-      expect(formatCredentialLifespan('2026-07-22T11:59:30.000Z', undefined, now)).toEqual({
-        kind: 'alive',
-        label: '已存活 30 秒',
-      })
-      expect(formatCredentialLifespan('2026-07-22T11:02:00.000Z', undefined, now)).toEqual({
-        kind: 'alive',
-        label: '已存活 58 分钟',
-      })
-      expect(formatCredentialLifespan('2026-07-19T12:00:00.000Z', undefined, now)).toEqual({
-        kind: 'alive',
-        label: '已存活 3 天',
-      })
+      expect(
+        formatCredentialLifespan({ addedAt: '2026-07-22T11:59:30.000Z' }, now),
+      ).toEqual({ kind: 'alive', label: '已存活 30 秒' })
+      expect(
+        formatCredentialLifespan({ addedAt: '2026-07-22T11:02:00.000Z' }, now),
+      ).toEqual({ kind: 'alive', label: '已存活 58 分钟' })
+      expect(
+        formatCredentialLifespan({ addedAt: '2026-07-19T12:00:00.000Z' }, now),
+      ).toEqual({ kind: 'alive', label: '已存活 3 天' })
     })
 
     test('freezes at the moment of death once the account is banned', () => {
       // 线上观察到的典型寿命：约 58 分钟后被封
-      const result = formatCredentialLifespan(
-        '2026-07-22T10:00:00.000Z',
-        '2026-07-22T10:58:00.000Z',
-        now,
-      )
-      expect(result).toEqual({ kind: 'dead', label: '存活 58 分钟后死亡' })
+      expect(
+        formatCredentialLifespan(
+          { addedAt: '2026-07-22T10:00:00.000Z', diedAt: '2026-07-22T10:58:00.000Z' },
+          now,
+        ),
+      ).toEqual({ kind: 'dead', label: '存活 58 分钟后死亡' })
     })
 
     test('dead label does not drift as time passes', () => {
-      const args = ['2026-07-22T10:00:00.000Z', '2026-07-22T10:58:00.000Z'] as const
-      const early = formatCredentialLifespan(args[0], args[1], now)
-      const later = formatCredentialLifespan(args[0], args[1], now + 86_400_000)
-      expect(later).toEqual(early)
+      const input = {
+        addedAt: '2026-07-22T10:00:00.000Z',
+        diedAt: '2026-07-22T10:58:00.000Z',
+      }
+      expect(formatCredentialLifespan(input, now + 86_400_000)).toEqual(
+        formatCredentialLifespan(input, now),
+      )
+    })
+
+    /**
+     * 线上 bug：被手动禁用/额度耗尽禁用的账号仍显示「已存活 N 小时」并持续增长。
+     * 号早就不服务了，计时必须停。
+     */
+    test('a disabled account stops counting even without a death time', () => {
+      expect(
+        formatCredentialLifespan(
+          { addedAt: '2026-07-22T10:00:00.000Z', disabled: true },
+          now,
+        ),
+      ).toEqual({ kind: 'stopped', label: '已停用' })
+    })
+
+    /**
+     * 线上 bug：本功能上线时所有存量凭据拿到同一个回填时间戳，界面直接算差值，
+     * 于是 40 个账号全部显示「已存活 10 小时」—— 那是升级后经过的时长，不是账号寿命。
+     */
+    test('a backfilled join time is never used to compute a duration', () => {
+      expect(
+        formatCredentialLifespan(
+          { addedAt: '2026-07-22T02:00:00.000Z', addedAtBackfilled: true },
+          now,
+        ),
+      ).toEqual({ kind: 'unknown', label: '加入时间未知' })
+
+      // 判死事实仍要说出来，只是不给具体时长
+      expect(
+        formatCredentialLifespan(
+          {
+            addedAt: '2026-07-22T02:00:00.000Z',
+            addedAtBackfilled: true,
+            diedAt: '2026-07-22T11:00:00.000Z',
+          },
+          now,
+        ),
+      ).toEqual({ kind: 'dead', label: '已封号' })
     })
 
     test('reports unknown instead of inventing a number', () => {
-      expect(formatCredentialLifespan(undefined, undefined, now).kind).toBe('unknown')
-      expect(formatCredentialLifespan('not-a-date', undefined, now).kind).toBe('unknown')
+      expect(formatCredentialLifespan({}, now).kind).toBe('unknown')
+      expect(formatCredentialLifespan({ addedAt: 'not-a-date' }, now).kind).toBe('unknown')
     })
 
     test('clock skew does not produce a negative duration', () => {
       // 死亡时间早于加入时间（时钟回拨 / 数据异常）时按 0 处理，不显示负数
-      const result = formatCredentialLifespan(
-        '2026-07-22T11:00:00.000Z',
-        '2026-07-22T10:00:00.000Z',
-        now,
+      expect(
+        formatCredentialLifespan(
+          { addedAt: '2026-07-22T11:00:00.000Z', diedAt: '2026-07-22T10:00:00.000Z' },
+          now,
+        ),
+      ).toEqual({ kind: 'dead', label: '存活 0 秒后死亡' })
+    })
+  })
+
+  describe('cleanup countdown', () => {
+    const now = Date.parse('2026-07-22T12:00:00.000Z')
+
+    test('counts down from death time plus retention window', () => {
+      // 10:00 判死 + 24h 保留 → 距清理还有 22 小时
+      expect(formatCleanupCountdown('2026-07-22T10:00:00.000Z', 24, true, now)).toBe(
+        '22 小时后清理',
       )
-      expect(result).toEqual({ kind: 'dead', label: '存活 0 秒后死亡' })
+    })
+
+    test('shows pending once the window has elapsed', () => {
+      expect(formatCleanupCountdown('2026-07-20T10:00:00.000Z', 24, true, now)).toBe('待清理')
+    })
+
+    /** 手工添加的账号只禁用不删（通常是唯一一份），不该显示倒计时。 */
+    test('returns null when the account is not subject to auto deletion', () => {
+      expect(formatCleanupCountdown('2026-07-22T10:00:00.000Z', 24, false, now)).toBeNull()
+    })
+
+    test('returns null for accounts that are not dead', () => {
+      expect(formatCleanupCountdown(undefined, 24, true, now)).toBeNull()
+    })
+
+    test('returns null when retention is unknown or invalid', () => {
+      expect(formatCleanupCountdown('2026-07-22T10:00:00.000Z', undefined, true, now)).toBeNull()
+      expect(formatCleanupCountdown('2026-07-22T10:00:00.000Z', 0, true, now)).toBeNull()
     })
   })
 })

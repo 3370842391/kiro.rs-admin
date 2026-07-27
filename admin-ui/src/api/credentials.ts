@@ -704,6 +704,8 @@ export interface LogGovernanceConfig {
   traceEnabled: boolean
   traceRetentionDays: number
   usageLogRetentionDays: number
+  /** 判死凭据保留小时数：403 封号后先禁用留档，超过该时长才真正删除。 */
+  deadCredentialRetentionHours: number
   errorSnapshotEnabled: boolean
   errorSnapshotRetentionDays: number
   errorSnapshotMaxStorageGb: number

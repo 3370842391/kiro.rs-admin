@@ -1227,6 +1227,10 @@ pub struct CredentialEntrySnapshot {
     pub last_used_at: Option<String>,
     /// 加入号池的时间（RFC3339）。升级前的旧凭据为加载时回填值。
     pub added_at: Option<String>,
+    /// `added_at` 是否为回填值（非真实加入时刻）。
+    pub added_at_backfilled: bool,
+    /// 判死后是否参与保留期自动清理（手工添加的号只禁用不删）。
+    pub delete_on_forbidden: bool,
     /// 判死时间（RFC3339）。非空即表示该号已被封禁。
     pub died_at: Option<String>,
     /// 是否配置了凭据级代理
@@ -1342,6 +1346,10 @@ pub struct MultiTokenManager {
     account_throttle_failover: AtomicBool,
     /// 账号级风控冷却时长（秒，运行时可修改）
     account_throttle_cooldown_secs: AtomicU64,
+    /// 判死凭据的保留时长（小时，运行时可修改）。
+    ///
+    /// 清理调度器每轮读取它，所以管理端改完立刻生效、不必重启。
+    dead_credential_retention_hours: AtomicU64,
     /// 普通 429 重试策略模式（运行时可修改）
     retry_mode: Mutex<RetryMode>,
     /// 普通 429 自定义策略（运行时可修改）
@@ -1527,6 +1535,9 @@ impl MultiTokenManager {
                 // 无从判断，因此这里只保证字段非空、由文案提示口径（见 credential-card）。
                 if cred.added_at.is_none() {
                     cred.added_at = Some(Utc::now().to_rfc3339());
+                    // 标记成回填：所有存量凭据会拿到同一个时间戳，展示层必须能区分，
+                    // 否则会把「升级后经过的时长」当成账号存活时长。
+                    cred.added_at_backfilled = true;
                     has_new_ids = true; // 复用「需要回写」标志，触发一次持久化
                 }
                 // disabled_reason 是运行时状态、不持久化。重启后已判死的凭据只剩
@@ -1615,6 +1626,7 @@ impl MultiTokenManager {
         let proxy_balancing_mode = config.proxy_balancing_mode.clone();
         let throttle_failover = config.account_throttle_failover;
         let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
+        let dead_retention_hours = config.dead_credential_retention_hours.max(1);
         let retry_mode = config.retry_mode;
         let retry_policy = config.retry_policy.clone();
         let endpoint_chains = config.endpoint_chains.clone();
@@ -1654,6 +1666,7 @@ impl MultiTokenManager {
             proxy_balancing_mode: Mutex::new(proxy_balancing_mode),
             account_throttle_failover: AtomicBool::new(throttle_failover),
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
+            dead_credential_retention_hours: AtomicU64::new(u64::from(dead_retention_hours)),
             retry_mode: Mutex::new(retry_mode),
             retry_policy: Mutex::new(retry_policy),
             endpoint_chains: Mutex::new(endpoint_chains),
@@ -3055,6 +3068,8 @@ impl MultiTokenManager {
                         .to_string()
                     }),
                     added_at: e.credentials.added_at.clone(),
+                    added_at_backfilled: e.credentials.added_at_backfilled,
+                    delete_on_forbidden: e.credentials.delete_on_forbidden,
                     died_at: e.credentials.died_at.clone(),
                     throttled_remaining_secs: e
                         .throttled_until
@@ -3990,6 +4005,8 @@ impl MultiTokenManager {
         // 存活时长的计时起点。这里是全项目唯一的新增凭据入口（admin 手工添加、
         // key_supplier 自动采购、批量导入都经过本函数），所以打一处即可。
         validated_cred.added_at = Some(Utc::now().to_rfc3339());
+        // 新增凭据的时间是真实的，不是回填
+        validated_cred.added_at_backfilled = false;
         validated_cred.died_at = None;
         validated_cred.priority = new_cred.priority;
         validated_cred.rpm_limit = new_cred.rpm_limit;
@@ -4533,6 +4550,17 @@ impl MultiTokenManager {
 
         let has_available = self.entries.lock().iter().any(|entry| !entry.disabled);
         Ok(Some(has_available))
+    }
+
+    /// 判死凭据的保留时长（小时）。
+    pub fn dead_credential_retention_hours(&self) -> u32 {
+        self.dead_credential_retention_hours.load(Ordering::Relaxed) as u32
+    }
+
+    /// 设置判死凭据的保留时长（小时）。清理调度器下一轮即采用新值。
+    pub fn set_dead_credential_retention_hours(&self, hours: u32) {
+        self.dead_credential_retention_hours
+            .store(u64::from(hours.max(1)), Ordering::Relaxed);
     }
 
     /// 清理已过保留期的死号，返回删除条数。
@@ -8249,6 +8277,57 @@ mod tests {
             .map(|c| c.id.unwrap())
             .collect();
         assert_eq!(remaining, vec![2, 3, 4]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 保留期可在运行时调整，清理调度器每轮读取新值，无需重启。
+    #[test]
+    fn dead_credential_retention_is_adjustable_at_runtime() {
+        let path = tmp_creds_path("retention_runtime");
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![api_key_credential(1, "ksk_retention", true)],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(manager.dead_credential_retention_hours(), 24, "默认 24 小时");
+        manager.set_dead_credential_retention_hours(6);
+        assert_eq!(manager.dead_credential_retention_hours(), 6);
+        // 0 会让所有死号立刻被删，收紧到最小 1 小时
+        manager.set_dead_credential_retention_hours(0);
+        assert_eq!(manager.dead_credential_retention_hours(), 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 回填的 `added_at` 必须打标记。
+    ///
+    /// 线上事故：本功能上线时所有存量凭据拿到同一个回填时间戳，前端直接算差值，
+    /// 40 个账号全部显示「已存活 10 小时」—— 那是升级后经过的时长，不是账号寿命。
+    #[test]
+    fn backfilled_added_at_is_flagged_but_real_one_is_not() {
+        let path = tmp_creds_path("backfill_flag");
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![api_key_credential(1, "ksk_backfilled", false)],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+
+        let entry = &manager.snapshot().entries[0];
+        assert!(entry.added_at.is_some());
+        assert!(entry.added_at_backfilled, "加载时回填的必须打标记");
+
+        // 标记要落盘，重启后前端仍能区分真假
+        let persisted: Vec<KiroCredentials> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(persisted[0].added_at_backfilled);
 
         let _ = std::fs::remove_file(&path);
     }

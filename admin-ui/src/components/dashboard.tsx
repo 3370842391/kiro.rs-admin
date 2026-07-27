@@ -1280,6 +1280,28 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   <span className="hidden sm:inline">列表</span>
                 </button>
               </div>
+              {/* 显示已禁用：判死账号会在保留期内留在池子里，按线上封号速率可能积压
+                  上百条。关掉只看在服务的号，与「治理设置」里的保留期形成双重控制。 */}
+              <button
+                type="button"
+                onClick={() => filters.setShowDisabled(!filters.showDisabled)}
+                aria-pressed={filters.showDisabled}
+                title={
+                  filters.showDisabled
+                    ? "隐藏已禁用账号，只看在服务的号"
+                    : "显示已禁用账号（含判死留档）"
+                }
+                className={`inline-flex h-8 w-full items-center justify-center gap-1 rounded-full border border-border bg-card/60 px-3 text-sm backdrop-blur transition-colors hover:bg-accent sm:w-auto ${
+                  filters.showDisabled ? "text-muted-foreground" : "text-foreground"
+                }`}
+              >
+                {filters.showDisabled ? (
+                  <Eye className="h-3.5 w-3.5" />
+                ) : (
+                  <EyeOff className="h-3.5 w-3.5" />
+                )}
+                <span>含已禁用</span>
+              </button>
               <button
                 type="button"
                 onClick={() => changePrivacyMode(!privacyMode)}

@@ -123,6 +123,8 @@ export const GROUP_FILTER_NONE = '__none__'
 export interface CredentialFilters {
   /** 按当前条件过滤，供分页前使用。 */
   apply: (credentials: CredentialStatusItem[]) => CredentialStatusItem[]
+  setShowDisabled: (show: boolean) => void
+  showDisabled: boolean
   /** 是否有任一条件生效，用于决定是否展示「已筛选」提示。 */
   active: boolean
   /** 清空分级多选。比暴露原始 setter 更窄，调用方无法误传出非法集合。 */
@@ -138,6 +140,13 @@ export interface CredentialFilters {
 /** 三个筛选维度的取值，与 UI 状态解耦以便直接测试。 */
 export interface CredentialFilterCriteria {
   groupFilter: string
+  /**
+   * 是否在列表里显示已禁用账号。
+   *
+   * 默认显示。判死账号会在保留期内留在池子里（供查看存活时长与死因），按线上封号
+   * 速率可能积压上百条；关掉这个开关能只看在服务的号。
+   */
+  showDisabled: boolean
   searchQuery: string
   tierFilter: Set<Tier>
 }
@@ -150,9 +159,12 @@ export interface CredentialFilterCriteria {
  */
 export function filterCredentials(
   credentials: CredentialStatusItem[],
-  { groupFilter, searchQuery, tierFilter }: CredentialFilterCriteria,
+  { groupFilter, searchQuery, showDisabled, tierFilter }: CredentialFilterCriteria,
 ): CredentialStatusItem[] {
   let out = credentials
+  if (!showDisabled) {
+    out = out.filter((c) => !c.disabled)
+  }
   if (groupFilter) {
     out =
       groupFilter === GROUP_FILTER_NONE
@@ -183,6 +195,9 @@ export function useCredentialFilters(): CredentialFilters {
   const [groupFilter, setGroupFilter] = useState('')
   const [tierFilter, setTierFilter] = useState<Set<Tier>>(new Set())
   const [searchQuery, setSearchQuery] = useState('')
+  // 默认显示已禁用：隐藏账号是「我主动想少看点」，不该是默认行为——
+  // 否则号被判死后从列表里消失，会被误认为丢了。
+  const [showDisabled, setShowDisabled] = useState(true)
 
   const clearTiers = useCallback(() => setTierFilter(new Set()), [])
 
@@ -197,13 +212,14 @@ export function useCredentialFilters(): CredentialFilters {
 
   const apply = useCallback(
     (credentials: CredentialStatusItem[]) =>
-      filterCredentials(credentials, { groupFilter, searchQuery, tierFilter }),
-    [groupFilter, searchQuery, tierFilter],
+      filterCredentials(credentials, { groupFilter, searchQuery, showDisabled, tierFilter }),
+    [groupFilter, searchQuery, showDisabled, tierFilter],
   )
 
   const active = useMemo(
-    () => Boolean(groupFilter) || tierFilter.size > 0 || searchQuery.trim() !== '',
-    [groupFilter, searchQuery, tierFilter],
+    () =>
+      Boolean(groupFilter) || tierFilter.size > 0 || searchQuery.trim() !== '' || !showDisabled,
+    [groupFilter, searchQuery, showDisabled, tierFilter],
   )
 
   return {
@@ -214,6 +230,8 @@ export function useCredentialFilters(): CredentialFilters {
     searchQuery,
     setGroupFilter,
     setSearchQuery,
+    setShowDisabled,
+    showDisabled,
     tierFilter,
     toggleTier,
   }

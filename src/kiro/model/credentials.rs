@@ -180,11 +180,19 @@ pub struct KiroCredentials {
     /// 加入号池的时间（RFC3339）。
     ///
     /// 升级前就存在的凭据文件没有该字段，`MultiTokenManager::new` 会在加载时按
-    /// 「首次见到」回填。回填值不是真实加入时间，展示层需要能区分（否则会把
-    /// 「升级后经过的时长」误读成账号存活时长）。
+    /// 「首次见到」回填，同时把 [`Self::added_at_backfilled`] 置真。
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub added_at: Option<String>,
+
+    /// `added_at` 是否为加载时回填值（而非真实加入时刻）。
+    ///
+    /// 必须显式标记：本功能上线时所有存量凭据会拿到同一个回填时间戳，若不加区分，
+    /// 界面会把「升级后经过的时长」当成账号存活时长展示 —— 线上确实出现过所有账号
+    /// 都显示「已存活 10 小时」的情况。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub added_at_backfilled: bool,
 
     /// 判定死亡的时间（RFC3339）。
     ///
@@ -1020,6 +1028,7 @@ mod tests {
             source_channel: None,
             delete_on_forbidden: false,
             added_at: None,
+            added_at_backfilled: false,
             died_at: None,
         };
 
@@ -1264,6 +1273,7 @@ mod tests {
             source_channel: None,
             delete_on_forbidden: false,
             added_at: None,
+            added_at_backfilled: false,
             died_at: None,
         };
 
@@ -1307,6 +1317,7 @@ mod tests {
             source_channel: None,
             delete_on_forbidden: false,
             added_at: None,
+            added_at_backfilled: false,
             died_at: None,
         };
 
@@ -1433,6 +1444,7 @@ mod tests {
             source_channel: None,
             delete_on_forbidden: false,
             added_at: None,
+            added_at_backfilled: false,
             died_at: None,
         };
 

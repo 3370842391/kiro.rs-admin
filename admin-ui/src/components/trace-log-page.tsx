@@ -517,6 +517,7 @@ function GovernanceButton() {
   const { mutate, isPending } = useSetLogGovernanceConfig()
   const [traceDays, setTraceDays] = useState('')
   const [usageDays, setUsageDays] = useState('')
+  const [deadHours, setDeadHours] = useState('')
   const [snapshotDays, setSnapshotDays] = useState('')
   const [snapshotMaxGb, setSnapshotMaxGb] = useState('')
   const [snapshotMinFreeGb, setSnapshotMinFreeGb] = useState('')
@@ -540,7 +541,8 @@ function GovernanceButton() {
       | 'usageLogRetentionDays'
       | 'errorSnapshotRetentionDays'
       | 'errorSnapshotMaxStorageGb'
-      | 'errorSnapshotMinFreeDiskGb',
+      | 'errorSnapshotMinFreeDiskGb'
+      | 'deadCredentialRetentionHours',
     raw: string,
     max: number,
     label: string,
@@ -626,6 +628,41 @@ function GovernanceButton() {
             className="h-7 text-xs"
           />
           <Button type="submit" size="sm" variant="outline" className="h-7 text-xs" disabled={isPending || !usageDays.trim()}>
+            保存
+          </Button>
+        </form>
+        <DropdownMenuLabel className="pt-1">
+          判死账号保留小时数（当前 {cfg?.deadCredentialRetentionHours ?? '—'}）
+        </DropdownMenuLabel>
+        <div className="px-2 pb-1 text-[11px] leading-snug text-muted-foreground">
+          403 封号后账号先禁用留档，便于查看存活时长与死因；超过该时长由后台清理。
+          仅清理自动采购的账号，手工添加的只禁用不自动删。
+        </div>
+        <form
+          onSubmit={(e) =>
+            submitNumber(e, 'deadCredentialRetentionHours', deadHours, 8760, '判死保留小时数', () =>
+              setDeadHours(''),
+            )
+          }
+          className="flex items-center gap-1.5 px-2 pb-2"
+        >
+          <Input
+            type="number"
+            min={1}
+            max={8760}
+            placeholder="小时"
+            value={deadHours}
+            onChange={(e) => setDeadHours(e.target.value)}
+            disabled={isPending}
+            className="h-7 text-xs"
+          />
+          <Button
+            type="submit"
+            size="sm"
+            variant="outline"
+            className="h-7 text-xs"
+            disabled={isPending || !deadHours.trim()}
+          >
             保存
           </Button>
         </form>

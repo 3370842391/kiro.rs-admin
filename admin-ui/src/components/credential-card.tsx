@@ -56,6 +56,7 @@ import {
   formatSuccessRate,
   formatTokenState,
   formatCredentialLifespan,
+  formatCleanupCountdown,
 } from "@/lib/credential-metrics";
 import { formatCreditAmount } from "@/lib/credential-summary";
 import {
@@ -64,6 +65,7 @@ import {
   concurrencyTone,
 } from "@/lib/credential-concurrency";
 import {
+  useLogGovernanceConfig,
   useSetDisabled,
   useSetPriority,
   useResetFailure,
@@ -111,6 +113,22 @@ function formatLastUsed(lastUsedAt: string | null): string {
   const h = Math.floor(m / 60);
   if (h < 24) return `${h} 小时前`;
   return `${Math.floor(h / 24)} 天前`;
+}
+
+/** 存活时长的 hover 说明。回填的加入时间必须点明，否则会被当成真实入池时刻。 */
+function lifespanHint(
+  credential: CredentialStatusItem,
+  kind: "alive" | "dead" | "stopped" | "unknown",
+): string {
+  if (kind === "dead") {
+    return credential.addedAtBackfilled
+      ? `已被上游封号（封号于 ${credential.diedAt}）。加入时间为升级时回填，无法算出真实存活时长。`
+      : `加入于 ${credential.addedAt}，封号于 ${credential.diedAt}`;
+  }
+  if (kind === "stopped") {
+    return "账号已禁用但不是被上游封号（手动禁用或额度耗尽），存活时长停止累计";
+  }
+  return `加入于 ${credential.addedAt}`;
 }
 
 function formatResetDate(ts: number | null): string {
@@ -286,6 +304,9 @@ function ConcurrencyGauge({ inFlight }: { inFlight: number }) {
  * 这里压成一行低对比度文本，信息密度不减但视觉噪音大幅下降。
  */
 function CredentialMetaLine({ credential }: { credential: CredentialStatusItem }) {
+  // 共享 queryKey，多张卡片命中同一份缓存，不会各发一次请求
+  const { data: governance } = useLogGovernanceConfig();
+  const deadRetentionHours = governance?.deadCredentialRetentionHours;
   const region =
     credential.authRegion && credential.apiRegion
       ? credential.authRegion === credential.apiRegion
@@ -327,17 +348,30 @@ function CredentialMetaLine({ credential }: { credential: CredentialStatusItem }
       hint: `来源渠道：${credential.sourceChannel}`,
     });
   }
-  // 存活时长：判死的号定格在死亡瞬间，活着的号持续增长。
-  // 号池升级前就存在的凭据，addedAt 是后端加载时的回填值——那种情况下这里显示的
-  // 是「升级后经过的时长」而非真实存活时长，用 hint 说清楚，避免被当成账号寿命。
-  const lifespan = formatCredentialLifespan(credential.addedAt, credential.diedAt);
+  // 存活时长。三种状态各自的口径见 formatCredentialLifespan 的说明：
+  // 判死定格在死亡瞬间、禁用停止计时、回填的加入时间不参与计算。
+  const lifespan = formatCredentialLifespan({
+    addedAt: credential.addedAt,
+    addedAtBackfilled: credential.addedAtBackfilled,
+    diedAt: credential.diedAt,
+    disabled: credential.disabled,
+  });
   if (lifespan.kind !== "unknown") {
     items.push({
       text: lifespan.label,
-      hint:
-        lifespan.kind === "dead"
-          ? `加入于 ${credential.addedAt}，封号于 ${credential.diedAt}`
-          : `加入于 ${credential.addedAt}。若该账号在本功能上线前就已存在，此处为回填时间，不代表真实加入时刻`,
+      hint: lifespanHint(credential, lifespan.kind),
+    });
+  }
+  // 判死账号补一个清理倒计时，回答「这个号还会在列表里待多久」。
+  const cleanup = formatCleanupCountdown(
+    credential.diedAt,
+    deadRetentionHours,
+    credential.deleteOnForbidden,
+  );
+  if (cleanup) {
+    items.push({
+      text: cleanup,
+      hint: `判死账号保留 ${deadRetentionHours} 小时供查看，之后由后台自动删除。可在请求日志页的「治理设置」里调整。`,
     });
   }
 

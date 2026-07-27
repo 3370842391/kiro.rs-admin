@@ -1310,6 +1310,8 @@ impl AdminService {
                     success_count: entry.success_count,
                     last_used_at: entry.last_used_at.clone(),
                     added_at: entry.added_at.clone(),
+                    added_at_backfilled: entry.added_at_backfilled,
+                    delete_on_forbidden: entry.delete_on_forbidden,
                     died_at: entry.died_at.clone(),
                     has_proxy: entry.has_proxy,
                     proxy_url: entry.proxy_url,
@@ -1947,6 +1949,7 @@ impl AdminService {
             // 两个时间戳都由 token_manager::add_credential 统一打，
             // 这里留空避免多个入口各写一套导致口径不一致。
             added_at: None,
+            added_at_backfilled: false,
             died_at: None,
         };
 
@@ -3266,6 +3269,7 @@ impl AdminService {
                 .as_ref()
                 .map(|r| r.retention_days() as u32)
                 .unwrap_or(cfg.usage_log_retention_days),
+            dead_credential_retention_hours: self.token_manager.dead_credential_retention_hours(),
             error_snapshot_enabled: snapshot_policy.enabled,
             error_snapshot_retention_days: snapshot_policy.retention_days,
             error_snapshot_max_storage_gb: snapshot_policy.max_storage_bytes / GIB,
@@ -3284,6 +3288,7 @@ impl AdminService {
         if req.trace_enabled.is_none()
             && req.trace_retention_days.is_none()
             && req.usage_log_retention_days.is_none()
+            && req.dead_credential_retention_hours.is_none()
             && req.error_snapshot_enabled.is_none()
             && req.error_snapshot_retention_days.is_none()
             && req.error_snapshot_max_storage_gb.is_none()
@@ -3310,6 +3315,15 @@ impl AdminService {
                 }
             }
         }
+        // 死号保留期用小时计（线上约每小时封一批，按天保留会积压上百条），上限一年
+        if let Some(hours) = req.dead_credential_retention_hours {
+            if !(1..=8760).contains(&hours) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "deadCredentialRetentionHours 必须在 1..=8760 内: {}",
+                    hours
+                )));
+            }
+        }
 
         // 先改运行时原子值
         if let Some(enabled) = req.trace_enabled {
@@ -3326,6 +3340,10 @@ impl AdminService {
             if let Some(r) = &self.usage_recorder {
                 r.set_retention_days(days as i64);
             }
+        }
+        if let Some(hours) = req.dead_credential_retention_hours {
+            self.token_manager
+                .set_dead_credential_retention_hours(hours);
         }
         if let Some(store) = &self.error_snapshot_store {
             const GIB: u64 = 1024 * 1024 * 1024;
@@ -3387,6 +3405,9 @@ impl AdminService {
         }
         if let Some(v) = req.usage_log_retention_days {
             config.usage_log_retention_days = v;
+        }
+        if let Some(v) = req.dead_credential_retention_hours {
+            config.dead_credential_retention_hours = v;
         }
         if let Some(v) = req.error_snapshot_enabled {
             config.error_snapshot_enabled = v;
@@ -5143,6 +5164,8 @@ mod tests {
             success_count: 0,
             last_used_at: None,
             added_at: None,
+            added_at_backfilled: false,
+            delete_on_forbidden: false,
             died_at: None,
             has_proxy: false,
             proxy_url: None,

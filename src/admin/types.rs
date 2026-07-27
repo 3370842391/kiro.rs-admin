@@ -100,6 +100,10 @@ pub struct CredentialStatusItem {
     /// 加入时间展示（否则显示的是「升级后经过的时长」）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub added_at: Option<String>,
+    /// `addedAt` 是否为加载时回填值。为真时前端不得把它当作真实加入时刻展示。
+    pub added_at_backfilled: bool,
+    /// 判死后是否参与保留期自动清理。false 表示只禁用、不会被后台删除。
+    pub delete_on_forbidden: bool,
     /// 判死时间（RFC3339）。非空即代表该号已被上游封禁。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub died_at: Option<String>,
@@ -894,6 +898,8 @@ pub struct LogGovernanceConfigResponse {
     pub trace_retention_days: u32,
     /// 用量日志保留天数
     pub usage_log_retention_days: u32,
+    /// 判死凭据的保留时长（小时）。403 封号后凭据先禁用留档，超过该时长才真正删除。
+    pub dead_credential_retention_hours: u32,
     pub error_snapshot_enabled: bool,
     pub error_snapshot_retention_days: u32,
     pub error_snapshot_max_storage_gb: u64,
@@ -914,6 +920,9 @@ pub struct SetLogGovernanceConfigRequest {
     /// 用量日志保留天数，1..=365
     #[serde(default)]
     pub usage_log_retention_days: Option<u32>,
+    /// 判死凭据保留小时数，1..=8760（一年）
+    #[serde(default)]
+    pub dead_credential_retention_hours: Option<u32>,
     #[serde(default)]
     pub error_snapshot_enabled: Option<bool>,
     #[serde(default)]
