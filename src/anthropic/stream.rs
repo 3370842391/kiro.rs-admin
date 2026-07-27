@@ -664,9 +664,17 @@ const STRAY_INVOKE_TOKENS: &[&str] = &["call", "count", "card"];
 /// 设为 16 可在客户端出现大面积刷屏前止血；比较保留行首缩进，避免把正常嵌套代码
 /// 中不同层级的闭合括号误判为同一行。
 const REPEAT_GUARD_TRIP_THRESHOLD: u32 = 16;
-/// Thinking 不是最终正文；相同短单元连续出现 4 次已经足以判定上游退化。
-/// 使用更低阈值可显著减少客户先看到的复读，同时正文仍沿用保守阈值 16。
-const REPEAT_GUARD_THINKING_TRIP_THRESHOLD: u32 = 4;
+/// Thinking 通道的连续复读阈值。
+///
+/// 原值 4 太激进：正常推理里连续出现 4 个相同短行完全可能（分点枚举、重复的过渡词、
+/// 反复的「先看 X」这类自述），把它判成退化会误杀大量正常请求。而 thinking 跳闸的
+/// 代价曾经是**整轮响应连工具调用一起丢弃**，于是一次误判就把客户端的 agentic
+/// 循环打断在半路。
+///
+/// 现在 thinking 跳闸只截断 thinking 通道（见 `thinking_repeat_tripped`），代价小了，
+/// 但阈值本身仍应回到合理区间：12 既能在客户端看到大面积复读前止血，也给正常推理
+/// 留足空间；真正的死循环会迅速越过它，另有周期检测器兜住多行循环形态。
+const REPEAT_GUARD_THINKING_TRIP_THRESHOLD: u32 = 12;
 /// 只对短候选做连续比较，避免复制和比较超大正文。
 const REPEAT_GUARD_MAX_UNIT_BYTES: usize = 512;
 /// 多行周期最多覆盖 8 行；截图中的 `user/assist` 退化循环周期为 4 行。
@@ -1865,7 +1873,14 @@ pub struct StreamContext {
     repeat_guard_run: u32,
     /// 多行周期复读检测；只保存少量完整短行，不保存整段响应。
     repeat_guard_periodic: PeriodicRepeatGuard,
-    /// 复读熔断：是否已经触发过熔断（触发后本轮后续文本一律丢弃，不再吐、不写历史）。
+    /// 复读熔断：thinking 通道是否已跳闸。
+    ///
+    /// 与 `repeat_guard_tripped` 分开：thinking 不是最终交付物，它复读了只需要停掉
+    /// thinking 输出，正文与工具调用必须照常走完。合在一起时一次 thinking 误判会把
+    /// 整轮响应连 tool_use 一起丢掉，客户端的 agentic 循环直接断在半路——SSE 流少了
+    /// `message_stop`，表现为「工具调用凭空消失、会话卡住」。
+    thinking_repeat_tripped: bool,
+    /// 复读熔断：正文通道是否已跳闸（触发后本轮后续文本一律丢弃，不再吐、不写历史）。
     repeat_guard_tripped: bool,
     /// 同一上游流内最近长 Thinking delta 的定长指纹，用于跨事件来源精确抑制完整重放。
     long_thinking_fingerprints: VecDeque<(usize, [u8; 32])>,
@@ -1990,9 +2005,24 @@ impl StreamContext {
         self.terminal_attempt_failure.as_ref()
     }
 
-    /// 上游是否已被通用复读熔断器判定为退化输出。
+    /// 上游正文是否已被复读熔断器判定为退化输出。
+    ///
+    /// 只反映**正文**通道。thinking 通道跳闸见 `thinking_repetition_guard_tripped`——
+    /// 它不算本轮失败，正文与工具调用照常交付，故不进入这个判定。
     pub fn repetition_guard_tripped(&self) -> bool {
         self.repeat_guard_tripped
+    }
+
+    /// thinking 通道是否已被复读熔断器静音。
+    ///
+    /// 与 `repetition_guard_tripped` 分开：thinking 复读只停掉 thinking 输出，
+    /// 本轮仍算成功，不记 error、不中止正文与工具调用。
+    ///
+    /// 仅测试使用：线上可见性由 `repeat_guard_filter` 的 `thinking_only=true`
+    /// 日志字段提供，无需额外的运行时消费者。
+    #[cfg(test)]
+    pub fn thinking_repetition_guard_tripped(&self) -> bool {
+        self.thinking_repeat_tripped
     }
 
     pub(crate) fn accumulated_text(&self) -> &str {
@@ -2045,6 +2075,7 @@ impl StreamContext {
         self.repeat_guard_run = 0;
         self.repeat_guard_periodic = PeriodicRepeatGuard::default();
         self.repeat_guard_tripped = false;
+        self.thinking_repeat_tripped = false;
         self.long_thinking_fingerprints.clear();
         self.tool_json_accumulator = ToolJsonAccumulator::new();
         self.tool_json_error = None;
@@ -2127,6 +2158,7 @@ impl StreamContext {
             repeat_guard_run: 0,
             repeat_guard_periodic: PeriodicRepeatGuard::default(),
             repeat_guard_tripped: false,
+            thinking_repeat_tripped: false,
             long_thinking_fingerprints: VecDeque::new(),
             tool_json_accumulator: ToolJsonAccumulator::new(),
             tool_json_error: None,
@@ -2698,8 +2730,12 @@ impl StreamContext {
     ///
     /// 返回应当继续吐出的文本（跳闸时返回空串）。
     fn repeat_guard_filter(&mut self, text: &str, channel: &'static str) -> String {
-        // 已跳闸：本轮剩余文本全部丢弃，断雪球。
+        // 正文已跳闸：本轮剩余内容全部丢弃，断雪球。
         if self.repeat_guard_tripped {
+            return String::new();
+        }
+        // thinking 已跳闸：只静音 thinking 通道，正文与工具调用继续走完。
+        if channel == "thinking" && self.thinking_repeat_tripped {
             return String::new();
         }
 
@@ -2727,12 +2763,17 @@ impl StreamContext {
                     REPEAT_GUARD_TRIP_THRESHOLD
                 };
                 if self.repeat_guard_run >= trip_threshold {
-                    self.repeat_guard_tripped = true;
+                    if channel == "thinking" {
+                        self.thinking_repeat_tripped = true;
+                    } else {
+                        self.repeat_guard_tripped = true;
+                    }
                     tracing::warn!(
                         message_id = %self.message_id,
                         channel = %channel,
                         repeat_count = self.repeat_guard_run,
                         unit_bytes = line.len(),
+                        thinking_only = channel == "thinking",
                         "upstream repetition guard tripped"
                     );
                     return kept;
@@ -2744,12 +2785,17 @@ impl StreamContext {
             }
 
             if let Some(cycle) = self.repeat_guard_periodic.observe_segment(segment, channel) {
-                self.repeat_guard_tripped = true;
+                if channel == "thinking" {
+                    self.thinking_repeat_tripped = true;
+                } else {
+                    self.repeat_guard_tripped = true;
+                }
                 tracing::warn!(
                     message_id = %self.message_id,
                     channel = %channel,
                     period_lines = cycle.period,
                     cycle_count = cycle.cycles,
+                    thinking_only = channel == "thinking",
                     "upstream periodic repetition guard tripped"
                 );
                 return kept;
@@ -3687,6 +3733,8 @@ impl StreamContext {
                 cache_creation,
                 cache_read,
             );
+            // 只留 content_block_stop：`error` 事件本身就是 SSE 流的终止事件，
+            // 后面不再跟 message_delta / message_stop。本仓库所有终态错误路径统一如此。
             terminal_events.retain(|event| event.event == "content_block_stop");
             events.extend(terminal_events);
             events.push(SseEvent::new(
@@ -8100,16 +8148,28 @@ mod tests {
             thinking.matches('}').count() < 32,
             "thinking flood was not stopped: {thinking:?}"
         );
-        assert!(ctx.repetition_guard_tripped());
-        assert!(!events.iter().any(|event| event.event == "message_delta"));
-        assert!(!events.iter().any(|event| event.event == "message_stop"));
-        assert!(events.iter().any(|event| {
-            event.event == "error" && event.data["error"]["type"] == "upstream_repetition_guard"
-        }));
+        // thinking 复读只静音 thinking 通道，本轮不算失败：
+        // 正文与工具调用必须照常交付，否则一次 thinking 误判就会打断客户端的
+        // agentic 循环（这是线上「工具调用凭空消失、会话卡住」的成因）。
+        assert!(ctx.thinking_repetition_guard_tripped());
+        assert!(
+            !ctx.repetition_guard_tripped(),
+            "thinking 复读不得把整轮判为退化"
+        );
+        assert!(
+            !events.iter().any(|event| {
+                event.event == "error" && event.data["error"]["type"] == "upstream_repetition_guard"
+            }),
+            "thinking 复读不得产生终态 error"
+        );
+        assert!(
+            events.iter().any(|event| event.event == "message_stop"),
+            "thinking 复读后本轮仍须正常收尾"
+        );
     }
 
     #[test]
-    fn repeat_guard_stops_native_thinking_before_fifth_duplicate() {
+    fn repeat_guard_stops_native_thinking_at_threshold() {
         let mut ctx = StreamContext::new_with_thinking(
             "test-model",
             1,
@@ -8130,11 +8190,53 @@ mod tests {
         }
 
         let thinking = collect_thinking_content(&events);
+        // 阈值 12：正常推理里连续几个相同短行（分点、过渡词）不该被判成退化，
+        // 但真正的死循环会迅速越过它。
         assert!(
-            thinking.matches("用户要求直接实现。").count() <= 4,
-            "thinking 复读应在第五次前停止，实际内容: {thinking:?}"
+            thinking.matches("用户要求直接实现。").count()
+                <= REPEAT_GUARD_THINKING_TRIP_THRESHOLD as usize,
+            "thinking 复读应在阈值处停止，实际内容: {thinking:?}"
         );
-        assert!(ctx.repetition_guard_tripped());
+        assert!(ctx.thinking_repetition_guard_tripped());
+        assert!(
+            !ctx.repetition_guard_tripped(),
+            "thinking 复读不得把整轮判为退化"
+        );
+    }
+
+    #[test]
+    fn normal_thinking_repetition_below_threshold_survives() {
+        // 回归：阈值原为 4，正常推理里连续 4 个相同短行（分点枚举、重复过渡词）
+        // 就会跳闸，进而丢弃整轮响应连工具调用——线上表现为会话被打断。
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let mut events = Vec::new();
+        for _ in 0..5 {
+            events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+                crate::kiro::model::events::ReasoningContentEvent {
+                    text: Some("先看下一处。\n".into()),
+                    signature: None,
+                    redacted_content: None,
+                },
+            )));
+        }
+
+        assert!(
+            !ctx.thinking_repetition_guard_tripped(),
+            "连续 5 次相同短行不应触发 thinking 熔断"
+        );
+        let thinking = collect_thinking_content(&events);
+        assert_eq!(
+            thinking.matches("先看下一处。").count(),
+            5,
+            "阈值以下的重复必须全部保留，实际: {thinking:?}"
+        );
     }
 
     #[test]
