@@ -2083,19 +2083,28 @@ fn push_system_history(
             } else {
                 system_content
             };
-            history.push(Message::User(HistoryUserMessage {
-                user_input_message: UserMessage::new(content, model_id),
-            }));
+            push_system_pair(history, content, model_id);
         } else if let Some(prefix) = thinking_prefix {
-            history.push(Message::User(HistoryUserMessage {
-                user_input_message: UserMessage::new(prefix, model_id),
-            }));
+            push_system_pair(history, prefix, model_id);
         }
     } else if let Some(prefix) = thinking_prefix {
-        history.push(Message::User(HistoryUserMessage {
-            user_input_message: UserMessage::new(prefix, model_id),
-        }));
+        push_system_pair(history, prefix, model_id);
     }
+}
+
+/// 系统消息以 user + assistant 成对写入 history。
+///
+/// Kiro 上游按 user/assistant 严格交替解析 `history`。只推入 user 会让系统消息和
+/// 紧随其后的第一条真实 user 消息相邻同角色，上游随即把这段历史拼成一整块扁平文本
+/// （形如 `user…assist…user…`）。模型把那块文本当成待续写的内容复读，表现为 thinking
+/// 永不闭合、同一段循环刷屏。补上配对的 assistant 回复即可恢复交替。
+fn push_system_pair(history: &mut Vec<Message>, content: impl Into<String>, model_id: &str) {
+    history.push(Message::User(HistoryUserMessage {
+        user_input_message: UserMessage::new(content.into(), model_id),
+    }));
+    history.push(Message::Assistant(HistoryAssistantMessage::new(
+        "I will follow these instructions.",
+    )));
 }
 
 /// 构建历史消息
@@ -3966,6 +3975,52 @@ mod tests {
         let wire = serde_json::to_string(&result.conversation_state).unwrap();
         assert!(!wire.contains("client_system_instructions"));
         assert!(!wire.contains("user_content"));
+    }
+
+    #[test]
+    fn system_history_is_paired_so_roles_strictly_alternate() {
+        use super::super::types::{Message as AnthropicMessage, SystemMessage};
+
+        let mut req = minimal_request_with_output_config("claude-sonnet-4.5");
+        req.output_config = None;
+        req.system = Some(vec![SystemMessage {
+            text: "be terse".into(),
+            cache_control: None,
+        }]);
+        req.messages = vec![
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("继续"),
+            },
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!("Still down."),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("继续"),
+            },
+        ];
+
+        let result = convert_request(&req).unwrap();
+        let roles: Vec<&str> = result
+            .conversation_state
+            .history
+            .iter()
+            .map(|m| match m {
+                Message::User(_) => "user",
+                Message::Assistant(_) => "assistant",
+            })
+            .collect();
+
+        // Kiro 上游按 user/assistant 严格交替解析 history。两条相邻同角色消息会让
+        // 上游把它们拼成一段扁平文本，模型随后复读该文本导致 thinking 无法闭合。
+        assert!(
+            roles.windows(2).all(|w| w[0] != w[1]),
+            "history 必须严格交替，实际为 {roles:?}"
+        );
+        assert_eq!(roles.first(), Some(&"user"));
+        assert_eq!(roles.last(), Some(&"assistant"));
     }
 
     #[test]
