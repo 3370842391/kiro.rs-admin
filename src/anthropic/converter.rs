@@ -595,6 +595,16 @@ pub struct ConversionResult {
     /// 解析后的工具选择策略。Kiro 上游无 tool_choice 字段，本代理据此在下发前调整工具集
     /// 与描述 nudge（见 [`ToolChoicePolicy`]），使 `tool_choice` 不再被静默忽略。
     pub tool_choice_policy: ToolChoicePolicy,
+    /// 本次请求**实际是否向上游注入了** thinking 前缀。
+    ///
+    /// 与「客户端是否请求了 thinking」不同：`max_tokens` 过小时会跳过注入
+    ///（见 [`MIN_MAX_TOKENS_FOR_THINKING`]），此时上游不会返回任何 reasoning。下游必须按
+    /// 这个字段而非客户端意图来判断，否则会在收尾时误判「请求了 thinking 但上游没给」——
+    /// 轻则刷无意义的 warn，重则在开启 `strict_thinking_validation` 时把整轮判成
+    /// `upstream_thinking_protocol_error` 而失败。
+    ///
+    /// 单一真源：判定只在 converter 里做一次，下游读这个字段，避免规则在两处漂移。
+    pub thinking_prefix_injected: bool,
 }
 
 /// 工具选择策略（由客户端 `tool_choice` 解析而来）。
@@ -1060,6 +1070,9 @@ pub fn convert_request_with_mode(
         tool_contracts,
         additional_model_request_fields,
         tool_choice_policy,
+        // 与 push_system_history 里实际注入前缀的判定同源：都取自
+        // generate_thinking_prefix，因此不会出现「这里说注入了、那边其实没注入」的漂移。
+        thinking_prefix_injected: generate_thinking_prefix(req, &model_id).is_some(),
     })
 }
 
@@ -4110,6 +4123,64 @@ mod tests {
         let wire = serde_json::to_string(&result.conversation_state).unwrap();
         assert!(!wire.contains("client_system_instructions"));
         assert!(!wire.contains("user_content"));
+    }
+
+    #[test]
+    fn thinking_prefix_injected_reflects_actual_injection_not_client_intent() {
+        use super::super::types::Thinking;
+
+        // 下游（handlers 的 thinking_enabled）按这个字段判断上游会不会返回 reasoning。
+        // 若它跟着客户端意图而非实际注入走，max_tokens 过小的请求会被误判成
+        // 「请求了 thinking 但上游没给」——轻则刷 warn（线上实测 6 小时 623 条），
+        // 重则在 strict_thinking_validation 开启时整轮失败。
+        let build = |max_tokens: i32, thinking: Option<Thinking>| {
+            let mut req = minimal_request_with_output_config("claude-sonnet-4.5");
+            req.max_tokens = max_tokens;
+            req.thinking = thinking;
+            req
+        };
+        let enabled = || {
+            Some(Thinking {
+                thinking_type: "enabled".to_string(),
+                budget_tokens: 2_048,
+            })
+        };
+
+        // 客户端请求了 thinking 且 max_tokens 足够 → 确实注入。
+        assert!(
+            convert_request(&build(64_000, enabled()))
+                .unwrap()
+                .thinking_prefix_injected
+        );
+
+        // 客户端请求了 thinking 但 max_tokens 过小 → 跳过注入，字段须为 false，
+        // 即使客户端意图是 enabled。
+        assert!(
+            !convert_request(&build(64, enabled()))
+                .unwrap()
+                .thinking_prefix_injected,
+            "max_tokens 过小时未注入前缀，字段不得报 true"
+        );
+
+        // 客户端没请求 thinking → 自然没注入。
+        assert!(
+            !convert_request(&build(64_000, None))
+                .unwrap()
+                .thinking_prefix_injected
+        );
+
+        // disabled 也不注入。
+        assert!(
+            !convert_request(&build(
+                64_000,
+                Some(Thinking {
+                    thinking_type: "disabled".to_string(),
+                    budget_tokens: 0,
+                })
+            ))
+            .unwrap()
+            .thinking_prefix_injected
+        );
     }
 
     #[test]

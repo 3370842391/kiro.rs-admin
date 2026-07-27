@@ -2421,12 +2421,13 @@ pub async fn post_messages(
         payload.tools.clone(),
     ) as i32;
 
-    // 检查是否启用了thinking
-    let thinking_enabled = payload
-        .thinking
-        .as_ref()
-        .map(|t| t.is_enabled())
-        .unwrap_or(false);
+    // thinking 是否生效：以「实际是否注入了前缀」为准，而非客户端意图。
+    //
+    // max_tokens 过小时 converter 会跳过注入（见 MIN_MAX_TOKENS_FOR_THINKING），上游就
+    // 不会返回任何 reasoning。若这里仍按客户端意图置 true，收尾会误判「请求了 thinking
+    // 但上游没给」——轻则刷无意义的 warn（线上实测 6 小时 623 条），重则在开启
+    // strict_thinking_validation 时把整轮判成 upstream_thinking_protocol_error 而失败。
+    let thinking_enabled = conversion_result.thinking_prefix_injected;
 
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
@@ -5488,12 +5489,13 @@ pub async fn post_messages_cc(
         payload.tools.clone(),
     ) as i32;
 
-    // 检查是否启用了thinking
-    let thinking_enabled = payload
-        .thinking
-        .as_ref()
-        .map(|t| t.is_enabled())
-        .unwrap_or(false);
+    // thinking 是否生效：以「实际是否注入了前缀」为准，而非客户端意图。
+    //
+    // max_tokens 过小时 converter 会跳过注入（见 MIN_MAX_TOKENS_FOR_THINKING），上游就
+    // 不会返回任何 reasoning。若这里仍按客户端意图置 true，收尾会误判「请求了 thinking
+    // 但上游没给」——轻则刷无意义的 warn（线上实测 6 小时 623 条），重则在开启
+    // strict_thinking_validation 时把整轮判成 upstream_thinking_protocol_error 而失败。
+    let thinking_enabled = conversion_result.thinking_prefix_injected;
 
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
