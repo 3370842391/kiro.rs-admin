@@ -5967,6 +5967,76 @@ mod tests {
     }
 
     #[test]
+    fn thinking_pipeline_survives_adversarial_fragmentation() {
+        // 属性测试：把一批「刁钻但合法」的内容按 1..=9 字节硬切喂进流水线，断言
+        // 既不 panic（UTF-8 边界 / 字节索引），也不静默吃掉内容。
+        //
+        // 这轮六个 bug 全是「按理想形态构造的测试一直绿着」造成的，所以这里刻意覆盖
+        // 多字节字符、标签紧贴标点/引号、未闭合标签、嵌套提及等形态。
+        let corpus = [
+            "普通中文回答，没有任何标签。",
+            "<thinking>\n推理内容\n</thinking>\n\n正文",
+            "Starting now.<thinking>\nreasoning\n</thinking>\nDone.",
+            "answer<thinking>`cargo test`失败</thinking>next",
+            "见 `code`</thinking>\n收尾",
+            "<thinking>未闭合的推理，流就这么结束了",
+            "讨论 `<thinking>` 这个标签本身,不该被当成开标签",
+            "混合 emoji 🚀 与中文，以及 tab\t和多空格   结尾 ",
+            "</thinking></thinking></thinking>连续闭标签",
+            "行一\n行一\n行一\n不同行\n行一\n",
+            "",
+            "\n\n\n",
+            "a",
+        ];
+
+        for text in corpus {
+            for step in 1..=9usize {
+                let mut ctx = StreamContext::new_with_thinking(
+                    "test-model",
+                    1,
+                    true,
+                    HashMap::new(),
+                    test_known_tools(),
+                );
+                let _ = ctx.generate_initial_events();
+
+                let mut events = Vec::new();
+                let mut start = 0usize;
+                while start < text.len() {
+                    let mut end = (start + step).min(text.len());
+                    while end < text.len() && !text.is_char_boundary(end) {
+                        end += 1;
+                    }
+                    // 不 panic 即为通过的第一层断言。
+                    events.extend(ctx.process_assistant_response(&text[start..end]));
+                    start = end;
+                }
+                events.extend(ctx.generate_final_events());
+
+                // 第二层：内容不得凭空消失。把 thinking 与正文合起来，去掉标签与空白后，
+                // 原文的可见字符应当全部还在（顺序可能因分块而变，故只比字符集合与总量）。
+                let delivered: String = collect_thinking_content(&events)
+                    + &collect_text_content(&events);
+                let strip = |s: &str| -> String {
+                    s.replace("<thinking>", "")
+                        .replace("</thinking>", "")
+                        .chars()
+                        .filter(|c| !c.is_whitespace())
+                        .collect()
+                };
+                let want = strip(text);
+                let got = strip(&delivered);
+                assert!(
+                    got.chars().count() >= want.chars().count(),
+                    "step={step} 内容丢失\n原文有效字符={:?}\n交付有效字符={:?}\n原始输入={text:?}",
+                    want,
+                    got
+                );
+            }
+        }
+    }
+
+    #[test]
     fn invoke_start_is_found_regardless_of_preceding_char() {
         // 漏检一个真 invoke 的后果远重于误判：工具永不执行、整块 XML 泄漏成正文，
         // 对话打断且无法恢复。误判方向有 5 道下游闸门兜底（闭合标签/解析/工具表/围栏/
