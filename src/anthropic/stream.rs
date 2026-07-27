@@ -4473,7 +4473,7 @@ mod tests {
     }
 
     #[test]
-    fn context_usage_does_not_override_stream_api_usage() {
+    fn context_usage_drives_stream_api_usage() {
         let mut ctx = StreamContext::new_with_thinking(
             "claude-opus-4.8",
             72,
@@ -4487,7 +4487,8 @@ mod tests {
             },
         ));
 
-        assert_eq!(ctx.resolved_usage(), (72, 0, 0));
+        // 终态 usage 必须报上游真实占用：客户端据此判断是否该自动压缩。
+        assert_eq!(ctx.resolved_usage(), (5_417, 0, 0));
         assert_eq!(ctx.upstream_context_tokens(), Some(5_417));
     }
 
@@ -4510,7 +4511,7 @@ mod tests {
     }
 
     #[test]
-    fn buffered_cc_stream_rewrites_message_start_with_client_visible_usage() {
+    fn buffered_cc_stream_rewrites_message_start_with_upstream_context() {
         let mut ctx = BufferedStreamContext::new(
             "claude-opus-4.8",
             72,
@@ -4528,7 +4529,8 @@ mod tests {
             .iter()
             .find(|event| event.event == "message_start")
             .unwrap();
-        assert_eq!(start.data["message"]["usage"]["input_tokens"], 72);
+        // 缓冲流吐 message_start 时 contextUsageEvent 已到，必须带真实占用。
+        assert_eq!(start.data["message"]["usage"]["input_tokens"], 5_417);
     }
 
     #[test]

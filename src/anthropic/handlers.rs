@@ -7146,9 +7146,14 @@ mod tests {
     }
 
     #[test]
-    fn non_stream_usage_ignores_upstream_context_for_api_total() {
+    fn non_stream_usage_reports_upstream_context_for_api_total() {
         let cache = crate::anthropic::cache_metering::CacheUsage::default();
-        assert_eq!(split_non_stream_usage(72, Some(5_417), &cache), (72, 0, 0));
+        assert_eq!(
+            split_non_stream_usage(72, Some(5_417), &cache),
+            (5_417, 0, 0)
+        );
+        // 拿不到上游值时退回客户端估算。
+        assert_eq!(split_non_stream_usage(72, None, &cache), (72, 0, 0));
     }
 
     #[test]
