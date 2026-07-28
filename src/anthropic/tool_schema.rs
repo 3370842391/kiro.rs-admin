@@ -498,7 +498,7 @@ fn validate_value(
     repairs: &mut Vec<String>,
     violations: &mut Vec<ToolInputViolation>,
 ) {
-    repair_json_encoded_required_array(schema, value, path, required_property, repairs);
+    repair_json_encoded_array(schema, value, path, repairs);
     repair_or_validate_fixed_value(schema, value, path, required_property, repairs, violations);
 
     let Some(expected_type) = schema.get("type") else {
@@ -548,16 +548,16 @@ fn validate_composite(
     }
 }
 
-fn repair_json_encoded_required_array(
+fn repair_json_encoded_array(
     schema: &serde_json::Value,
     value: &mut serde_json::Value,
     path: &str,
-    required_property: bool,
     repairs: &mut Vec<String>,
 ) {
-    if !required_property {
-        return;
-    }
+    // 不再限定 required 字段。模型把数组当 JSON 字符串发（"[{...}]" 而非 [{...}]）与该
+    // 字段是否 required 无关——线上 AskUserQuestion 的 questions 非 required，被卡在这里
+    // 报 `expected array` 整轮失败。解码只在 schema 明确声明为 array、且字符串确实能解析
+    // 成数组时发生，对声明为 string 的字段零影响。
     let declares_array = match schema.get("type") {
         Some(serde_json::Value::String(kind)) => kind == "array",
         Some(serde_json::Value::Array(kinds)) => kinds
@@ -1441,6 +1441,63 @@ mod tests {
                     display_violation(violation).contains("maximum")
                 })
         ));
+    }
+
+    #[test]
+    fn decodes_json_encoded_array_regardless_of_required() {
+        // 线上 bug：AskUserQuestion 的 questions 是数组，模型把它当 JSON 字符串发来
+        //（"[{...}]" 而非 [{...}]）。原修复只在字段 required 时才解码，于是非 required
+        // 的数组字段（或 required 标注方式不同的工具）直接报 `expected array` 整轮失败。
+        // JSON 编码的数组是否该解码，与它是否 required 无关。
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "questions": {"type": "array", "items": {"type": "object"}}
+            }
+            // 注意：questions 不在 required 里
+        });
+        let mut input = serde_json::json!({
+            "questions": "[{\"q\":\"pick one\"}]"
+        });
+
+        match validate_and_repair(&schema, &mut input) {
+            ToolInputOutcome::Repaired { paths } => {
+                assert!(
+                    paths.iter().any(|p| p.contains("questions")),
+                    "questions 应被记为已修复，实际 {paths:?}"
+                );
+                assert!(
+                    input["questions"].is_array(),
+                    "JSON 编码的数组必须被解码成真数组，实际 {:?}",
+                    input["questions"]
+                );
+            }
+            other => panic!("非 required 的 JSON 编码数组也应被解码修复，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn string_field_receiving_json_like_text_is_not_decoded() {
+        // 反向保护：只有 schema 声明为 array 的字段才解码 JSON 字符串。声明为 string 的
+        // 字段即使值长得像数组，也必须原样保留——否则会把用户真想传的字符串吃成数组。
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "note": {"type": "string"}
+            },
+            "required": ["note"]
+        });
+        let mut input = serde_json::json!({"note": "[1, 2, 3]"});
+
+        assert!(
+            matches!(validate_and_repair(&schema, &mut input), ToolInputOutcome::Valid),
+            "声明为 string 的字段不应被改动"
+        );
+        assert_eq!(
+            input["note"],
+            serde_json::json!("[1, 2, 3]"),
+            "string 字段的值必须原样保留"
+        );
     }
 
     #[test]
