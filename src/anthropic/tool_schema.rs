@@ -926,6 +926,11 @@ fn repair_or_validate_fixed_value(
     repairs: &mut Vec<String>,
     violations: &mut Vec<ToolInputViolation>,
 ) {
+    // const / 单值 enum 只在字段 required 时才修复——这是**有意的保守**，不是 bug：
+    // const 常被用作「服务端固定标记」，可选字段上模型发了别的值，更可能是它有别的意图
+    // （而非格式笔误），静默覆盖会掩盖真实问题，故宁可报违规。与 JSON 编码数组不同——
+    // 那个有 AskUserQuestion 的线上故障实证，且数组解码不改变语义；这里没有对应故障，
+    // 不凭「统一病根」的推断扩大修复面（本文件所有修复均由线上实测驱动）。
     if let Some(expected) = schema.get("const")
         && value != expected
         && required_property
