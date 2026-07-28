@@ -704,14 +704,37 @@ export interface LogGovernanceConfig {
   traceEnabled: boolean
   traceRetentionDays: number
   usageLogRetentionDays: number
-  /** 判死凭据保留小时数：403 封号后先禁用留档，超过该时长才真正删除。 */
-  deadCredentialRetentionHours: number
   errorSnapshotEnabled: boolean
   errorSnapshotRetentionDays: number
   errorSnapshotMaxStorageGb: number
   errorSnapshotCaptureRecovered: boolean
   errorSnapshotCaptureBodies: boolean
   errorSnapshotMinFreeDiskGb: number
+}
+
+export interface DeadCredentialConfig {
+  /** 保留期结束后是否自动删除（全局总闸） */
+  autoDelete: boolean
+  /** 判死后的保留时长（小时） */
+  retentionHours: number
+  /** 当前处于判死禁用状态的凭据数 */
+  deadCount: number
+  /** 其中参与自动清理的数量（凭据级 deleteOnForbidden 为真） */
+  autoDeleteEligible: number
+}
+
+// 获取死号治理配置
+export async function getDeadCredentialConfig(): Promise<DeadCredentialConfig> {
+  const { data } = await api.get<DeadCredentialConfig>('/config/dead-credentials')
+  return data
+}
+
+// 更新死号治理配置
+export async function setDeadCredentialConfig(
+  patch: Partial<Pick<DeadCredentialConfig, 'autoDelete' | 'retentionHours'>>,
+): Promise<DeadCredentialConfig> {
+  const { data } = await api.put<DeadCredentialConfig>('/config/dead-credentials', patch)
+  return data
 }
 
 // 获取日志治理配置

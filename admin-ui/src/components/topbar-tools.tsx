@@ -1,7 +1,7 @@
 import { forwardRef, useEffect, useState, type ComponentPropsWithoutRef } from 'react'
 import {
   Activity, RefreshCw, UploadCloud, Settings, Key, Wand2, Eye, EyeOff, Copy,
-  MoreHorizontal, ShieldAlert, ShieldCheck, Gauge, Shuffle, Brain, Images,
+  MoreHorizontal, ShieldAlert, ShieldCheck, Gauge, Shuffle, Brain, Images, Trash2,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -33,6 +33,7 @@ import { ModelProfilesDialog } from '@/components/model-profiles-dialog'
 import { EndpointChainsDialog } from '@/components/endpoint-chains-dialog'
 import { CachePolicyDialog } from '@/components/cache-policy-dialog'
 import { ImageBudgetDialog } from '@/components/image-budget-dialog'
+import { DeadCredentialDialog } from '@/components/dead-credential-dialog'
 import { CompatibilitySettingsDialog } from '@/components/compatibility-settings-dialog'
 
 /**
@@ -61,6 +62,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
   const [endpointChainsOpen, setEndpointChainsOpen] = useState(false)
   const [cachePolicyOpen, setCachePolicyOpen] = useState(false)
   const [imageBudgetOpen, setImageBudgetOpen] = useState(false)
+  const [deadCredentialOpen, setDeadCredentialOpen] = useState(false)
   const [compatibilitySettingsOpen, setCompatibilitySettingsOpen] = useState(false)
   const [keyDialogOpen, setKeyDialogOpen] = useState(false)
   const [newKey, setNewKey] = useState('')
@@ -136,6 +138,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     openEndpointChains: () => setEndpointChainsOpen(true),
     openCachePolicy: () => setCachePolicyOpen(true),
     openImageBudget: () => setImageBudgetOpen(true),
+    openDeadCredentials: () => setDeadCredentialOpen(true),
     openCompatibilitySettings: () => setCompatibilitySettingsOpen(true),
     openKeyDialog,
     retryPolicy,
@@ -166,6 +169,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
       <EndpointChainsDialog open={endpointChainsOpen} onOpenChange={setEndpointChainsOpen} />
       <CachePolicyDialog open={cachePolicyOpen} onOpenChange={setCachePolicyOpen} />
       <ImageBudgetDialog open={imageBudgetOpen} onOpenChange={setImageBudgetOpen} />
+      <DeadCredentialDialog open={deadCredentialOpen} onOpenChange={setDeadCredentialOpen} />
       <CompatibilitySettingsDialog
         open={compatibilitySettingsOpen}
         onOpenChange={setCompatibilitySettingsOpen}
@@ -285,6 +289,7 @@ interface ToolControls {
   openEndpointChains: () => void
   openCachePolicy: () => void
   openImageBudget: () => void
+  openDeadCredentials: () => void
   openCompatibilitySettings: () => void
   openKeyDialog: () => void
   retryPolicy?: RetryPolicyConfig
@@ -315,6 +320,7 @@ function FullTools({ controls }: { controls: ToolControls }) {
         onOpenEndpointChains={controls.openEndpointChains}
         onOpenCachePolicy={controls.openCachePolicy}
         onOpenImageBudget={controls.openImageBudget}
+        onOpenDeadCredentials={controls.openDeadCredentials}
         onOpenCompatibilitySettings={controls.openCompatibilitySettings}
       />
     </>
@@ -374,6 +380,9 @@ function CompactTools({ controls }: { controls: ToolControls }) {
         </DropdownMenuItem>
         <DropdownMenuItem onSelect={controls.openCompatibilitySettings}>
           <Settings />协议兼容设置（空 user 请求）
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={controls.openDeadCredentials}>
+          <Trash2 />死号治理（封号后保留 / 自动删除）
         </DropdownMenuItem>
         <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
         <DropdownMenuItem onSelect={controls.openKeyDialog}>
@@ -717,6 +726,7 @@ function KeySettingsMenu({
   onOpenEndpointChains: () => void
   onOpenCachePolicy: () => void
   onOpenImageBudget: () => void
+  onOpenDeadCredentials: () => void
   onOpenCompatibilitySettings: () => void
 }) {
   return (

@@ -1350,6 +1350,8 @@ pub struct MultiTokenManager {
     ///
     /// 清理调度器每轮读取它，所以管理端改完立刻生效、不必重启。
     dead_credential_retention_hours: AtomicU64,
+    /// 判死凭据是否自动删除的全局总闸（运行时可修改）。
+    dead_credential_auto_delete: AtomicBool,
     /// 普通 429 重试策略模式（运行时可修改）
     retry_mode: Mutex<RetryMode>,
     /// 普通 429 自定义策略（运行时可修改）
@@ -1627,6 +1629,7 @@ impl MultiTokenManager {
         let throttle_failover = config.account_throttle_failover;
         let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
         let dead_retention_hours = config.dead_credential_retention_hours.max(1);
+        let dead_auto_delete = config.dead_credential_auto_delete;
         let retry_mode = config.retry_mode;
         let retry_policy = config.retry_policy.clone();
         let endpoint_chains = config.endpoint_chains.clone();
@@ -1667,6 +1670,7 @@ impl MultiTokenManager {
             account_throttle_failover: AtomicBool::new(throttle_failover),
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
             dead_credential_retention_hours: AtomicU64::new(u64::from(dead_retention_hours)),
+            dead_credential_auto_delete: AtomicBool::new(dead_auto_delete),
             retry_mode: Mutex::new(retry_mode),
             retry_policy: Mutex::new(retry_policy),
             endpoint_chains: Mutex::new(endpoint_chains),
@@ -4563,12 +4567,27 @@ impl MultiTokenManager {
             .store(u64::from(hours.max(1)), Ordering::Relaxed);
     }
 
+    /// 判死凭据是否自动删除（全局总闸）。
+    pub fn dead_credential_auto_delete(&self) -> bool {
+        self.dead_credential_auto_delete.load(Ordering::Relaxed)
+    }
+
+    /// 设置判死凭据是否自动删除。关闭后死号只禁用、永久保留。
+    pub fn set_dead_credential_auto_delete(&self, enabled: bool) {
+        self.dead_credential_auto_delete
+            .store(enabled, Ordering::Relaxed);
+    }
+
     /// 清理已过保留期的死号，返回删除条数。
     ///
     /// 三个条件同时满足才删：判死禁用（`Forbidden`）、`died_at` 早于保留期、
     /// 且凭据带 `delete_on_forbidden`。最后一条让手工添加的号只禁用不自动删——
     /// 那些通常是运营手上唯一一份，删掉不可恢复。
     pub fn cleanup_dead_credentials(&self, retention: StdDuration) -> usize {
+        // 全局总闸关闭时一条都不删，死号永久留在池子里供查看
+        if !self.dead_credential_auto_delete() {
+            return 0;
+        }
         let cutoff = Utc::now() - chrono::Duration::from_std(retention).unwrap_or_default();
         let expired: Vec<u64> = self
             .entries
@@ -8300,6 +8319,39 @@ mod tests {
         // 0 会让所有死号立刻被删，收紧到最小 1 小时
         manager.set_dead_credential_retention_hours(0);
         assert_eq!(manager.dead_credential_retention_hours(), 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 总闸关闭时一条都不删，即使已过保留期。
+    #[test]
+    fn auto_delete_master_switch_blocks_all_cleanup() {
+        let long_ago = (Utc::now() - chrono::Duration::hours(48)).to_rfc3339();
+        let mut expired = api_key_credential(1, "ksk_expired_but_kept", true);
+        expired.disabled = true;
+        expired.died_at = Some(long_ago);
+
+        let path = tmp_creds_path("auto_delete_switch");
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![expired], None, Some(path.clone()), true)
+                .unwrap();
+
+        assert!(manager.dead_credential_auto_delete(), "默认开启");
+
+        manager.set_dead_credential_auto_delete(false);
+        assert_eq!(
+            manager.cleanup_dead_credentials(StdDuration::from_secs(3600)),
+            0,
+            "总闸关闭时不得删除任何死号"
+        );
+        assert_eq!(manager.clone_all_credentials().len(), 1);
+
+        // 重新打开后同一个号立刻可清理，证明拦截点只在总闸
+        manager.set_dead_credential_auto_delete(true);
+        assert_eq!(
+            manager.cleanup_dead_credentials(StdDuration::from_secs(3600)),
+            1
+        );
 
         let _ = std::fs::remove_file(&path);
     }

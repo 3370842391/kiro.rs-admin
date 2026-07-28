@@ -908,6 +908,34 @@ pub struct LogGovernanceConfigResponse {
     pub error_snapshot_min_free_disk_gb: u64,
 }
 
+/// 死号治理配置（403 判死后的留档与清理策略）
+///
+/// 独立于「日志治理」：那个管的是 trace / usage / 错误快照的落盘，这个管的是凭据
+/// 生命周期，归属凭据管理而非请求日志。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeadCredentialConfigResponse {
+    /// 保留期结束后是否自动删除（全局总闸）
+    pub auto_delete: bool,
+    /// 判死后的保留时长（小时）
+    pub retention_hours: u32,
+    /// 当前处于判死禁用状态的凭据数
+    pub dead_count: usize,
+    /// 其中参与自动清理的数量（凭据级 deleteOnForbidden 为真）
+    pub auto_delete_eligible: usize,
+}
+
+/// 更新死号治理配置（字段缺省表示不修改）
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetDeadCredentialConfigRequest {
+    #[serde(default)]
+    pub auto_delete: Option<bool>,
+    /// 保留小时数，1..=8760（一年）
+    #[serde(default)]
+    pub retention_hours: Option<u32>,
+}
+
 /// 更新日志治理配置（字段缺省表示不修改）
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]

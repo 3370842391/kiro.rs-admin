@@ -57,7 +57,8 @@ use super::types::{
     PatchModelProfileRequest, PollIdcLoginResponse, PreviewModelProfilesRequest,
     ProfitConfigResponse, ProxyBalancingModeResponse, ProxyCheckAllResponse, ProxyCheckResponse,
     ProxyCheckUrlRequest, ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult,
-    ResolvedModelProfileResponse, RetryPolicyResponse, RevisionRequest, RpmSummary,
+    DeadCredentialConfigResponse, ResolvedModelProfileResponse, RetryPolicyResponse,
+    RevisionRequest, RpmSummary, SetDeadCredentialConfigRequest,
     SetAccountThrottleConfigRequest, SetCacheHitRateRequest, SetCachePolicyRequest,
     SetCompatibilityConfigRequest, SetEndpointChainsRequest, SetEndpointModeRequest,
     SetImageBudgetRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
@@ -3277,6 +3278,80 @@ impl AdminService {
             error_snapshot_capture_bodies: snapshot_policy.capture_bodies,
             error_snapshot_min_free_disk_gb: snapshot_policy.min_free_disk_bytes / GIB,
         }
+    }
+
+    /// 死号治理配置：判死后的保留策略，以及当前死号统计。
+    pub fn get_dead_credential_config(&self) -> DeadCredentialConfigResponse {
+        let snapshot = self.token_manager.snapshot();
+        let dead: Vec<_> = snapshot
+            .entries
+            .iter()
+            .filter(|e| e.died_at.is_some())
+            .collect();
+        DeadCredentialConfigResponse {
+            auto_delete: self.token_manager.dead_credential_auto_delete(),
+            retention_hours: self.token_manager.dead_credential_retention_hours(),
+            dead_count: dead.len(),
+            auto_delete_eligible: dead.iter().filter(|e| e.delete_on_forbidden).count(),
+        }
+    }
+
+    /// 更新死号治理配置：改运行时原子值 + 持久化到 config.json。
+    pub fn set_dead_credential_config(
+        &self,
+        req: SetDeadCredentialConfigRequest,
+    ) -> Result<DeadCredentialConfigResponse, AdminServiceError> {
+        if req.auto_delete.is_none() && req.retention_hours.is_none() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供一个死号治理字段".to_string(),
+            ));
+        }
+        // 上限一年：保留期用小时计（线上约每小时封一批，按天会积压上百条）
+        if let Some(hours) = req.retention_hours {
+            if !(1..=8760).contains(&hours) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "retentionHours 必须在 1..=8760 内: {}",
+                    hours
+                )));
+            }
+        }
+
+        if let Some(enabled) = req.auto_delete {
+            self.token_manager.set_dead_credential_auto_delete(enabled);
+        }
+        if let Some(hours) = req.retention_hours {
+            self.token_manager
+                .set_dead_credential_retention_hours(hours);
+        }
+
+        if let Err(error) = self.persist_dead_credential_config(&req) {
+            tracing::warn!(%error, "持久化死号治理配置失败（运行时已生效）");
+        }
+        Ok(self.get_dead_credential_config())
+    }
+
+    fn persist_dead_credential_config(
+        &self,
+        req: &SetDeadCredentialConfigRequest,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let Some(config_path) = self.token_manager.config().config_path().map(|p| p.to_path_buf())
+        else {
+            tracing::warn!("配置文件路径未知，死号治理配置仅在当前进程生效");
+            return Ok(());
+        };
+        let mut config = crate::model::config::Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        if let Some(v) = req.auto_delete {
+            config.dead_credential_auto_delete = v;
+        }
+        if let Some(v) = req.retention_hours {
+            config.dead_credential_retention_hours = v;
+        }
+        config
+            .save()
+            .with_context(|| format!("持久化死号治理配置失败: {}", config_path.display()))?;
+        Ok(())
     }
 
     /// 更新日志治理配置：改运行时原子值 + 持久化到 config.json。

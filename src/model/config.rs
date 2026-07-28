@@ -477,6 +477,14 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub error_snapshot_enabled: bool,
 
+    /// 判死凭据是否在保留期结束后自动删除。
+    ///
+    /// 关闭后死号只禁用、永久留在池子里（配合管理端的「含已禁用」筛选决定是否显示）。
+    /// 与凭据级 `deleteOnForbidden` 是 AND 关系：这是全局总闸，那个是逐账号白名单
+    /// （手工添加的账号通常是唯一一份，即使总闸打开也不参与自动删除）。
+    #[serde(default = "default_true")]
+    pub dead_credential_auto_delete: bool,
+
     /// 判死凭据的保留时长（小时）。
     ///
     /// 403 命中封禁标记后凭据先被禁用并记录 `died_at`，供运营查看存活时长与死因；
@@ -890,6 +898,7 @@ impl Default for Config {
             profit_quota_per_unit: default_profit_quota_per_unit(),
             key_supplier: KeySupplierConfig::default(),
             error_snapshot_enabled: true,
+            dead_credential_auto_delete: true,
             dead_credential_retention_hours: default_dead_credential_retention_hours(),
             error_snapshot_retention_days: default_error_snapshot_retention_days(),
             error_snapshot_max_storage_gb: default_error_snapshot_max_storage_gb(),

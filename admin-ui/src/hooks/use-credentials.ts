@@ -30,7 +30,9 @@ import {
   getCachePolicy,
   setCachePolicy,
   clearCachePolicyEntries,
+  getDeadCredentialConfig,
   getLogGovernanceConfig,
+  setDeadCredentialConfig,
   setLogGovernanceConfig,
   resetSuccessCount,
   resetAllSuccessCount,
@@ -363,6 +365,25 @@ export function useClearCachePolicyEntries() {
 }
 
 // 获取日志治理配置
+export function useDeadCredentialConfig() {
+  return useQuery({
+    queryKey: ['deadCredentialConfig'],
+    queryFn: getDeadCredentialConfig,
+  })
+}
+
+// 更新死号治理配置。凭据列表也要刷新：改完保留期后倒计时会变。
+export function useSetDeadCredentialConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setDeadCredentialConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['deadCredentialConfig'] })
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
 export function useLogGovernanceConfig() {
   return useQuery({
     queryKey: ['logGovernanceConfig'],

@@ -34,7 +34,8 @@ use super::{
         ProxyCheckUrlRequest, RevisionRequest, SetAccountThrottleConfigRequest,
         SetCacheHitRateRequest, SetCachePolicyRequest, SetCompatibilityConfigRequest,
         SetDisabledRequest, SetEndpointChainsRequest, SetEndpointModeRequest,
-        SetGlobalProxyRequest, SetImageBudgetRequest, SetLoadBalancingModeRequest,
+        SetDeadCredentialConfigRequest, SetGlobalProxyRequest, SetImageBudgetRequest,
+        SetLoadBalancingModeRequest,
         SetLogGovernanceConfigRequest, SetModelProfileSettingsRequest, SetPriorityRequest,
         SetProfitConfigRequest, SetProxyBalancingModeRequest, SetRetryPolicyRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
@@ -926,6 +927,23 @@ pub async fn set_cache_hit_rate(
 /// GET /api/admin/config/image-budget
 pub async fn get_image_budget(State(state): State<AdminState>) -> impl IntoResponse {
     match state.service.get_image_budget() {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/dead-credentials
+/// 死号治理配置：判死后保留多久、是否自动删除，以及当前死号统计。
+pub async fn get_dead_credential_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_dead_credential_config())
+}
+
+/// PUT /api/admin/config/dead-credentials
+pub async fn set_dead_credential_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetDeadCredentialConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_dead_credential_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
     }

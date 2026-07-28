@@ -65,7 +65,7 @@ import {
   concurrencyTone,
 } from "@/lib/credential-concurrency";
 import {
-  useLogGovernanceConfig,
+  useDeadCredentialConfig,
   useSetDisabled,
   useSetPriority,
   useResetFailure,
@@ -305,8 +305,11 @@ function ConcurrencyGauge({ inFlight }: { inFlight: number }) {
  */
 function CredentialMetaLine({ credential }: { credential: CredentialStatusItem }) {
   // 共享 queryKey，多张卡片命中同一份缓存，不会各发一次请求
-  const { data: governance } = useLogGovernanceConfig();
-  const deadRetentionHours = governance?.deadCredentialRetentionHours;
+  const { data: deadConfig } = useDeadCredentialConfig();
+  // 总闸关闭时不显示倒计时——死号不会被删，倒计时就是假信息
+  const deadRetentionHours = deadConfig?.autoDelete
+    ? deadConfig.retentionHours
+    : undefined;
   const region =
     credential.authRegion && credential.apiRegion
       ? credential.authRegion === credential.apiRegion
