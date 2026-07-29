@@ -23,6 +23,7 @@
 //! ```
 
 pub mod cache_metering;
+pub(crate) mod compaction_diagnostics;
 pub(crate) mod converter;
 mod document;
 pub(crate) mod error_snapshot;

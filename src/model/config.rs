@@ -441,6 +441,10 @@ pub struct Config {
     #[serde(default = "default_trace_enabled")]
     pub trace_enabled: bool,
 
+    /// 是否采集自动压缩诊断。独立于 trace 开关；关闭后请求入口立即短路。
+    #[serde(default = "default_true")]
+    pub auto_compact_diagnostics_enabled: bool,
+
     /// 请求链路追踪记录保留天数（默认 7）。后台任务每天清理超期记录。
     #[serde(default = "default_trace_retention_days")]
     pub trace_retention_days: u32,
@@ -889,6 +893,7 @@ impl Default for Config {
             default_endpoint: default_endpoint(),
             endpoint_mode: EndpointMode::default(),
             trace_enabled: default_trace_enabled(),
+            auto_compact_diagnostics_enabled: default_true(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
             profit_newapi_base: None,
@@ -1263,6 +1268,21 @@ mod tests {
     fn strict_thinking_validation_can_be_enabled() {
         let config: Config = serde_json::from_str(r#"{"strictThinkingValidation":true}"#).unwrap();
         assert!(config.strict_thinking_validation);
+    }
+
+    #[test]
+    fn auto_compact_diagnostics_defaults_on_and_round_trips_in_camel_case() {
+        let defaulted: Config = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(defaulted.auto_compact_diagnostics_enabled);
+
+        let disabled: Config = serde_json::from_value(serde_json::json!({
+            "autoCompactDiagnosticsEnabled": false
+        }))
+        .unwrap();
+        assert!(!disabled.auto_compact_diagnostics_enabled);
+        let serialized = serde_json::to_value(disabled).unwrap();
+        assert_eq!(serialized["autoCompactDiagnosticsEnabled"], false);
+        assert!(serialized.get("auto_compact_diagnostics_enabled").is_none());
     }
 
     #[test]

@@ -1376,6 +1376,8 @@ pub struct MultiTokenManager {
     partial_stream_recovery_window_ms: AtomicU64,
     /// 空 user 请求兼容开关（运行时可修改）。
     empty_user_message_compat: AtomicBool,
+    /// 自动压缩诊断开关（运行时可修改，独立于 trace 开关）。
+    auto_compact_diagnostics_enabled: AtomicBool,
     /// 缓存命中率整形下界（百分比 0..=100，运行时可修改）。min==0 && max==0 = 关闭整形。
     cache_hit_rate_min_pct: AtomicU32,
     /// 缓存命中率整形上界（百分比 0..=100，运行时可修改）。见 cache_hit_rate_min_pct。
@@ -1641,6 +1643,7 @@ impl MultiTokenManager {
         let partial_stream_recovery_enabled = config.partial_stream_recovery_enabled;
         let partial_stream_recovery_window_ms = config.partial_stream_recovery_window_ms;
         let empty_user_message_compat = config.empty_user_message_compat;
+        let auto_compact_diagnostics_enabled = config.auto_compact_diagnostics_enabled;
         let cache_hit_rate_min_pct = config.cache_hit_rate_min_pct.min(100);
         let cache_hit_rate_max_pct = config.cache_hit_rate_max_pct.min(100);
         // 构造路径不强制 min<=max（仅 admin setter 校验）。非法区间不 panic（shape_hit_rate 有防御），
@@ -1683,6 +1686,7 @@ impl MultiTokenManager {
             partial_stream_recovery_enabled: AtomicBool::new(partial_stream_recovery_enabled),
             partial_stream_recovery_window_ms: AtomicU64::new(partial_stream_recovery_window_ms),
             empty_user_message_compat: AtomicBool::new(empty_user_message_compat),
+            auto_compact_diagnostics_enabled: AtomicBool::new(auto_compact_diagnostics_enabled),
             cache_hit_rate_min_pct: AtomicU32::new(cache_hit_rate_min_pct),
             cache_hit_rate_max_pct: AtomicU32::new(cache_hit_rate_max_pct),
             last_stats_save_at: Mutex::new(None),
@@ -5274,6 +5278,50 @@ impl MultiTokenManager {
             .with_context(|| format!("持久化自动续写配置失败: {}", config_path.display()))
     }
 
+    /// 读取自动压缩诊断开关。
+    pub fn auto_compact_diagnostics_enabled(&self) -> bool {
+        self.auto_compact_diagnostics_enabled
+            .load(Ordering::Relaxed)
+    }
+
+    /// 更新自动压缩诊断开关；持久化失败时回滚运行时值。
+    pub fn set_auto_compact_diagnostics_enabled_runtime(
+        &self,
+        enabled: bool,
+    ) -> anyhow::Result<()> {
+        let previous = self
+            .auto_compact_diagnostics_enabled
+            .swap(enabled, Ordering::Relaxed);
+        if previous == enabled {
+            return Ok(());
+        }
+        if let Err(error) = self.persist_auto_compact_diagnostics_enabled(enabled) {
+            self.auto_compact_diagnostics_enabled
+                .store(previous, Ordering::Relaxed);
+            return Err(error);
+        }
+        tracing::info!(enabled, "自动压缩诊断配置已更新");
+        Ok(())
+    }
+
+    fn persist_auto_compact_diagnostics_enabled(&self, enabled: bool) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                return Err(anyhow::anyhow!("配置文件路径不可用"));
+            }
+        };
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.auto_compact_diagnostics_enabled = enabled;
+        config
+            .save()
+            .with_context(|| format!("持久化自动压缩诊断配置失败: {}", config_path.display()))?;
+        Ok(())
+    }
+
     /// 读取空 user 请求兼容开关。
     pub fn get_empty_user_message_compat(&self) -> bool {
         self.empty_user_message_compat.load(Ordering::Relaxed)
@@ -6179,6 +6227,28 @@ mod tests {
                 .unwrap()
                 .empty_user_message_compat
         );
+
+        std::fs::remove_file(&config_path).unwrap();
+    }
+
+    #[test]
+    fn auto_compact_diagnostics_runtime_switch_is_independent_and_persists() {
+        let config_path = std::env::temp_dir().join(format!(
+            "kiro-auto-compact-diagnostics-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&config_path, r#"{"traceEnabled":false}"#).unwrap();
+        let config = Config::load(&config_path).unwrap();
+        let manager = MultiTokenManager::new(config, Vec::new(), None, None, true).unwrap();
+
+        assert!(manager.auto_compact_diagnostics_enabled());
+        manager
+            .set_auto_compact_diagnostics_enabled_runtime(false)
+            .unwrap();
+        assert!(!manager.auto_compact_diagnostics_enabled());
+        let persisted = Config::load(&config_path).unwrap();
+        assert!(!persisted.trace_enabled);
+        assert!(!persisted.auto_compact_diagnostics_enabled);
 
         std::fs::remove_file(&config_path).unwrap();
     }
