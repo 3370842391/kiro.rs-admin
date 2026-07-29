@@ -1892,6 +1892,18 @@ pub async fn list_traces(
             .get("failedAttemptCredentialId")
             .and_then(|s| s.parse::<u64>().ok()),
         model: params.get("model").filter(|s| !s.is_empty()).cloned(),
+        compaction_diagnosis: params
+            .get("compactionDiagnosis")
+            .filter(|value| !value.is_empty())
+            .cloned(),
+        session_hash: params
+            .get("sessionHash")
+            .filter(|value| !value.is_empty())
+            .cloned(),
+        high_pressure_only: params
+            .get("highPressureOnly")
+            .map(|value| value == "true" || value == "1")
+            .unwrap_or(false),
         only_failed: params
             .get("onlyFailed")
             .map(|s| s == "true" || s == "1")
@@ -2593,6 +2605,7 @@ mod tests {
             thinking: false,
             empty_user_compat_applied: false,
             snapshot_id: None,
+            compaction: None,
             attempts: Vec::new(),
         };
 

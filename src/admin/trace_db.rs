@@ -14,8 +14,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use chrono::Utc;
 use parking_lot::Mutex;
-use rusqlite::{Connection, types::Type};
+use rusqlite::{Connection, OptionalExtension, types::Type};
 use serde::{Deserialize, Serialize};
+
+use crate::anthropic::compaction_diagnostics::CompactionTraceData;
 
 use super::client_keys::ClientResponseMode;
 
@@ -150,6 +152,9 @@ pub struct TraceRecord {
     /// 失败请求对应的持久化错误快照 ID。
     #[serde(default)]
     pub snapshot_id: Option<String>,
+    /// 自动压缩诊断安全快照；不含正文、工具参数、请求头或凭证。
+    #[serde(default)]
+    pub compaction: Option<CompactionTraceData>,
     /// 每跳明细
     pub attempts: Vec<TraceAttempt>,
 }
@@ -243,6 +248,12 @@ pub struct TraceQuery {
     /// 按账号分组筛选：只返回最终凭据属于这些 id 的 trace。
     /// 由 handler 层在查询前根据 group 参数转换为凭据 id 白名单填入。
     pub credential_ids: Option<Vec<u64>>,
+    /// 自动压缩诊断原因精确匹配。
+    pub compaction_diagnosis: Option<String>,
+    /// SHA-256 会话 hash 精确匹配。
+    pub session_hash: Option<String>,
+    /// 仅返回达到上下文/字节压力或诊断非 normal 的记录。
+    pub high_pressure_only: bool,
     /// 返回条数上限
     pub limit: usize,
     /// 偏移量（分页用）
@@ -335,7 +346,7 @@ impl TraceStore {
         // (列名, 定义) —— 与 SCHEMA 中新增列保持一致
         // 注意 key_source 不带 NOT NULL：老库已有行需先以 NULL 添加再回填（SQLite ALTER ADD COLUMN
         // NOT NULL 不带常量 DEFAULT 时无法对已有行赋值）。新插入永远写入合法值。
-        let columns: [(&str, &str); 14] = [
+        let columns: [(&str, &str); 22] = [
             ("input_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("output_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"),
@@ -350,6 +361,14 @@ impl TraceStore {
             ("thinking", "INTEGER NOT NULL DEFAULT 0"),
             ("empty_user_compat_applied", "INTEGER NOT NULL DEFAULT 0"),
             ("snapshot_id", "TEXT"),
+            ("session_hash", "TEXT"),
+            ("client_version", "TEXT"),
+            ("compaction_diagnosis", "TEXT"),
+            ("request_body_bytes", "INTEGER"),
+            ("upstream_context_tokens", "INTEGER"),
+            ("upstream_context_percentage", "REAL"),
+            ("client_reported_tokens", "INTEGER"),
+            ("compaction_diagnostics_json", "TEXT"),
         ];
         let key_source_added = !existing.contains("key_source");
         for (name, def) in columns {
@@ -366,7 +385,11 @@ impl TraceStore {
         }
         // 必须在旧库补列之后创建，否则旧表尚无 snapshot_id 时索引会创建失败。
         conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_traces_snapshot ON traces(snapshot_id);",
+            "CREATE INDEX IF NOT EXISTS idx_traces_snapshot ON traces(snapshot_id);
+             CREATE INDEX IF NOT EXISTS idx_traces_session_ts
+                 ON traces(session_hash, ts_epoch DESC);
+             CREATE INDEX IF NOT EXISTS idx_traces_compaction_diagnosis
+                 ON traces(compaction_diagnosis);",
         )?;
         Ok(())
     }
@@ -527,6 +550,10 @@ impl TraceStore {
         let ts_epoch = chrono::DateTime::parse_from_rfc3339(&rec.ts)
             .map(|d| d.timestamp())
             .unwrap_or_else(|_| Utc::now().timestamp());
+        let compaction = rec.compaction.as_ref();
+        let compaction_diagnosis = compaction
+            .map(|snapshot| Self::infer_compaction_diagnosis(tx, &rec.trace_id, snapshot))
+            .transpose()?;
         {
             tx.execute(
                 "INSERT OR REPLACE INTO traces (trace_id, ts, ts_epoch, key_id, key_source, response_mode, model, \
@@ -534,8 +561,10 @@ impl TraceStore {
                  total_attempts, duration_ms, interrupted_after_bytes, \
                  input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, \
                  credits, first_token_ms, upstream_first_byte_ms, reasoning_effort, context_1m, thinking, \
-                 empty_user_compat_applied, snapshot_id) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27)",
+                 empty_user_compat_applied, snapshot_id, session_hash, client_version, \
+                 compaction_diagnosis, request_body_bytes, upstream_context_tokens, \
+                 upstream_context_percentage, client_reported_tokens, compaction_diagnostics_json) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35)",
                 rusqlite::params![
                     rec.trace_id,
                     rec.ts,
@@ -564,6 +593,18 @@ impl TraceStore {
                     rec.thinking as i64,
                     rec.empty_user_compat_applied as i64,
                     rec.snapshot_id,
+                    compaction.and_then(|value| value.session_hash.as_deref()),
+                    compaction.and_then(|value| value.client_version.as_deref()),
+                    compaction_diagnosis,
+                    compaction.map(|value| value.request_body_bytes as i64),
+                    compaction
+                        .and_then(|value| value.upstream_context_tokens)
+                        .map(|value| value as i64),
+                    compaction.and_then(|value| value.upstream_context_percentage),
+                    compaction
+                        .and_then(|value| value.client_reported_tokens)
+                        .map(|value| value as i64),
+                    compaction.map(|value| value.diagnostics_json.as_str()),
                 ],
             )?;
             // 用「发射顺序下标」作为 attempt 主键分量，而非 provider 的重试轮次计数：
@@ -591,6 +632,55 @@ impl TraceStore {
             }
         }
         Ok(())
+    }
+
+    fn infer_compaction_diagnosis(
+        tx: &rusqlite::Transaction<'_>,
+        trace_id: &str,
+        current: &CompactionTraceData,
+    ) -> rusqlite::Result<String> {
+        let Some(session_hash) = current.session_hash.as_deref() else {
+            return Ok(current.diagnosis.clone());
+        };
+        let previous = tx
+            .query_row(
+                "SELECT request_body_bytes, upstream_context_percentage, client_reported_tokens \
+                 FROM traces WHERE session_hash = ?1 AND trace_id != ?2 \
+                 ORDER BY ts_epoch DESC, rowid DESC LIMIT 1",
+                rusqlite::params![session_hash, trace_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?.map(|value| value as u64),
+                        row.get::<_, Option<f64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?.map(|value| value as u64),
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((Some(previous_bytes), previous_percentage, previous_client_tokens)) = previous
+        else {
+            return Ok(current.diagnosis.clone());
+        };
+        if previous_bytes == 0 {
+            return Ok(current.diagnosis.clone());
+        }
+
+        let previous_exposed_high_context = previous_percentage
+            .is_some_and(|percentage| percentage >= 80.0)
+            && previous_client_tokens.is_some();
+        let stayed_large = current.request_body_bytes >= 2_500_000
+            && current.request_body_bytes.saturating_mul(100)
+                >= previous_bytes.saturating_mul(85);
+        if previous_exposed_high_context && stayed_large {
+            return Ok("suspected_client_compaction_not_triggered".to_string());
+        }
+
+        let shrank_at_least_twenty_percent = current.request_body_bytes.saturating_mul(100)
+            <= previous_bytes.saturating_mul(80);
+        if current.diagnosis == "payload_limit_preempted" && shrank_at_least_twenty_percent {
+            return Ok("suspected_compaction_insufficient".to_string());
+        }
+        Ok(current.diagnosis.clone())
     }
 
     /// 把已落库的 trace 与错误快照关联。相同关联可重复写入，冲突关联 fail-closed。
@@ -711,6 +801,14 @@ impl TraceStore {
             clauses.push("model = ?".to_string());
             params.push(Box::new(m.clone()));
         }
+        if let Some(diagnosis) = &q.compaction_diagnosis {
+            clauses.push("compaction_diagnosis = ?".to_string());
+            params.push(Box::new(diagnosis.clone()));
+        }
+        if let Some(session_hash) = &q.session_hash {
+            clauses.push("session_hash = ?".to_string());
+            params.push(Box::new(session_hash.clone()));
+        }
         if let Some(ids) = &q.credential_ids {
             if ids.is_empty() {
                 // 空白名单 = 该分组下无凭据 → 强制零匹配
@@ -728,6 +826,14 @@ impl TraceStore {
         }
         if q.only_failed {
             clauses.push("final_status != 'success'".to_string());
+        }
+        if q.high_pressure_only {
+            clauses.push(
+                "(COALESCE(upstream_context_percentage, 0) >= 80 \
+                 OR COALESCE(request_body_bytes, 0) >= 2500000 \
+                 OR COALESCE(compaction_diagnosis, 'normal') != 'normal')"
+                    .to_string(),
+            );
         }
         let where_sql = if clauses.is_empty() {
             String::new()
@@ -757,13 +863,37 @@ impl TraceStore {
             "SELECT trace_id, ts, key_id, key_source, response_mode, model, is_stream, final_status, final_credential_id, \
              error_type, error_message, total_attempts, duration_ms, interrupted_after_bytes, \
              input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits, first_token_ms, \
-             upstream_first_byte_ms, reasoning_effort, context_1m, thinking, empty_user_compat_applied, snapshot_id \
+             upstream_first_byte_ms, reasoning_effort, context_1m, thinking, empty_user_compat_applied, snapshot_id, \
+             session_hash, client_version, compaction_diagnosis, request_body_bytes, \
+             upstream_context_tokens, upstream_context_percentage, client_reported_tokens, \
+             compaction_diagnostics_json \
              FROM traces {} ORDER BY ts_epoch DESC LIMIT {} OFFSET {}",
             where_sql, limit, q.offset
         );
 
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(param_refs.as_slice(), |row| {
+            let diagnosis: Option<String> = row.get(28)?;
+            let compaction = if let Some(diagnosis) = diagnosis {
+                Some(CompactionTraceData {
+                    session_hash: row.get(26)?,
+                    client_version: row.get(27)?,
+                    diagnosis,
+                    request_body_bytes: row.get::<_, Option<i64>>(29)?.unwrap_or(0) as u64,
+                    upstream_context_tokens: row
+                        .get::<_, Option<i64>>(30)?
+                        .map(|value| value as u64),
+                    upstream_context_percentage: row.get(31)?,
+                    client_reported_tokens: row
+                        .get::<_, Option<i64>>(32)?
+                        .map(|value| value as u64),
+                    diagnostics_json: row
+                        .get::<_, Option<String>>(33)?
+                        .unwrap_or_else(|| "{\"schemaVersion\":1}".to_string()),
+                })
+            } else {
+                None
+            };
             Ok(TraceRecord {
                 trace_id: row.get(0)?,
                 ts: row.get(1)?,
@@ -794,6 +924,7 @@ impl TraceStore {
                 thinking: row.get::<_, i64>(23)? != 0,
                 empty_user_compat_applied: row.get::<_, i64>(24)? != 0,
                 snapshot_id: row.get(25)?,
+                compaction,
                 attempts: Vec::new(),
             })
         })?;
@@ -1013,7 +1144,15 @@ CREATE TABLE IF NOT EXISTS traces (
     context_1m        INTEGER NOT NULL DEFAULT 0,
     thinking          INTEGER NOT NULL DEFAULT 0,
     empty_user_compat_applied INTEGER NOT NULL DEFAULT 0,
-    snapshot_id       TEXT
+    snapshot_id       TEXT,
+    session_hash      TEXT,
+    client_version    TEXT,
+    compaction_diagnosis TEXT,
+    request_body_bytes INTEGER,
+    upstream_context_tokens INTEGER,
+    upstream_context_percentage REAL,
+    client_reported_tokens INTEGER,
+    compaction_diagnostics_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_traces_ts ON traces(ts_epoch DESC);
 CREATE INDEX IF NOT EXISTS idx_traces_status ON traces(final_status);
@@ -1081,6 +1220,7 @@ mod tests {
             thinking: false,
             empty_user_compat_applied: false,
             snapshot_id: None,
+            compaction: None,
             attempts: vec![
                 TraceAttempt {
                     attempt: 0,
@@ -1119,6 +1259,230 @@ mod tests {
             writer: Mutex::new(None),
             dropped: AtomicU64::new(0),
         }
+    }
+
+    fn compaction(
+        session_hash: &str,
+        diagnosis: &str,
+        request_body_bytes: u64,
+        upstream_context_percentage: Option<f64>,
+    ) -> crate::anthropic::compaction_diagnostics::CompactionTraceData {
+        crate::anthropic::compaction_diagnostics::CompactionTraceData {
+            session_hash: Some(session_hash.to_string()),
+            client_version: Some("2.1.220".to_string()),
+            diagnosis: diagnosis.to_string(),
+            request_body_bytes,
+            upstream_context_tokens: upstream_context_percentage
+                .map(|percentage| (percentage * 10_000.0) as u64),
+            upstream_context_percentage,
+            client_reported_tokens: upstream_context_percentage
+                .map(|percentage| (percentage * 10_000.0) as u64),
+            diagnostics_json:
+                "{\"schemaVersion\":1,\"containsOnlySafeCounters\":true}".to_string(),
+        }
+    }
+
+    #[test]
+    fn compaction_migration_is_idempotent_and_creates_indexes() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE traces (
+                trace_id TEXT PRIMARY KEY,
+                ts TEXT NOT NULL,
+                ts_epoch INTEGER NOT NULL,
+                key_id INTEGER NOT NULL,
+                model TEXT NOT NULL,
+                is_stream INTEGER NOT NULL,
+                final_status TEXT NOT NULL,
+                final_credential_id INTEGER NOT NULL,
+                total_attempts INTEGER NOT NULL,
+                duration_ms INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+
+        TraceStore::migrate(&conn).unwrap();
+        TraceStore::migrate(&conn).unwrap();
+
+        let columns: std::collections::HashSet<String> = conn
+            .prepare("PRAGMA table_info(traces)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for column in [
+            "session_hash",
+            "client_version",
+            "compaction_diagnosis",
+            "request_body_bytes",
+            "upstream_context_tokens",
+            "upstream_context_percentage",
+            "client_reported_tokens",
+            "compaction_diagnostics_json",
+        ] {
+            assert!(columns.contains(column), "missing migrated column {column}");
+        }
+        let indexes: std::collections::HashSet<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(indexes.contains("idx_traces_session_ts"));
+        assert!(indexes.contains("idx_traces_compaction_diagnosis"));
+    }
+
+    #[test]
+    fn compaction_fields_round_trip_and_support_all_filters() {
+        let store = mem_store();
+        for (trace_id, session, diagnosis, bytes, percentage) in [
+            (
+                "compaction-high",
+                "session-high",
+                "context_signal_enqueued",
+                3_000_000,
+                Some(90.0),
+            ),
+            (
+                "compaction-normal",
+                "session-normal",
+                "normal",
+                100_000,
+                Some(10.0),
+            ),
+        ] {
+            let mut record = sample(TraceSample {
+                trace_id,
+                status: "success",
+                credential_id: 5,
+                model: "claude-opus-4-8",
+            });
+            record.compaction = Some(compaction(session, diagnosis, bytes, percentage));
+            store.insert(record);
+        }
+
+        let by_diagnosis = store.query(&TraceQuery {
+            compaction_diagnosis: Some("context_signal_enqueued".to_string()),
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(by_diagnosis.len(), 1);
+        let details = by_diagnosis[0].compaction.as_ref().unwrap();
+        assert_eq!(details.session_hash.as_deref(), Some("session-high"));
+        assert_eq!(details.client_version.as_deref(), Some("2.1.220"));
+        assert_eq!(details.request_body_bytes, 3_000_000);
+        assert_eq!(details.upstream_context_percentage, Some(90.0));
+        assert!(details.diagnostics_json.contains("containsOnlySafeCounters"));
+
+        let by_session = store.query(&TraceQuery {
+            session_hash: Some("session-normal".to_string()),
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(by_session.len(), 1);
+        assert_eq!(by_session[0].trace_id, "compaction-normal");
+
+        let high_pressure = store.query(&TraceQuery {
+            high_pressure_only: true,
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(high_pressure.len(), 1);
+        assert_eq!(high_pressure[0].trace_id, "compaction-high");
+    }
+
+    #[test]
+    fn compaction_inference_distinguishes_not_triggered_from_insufficient() {
+        let store = mem_store();
+        let base = DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap();
+
+        let mut previous = sample(TraceSample {
+            trace_id: "no-trigger-previous",
+            status: "success",
+            credential_id: 5,
+            model: "claude-opus-4-8",
+        });
+        previous.ts = base.to_rfc3339();
+        previous.compaction = Some(compaction(
+            "session-no-trigger",
+            "context_signal_enqueued",
+            3_000_000,
+            Some(90.0),
+        ));
+        store.insert(previous);
+
+        let mut next = sample(TraceSample {
+            trace_id: "no-trigger-next",
+            status: "success",
+            credential_id: 5,
+            model: "claude-opus-4-8",
+        });
+        next.ts = (base + chrono::Duration::seconds(1)).to_rfc3339();
+        next.compaction = Some(compaction(
+            "session-no-trigger",
+            "upstream_context_unknown",
+            2_700_000,
+            None,
+        ));
+        store.insert(next);
+
+        let mut before_compaction = sample(TraceSample {
+            trace_id: "insufficient-previous",
+            status: "success",
+            credential_id: 5,
+            model: "claude-opus-4-8",
+        });
+        before_compaction.ts = base.to_rfc3339();
+        before_compaction.compaction = Some(compaction(
+            "session-insufficient",
+            "context_signal_enqueued",
+            3_000_000,
+            Some(90.0),
+        ));
+        store.insert(before_compaction);
+
+        let mut after_compaction = sample(TraceSample {
+            trace_id: "insufficient-next",
+            status: "error",
+            credential_id: 5,
+            model: "claude-opus-4-8",
+        });
+        after_compaction.ts = (base + chrono::Duration::seconds(1)).to_rfc3339();
+        after_compaction.compaction = Some(compaction(
+            "session-insufficient",
+            "payload_limit_preempted",
+            2_300_000,
+            None,
+        ));
+        store.insert(after_compaction);
+
+        let not_triggered = store.query(&TraceQuery {
+            compaction_diagnosis: Some(
+                "suspected_client_compaction_not_triggered".to_string(),
+            ),
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(not_triggered.len(), 1);
+        assert_eq!(not_triggered[0].trace_id, "no-trigger-next");
+        assert_eq!(
+            not_triggered[0]
+                .compaction
+                .as_ref()
+                .unwrap()
+                .diagnostics_json,
+            "{\"schemaVersion\":1,\"containsOnlySafeCounters\":true}"
+        );
+
+        let insufficient = store.query(&TraceQuery {
+            compaction_diagnosis: Some("suspected_compaction_insufficient".to_string()),
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(insufficient.len(), 1);
+        assert_eq!(insufficient[0].trace_id, "insufficient-next");
     }
 
     /// 启动写入器后，`insert` 必须只入队、不碰磁盘。

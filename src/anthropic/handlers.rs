@@ -396,7 +396,7 @@ impl RequestTracer {
         {
             return;
         }
-        let _compaction = self.compaction.finalize(CompactionFinalize {
+        let compaction = self.compaction.finalize(CompactionFinalize {
             final_status,
             error_type,
             error_message,
@@ -460,6 +460,7 @@ impl RequestTracer {
                 .empty_user_compat_applied
                 .load(std::sync::atomic::Ordering::Relaxed),
             snapshot_id,
+            compaction,
             attempts,
         };
         store.insert(rec);
@@ -6662,7 +6663,7 @@ mod tests {
 
     #[test]
     fn compaction_diagnostics_observe_upstream_context_and_metering() {
-        let (tracer, _snapshot_store, _trace_store) =
+        let (tracer, _snapshot_store, trace_store) =
             test_request_tracer_with_snapshot("trace-compaction-upstream", true);
         tracer.observe_upstream_event(
             &Event::ContextUsage(crate::kiro::model::events::ContextUsageEvent {
@@ -6674,16 +6675,13 @@ mod tests {
             &Event::Metering(crate::kiro::model::events::MeteringEvent { usage: 0.5 }),
             1_000_000,
         );
-        let snapshot = tracer
-            .compaction
-            .finalize(super::super::compaction_diagnostics::CompactionFinalize {
-                final_status: "success",
-                error_type: None,
-                error_message: None,
-                is_stream: true,
-                usage_input_tokens: 0,
-            })
-            .unwrap();
+        tracer.finalize("success", None, None, None, TraceUsage::zero());
+        let (records, total) = trace_store.query_paged(&crate::admin::trace_db::TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(total, 1);
+        let snapshot = records[0].compaction.as_ref().unwrap();
         assert_eq!(snapshot.upstream_context_tokens, Some(875_000));
         assert_eq!(snapshot.upstream_context_percentage, Some(87.5));
         assert!(snapshot.diagnostics_json.contains("\"meteringEventCount\":1"));
