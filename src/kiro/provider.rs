@@ -555,6 +555,10 @@ impl KiroProvider {
         self.token_manager.partial_stream_recovery_window_ms()
     }
 
+    pub fn auto_compact_diagnostics_enabled(&self) -> bool {
+        self.token_manager.auto_compact_diagnostics_enabled()
+    }
+
     /// 是否在等待 Kiro 上游响应时提前提交 SSE 连接注释。
     pub fn early_stream_handshake(&self) -> bool {
         self.token_manager.config().early_stream_handshake

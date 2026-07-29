@@ -20,7 +20,6 @@ use futures::{StreamExt, stream};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::admin::trace_db::TraceSink;
 use crate::kiro::image_budget::{
     ImageBudgetError, ImageBudgetPolicy, PreparedKiroBodies, prepare_kiro_bodies,
 };
@@ -145,6 +144,7 @@ async fn decode_round(
     context_window_size: i32,
     tool_name_map: &std::collections::HashMap<String, String>,
     idle_timeout: Option<std::time::Duration>,
+    tracer: &RequestTracer,
 ) -> RoundOutcome {
     let mut body_stream = response.bytes_stream();
     let mut decoder = EventStreamDecoder::new();
@@ -196,6 +196,7 @@ async fn decode_round(
                 Ok(ev) => ev,
                 Err(_) => continue,
             };
+            tracer.observe_upstream_event(&event, context_window_size);
             match event {
                 Event::AssistantResponse(resp) => text.push_str(&resp.content),
                 Event::ToolUse(tu) => {
@@ -275,7 +276,7 @@ async fn run_round(
     group: Option<&str>,
     tool_compatibility_mode: ToolCompatibilityMode,
     context_window_size: i32,
-    sink: Option<&dyn TraceSink>,
+    tracer: &RequestTracer,
 ) -> Result<(RoundOutcome, u64), Response> {
     let conversion = match convert_request_with_mode(payload, tool_compatibility_mode) {
         Ok(c) => c,
@@ -351,7 +352,7 @@ async fn run_round(
         .call_api_stream_with_content_length_retry(
             &prepared.primary_body,
             prepared.threshold_retry_body.as_deref(),
-            sink,
+            Some(tracer),
             group,
         )
         .await
@@ -368,6 +369,7 @@ async fn run_round(
         context_window_size,
         &conversion.tool_name_map,
         round_idle_timeout(provider.stream_idle_timeout_secs()),
+        tracer,
     )
     .await;
     // Carry the declared tool names (original + shortened) so the flush step can run the
@@ -762,7 +764,7 @@ pub(super) async fn run_web_search_loop(
             group.as_deref(),
             tool_compatibility_mode,
             context_window_size,
-            Some(tracer.as_ref()),
+            tracer.as_ref(),
         )
         .await
         {

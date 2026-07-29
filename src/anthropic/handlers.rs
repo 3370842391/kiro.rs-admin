@@ -37,6 +37,7 @@ use std::time::Duration;
 use tokio::time::{Instant as TokioInstant, interval};
 use uuid::Uuid;
 
+use super::compaction_diagnostics::{CompactionDiagnostics, CompactionFinalize};
 use super::converter::{ConversionError, convert_request_with_mode};
 use super::middleware::{AppState, KeyContext};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
@@ -184,6 +185,8 @@ pub(crate) struct RequestTracer {
     thinking: bool,
     /// 是否对精确空 user 请求应用了最小兼容文本。
     empty_user_compat_applied: std::sync::atomic::AtomicBool,
+    /// 请求局部自动压缩诊断；关闭时内部为空，不进行 hash、扫描或 JSON 构造。
+    compaction: CompactionDiagnostics,
     started_at: Instant,
     /// 首个客户端可见内容事件产出时刻（仅流式标记；取第一次）
     first_token_at: parking_lot::Mutex<Option<Instant>>,
@@ -244,6 +247,10 @@ impl RequestTracer {
             )
             .map(std::sync::Arc::new)
         });
+        let compaction_enabled = state
+            .kiro_provider
+            .as_ref()
+            .is_some_and(|provider| provider.auto_compact_diagnostics_enabled());
         Self {
             store: state.trace_store.clone(),
             snapshot,
@@ -259,6 +266,7 @@ impl RequestTracer {
             context_1m: options.context_1m,
             thinking: options.thinking,
             empty_user_compat_applied: std::sync::atomic::AtomicBool::new(false),
+            compaction: CompactionDiagnostics::new(compaction_enabled, headers, request),
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
             upstream_first_byte_at: parking_lot::Mutex::new(None),
@@ -345,6 +353,30 @@ impl RequestTracer {
         }
     }
 
+    pub(crate) fn observe_upstream_event(&self, event: &Event, context_window_size: i32) {
+        match event {
+            Event::ContextUsage(context_usage) => self.compaction.observe_upstream_context(
+                context_usage.context_usage_percentage,
+                context_window_size,
+            ),
+            Event::Metering(_) => self.compaction.observe_metering_event(),
+            Event::Exception { exception_type, .. }
+                if exception_type == "ContentLengthExceededException" =>
+            {
+                self.compaction.mark_payload_limit_observed();
+            }
+            _ => {}
+        }
+    }
+
+    fn observe_probation(&self, probation: &ProbationBuffer, can_retry: bool, retryable: bool) {
+        self.compaction.observe_probation(
+            probation.semantic_output_started(),
+            can_retry,
+            retryable,
+        );
+    }
+
     fn last_http_status(&self) -> Option<u16> {
         self.attempts.lock().last().and_then(|a| a.http_status)
     }
@@ -364,6 +396,13 @@ impl RequestTracer {
         {
             return;
         }
+        let _compaction = self.compaction.finalize(CompactionFinalize {
+            final_status,
+            error_type,
+            error_message,
+            is_stream: self.is_stream,
+            usage_input_tokens: usage.input_tokens,
+        });
         let attempts = std::mem::take(&mut *self.attempts.lock());
         // 最终凭据：最后一跳的命中凭据（成功跳即命中凭据，失败跳即最后尝试的凭据）
         let final_credential_id = attempts.last().map(|a| a.credential_id).unwrap_or(0);
@@ -436,6 +475,15 @@ impl TraceSink for RequestTracer {
     }
 
     fn on_diagnostic(&self, event: TraceDiagnosticEvent<'_>) {
+        match &event {
+            TraceDiagnosticEvent::UpstreamRequest { body, .. } => {
+                self.compaction.observe_upstream_request(body.len());
+            }
+            TraceDiagnosticEvent::UpstreamResponse { body, .. } => {
+                self.compaction.observe_upstream_response(body);
+            }
+            TraceDiagnosticEvent::NetworkError { .. } => {}
+        }
         let Some(snapshot) = &self.snapshot else {
             return;
         };
@@ -985,7 +1033,10 @@ async fn collect_buffered_attempt(
     for result in decoder.decode_iter() {
         match result {
             Ok(frame) => match Event::from_frame(frame) {
-                Ok(event) => context.process_and_buffer(&event),
+                Ok(event) => {
+                    tracer.observe_upstream_event(&event, context_window_size);
+                    context.process_and_buffer(&event);
+                }
                 Err(error) => {
                     tracing::warn!(error = %error, "strict JSON attempt event decode failed");
                     tracer.record_protocol_error("sse_state_error", &error.to_string());
@@ -3436,13 +3487,11 @@ async fn send_sse_events(
         }
     }
     for event in events {
-        if sender
-            .send(Ok(Bytes::from(event.to_sse_string())))
-            .await
-            .is_err()
-        {
+        let bytes = Bytes::from(event.to_sse_string());
+        if sender.send(Ok(bytes)).await.is_err() {
             return false;
         }
+        tracer.compaction.observe_client_event_enqueued(&event);
     }
     true
 }
@@ -3525,6 +3574,7 @@ async fn read_continuation_round(
     ctx: &mut StreamContext,
     probation: &mut ProbationBuffer,
     tracer: &RequestTracer,
+    context_window_size: i32,
     idle_timeout_secs: u64,
     sender: &tokio::sync::mpsc::Sender<Result<Bytes, Infallible>>,
     start_tx: &mut Option<tokio::sync::oneshot::Sender<StreamStart>>,
@@ -3562,7 +3612,10 @@ async fn read_continuation_round(
                     for result in decoder.decode_iter() {
                         match result {
                             Ok(frame) => match Event::from_frame(frame) {
-                                Ok(event) => events.extend(ctx.process_kiro_event(&event)),
+                                Ok(event) => {
+                                    tracer.observe_upstream_event(&event, context_window_size);
+                                    events.extend(ctx.process_kiro_event(&event));
+                                }
                                 Err(error) => {
                                     tracing::warn!(%error, continuation_round, "续写流事件解码失败");
                                     tracer.record_protocol_error("sse_state_error", &error.to_string());
@@ -3742,7 +3795,13 @@ async fn run_realtime_sse_attempts(
                         for result in decoder.decode_iter() {
                             match result {
                                 Ok(frame) => match Event::from_frame(frame) {
-                                    Ok(event) => events.extend(ctx.process_kiro_event(&event)),
+                                    Ok(event) => {
+                                        tracer.observe_upstream_event(
+                                            &event,
+                                            setup.context_window_size,
+                                        );
+                                        events.extend(ctx.process_kiro_event(&event));
+                                    }
                                     Err(error) => {
                                         tracing::warn!(%error, attempt = attempt_index + 1, "流式事件解码失败");
                                         tracer.record_protocol_error("sse_state_error", &error.to_string());
@@ -3853,6 +3912,7 @@ async fn run_realtime_sse_attempts(
             .flatten();
         let retryable = prepared_retry_body.is_some()
             && probation.prepare_attempt_retry(attempt_index, termination.clone(), attempt_failure);
+        tracer.observe_probation(&probation, can_retry, retryable);
         if retryable {
             retry_request_body = prepared_retry_body;
             tracing::warn!(
@@ -3967,6 +4027,7 @@ async fn run_realtime_sse_attempts(
                 &mut ctx,
                 &mut probation,
                 tracer.as_ref(),
+                setup.context_window_size,
                 idle_timeout_secs,
                 &sender,
                 &mut start_tx,
@@ -4399,6 +4460,7 @@ async fn collect_non_stream_tool_attempt(
             Ok(frame) => match Event::from_frame(frame) {
                 Ok(event) => {
                     observation.observe(&event);
+                    tracer.observe_upstream_event(&event, context_window_size);
                     match event {
                         Event::AssistantResponse(response) => {
                             text_content.push_str(&response.content);
@@ -5819,7 +5881,13 @@ async fn run_buffered_sse_attempts(
                         for result in decoder.decode_iter() {
                             match result {
                                 Ok(frame) => match Event::from_frame(frame) {
-                                    Ok(event) => ctx.process_and_buffer(&event),
+                                    Ok(event) => {
+                                        tracer.observe_upstream_event(
+                                            &event,
+                                            setup.context_window_size,
+                                        );
+                                        ctx.process_and_buffer(&event);
+                                    }
                                     Err(error) => tracing::warn!(%error, attempt = attempt_index + 1, "缓冲流事件解码失败"),
                                 },
                                 Err(error) => tracing::warn!(%error, attempt = attempt_index + 1, "缓冲流 frame 解码失败"),
@@ -5885,6 +5953,7 @@ async fn run_buffered_sse_attempts(
             .flatten();
         let retryable = prepared_retry_body.is_some()
             && probation.prepare_attempt_retry(attempt_index, termination.clone(), attempt_failure);
+        tracer.observe_probation(&probation, can_retry, retryable);
         if retryable {
             retry_request_body = prepared_retry_body;
             tracing::warn!(
@@ -6423,6 +6492,7 @@ mod tests {
 
     fn test_request_tracer_with_snapshot(
         trace_id: &str,
+        compaction_enabled: bool,
     ) -> (
         RequestTracer,
         crate::admin::error_snapshot_db::SharedErrorSnapshotStore,
@@ -6478,6 +6548,11 @@ mod tests {
                 context_1m: false,
                 thinking: false,
                 empty_user_compat_applied: std::sync::atomic::AtomicBool::new(false),
+                compaction: super::super::compaction_diagnostics::CompactionDiagnostics::new(
+                    compaction_enabled,
+                    &HeaderMap::new(),
+                    &request,
+                ),
                 started_at: Instant::now(),
                 first_token_at: parking_lot::Mutex::new(None),
                 upstream_first_byte_at: parking_lot::Mutex::new(None),
@@ -6488,10 +6563,136 @@ mod tests {
         )
     }
 
+    fn compaction_sse_events() -> Vec<SseEvent> {
+        vec![
+            SseEvent::new(
+                "message_start",
+                serde_json::json!({
+                    "type": "message_start",
+                    "message": {
+                        "usage": {
+                            "input_tokens": 700,
+                            "cache_creation_input_tokens": 200,
+                            "cache_read_input_tokens": 100
+                        }
+                    }
+                }),
+            ),
+            SseEvent::new(
+                "content_block_delta",
+                serde_json::json!({
+                    "type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": "unchanged"}
+                }),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn compaction_diagnostics_preserve_sse_bytes_and_observe_only_successful_enqueue() {
+        async fn collect(enabled: bool) -> (Vec<Bytes>, Option<u64>, String) {
+            let (tracer, _snapshot_store, _trace_store) =
+                test_request_tracer_with_snapshot("trace-compaction-sse", enabled);
+            let events = compaction_sse_events();
+            let event_count = events.len();
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+            let mut start_tx = None;
+            assert!(send_sse_events(&sender, &tracer, events, &mut start_tx).await);
+            let mut output = Vec::new();
+            for _ in 0..event_count {
+                output.push(receiver.recv().await.unwrap().unwrap());
+            }
+            let snapshot = tracer
+                .compaction
+                .finalize(super::super::compaction_diagnostics::CompactionFinalize {
+                    final_status: "success",
+                    error_type: None,
+                    error_message: None,
+                    is_stream: true,
+                    usage_input_tokens: 0,
+                });
+            let client_tokens = snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.client_reported_tokens);
+            let diagnostics_json = snapshot
+                .map(|snapshot| snapshot.diagnostics_json)
+                .unwrap_or_default();
+            (output, client_tokens, diagnostics_json)
+        }
+
+        let (disabled_bytes, disabled_tokens, disabled_json) = collect(false).await;
+        let (enabled_bytes, enabled_tokens, enabled_json) = collect(true).await;
+        assert_eq!(disabled_bytes, enabled_bytes);
+        assert_eq!(disabled_tokens, None);
+        assert!(disabled_json.is_empty());
+        assert_eq!(enabled_tokens, Some(1_000));
+        assert!(enabled_json.contains("\"messageStartEnqueued\":true"));
+
+        let (tracer, _snapshot_store, _trace_store) =
+            test_request_tracer_with_snapshot("trace-compaction-sse-closed", true);
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        drop(receiver);
+        let mut start_tx = None;
+        assert!(
+            !send_sse_events(
+                &sender,
+                &tracer,
+                vec![compaction_sse_events().remove(0)],
+                &mut start_tx,
+            )
+            .await
+        );
+        let snapshot = tracer
+            .compaction
+            .finalize(super::super::compaction_diagnostics::CompactionFinalize {
+                final_status: "interrupted",
+                error_type: Some("client_disconnected"),
+                error_message: None,
+                is_stream: true,
+                usage_input_tokens: 0,
+            })
+            .unwrap();
+        assert_eq!(snapshot.client_reported_tokens, None);
+        assert!(
+            snapshot
+                .diagnostics_json
+                .contains("\"messageStartEnqueued\":false")
+        );
+    }
+
+    #[test]
+    fn compaction_diagnostics_observe_upstream_context_and_metering() {
+        let (tracer, _snapshot_store, _trace_store) =
+            test_request_tracer_with_snapshot("trace-compaction-upstream", true);
+        tracer.observe_upstream_event(
+            &Event::ContextUsage(crate::kiro::model::events::ContextUsageEvent {
+                context_usage_percentage: 87.5,
+            }),
+            1_000_000,
+        );
+        tracer.observe_upstream_event(
+            &Event::Metering(crate::kiro::model::events::MeteringEvent { usage: 0.5 }),
+            1_000_000,
+        );
+        let snapshot = tracer
+            .compaction
+            .finalize(super::super::compaction_diagnostics::CompactionFinalize {
+                final_status: "success",
+                error_type: None,
+                error_message: None,
+                is_stream: true,
+                usage_input_tokens: 0,
+            })
+            .unwrap();
+        assert_eq!(snapshot.upstream_context_tokens, Some(875_000));
+        assert_eq!(snapshot.upstream_context_percentage, Some(87.5));
+        assert!(snapshot.diagnostics_json.contains("\"meteringEventCount\":1"));
+    }
+
     #[test]
     fn client_disconnect_finalizes_interrupted_snapshot() {
         let (tracer, snapshot_store, trace_store) =
-            test_request_tracer_with_snapshot("trace-client-disconnect");
+            test_request_tracer_with_snapshot("trace-client-disconnect", false);
 
         finalize_client_disconnected(
             &tracer,
@@ -6526,7 +6727,7 @@ mod tests {
     #[test]
     fn structured_json_semantic_retry_marks_recovered_snapshot() {
         let (tracer, snapshot_store, _trace_store) =
-            test_request_tracer_with_snapshot("trace-structured-retry");
+            test_request_tracer_with_snapshot("trace-structured-retry", false);
 
         record_strict_json_recovery(&tracer, 2);
         tracer.finalize("success", None, None, None, TraceUsage::zero());
@@ -6548,7 +6749,7 @@ mod tests {
     #[test]
     fn immediate_error_response_preserves_http_status_and_message() {
         let (tracer, snapshot_store, _trace_store) =
-            test_request_tracer_with_snapshot("trace-immediate-error");
+            test_request_tracer_with_snapshot("trace-immediate-error", false);
         let response = (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new("invalid_request_error", "bad document")),
@@ -6574,7 +6775,7 @@ mod tests {
     #[test]
     fn request_tracer_forwards_provider_diagnostics_without_duplicate_attempts() {
         let (tracer, snapshot_store, _trace_store) =
-            test_request_tracer_with_snapshot("trace-provider-diagnostics");
+            test_request_tracer_with_snapshot("trace-provider-diagnostics", false);
 
         tracer.on_diagnostic(
             crate::admin::trace_db::TraceDiagnosticEvent::UpstreamRequest {
@@ -6654,7 +6855,7 @@ mod tests {
     #[test]
     fn request_tracer_records_empty_user_compat_application() {
         let (tracer, _snapshot_store, trace_store) =
-            test_request_tracer_with_snapshot("trace-empty-user-compat");
+            test_request_tracer_with_snapshot("trace-empty-user-compat", false);
         tracer.mark_empty_user_compat_applied();
         tracer.finalize("success", None, None, None, TraceUsage::zero());
 
