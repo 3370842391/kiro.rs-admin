@@ -702,6 +702,7 @@ export async function setCompatibilityConfig(
 
 export interface LogGovernanceConfig {
   traceEnabled: boolean
+  autoCompactDiagnosticsEnabled: boolean
   traceRetentionDays: number
   usageLogRetentionDays: number
   errorSnapshotEnabled: boolean

@@ -674,6 +674,75 @@ export interface TraceAttempt {
   durationMs: number
 }
 
+export type CompactionDiagnosis =
+  | 'normal'
+  | 'payload_limit_preempted'
+  | 'client_disconnected_before_signal'
+  | 'proxy_context_signal_not_exposed'
+  | 'client_usage_signal_incomplete'
+  | 'context_signal_enqueued'
+  | 'upstream_context_unknown'
+  | 'suspected_client_compaction_not_triggered'
+  | 'suspected_compaction_insufficient'
+
+export interface CompactionRequestShape {
+  messageCount: number
+  systemCount: number
+  toolCount: number
+  imageCount: number
+  toolUseCount: number
+  toolResultCount: number
+  messageBytes: number
+  systemBytes: number
+  toolSchemaBytes: number
+  imageBytes: number
+  toolUseBytes: number
+  toolResultBytes: number
+}
+
+/** 仅包含数字、布尔值和安全枚举，不含请求正文、工具参数、请求头或凭证。 */
+export interface CompactionDiagnostics {
+  schemaVersion: number
+  currentDiagnosis: string
+  knownThirdPartyAutocompactRegressionPossible: boolean
+  requestShape: CompactionRequestShape
+  requestBodyBytes: number
+  upstreamRequestCount: number
+  upstreamRequestFirstBytes: number | null
+  upstreamRequestLastBytes: number | null
+  upstreamRequestMinBytes: number | null
+  upstreamRequestMaxBytes: number | null
+  contextUsageEventCount: number
+  meteringEventCount: number
+  upstreamContextTokens: number | null
+  upstreamContextPercentage: number | null
+  upstreamContextLimitReached: boolean
+  clientReportedTokens: number | null
+  messageStartEnqueued: boolean
+  messageDeltaEnqueued: boolean
+  messageStopEnqueued: boolean
+  clientErrorEnqueued: boolean
+  semanticOutputEnqueued: boolean
+  probationSemanticOutputStarted: boolean
+  probationRetryConsidered: boolean
+  probationRetryStarted: boolean
+  clientDisconnected: boolean
+  payloadLimitObserved: boolean
+  finalStatus: string
+  finalErrorType: string | null
+}
+
+export interface CompactionTrace {
+  sessionHash: string | null
+  clientVersion: string | null
+  diagnosis: CompactionDiagnosis | string
+  requestBodyBytes: number
+  upstreamContextTokens: number | null
+  upstreamContextPercentage: number | null
+  clientReportedTokens: number | null
+  diagnostics: CompactionDiagnostics
+}
+
 /** 一个外部请求的完整链路 */
 export interface TraceRecord {
   traceId: string
@@ -722,6 +791,8 @@ export interface TraceRecord {
   thinking?: boolean
   /** 是否对精确空 user 请求应用了最小兼容文本 */
   emptyUserCompatApplied?: boolean
+  /** 自动压缩安全诊断；旧记录或开关关闭时为 null。 */
+  compaction?: CompactionTrace | null
   attempts: TraceAttempt[]
 }
 
@@ -737,6 +808,9 @@ export interface TraceQuery {
   model?: string
   /** 按账号分组名筛选（只返回 final_credential_id 属于该分组的 trace） */
   group?: string
+  compactionDiagnosis?: string
+  sessionHash?: string
+  highPressureOnly?: boolean
   onlyFailed?: boolean
   limit?: number
   offset?: number

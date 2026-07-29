@@ -24,6 +24,9 @@ export async function getTraces(query: TraceQuery): Promise<TracePage> {
     params.failedAttemptCredentialId = String(query.failedAttemptCredentialId)
   if (query.model) params.model = query.model
   if (query.group) params.group = query.group
+  if (query.compactionDiagnosis) params.compactionDiagnosis = query.compactionDiagnosis
+  if (query.sessionHash) params.sessionHash = query.sessionHash
+  if (query.highPressureOnly) params.highPressureOnly = 'true'
   if (query.onlyFailed) params.onlyFailed = 'true'
   if (query.limit != null) params.limit = String(query.limit)
   if (query.offset != null) params.offset = String(query.offset)

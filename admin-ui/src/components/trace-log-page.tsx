@@ -117,6 +117,12 @@ function formatTokens(n: number): string {
   return String(n)
 }
 
+function formatBytes(n: number): string {
+  if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(2)} MiB`
+  if (n >= 1024) return `${(n / 1024).toFixed(1)} KiB`
+  return `${n} B`
+}
+
 /** 千位分隔的完整数值（用于明细悬浮框） */
 function formatTokenFull(n: number): string {
   return n.toLocaleString('en-US')
@@ -150,6 +156,53 @@ const ERROR_TYPE_OPTIONS = [
   { value: 'stream_interrupted', label: '流中断' },
   { value: 'unknown', label: '未知' },
 ]
+
+const COMPACTION_DIAGNOSIS_OPTIONS = [
+  { value: '', label: '全部压缩诊断' },
+  { value: 'normal', label: '正常' },
+  { value: 'context_signal_enqueued', label: '上下文信号已入队' },
+  { value: 'proxy_context_signal_not_exposed', label: '代理未暴露信号' },
+  { value: 'client_usage_signal_incomplete', label: '客户端用量信号不完整' },
+  { value: 'client_disconnected_before_signal', label: '信号前客户端断开' },
+  { value: 'upstream_context_unknown', label: '上游上下文未知' },
+  { value: 'payload_limit_preempted', label: '请求体限制抢先失败' },
+  { value: 'suspected_client_compaction_not_triggered', label: '疑似客户端未触发压缩' },
+  { value: 'suspected_compaction_insufficient', label: '疑似压缩不足' },
+]
+
+function compactionDiagnosisStyle(diagnosis: string): {
+  label: string
+  variant: 'secondary' | 'destructive' | 'outline' | 'success' | 'warning'
+} {
+  switch (diagnosis) {
+    case 'normal':
+      return { label: '正常', variant: 'outline' }
+    case 'context_signal_enqueued':
+      return { label: '信号已入队', variant: 'success' }
+    case 'proxy_context_signal_not_exposed':
+      return { label: '代理未暴露信号', variant: 'warning' }
+    case 'client_usage_signal_incomplete':
+      return { label: '客户端信号不完整', variant: 'warning' }
+    case 'client_disconnected_before_signal':
+      return { label: '信号前断开', variant: 'destructive' }
+    case 'upstream_context_unknown':
+      return { label: '上游上下文未知', variant: 'secondary' }
+    case 'payload_limit_preempted':
+      return { label: '请求体限制', variant: 'destructive' }
+    case 'suspected_client_compaction_not_triggered':
+      return { label: '疑似未触发压缩', variant: 'warning' }
+    case 'suspected_compaction_insufficient':
+      return { label: '疑似压缩不足', variant: 'destructive' }
+    default:
+      return { label: diagnosis, variant: 'secondary' }
+  }
+}
+
+function CompactionBadge({ diagnosis }: { diagnosis?: string | null }) {
+  if (!diagnosis) return <span className="text-muted-foreground">—</span>
+  const style = compactionDiagnosisStyle(diagnosis)
+  return <Badge variant={style.variant}>{style.label}</Badge>
+}
 
 /** 单跳明细行 */
 function AttemptRow({ a }: { a: TraceAttempt }) {
@@ -310,7 +363,148 @@ function TokenCell({ rec }: { rec: TraceRecord }) {
   )
 }
 
-function TraceRow({ rec }: { rec: TraceRecord }) {
+function CompactionDetail({
+  rec,
+  onViewSession,
+}: {
+  rec: TraceRecord
+  onViewSession: (sessionHash: string) => void
+}) {
+  const compaction = rec.compaction
+  if (!compaction) return null
+  const diagnostics = compaction.diagnostics
+  const shape = diagnostics?.requestShape
+  const signals: Array<[string, boolean | undefined]> = [
+    ['message_start 已入队', diagnostics?.messageStartEnqueued],
+    ['message_delta 已入队', diagnostics?.messageDeltaEnqueued],
+    ['message_stop 已入队', diagnostics?.messageStopEnqueued],
+    ['客户端错误已入队', diagnostics?.clientErrorEnqueued],
+    ['语义输出已入队', diagnostics?.semanticOutputEnqueued],
+    ['Probation 已见语义输出', diagnostics?.probationSemanticOutputStarted],
+    ['考虑过整轮重试', diagnostics?.probationRetryConsidered],
+    ['已启动整轮重试', diagnostics?.probationRetryStarted],
+    ['客户端已断开', diagnostics?.clientDisconnected],
+    ['观察到请求体限制', diagnostics?.payloadLimitObserved],
+  ]
+  const metrics: Array<[string, string]> = [
+    ['客户端请求体', formatBytes(compaction.requestBodyBytes)],
+    [
+      '上游最大请求体',
+      diagnostics?.upstreamRequestMaxBytes != null
+        ? formatBytes(diagnostics.upstreamRequestMaxBytes)
+        : '未观察到',
+    ],
+    ['上游请求次数', String(diagnostics?.upstreamRequestCount ?? 0)],
+    ['contextUsage 事件', String(diagnostics?.contextUsageEventCount ?? 0)],
+    ['metering 事件', String(diagnostics?.meteringEventCount ?? 0)],
+    [
+      '上游上下文占比',
+      compaction.upstreamContextPercentage != null
+        ? `${compaction.upstreamContextPercentage.toFixed(2)}%`
+        : '未知',
+    ],
+    [
+      '上游上下文 Token',
+      compaction.upstreamContextTokens != null
+        ? formatTokenFull(compaction.upstreamContextTokens)
+        : '未知',
+    ],
+    [
+      '客户端收到的输入 Token',
+      compaction.clientReportedTokens != null
+        ? formatTokenFull(compaction.clientReportedTokens)
+        : '未观察到',
+    ],
+  ]
+
+  return (
+    <section className="space-y-3 rounded-lg border border-amber-500/25 bg-amber-500/5 p-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-[12px] font-medium text-foreground">自动压缩诊断</span>
+        <CompactionBadge diagnosis={compaction.diagnosis} />
+        {diagnostics?.knownThirdPartyAutocompactRegressionPossible ? (
+          <Badge variant="warning">客户端版本可能命中已知回归</Badge>
+        ) : null}
+        {compaction.clientVersion ? (
+          <span className="font-mono text-[11px] text-muted-foreground">
+            client {compaction.clientVersion}
+          </span>
+        ) : null}
+      </div>
+
+      {compaction.sessionHash ? (
+        <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
+          <span>会话 SHA-256</span>
+          <code className="max-w-[36rem] truncate rounded bg-background/70 px-1.5 py-0.5" title={compaction.sessionHash}>
+            {compaction.sessionHash}
+          </code>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-7 text-xs"
+            onClick={() => onViewSession(compaction.sessionHash!)}
+          >
+            查看同会话
+          </Button>
+        </div>
+      ) : null}
+
+      <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+        {metrics.map(([label, value]) => (
+          <div key={label} className="rounded-md bg-background/60 px-2.5 py-2 text-[11px]">
+            <div className="text-muted-foreground">{label}</div>
+            <div className="mt-0.5 font-mono font-medium tabular-nums text-foreground">{value}</div>
+          </div>
+        ))}
+      </div>
+
+      {shape ? (
+        <div className="space-y-1.5">
+          <div className="text-[11px] font-medium text-muted-foreground">请求安全形状</div>
+          <div className="flex flex-wrap gap-1.5 text-[11px]">
+            <Badge variant="outline">消息 {shape.messageCount}</Badge>
+            <Badge variant="outline">系统块 {shape.systemCount}</Badge>
+            <Badge variant="outline">工具声明 {shape.toolCount}</Badge>
+            <Badge variant="outline">图片 {shape.imageCount}</Badge>
+            <Badge variant="outline">tool_use {shape.toolUseCount}</Badge>
+            <Badge variant="outline">tool_result {shape.toolResultCount}</Badge>
+            <Badge variant="outline">消息形状 {formatBytes(shape.messageBytes)}</Badge>
+            <Badge variant="outline">系统形状 {formatBytes(shape.systemBytes)}</Badge>
+            <Badge variant="outline">工具 Schema 形状 {formatBytes(shape.toolSchemaBytes)}</Badge>
+            <Badge variant="outline">图片形状 {formatBytes(shape.imageBytes)}</Badge>
+            <Badge variant="outline">tool_use 形状 {formatBytes(shape.toolUseBytes)}</Badge>
+            <Badge variant="outline">tool_result 形状 {formatBytes(shape.toolResultBytes)}</Badge>
+          </div>
+        </div>
+      ) : (
+        <div className="text-[11px] text-muted-foreground">详细计数无法解析；数据库主诊断仍可用于筛选。</div>
+      )}
+
+      <div className="space-y-1.5">
+        <div className="text-[11px] font-medium text-muted-foreground">信号边界</div>
+        <div className="flex flex-wrap gap-1.5">
+          {signals.map(([label, observed]) => (
+            <Badge key={label} variant={observed ? 'success' : 'outline'}>
+              {observed ? '✓' : '—'} {label}
+            </Badge>
+          ))}
+        </div>
+      </div>
+
+      <p className="text-[11px] leading-relaxed text-muted-foreground">
+        这里只展示 hash、版本、字节数、计数和布尔信号，不保存请求正文、工具参数、请求头或凭证。
+      </p>
+    </section>
+  )
+}
+
+function TraceRow({
+  rec,
+  onViewSession,
+}: {
+  rec: TraceRecord
+  onViewSession: (sessionHash: string) => void
+}) {
   const [open, setOpen] = useState(false)
   const errStyle = rec.errorType ? outcomeStyle(rec.errorType) : null
   const detailId = `trace-detail-${rec.traceId}`
@@ -359,6 +553,9 @@ function TraceRow({ rec }: { rec: TraceRecord }) {
         <td className="py-2.5 pr-3">
           <StatusBadge status={rec.finalStatus} />
         </td>
+        <td className="py-2.5 pr-3">
+          <CompactionBadge diagnosis={rec.compaction?.diagnosis} />
+        </td>
         <TraceCredentialCell rec={rec} />
         <td className="py-2.5 pr-3 text-[12px] tabular-nums">
           <TokenCell rec={rec} />
@@ -379,7 +576,7 @@ function TraceRow({ rec }: { rec: TraceRecord }) {
           {formatDuration(rec.durationMs)}
         </td>
       </tr>
-      {open && <ExpandedTraceRow rec={rec} id={detailId} />}
+      {open ? <ExpandedTraceRow rec={rec} id={detailId} onViewSession={onViewSession} /> : null}
     </>
   )
 }
@@ -423,18 +620,32 @@ function TraceTableSkeleton() {
   )
 }
 
-function ExpandedTraceRow({ id, rec }: { id: string; rec: TraceRecord }) {
+function ExpandedTraceRow({
+  id,
+  rec,
+  onViewSession,
+}: {
+  id: string
+  rec: TraceRecord
+  onViewSession: (sessionHash: string) => void
+}) {
   return (
     <tr id={id} className="border-b border-border/40 bg-secondary/20">
-      <td colSpan={12} className="px-3 py-3">
-        <ExpandedDetail rec={rec} />
+      <td colSpan={13} className="px-3 py-3">
+        <ExpandedDetail rec={rec} onViewSession={onViewSession} />
       </td>
     </tr>
   )
 }
 
 /** 展开后的链路详情：错误摘要 + 每跳时间线 */
-function ExpandedDetail({ rec }: { rec: TraceRecord }) {
+function ExpandedDetail({
+  rec,
+  onViewSession,
+}: {
+  rec: TraceRecord
+  onViewSession: (sessionHash: string) => void
+}) {
   const [snapshotOpen, setSnapshotOpen] = useState(false)
   return (
     <div className="space-y-3">
@@ -448,6 +659,7 @@ function ExpandedDetail({ rec }: { rec: TraceRecord }) {
           中断前已发送 {rec.interruptedAfterBytes} 字节
         </div>
       )}
+      <CompactionDetail rec={rec} onViewSession={onViewSession} />
       {rec.snapshotId && (
         <>
           <Button size="sm" variant="outline" onClick={() => setSnapshotOpen(true)}>
@@ -522,6 +734,7 @@ function GovernanceButton() {
   const [snapshotMinFreeGb, setSnapshotMinFreeGb] = useState('')
 
   const enabled = cfg?.traceEnabled ?? true
+  const autoCompactDiagnosticsEnabled = cfg?.autoCompactDiagnosticsEnabled ?? true
   const errorSnapshotEnabled = cfg?.errorSnapshotEnabled ?? true
   const errorSnapshotCaptureRecovered = cfg?.errorSnapshotCaptureRecovered ?? true
   const errorSnapshotCaptureBodies = cfg?.errorSnapshotCaptureBodies ?? true
@@ -583,6 +796,31 @@ function GovernanceButton() {
               disabled={isLoading || isPending}
               onCheckedChange={(v) =>
                 save({ traceEnabled: v }, v ? '已开启链路追踪' : '已关闭链路追踪')
+              }
+            />
+          </div>
+        </div>
+        <DropdownMenuSeparator />
+        <DropdownMenuLabel>自动压缩诊断</DropdownMenuLabel>
+        <div className="px-2 pb-2">
+          <div className="flex items-center justify-between gap-3 rounded-md bg-secondary/40 px-2.5 py-2">
+            <div className="text-xs">
+              <div className="font-medium text-foreground">
+                {autoCompactDiagnosticsEnabled ? '已启用' : '已关闭'}
+              </div>
+              <div className="leading-snug text-muted-foreground">
+                独立于链路追踪；Docker 仅输出高压力结论，详细安全计数写入 traces.db。
+              </div>
+            </div>
+            <Switch
+              checked={autoCompactDiagnosticsEnabled}
+              disabled={isLoading || isPending}
+              aria-label="自动压缩诊断"
+              onCheckedChange={(value) =>
+                save(
+                  { autoCompactDiagnosticsEnabled: value },
+                  value ? '已开启自动压缩诊断' : '已关闭自动压缩诊断',
+                )
               }
             />
           </div>
@@ -758,6 +996,9 @@ export function TraceLogPage() {
   const [keyId, setKeyId] = useState('')
   const [group, setGroup] = useState('')
   const [onlyFailed, setOnlyFailed] = useState(false)
+  const [compactionDiagnosis, setCompactionDiagnosis] = useState('')
+  const [sessionHash, setSessionHash] = useState('')
+  const [highPressureOnly, setHighPressureOnly] = useState(false)
   const [page, setPage] = useState(0)
 
   const { data: keysData } = useClientKeys()
@@ -784,6 +1025,9 @@ export function TraceLogPage() {
     keyId: keyId ? Number(keyId) : undefined,
     group: group || undefined,
     onlyFailed: onlyFailed || undefined,
+    compactionDiagnosis: compactionDiagnosis || undefined,
+    sessionHash: sessionHash || undefined,
+    highPressureOnly: highPressureOnly || undefined,
     limit: PAGE_SIZE,
     offset: page * PAGE_SIZE,
   }
@@ -791,6 +1035,11 @@ export function TraceLogPage() {
   const records = data?.records ?? []
   const total = data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
+
+  const showSession = (hash: string) => {
+    setSessionHash(hash)
+    setPage(0)
+  }
 
   const confirm = useConfirm()
   const clearTraces = useClearTraces()
@@ -845,6 +1094,12 @@ export function TraceLogPage() {
             onChange={resetTo(setErrorType)}
             options={ERROR_TYPE_OPTIONS}
           />
+          <Select
+            label="按自动压缩诊断筛选"
+            value={compactionDiagnosis}
+            onChange={resetTo(setCompactionDiagnosis)}
+            options={COMPACTION_DIAGNOSIS_OPTIONS}
+          />
           {/* aria-pressed：这是个开关式按钮，选中态目前只靠 variant 换色表达 */}
           <Button
             size="sm"
@@ -857,6 +1112,31 @@ export function TraceLogPage() {
           >
             只看失败
           </Button>
+          <Button
+            size="sm"
+            variant={highPressureOnly ? 'default' : 'outline'}
+            aria-pressed={highPressureOnly}
+            onClick={() => {
+              setHighPressureOnly((value) => !value)
+              setPage(0)
+            }}
+          >
+            只看高压力
+          </Button>
+          {sessionHash ? (
+            <Button
+              size="sm"
+              variant="secondary"
+              title={sessionHash}
+              aria-label={`清除会话筛选 ${sessionHash}`}
+              onClick={() => {
+                setSessionHash('')
+                setPage(0)
+              }}
+            >
+              会话 {sessionHash.slice(0, 10)}… ×
+            </Button>
+          ) : null}
           <GovernanceButton />
           <Button size="sm" variant="outline" onClick={() => refetch()} disabled={isFetching}>
             <RefreshCw className={`h-3.5 w-3.5 ${isFetching ? 'animate-spin' : ''}`} />
@@ -885,7 +1165,7 @@ export function TraceLogPage() {
             </div>
           ) : (
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[1080px] text-left">
+              <table className="w-full min-w-[1240px] text-left">
                 <caption className="sr-only">
                   请求链路日志：每行一次请求，展开可查看逐跳尝试详情
                 </caption>
@@ -899,6 +1179,7 @@ export function TraceLogPage() {
                     <th scope="col" className="py-2 pr-3 font-medium">模型</th>
                     <th scope="col" className="py-2 pr-3 font-medium">入口 Key</th>
                     <th scope="col" className="py-2 pr-3 font-medium">状态</th>
+                    <th scope="col" className="py-2 pr-3 font-medium">压缩诊断</th>
                     <th scope="col" className="py-2 pr-3 font-medium">最终凭据</th>
                     <th scope="col" className="py-2 pr-3 font-medium">Token</th>
                     <th scope="col" className="py-2 pr-3 font-medium">费用</th>
@@ -910,7 +1191,7 @@ export function TraceLogPage() {
                 </thead>
                 <tbody>
                   {records.map((rec) => (
-                    <TraceRow key={rec.traceId} rec={rec} />
+                    <TraceRow key={rec.traceId} rec={rec} onViewSession={showSession} />
                   ))}
                 </tbody>
               </table>
