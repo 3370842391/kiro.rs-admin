@@ -39,6 +39,7 @@ describe('auto compact diagnostics UI wiring', () => {
       'requestShape',
       'meteringEventCount',
       'messageStartEnqueued',
+      'contextWindowExceededEnqueued',
     ]) {
       expect(page).toContain(field)
     }

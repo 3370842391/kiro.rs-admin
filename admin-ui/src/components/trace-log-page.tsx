@@ -377,6 +377,7 @@ function CompactionDetail({
   const signals: Array<[string, boolean | undefined]> = [
     ['message_start 已入队', diagnostics?.messageStartEnqueued],
     ['message_delta 已入队', diagnostics?.messageDeltaEnqueued],
+    ['上下文耗尽 stop_reason 已入队', diagnostics?.contextWindowExceededEnqueued],
     ['message_stop 已入队', diagnostics?.messageStopEnqueued],
     ['客户端错误已入队', diagnostics?.clientErrorEnqueued],
     ['语义输出已入队', diagnostics?.semanticOutputEnqueued],

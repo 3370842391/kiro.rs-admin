@@ -720,6 +720,7 @@ export interface CompactionDiagnostics {
   clientReportedTokens: number | null
   messageStartEnqueued: boolean
   messageDeltaEnqueued: boolean
+  contextWindowExceededEnqueued: boolean
   messageStopEnqueued: boolean
   clientErrorEnqueued: boolean
   semanticOutputEnqueued: boolean

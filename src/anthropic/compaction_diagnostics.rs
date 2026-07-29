@@ -83,6 +83,7 @@ struct SafeDiagnosticSnapshot<'a> {
     client_reported_tokens: Option<u64>,
     message_start_enqueued: bool,
     message_delta_enqueued: bool,
+    context_window_exceeded_enqueued: bool,
     message_stop_enqueued: bool,
     client_error_enqueued: bool,
     semantic_output_enqueued: bool,
@@ -114,6 +115,7 @@ struct EnabledDiagnostics {
     client_reported_tokens: AtomicU64,
     message_start_enqueued: AtomicBool,
     message_delta_enqueued: AtomicBool,
+    context_window_exceeded_enqueued: AtomicBool,
     message_stop_enqueued: AtomicBool,
     client_error_enqueued: AtomicBool,
     semantic_output_enqueued: AtomicBool,
@@ -169,6 +171,7 @@ impl CompactionDiagnostics {
                 client_reported_tokens: AtomicU64::new(UNKNOWN_U64),
                 message_start_enqueued: AtomicBool::new(false),
                 message_delta_enqueued: AtomicBool::new(false),
+                context_window_exceeded_enqueued: AtomicBool::new(false),
                 message_stop_enqueued: AtomicBool::new(false),
                 client_error_enqueued: AtomicBool::new(false),
                 semantic_output_enqueued: AtomicBool::new(false),
@@ -271,7 +274,19 @@ impl CompactionDiagnostics {
                     state.client_reported_tokens.store(total, Ordering::Relaxed);
                 }
             }
-            "message_delta" => state.message_delta_enqueued.store(true, Ordering::Relaxed),
+            "message_delta" => {
+                state.message_delta_enqueued.store(true, Ordering::Relaxed);
+                if event
+                    .data
+                    .pointer("/delta/stop_reason")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("model_context_window_exceeded")
+                {
+                    state
+                        .context_window_exceeded_enqueued
+                        .store(true, Ordering::Relaxed);
+                }
+            }
             "message_stop" => state.message_stop_enqueued.store(true, Ordering::Relaxed),
             "error" => state.client_error_enqueued.store(true, Ordering::Relaxed),
             "content_block_start" | "content_block_delta" => {
@@ -283,6 +298,17 @@ impl CompactionDiagnostics {
             }
             _ => {}
         }
+    }
+
+    pub(crate) fn observe_non_stream_client_usage(&self, input_tokens: u64) {
+        let Some(state) = &self.enabled else {
+            return;
+        };
+        state
+            .client_reported_tokens
+            .store(input_tokens, Ordering::Relaxed);
+        // 非流式响应没有 message_start 事件；该字段在诊断中统一表示 usage 已暴露给客户端。
+        state.message_start_enqueued.store(true, Ordering::Relaxed);
     }
 
     pub(crate) fn observe_probation(
@@ -324,7 +350,9 @@ impl CompactionDiagnostics {
         let mut client_reported_tokens = optional_atomic(&state.client_reported_tokens);
         let mut message_start_enqueued = state.message_start_enqueued.load(Ordering::Relaxed);
         if !outcome.is_stream && outcome.final_status == "success" {
-            client_reported_tokens = Some(outcome.usage_input_tokens);
+            if outcome.usage_input_tokens > 0 || client_reported_tokens.is_none() {
+                client_reported_tokens = Some(outcome.usage_input_tokens);
+            }
             message_start_enqueued = true;
         }
         let client_disconnected = outcome.error_type == Some("client_disconnected");
@@ -367,6 +395,9 @@ impl CompactionDiagnostics {
             client_reported_tokens,
             message_start_enqueued,
             message_delta_enqueued: state.message_delta_enqueued.load(Ordering::Relaxed),
+            context_window_exceeded_enqueued: state
+                .context_window_exceeded_enqueued
+                .load(Ordering::Relaxed),
             message_stop_enqueued: state.message_stop_enqueued.load(Ordering::Relaxed),
             client_error_enqueued: state.client_error_enqueued.load(Ordering::Relaxed),
             semantic_output_enqueued: state.semantic_output_enqueued.load(Ordering::Relaxed),
@@ -397,6 +428,9 @@ impl CompactionDiagnostics {
                 upstream_context_percentage = facts.upstream_context_percentage,
                 client_reported_tokens = facts.client_reported_tokens,
                 message_start_enqueued = facts.message_start_enqueued,
+                context_window_exceeded_enqueued = state
+                    .context_window_exceeded_enqueued
+                    .load(Ordering::Relaxed),
                 client_disconnected = facts.client_disconnected,
                 payload_limit_observed = facts.payload_limit_observed,
                 "自动压缩诊断结论（仅安全计数，不含正文、工具参数或凭证）"
@@ -688,6 +722,44 @@ mod tests {
         assert!(json.contains("\"toolUseCount\":1"));
         assert!(json.contains("\"toolResultCount\":1"));
         assert!(json.contains("\"imageCount\":1"));
+    }
+
+    #[test]
+    fn non_stream_finalize_preserves_usage_already_observed_on_the_client_response() {
+        let diagnostics = CompactionDiagnostics::new(true, &HeaderMap::new(), &request());
+        diagnostics.observe_non_stream_client_usage(1_000);
+
+        let snapshot = diagnostics
+            .finalize(CompactionFinalize {
+                final_status: "success",
+                error_type: None,
+                error_message: None,
+                is_stream: false,
+                usage_input_tokens: 0,
+            })
+            .unwrap();
+
+        assert_eq!(snapshot.client_reported_tokens, Some(1_000));
+    }
+
+    #[test]
+    fn snapshot_records_whether_context_window_exceeded_reached_the_client() {
+        let diagnostics = CompactionDiagnostics::new(true, &HeaderMap::new(), &request());
+        diagnostics.observe_client_event_enqueued(&crate::anthropic::stream::SseEvent::new(
+            "message_delta",
+            json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "model_context_window_exceeded"},
+                "usage": {"output_tokens": 1}
+            }),
+        ));
+
+        let snapshot = diagnostics.finalize(finalize()).unwrap();
+        assert!(
+            snapshot
+                .diagnostics_json
+                .contains("\"contextWindowExceededEnqueued\":true")
+        );
     }
 
     #[test]

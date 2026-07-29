@@ -928,8 +928,10 @@ pub(super) async fn run_web_search_loop(
                 &stop_reason,
                 final_input,
                 output_tokens,
+                tracer.as_ref(),
             )
         } else {
+            tracer.observe_non_stream_client_usage(final_input.max(0) as u64);
             render_json(
                 &payload.model,
                 content,
@@ -993,8 +995,10 @@ fn render_sse(
     stop_reason: &str,
     input_tokens: i32,
     output_tokens: i32,
+    tracer: &RequestTracer,
 ) -> Response {
     let events = build_sse_events(model, content, stop_reason, input_tokens, output_tokens);
+    tracer.observe_client_events_enqueued(&events);
     let stream = stream::iter(
         events
             .into_iter()

@@ -369,6 +369,17 @@ impl RequestTracer {
         }
     }
 
+    pub(crate) fn observe_client_events_enqueued(&self, events: &[SseEvent]) {
+        for event in events {
+            self.compaction.observe_client_event_enqueued(event);
+        }
+    }
+
+    pub(crate) fn observe_non_stream_client_usage(&self, input_tokens: u64) {
+        self.compaction
+            .observe_non_stream_client_usage(input_tokens);
+    }
+
     fn observe_probation(&self, probation: &ProbationBuffer, can_retry: bool, retryable: bool) {
         self.compaction.observe_probation(
             probation.semantic_output_started(),
@@ -1293,15 +1304,15 @@ async fn handle_strict_json_request(
             );
             record_strict_json_recovery(tracer.as_ref(), recovered.attempts.len());
             tracer.mark_first_token();
-            tracer.finalize("success", None, None, None, trace_usage);
-
-            if payload.stream {
-                local_text_stream_response(build_local_text_stream_events(
+            let response = if payload.stream {
+                let events = build_local_text_stream_events(
                     &payload.model,
                     &recovered.json,
                     input_tokens,
                     cache_usage,
-                ))
+                );
+                tracer.observe_client_events_enqueued(&events);
+                local_text_stream_response(events)
             } else {
                 (
                     StatusCode::OK,
@@ -1313,7 +1324,9 @@ async fn handle_strict_json_request(
                     )),
                 )
                     .into_response()
-            }
+            };
+            tracer.finalize("success", None, None, None, trace_usage);
+            response
         }
         Err(failure) => {
             let credential_id = failure
@@ -6603,15 +6616,15 @@ mod tests {
             for _ in 0..event_count {
                 output.push(receiver.recv().await.unwrap().unwrap());
             }
-            let snapshot = tracer
-                .compaction
-                .finalize(super::super::compaction_diagnostics::CompactionFinalize {
+            let snapshot = tracer.compaction.finalize(
+                super::super::compaction_diagnostics::CompactionFinalize {
                     final_status: "success",
                     error_type: None,
                     error_message: None,
                     is_stream: true,
                     usage_input_tokens: 0,
-                });
+                },
+            );
             let client_tokens = snapshot
                 .as_ref()
                 .and_then(|snapshot| snapshot.client_reported_tokens);
@@ -6662,6 +6675,32 @@ mod tests {
     }
 
     #[test]
+    fn compaction_diagnostics_observe_locally_generated_sse_events() {
+        let (tracer, _snapshot_store, _trace_store) =
+            test_request_tracer_with_snapshot("trace-compaction-local-sse", true);
+        let events = compaction_sse_events();
+
+        tracer.observe_client_events_enqueued(&events);
+
+        let snapshot = tracer
+            .compaction
+            .finalize(super::super::compaction_diagnostics::CompactionFinalize {
+                final_status: "success",
+                error_type: None,
+                error_message: None,
+                is_stream: true,
+                usage_input_tokens: 0,
+            })
+            .unwrap();
+        assert_eq!(snapshot.client_reported_tokens, Some(1_000));
+        assert!(
+            snapshot
+                .diagnostics_json
+                .contains("\"messageStartEnqueued\":true")
+        );
+    }
+
+    #[test]
     fn compaction_diagnostics_observe_upstream_context_and_metering() {
         let (tracer, _snapshot_store, trace_store) =
             test_request_tracer_with_snapshot("trace-compaction-upstream", true);
@@ -6684,7 +6723,11 @@ mod tests {
         let snapshot = records[0].compaction.as_ref().unwrap();
         assert_eq!(snapshot.upstream_context_tokens, Some(875_000));
         assert_eq!(snapshot.upstream_context_percentage, Some(87.5));
-        assert!(snapshot.diagnostics_json.contains("\"meteringEventCount\":1"));
+        assert!(
+            snapshot
+                .diagnostics_json
+                .contains("\"meteringEventCount\":1")
+        );
     }
 
     #[test]
