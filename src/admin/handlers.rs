@@ -1810,6 +1810,22 @@ fn trace_record_to_admin_json(
     final_email: Option<String>,
     email_map: &HashMap<u64, Option<String>>,
 ) -> serde_json::Value {
+    let compaction = r.compaction.as_ref().map(|snapshot| {
+        let diagnostics = serde_json::from_str::<serde_json::Value>(&snapshot.diagnostics_json)
+            .unwrap_or_else(|_| {
+                serde_json::json!({"schemaVersion": 1, "parseError": true})
+            });
+        serde_json::json!({
+            "sessionHash": snapshot.session_hash,
+            "clientVersion": snapshot.client_version,
+            "diagnosis": snapshot.diagnosis,
+            "requestBodyBytes": snapshot.request_body_bytes,
+            "upstreamContextTokens": snapshot.upstream_context_tokens,
+            "upstreamContextPercentage": snapshot.upstream_context_percentage,
+            "clientReportedTokens": snapshot.client_reported_tokens,
+            "diagnostics": diagnostics,
+        })
+    });
     let attempts: Vec<serde_json::Value> = r
         .attempts
         .iter()
@@ -1857,31 +1873,16 @@ fn trace_record_to_admin_json(
         "context1m": r.context_1m,
         "thinking": r.thinking,
         "emptyUserCompatApplied": r.empty_user_compat_applied,
+        "compaction": compaction,
         "attempts": attempts,
     })
 }
 
-pub async fn list_traces(
-    State(state): State<AdminState>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
-) -> impl IntoResponse {
-    // 解析分组筛选：把 group 名转为凭据 id 白名单（先于查询执行，避免分页错位）
-    let group = params
-        .get("group")
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let credential_ids: Option<Vec<u64>> = group.as_ref().map(|g| {
-        state
-            .service
-            .get_all_credentials()
-            .credentials
-            .iter()
-            .filter(|c| c.groups.iter().any(|cg| cg == g))
-            .map(|c| c.id)
-            .collect()
-    });
-
-    let query = TraceQuery {
+fn trace_query_from_params(
+    params: &std::collections::HashMap<String, String>,
+    credential_ids: Option<Vec<u64>>,
+) -> TraceQuery {
+    TraceQuery {
         status: params.get("status").filter(|s| !s.is_empty()).cloned(),
         error_type: params.get("errorType").filter(|s| !s.is_empty()).cloned(),
         credential_id: params
@@ -1918,7 +1919,30 @@ pub async fn list_traces(
             .get("offset")
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(0),
-    };
+    }
+}
+
+pub async fn list_traces(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    // 解析分组筛选：把 group 名转为凭据 id 白名单（先于查询执行，避免分页错位）
+    let group = params
+        .get("group")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let credential_ids: Option<Vec<u64>> = group.as_ref().map(|g| {
+        state
+            .service
+            .get_all_credentials()
+            .credentials
+            .iter()
+            .filter(|c| c.groups.iter().any(|cg| cg == g))
+            .map(|c| c.id)
+            .collect()
+    });
+
+    let query = trace_query_from_params(&params, credential_ids);
     let (records, total) = state.trace_store.query_paged(&query);
 
     // 附加 credential email 方便前端展示（与 stats_by_credential 一致）
@@ -2577,7 +2601,7 @@ mod tests {
     }
 
     #[test]
-    fn trace_admin_json_includes_response_mode_snapshot() {
+    fn compaction_trace_admin_json_includes_safe_diagnostics_object() {
         let record = crate::admin::trace_db::TraceRecord {
             trace_id: "trace-native".into(),
             ts: "2026-07-15T00:00:00Z".into(),
@@ -2605,7 +2629,18 @@ mod tests {
             thinking: false,
             empty_user_compat_applied: false,
             snapshot_id: None,
-            compaction: None,
+            compaction: Some(
+                crate::anthropic::compaction_diagnostics::CompactionTraceData {
+                    session_hash: Some("a".repeat(64)),
+                    client_version: Some("2.1.220".into()),
+                    diagnosis: "context_signal_enqueued".into(),
+                    request_body_bytes: 3_000_000,
+                    upstream_context_tokens: Some(900_000),
+                    upstream_context_percentage: Some(90.0),
+                    client_reported_tokens: Some(900_000),
+                    diagnostics_json: "{\"schemaVersion\":1,\"messageCount\":4}".into(),
+                },
+            ),
             attempts: Vec::new(),
         };
 
@@ -2618,5 +2653,31 @@ mod tests {
 
         assert_eq!(value["responseMode"], "kiro_native");
         assert_eq!(value["keyName"], "native-key");
+        assert_eq!(
+            value["compaction"]["diagnosis"],
+            "context_signal_enqueued"
+        );
+        assert_eq!(value["compaction"]["diagnostics"]["schemaVersion"], 1);
+        assert_eq!(value["compaction"]["diagnostics"]["messageCount"], 4);
+        assert!(value["compaction"].get("diagnosticsJson").is_none());
+    }
+
+    #[test]
+    fn compaction_trace_query_params_are_parsed() {
+        let params = std::collections::HashMap::from([
+            ("compactionDiagnosis".to_string(), "payload_limit_preempted".to_string()),
+            ("sessionHash".to_string(), "abc123".to_string()),
+            ("highPressureOnly".to_string(), "true".to_string()),
+            ("limit".to_string(), "25".to_string()),
+        ]);
+        let query = trace_query_from_params(&params, Some(vec![7, 9]));
+        assert_eq!(
+            query.compaction_diagnosis.as_deref(),
+            Some("payload_limit_preempted")
+        );
+        assert_eq!(query.session_hash.as_deref(), Some("abc123"));
+        assert!(query.high_pressure_only);
+        assert_eq!(query.credential_ids, Some(vec![7, 9]));
+        assert_eq!(query.limit, 25);
     }
 }

@@ -894,6 +894,8 @@ pub struct ClearCacheResponse {
 pub struct LogGovernanceConfigResponse {
     /// 是否启用请求链路追踪写入
     pub trace_enabled: bool,
+    /// 是否采集自动压缩安全诊断；独立于 trace 开关。
+    pub auto_compact_diagnostics_enabled: bool,
     /// trace 记录保留天数
     pub trace_retention_days: u32,
     /// 用量日志保留天数
@@ -942,6 +944,8 @@ pub struct SetDeadCredentialConfigRequest {
 pub struct SetLogGovernanceConfigRequest {
     #[serde(default)]
     pub trace_enabled: Option<bool>,
+    #[serde(default)]
+    pub auto_compact_diagnostics_enabled: Option<bool>,
     /// trace 保留天数，1..=365
     #[serde(default)]
     pub trace_retention_days: Option<u32>,

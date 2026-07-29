@@ -3260,6 +3260,9 @@ impl AdminService {
                 .as_ref()
                 .map(|s| s.is_enabled())
                 .unwrap_or(cfg.trace_enabled),
+            auto_compact_diagnostics_enabled: self
+                .token_manager
+                .auto_compact_diagnostics_enabled(),
             trace_retention_days: self
                 .trace_store
                 .as_ref()
@@ -3361,6 +3364,7 @@ impl AdminService {
         req: SetLogGovernanceConfigRequest,
     ) -> Result<LogGovernanceConfigResponse, AdminServiceError> {
         if req.trace_enabled.is_none()
+            && req.auto_compact_diagnostics_enabled.is_none()
             && req.trace_retention_days.is_none()
             && req.usage_log_retention_days.is_none()
             && req.dead_credential_retention_hours.is_none()
@@ -3405,6 +3409,11 @@ impl AdminService {
             if let Some(s) = &self.trace_store {
                 s.set_enabled(enabled);
             }
+        }
+        if let Some(enabled) = req.auto_compact_diagnostics_enabled {
+            self.token_manager
+                .set_auto_compact_diagnostics_enabled_runtime(enabled)
+                .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
         }
         if let Some(days) = req.trace_retention_days {
             if let Some(s) = &self.trace_store {
@@ -3474,6 +3483,9 @@ impl AdminService {
             .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
         if let Some(v) = req.trace_enabled {
             config.trace_enabled = v;
+        }
+        if let Some(v) = req.auto_compact_diagnostics_enabled {
+            config.auto_compact_diagnostics_enabled = v;
         }
         if let Some(v) = req.trace_retention_days {
             config.trace_retention_days = v;
@@ -5571,6 +5583,49 @@ mod tests {
                 .unwrap()
                 .rpm_limit,
             4
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_compact_log_governance_switch_is_independent_and_persists() {
+        let temp = ImageBudgetTestDir::new();
+        let config_path = temp.path().join("config.json");
+        let mut config = Config::load(&config_path).unwrap();
+        config.trace_enabled = false;
+        config.auto_compact_diagnostics_enabled = true;
+        config.save().unwrap();
+        let manager = Arc::new(
+            MultiTokenManager::new(config, Vec::new(), None, None, true).unwrap(),
+        );
+        let service = AdminService::new(
+            Arc::clone(&manager),
+            vec!["ide".to_string()],
+            Arc::new(ProxyPoolManager::new(
+                None,
+                crate::model::config::TlsBackend::Rustls,
+            )),
+        );
+
+        let response = service
+            .set_log_governance_config(SetLogGovernanceConfigRequest {
+                auto_compact_diagnostics_enabled: Some(false),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert!(!response.auto_compact_diagnostics_enabled);
+        assert_eq!(
+            serde_json::to_value(&response).unwrap()["autoCompactDiagnosticsEnabled"],
+            false
+        );
+        assert!(!manager.auto_compact_diagnostics_enabled());
+        let persisted = Config::load(&config_path).unwrap();
+        assert!(!persisted.auto_compact_diagnostics_enabled);
+        assert!(!persisted.trace_enabled);
+        assert!(
+            service
+                .set_log_governance_config(SetLogGovernanceConfigRequest::default())
+                .is_err()
         );
     }
 
