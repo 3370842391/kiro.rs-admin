@@ -7,20 +7,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
-use serde::Serialize;
 use serde_json::Value;
 
-use crate::admin::key_supplier::client::{Profile, Stock, SupplierClient, SupplierStatus};
+use crate::admin::key_supplier::client::{SupplierClient, SupplierSnapshot};
 use crate::admin::key_supplier::config::{
-    SupplierConfigUpdate, SupplierConfigView, SupplierRuntimeConfig, is_valid_webhook_token,
+    MAX_SUPPLIERS, SupplierConfigUpdate, SupplierConfigView, SupplierEntryRuntime,
+    SupplierEntryUpdate, SupplierEntryView, SupplierRuntimeConfig, is_valid_webhook_token,
+    normalize_supplier_id, store_suppliers,
 };
 use crate::admin::key_supplier::store::{
-    IncomingSupplierEvent, InsertOutcome, ProcessSummary, StoredSupplierEvent, SupplierEventStore,
+    IncomingSupplierEvent, InsertOutcome, LEGACY_SUPPLIER_ID, ProcessSummary, StoredSupplierEvent,
+    SupplierEventStore,
 };
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::region::API_KEY_AUTH_REGION;
 use crate::kiro::token_manager::MultiTokenManager;
-use crate::model::config::Config;
+use crate::model::config::{Config, SupplierKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CountDecision {
@@ -64,7 +66,16 @@ pub enum IncomingWebhook {
 }
 
 impl IncomingWebhook {
-    pub fn parse(body: &[u8]) -> Result<Self, SupplierServiceError> {
+    /// 解析 webhook。按供货商协议分派：`kiro-rs` 走原有严格校验，
+    /// `kiro-app` 的推送体格式未文档化，走宽容解析。
+    pub fn parse(kind: SupplierKind, body: &[u8]) -> Result<Self, SupplierServiceError> {
+        match kind {
+            SupplierKind::KiroRs => Self::parse_kiro_rs(body),
+            SupplierKind::KiroApp => Self::parse_kiro_app(body),
+        }
+    }
+
+    fn parse_kiro_rs(body: &[u8]) -> Result<Self, SupplierServiceError> {
         let value: Value =
             serde_json::from_slice(body).map_err(|_| SupplierServiceError::InvalidJson)?;
         let object = value
@@ -98,7 +109,60 @@ impl IncomingWebhook {
         }
     }
 
-    fn into_event(self) -> IncomingSupplierEvent {
+    /// kiroapp.cc 的到货推送：「一车产出多少 Key 只发一条」，字段名未公开。
+    ///
+    /// 因此：数量按一组候选字段名取，取不到按 0 处理（下单量再由库存/配置夹逼）；
+    /// event id 优先用对方给的稳定 id，没有就退化成 body 指纹——同一车重复推
+    /// 仍然命中同一行，靠 `(supplier_id, event_id)` 唯一索引挡住第二次下单。
+    fn parse_kiro_app(body: &[u8]) -> Result<Self, SupplierServiceError> {
+        let value: Value =
+            serde_json::from_slice(body).map_err(|_| SupplierServiceError::InvalidJson)?;
+        let object = value
+            .as_object()
+            .ok_or(SupplierServiceError::InvalidPayload)?;
+
+        let event_name = object
+            .get("event")
+            .or_else(|| object.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let message = object
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("kiroapp 到货通知")
+            .to_string();
+        let event_id = optional_id(object, &["event_id", "eventId", "id", "batchId", "batch_id"])
+            .unwrap_or_else(|| body_fingerprint(body));
+
+        if event_name.eq_ignore_ascii_case("test") {
+            return Ok(Self::Test { event_id, message });
+        }
+
+        let new_keys = optional_quantity(
+            object,
+            &[
+                "count",
+                "keys",
+                "newKeys",
+                "new_keys",
+                "availableKeys",
+                "available_keys",
+                "quantity",
+            ],
+        )
+        .unwrap_or(0);
+        // claim 没有幂等键，订单号只用于日志与昵称后缀；从 event_id 派生保证重放一致。
+        let purchase_order_id = derive_order_id(&event_id);
+        Ok(Self::NewKeysAvailable {
+            event_id,
+            purchase_order_id,
+            message,
+            new_keys,
+        })
+    }
+
+    fn into_event(self, supplier_id: &str) -> IncomingSupplierEvent {
+        let supplier_id = supplier_id.to_string();
         match self {
             Self::NewKeysAvailable {
                 event_id,
@@ -106,6 +170,7 @@ impl IncomingWebhook {
                 message,
                 new_keys,
             } => IncomingSupplierEvent {
+                supplier_id,
                 event_id,
                 event_type: "new_keys_available".to_string(),
                 purchase_order_id: Some(purchase_order_id),
@@ -117,6 +182,7 @@ impl IncomingWebhook {
                 message,
                 dead,
             } => IncomingSupplierEvent {
+                supplier_id,
                 event_id,
                 event_type: "all_keys_dead".to_string(),
                 purchase_order_id: None,
@@ -124,6 +190,7 @@ impl IncomingWebhook {
                 quantity: i64::from(dead),
             },
             Self::Test { event_id, message } => IncomingSupplierEvent {
+                supplier_id,
                 event_id,
                 event_type: "test".to_string(),
                 purchase_order_id: None,
@@ -132,6 +199,89 @@ impl IncomingWebhook {
             },
         }
     }
+}
+
+/// `hex(HMAC-SHA256(secret, 原始请求体))`，与 kiroapp.cc 的 `X-Kiro-Signature` 对齐。
+fn sign_webhook_body(secret: &str, body: &[u8]) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes())
+        .expect("HMAC accepts keys of any length");
+    mac.update(body);
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// 用推送体指纹当 event id：同一车重复推 → 同一 id → 唯一索引判重 → 不重复下单。
+fn body_fingerprint(body: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(body);
+    hex_prefix(&digest)
+}
+
+/// 从 event id 派生 32 hex 订单号，保证同一事件重放得到同一个订单号。
+fn derive_order_id(event_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"kiro-supplier-order:");
+    hasher.update(event_id.as_bytes());
+    hex_prefix(&hasher.finalize())
+}
+
+fn hex_prefix(digest: &[u8]) -> String {
+    digest
+        .iter()
+        .take(16)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// event id 的最大长度。对方的 `evt_8DX2ZPK9MR7Q4JWH` 远短于此，留足余量即可。
+const MAX_EVENT_ID_CHARS: usize = 128;
+
+/// 在候选字段名里找第一个可用的 id。
+///
+/// **原样保留**对方给的 id（例如 `evt_8DX2ZPK9MR7Q4JWH`），这样事件历史里的 id
+/// 能直接和对方后台的投递记录对上。只有超长或含控制字符时才退化成哈希——
+/// 去重只要求「同一事件映射到同一个 id」，不要求 id 是 hex。
+fn optional_id(object: &serde_json::Map<String, Value>, fields: &[&str]) -> Option<String> {
+    for field in fields {
+        let raw = match object.get(*field) {
+            Some(Value::String(value)) => value.trim().to_string(),
+            Some(Value::Number(value)) => value.to_string(),
+            _ => continue,
+        };
+        if raw.is_empty() {
+            continue;
+        }
+        let usable = raw.chars().count() <= MAX_EVENT_ID_CHARS
+            && !raw.chars().any(|ch| ch.is_control() || ch.is_whitespace());
+        return Some(if usable { raw } else { derive_order_id(&raw) });
+    }
+    None
+}
+
+/// 在候选字段名里找第一个能当数量用的值。数组按长度算（`{"keys":[...]}`）。
+fn optional_quantity(object: &serde_json::Map<String, Value>, fields: &[&str]) -> Option<u32> {
+    for field in fields {
+        let quantity = match object.get(*field) {
+            Some(Value::Number(value)) => value.as_u64(),
+            Some(Value::Array(values)) => Some(values.len() as u64),
+            Some(Value::String(value)) => value.trim().parse::<u64>().ok(),
+            _ => None,
+        };
+        if let Some(quantity) = quantity
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|quantity| *quantity > 0)
+        {
+            return Some(quantity);
+        }
+    }
+    None
 }
 
 fn required_id(
@@ -191,19 +341,21 @@ impl CredentialImporter for TokenManagerCredentialImporter {
 
 pub struct KeySupplierService {
     store: Arc<SupplierEventStore>,
-    runtime: parking_lot::RwLock<SupplierRuntimeConfig>,
+    suppliers: parking_lot::RwLock<Vec<SupplierEntryRuntime>>,
     importer: Option<Arc<dyn CredentialImporter>>,
     processing_lock: tokio::sync::Mutex<()>,
     config_path: Option<PathBuf>,
     config_update_lock: parking_lot::Mutex<()>,
     processor_started: AtomicBool,
+    /// webhook 落库后立刻唤醒后台处理器，不必等 30s tick。抢货拼的就是这点延迟。
+    wakeup: tokio::sync::Notify,
 }
 
 impl fmt::Debug for KeySupplierService {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("KeySupplierService")
-            .field("runtime", &*self.runtime.read())
+            .field("suppliers", &*self.suppliers.read())
             .field("config_path", &self.config_path)
             .field(
                 "processor_started",
@@ -214,48 +366,93 @@ impl fmt::Debug for KeySupplierService {
 }
 
 impl KeySupplierService {
+    /// 单供货商构造器，等价于只挂一家 `default` / `kiro-rs`。
+    /// 生产路径走 `new_with_token_manager`（读配置列表），这个只剩测试在用。
+    #[cfg(test)]
     pub fn new(store: Arc<SupplierEventStore>, runtime: SupplierRuntimeConfig) -> Self {
+        Self::with_suppliers(store, vec![default_entry(runtime)])
+    }
+
+    #[cfg(test)]
+    pub fn with_suppliers(
+        store: Arc<SupplierEventStore>,
+        suppliers: Vec<SupplierEntryRuntime>,
+    ) -> Self {
         Self {
             store,
-            runtime: parking_lot::RwLock::new(runtime),
+            suppliers: parking_lot::RwLock::new(suppliers),
             importer: None,
             processing_lock: tokio::sync::Mutex::new(()),
             config_path: None,
             config_update_lock: parking_lot::Mutex::new(()),
             processor_started: AtomicBool::new(false),
+            wakeup: tokio::sync::Notify::new(),
         }
     }
 
+    #[cfg(test)]
     pub fn with_importer(
         store: Arc<SupplierEventStore>,
         runtime: SupplierRuntimeConfig,
         importer: Arc<dyn CredentialImporter>,
     ) -> Self {
+        Self::with_suppliers_and_importer(store, vec![default_entry(runtime)], importer)
+    }
+
+    pub fn with_suppliers_and_importer(
+        store: Arc<SupplierEventStore>,
+        suppliers: Vec<SupplierEntryRuntime>,
+        importer: Arc<dyn CredentialImporter>,
+    ) -> Self {
         Self {
             store,
-            runtime: parking_lot::RwLock::new(runtime),
+            suppliers: parking_lot::RwLock::new(suppliers),
             importer: Some(importer),
             processing_lock: tokio::sync::Mutex::new(()),
             config_path: None,
             config_update_lock: parking_lot::Mutex::new(()),
             processor_started: AtomicBool::new(false),
+            wakeup: tokio::sync::Notify::new(),
         }
     }
 
     pub fn new_with_token_manager(
         store: Arc<SupplierEventStore>,
-        runtime: SupplierRuntimeConfig,
+        suppliers: Vec<SupplierEntryRuntime>,
         token_manager: Arc<MultiTokenManager>,
     ) -> Self {
-        Self::with_importer(
+        Self::with_suppliers_and_importer(
             store,
-            runtime,
+            suppliers,
             Arc::new(TokenManagerCredentialImporter::new(token_manager)),
         )
     }
 
+    pub fn supplier(&self, id: &str) -> Option<SupplierEntryRuntime> {
+        let id = normalize_supplier_id(id).ok()?;
+        self.suppliers
+            .read()
+            .iter()
+            .find(|entry| entry.id == id)
+            .cloned()
+    }
+
+    /// 历史单供货商接口的落点：第一个启用的供货商，没有则第一个。
+    fn primary(&self) -> Result<SupplierEntryRuntime, SupplierServiceError> {
+        let suppliers = self.suppliers.read();
+        suppliers
+            .iter()
+            .find(|entry| entry.enabled)
+            .or_else(|| suppliers.first())
+            .cloned()
+            .ok_or(SupplierServiceError::SupplierConfiguration)
+    }
+
+    /// 历史接口用的运行期配置（第一个供货商）。缺供货商时给默认值，避免 panic。
     pub fn runtime_config(&self) -> SupplierRuntimeConfig {
-        self.runtime.read().clone()
+        self.primary()
+            .map(|entry| entry.settings)
+            .unwrap_or_else(|_| empty_runtime())
     }
 
     pub fn with_config_path(mut self, config_path: impl AsRef<Path>) -> Self {
@@ -263,8 +460,18 @@ impl KeySupplierService {
         self
     }
 
-    pub fn set_runtime_config(&self, runtime: SupplierRuntimeConfig) {
-        *self.runtime.write() = runtime;
+    /// 直接热替第一个供货商的连接配置。仅测试用——生产路径一律走
+    /// `upsert_supplier`，那条路会同时落盘，不会让内存和磁盘分叉。
+    #[cfg(test)]
+    fn set_runtime_config(&self, runtime: SupplierRuntimeConfig) {
+        let mut suppliers = self.suppliers.write();
+        match suppliers.iter_mut().find(|entry| entry.enabled) {
+            Some(entry) => entry.settings = runtime,
+            None => match suppliers.first_mut() {
+                Some(entry) => entry.settings = runtime,
+                None => suppliers.push(default_entry(runtime)),
+            },
+        }
     }
 
     pub fn store(&self) -> Arc<SupplierEventStore> {
@@ -283,81 +490,195 @@ impl KeySupplierService {
             .map_err(|_| SupplierServiceError::Store)
     }
 
+    /// 任一供货商的 token 命中即通过（历史行为：只看第一家）。
     pub fn has_valid_webhook_token(&self, token: &str) -> bool {
-        let runtime = self.runtime_config();
-        is_valid_webhook_token(&runtime.webhook_token)
-            && crate::common::auth::constant_time_eq(&runtime.webhook_token, token)
+        self.resolve_webhook_token(token).is_some()
+    }
+
+    /// 用 webhook token 反查供货商。每家一个 token，常量时间比较防时序侧信道。
+    pub fn resolve_webhook_token(&self, token: &str) -> Option<SupplierEntryRuntime> {
+        self.suppliers
+            .read()
+            .iter()
+            .find(|entry| {
+                is_valid_webhook_token(&entry.settings.webhook_token)
+                    && crate::common::auth::constant_time_eq(&entry.settings.webhook_token, token)
+            })
+            .cloned()
     }
 
     pub fn config_view(&self) -> SupplierConfigView {
         SupplierConfigView::from(&self.runtime_config())
     }
 
+    pub fn supplier_views(&self) -> Vec<SupplierEntryView> {
+        self.suppliers
+            .read()
+            .iter()
+            .map(SupplierEntryView::from)
+            .collect()
+    }
+
+    /// 历史单供货商配置接口。落到第一个供货商上，不再写 `config.key_supplier`。
     pub fn update_config(
         &self,
         update: SupplierConfigUpdate,
     ) -> Result<SupplierConfigView, SupplierServiceError> {
+        let primary = self.primary().ok();
+        let entry = self.upsert_supplier(
+            primary.as_ref().map(|entry| entry.id.clone()),
+            SupplierEntryUpdate {
+                id: Some(
+                    primary
+                        .as_ref()
+                        .map(|entry| entry.id.clone())
+                        .unwrap_or_else(|| LEGACY_SUPPLIER_ID.to_owned()),
+                ),
+                name: primary
+                    .as_ref()
+                    .map(|entry| entry.name.clone())
+                    .unwrap_or_else(|| "默认供货商".to_owned()),
+                kind: primary.as_ref().map_or(SupplierKind::KiroRs, |e| e.kind),
+                enabled: primary.as_ref().is_none_or(|entry| entry.enabled),
+                settings: update,
+            },
+        )?;
+        Ok(entry.settings)
+    }
+
+    /// 新增或修改一家供货商，落盘后热更新内存。`id=None` 表示新增。
+    pub fn upsert_supplier(
+        &self,
+        id: Option<String>,
+        update: SupplierEntryUpdate,
+    ) -> Result<SupplierEntryView, SupplierServiceError> {
         let _guard = self.config_update_lock.lock();
+        let mut entries = self.suppliers.read().clone();
+        let existing_index = match id.as_deref() {
+            Some(id) => {
+                let id = normalize_supplier_id(id)
+                    .map_err(|_| SupplierServiceError::SupplierConfiguration)?;
+                Some(
+                    entries
+                        .iter()
+                        .position(|entry| entry.id == id)
+                        .ok_or(SupplierServiceError::SupplierNotFound)?,
+                )
+            }
+            None => None,
+        };
+        let existing = existing_index.map(|index| entries[index].clone());
+        let runtime =
+            SupplierEntryRuntime::normalize_update(id.as_deref(), update, existing.as_ref())
+                .map_err(|_| SupplierServiceError::SupplierConfiguration)?;
+
+        match existing_index {
+            Some(index) => entries[index] = runtime.clone(),
+            None => {
+                if entries.iter().any(|entry| entry.id == runtime.id) {
+                    return Err(SupplierServiceError::SupplierIdConflict);
+                }
+                if entries.len() >= MAX_SUPPLIERS {
+                    return Err(SupplierServiceError::TooManySuppliers);
+                }
+                entries.push(runtime.clone());
+            }
+        }
+        self.persist_suppliers(&entries)?;
+        *self.suppliers.write() = entries;
+        Ok(SupplierEntryView::from(&runtime))
+    }
+
+    /// 删除一家供货商。事件历史保留（带 supplier_id），只是不再采购。
+    pub fn delete_supplier(&self, id: &str) -> Result<(), SupplierServiceError> {
+        let _guard = self.config_update_lock.lock();
+        let id = normalize_supplier_id(id).map_err(|_| SupplierServiceError::SupplierNotFound)?;
+        let mut entries = self.suppliers.read().clone();
+        let before = entries.len();
+        entries.retain(|entry| entry.id != id);
+        if entries.len() == before {
+            return Err(SupplierServiceError::SupplierNotFound);
+        }
+        self.persist_suppliers(&entries)?;
+        *self.suppliers.write() = entries;
+        Ok(())
+    }
+
+    fn persist_suppliers(
+        &self,
+        entries: &[SupplierEntryRuntime],
+    ) -> Result<(), SupplierServiceError> {
         let path = self
             .config_path
             .as_ref()
             .ok_or(SupplierServiceError::ConfigPathUnavailable)?;
         let mut config = Config::load(path).map_err(|_| SupplierServiceError::ConfigPersistence)?;
-        let runtime = SupplierRuntimeConfig::apply(&mut config, update)
-            .map_err(|_| SupplierServiceError::SupplierConfiguration)?;
+        store_suppliers(&mut config, entries);
         config
             .save()
-            .map_err(|_| SupplierServiceError::ConfigPersistence)?;
-        *self.runtime.write() = runtime.clone();
-        Ok(SupplierConfigView::from(&runtime))
+            .map_err(|_| SupplierServiceError::ConfigPersistence)
     }
 
-    fn supplier_client(&self) -> Result<SupplierClient, SupplierServiceError> {
-        let runtime = self.runtime_config();
-        if runtime.base_url.trim().is_empty() || runtime.api_key.trim().is_empty() {
+    fn client_for(
+        &self,
+        entry: &SupplierEntryRuntime,
+    ) -> Result<SupplierClient, SupplierServiceError> {
+        if !entry.is_operable() {
             return Err(SupplierServiceError::SupplierConfiguration);
         }
-        SupplierClient::new(&runtime.base_url, &runtime.api_key)
+        SupplierClient::with_kind(&entry.settings.base_url, &entry.settings.api_key, entry.kind)
             .map_err(|_| SupplierServiceError::SupplierConfiguration)
     }
 
     pub async fn overview(&self) -> Result<SupplierOverview, SupplierServiceError> {
-        let client = self.supplier_client()?;
-        let profile = client
-            .profile()
+        self.supplier_overview(&self.primary()?.id).await
+    }
+
+    /// 指定供货商的概览。字段按协议能力给，缺的留 `None`。
+    pub async fn supplier_overview(
+        &self,
+        id: &str,
+    ) -> Result<SupplierOverview, SupplierServiceError> {
+        let entry = self
+            .supplier(id)
+            .ok_or(SupplierServiceError::SupplierNotFound)?;
+        let snapshot = self
+            .client_for(&entry)?
+            .snapshot()
             .await
             .map_err(SupplierServiceError::supplier_api)?;
-        let webhook_registered = self
-            .callback_url()
-            .ok()
-            .is_some_and(|callback| profile.webhook_url == callback);
-        let stock = client
-            .stock()
-            .await
-            .map_err(SupplierServiceError::supplier_api)?;
-        let status = client
-            .status()
-            .await
-            .map_err(SupplierServiceError::supplier_api)?;
+        let webhook_registered = match (&snapshot.webhook_url, self.supplier_callback_url(id).ok()) {
+            (Some(registered), Some(callback)) => *registered == callback,
+            // kiro-app 读不到对方登记的回调地址，注册状态未知。
+            _ => false,
+        };
         Ok(SupplierOverview {
-            profile,
-            stock,
-            status,
+            supplier_id: entry.id,
+            kind: entry.kind.as_str(),
+            snapshot,
             webhook_registered,
         })
     }
 
+    /// 历史单供货商回调地址。生产路径走 `supplier_callback_url`（带 id）。
+    #[cfg(test)]
     pub fn callback_url(&self) -> Result<String, SupplierServiceError> {
-        let runtime = self.runtime_config();
-        if runtime.webhook_token.len() != 64
-            || !runtime
-                .webhook_token
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
+        self.supplier_callback_url(&self.primary()?.id)
+    }
+
+    /// 该供货商专属的回调地址。`kiro-app` 需要把这个地址手填到对方面板。
+    pub fn supplier_callback_url(&self, id: &str) -> Result<String, SupplierServiceError> {
+        let entry = self
+            .supplier(id)
+            .ok_or(SupplierServiceError::SupplierNotFound)?;
+        let runtime = &entry.settings;
+        if !is_valid_webhook_token(&runtime.webhook_token)
             || runtime.public_base_url.trim().is_empty()
         {
             return Err(SupplierServiceError::SupplierConfiguration);
         }
+        // 必须是纯 origin：带 path 的 publicBaseUrl 会被 set_path 静默吞掉，
+        // 让人以为回调配好了其实地址是错的，所以这里直接拒绝。
         SupplierClient::new(&runtime.public_base_url, "callback-validation")
             .map_err(|_| SupplierServiceError::SupplierConfiguration)?;
         let mut callback = reqwest::Url::parse(&runtime.public_base_url)
@@ -372,8 +693,21 @@ impl KeySupplierService {
     }
 
     pub async fn register_webhook(&self) -> Result<String, SupplierServiceError> {
-        let callback = self.callback_url()?;
-        self.supplier_client()?
+        self.register_supplier_webhook(&self.primary()?.id).await
+    }
+
+    pub async fn register_supplier_webhook(
+        &self,
+        id: &str,
+    ) -> Result<String, SupplierServiceError> {
+        let entry = self
+            .supplier(id)
+            .ok_or(SupplierServiceError::SupplierNotFound)?;
+        if !entry.kind.supports_webhook_registration() {
+            return Err(SupplierServiceError::WebhookRegistrationUnsupported);
+        }
+        let callback = self.supplier_callback_url(&entry.id)?;
+        self.client_for(&entry)?
             .register_webhook(&callback)
             .await
             .map_err(SupplierServiceError::supplier_api)?;
@@ -381,12 +715,24 @@ impl KeySupplierService {
     }
 
     pub async fn test_webhook(&self) -> Result<(), SupplierServiceError> {
-        self.supplier_client()?
+        self.test_supplier_webhook(&self.primary()?.id).await
+    }
+
+    pub async fn test_supplier_webhook(&self, id: &str) -> Result<(), SupplierServiceError> {
+        let entry = self
+            .supplier(id)
+            .ok_or(SupplierServiceError::SupplierNotFound)?;
+        if !entry.kind.supports_webhook_registration() {
+            return Err(SupplierServiceError::WebhookRegistrationUnsupported);
+        }
+        self.client_for(&entry)?
             .test_webhook()
             .await
             .map_err(SupplierServiceError::supplier_api)
     }
 
+    /// HTTP 层直接打 `store.retry`；这层包装只剩测试在用。
+    #[cfg(test)]
     pub fn retry_event(&self, id: i64) -> Result<(), SupplierServiceError> {
         self.store
             .retry(id)
@@ -422,7 +768,12 @@ impl KeySupplierService {
                 Duration::from_secs(30),
             );
             loop {
-                interval.tick().await;
+                // 抢货是拼延迟的：库存通知一落库就立刻处理，别等下一个 30s tick。
+                // 定时 tick 仍然保留，用于回收 stale processing 和兜底重放。
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = service.wakeup.notified() => {}
+                }
                 if let Err(error) = service.run_processing_cycle().await {
                     tracing::warn!(
                         kind = processing_error_kind(&error),
@@ -434,34 +785,67 @@ impl KeySupplierService {
         true
     }
 
+    /// 收 webhook：token 反查供货商 → 按其协议解析 → 落库。
+    ///
+    /// 重复推送在这里被唯一索引挡住（只累加 `webhook_duplicate_count`），
+    /// 不会产生第二条待处理事件，因此不会重复下单。
     pub fn ingest<B: AsRef<[u8]>>(
         &self,
         token: &str,
         body: B,
     ) -> Result<IngestResult, SupplierServiceError> {
-        if !self.has_valid_webhook_token(token) {
-            return Err(SupplierServiceError::Unauthorized);
-        }
-        let runtime = self.runtime_config();
+        self.ingest_signed(token, body, None)
+    }
 
-        let webhook = IncomingWebhook::parse(body.as_ref())?;
-        let mut event = webhook.into_event();
+    /// 收 webhook，并在配了签名密钥时校验 `X-Kiro-Signature`。
+    ///
+    /// `signature` 是请求头原文；`body` 必须是**原始请求体字节**，
+    /// 不能是重新序列化过的 JSON（字段顺序/空格变了签名就不对）。
+    pub fn ingest_signed<B: AsRef<[u8]>>(
+        &self,
+        token: &str,
+        body: B,
+        signature: Option<&str>,
+    ) -> Result<IngestResult, SupplierServiceError> {
+        let entry = self
+            .resolve_webhook_token(token)
+            .ok_or(SupplierServiceError::Unauthorized)?;
+
+        if !entry.settings.webhook_secret.is_empty() {
+            let expected = sign_webhook_body(&entry.settings.webhook_secret, body.as_ref());
+            let provided = signature.unwrap_or_default();
+            if !crate::common::auth::constant_time_eq(&expected, provided) {
+                return Err(SupplierServiceError::InvalidSignature);
+            }
+        }
+
+        let webhook = IncomingWebhook::parse(entry.kind, body.as_ref())?;
+        let mut event = webhook.into_event(&entry.id);
         event.message = event
             .message
-            .map(|message| redact_runtime_secrets(&message, &runtime));
+            .map(|message| redact_runtime_secrets(&message, &entry.settings));
         let event_id = event.event_id.clone();
         let event_type = event.event_type.clone();
         let outcome = self
             .store
             .insert_event(event)
             .map_err(|_| SupplierServiceError::Store)?;
+        let duplicate = matches!(outcome, InsertOutcome::Duplicate(_));
+        // 只有真正新落库的事件才唤醒处理器：重复推送已经处理过（或正在处理），
+        // 再唤醒一次只会空转，而且绝不能因此重复下单。
+        if !duplicate {
+            self.wakeup.notify_one();
+        }
         Ok(IngestResult {
-            duplicate: matches!(outcome, InsertOutcome::Duplicate(_)),
+            duplicate,
+            supplier_id: entry.id,
             event_id,
             event_type,
         })
     }
 
+    /// 立刻处理一轮待办，不做 stale 回收。生产路径走 `run_processing_cycle`。
+    #[cfg(test)]
     pub async fn process_pending(&self) -> Result<usize, SupplierServiceError> {
         let _guard = self.processing_lock.lock().await;
         self.process_pending_locked().await
@@ -488,14 +872,27 @@ impl KeySupplierService {
         &self,
         count: u32,
     ) -> Result<ManualPurchaseResult, SupplierServiceError> {
-        let runtime = self.runtime_config();
-        if count < runtime.min_purchase || count > runtime.max_purchase {
+        let primary = self.primary()?;
+        self.manual_purchase_from(&primary.id, count).await
+    }
+
+    /// 指定供货商手动采购。数量必须落在该供货商自己的 min/max 区间内。
+    pub async fn manual_purchase_from(
+        &self,
+        supplier_id: &str,
+        count: u32,
+    ) -> Result<ManualPurchaseResult, SupplierServiceError> {
+        let entry = self
+            .supplier(supplier_id)
+            .ok_or(SupplierServiceError::SupplierNotFound)?;
+        if count < entry.settings.min_purchase || count > entry.settings.max_purchase {
             return Err(SupplierServiceError::InvalidPurchaseQuantity);
         }
 
         let _guard = self.processing_lock.lock().await;
         let order_id = uuid::Uuid::new_v4().simple().to_string();
         let event = IncomingSupplierEvent {
+            supplier_id: entry.id.clone(),
             event_id: order_id.clone(),
             event_type: "manual_purchase".to_owned(),
             purchase_order_id: Some(order_id.clone()),
@@ -504,13 +901,17 @@ impl KeySupplierService {
         };
         self.run_store_operation(move |store| store.insert_event(event))
             .await?;
+        let lookup_supplier_id = entry.id.clone();
         let lookup_order_id = order_id.clone();
         let event = self
-            .run_store_operation(move |store| store.claim_by_event_id(&lookup_order_id))
+            .run_store_operation(move |store| {
+                store.claim_by_event_id(&lookup_supplier_id, &lookup_order_id)
+            })
             .await?
             .ok_or(SupplierServiceError::Store)?;
         let summary = self.process_claimed(event).await?;
         Ok(ManualPurchaseResult {
+            supplier_id: entry.id,
             order_id,
             requested: count,
             purchased: summary.purchased_count as u32,
@@ -538,9 +939,13 @@ impl KeySupplierService {
                 .await?;
                 Ok(empty_summary())
             }
+            Ok(ProcessAction::SkipWithReason(reason)) => {
+                self.run_store_operation(move |store| store.skip(event.id, Some(reason)))
+                    .await?;
+                Ok(empty_summary())
+            }
             Ok(ProcessAction::Failed { summary, error }) => {
-                let persistence_error =
-                    sanitize_error(&error.persistence_detail(), &self.runtime_config());
+                let persistence_error = self.sanitize_for(&event.supplier_id, &error);
                 self.run_store_operation(move |store| {
                     store.fail_with_summary(event.id, summary, &persistence_error)
                 })
@@ -548,12 +953,20 @@ impl KeySupplierService {
                 Err(error)
             }
             Err(error) => {
-                let persistence_error =
-                    sanitize_error(&error.persistence_detail(), &self.runtime_config());
+                let persistence_error = self.sanitize_for(&event.supplier_id, &error);
                 self.run_store_operation(move |store| store.fail(event.id, &persistence_error))
                     .await?;
                 Err(error)
             }
+        }
+    }
+
+    /// 用事件所属供货商的 secret 做脱敏。供货商已删则退化成通用脱敏。
+    fn sanitize_for(&self, supplier_id: &str, error: &SupplierServiceError) -> String {
+        let detail = error.persistence_detail();
+        match self.supplier(supplier_id) {
+            Some(entry) => sanitize_error(&detail, &entry.settings),
+            None => sanitize_error(&detail, &empty_runtime()),
         }
     }
 
@@ -565,8 +978,12 @@ impl KeySupplierService {
             return Ok(ProcessAction::Complete(empty_summary()));
         }
 
-        let runtime = self.runtime_config();
-        if event.event_type == "new_keys_available" && !runtime.auto_purchase {
+        // 事件带 supplier_id，处理时按它找回供货商；供货商被删掉就跳过而不是报错。
+        let entry = self
+            .supplier(&event.supplier_id)
+            .ok_or(SupplierServiceError::SupplierNotFound)?;
+        let runtime = &entry.settings;
+        if event.event_type == "new_keys_available" && (!runtime.auto_purchase || !entry.enabled) {
             return Ok(ProcessAction::Skip);
         }
         if !matches!(
@@ -581,16 +998,28 @@ impl KeySupplierService {
             .ok_or(SupplierServiceError::ImporterUnavailable)?;
         let (count, client) = match event.event_type.as_str() {
             "new_keys_available" => {
-                let client = self.supplier_client()?;
-                let stock = client
-                    .stock()
-                    .await
-                    .map_err(SupplierServiceError::supplier_api)?;
+                let client = self.client_for(&entry)?;
                 let event_count = u32::try_from(event.quantity)
                     .map_err(|_| SupplierServiceError::InvalidEvent)?;
+                // kiro-app 的库存通知自带 count，官方文档明确建议「直接尝试领取，
+                // 不要先查 /openapi/stock」——查询和领取不是一个事务，多一次往返
+                // 只会把货让给别人。kiro-rs 没这个说法，保持先查库存夹逼。
+                let available = match entry.kind {
+                    SupplierKind::KiroApp => u64::from(runtime.max_purchase),
+                    SupplierKind::KiroRs => client
+                        .available_stock()
+                        .await
+                        .map_err(SupplierServiceError::supplier_api)?,
+                };
+                // 推送没带数量时按配置上限要，实际给多少由对方决定。
+                let requested = if event_count == 0 {
+                    runtime.max_purchase
+                } else {
+                    event_count
+                };
                 match select_purchase_count(
-                    event_count,
-                    stock.max,
+                    requested,
+                    available,
                     runtime.max_purchase,
                     runtime.min_purchase,
                 ) {
@@ -601,7 +1030,7 @@ impl KeySupplierService {
             "manual_purchase" => {
                 let count = u32::try_from(event.quantity)
                     .map_err(|_| SupplierServiceError::InvalidEvent)?;
-                let client = self.supplier_client()?;
+                let client = self.client_for(&entry)?;
                 (count, client)
             }
             _ => unreachable!("event type was validated before purchase"),
@@ -611,10 +1040,15 @@ impl KeySupplierService {
             .purchase_order_id
             .as_deref()
             .ok_or(SupplierServiceError::InvalidEvent)?;
-        let purchase = client
-            .purchase(count, order_id)
-            .await
-            .map_err(SupplierServiceError::supplier_api)?;
+        let purchase = match client.purchase(count, order_id).await {
+            Ok(purchase) => purchase,
+            // 被别人抢完了：正常竞争结果，记 skipped 而不是 failed，也不给重试按钮
+            // （重试只会再抢一次空气，还可能在真有货时变成额外下单）。
+            Err(crate::admin::key_supplier::client::SupplierError::OutOfStock) => {
+                return Ok(ProcessAction::SkipWithReason("库存已被抢完"));
+            }
+            Err(error) => return Err(SupplierServiceError::supplier_api(error)),
+        };
         let mut summary = ProcessSummary {
             purchased_count: i64::from(purchase.purchased),
             ..empty_summary()
@@ -622,7 +1056,7 @@ impl KeySupplierService {
         let mut import_failed = false;
         for (index, key) in purchase.keys.into_iter().enumerate() {
             let credential =
-                credential_from_supplier_key(key.into_inner(), &runtime, order_id, index + 1);
+                credential_from_supplier_key(key.into_inner(), runtime, order_id, index + 1);
             match importer.import(credential).await {
                 Ok(()) => summary.imported_count += 1,
                 Err(error) if is_duplicate_error(&error.to_string()) => {
@@ -648,6 +1082,8 @@ impl KeySupplierService {
 enum ProcessAction {
     Complete(ProcessSummary),
     Skip,
+    /// 跳过并记下原因（例如库存被抢完），让事件历史能看出是竞争失败而非故障。
+    SkipWithReason(&'static str),
     Failed {
         summary: ProcessSummary,
         error: SupplierServiceError,
@@ -656,6 +1092,7 @@ enum ProcessAction {
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ManualPurchaseResult {
+    pub supplier_id: String,
     pub order_id: String,
     pub requested: u32,
     pub purchased: u32,
@@ -668,6 +1105,7 @@ impl fmt::Debug for ManualPurchaseResult {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ManualPurchaseResult")
+            .field("supplier_id", &self.supplier_id)
             .field("order_id", &self.order_id)
             .field("requested", &self.requested)
             .field("purchased", &self.purchased)
@@ -751,6 +1189,7 @@ fn redact_runtime_secrets(value: &str, runtime: &SupplierRuntimeConfig) -> Strin
 #[derive(Clone, PartialEq, Eq)]
 pub struct IngestResult {
     pub duplicate: bool,
+    pub supplier_id: String,
     pub event_id: String,
     pub event_type: String,
 }
@@ -760,18 +1199,18 @@ impl fmt::Debug for IngestResult {
         formatter
             .debug_struct("IngestResult")
             .field("duplicate", &self.duplicate)
+            .field("supplier_id", &self.supplier_id)
             .field("event_id", &self.event_id)
             .field("event_type", &self.event_type)
             .finish()
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq)]
 pub struct SupplierOverview {
-    pub profile: Profile,
-    pub stock: Stock,
-    pub status: SupplierStatus,
+    pub supplier_id: String,
+    pub kind: &'static str,
+    pub snapshot: SupplierSnapshot,
     pub webhook_registered: bool,
 }
 
@@ -779,11 +1218,44 @@ impl fmt::Debug for SupplierOverview {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SupplierOverview")
-            .field("profile", &self.profile)
-            .field("stock_max", &self.stock.max)
-            .field("status", &self.status)
+            .field("supplier_id", &self.supplier_id)
+            .field("kind", &self.kind)
+            .field("snapshot", &self.snapshot)
             .field("webhook_registered", &self.webhook_registered)
             .finish()
+    }
+}
+
+/// 只挂一家 `default`/`kiro-rs` 供货商时的条目。测试专用（见 `new`）。
+#[cfg(test)]
+fn default_entry(runtime: SupplierRuntimeConfig) -> SupplierEntryRuntime {
+    SupplierEntryRuntime {
+        id: LEGACY_SUPPLIER_ID.to_owned(),
+        name: "默认供货商".to_owned(),
+        kind: SupplierKind::KiroRs,
+        enabled: true,
+        settings: runtime,
+    }
+}
+
+/// 没有任何供货商时给历史接口用的空配置。
+fn empty_runtime() -> SupplierRuntimeConfig {
+    SupplierRuntimeConfig {
+        base_url: String::new(),
+        api_key: String::new(),
+        public_base_url: String::new(),
+        webhook_token: String::new(),
+        webhook_secret: String::new(),
+        auto_purchase: false,
+        auto_delete_forbidden: false,
+        min_purchase: 1,
+        max_purchase: 1,
+        api_region: API_KEY_AUTH_REGION.to_owned(),
+        rpm_limit: 0,
+        priority: 0,
+        groups: Vec::new(),
+        source_channel: String::new(),
+        nickname_prefix: String::new(),
     }
 }
 
@@ -792,6 +1264,7 @@ fn processing_error_kind(error: &SupplierServiceError) -> &'static str {
         SupplierServiceError::Store => "store",
         SupplierServiceError::SupplierApi { .. } => "supplier_api",
         SupplierServiceError::SupplierConfiguration => "configuration",
+        SupplierServiceError::SupplierNotFound => "supplier_missing",
         SupplierServiceError::ImporterUnavailable => "importer",
         _ => "other",
     }
@@ -799,12 +1272,21 @@ fn processing_error_kind(error: &SupplierServiceError) -> &'static str {
 
 pub enum SupplierServiceError {
     Unauthorized,
+    /// `X-Kiro-Signature` 缺失或不匹配。
+    InvalidSignature,
     InvalidJson,
     InvalidPayload,
     InvalidEvent,
     InvalidPurchaseQuantity,
     SupplierConfiguration,
     SupplierApi { diagnostic: String },
+    /// 路径里的供货商 id 不存在（或事件所属供货商已被删除）。
+    SupplierNotFound,
+    /// 新增时 id 已被占用。
+    SupplierIdConflict,
+    TooManySuppliers,
+    /// 该协议不支持远程注册/测试 webhook（`kiro-app` 只能手填回调地址）。
+    WebhookRegistrationUnsupported,
     ImporterUnavailable,
     ImportFailed,
     Store,
@@ -816,6 +1298,7 @@ impl fmt::Display for SupplierServiceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Unauthorized => "webhook authentication failed",
+            Self::InvalidSignature => "webhook signature verification failed",
             Self::InvalidJson => "invalid webhook JSON",
             Self::InvalidPayload => "invalid webhook payload",
             Self::InvalidEvent => "invalid supplier event",
@@ -824,6 +1307,12 @@ impl fmt::Display for SupplierServiceError {
             }
             Self::SupplierConfiguration => "supplier configuration is invalid",
             Self::SupplierApi { .. } => "supplier API request failed",
+            Self::SupplierNotFound => "supplier not found",
+            Self::SupplierIdConflict => "supplier id already exists",
+            Self::TooManySuppliers => "too many suppliers configured",
+            Self::WebhookRegistrationUnsupported => {
+                "supplier protocol does not support webhook registration"
+            }
             Self::ImporterUnavailable => "credential importer is unavailable",
             Self::ImportFailed => "credential import failed",
             Self::Store => "supplier event store unavailable",
@@ -837,12 +1326,17 @@ impl fmt::Debug for SupplierServiceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Unauthorized => "Unauthorized",
+            Self::InvalidSignature => "InvalidSignature",
             Self::InvalidJson => "InvalidJson",
             Self::InvalidPayload => "InvalidPayload",
             Self::InvalidEvent => "InvalidEvent",
             Self::InvalidPurchaseQuantity => "InvalidPurchaseQuantity",
             Self::SupplierConfiguration => "SupplierConfiguration",
             Self::SupplierApi { .. } => "SupplierApi",
+            Self::SupplierNotFound => "SupplierNotFound",
+            Self::SupplierIdConflict => "SupplierIdConflict",
+            Self::TooManySuppliers => "TooManySuppliers",
+            Self::WebhookRegistrationUnsupported => "WebhookRegistrationUnsupported",
             Self::ImporterUnavailable => "ImporterUnavailable",
             Self::ImportFailed => "ImportFailed",
             Self::Store => "Store",
@@ -964,6 +1458,7 @@ mod tests {
             api_key: "ksk-canary".to_string(),
             public_base_url: String::new(),
             webhook_token: token.to_string(),
+            webhook_secret: String::new(),
             auto_purchase: false,
             auto_delete_forbidden: false,
             min_purchase: 1,
@@ -1002,6 +1497,7 @@ mod tests {
             api_key: None,
             public_base_url: runtime.public_base_url.clone(),
             webhook_token: None,
+            webhook_secret: None,
             auto_purchase: runtime.auto_purchase,
             auto_delete_forbidden: runtime.auto_delete_forbidden,
             min_purchase: u64::from(runtime.min_purchase),
@@ -1043,6 +1539,7 @@ mod tests {
     ) {
         store
             .insert_event(IncomingSupplierEvent {
+                supplier_id: LEGACY_SUPPLIER_ID.to_string(),
                 event_id: format!("{:032x}", quantity + 100),
                 event_type: event_type.to_owned(),
                 purchase_order_id: order_id.map(str::to_owned),
@@ -1055,6 +1552,7 @@ mod tests {
     #[test]
     fn parses_all_supported_webhook_events() {
         let new_keys = IncomingWebhook::parse(
+            SupplierKind::KiroRs,
             format!(
                 r#"{{"event":"new_keys_available","event_id":"{EVENT_ID}","purchase_order_id":"{ORDER_ID}","message":"ready","new_keys":3}}"#
             )
@@ -1067,6 +1565,7 @@ mod tests {
         ));
 
         let dead = IncomingWebhook::parse(
+            SupplierKind::KiroRs,
             format!(
                 r#"{{"event":"all_keys_dead","event_id":"{EVENT_ID}","message":"dead","dead":2}}"#
             )
@@ -1076,6 +1575,7 @@ mod tests {
         assert!(matches!(dead, IncomingWebhook::AllKeysDead { dead: 2, .. }));
 
         let test = IncomingWebhook::parse(
+            SupplierKind::KiroRs,
             format!(r#"{{"event":"test","event_id":"{EVENT_ID}","message":"test"}}"#).as_bytes(),
         )
         .unwrap();
@@ -1091,7 +1591,10 @@ mod tests {
             r#"{"event":"all_keys_dead","event_id":"","message":"x","dead":1}"#,
             r#"{"event":"all_keys_dead","event_id":"0123456789abcdef0123456789abcdef","message":"x","dead":0}"#,
         ] {
-            assert!(IncomingWebhook::parse(body.as_bytes()).is_err(), "{body}");
+            assert!(
+                IncomingWebhook::parse(SupplierKind::KiroRs, body.as_bytes()).is_err(),
+                "{body}"
+            );
         }
     }
 
@@ -1109,7 +1612,7 @@ mod tests {
         assert!(second.duplicate);
         assert_eq!(first.event_id, EVENT_ID);
         assert_eq!(first.event_type, "new_keys_available");
-        let page = store.list(10, None).unwrap();
+        let page = store.list(10, None, None).unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].webhook_duplicate_count, 1);
         assert_eq!(page.items[0].quantity, 3);
@@ -1142,7 +1645,7 @@ mod tests {
             service.ingest("weak-token", body.as_bytes()),
             Err(SupplierServiceError::Unauthorized)
         ));
-        assert!(store.list(1, None).unwrap().items.is_empty());
+        assert!(store.list(1, None, None).unwrap().items.is_empty());
     }
 
     #[test]
@@ -1188,7 +1691,7 @@ mod tests {
         let stored: String = connection
             .query_row("SELECT message FROM supplier_events", [], |row| row.get(0))
             .unwrap();
-        let listed = store.list(1, None).unwrap().items.remove(0);
+        let listed = store.list(1, None, None).unwrap().items.remove(0);
         let debug = format!("{listed:?}");
 
         for secret in [
@@ -1216,7 +1719,7 @@ mod tests {
         );
         let result = service.ingest(TOKEN, body.as_bytes()).unwrap();
         assert!(!result.duplicate);
-        let item = &store.list(10, None).unwrap().items[0];
+        let item = &store.list(10, None, None).unwrap().items[0];
         assert_eq!(item.message.as_ref().unwrap().chars().count(), 2_000);
         assert_eq!(item.status, SupplierEventStatus::Received);
     }
@@ -1281,7 +1784,7 @@ mod tests {
         let purchase: serde_json::Value = serde_json::from_str(&request_log[1]).unwrap();
         assert_eq!(purchase["client_order_id"], ORDER_ID);
         assert_eq!(purchase["count"], 3);
-        let item = &store.list(1, None).unwrap().items[0];
+        let item = &store.list(1, None, None).unwrap().items[0];
         assert_eq!(item.status, SupplierEventStatus::Succeeded);
         assert_eq!(item.purchased_count, 1);
     }
@@ -1385,7 +1888,7 @@ mod tests {
         let service = KeySupplierService::with_importer(store.clone(), config, importer);
 
         service.process_pending().await.unwrap();
-        let failed = store.list(1, None).unwrap().items.remove(0);
+        let failed = store.list(1, None, None).unwrap().items.remove(0);
         assert_eq!(
             (
                 failed.purchased_count,
@@ -1399,7 +1902,7 @@ mod tests {
 
         service.retry_event(failed.id).unwrap();
         service.process_pending().await.unwrap();
-        let retried = &store.list(1, None).unwrap().items[0];
+        let retried = &store.list(1, None, None).unwrap().items[0];
         assert_eq!(retried.status, SupplierEventStatus::Succeeded);
         assert_eq!(
             (
@@ -1450,7 +1953,7 @@ mod tests {
         );
         service.process_pending().await.unwrap();
         assert_eq!(
-            store.list(1, None).unwrap().items[0].status,
+            store.list(1, None, None).unwrap().items[0].status,
             SupplierEventStatus::Skipped
         );
 
@@ -1460,6 +1963,7 @@ mod tests {
         service.set_runtime_config(below);
         store
             .insert_event(IncomingSupplierEvent {
+                supplier_id: LEGACY_SUPPLIER_ID.to_string(),
                 event_id: "1123456789abcdef0123456789abcdef".to_owned(),
                 event_type: "new_keys_available".to_owned(),
                 purchase_order_id: Some("0123456789abcdef0123456789abcdef".to_owned()),
@@ -1471,7 +1975,7 @@ mod tests {
         assert_eq!(*calls.lock().unwrap(), 1);
         assert!(
             store
-                .list(10, None)
+                .list(10, None, None)
                 .unwrap()
                 .items
                 .iter()
@@ -1487,7 +1991,7 @@ mod tests {
         let service =
             KeySupplierService::with_importer(store.clone(), runtime(TOKEN), importer.clone());
         assert_eq!(service.process_pending().await.unwrap(), 1);
-        let item = &store.list(1, None).unwrap().items[0];
+        let item = &store.list(1, None, None).unwrap().items[0];
         assert_eq!(item.status, SupplierEventStatus::Succeeded);
         assert_eq!(item.purchased_count, 0);
         assert!(importer.credentials.lock().unwrap().is_empty());
@@ -1515,7 +2019,7 @@ mod tests {
         assert_eq!(result.order_id.len(), 32);
         assert!(result.order_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert_eq!(*paths.lock().unwrap(), vec!["/api/my/purchase"]);
-        let item = &store.list(1, None).unwrap().items[0];
+        let item = &store.list(1, None, None).unwrap().items[0];
         assert_eq!(item.event_type, "manual_purchase");
         assert_eq!(
             item.purchase_order_id.as_deref(),
@@ -1533,7 +2037,7 @@ mod tests {
             Arc::new(FakeImporter::default()),
         );
         assert!(configuration_service.manual_purchase(1).await.is_err());
-        let configuration_event = &configuration_store.list(1, None).unwrap().items[0];
+        let configuration_event = &configuration_store.list(1, None, None).unwrap().items[0];
         assert_eq!(configuration_event.status, SupplierEventStatus::Failed);
         assert_eq!(
             (
@@ -1558,7 +2062,7 @@ mod tests {
             Arc::new(FakeImporter::default()),
         );
         assert!(api_service.manual_purchase(1).await.is_err());
-        let api_event = &api_store.list(1, None).unwrap().items[0];
+        let api_event = &api_store.list(1, None, None).unwrap().items[0];
         assert_eq!(api_event.status, SupplierEventStatus::Failed);
         assert_eq!(
             (
@@ -1597,7 +2101,7 @@ mod tests {
             ))])),
         );
         assert!(import_service.manual_purchase(1).await.is_err());
-        let import_event = &import_store.list(1, None).unwrap().items[0];
+        let import_event = &import_store.list(1, None, None).unwrap().items[0];
         assert_eq!(import_event.status, SupplierEventStatus::Failed);
         assert_eq!(
             (
@@ -1649,13 +2153,13 @@ mod tests {
             Arc::new(FakeImporter::default()),
         );
         service.process_pending().await.unwrap();
-        let failed = store.list(1, None).unwrap().items.remove(0);
+        let failed = store.list(1, None, None).unwrap().items.remove(0);
         assert_eq!(failed.status, SupplierEventStatus::Failed);
         assert!(!format!("{failed:?}").contains("ksk_api_failure_canary"));
         store.retry(failed.id).unwrap();
         service.process_pending().await.unwrap();
         assert_eq!(
-            store.list(1, None).unwrap().items[0].status,
+            store.list(1, None, None).unwrap().items[0].status,
             SupplierEventStatus::Succeeded
         );
     }
@@ -1683,7 +2187,7 @@ mod tests {
 
         let error = service.manual_purchase(1).await.unwrap_err();
         let external = format!("{error} {error:?}");
-        let event = &store.list(1, None).unwrap().items[0];
+        let event = &store.list(1, None, None).unwrap().items[0];
         let stored = event.last_error.as_deref().unwrap();
 
         assert!(stored.contains("supplier HTTP 502"));
@@ -1708,7 +2212,7 @@ mod tests {
         config.base_url = "http://bad-path/ksk_config_canary".to_owned();
         let service = KeySupplierService::new(store.clone(), config);
         service.process_pending().await.unwrap();
-        let item = &store.list(1, None).unwrap().items[0];
+        let item = &store.list(1, None, None).unwrap().items[0];
         assert_eq!(item.status, SupplierEventStatus::Failed);
         let rendered = format!("{item:?}");
         assert!(!rendered.contains("ksk_config_canary"));
@@ -1735,7 +2239,7 @@ mod tests {
         service.process_pending().await.unwrap();
         assert_eq!(*calls.lock().unwrap(), 0);
         assert_eq!(
-            store.list(1, None).unwrap().items[0].status,
+            store.list(1, None, None).unwrap().items[0].status,
             SupplierEventStatus::Failed
         );
     }
@@ -1879,9 +2383,12 @@ mod tests {
         );
 
         let overview = service.overview().await.unwrap();
-        assert_eq!(overview.profile.name, "demo");
-        assert_eq!(overview.stock.max, 4);
-        assert_eq!(overview.status.keys_active, 3);
+        assert_eq!(overview.snapshot.profile.as_ref().unwrap().name, "demo");
+        assert_eq!(overview.snapshot.stock_available, Some(4));
+        assert_eq!(
+            overview.snapshot.status.as_ref().unwrap().keys_active,
+            3
+        );
         assert!(!overview.webhook_registered);
         assert!(!format!("{overview:?}").contains(&config.webhook_token));
         let callback = service.register_webhook().await.unwrap();
@@ -1898,6 +2405,7 @@ mod tests {
         let store = Arc::new(SupplierEventStore::open(&path).unwrap());
         store
             .insert_event(IncomingSupplierEvent {
+                supplier_id: LEGACY_SUPPLIER_ID.to_string(),
                 event_id: "stale-event".to_string(),
                 event_type: "all_keys_dead".to_string(),
                 purchase_order_id: None,
@@ -1917,7 +2425,7 @@ mod tests {
 
         assert_eq!(service.run_processing_cycle().await.unwrap(), 1);
         assert_eq!(
-            store.list(1, None).unwrap().items[0].status,
+            store.list(1, None, None).unwrap().items[0].status,
             SupplierEventStatus::Succeeded
         );
         assert!(service.start_processor());
@@ -1957,7 +2465,7 @@ mod tests {
         let running_service = service.clone();
         let running = tokio::spawn(async move { running_service.process_pending().await });
         started_wait.await;
-        let id = store.list(1, None).unwrap().items[0].id;
+        let id = store.list(1, None, None).unwrap().items[0].id;
         rusqlite::Connection::open(&path)
             .unwrap()
             .execute(
@@ -1970,7 +2478,7 @@ mod tests {
         let recovery = tokio::spawn(async move { recovery_service.run_processing_cycle().await });
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         assert_eq!(
-            store.list(1, None).unwrap().items[0].status,
+            store.list(1, None, None).unwrap().items[0].status,
             SupplierEventStatus::Processing
         );
 
@@ -1978,7 +2486,7 @@ mod tests {
         assert_eq!(running.await.unwrap().unwrap(), 1);
         assert_eq!(recovery.await.unwrap().unwrap(), 0);
         assert_eq!(
-            store.list(1, None).unwrap().items[0].status,
+            store.list(1, None, None).unwrap().items[0].status,
             SupplierEventStatus::Succeeded
         );
         drop(service);
@@ -1995,8 +2503,635 @@ mod tests {
 
         service.retry_event(claimed.id).unwrap();
         assert_eq!(
-            store.list(1, None).unwrap().items[0].status,
+            store.list(1, None, None).unwrap().items[0].status,
             SupplierEventStatus::Received
         );
+    }
+
+    // ============ 多供货商 ============
+
+    fn entry(id: &str, kind: SupplierKind, token: &str) -> SupplierEntryRuntime {
+        let mut settings = runtime(token);
+        settings.base_url = "https://supplier.example".to_string();
+        settings.public_base_url = "https://admin.example".to_string();
+        settings.auto_purchase = true;
+        SupplierEntryRuntime {
+            id: id.to_owned(),
+            name: format!("supplier {id}"),
+            kind,
+            enabled: true,
+            settings,
+        }
+    }
+
+    fn multi_service(entries: Vec<SupplierEntryRuntime>) -> (Arc<KeySupplierService>, PathBuf) {
+        let path = temp_config_path("multi");
+        let mut config = Config::load(&path).unwrap();
+        crate::admin::key_supplier::config::store_suppliers(&mut config, &entries);
+        config.save().unwrap();
+        let store = Arc::new(SupplierEventStore::open_in_memory().unwrap());
+        (
+            Arc::new(
+                KeySupplierService::with_suppliers(store, entries).with_config_path(&path),
+            ),
+            path,
+        )
+    }
+
+    #[test]
+    fn webhook_token_resolves_the_owning_supplier() {
+        let first_token = "a".repeat(64);
+        let second_token = "b".repeat(64);
+        let (service, path) = multi_service(vec![
+            entry("first", SupplierKind::KiroRs, &first_token),
+            entry("second", SupplierKind::KiroApp, &second_token),
+        ]);
+
+        assert_eq!(
+            service.resolve_webhook_token(&first_token).unwrap().id,
+            "first"
+        );
+        let second = service.resolve_webhook_token(&second_token).unwrap();
+        assert_eq!(second.id, "second");
+        assert_eq!(second.kind, SupplierKind::KiroApp);
+        assert!(service.resolve_webhook_token(&"c".repeat(64)).is_none());
+        // 每家一个独立回调地址，token 不同 → URL 不同。
+        assert_ne!(
+            service.supplier_callback_url("first").unwrap(),
+            service.supplier_callback_url("second").unwrap()
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn events_are_scoped_per_supplier_and_same_event_id_does_not_collide() {
+        let first_token = "a".repeat(64);
+        let second_token = "b".repeat(64);
+        let (service, path) = multi_service(vec![
+            entry("first", SupplierKind::KiroRs, &first_token),
+            entry("second", SupplierKind::KiroRs, &second_token),
+        ]);
+        let body = format!(
+            r#"{{"event":"new_keys_available","event_id":"{EVENT_ID}","purchase_order_id":"{ORDER_ID}","message":"ready","new_keys":1}}"#
+        );
+
+        // 两家供货商推同一个 event_id：必须各自落一条，不能互相判重。
+        let first = service.ingest(&first_token, &body).unwrap();
+        let second = service.ingest(&second_token, &body).unwrap();
+        assert!(!first.duplicate && !second.duplicate);
+        assert_eq!(first.supplier_id, "first");
+        assert_eq!(second.supplier_id, "second");
+
+        let store = service.store();
+        assert_eq!(store.list(10, None, None).unwrap().items.len(), 2);
+        let scoped = store.list(10, None, Some("first")).unwrap().items;
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].supplier_id, "first");
+        assert_eq!(store.unread_count(Some("second")).unwrap(), 1);
+        store.mark_all_read(Some("second")).unwrap();
+        assert_eq!(store.unread_count(Some("second")).unwrap(), 0);
+        assert_eq!(store.unread_count(Some("first")).unwrap(), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn repeated_kiroapp_push_is_deduplicated_so_it_never_buys_twice() {
+        let token = "e".repeat(64);
+        let (service, path) = multi_service(vec![entry("app", SupplierKind::KiroApp, &token)]);
+        // kiroapp 的推送体没有稳定 event id，去重只能靠 body 指纹。
+        let body = r#"{"event":"stock.ready","count":3}"#;
+
+        let first = service.ingest(&token, body).unwrap();
+        let second = service.ingest(&token, body).unwrap();
+        let third = service.ingest(&token, body).unwrap();
+
+        assert!(!first.duplicate);
+        assert!(second.duplicate && third.duplicate);
+        assert_eq!(first.event_id, second.event_id);
+        let items = service.store().list(10, None, None).unwrap().items;
+        assert_eq!(items.len(), 1, "重复推送不能产生第二条待处理事件");
+        assert_eq!(items[0].webhook_duplicate_count, 2);
+        assert_eq!(items[0].quantity, 3);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn kiroapp_webhook_tolerates_unknown_shapes_and_missing_counts() {
+        // 数量字段名未文档化，取不到就按 0 落库（下单量再由库存与配置夹逼）。
+        let bare = IncomingWebhook::parse(SupplierKind::KiroApp, br#"{"foo":"bar"}"#).unwrap();
+        match bare {
+            IncomingWebhook::NewKeysAvailable {
+                new_keys, event_id, ..
+            } => {
+                assert_eq!(new_keys, 0);
+                assert_eq!(event_id.len(), 32);
+            }
+            _ => panic!("kiroapp payload should be treated as a stock notification"),
+        }
+
+        for (body, expected) in [
+            (r#"{"count":5}"#, 5),
+            (r#"{"newKeys":2}"#, 2),
+            (r#"{"keys":["a","b","c"]}"#, 3),
+            (r#"{"availableKeys":"7"}"#, 7),
+        ] {
+            let parsed = IncomingWebhook::parse(SupplierKind::KiroApp, body.as_bytes()).unwrap();
+            let IncomingWebhook::NewKeysAvailable { new_keys, .. } = parsed else {
+                panic!("{body}");
+            };
+            assert_eq!(new_keys, expected, "{body}");
+        }
+
+        // 显式 test 事件不触发采购。
+        assert!(matches!(
+            IncomingWebhook::parse(SupplierKind::KiroApp, br#"{"event":"test"}"#).unwrap(),
+            IncomingWebhook::Test { .. }
+        ));
+        // 非 JSON 仍然拒绝。
+        assert!(IncomingWebhook::parse(SupplierKind::KiroApp, b"not json").is_err());
+    }
+
+    #[test]
+    fn kiroapp_stable_event_id_is_reused_across_body_changes() {
+        // 对方给了稳定 id 时以它为准：同一批次即使 body 其它字段变了也判重。
+        let first =
+            IncomingWebhook::parse(SupplierKind::KiroApp, br#"{"id":"batch-9","count":1}"#).unwrap();
+        let second = IncomingWebhook::parse(
+            SupplierKind::KiroApp,
+            br#"{"id":"batch-9","count":1,"note":"retry"}"#,
+        )
+        .unwrap();
+        let (
+            IncomingWebhook::NewKeysAvailable {
+                event_id: first_id,
+                purchase_order_id: first_order,
+                ..
+            },
+            IncomingWebhook::NewKeysAvailable {
+                event_id: second_id,
+                purchase_order_id: second_order,
+                ..
+            },
+        ) = (first, second)
+        else {
+            panic!("both payloads should parse as stock notifications");
+        };
+        assert_eq!(first_id, second_id);
+        assert_eq!(first_order, second_order);
+    }
+
+    #[tokio::test]
+    async fn kiroapp_claim_imports_keys_and_is_never_retried() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = calls.clone();
+        let app = Router::new()
+            .route(
+                "/openapi/stock",
+                get(|| async { axum::Json(serde_json::json!({"availableKeys": 5, "keyPrice": 1.5})) }),
+            )
+            .route(
+                "/openapi/claim",
+                post(move |request: axum::http::Request<axum::body::Body>| {
+                    let observed = observed.clone();
+                    async move {
+                        // kiroapp 用 Bearer，不是 X-API-Key。
+                        let authorization = request
+                            .headers()
+                            .get("authorization")
+                            .unwrap()
+                            .to_str()
+                            .unwrap()
+                            .to_owned();
+                        let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+                            .await
+                            .unwrap();
+                        observed
+                            .lock()
+                            .unwrap()
+                            .push((authorization, String::from_utf8(body.to_vec()).unwrap()));
+                        axum::Json(serde_json::json!({"keys":["ksk_one","ksk_two"]}))
+                    }
+                }),
+            );
+        let importer = Arc::new(FakeImporter::default());
+        let mut supplier = entry("app", SupplierKind::KiroApp, &"f".repeat(64));
+        supplier.settings.base_url = server(app).await;
+        supplier.settings.api_key = "kiroapp-secret".to_string();
+        supplier.settings.max_purchase = 4;
+        supplier.settings.source_channel = "kiroapp".to_string();
+        let store = Arc::new(SupplierEventStore::open_in_memory().unwrap());
+        let service = KeySupplierService::with_suppliers_and_importer(
+            store.clone(),
+            vec![supplier],
+            importer.clone(),
+        );
+
+        let result = service.manual_purchase_from("app", 2).await.unwrap();
+
+        assert_eq!(result.purchased, 2);
+        assert_eq!(result.imported, 2);
+        assert_eq!(result.supplier_id, "app");
+        let requests = observed_requests(&calls);
+        assert_eq!(requests.len(), 1, "claim 没有幂等键，绝不能重试");
+        assert_eq!(requests[0].0, "Bearer kiroapp-secret");
+        assert_eq!(requests[0].1, r#"{"count":2}"#);
+        let imported = importer.credentials.lock().unwrap();
+        assert_eq!(imported.len(), 2);
+        assert_eq!(imported[0].kiro_api_key.as_deref(), Some("ksk_one"));
+        assert_eq!(imported[0].source_channel.as_deref(), Some("kiroapp"));
+    }
+
+    #[tokio::test]
+    async fn kiroapp_claim_failure_is_not_retried_and_records_diagnostics() {
+        let calls = Arc::new(Mutex::new(0_usize));
+        let observed = calls.clone();
+        let app = Router::new()
+            .route(
+                "/openapi/stock",
+                get(|| async { axum::Json(serde_json::json!({"availableKeys": 5})) }),
+            )
+            .route(
+                "/openapi/claim",
+                post(move || {
+                    let observed = observed.clone();
+                    async move {
+                        *observed.lock().unwrap() += 1;
+                        (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            r#"{"error":{"type":"server_error","message":"boom"}}"#,
+                        )
+                    }
+                }),
+            );
+        let mut supplier = entry("app", SupplierKind::KiroApp, &"9".repeat(64));
+        supplier.settings.base_url = server(app).await;
+        supplier.settings.api_key = "kiroapp-secret".to_string();
+        supplier.settings.max_purchase = 4;
+        let store = Arc::new(SupplierEventStore::open_in_memory().unwrap());
+        let service = KeySupplierService::with_suppliers_and_importer(
+            store.clone(),
+            vec![supplier],
+            Arc::new(FakeImporter::default()),
+        );
+
+        assert!(service.manual_purchase_from("app", 2).await.is_err());
+
+        // 5xx 也不重试：宁可失败让人工重放，也不冒重复扣积分的风险。
+        assert_eq!(*calls.lock().unwrap(), 1);
+        let stored = store.list(1, None, None).unwrap().items.remove(0);
+        assert_eq!(stored.status, SupplierEventStatus::Failed);
+        assert!(stored.last_error.unwrap().contains("500"));
+    }
+
+    #[tokio::test]
+    async fn kiroapp_rate_limit_is_surfaced_without_retrying() {
+        let calls = Arc::new(Mutex::new(0_usize));
+        let observed = calls.clone();
+        let app = Router::new()
+            .route(
+                "/openapi/stock",
+                get(|| async { axum::Json(serde_json::json!({"availableKeys": 5})) }),
+            )
+            .route(
+                "/openapi/claim",
+                post(move || {
+                    let observed = observed.clone();
+                    async move {
+                        *observed.lock().unwrap() += 1;
+                        (
+                            axum::http::StatusCode::TOO_MANY_REQUESTS,
+                            r#"{"error":{"type":"rate_limit_exceeded","message":"slow down","retryAfter":30}}"#,
+                        )
+                    }
+                }),
+            );
+        let mut supplier = entry("app", SupplierKind::KiroApp, &"8".repeat(64));
+        supplier.settings.base_url = server(app).await;
+        supplier.settings.api_key = "kiroapp-secret".to_string();
+        supplier.settings.max_purchase = 4;
+        let store = Arc::new(SupplierEventStore::open_in_memory().unwrap());
+        let service = KeySupplierService::with_suppliers_and_importer(
+            store.clone(),
+            vec![supplier],
+            Arc::new(FakeImporter::default()),
+        );
+
+        assert!(service.manual_purchase_from("app", 2).await.is_err());
+
+        assert_eq!(*calls.lock().unwrap(), 1);
+        let stored = store.list(1, None, None).unwrap().items.remove(0);
+        let error = stored.last_error.unwrap();
+        assert!(error.contains("rate limited"), "{error}");
+        assert!(error.contains("30"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn kiroapp_claims_directly_without_a_stock_precheck() {
+        let claimed = Arc::new(Mutex::new(Vec::new()));
+        let observed = claimed.clone();
+        let stock_calls = Arc::new(Mutex::new(0_usize));
+        let stock_observed = stock_calls.clone();
+        let app = Router::new()
+            .route(
+                "/openapi/stock",
+                get(move || {
+                    let stock_observed = stock_observed.clone();
+                    async move {
+                        *stock_observed.lock().unwrap() += 1;
+                        axum::Json(serde_json::json!({"availableKeys": 2}))
+                    }
+                }),
+            )
+            .route(
+                "/openapi/claim",
+                post(move |body: axum::body::Bytes| {
+                    let observed = observed.clone();
+                    async move {
+                        observed
+                            .lock()
+                            .unwrap()
+                            .push(String::from_utf8(body.to_vec()).unwrap());
+                        axum::Json(serde_json::json!({"keys":["ksk_a","ksk_b"]}))
+                    }
+                }),
+            );
+        let token = "7".repeat(64);
+        let mut supplier = entry("app", SupplierKind::KiroApp, &token);
+        supplier.settings.base_url = server(app).await;
+        supplier.settings.api_key = "kiroapp-secret".to_string();
+        supplier.settings.min_purchase = 1;
+        supplier.settings.max_purchase = 5;
+        let store = Arc::new(SupplierEventStore::open_in_memory().unwrap());
+        let service = KeySupplierService::with_suppliers_and_importer(
+            store.clone(),
+            vec![supplier],
+            Arc::new(FakeImporter::default()),
+        );
+
+        service.ingest(&token, r#"{"event":"stock.ready"}"#).unwrap();
+        service.process_pending().await.unwrap();
+
+        // 推送没带数量 → 直接按 max_purchase(5) 领取。
+        // 对方文档明确要求「不要先查 /openapi/stock 再领取」：多一次往返就把货让给别人了。
+        let requests = claimed.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0], r#"{"count":5}"#);
+        assert_eq!(*stock_calls.lock().unwrap(), 0, "领取前不该查库存");
+        assert_eq!(
+            store.list(1, None, None).unwrap().items[0].status,
+            SupplierEventStatus::Succeeded
+        );
+    }
+
+    #[tokio::test]
+    async fn out_of_stock_is_recorded_as_skipped_instead_of_failed() {
+        let app = Router::new().route(
+            "/openapi/claim",
+            post(|| async {
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    r#"{"error":{"type":"out_of_stock","message":"库存不足"}}"#,
+                )
+            }),
+        );
+        let token = "6".repeat(64);
+        let mut supplier = entry("app", SupplierKind::KiroApp, &token);
+        supplier.settings.base_url = server(app).await;
+        supplier.settings.api_key = "kiroapp-secret".to_string();
+        let store = Arc::new(SupplierEventStore::open_in_memory().unwrap());
+        let service = KeySupplierService::with_suppliers_and_importer(
+            store.clone(),
+            vec![supplier],
+            Arc::new(FakeImporter::default()),
+        );
+
+        service.ingest(&token, r#"{"count":2}"#).unwrap();
+        service.process_pending().await.unwrap();
+
+        // 被别人抢完是正常竞争结果：记 skipped，不记 failed，也不该有 last_error。
+        let stored = store.list(1, None, None).unwrap().items.remove(0);
+        assert_eq!(stored.status, SupplierEventStatus::Skipped);
+        assert_eq!(stored.message.as_deref(), Some("库存已被抢完"));
+        assert!(stored.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn webhook_signature_is_verified_when_a_secret_is_configured() {
+        let token = "5".repeat(64);
+        let secret = "hook-secret";
+        let mut supplier = entry("app", SupplierKind::KiroApp, &token);
+        supplier.settings.webhook_secret = secret.to_string();
+        let store = Arc::new(SupplierEventStore::open_in_memory().unwrap());
+        let service = KeySupplierService::with_suppliers_and_importer(
+            store.clone(),
+            vec![supplier],
+            Arc::new(FakeImporter::default()),
+        );
+        let body = r#"{"event":"stock","id":"evt_8DX2ZPK9MR7Q4JWH","count":3}"#;
+        let signature = sign_webhook_body(secret, body.as_bytes());
+
+        // 缺签名 / 错签名都必须拒，且不能落库。
+        assert!(matches!(
+            service.ingest_signed(&token, body, None),
+            Err(SupplierServiceError::InvalidSignature)
+        ));
+        assert!(matches!(
+            service.ingest_signed(&token, body, Some("deadbeef")),
+            Err(SupplierServiceError::InvalidSignature)
+        ));
+        assert!(store.list(1, None, None).unwrap().items.is_empty());
+
+        // 正确签名放行。
+        let result = service
+            .ingest_signed(&token, body, Some(&signature))
+            .unwrap();
+        assert!(!result.duplicate);
+        // 原样保留对方的 event id，方便和对方后台的投递记录对账。
+        assert_eq!(result.event_id, "evt_8DX2ZPK9MR7Q4JWH");
+
+        // 同一 body 改一个字节，签名就该失配（证明验的是原始字节而非解析结果）。
+        let tampered = r#"{"event":"stock","id":"evt_8DX2ZPK9MR7Q4JWH","count":4}"#;
+        assert!(matches!(
+            service.ingest_signed(&token, tampered, Some(&signature)),
+            Err(SupplierServiceError::InvalidSignature)
+        ));
+    }
+
+    #[test]
+    fn signature_matches_the_documented_hmac_sha256_hex_scheme() {
+        // 对方文档：hex(HMAC-SHA256(webhook_secret, raw_request_body))。
+        let signature = sign_webhook_body("key", b"The quick brown fox jumps over the lazy dog");
+        assert_eq!(
+            signature,
+            "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsigned_suppliers_still_accept_webhooks_without_a_signature() {
+        // kiro-rs 不签名：没配 secret 就不验签，否则历史供货商会全挂。
+        let token = "4".repeat(64);
+        let store = Arc::new(SupplierEventStore::open_in_memory().unwrap());
+        let service = KeySupplierService::with_suppliers_and_importer(
+            store,
+            vec![entry("app", SupplierKind::KiroApp, &token)],
+            Arc::new(FakeImporter::default()),
+        );
+
+        assert!(service.ingest(&token, r#"{"count":1}"#).is_ok());
+    }
+
+    #[tokio::test]
+    async fn kiroapp_rejects_webhook_registration_and_exposes_a_manual_callback_url() {
+        let (service, path) = multi_service(vec![entry(
+            "app",
+            SupplierKind::KiroApp,
+            &"1".repeat(64),
+        )]);
+
+        assert!(matches!(
+            service.register_supplier_webhook("app").await,
+            Err(SupplierServiceError::WebhookRegistrationUnsupported)
+        ));
+        assert!(matches!(
+            service.test_supplier_webhook("app").await,
+            Err(SupplierServiceError::WebhookRegistrationUnsupported)
+        ));
+        // 手填地址仍然要能拿到，否则用户没法在对方面板配置。
+        let callback = service.supplier_callback_url("app").unwrap();
+        assert!(callback.starts_with("https://admin.example/api/admin/key-supplier/webhook/"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn supplier_crud_persists_and_rejects_conflicts_and_unknown_ids() {
+        let (service, path) = multi_service(vec![entry(
+            "first",
+            SupplierKind::KiroRs,
+            &"a".repeat(64),
+        )]);
+
+        let mut update = SupplierEntryUpdate {
+            id: Some("kiroapp".to_owned()),
+            name: "kiroapp.cc".to_owned(),
+            kind: SupplierKind::KiroApp,
+            enabled: true,
+            settings: supplier_update(&entry("x", SupplierKind::KiroApp, &"b".repeat(64)).settings),
+        };
+        update.settings.api_key = Some("kiroapp-secret".to_owned());
+        let created = service.upsert_supplier(None, update.clone()).unwrap();
+
+        assert_eq!(created.id, "kiroapp");
+        assert_eq!(created.kind, "kiro-app");
+        assert!(!created.supports_webhook_registration);
+        assert!(created.settings.api_key_configured);
+        // 没给 token 时自动生成，否则收不到回调。
+        assert!(created.settings.webhook_token_configured);
+
+        let persisted = Config::load(&path).unwrap();
+        assert_eq!(persisted.key_suppliers.len(), 2);
+        // 历史字段镜像的是 kiro-rs 那家，回滚旧版本仍可用。
+        assert_eq!(persisted.key_supplier.base_url, "https://supplier.example");
+
+        // 同 id 再新增要冲突，未知 id 修改要 404。
+        assert!(matches!(
+            service.upsert_supplier(None, update.clone()),
+            Err(SupplierServiceError::SupplierIdConflict)
+        ));
+        assert!(matches!(
+            service.upsert_supplier(Some("missing".to_owned()), update.clone()),
+            Err(SupplierServiceError::SupplierNotFound)
+        ));
+
+        // 修改时留空 secret 不覆盖已存的值。
+        let mut edit = update.clone();
+        edit.settings.api_key = None;
+        edit.name = "kiroapp 改名".to_owned();
+        let edited = service
+            .upsert_supplier(Some("kiroapp".to_owned()), edit)
+            .unwrap();
+        assert_eq!(edited.name, "kiroapp 改名");
+        assert!(edited.settings.api_key_configured);
+        assert_eq!(
+            service.supplier("kiroapp").unwrap().settings.api_key,
+            "kiroapp-secret"
+        );
+
+        service.delete_supplier("kiroapp").unwrap();
+        assert!(service.supplier("kiroapp").is_none());
+        assert_eq!(Config::load(&path).unwrap().key_suppliers.len(), 1);
+        assert!(matches!(
+            service.delete_supplier("kiroapp"),
+            Err(SupplierServiceError::SupplierNotFound)
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn disabled_supplier_stores_events_but_skips_purchasing() {
+        let token = "3".repeat(64);
+        let mut supplier = entry("app", SupplierKind::KiroApp, &token);
+        supplier.enabled = false;
+        let store = Arc::new(SupplierEventStore::open_in_memory().unwrap());
+        let service = KeySupplierService::with_suppliers_and_importer(
+            store.clone(),
+            vec![supplier],
+            Arc::new(FakeImporter::default()),
+        );
+
+        service.ingest(&token, r#"{"count":2}"#).unwrap();
+        service.process_pending().await.unwrap();
+
+        // 关掉的供货商不下单（这里 base_url 指向不存在的服务，真下单会报错而不是 skipped）。
+        assert_eq!(
+            store.list(1, None, None).unwrap().items[0].status,
+            SupplierEventStatus::Skipped
+        );
+    }
+
+    #[test]
+    fn legacy_single_supplier_config_migrates_into_the_list() {
+        let mut config = Config::default();
+        // 空壳配置不迁移。
+        let (empty, migrated) =
+            crate::admin::key_supplier::config::load_suppliers(&config).unwrap();
+        assert!(empty.is_empty() && !migrated);
+
+        config.key_supplier.base_url = "https://legacy.example".to_string();
+        config.key_supplier.api_key = "legacy-secret".to_string();
+        config.key_supplier.webhook_token = "a".repeat(64);
+        let (entries, migrated) =
+            crate::admin::key_supplier::config::load_suppliers(&config).unwrap();
+
+        assert!(migrated);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, LEGACY_SUPPLIER_ID);
+        assert_eq!(entries[0].kind, SupplierKind::KiroRs);
+        assert!(entries[0].enabled);
+        assert_eq!(entries[0].settings.base_url, "https://legacy.example");
+        assert_eq!(entries[0].settings.webhook_token, "a".repeat(64));
+
+        // 迁移后列表优先，历史字段被忽略。
+        crate::admin::key_supplier::config::store_suppliers(&mut config, &entries);
+        config.key_supplier.base_url = "https://stale.example".to_string();
+        let (after, migrated) = crate::admin::key_supplier::config::load_suppliers(&config).unwrap();
+        assert!(!migrated);
+        assert_eq!(after[0].settings.base_url, "https://legacy.example");
+    }
+
+    #[test]
+    fn duplicate_supplier_ids_on_disk_are_rejected() {
+        let mut config = Config::default();
+        let entries = vec![
+            entry("same", SupplierKind::KiroRs, &"a".repeat(64)),
+            entry("same", SupplierKind::KiroApp, &"b".repeat(64)),
+        ];
+        crate::admin::key_supplier::config::store_suppliers(&mut config, &entries);
+
+        assert!(crate::admin::key_supplier::config::load_suppliers(&config).is_err());
+    }
+
+    fn observed_requests(calls: &Arc<Mutex<Vec<(String, String)>>>) -> Vec<(String, String)> {
+        calls.lock().unwrap().clone()
     }
 }

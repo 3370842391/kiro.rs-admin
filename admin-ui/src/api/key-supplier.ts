@@ -1,12 +1,17 @@
 import axios from 'axios'
-import { buildSupplierConfigPayload } from '@/lib/key-supplier'
+import { buildSupplierConfigPayload, buildSupplierEntryPayload } from '@/lib/key-supplier'
 import { storage } from '@/lib/storage'
 import type {
   PurchaseResponse,
+  SupplierCallbackUrlResponse,
   SupplierConfigUpdate,
   SupplierConfigView,
+  SupplierDeleteResponse,
+  SupplierEntryUpdate,
+  SupplierEntryView,
   SupplierEventPage,
   SupplierEventQuery,
+  SupplierListResponse,
   SupplierMarkEventsReadRequest,
   SupplierMarkEventsReadResponse,
   SupplierOverview,
@@ -81,5 +86,75 @@ export async function markSupplierEventsRead(
 
 export async function retrySupplierEvent(id: number): Promise<SupplierRetryEventResponse> {
   const { data } = await api.post<SupplierRetryEventResponse>(`/key-supplier/events/${id}/retry`)
+  return data
+}
+
+// ============ Multi-supplier ============
+
+function supplierPath(id: string, suffix = ''): string {
+  return `/key-suppliers/${encodeURIComponent(id)}${suffix}`
+}
+
+export async function listSuppliers(): Promise<SupplierListResponse> {
+  const { data } = await api.get<SupplierListResponse>('/key-suppliers')
+  return data
+}
+
+export async function createSupplier(update: SupplierEntryUpdate): Promise<SupplierEntryView> {
+  const { data } = await api.post<SupplierEntryView>(
+    '/key-suppliers',
+    buildSupplierEntryPayload(update),
+  )
+  return data
+}
+
+export async function updateSupplier(
+  id: string,
+  update: SupplierEntryUpdate,
+): Promise<SupplierEntryView> {
+  const { data } = await api.put<SupplierEntryView>(
+    supplierPath(id),
+    buildSupplierEntryPayload(update),
+  )
+  return data
+}
+
+export async function deleteSupplier(id: string): Promise<SupplierDeleteResponse> {
+  const { data } = await api.delete<SupplierDeleteResponse>(supplierPath(id))
+  return data
+}
+
+export async function getSupplierEntryOverview(id: string): Promise<SupplierOverview> {
+  const { data } = await api.get<SupplierOverview>(supplierPath(id, '/overview'))
+  return data
+}
+
+export async function purchaseFromSupplier(
+  id: string,
+  count: number,
+): Promise<PurchaseResponse> {
+  const { data } = await api.post<PurchaseResponse>(supplierPath(id, '/purchase'), { count })
+  return data
+}
+
+export async function registerSupplierEntryWebhook(
+  id: string,
+): Promise<SupplierWebhookRegisterResponse> {
+  const { data } = await api.post<SupplierWebhookRegisterResponse>(
+    supplierPath(id, '/webhook/register'),
+  )
+  return data
+}
+
+export async function testSupplierEntryWebhook(
+  id: string,
+): Promise<SupplierWebhookTestResponse> {
+  const { data } = await api.post<SupplierWebhookTestResponse>(supplierPath(id, '/webhook/test'))
+  return data
+}
+
+/** For `kiro-app`, this URL has to be pasted into the vendor's own webhook field. */
+export async function getSupplierCallbackUrl(id: string): Promise<SupplierCallbackUrlResponse> {
+  const { data } = await api.get<SupplierCallbackUrlResponse>(supplierPath(id, '/callback-url'))
   return data
 }

@@ -14,8 +14,10 @@ use serde::{Deserialize, Serialize};
 use crate::admin::{middleware::AdminState, types::AdminErrorResponse};
 
 use super::{
-    config::SupplierConfigUpdate,
-    service::{KeySupplierService, SupplierServiceError},
+    config::{
+        SupplierConfigUpdate, SupplierEntryUpdate, SupplierEntryView, normalize_supplier_id,
+    },
+    service::{KeySupplierService, ManualPurchaseResult, SupplierOverview, SupplierServiceError},
     store::{StoredSupplierEvent, SupplierEventStatus},
 };
 
@@ -93,7 +95,16 @@ pub async fn ingest_webhook(
             );
         }
     };
-    match tokio::task::spawn_blocking(move || service.ingest(&token, body)).await {
+    // 必须用原始请求体字节验签：解析后再序列化会改变字段顺序/空格，签名就对不上。
+    let signature = headers
+        .get("x-kiro-signature")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    match tokio::task::spawn_blocking(move || {
+        service.ingest_signed(&token, body, signature.as_deref())
+    })
+    .await
+    {
         Ok(Ok(result)) => {
             let status = if result.duplicate {
                 StatusCode::OK
@@ -105,6 +116,7 @@ pub async fn ingest_webhook(
                 Json(IngestResponse {
                     accepted: true,
                     duplicate: result.duplicate,
+                    supplier_id: result.supplier_id,
                     event_id: result.event_id,
                     event_type: result.event_type,
                 }),
@@ -115,6 +127,12 @@ pub async fn ingest_webhook(
             StatusCode::NOT_FOUND,
             "not_found",
             "webhook endpoint not found",
+        ),
+        // 对方文档要求验签失败返回 401/403 且不执行任何业务操作。
+        Ok(Err(SupplierServiceError::InvalidSignature)) => error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_signature",
+            "webhook signature verification failed",
         ),
         Ok(Err(SupplierServiceError::InvalidJson | SupplierServiceError::InvalidPayload)) => error(
             StatusCode::BAD_REQUEST,
@@ -161,23 +179,7 @@ pub async fn overview(State(state): State<AdminState>) -> Response {
         Err(response) => return response,
     };
     match service.overview().await {
-        Ok(overview) => Json(OverviewResponse {
-            profile: ProfileView {
-                name: overview.profile.name,
-                quota: overview.profile.quota,
-                remaining: overview.profile.remaining,
-                used_quota: overview.profile.used_quota,
-            },
-            stock_max: overview.stock.max,
-            webhook_registered: overview.webhook_registered,
-            status: StatusView {
-                keys_active: overview.status.keys_active,
-                keys_dead: overview.status.keys_dead,
-                keys_stock: overview.status.keys_stock,
-                generating: overview.status.generating,
-            },
-        })
-        .into_response(),
+        Ok(overview) => Json(OverviewResponse::from(overview)).into_response(),
         Err(error_value) => service_error_response(error_value),
     }
 }
@@ -195,15 +197,7 @@ pub async fn purchase(
         Err(response) => return response,
     };
     match service.manual_purchase(request.count).await {
-        Ok(result) => Json(PurchaseResponse {
-            order_id: result.order_id,
-            requested: result.requested,
-            purchased: result.purchased,
-            imported: result.imported,
-            duplicate: result.duplicate,
-            failed: result.failed,
-        })
-        .into_response(),
+        Ok(result) => Json(PurchaseResponse::from(result)).into_response(),
         Err(error_value) => service_error_response(error_value),
     }
 }
@@ -232,6 +226,146 @@ pub async fn test_webhook(State(state): State<AdminState>) -> Response {
     }
 }
 
+// ============ 多供货商 ============
+
+pub async fn list_suppliers(State(state): State<AdminState>) -> Response {
+    match supplier(&state) {
+        Ok(service) => Json(SupplierListResponse {
+            items: service.supplier_views(),
+        })
+        .into_response(),
+        Err(response) => response,
+    }
+}
+
+pub async fn create_supplier(
+    State(state): State<AdminState>,
+    update: Result<Json<SupplierEntryUpdate>, JsonRejection>,
+) -> Response {
+    let Json(update) = match update {
+        Ok(update) => update,
+        Err(rejection) => return json_rejection(rejection),
+    };
+    let service = match supplier(&state) {
+        Ok(service) => service,
+        Err(response) => return response,
+    };
+    match service.upsert_supplier(None, update) {
+        Ok(view) => (StatusCode::CREATED, Json(view)).into_response(),
+        Err(error_value) => service_error_response(error_value),
+    }
+}
+
+pub async fn update_supplier(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    update: Result<Json<SupplierEntryUpdate>, JsonRejection>,
+) -> Response {
+    let Json(update) = match update {
+        Ok(update) => update,
+        Err(rejection) => return json_rejection(rejection),
+    };
+    let service = match supplier(&state) {
+        Ok(service) => service,
+        Err(response) => return response,
+    };
+    match service.upsert_supplier(Some(id), update) {
+        Ok(view) => Json(view).into_response(),
+        Err(error_value) => service_error_response(error_value),
+    }
+}
+
+pub async fn delete_supplier(State(state): State<AdminState>, Path(id): Path<String>) -> Response {
+    let service = match supplier(&state) {
+        Ok(service) => service,
+        Err(response) => return response,
+    };
+    match service.delete_supplier(&id) {
+        Ok(()) => Json(serde_json::json!({ "deleted": true })).into_response(),
+        Err(error_value) => service_error_response(error_value),
+    }
+}
+
+pub async fn supplier_overview(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Response {
+    let service = match supplier(&state) {
+        Ok(service) => service,
+        Err(response) => return response,
+    };
+    match service.supplier_overview(&id).await {
+        Ok(overview) => Json(OverviewResponse::from(overview)).into_response(),
+        Err(error_value) => service_error_response(error_value),
+    }
+}
+
+pub async fn supplier_purchase(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    request: Result<Json<PurchaseRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(rejection) => return json_rejection(rejection),
+    };
+    let service = match supplier(&state) {
+        Ok(service) => service,
+        Err(response) => return response,
+    };
+    match service.manual_purchase_from(&id, request.count).await {
+        Ok(result) => Json(PurchaseResponse::from(result)).into_response(),
+        Err(error_value) => service_error_response(error_value),
+    }
+}
+
+pub async fn register_supplier_webhook(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Response {
+    let service = match supplier(&state) {
+        Ok(service) => service,
+        Err(response) => return response,
+    };
+    match service.register_supplier_webhook(&id).await {
+        Ok(callback_url) => {
+            Json(serde_json::json!({ "callbackUrl": callback_url })).into_response()
+        }
+        Err(error_value) => service_error_response(error_value),
+    }
+}
+
+pub async fn test_supplier_webhook(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Response {
+    let service = match supplier(&state) {
+        Ok(service) => service,
+        Err(response) => return response,
+    };
+    match service.test_supplier_webhook(&id).await {
+        Ok(()) => Json(serde_json::json!({ "success": true })).into_response(),
+        Err(error_value) => service_error_response(error_value),
+    }
+}
+
+/// 回调地址查询。`kiro-app` 这种不能远程注册的供货商，把它手填到对方面板。
+pub async fn supplier_callback_url(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Response {
+    let service = match supplier(&state) {
+        Ok(service) => service,
+        Err(response) => return response,
+    };
+    match service.supplier_callback_url(&id) {
+        Ok(callback_url) => {
+            Json(serde_json::json!({ "callbackUrl": callback_url })).into_response()
+        }
+        Err(error_value) => service_error_response(error_value),
+    }
+}
+
 pub async fn list_events(
     State(state): State<AdminState>,
     query: Result<Query<EventQuery>, QueryRejection>,
@@ -252,10 +386,14 @@ pub async fn list_events(
             "invalid event pagination",
         );
     }
+    let supplier_id = match normalize_supplier_filter(query.supplier_id.as_deref()) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     let store = service.store();
     match tokio::task::spawn_blocking(move || {
-        let page = store.list(limit, query.before)?;
-        let unread_count = store.unread_count()?;
+        let page = store.list(limit, query.before, supplier_id.as_deref())?;
+        let unread_count = store.unread_count(supplier_id.as_deref())?;
         Ok::<_, rusqlite::Error>((page, unread_count))
     })
     .await
@@ -279,6 +417,10 @@ pub async fn mark_events_read(
     };
     let service = match supplier(&state) {
         Ok(service) => service,
+        Err(response) => return response,
+    };
+    let supplier_id = match normalize_supplier_filter(request.supplier_id.as_deref()) {
+        Ok(value) => value,
         Err(response) => return response,
     };
     let operation = if request.mark_all {
@@ -313,7 +455,7 @@ pub async fn mark_events_read(
     };
     let store = service.store();
     match tokio::task::spawn_blocking(move || match operation {
-        MarkReadOperation::All => store.mark_all_read(),
+        MarkReadOperation::All => store.mark_all_read(supplier_id.as_deref()),
         MarkReadOperation::Ids(ids) => store.mark_read(&ids),
     })
     .await
@@ -366,6 +508,20 @@ fn unavailable() -> Response {
     )
 }
 
+/// 事件过滤用的供货商 id。空串/缺省表示不过滤。
+fn normalize_supplier_filter(value: Option<&str>) -> Result<Option<String>, Response> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(None),
+        Some(value) => normalize_supplier_id(value).map(Some).map_err(|_| {
+            error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "invalid supplier id",
+            )
+        }),
+    }
+}
+
 fn service_error_response(error_value: SupplierServiceError) -> Response {
     match error_value {
         SupplierServiceError::Store
@@ -375,6 +531,24 @@ fn service_error_response(error_value: SupplierServiceError) -> Response {
             StatusCode::BAD_GATEWAY,
             "api_error",
             "supplier API request failed",
+        ),
+        SupplierServiceError::SupplierNotFound => {
+            error(StatusCode::NOT_FOUND, "not_found", "supplier not found")
+        }
+        SupplierServiceError::SupplierIdConflict => error(
+            StatusCode::CONFLICT,
+            "conflict",
+            "supplier id already exists",
+        ),
+        SupplierServiceError::TooManySuppliers => error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "too many suppliers configured",
+        ),
+        SupplierServiceError::WebhookRegistrationUnsupported => error(
+            StatusCode::BAD_REQUEST,
+            "unsupported",
+            "该供货商不支持远程注册 webhook，请复制回调地址到对方面板手动填写",
         ),
         SupplierServiceError::InvalidPurchaseQuantity
         | SupplierServiceError::SupplierConfiguration
@@ -389,6 +563,7 @@ fn service_error_response(error_value: SupplierServiceError) -> Response {
             "key supplier processing is unavailable",
         ),
         SupplierServiceError::Unauthorized
+        | SupplierServiceError::InvalidSignature
         | SupplierServiceError::InvalidJson
         | SupplierServiceError::InvalidPayload => error(
             StatusCode::BAD_REQUEST,
@@ -446,6 +621,7 @@ fn has_duplicates(ids: &[i64]) -> bool {
 struct IngestResponse {
     accepted: bool,
     duplicate: bool,
+    supplier_id: String,
     event_id: String,
     event_type: String,
 }
@@ -459,6 +635,7 @@ pub(crate) struct PurchaseRequest {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PurchaseResponse {
+    supplier_id: String,
     order_id: String,
     requested: u32,
     purchased: u32,
@@ -467,20 +644,94 @@ struct PurchaseResponse {
     failed: u32,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct OverviewResponse {
-    profile: ProfileView,
-    stock_max: u64,
-    webhook_registered: bool,
-    status: StatusView,
+impl From<ManualPurchaseResult> for PurchaseResponse {
+    fn from(result: ManualPurchaseResult) -> Self {
+        Self {
+            supplier_id: result.supplier_id,
+            order_id: result.order_id,
+            requested: result.requested,
+            purchased: result.purchased,
+            imported: result.imported,
+            duplicate: result.duplicate,
+            failed: result.failed,
+        }
+    }
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SupplierListResponse {
+    items: Vec<SupplierEntryView>,
+}
+
+/// 概览响应。`kiro-rs` 独有的 profile/status 缺失时留 `null`，
+/// `stockMax` 保留历史字段名以免旧前端炸。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OverviewResponse {
+    supplier_id: String,
+    kind: &'static str,
+    stock_max: u64,
+    key_price: Option<f64>,
+    balance: Option<u64>,
+    webhook_registered: bool,
+    profile: ProfileView,
+    status: StatusView,
+}
+
+impl From<SupplierOverview> for OverviewResponse {
+    fn from(overview: SupplierOverview) -> Self {
+        let snapshot = overview.snapshot;
+        Self {
+            supplier_id: overview.supplier_id,
+            kind: overview.kind,
+            stock_max: snapshot.stock_available.unwrap_or_default(),
+            key_price: snapshot.key_price,
+            balance: snapshot.balance,
+            webhook_registered: overview.webhook_registered,
+            profile: snapshot
+                .profile
+                .as_ref()
+                .map(|profile| ProfileView {
+                    name: profile.name.clone(),
+                    quota: profile.quota,
+                    remaining: profile.remaining,
+                    used_quota: profile.used_quota,
+                })
+                .unwrap_or_else(|| ProfileView {
+                    // kiro-app 没有 profile 概念，用余额填 remaining 以便前端统一展示。
+                    name: overview.kind.to_string(),
+                    quota: 0,
+                    remaining: snapshot.balance.unwrap_or_default(),
+                    used_quota: 0,
+                }),
+            status: snapshot
+                .status
+                .as_ref()
+                .map(|status| StatusView {
+                    keys_active: status.keys_active,
+                    keys_dead: status.keys_dead,
+                    keys_stock: status.keys_stock,
+                    generating: status.generating,
+                })
+                .unwrap_or_else(|| StatusView {
+                    keys_active: 0,
+                    keys_dead: 0,
+                    keys_stock: snapshot.stock_available.unwrap_or_default(),
+                    generating: false,
+                }),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ProfileView {
     name: String,
     quota: u64,
     remaining: u64,
+    /// 改造前这里漏了 `rename_all`，实际发的是 `used_quota` 而前端类型写的是
+    /// `usedQuota`（没人读所以没炸）。这里对齐成 camelCase。
     used_quota: u64,
 }
 
@@ -494,9 +745,12 @@ struct StatusView {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct EventQuery {
     limit: Option<usize>,
     before: Option<i64>,
+    /// 只看某家供货商的事件；缺省看全部。
+    supplier_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -505,6 +759,8 @@ pub(crate) struct MarkReadRequest {
     ids: Option<Vec<i64>>,
     #[serde(default)]
     mark_all: bool,
+    /// 配合 `markAll` 限定只标记某家供货商。
+    supplier_id: Option<String>,
 }
 
 enum MarkReadOperation {
@@ -523,6 +779,7 @@ struct EventPageResponse {
 #[serde(rename_all = "camelCase")]
 struct EventView {
     id: i64,
+    supplier_id: String,
     event_id: String,
     event_type: String,
     purchase_order_id: Option<String>,
@@ -544,6 +801,7 @@ impl From<StoredSupplierEvent> for EventView {
     fn from(event: StoredSupplierEvent) -> Self {
         Self {
             id: event.id,
+            supplier_id: event.supplier_id,
             event_id: event.event_id,
             event_type: event.event_type,
             purchase_order_id: event.purchase_order_id,

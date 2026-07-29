@@ -102,6 +102,12 @@ pub struct KeySupplierConfig {
     pub public_base_url: String,
     #[serde(default)]
     pub webhook_token: String,
+    /// Webhook 签名密钥（kiroapp.cc 的 `X-Kiro-Signature` 用）。
+    ///
+    /// 留空表示不验签（历史号商协议不签名）。配上以后，未带正确
+    /// `hex(HMAC-SHA256(secret, 原始请求体))` 的推送会被拒。
+    #[serde(default)]
+    pub webhook_secret: String,
     #[serde(default)]
     pub auto_purchase: bool,
     #[serde(default)]
@@ -134,6 +140,10 @@ impl std::fmt::Debug for KeySupplierConfig {
                 "webhook_token_configured",
                 &(!self.webhook_token.is_empty()),
             )
+            .field(
+                "webhook_secret_configured",
+                &(!self.webhook_secret.is_empty()),
+            )
             .field("auto_purchase", &self.auto_purchase)
             .field("auto_delete_forbidden", &self.auto_delete_forbidden)
             .field("min_purchase", &self.min_purchase)
@@ -155,6 +165,7 @@ impl Default for KeySupplierConfig {
             api_key: String::new(),
             public_base_url: String::new(),
             webhook_token: String::new(),
+            webhook_secret: String::new(),
             auto_purchase: false,
             auto_delete_forbidden: false,
             min_purchase: default_supplier_purchase(),
@@ -166,6 +177,101 @@ impl Default for KeySupplierConfig {
             source_channel: default_supplier_source_channel(),
             nickname_prefix: default_supplier_nickname_prefix(),
         }
+    }
+}
+
+/// 供货商协议类型。
+///
+/// - `KiroRs`：历史号商协议。`X-API-Key` 认证，`/api/my/*`，采购带 `client_order_id`（幂等），
+///   支持远程注册 webhook。
+/// - `KiroApp`：kiroapp.cc 协议。`Authorization: Bearer` 认证，`/openapi/*`，采购是
+///   `POST /openapi/claim`，**没有幂等键**（因此绝不重试），回调地址在对方面板手填。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum SupplierKind {
+    #[default]
+    KiroRs,
+    KiroApp,
+}
+
+impl SupplierKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::KiroRs => "kiro-rs",
+            Self::KiroApp => "kiro-app",
+        }
+    }
+
+    /// 该协议是否能远程注册/测试 webhook。`kiro-app` 只能手填回调地址。
+    pub fn supports_webhook_registration(self) -> bool {
+        matches!(self, Self::KiroRs)
+    }
+}
+
+impl std::fmt::Display for SupplierKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for SupplierKind {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "kiro-rs" | "kirors" | "default" => Ok(Self::KiroRs),
+            "kiro-app" | "kiroapp" => Ok(Self::KiroApp),
+            other => anyhow::bail!("无效的供货商协议类型: {other}"),
+        }
+    }
+}
+
+/// 单个供货商的完整配置。`settings` 复用历史单供货商结构，避免两套字段。
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct KeySupplierEntryConfig {
+    /// 稳定标识。用于路由、事件表 `supplier_id` 与前端选择，创建后不可改。
+    pub id: String,
+    /// 展示名。
+    #[serde(default)]
+    pub name: String,
+    /// 协议类型。
+    #[serde(default)]
+    pub kind: SupplierKind,
+    /// 关闭后不参与自动采购，webhook 仍然落库（标记 skipped）。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(flatten)]
+    pub settings: KeySupplierConfig,
+}
+
+impl std::fmt::Debug for KeySupplierEntryConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeySupplierEntryConfig")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("enabled", &self.enabled)
+            .field("settings", &self.settings)
+            .finish()
+    }
+}
+
+impl KeySupplierEntryConfig {
+    /// 把历史单供货商配置迁移成一条多供货商条目。
+    pub fn from_legacy(settings: KeySupplierConfig) -> Self {
+        Self {
+            id: "default".to_string(),
+            name: "默认供货商".to_string(),
+            kind: SupplierKind::KiroRs,
+            enabled: true,
+            settings,
+        }
+    }
+
+    /// 历史单供货商配置是否值得迁移（没配 baseUrl/apiKey 的空壳不迁）。
+    pub fn legacy_is_configured(settings: &KeySupplierConfig) -> bool {
+        !settings.base_url.trim().is_empty() || !settings.api_key.trim().is_empty()
     }
 }
 
@@ -474,8 +580,15 @@ pub struct Config {
     pub profit_quota_per_unit: f64,
 
     /// Kiro API Key 供应商与 Webhook 自动采购配置。
+    ///
+    /// 单供货商的历史字段。多供货商改造后仅作为升级来源：启动时若 `key_suppliers`
+    /// 为空且这里已配置，会迁移成 `id=default` 的一项。保留字段本身是为了回滚兼容。
     #[serde(default)]
     pub key_supplier: KeySupplierConfig,
+
+    /// 多供货商 Key 采购配置。每项一家供货商，自带协议类型、凭据与导入预设。
+    #[serde(default)]
+    pub key_suppliers: Vec<KeySupplierEntryConfig>,
 
     /// 是否记录失败、中断和可选恢复请求的完整脱敏诊断快照。
     #[serde(default = "default_true")]
@@ -902,6 +1015,7 @@ impl Default for Config {
             profit_credit_price: default_profit_credit_price(),
             profit_quota_per_unit: default_profit_quota_per_unit(),
             key_supplier: KeySupplierConfig::default(),
+            key_suppliers: Vec::new(),
             error_snapshot_enabled: true,
             dead_credential_auto_delete: true,
             dead_credential_retention_hours: default_dead_credential_retention_hours(),
@@ -1036,6 +1150,7 @@ mod tests {
                 "apiKey": "secret",
                 "publicBaseUrl": "https://public.example",
                 "webhookToken": "token",
+                "webhookSecret": "hook-secret",
                 "autoPurchase": true,
                 "autoDeleteForbidden": true,
                 "minPurchase": 2,

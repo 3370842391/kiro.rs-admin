@@ -6,10 +6,19 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types
 
 const MAX_MESSAGE_CHARS: usize = 2000;
 
+/// `row_to_event` 的列顺序。所有单行查询共用，避免手抄漏列。
+const EVENT_COLUMNS: &str = "id,supplier_id,event_id,event_type,purchase_order_id,message,quantity,\
+received_at,status,attempts,last_error,purchased,imported,duplicate_count,\
+webhook_duplicate_count,failed_count,read_at,processing_started_at";
+
+/// 历史行（单供货商时代）回填的供货商标识，与配置迁移出来的条目 id 一致。
+pub const LEGACY_SUPPLIER_ID: &str = "default";
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS supplier_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    event_id TEXT UNIQUE NOT NULL,
+    supplier_id TEXT NOT NULL DEFAULT 'default',
+    event_id TEXT NOT NULL,
     event_type TEXT NOT NULL,
     purchase_order_id TEXT,
     message TEXT,
@@ -31,8 +40,14 @@ CREATE TABLE IF NOT EXISTS supplier_events (
 const INDEXES: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_supplier_events_queue ON supplier_events(status, id);
 CREATE INDEX IF NOT EXISTS idx_supplier_events_read ON supplier_events(read_at);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_supplier_events_event_id_unique ON supplier_events(event_id);
+CREATE INDEX IF NOT EXISTS idx_supplier_events_supplier ON supplier_events(supplier_id, id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_supplier_events_supplier_event_unique
+    ON supplier_events(supplier_id, event_id);
 "#;
+
+/// 多供货商改造前建的唯一索引（只锁 `event_id`）。重建后必须删掉，
+/// 否则两家供货商推同名 event id 会被误判成重复而丢单。
+const LEGACY_EVENT_ID_INDEX: &str = "idx_supplier_events_event_id_unique";
 
 const MIGRATION_COLUMNS: &[(&str, &str)] = &[
     ("purchase_order_id", "TEXT"),
@@ -47,6 +62,7 @@ const MIGRATION_COLUMNS: &[(&str, &str)] = &[
     ("failed_count", "INTEGER NOT NULL DEFAULT 0"),
     ("read_at", "TEXT"),
     ("processing_started_at", "TEXT"),
+    ("supplier_id", "TEXT NOT NULL DEFAULT 'default'"),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +106,7 @@ impl SupplierEventStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IncomingSupplierEvent {
+    pub supplier_id: String,
     pub event_id: String,
     pub event_type: String,
     pub purchase_order_id: Option<String>,
@@ -100,6 +117,7 @@ pub struct IncomingSupplierEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredSupplierEvent {
     pub id: i64,
+    pub supplier_id: String,
     pub event_id: String,
     pub event_type: String,
     pub purchase_order_id: Option<String>,
@@ -168,6 +186,8 @@ impl SupplierEventStore {
         })
     }
 
+    /// 落库一条 webhook 事件。`(supplier_id, event_id)` 唯一，重复推送只累加
+    /// `webhook_duplicate_count`，绝不产生第二条待处理事件——这是「不重复购买」的第一道闸。
     pub fn insert_event(&self, event: IncomingSupplierEvent) -> rusqlite::Result<InsertOutcome> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -177,9 +197,10 @@ impl SupplierEventStore {
             .map(|value| truncate_chars(&value, MAX_MESSAGE_CHARS));
         let inserted = tx.execute(
             "INSERT OR IGNORE INTO supplier_events
-             (event_id,event_type,purchase_order_id,message,quantity,received_at,status)
-             VALUES (?1,?2,?3,?4,?5,?6,'received')",
+             (supplier_id,event_id,event_type,purchase_order_id,message,quantity,received_at,status)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,'received')",
             params![
+                event.supplier_id,
                 event.event_id,
                 event.event_type,
                 event.purchase_order_id,
@@ -190,12 +211,13 @@ impl SupplierEventStore {
         )?;
         if inserted == 0 {
             tx.execute(
-                "UPDATE supplier_events SET webhook_duplicate_count=webhook_duplicate_count+1 WHERE event_id=?1",
-                params![event.event_id],
+                "UPDATE supplier_events SET webhook_duplicate_count=webhook_duplicate_count+1
+                 WHERE supplier_id=?1 AND event_id=?2",
+                params![event.supplier_id, event.event_id],
             )?;
         }
         tx.commit()?;
-        let stored = Self::query_by_event_id(&conn, &event.event_id)?
+        let stored = Self::query_by_event_id(&conn, &event.supplier_id, &event.event_id)?
             .expect("inserted or duplicate event must be queryable");
         if inserted == 1 {
             Ok(InsertOutcome::Inserted(stored))
@@ -225,14 +247,16 @@ impl SupplierEventStore {
 
     pub fn claim_by_event_id(
         &self,
+        supplier_id: &str,
         event_id: &str,
     ) -> rusqlite::Result<Option<StoredSupplierEvent>> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let id: Option<i64> = tx
             .query_row(
-                "SELECT id FROM supplier_events WHERE event_id=?1 AND status='received'",
-                params![event_id],
+                "SELECT id FROM supplier_events
+                 WHERE supplier_id=?1 AND event_id=?2 AND status='received'",
+                params![supplier_id, event_id],
                 |row| row.get(0),
             )
             .optional()?;
@@ -324,24 +348,33 @@ impl SupplierEventStore {
         )
     }
 
-    pub fn list(&self, limit: usize, before: Option<i64>) -> rusqlite::Result<SupplierEventPage> {
+    /// 分页读事件。`supplier_id=None` 表示不按供货商过滤（跨供货商总览）。
+    pub fn list(
+        &self,
+        limit: usize,
+        before: Option<i64>,
+        supplier_id: Option<&str>,
+    ) -> rusqlite::Result<SupplierEventPage> {
         let conn = self.conn.lock().unwrap();
         let limit = limit.clamp(1, 200) as i64;
         let mut stmt = conn.prepare(
-            "SELECT id,event_id,event_type,purchase_order_id,message,quantity,received_at,status,attempts,last_error,
+            "SELECT id,supplier_id,event_id,event_type,purchase_order_id,message,quantity,received_at,status,attempts,last_error,
                     purchased,imported,duplicate_count,webhook_duplicate_count,failed_count,read_at,processing_started_at
-             FROM supplier_events WHERE (?1 IS NULL OR id < ?1) ORDER BY id DESC LIMIT ?2",
+             FROM supplier_events
+             WHERE (?1 IS NULL OR id < ?1) AND (?2 IS NULL OR supplier_id = ?2)
+             ORDER BY id DESC LIMIT ?3",
         )?;
-        let rows = stmt.query_map(params![before, limit], Self::row_to_event)?;
+        let rows = stmt.query_map(params![before, supplier_id, limit], Self::row_to_event)?;
         Ok(SupplierEventPage {
             items: rows.collect::<rusqlite::Result<_>>()?,
         })
     }
 
-    pub fn unread_count(&self) -> rusqlite::Result<i64> {
+    pub fn unread_count(&self, supplier_id: Option<&str>) -> rusqlite::Result<i64> {
         self.conn.lock().unwrap().query_row(
-            "SELECT COUNT(*) FROM supplier_events WHERE read_at IS NULL",
-            [],
+            "SELECT COUNT(*) FROM supplier_events
+             WHERE read_at IS NULL AND (?1 IS NULL OR supplier_id = ?1)",
+            params![supplier_id],
             |row| row.get(0),
         )
     }
@@ -361,10 +394,11 @@ impl SupplierEventStore {
         Ok(changed)
     }
 
-    pub fn mark_all_read(&self) -> rusqlite::Result<usize> {
+    pub fn mark_all_read(&self, supplier_id: Option<&str>) -> rusqlite::Result<usize> {
         self.conn.lock().unwrap().execute(
-            "UPDATE supplier_events SET read_at=?1 WHERE read_at IS NULL",
-            params![Utc::now().to_rfc3339()],
+            "UPDATE supplier_events SET read_at=?1
+             WHERE read_at IS NULL AND (?2 IS NULL OR supplier_id = ?2)",
+            params![Utc::now().to_rfc3339(), supplier_id],
         )
     }
 
@@ -399,37 +433,49 @@ impl SupplierEventStore {
 
     fn query_by_event_id(
         conn: &Connection,
+        supplier_id: &str,
         event_id: &str,
     ) -> rusqlite::Result<Option<StoredSupplierEvent>> {
-        conn.query_row("SELECT id,event_id,event_type,purchase_order_id,message,quantity,received_at,status,attempts,last_error,purchased,imported,duplicate_count,webhook_duplicate_count,failed_count,read_at,processing_started_at FROM supplier_events WHERE event_id=?1", params![event_id], Self::row_to_event).optional()
+        conn.query_row(
+            &format!("SELECT {EVENT_COLUMNS} FROM supplier_events WHERE supplier_id=?1 AND event_id=?2"),
+            params![supplier_id, event_id],
+            Self::row_to_event,
+        )
+        .optional()
     }
 
     fn query_by_id(
         conn: &rusqlite::Transaction<'_>,
         id: i64,
     ) -> rusqlite::Result<Option<StoredSupplierEvent>> {
-        conn.query_row("SELECT id,event_id,event_type,purchase_order_id,message,quantity,received_at,status,attempts,last_error,purchased,imported,duplicate_count,webhook_duplicate_count,failed_count,read_at,processing_started_at FROM supplier_events WHERE id=?1", params![id], Self::row_to_event).optional()
+        conn.query_row(
+            &format!("SELECT {EVENT_COLUMNS} FROM supplier_events WHERE id=?1"),
+            params![id],
+            Self::row_to_event,
+        )
+        .optional()
     }
 
     fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredSupplierEvent> {
         Ok(StoredSupplierEvent {
             id: row.get(0)?,
-            event_id: row.get(1)?,
-            event_type: row.get(2)?,
-            purchase_order_id: row.get(3)?,
-            message: row.get(4)?,
-            quantity: row.get(5)?,
-            received_at: row.get(6)?,
-            status: SupplierEventStatus::from_db(&row.get::<_, String>(7)?, 7)?,
-            attempts: row.get(8)?,
-            last_error: row.get(9)?,
-            purchased_count: row.get(10)?,
-            imported_count: row.get(11)?,
-            duplicate_count: row.get(12)?,
-            webhook_duplicate_count: row.get(13)?,
-            failed_count: row.get(14)?,
-            read_at: row.get(15)?,
-            processing_started_at: row.get(16)?,
+            supplier_id: row.get(1)?,
+            event_id: row.get(2)?,
+            event_type: row.get(3)?,
+            purchase_order_id: row.get(4)?,
+            message: row.get(5)?,
+            quantity: row.get(6)?,
+            received_at: row.get(7)?,
+            status: SupplierEventStatus::from_db(&row.get::<_, String>(8)?, 8)?,
+            attempts: row.get(9)?,
+            last_error: row.get(10)?,
+            purchased_count: row.get(11)?,
+            imported_count: row.get(12)?,
+            duplicate_count: row.get(13)?,
+            webhook_duplicate_count: row.get(14)?,
+            failed_count: row.get(15)?,
+            read_at: row.get(16)?,
+            processing_started_at: row.get(17)?,
         })
     }
 
@@ -452,6 +498,41 @@ impl SupplierEventStore {
     }
 }
 
+/// 多供货商改造前的表把 `event_id` 声明成列级 `UNIQUE`，SQLite 无法直接 drop，
+/// 会让两家供货商推同名 event id 时误判重复丢单，因此整表重建。
+const REBUILD_TABLE: &str = r#"
+CREATE TABLE supplier_events_migrated (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    supplier_id TEXT NOT NULL DEFAULT 'default',
+    event_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    purchase_order_id TEXT,
+    message TEXT,
+    quantity INTEGER NOT NULL,
+    received_at TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    purchased INTEGER NOT NULL DEFAULT 0,
+    imported INTEGER NOT NULL DEFAULT 0,
+    duplicate_count INTEGER NOT NULL DEFAULT 0,
+    webhook_duplicate_count INTEGER NOT NULL DEFAULT 0,
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    read_at TEXT,
+    processing_started_at TEXT
+);
+INSERT INTO supplier_events_migrated
+    (id,supplier_id,event_id,event_type,purchase_order_id,message,quantity,received_at,status,
+     attempts,last_error,purchased,imported,duplicate_count,webhook_duplicate_count,failed_count,
+     read_at,processing_started_at)
+SELECT id,supplier_id,event_id,event_type,purchase_order_id,message,quantity,received_at,status,
+       attempts,last_error,purchased,imported,duplicate_count,webhook_duplicate_count,failed_count,
+       read_at,processing_started_at
+FROM supplier_events;
+DROP TABLE supplier_events;
+ALTER TABLE supplier_events_migrated RENAME TO supplier_events;
+"#;
+
 fn initialize_schema(conn: &Connection) -> rusqlite::Result<()> {
     let tx = conn.unchecked_transaction()?;
     tx.execute_batch(SCHEMA)?;
@@ -468,8 +549,23 @@ fn initialize_schema(conn: &Connection) -> rusqlite::Result<()> {
             )?;
         }
     }
+    if has_column_level_unique(&tx)? {
+        tx.execute_batch(REBUILD_TABLE)?;
+    }
+    tx.execute(&format!("DROP INDEX IF EXISTS {LEGACY_EVENT_ID_INDEX}"), [])?;
     tx.execute_batch(INDEXES)?;
     tx.commit()
+}
+
+/// 列级 `UNIQUE` 会让 SQLite 建一个 `sqlite_autoindex_*` 隐式索引；表的其它约束
+/// （INTEGER PRIMARY KEY AUTOINCREMENT 是 rowid 别名）不会。以此判断是否需要重建。
+fn has_column_level_unique(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master
+         WHERE type='index' AND tbl_name='supplier_events' AND name LIKE 'sqlite_autoindex_%')",
+        [],
+        |row| row.get(0),
+    )
 }
 
 fn truncate_chars(value: &str, max: usize) -> String {
@@ -484,6 +580,7 @@ mod tests {
 
     fn event(id: &str) -> IncomingSupplierEvent {
         IncomingSupplierEvent {
+            supplier_id: LEGACY_SUPPLIER_ID.to_string(),
             event_id: id.to_string(),
             event_type: "purchase.requested".to_string(),
             purchase_order_id: Some("po-1".to_string()),
@@ -498,7 +595,7 @@ mod tests {
         let path = root.join("nested/events.db");
         let _ = std::fs::remove_dir_all(&root);
         let store = SupplierEventStore::open(&path).unwrap();
-        assert_eq!(store.unread_count().unwrap(), 0);
+        assert_eq!(store.unread_count(None).unwrap(), 0);
         let conn = Connection::open(path).unwrap();
         let journal: String = conn
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
@@ -540,7 +637,7 @@ mod tests {
         }
 
         let store = SupplierEventStore::open(&path).unwrap();
-        let page = store.list(10, None).unwrap();
+        let page = store.list(10, None, None).unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].event_id, "legacy-1");
         assert_eq!(page.items[0].quantity, 0);
@@ -642,7 +739,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            store.list(1, None).unwrap().items[0]
+            store.list(1, None, None).unwrap().items[0]
                 .message
                 .as_ref()
                 .unwrap()
@@ -661,7 +758,7 @@ mod tests {
         let skip_message = format!("{}🚀", "好".repeat(MAX_MESSAGE_CHARS));
         store.skip(skipped.id, Some(&skip_message)).unwrap();
         assert_eq!(
-            store.list(1, None).unwrap().items[0]
+            store.list(1, None, None).unwrap().items[0]
                 .message
                 .as_ref()
                 .unwrap()
@@ -669,6 +766,102 @@ mod tests {
                 .count(),
             MAX_MESSAGE_CHARS
         );
+    }
+
+    #[test]
+    fn open_rebuilds_the_table_so_two_suppliers_can_share_an_event_id() {
+        let path = std::env::temp_dir().join(format!(
+            "kiro-supplier-rebuild-{}-{}.db",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            // 多供货商改造前的真实表形状：event_id 是列级 UNIQUE。
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE supplier_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT UNIQUE NOT NULL,
+                    event_type TEXT NOT NULL,
+                    purchase_order_id TEXT,
+                    message TEXT,
+                    quantity INTEGER NOT NULL,
+                    received_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    purchased INTEGER NOT NULL DEFAULT 0,
+                    imported INTEGER NOT NULL DEFAULT 0,
+                    duplicate_count INTEGER NOT NULL DEFAULT 0,
+                    webhook_duplicate_count INTEGER NOT NULL DEFAULT 0,
+                    failed_count INTEGER NOT NULL DEFAULT 0,
+                    read_at TEXT,
+                    processing_started_at TEXT
+                );
+                CREATE UNIQUE INDEX idx_supplier_events_event_id_unique ON supplier_events(event_id);
+                INSERT INTO supplier_events
+                    (event_id,event_type,quantity,received_at,status,imported)
+                VALUES ('shared-1','new_keys_available',3,'2026-01-01T00:00:00Z','succeeded',3);",
+            )
+            .unwrap();
+        }
+
+        let store = SupplierEventStore::open(&path).unwrap();
+
+        // 历史行保留并回填 default，计数不丢。
+        let items = store.list(10, None, None).unwrap().items;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].supplier_id, LEGACY_SUPPLIER_ID);
+        assert_eq!(items[0].imported_count, 3);
+        assert_eq!(items[0].status, SupplierEventStatus::Succeeded);
+
+        // 另一家供货商用同一个 event_id 必须能落库（旧的列级 UNIQUE 已被拆掉）。
+        let other = store
+            .insert_event(IncomingSupplierEvent {
+                supplier_id: "kiroapp".to_string(),
+                event_id: "shared-1".to_string(),
+                event_type: "new_keys_available".to_string(),
+                purchase_order_id: None,
+                message: None,
+                quantity: 1,
+            })
+            .unwrap();
+        assert!(matches!(other, InsertOutcome::Inserted(_)));
+        assert_eq!(store.list(10, None, None).unwrap().items.len(), 2);
+        // 同一家重复推还是判重。
+        assert!(matches!(
+            store
+                .insert_event(IncomingSupplierEvent {
+                    supplier_id: "kiroapp".to_string(),
+                    event_id: "shared-1".to_string(),
+                    event_type: "new_keys_available".to_string(),
+                    purchase_order_id: None,
+                    message: None,
+                    quantity: 1,
+                })
+                .unwrap(),
+            InsertOutcome::Duplicate(_)
+        ));
+
+        // 遗留的单列唯一索引必须消失，否则跨供货商同 id 又会被误判重复。
+        let conn = Connection::open(&path).unwrap();
+        let legacy_index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                params![LEGACY_EVENT_ID_INDEX],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_index, 0);
+        drop(conn);
+
+        // 重复 open 幂等（不会反复重建）。
+        drop(store);
+        let reopened = SupplierEventStore::open(&path).unwrap();
+        assert_eq!(reopened.list(10, None, None).unwrap().items.len(), 2);
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -682,7 +875,7 @@ mod tests {
             store.insert_event(event("a")).unwrap(),
             InsertOutcome::Duplicate(_)
         ));
-        let items = store.list(10, None).unwrap().items;
+        let items = store.list(10, None, None).unwrap().items;
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].webhook_duplicate_count, 1);
     }
@@ -720,7 +913,7 @@ mod tests {
             )
             .unwrap();
 
-        let stored = store.list(1, None).unwrap().items.remove(0);
+        let stored = store.list(1, None, None).unwrap().items.remove(0);
         assert_eq!(stored.purchased_count, 3);
         assert_eq!(stored.imported_count, 1);
         assert_eq!(stored.duplicate_count, 1);
@@ -732,10 +925,10 @@ mod tests {
         let store = SupplierEventStore::open_in_memory().unwrap();
         store.insert_event(event("a")).unwrap();
 
-        let claimed = store.claim_by_event_id("a").unwrap().unwrap();
+        let claimed = store.claim_by_event_id(LEGACY_SUPPLIER_ID, "a").unwrap().unwrap();
         assert_eq!(claimed.status, SupplierEventStatus::Processing);
         assert_eq!(claimed.attempts, 1);
-        assert!(store.claim_by_event_id("a").unwrap().is_none());
+        assert!(store.claim_by_event_id(LEGACY_SUPPLIER_ID, "a").unwrap().is_none());
     }
 
     #[test]
@@ -778,18 +971,18 @@ mod tests {
         for id in ["a", "b", "c"] {
             store.insert_event(event(id)).unwrap();
         }
-        let page = store.list(999, None).unwrap();
+        let page = store.list(999, None, None).unwrap();
         assert_eq!(page.items.len(), 3);
         assert_eq!(page.items[0].event_id, "c");
         assert_eq!(
-            store.list(2, Some(page.items[0].id)).unwrap().items.len(),
+            store.list(2, Some(page.items[0].id), None).unwrap().items.len(),
             2
         );
-        assert_eq!(store.unread_count().unwrap(), 3);
+        assert_eq!(store.unread_count(None).unwrap(), 3);
         store.mark_read(&[page.items[0].id]).unwrap();
-        assert_eq!(store.unread_count().unwrap(), 2);
-        store.mark_all_read().unwrap();
-        assert_eq!(store.unread_count().unwrap(), 0);
+        assert_eq!(store.unread_count(None).unwrap(), 2);
+        store.mark_all_read(None).unwrap();
+        assert_eq!(store.unread_count(None).unwrap(), 0);
     }
 
     #[test]
@@ -802,6 +995,6 @@ mod tests {
             .unwrap()
             .execute("UPDATE supplier_events SET status='future'", [])
             .unwrap();
-        assert!(store.list(1, None).is_err());
+        assert!(store.list(1, None, None).is_err());
     }
 }

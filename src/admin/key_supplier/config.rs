@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::kiro::region::validate_api_region;
-use crate::model::config::{Config, KeySupplierConfig};
+use crate::model::config::{Config, KeySupplierConfig, KeySupplierEntryConfig, SupplierKind};
 
 const MAX_URL_CHARS: usize = 2_048;
 const MAX_SECRET_CHARS: usize = 4_096;
@@ -16,6 +16,120 @@ const MAX_NICKNAME_PREFIX_CHARS: usize = 128;
 const MAX_PURCHASE: u64 = 10_000;
 const MAX_RPM_LIMIT: u64 = 100_000;
 const MAX_PRIORITY: u64 = u32::MAX as u64;
+const MAX_SUPPLIER_ID_CHARS: usize = 64;
+const MAX_SUPPLIER_NAME_CHARS: usize = 128;
+/// 单实例能挂的供货商上限。够用又不至于让 webhook token 反查退化成长列表扫描。
+pub const MAX_SUPPLIERS: usize = 32;
+
+/// 一家供货商的运行期配置：身份（id/name/kind/enabled）+ 连接与导入预设。
+#[derive(Clone, PartialEq, Eq)]
+pub struct SupplierEntryRuntime {
+    pub id: String,
+    pub name: String,
+    pub kind: SupplierKind,
+    pub enabled: bool,
+    pub settings: SupplierRuntimeConfig,
+}
+
+impl std::fmt::Debug for SupplierEntryRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SupplierEntryRuntime")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("enabled", &self.enabled)
+            .field("settings", &self.settings)
+            .finish()
+    }
+}
+
+impl SupplierEntryRuntime {
+    /// 从持久化条目读取，校验但不生成缺失的 webhook token。
+    pub fn from_persisted(entry: &KeySupplierEntryConfig) -> anyhow::Result<Self> {
+        Ok(Self {
+            id: normalize_supplier_id(&entry.id)?,
+            name: normalize_text(&entry.name, "name", MAX_SUPPLIER_NAME_CHARS)?,
+            kind: entry.kind,
+            enabled: entry.enabled,
+            settings: normalize_persisted(&entry.settings)?,
+        })
+    }
+
+    /// 该供货商是否具备发起采购的最小条件。
+    pub fn is_operable(&self) -> bool {
+        !self.settings.base_url.trim().is_empty() && !self.settings.api_key.trim().is_empty()
+    }
+}
+
+impl From<&SupplierEntryRuntime> for KeySupplierEntryConfig {
+    fn from(value: &SupplierEntryRuntime) -> Self {
+        Self {
+            id: value.id.clone(),
+            name: value.name.clone(),
+            kind: value.kind,
+            enabled: value.enabled,
+            settings: KeySupplierConfig::from(&value.settings),
+        }
+    }
+}
+
+/// 供货商列表项的对外视图，secret 只报「是否已配置」。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupplierEntryView {
+    pub id: String,
+    pub name: String,
+    pub kind: &'static str,
+    pub enabled: bool,
+    pub supports_webhook_registration: bool,
+    #[serde(flatten)]
+    pub settings: SupplierConfigView,
+}
+
+impl From<&SupplierEntryRuntime> for SupplierEntryView {
+    fn from(value: &SupplierEntryRuntime) -> Self {
+        Self {
+            id: value.id.clone(),
+            name: value.name.clone(),
+            kind: value.kind.as_str(),
+            enabled: value.enabled,
+            supports_webhook_registration: value.kind.supports_webhook_registration(),
+            settings: SupplierConfigView::from(&value.settings),
+        }
+    }
+}
+
+/// 新增/修改一家供货商的入参。`id` 仅新增时使用，修改时以路径参数为准。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupplierEntryUpdate {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub kind: SupplierKind,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(flatten)]
+    pub settings: SupplierConfigUpdate,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+impl std::fmt::Debug for SupplierEntryUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SupplierEntryUpdate")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("enabled", &self.enabled)
+            .field("settings", &self.settings)
+            .finish()
+    }
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct SupplierRuntimeConfig {
@@ -23,6 +137,8 @@ pub struct SupplierRuntimeConfig {
     pub api_key: String,
     pub public_base_url: String,
     pub webhook_token: String,
+    /// 留空 = 不验签。配上则校验 `X-Kiro-Signature`。
+    pub webhook_secret: String,
     pub auto_purchase: bool,
     pub auto_delete_forbidden: bool,
     pub min_purchase: u32,
@@ -42,6 +158,7 @@ pub struct SupplierConfigView {
     pub api_key_configured: bool,
     pub public_base_url: String,
     pub webhook_token_configured: bool,
+    pub webhook_secret_configured: bool,
     pub auto_purchase: bool,
     pub auto_delete_forbidden: bool,
     pub min_purchase: u32,
@@ -63,6 +180,8 @@ pub struct SupplierConfigUpdate {
     pub public_base_url: String,
     #[serde(default)]
     pub webhook_token: Option<String>,
+    #[serde(default)]
+    pub webhook_secret: Option<String>,
     pub auto_purchase: bool,
     #[serde(default)]
     pub auto_delete_forbidden: bool,
@@ -86,6 +205,10 @@ impl std::fmt::Debug for SupplierRuntimeConfig {
             .field(
                 "webhook_token_configured",
                 &(!self.webhook_token.is_empty()),
+            )
+            .field(
+                "webhook_secret_configured",
+                &(!self.webhook_secret.is_empty()),
             )
             .field("auto_purchase", &self.auto_purchase)
             .field("auto_delete_forbidden", &self.auto_delete_forbidden)
@@ -114,6 +237,10 @@ impl std::fmt::Debug for SupplierConfigUpdate {
                 "webhook_token_configured",
                 &self.webhook_token.as_ref().is_some_and(|v| !v.is_empty()),
             )
+            .field(
+                "webhook_secret_configured",
+                &self.webhook_secret.as_ref().is_some_and(|v| !v.is_empty()),
+            )
             .field("auto_purchase", &self.auto_purchase)
             .field("auto_delete_forbidden", &self.auto_delete_forbidden)
             .field("min_purchase", &self.min_purchase)
@@ -129,18 +256,19 @@ impl std::fmt::Debug for SupplierConfigUpdate {
 }
 
 impl SupplierRuntimeConfig {
-    pub fn from_config(config: &Config) -> anyhow::Result<Self> {
-        normalize_persisted(&config.key_supplier)
-    }
-
-    pub fn apply(config: &mut Config, update: SupplierConfigUpdate) -> anyhow::Result<Self> {
-        let runtime = Self::normalize(config, update, true)?;
-        config.key_supplier = KeySupplierConfig::from(&runtime);
-        Ok(runtime)
+    /// 校验并规范化一份连接配置。`existing` 提供「留空 secret 不覆盖」的旧值。
+    ///
+    /// 缺失的 webhook token 不在这里生成——由 `SupplierEntryRuntime::normalize_update`
+    /// 统一补，避免持久化读取路径意外「凭空」得到一个 token。
+    pub fn normalize_standalone(
+        update: SupplierConfigUpdate,
+        existing: Option<&Self>,
+    ) -> anyhow::Result<Self> {
+        Self::normalize(existing, update, false)
     }
 
     fn normalize(
-        config: &Config,
+        existing: Option<&Self>,
         update: SupplierConfigUpdate,
         generate_missing_webhook_token: bool,
     ) -> anyhow::Result<Self> {
@@ -159,24 +287,33 @@ impl SupplierRuntimeConfig {
             update
                 .api_key
                 .as_deref()
-                .unwrap_or(&config.key_supplier.api_key),
+                .unwrap_or_else(|| existing.map_or("", |value| value.api_key.as_str())),
             "apiKey",
         )?;
         let mut webhook_token = normalize_webhook_token(
             update
                 .webhook_token
                 .as_deref()
-                .unwrap_or(&config.key_supplier.webhook_token),
+                .unwrap_or_else(|| existing.map_or("", |value| value.webhook_token.as_str())),
         )?;
         if generate_missing_webhook_token && webhook_token.is_empty() {
             webhook_token = generate_webhook_token();
         }
+        // 签名密钥由供货商生成，格式不由我们定，只做长度上限校验。
+        let webhook_secret = normalize_secret(
+            update
+                .webhook_secret
+                .as_deref()
+                .unwrap_or_else(|| existing.map_or("", |value| value.webhook_secret.as_str())),
+            "webhookSecret",
+        )?;
 
         let runtime = Self {
             base_url,
             api_key,
             public_base_url,
             webhook_token,
+            webhook_secret,
             auto_purchase: update.auto_purchase,
             auto_delete_forbidden: update.auto_delete_forbidden,
             min_purchase: update.min_purchase as u32,
@@ -208,6 +345,7 @@ impl From<&SupplierRuntimeConfig> for KeySupplierConfig {
             api_key: value.api_key.clone(),
             public_base_url: value.public_base_url.clone(),
             webhook_token: value.webhook_token.clone(),
+            webhook_secret: value.webhook_secret.clone(),
             auto_purchase: value.auto_purchase,
             auto_delete_forbidden: value.auto_delete_forbidden,
             min_purchase: value.min_purchase,
@@ -229,6 +367,7 @@ impl From<&SupplierRuntimeConfig> for SupplierConfigView {
             api_key_configured: !value.api_key.is_empty(),
             public_base_url: value.public_base_url.clone(),
             webhook_token_configured: !value.webhook_token.is_empty(),
+            webhook_secret_configured: !value.webhook_secret.is_empty(),
             auto_purchase: value.auto_purchase,
             auto_delete_forbidden: value.auto_delete_forbidden,
             min_purchase: value.min_purchase,
@@ -247,6 +386,103 @@ pub fn generate_webhook_token() -> String {
     format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
 
+/// 供货商 id：小写字母/数字/`-`/`_`，用于 URL 路径与事件表外键，创建后不可改。
+pub fn normalize_supplier_id(value: &str) -> anyhow::Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        anyhow::bail!("供货商 id 不能为空");
+    }
+    if value.chars().count() > MAX_SUPPLIER_ID_CHARS {
+        anyhow::bail!("供货商 id 最多允许 {MAX_SUPPLIER_ID_CHARS} 个字符");
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        anyhow::bail!("供货商 id 只能包含字母、数字、- 和 _");
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+/// 读取整份供货商列表。空列表且历史单供货商已配置时，迁移出 `default` 一项。
+///
+/// 返回 `(列表, 是否发生迁移)`；迁移标记由调用方决定要不要落盘。
+pub fn load_suppliers(config: &Config) -> anyhow::Result<(Vec<SupplierEntryRuntime>, bool)> {
+    if config.key_suppliers.is_empty() {
+        if !KeySupplierEntryConfig::legacy_is_configured(&config.key_supplier) {
+            return Ok((Vec::new(), false));
+        }
+        let migrated = KeySupplierEntryConfig::from_legacy(config.key_supplier.clone());
+        return Ok((vec![SupplierEntryRuntime::from_persisted(&migrated)?], true));
+    }
+
+    let mut seen = HashSet::new();
+    let mut entries = Vec::with_capacity(config.key_suppliers.len());
+    for entry in &config.key_suppliers {
+        let runtime = SupplierEntryRuntime::from_persisted(entry)?;
+        if !seen.insert(runtime.id.clone()) {
+            anyhow::bail!("供货商 id 重复: {}", runtime.id);
+        }
+        entries.push(runtime);
+    }
+    Ok((entries, false))
+}
+
+/// 把内存里的供货商列表写回 `Config`（调用方负责 `save()`）。
+///
+/// 同时把第一个 `kiro-rs` 供货商镜像回历史 `keySupplier` 字段：镜像本身不参与读取
+/// （启动时只在 `keySuppliers` 为空才看它），存在的意义是回滚到旧版本后主供货商仍可用。
+pub fn store_suppliers(config: &mut Config, entries: &[SupplierEntryRuntime]) {
+    config.key_suppliers = entries.iter().map(KeySupplierEntryConfig::from).collect();
+    if let Some(primary) = entries
+        .iter()
+        .find(|entry| entry.enabled && entry.kind == SupplierKind::KiroRs)
+        .or_else(|| {
+            entries
+                .iter()
+                .find(|entry| entry.kind == SupplierKind::KiroRs)
+        })
+    {
+        config.key_supplier = KeySupplierConfig::from(&primary.settings);
+    }
+}
+
+impl SupplierEntryRuntime {
+    /// 校验一条新增/修改请求。`id` 已定则沿用（改），否则从入参取（新增）。
+    ///
+    /// `existing` 是同一条的旧值，用于「留空 secret 不覆盖」语义。
+    pub fn normalize_update(
+        id: Option<&str>,
+        update: SupplierEntryUpdate,
+        existing: Option<&SupplierEntryRuntime>,
+    ) -> anyhow::Result<Self> {
+        let id = match id {
+            Some(id) => normalize_supplier_id(id)?,
+            None => normalize_supplier_id(
+                update
+                    .id
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("新增供货商必须提供 id"))?,
+            )?,
+        };
+        let name = normalize_text(&update.name, "name", MAX_SUPPLIER_NAME_CHARS)?;
+        let mut settings = SupplierRuntimeConfig::normalize_standalone(
+            update.settings,
+            existing.map(|entry| &entry.settings),
+        )?;
+        if settings.webhook_token.is_empty() {
+            settings.webhook_token = generate_webhook_token();
+        }
+        Ok(Self {
+            id,
+            name,
+            kind: update.kind,
+            enabled: update.enabled,
+            settings,
+        })
+    }
+}
+
 pub fn is_valid_webhook_token(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -257,6 +493,7 @@ fn normalize_persisted(value: &KeySupplierConfig) -> anyhow::Result<SupplierRunt
         api_key: Some(value.api_key.clone()),
         public_base_url: value.public_base_url.clone(),
         webhook_token: Some(value.webhook_token.clone()),
+        webhook_secret: Some(value.webhook_secret.clone()),
         auto_purchase: value.auto_purchase,
         auto_delete_forbidden: value.auto_delete_forbidden,
         min_purchase: u64::from(value.min_purchase),
@@ -268,9 +505,7 @@ fn normalize_persisted(value: &KeySupplierConfig) -> anyhow::Result<SupplierRunt
         source_channel: value.source_channel.clone(),
         nickname_prefix: value.nickname_prefix.clone(),
     };
-    let mut config = Config::default();
-    config.key_supplier = value.clone();
-    SupplierRuntimeConfig::normalize(&config, update, false)
+    SupplierRuntimeConfig::normalize(None, update, false)
 }
 
 fn normalize_http_origin(value: &str, field: &str) -> anyhow::Result<String> {
@@ -352,6 +587,7 @@ mod tests {
             api_key: Some(" supplier-secret ".to_string()),
             public_base_url: " https://public.example/ ".to_string(),
             webhook_token: None,
+            webhook_secret: None,
             auto_purchase: true,
             auto_delete_forbidden: true,
             min_purchase: 2,
@@ -375,9 +611,7 @@ mod tests {
         update.min_purchase = 6;
         update.max_purchase = 5;
 
-        let mut config = Config::default();
-
-        assert!(SupplierRuntimeConfig::apply(&mut config, update).is_err());
+        assert!(SupplierRuntimeConfig::normalize_standalone(update, None).is_err());
     }
 
     #[test]
@@ -399,8 +633,7 @@ mod tests {
             update.base_url = base_url.to_string();
             update.public_base_url = public_base_url.to_string();
             update.api_region = api_region.to_string();
-            let mut config = Config::default();
-            assert!(SupplierRuntimeConfig::apply(&mut config, update).is_err());
+            assert!(SupplierRuntimeConfig::normalize_standalone(update, None).is_err());
         }
     }
 
@@ -414,78 +647,124 @@ mod tests {
         ] {
             let mut update = valid_update();
             update.base_url = value.to_string();
-            let mut config = Config::default();
             assert!(
-                SupplierRuntimeConfig::apply(&mut config, update).is_err(),
+                SupplierRuntimeConfig::normalize_standalone(update, None).is_err(),
                 "{value}"
             );
 
             let mut update = valid_update();
             update.public_base_url = value.to_string();
-            let mut config = Config::default();
             assert!(
-                SupplierRuntimeConfig::apply(&mut config, update).is_err(),
+                SupplierRuntimeConfig::normalize_standalone(update, None).is_err(),
                 "{value}"
             );
         }
     }
 
     #[test]
-    fn apply_normalizes_values_and_generates_missing_webhook_token() {
-        let mut config = Config::default();
-        let runtime = SupplierRuntimeConfig::apply(&mut config, valid_update()).unwrap();
+    fn normalization_trims_values_and_deduplicates_groups() {
+        let runtime = SupplierRuntimeConfig::normalize_standalone(valid_update(), None).unwrap();
 
         assert_eq!(runtime.base_url, "https://supplier.example");
         assert_eq!(runtime.public_base_url, "https://public.example");
         assert_eq!(runtime.api_region, "us-east-1");
         assert_eq!(runtime.groups, vec!["production", "backup"]);
         assert!(runtime.auto_delete_forbidden);
-        assert_eq!(runtime.webhook_token.len(), 64);
+        assert_eq!(runtime.api_key, "supplier-secret");
+        assert_eq!(runtime.source_channel, "Webhook 自动采购");
+    }
+
+    #[test]
+    fn entry_normalization_generates_a_missing_webhook_token() {
+        let mut update = valid_update();
+        update.webhook_token = None;
+        let entry = SupplierEntryRuntime::normalize_update(
+            None,
+            SupplierEntryUpdate {
+                id: Some("kiroapp".to_owned()),
+                name: " kiroapp.cc ".to_owned(),
+                kind: SupplierKind::KiroApp,
+                enabled: true,
+                settings: update,
+            },
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(entry.id, "kiroapp");
+        assert_eq!(entry.name, "kiroapp.cc");
+        assert_eq!(entry.kind, SupplierKind::KiroApp);
+        // 没有 token 就收不到回调，所以这里必须自动补一个。
+        assert_eq!(entry.settings.webhook_token.len(), 64);
         assert!(
-            runtime
+            entry
+                .settings
                 .webhook_token
                 .chars()
                 .all(|ch| ch.is_ascii_hexdigit())
         );
-        assert_eq!(config.key_supplier.base_url, runtime.base_url);
-        assert_eq!(config.key_supplier.webhook_token, runtime.webhook_token);
-        assert!(config.key_supplier.auto_delete_forbidden);
+    }
+
+    #[test]
+    fn supplier_ids_are_lowercased_and_restricted_to_url_safe_values() {
+        assert_eq!(normalize_supplier_id("  KiroApp  ").unwrap(), "kiroapp");
+        assert_eq!(normalize_supplier_id("vendor_1-x").unwrap(), "vendor_1-x");
+        for invalid in ["", "   ", "has space", "slash/es", "dots.", "中文", &"a".repeat(65)] {
+            assert!(normalize_supplier_id(invalid).is_err(), "{invalid}");
+        }
     }
 
     #[test]
     fn webhook_token_must_be_empty_or_64_hex_when_loading_and_updating() {
         for token in ["webhook-token".to_owned(), "a".repeat(63), "g".repeat(64)] {
-            let mut config = Config::default();
             let mut update = valid_update();
             update.webhook_token = Some(token.clone());
-            assert!(SupplierRuntimeConfig::apply(&mut config, update).is_err());
+            assert!(SupplierRuntimeConfig::normalize_standalone(update, None).is_err());
 
+            let mut config = Config::default();
             config.key_supplier.webhook_token = token;
-            assert!(SupplierRuntimeConfig::from_config(&config).is_err());
+            // 持久化里的坏 token 也要在读取时就被拒绝，而不是运行时才炸。
+            assert!(load_suppliers(&config).is_err() || config.key_supplier.base_url.is_empty());
+            config.key_supplier.base_url = "https://supplier.example".to_string();
+            assert!(load_suppliers(&config).is_err());
         }
 
-        let mut config = Config::default();
         let mut update = valid_update();
         let valid = "a".repeat(64);
         update.webhook_token = Some(valid.clone());
         assert_eq!(
-            SupplierRuntimeConfig::apply(&mut config, update)
+            SupplierRuntimeConfig::normalize_standalone(update, None)
                 .unwrap()
                 .webhook_token,
             valid
         );
+        // 读取路径不会凭空造 token。
         assert!(
-            SupplierRuntimeConfig::from_config(&Config::default())
-                .unwrap()
-                .webhook_token
-                .is_empty()
+            SupplierRuntimeConfig::normalize_standalone(
+                SupplierConfigUpdate {
+                    webhook_token: Some(String::new()),
+                    webhook_secret: None,
+                    ..valid_update()
+                },
+                None
+            )
+            .unwrap()
+            .webhook_token
+            .is_empty()
         );
     }
 
     #[test]
     fn view_never_serializes_sensitive_values() {
-        let mut config = Config::default();
-        let runtime = SupplierRuntimeConfig::apply(&mut config, valid_update()).unwrap();
+        let runtime = SupplierRuntimeConfig::normalize_standalone(
+            SupplierConfigUpdate {
+                webhook_token: Some("a".repeat(64)),
+                webhook_secret: None,
+                ..valid_update()
+            },
+            None,
+        )
+        .unwrap();
         let api_key = runtime.api_key.clone();
         let webhook_token = runtime.webhook_token.clone();
         let value = serde_json::to_value(SupplierConfigView::from(&runtime)).unwrap();
@@ -501,16 +780,23 @@ mod tests {
 
     #[test]
     fn loading_config_does_not_claim_an_unpersisted_webhook_token() {
-        let runtime = SupplierRuntimeConfig::from_config(&Config::default()).unwrap();
-        let view = SupplierConfigView::from(&runtime);
+        let (entries, migrated) = load_suppliers(&Config::default()).unwrap();
 
-        assert!(runtime.webhook_token.is_empty());
-        assert!(!view.webhook_token_configured);
+        // 空配置不该凭空长出一家供货商，更不该长出 token。
+        assert!(entries.is_empty());
+        assert!(!migrated);
+
+        let mut config = Config::default();
+        config.key_supplier.base_url = "https://supplier.example".to_string();
+        let (entries, migrated) = load_suppliers(&config).unwrap();
+        assert!(migrated);
+        assert!(entries[0].settings.webhook_token.is_empty());
+        assert!(!SupplierConfigView::from(&entries[0].settings).webhook_token_configured);
     }
 
     #[test]
     fn debug_does_not_expose_supplier_runtime_secrets() {
-        let mut runtime = SupplierRuntimeConfig::from_config(&Config::default()).unwrap();
+        let mut runtime = SupplierRuntimeConfig::normalize_standalone(valid_update(), None).unwrap();
         runtime.api_key = "runtime-api-key-canary".to_string();
         runtime.webhook_token = "runtime-webhook-token-canary".to_string();
 
@@ -518,6 +804,26 @@ mod tests {
 
         assert!(!debug.contains("runtime-api-key-canary"));
         assert!(!debug.contains("runtime-webhook-token-canary"));
+
+        // 包一层供货商条目后也不能漏。
+        let entry = SupplierEntryRuntime {
+            id: "kiroapp".to_owned(),
+            name: "kiroapp.cc".to_owned(),
+            kind: SupplierKind::KiroApp,
+            enabled: true,
+            settings: runtime,
+        };
+        let debug = format!("{entry:?}");
+        assert!(!debug.contains("runtime-api-key-canary"));
+        assert!(!debug.contains("runtime-webhook-token-canary"));
+
+        // 对外视图同样只报「是否已配置」。
+        let encoded = serde_json::to_string(&SupplierEntryView::from(&entry)).unwrap();
+        assert!(!encoded.contains("runtime-api-key-canary"));
+        assert!(!encoded.contains("runtime-webhook-token-canary"));
+        assert!(encoded.contains("\"apiKeyConfigured\":true"));
+        assert!(encoded.contains("\"kind\":\"kiro-app\""));
+        assert!(encoded.contains("\"supportsWebhookRegistration\":false"));
     }
 
     #[test]

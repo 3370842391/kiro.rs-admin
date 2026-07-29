@@ -42,10 +42,19 @@ use super::{
         update_credential, update_group, update_refresh_token, upsert_model_mapping,
     },
     key_supplier::handlers::{
+        create_supplier as create_key_supplier, delete_supplier as delete_key_supplier,
         get_config as get_key_supplier_config, list_events as list_key_supplier_events,
-        mark_events_read, overview as key_supplier_overview, purchase as key_supplier_purchase,
-        put_config as put_key_supplier_config, register_webhook as register_key_supplier_webhook,
-        retry_event as retry_key_supplier_event, test_webhook as test_key_supplier_webhook,
+        list_suppliers as list_key_suppliers, mark_events_read,
+        overview as key_supplier_overview, purchase as key_supplier_purchase,
+        put_config as put_key_supplier_config,
+        register_supplier_webhook as register_single_key_supplier_webhook,
+        register_webhook as register_key_supplier_webhook,
+        retry_event as retry_key_supplier_event,
+        supplier_callback_url as key_supplier_callback_url,
+        supplier_overview as single_key_supplier_overview,
+        supplier_purchase as single_key_supplier_purchase,
+        test_supplier_webhook as test_single_key_supplier_webhook,
+        test_webhook as test_key_supplier_webhook, update_supplier as update_key_supplier,
         webhook_router,
     },
     middleware::{AdminState, admin_auth_middleware},
@@ -213,6 +222,34 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/key-supplier/events/{id}/retry",
             post(retry_key_supplier_event),
         )
+        .route(
+            "/key-suppliers",
+            get(list_key_suppliers).post(create_key_supplier),
+        )
+        .route(
+            "/key-suppliers/{id}",
+            put(update_key_supplier).delete(delete_key_supplier),
+        )
+        .route(
+            "/key-suppliers/{id}/overview",
+            get(single_key_supplier_overview),
+        )
+        .route(
+            "/key-suppliers/{id}/purchase",
+            post(single_key_supplier_purchase),
+        )
+        .route(
+            "/key-suppliers/{id}/webhook/register",
+            post(register_single_key_supplier_webhook),
+        )
+        .route(
+            "/key-suppliers/{id}/webhook/test",
+            post(test_single_key_supplier_webhook),
+        )
+        .route(
+            "/key-suppliers/{id}/callback-url",
+            get(key_supplier_callback_url),
+        )
         .route("/system/update/pull", post(pull_update_image))
         .route("/system/update/apply", post(apply_image_update))
         .route("/system/update/rollback", post(rollback_image_update))
@@ -332,7 +369,7 @@ mod tests {
             key_supplier::{
                 config::SupplierRuntimeConfig,
                 service::{CredentialImporter, KeySupplierService},
-                store::{IncomingSupplierEvent, SupplierEventStore},
+                store::{IncomingSupplierEvent, LEGACY_SUPPLIER_ID, SupplierEventStore},
             },
             proxy_pool::ProxyPoolManager,
         },
@@ -380,6 +417,7 @@ mod tests {
             api_key: "supplier-api-key-canary".to_string(),
             public_base_url: "https://public.example".to_string(),
             webhook_token: token.clone(),
+            webhook_secret: String::new(),
             auto_purchase: false,
             auto_delete_forbidden: false,
             min_purchase: 1,
@@ -600,7 +638,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        assert!(supplier.store().list(1, None).unwrap().items.is_empty());
+        assert!(supplier.store().list(1, None, None).unwrap().items.is_empty());
     }
 
     #[tokio::test]
@@ -624,7 +662,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        assert!(supplier.store().list(1, None).unwrap().items.is_empty());
+        assert!(supplier.store().list(1, None, None).unwrap().items.is_empty());
     }
 
     #[tokio::test]
@@ -742,6 +780,7 @@ mod tests {
         let failed = supplier
             .store()
             .insert_event(IncomingSupplierEvent {
+                supplier_id: LEGACY_SUPPLIER_ID.to_string(),
                 event_id: "ffffffffffffffffffffffffffffffff".to_string(),
                 event_type: "new_keys_available".to_string(),
                 purchase_order_id: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()),
@@ -755,7 +794,7 @@ mod tests {
         };
         let claimed = supplier
             .store()
-            .claim_by_event_id("ffffffffffffffffffffffffffffffff")
+            .claim_by_event_id(LEGACY_SUPPLIER_ID, "ffffffffffffffffffffffffffffffff")
             .unwrap()
             .unwrap();
         supplier
@@ -840,6 +879,7 @@ mod tests {
                 api_key: "supplier-api-key-canary".to_string(),
                 public_base_url: "https://public.example".to_string(),
                 webhook_token: token,
+                webhook_secret: String::new(),
                 auto_purchase: false,
                 auto_delete_forbidden: false,
                 min_purchase: 1,

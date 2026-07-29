@@ -92,6 +92,70 @@ describe('key supplier management UI contract', () => {
     expect(page).not.toContain('#${event.id}')
   })
 
+  test('page manages multiple suppliers and scopes overview, purchase and events per supplier', async () => {
+    const page = await readSource('components/key-supplier-page.tsx')
+
+    expect(page).toContain('listSuppliers')
+    expect(page).toContain('createSupplier')
+    expect(page).toContain('updateSupplier')
+    expect(page).toContain('deleteSupplier')
+    expect(page).toContain('添加供货商')
+    expect(page).toContain('getSupplierKindLabel')
+    expect(page).toContain('selectedId')
+    // 概览/购买/webhook 都必须打到选中的那家，不能再走单供货商老路由。
+    expect(page).toContain('getSupplierEntryOverview')
+    expect(page).toContain('purchaseFromSupplier')
+    expect(page).toContain('registerSupplierEntryWebhook')
+    expect(page).toContain('testSupplierEntryWebhook')
+    expect(page).toContain('supplierId: eventSupplierId')
+    expect(page).toContain('只看当前供货商')
+    expect(page).toContain('event.supplierId')
+    // 删除要有确认，避免误删整家配置。
+    expect(page).toContain('window.confirm')
+  })
+
+  test('page hides remote webhook registration for protocols that cannot register', async () => {
+    const page = await readSource('components/key-supplier-page.tsx')
+
+    expect(page).toContain('supportsWebhookRegistration')
+    expect(page).toContain("config?.kind === 'kiro-rs'")
+    expect(page).toContain('getSupplierCallbackUrl')
+    expect(page).toContain('获取回调地址')
+    expect(page).toContain('需手动填写')
+    expect(page).toContain('到货通知')
+    // kiro-app 的价格与积分要能看到，否则无从判断该不该采购。
+    expect(page).toContain('keyPrice')
+    expect(page).toContain('balance')
+    expect(page).toContain('剩余积分')
+  })
+
+  test('page exposes the webhook signing secret and its verification state', async () => {
+    const page = await readSource('components/key-supplier-page.tsx')
+
+    expect(page).toContain('webhookSecret')
+    expect(page).toContain('Webhook 签名密钥')
+    expect(page).toContain('X-Kiro-Signature')
+    expect(page).toContain('webhookSecretConfigured')
+    expect(page).toContain('留空则不验签')
+    expect(page).toContain('验签')
+  })
+
+  test('page warns that duplicate pushes never buy twice and surfaces the duplicate counter', async () => {
+    const page = await readSource('components/key-supplier-page.tsx')
+
+    expect(page).toContain('同一条推送重复到达不会重复购买')
+    expect(page).toContain('event.webhookDuplicateCount')
+  })
+
+  test('page validates supplier ids before creating and locks them afterwards', async () => {
+    const page = await readSource('components/key-supplier-page.tsx')
+
+    expect(page).toContain('isValidSupplierId')
+    expect(page).toContain('suggestSupplierId')
+    expect(page).toContain('创建后不可改')
+    expect(page).toContain('readOnly={!creating}')
+  })
+
   test('page keeps numeric inputs as validated drafts and blocks invalid submits', async () => {
     const page = await readSource('components/key-supplier-page.tsx')
 

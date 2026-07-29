@@ -1146,6 +1146,8 @@ export interface SupplierConfigView {
   nicknamePrefix: string
   apiKeyConfigured: boolean
   webhookTokenConfigured: boolean
+  /** HMAC signing key for `X-Kiro-Signature`. Blank means signatures are not checked. */
+  webhookSecretConfigured: boolean
 }
 
 /** Secrets are write-only and are never present in SupplierConfigView. */
@@ -1164,12 +1166,50 @@ export interface SupplierConfigUpdate {
   nicknamePrefix: string
   apiKey?: string
   webhookToken?: string
+  webhookSecret?: string
 }
 
-export type SupplierConfigPayload = Omit<SupplierConfigUpdate, 'apiKey' | 'webhookToken'> &
-  Partial<Pick<SupplierConfigUpdate, 'apiKey' | 'webhookToken'>>
+export type SupplierConfigPayload = Omit<
+  SupplierConfigUpdate,
+  'apiKey' | 'webhookToken' | 'webhookSecret'
+> &
+  Partial<Pick<SupplierConfigUpdate, 'apiKey' | 'webhookToken' | 'webhookSecret'>>
+
+/** Supplier protocol. `kiro-rs` is the legacy vendor API; `kiro-app` is kiroapp.cc. */
+export type SupplierKind = 'kiro-rs' | 'kiro-app'
+
+/** One supplier in the multi-supplier list. Settings are flattened by the server. */
+export interface SupplierEntryView extends SupplierConfigView {
+  id: string
+  name: string
+  kind: SupplierKind
+  enabled: boolean
+  /** `kiro-app` cannot register callbacks remotely; the URL must be pasted manually. */
+  supportsWebhookRegistration: boolean
+}
+
+export interface SupplierEntryUpdate extends SupplierConfigUpdate {
+  /** Required when creating; ignored when editing (the path parameter wins). */
+  id?: string
+  name: string
+  kind: SupplierKind
+  enabled: boolean
+}
+
+export type SupplierEntryPayload = Omit<
+  SupplierEntryUpdate,
+  'apiKey' | 'webhookToken' | 'webhookSecret'
+> &
+  Partial<Pick<SupplierEntryUpdate, 'apiKey' | 'webhookToken' | 'webhookSecret'>>
+
+export interface SupplierListResponse {
+  items: SupplierEntryView[]
+}
 
 export interface SupplierOverview {
+  supplierId: string
+  kind: SupplierKind
+  /** Synthesised for `kiro-app`, which has no profile endpoint. */
   profile: {
     name: string
     quota: number
@@ -1177,6 +1217,10 @@ export interface SupplierOverview {
     usedQuota: number
   }
   stockMax: number
+  /** `kiro-app` only: price per key. */
+  keyPrice: number | null
+  /** Remaining quota/credits. */
+  balance: number | null
   webhookRegistered: boolean
   status: {
     keysActive: number
@@ -1186,10 +1230,19 @@ export interface SupplierOverview {
   }
 }
 
+export interface SupplierCallbackUrlResponse {
+  callbackUrl: string
+}
+
+export interface SupplierDeleteResponse {
+  deleted: boolean
+}
+
 export type SupplierEventStatus = 'received' | 'processing' | 'succeeded' | 'skipped' | 'failed'
 
 export interface SupplierEvent {
   id: number
+  supplierId: string
   eventId: string
   eventType: string
   purchaseOrderId: string | null
@@ -1215,10 +1268,15 @@ export interface SupplierEventPage {
 export interface SupplierEventQuery {
   limit?: number
   before?: number
+  /** Restrict to one supplier; omit to see every supplier's events. */
+  supplierId?: string
 }
 
 export interface PurchaseResponse {
+  supplierId: string
   orderId: string
+  /** Points spent; `kiro-app` only. */
+  pointsCost?: number | null
   requested: number
   purchased: number
   imported: number
@@ -1235,8 +1293,8 @@ export interface SupplierWebhookTestResponse {
 }
 
 export type SupplierMarkEventsReadRequest =
-  | { ids: number[]; markAll?: false }
-  | { markAll: true; ids?: never }
+  | { ids: number[]; markAll?: false; supplierId?: string }
+  | { markAll: true; ids?: never; supplierId?: string }
 
 export interface SupplierMarkEventsReadResponse {
   updated: number

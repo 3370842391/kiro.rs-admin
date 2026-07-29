@@ -614,20 +614,9 @@ fn initialize_key_supplier_service(
     cache_dir: &std::path::Path,
     token_manager: Arc<MultiTokenManager>,
 ) -> Option<Arc<admin::key_supplier::service::KeySupplierService>> {
-    if config.key_supplier.webhook_token.trim().is_empty() {
-        config.key_supplier.webhook_token = admin::key_supplier::config::generate_webhook_token();
-        if let Err(error) = config.save() {
-            config.key_supplier.webhook_token.clear();
-            tracing::error!(
-                %error,
-                "key supplier webhook token could not be persisted; supplier service is disabled"
-            );
-            return None;
-        }
-    }
-
-    let runtime = match admin::key_supplier::config::SupplierRuntimeConfig::from_config(config) {
-        Ok(runtime) => runtime,
+    // 历史单供货商配置 → 多供货商列表。迁移只做一次，落盘后后续启动走正常分支。
+    let (mut suppliers, migrated) = match admin::key_supplier::config::load_suppliers(config) {
+        Ok(result) => result,
         Err(error) => {
             tracing::error!(
                 %error,
@@ -636,6 +625,32 @@ fn initialize_key_supplier_service(
             return None;
         }
     };
+
+    // 每家供货商都需要一个 webhook token 才能收回调；缺的补上。
+    let mut needs_save = migrated;
+    for entry in &mut suppliers {
+        if entry.settings.webhook_token.trim().is_empty() {
+            entry.settings.webhook_token = admin::key_supplier::config::generate_webhook_token();
+            needs_save = true;
+        }
+    }
+    if needs_save {
+        admin::key_supplier::config::store_suppliers(config, &suppliers);
+        if let Err(error) = config.save() {
+            tracing::error!(
+                %error,
+                "key supplier configuration could not be persisted; supplier service is disabled"
+            );
+            return None;
+        }
+        if migrated {
+            tracing::info!(
+                suppliers = suppliers.len(),
+                "migrated legacy key supplier config into the multi-supplier list"
+            );
+        }
+    }
+
     let store = match admin::key_supplier::store::SupplierEventStore::open(
         cache_dir.join("key_supplier.db"),
     ) {
@@ -651,7 +666,7 @@ fn initialize_key_supplier_service(
     let service = Arc::new(
         admin::key_supplier::service::KeySupplierService::new_with_token_manager(
             store,
-            runtime,
+            suppliers,
             token_manager,
         )
         .with_config_path(config_path),
