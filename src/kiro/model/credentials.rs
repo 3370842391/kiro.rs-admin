@@ -168,6 +168,17 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
 
+    /// 采购来源供货商 id（机器可判定，非备注）。
+    ///
+    /// 由供货商采购流程写入，用于「这家的号是不是全死了」的补货判定。
+    /// 与 [`Self::source_channel`] 的区别：后者是用户可编辑的自由文本，两家填成
+    /// 一样就无法归属；这个字段只由代码写，取值就是 `keySuppliers[].id`。
+    ///
+    /// 手动添加的凭据没有这个字段，因此不会被计入任何供货商的存活数。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supplier_id: Option<String>,
+
     /// 上游返回封号 403 后，该凭据在保留期结束时自动删除。仅由受控导入流程显式开启。
     ///
     /// 语义变更（见 `token_manager::mark_credential_dead`）：早期是「403 立刻删除」，
@@ -193,6 +204,29 @@ pub struct KiroCredentials {
     #[serde(default)]
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub added_at_backfilled: bool,
+
+    /// 额度用尽的时间（RFC3339）。
+    ///
+    /// 上游 402（`MONTHLY_REQUEST_COUNT` / `OVERAGE_REQUEST_LIMIT_EXCEEDED`）或
+    /// 「一键超额」判定余额耗尽时写入。重新启用凭据时清空。
+    ///
+    /// 为什么必须持久化：`disabled_reason` 只在内存里，重启后额度耗尽的号只剩
+    /// `disabled: true`，跟手动禁用分不开。补货判定要的正是这个区别——额度耗尽
+    /// 该算「不可用」（可以补货了），手动禁用只是暂停。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_exhausted_at: Option<String>,
+
+    /// 采购这个号花了多少（供货商积分）。
+    ///
+    /// 由供货商采购流程按 key 写入——阶梯定价下同一单里各 key 不同价，按单摊会得到
+    /// 一个谁都对不上的假均价。和 [`Self::added_at`] / [`Self::died_at`] 一起构成
+    /// 「每存活小时成本」，这才是跨供货商可比的口径：单价便宜但活得短的那家可能更贵。
+    ///
+    /// 手动添加的凭据、以及不按 key 报价的协议（kiro-rs）没有这个字段。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purchase_price: Option<f64>,
 
     /// 判定死亡的时间（RFC3339）。
     ///
@@ -256,6 +290,8 @@ impl std::fmt::Debug for KiroCredentials {
             .field("endpoint", &self.endpoint)
             .field("groups", &self.groups)
             .field("source_channel", &self.source_channel)
+            .field("supplier_id", &self.supplier_id)
+            .field("quota_exhausted_at", &self.quota_exhausted_at)
             .field("delete_on_forbidden", &self.delete_on_forbidden)
             .finish()
     }
@@ -1026,6 +1062,9 @@ mod tests {
             endpoint: None,
             groups: vec![],
             source_channel: None,
+            supplier_id: None,
+            quota_exhausted_at: None,
+            purchase_price: None,
             delete_on_forbidden: false,
             added_at: None,
             added_at_backfilled: false,
@@ -1271,6 +1310,9 @@ mod tests {
             endpoint: None,
             groups: vec![],
             source_channel: None,
+            supplier_id: None,
+            quota_exhausted_at: None,
+            purchase_price: None,
             delete_on_forbidden: false,
             added_at: None,
             added_at_backfilled: false,
@@ -1315,6 +1357,9 @@ mod tests {
             endpoint: None,
             groups: vec![],
             source_channel: None,
+            supplier_id: None,
+            quota_exhausted_at: None,
+            purchase_price: None,
             delete_on_forbidden: false,
             added_at: None,
             added_at_backfilled: false,
@@ -1442,6 +1487,9 @@ mod tests {
             endpoint: None,
             groups: vec![],
             source_channel: None,
+            supplier_id: None,
+            quota_exhausted_at: None,
+            purchase_price: None,
             delete_on_forbidden: false,
             added_at: None,
             added_at_backfilled: false,

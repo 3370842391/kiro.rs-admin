@@ -5138,8 +5138,7 @@ mod tests {
         assert!(errors.is_empty(), "降级路径不应再报错: {errors:?}");
         assert!(
             !all.iter()
-                .any(|event| event.data.pointer("/content_block/type")
-                    == Some(&json!("tool_use"))),
+                .any(|event| event.data.pointer("/content_block/type") == Some(&json!("tool_use"))),
             "绝不能把未声明工具当 tool_use 发给客户端"
         );
         let text: String = all
@@ -5177,8 +5176,7 @@ mod tests {
         );
         assert!(
             !all.iter()
-                .any(|event| event.data.pointer("/content_block/type")
-                    == Some(&json!("tool_use"))),
+                .any(|event| event.data.pointer("/content_block/type") == Some(&json!("tool_use"))),
         );
     }
 
@@ -5908,20 +5906,14 @@ mod tests {
         }
         events.extend(ctx.generate_final_events());
 
-        assert!(
-            ctx.repetition_guard_tripped(),
-            "分片投喂下熔断必须仍然跳闸"
-        );
+        assert!(ctx.repetition_guard_tripped(), "分片投喂下熔断必须仍然跳闸");
         let text = collect_text_content(&events);
         let passed = text.matches("CHECK NEXT ITEM.").count();
         assert!(
             passed <= REPEAT_GUARD_TRIP_THRESHOLD as usize,
             "放行数不应超过阈值，实际 {passed}"
         );
-        assert!(
-            passed < 120,
-            "复读必须被截断，实际放行 {passed} / 120"
-        );
+        assert!(passed < 120, "复读必须被截断，实际放行 {passed} / 120");
     }
 
     #[test]
@@ -5955,10 +5947,7 @@ mod tests {
             start = end;
         }
 
-        assert!(
-            !ctx.repetition_guard_tripped(),
-            "不同内容的行不得触发熔断"
-        );
+        assert!(!ctx.repetition_guard_tripped(), "不同内容的行不得触发熔断");
         let text = collect_text_content(&events);
         assert!(
             text.contains("line 0 distinct") && text.contains("line 119 distinct"),
@@ -6015,8 +6004,8 @@ mod tests {
 
                 // 第二层：内容不得凭空消失。把 thinking 与正文合起来，去掉标签与空白后，
                 // 原文的可见字符应当全部还在（顺序可能因分块而变，故只比字符集合与总量）。
-                let delivered: String = collect_thinking_content(&events)
-                    + &collect_text_content(&events);
+                let delivered: String =
+                    collect_thinking_content(&events) + &collect_text_content(&events);
                 let strip = |s: &str| -> String {
                     s.replace("<thinking>", "")
                         .replace("</thinking>", "")
@@ -6109,10 +6098,26 @@ mod tests {
         // 闭标签后只有单换行加正文。旧实现要求后跟 `\n\n`，于是闭标签字面泄漏进 thinking
         // 内容（实测 thinking 里出现独立一行 `</thinking>`），块也不能及时闭合。
         for (name, chunk, want_text) in [
-            ("单换行接正文", "Starting now.<thinking>\nreasoning\n</thinking>\nDone.", "Done."),
-            ("无换行接正文", "Starting now.<thinking>\nreasoning\n</thinking>Done.", "Done."),
-            ("空格接正文", "Starting now.<thinking>\nreasoning\n</thinking> Done.", " Done."),
-            ("双换行接正文", "Starting now.<thinking>\nreasoning\n</thinking>\n\nDone.", "Done."),
+            (
+                "单换行接正文",
+                "Starting now.<thinking>\nreasoning\n</thinking>\nDone.",
+                "Done.",
+            ),
+            (
+                "无换行接正文",
+                "Starting now.<thinking>\nreasoning\n</thinking>Done.",
+                "Done.",
+            ),
+            (
+                "空格接正文",
+                "Starting now.<thinking>\nreasoning\n</thinking> Done.",
+                " Done.",
+            ),
+            (
+                "双换行接正文",
+                "Starting now.<thinking>\nreasoning\n</thinking>\n\nDone.",
+                "Done.",
+            ),
         ] {
             let mut ctx = StreamContext::new_with_thinking(
                 "test-model",
@@ -6380,7 +6385,8 @@ mod tests {
         assert!(!text.contains("<thinking>"));
 
         // 被反引号包裹的标签是在讨论它，不算开标签，正文原样保留。
-        let (thinking, text) = extract_thinking_from_complete_text("talking about `<thinking>` tag");
+        let (thinking, text) =
+            extract_thinking_from_complete_text("talking about `<thinking>` tag");
         assert!(thinking.is_none());
         assert_eq!(text, "talking about `<thinking>` tag");
     }
@@ -6769,7 +6775,10 @@ mod tests {
     #[test]
     fn trailing_end_tag_run_collapses_repeated_tags() {
         // 连续两个 / 三个：都应指向**第一个**标签的位置
-        assert_eq!(trailing_end_tag_run_start("内容</thinking></thinking>"), Some(6));
+        assert_eq!(
+            trailing_end_tag_run_start("内容</thinking></thinking>"),
+            Some(6)
+        );
         assert_eq!(
             trailing_end_tag_run_start("内容</thinking></thinking></thinking>"),
             Some(6)
@@ -6884,7 +6893,11 @@ mod tests {
     fn buffer_end_lookup_returns_run_start_for_repeated_tags() {
         let buffer = "思考内容</thinking></thinking>";
         let end_pos = find_real_thinking_end_tag_at_buffer_end(buffer).expect("应识别为结束标签");
-        assert_eq!(&buffer[..end_pos], "思考内容", "thinking 正文不得夹带字面标签");
+        assert_eq!(
+            &buffer[..end_pos],
+            "思考内容",
+            "thinking 正文不得夹带字面标签"
+        );
         // 跳过整串后应无残留
         let after = end_pos + end_tag_skip_len(buffer, end_pos);
         assert_eq!(
@@ -6903,8 +6916,7 @@ mod tests {
             "内容</thinking>\n\n",
             "</thinking>",
         ] {
-            let end_pos =
-                find_real_thinking_end_tag_at_buffer_end(buffer).expect("单标签应被识别");
+            let end_pos = find_real_thinking_end_tag_at_buffer_end(buffer).expect("单标签应被识别");
             let after = end_pos + end_tag_skip_len(buffer, end_pos);
             assert_eq!(buffer[after..].trim(), "", "剥离后不应有残留: {buffer:?}");
             assert!(

@@ -33,14 +33,14 @@ use super::{
         GlobalProxyResponse, PatchModelProfileRequest, PreviewModelProfilesRequest,
         ProxyCheckUrlRequest, RevisionRequest, SetAccountThrottleConfigRequest,
         SetCacheHitRateRequest, SetCachePolicyRequest, SetCompatibilityConfigRequest,
-        SetDisabledRequest, SetEndpointChainsRequest, SetEndpointModeRequest,
-        SetDeadCredentialConfigRequest, SetGlobalProxyRequest, SetImageBudgetRequest,
-        SetLoadBalancingModeRequest,
-        SetLogGovernanceConfigRequest, SetModelProfileSettingsRequest, SetPriorityRequest,
-        SetProfitConfigRequest, SetProxyBalancingModeRequest, SetRetryPolicyRequest,
-        SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
-        SyncModelProfilesRequest, UpdateAdminKeyRequest, UpdateClientKeyRequest,
-        UpdateClientKeyResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
+        SetDeadCredentialConfigRequest, SetDisabledRequest, SetEndpointChainsRequest,
+        SetEndpointModeRequest, SetGlobalProxyRequest, SetImageBudgetRequest,
+        SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetModelProfileSettingsRequest,
+        SetPriorityRequest, SetProfitConfigRequest, SetProxyBalancingModeRequest,
+        SetRetryPolicyRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
+        StartSocialLoginRequest, SuccessResponse, SyncModelProfilesRequest, UpdateAdminKeyRequest,
+        UpdateClientKeyRequest, UpdateClientKeyResponse, UpdateCredentialRequest,
+        UpdateRefreshTokenRequest,
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
 };
@@ -1812,9 +1812,7 @@ fn trace_record_to_admin_json(
 ) -> serde_json::Value {
     let compaction = r.compaction.as_ref().map(|snapshot| {
         let diagnostics = serde_json::from_str::<serde_json::Value>(&snapshot.diagnostics_json)
-            .unwrap_or_else(|_| {
-                serde_json::json!({"schemaVersion": 1, "parseError": true})
-            });
+            .unwrap_or_else(|_| serde_json::json!({"schemaVersion": 1, "parseError": true}));
         serde_json::json!({
             "sessionHash": snapshot.session_hash,
             "clientVersion": snapshot.client_version,
@@ -2653,10 +2651,7 @@ mod tests {
 
         assert_eq!(value["responseMode"], "kiro_native");
         assert_eq!(value["keyName"], "native-key");
-        assert_eq!(
-            value["compaction"]["diagnosis"],
-            "context_signal_enqueued"
-        );
+        assert_eq!(value["compaction"]["diagnosis"], "context_signal_enqueued");
         assert_eq!(value["compaction"]["diagnostics"]["schemaVersion"], 1);
         assert_eq!(value["compaction"]["diagnostics"]["messageCount"], 4);
         assert!(value["compaction"].get("diagnosticsJson").is_none());
@@ -2665,7 +2660,10 @@ mod tests {
     #[test]
     fn compaction_trace_query_params_are_parsed() {
         let params = std::collections::HashMap::from([
-            ("compactionDiagnosis".to_string(), "payload_limit_preempted".to_string()),
+            (
+                "compactionDiagnosis".to_string(),
+                "payload_limit_preempted".to_string(),
+            ),
             ("sessionHash".to_string(), "abc123".to_string()),
             ("highPressureOnly".to_string(), "true".to_string()),
             ("limit".to_string(), "25".to_string()),

@@ -15,6 +15,8 @@ import type {
   SupplierMarkEventsReadRequest,
   SupplierMarkEventsReadResponse,
   SupplierOverview,
+  SupplierPoolConfig,
+  SupplierPoolStatus,
   SupplierRetryEventResponse,
   SupplierWebhookRegisterResponse,
   SupplierWebhookTestResponse,
@@ -89,6 +91,26 @@ export async function retrySupplierEvent(id: number): Promise<SupplierRetryEvent
   return data
 }
 
+// ============ Global key pool ============
+
+export async function getSupplierPool(): Promise<SupplierPoolConfig> {
+  const { data } = await api.get<SupplierPoolConfig>('/key-supplier/pool')
+  return data
+}
+
+export async function updateSupplierPool(
+  update: SupplierPoolConfig,
+): Promise<SupplierPoolConfig> {
+  const { data } = await api.put<SupplierPoolConfig>('/key-supplier/pool', update)
+  return data
+}
+
+/** Read-only. Never triggers a purchase. */
+export async function getSupplierPoolStatus(): Promise<SupplierPoolStatus> {
+  const { data } = await api.get<SupplierPoolStatus>('/key-supplier/pool/status')
+  return data
+}
+
 // ============ Multi-supplier ============
 
 function supplierPath(id: string, suffix = ''): string {
@@ -153,7 +175,7 @@ export async function testSupplierEntryWebhook(
   return data
 }
 
-/** For `kiro-app`, this URL has to be pasted into the vendor's own webhook field. */
+/** For both kiroapp protocols, this URL has to be pasted into the vendor's own webhook field. */
 export async function getSupplierCallbackUrl(id: string): Promise<SupplierCallbackUrlResponse> {
   const { data } = await api.get<SupplierCallbackUrlResponse>(supplierPath(id, '/callback-url'))
   return data

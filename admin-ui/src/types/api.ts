@@ -1144,6 +1144,19 @@ export interface SupplierConfigView {
   groups: string[]
   sourceChannel: string
   nicknamePrefix: string
+  /**
+   * Only auto-purchase on webhook arrival when this supplier's usable key count has
+   * dropped to `restockUsableThreshold` or below. Off keeps the legacy behaviour of
+   * buying on every arrival notification.
+   */
+  restockOnlyWhenExhausted: boolean
+  /** Restock watermark. 0 = only buy once nothing is usable. */
+  restockUsableThreshold: number
+  /**
+   * Remaining quota at or below this counts as *not* usable. 0 = ignore quota and only
+   * treat bans and 402s as unusable. Absolute value, same unit as upstream `usageLimit`.
+   */
+  lowQuotaThreshold: number
   apiKeyConfigured: boolean
   webhookTokenConfigured: boolean
   /** HMAC signing key for `X-Kiro-Signature`. Blank means signatures are not checked. */
@@ -1164,6 +1177,19 @@ export interface SupplierConfigUpdate {
   groups: string[]
   sourceChannel: string
   nicknamePrefix: string
+  /**
+   * Only auto-purchase on webhook arrival when this supplier's usable key count has
+   * dropped to `restockUsableThreshold` or below. Off keeps the legacy behaviour of
+   * buying on every arrival notification.
+   */
+  restockOnlyWhenExhausted: boolean
+  /** Restock watermark. 0 = only buy once nothing is usable. */
+  restockUsableThreshold: number
+  /**
+   * Remaining quota at or below this counts as *not* usable. 0 = ignore quota and only
+   * treat bans and 402s as unusable. Absolute value, same unit as upstream `usageLimit`.
+   */
+  lowQuotaThreshold: number
   apiKey?: string
   webhookToken?: string
   webhookSecret?: string
@@ -1175,8 +1201,11 @@ export type SupplierConfigPayload = Omit<
 > &
   Partial<Pick<SupplierConfigUpdate, 'apiKey' | 'webhookToken' | 'webhookSecret'>>
 
-/** Supplier protocol. `kiro-rs` is the legacy vendor API; `kiro-app` is kiroapp.cc. */
-export type SupplierKind = 'kiro-rs' | 'kiro-app'
+/**
+ * Supplier protocol. `kiro-rs` is the legacy vendor API; `kiro-app` is kiroapp.cc;
+ * `kiroapp-io` is kiroapp.io (`/api/me/*`, Bearer `km_…`, idempotent purchases).
+ */
+export type SupplierKind = 'kiro-rs' | 'kiro-app' | 'kiroapp-io'
 
 /** One supplier in the multi-supplier list. Settings are flattened by the server. */
 export interface SupplierEntryView extends SupplierConfigView {
@@ -1184,7 +1213,7 @@ export interface SupplierEntryView extends SupplierConfigView {
   name: string
   kind: SupplierKind
   enabled: boolean
-  /** `kiro-app` cannot register callbacks remotely; the URL must be pasted manually. */
+  /** Neither kiroapp protocol can register callbacks remotely; the URL must be pasted manually. */
   supportsWebhookRegistration: boolean
 }
 
@@ -1209,7 +1238,7 @@ export interface SupplierListResponse {
 export interface SupplierOverview {
   supplierId: string
   kind: SupplierKind
-  /** Synthesised for `kiro-app`, which has no profile endpoint. */
+  /** Synthesised for the kiroapp protocols, which have no profile endpoint. */
   profile: {
     name: string
     quota: number
@@ -1217,10 +1246,30 @@ export interface SupplierOverview {
     usedQuota: number
   }
   stockMax: number
-  /** `kiro-app` only: price per key. */
+  /**
+   * Price per key. For `kiroapp-io` this is the *lowest* tier — pricing is tiered by
+   * each mother account's cumulative output, so a single order can mix prices.
+   */
   keyPrice: number | null
+  /** `kiroapp-io` only: highest tier price. Together with `keyPrice` it's the quoted range. */
+  keyPriceMax: number | null
   /** Remaining quota/credits. */
   balance: number | null
+  /**
+   * Local pool health for keys bought from this supplier. The restock gate compares
+   * `usable` against the watermark, so this is what explains "why didn't it buy".
+   */
+  credentialHealth: {
+    total: number
+    /** Manually disabled keys count as usable — that's a pause, not a dead key. */
+    usable: number
+    /** Banned (upstream 403 with a ban marker). */
+    dead: number
+    /** Quota used up (402, or the one-click over-quota sweep). */
+    quotaExhausted: number
+    /** Remaining quota at or below `lowQuotaThreshold`. */
+    lowQuota: number
+  }
   webhookRegistered: boolean
   status: {
     keysActive: number
@@ -1232,6 +1281,68 @@ export interface SupplierOverview {
 
 export interface SupplierCallbackUrlResponse {
   callbackUrl: string
+}
+
+// ============ Global key pool ============
+
+/**
+ * Global key pool config. One per instance, shared by every supplier.
+ *
+ * `targetCount` is a **stock target**, not a per-arrival cap: the total number of usable
+ * auto-purchased credentials must not exceed it. On each arrival notification the server
+ * computes `targetCount - currentUsable` and buys that deficit from the notifying supplier
+ * only. Suppliers have no priority order — whoever's event is processed first takes the
+ * deficit, which the existing global FIFO event queue already gives us.
+ *
+ * Enabling this takes over restock decisions: each supplier's own
+ * `restockOnlyWhenExhausted` / `restockUsableThreshold` / `lowQuotaThreshold` stop
+ * participating, so there is never a second watermark to reason about.
+ */
+export interface SupplierPoolConfig {
+  /** Off (default) means the whole feature is inert and per-supplier buying is unchanged. */
+  enabled: boolean
+  /**
+   * Stock target. `0` is the "not configured" sentinel, not a business default — enabling
+   * without setting a number must result in *not buying*, never in guessing a value.
+   */
+  targetCount: number
+  /** Remaining quota at or below this counts as not usable. 0 = ignore quota. */
+  lowQuotaThreshold: number
+}
+
+/** Per-credential health split, reused from the supplier overview. */
+export interface SupplierPoolHealth {
+  total: number
+  usable: number
+  /** Banned. Still in the pool until the retention window expires, but never counted usable. */
+  dead: number
+  quotaExhausted: number
+  lowQuota: number
+}
+
+export interface SupplierPoolStatus {
+  enabled: boolean
+  targetCount: number
+  lowQuotaThreshold: number
+  /** Currently usable auto-purchased credentials. Equals `health.usable`. */
+  globalUsable: number
+  /** How many more to buy. `0` means the pool is full and arrivals will be skipped. */
+  deficit: number
+  /**
+   * The four-way split. Answers "there are 10 keys in the pool, why is usable only 3" —
+   * usually because several are banned or out of quota.
+   */
+  health: SupplierPoolHealth
+  /** Credentials recognised via `supplierId` (written by current purchases). */
+  bySupplierId: number
+  /**
+   * Credentials recognised only by their `sourceChannel` note — bought before `supplierId`
+   * existed. Dropping to 0 unexpectedly usually means someone edited a supplier's
+   * `sourceChannel`, which silently stops those keys counting toward the watermark.
+   */
+  byLegacyChannel: number
+  /** The `sourceChannel` values currently used for note matching, sorted. */
+  matchedChannels: string[]
 }
 
 export interface SupplierDeleteResponse {
@@ -1246,6 +1357,8 @@ export interface SupplierEvent {
   eventId: string
   eventType: string
   purchaseOrderId: string | null
+  /** Vendor-side batch id, for reconciling against their console. `kiroapp-io` only. */
+  supplierBatchId: string | null
   message: string | null
   quantity: number
   receivedAt: string
@@ -1258,6 +1371,14 @@ export interface SupplierEvent {
   webhookDuplicateCount: number
   failedCount: number
   readAt: string | null
+  /** Actual amount charged for this order, in the supplier's credits. Tiered pricing makes this the only authoritative figure. */
+  totalDebit: number | null
+  /** Average unit price for this order = `totalDebit / purchasedCount`. */
+  unitPrice: number | null
+  /** Vendor-side order id, for reconciling against their order history. Not the same as `supplierBatchId`. */
+  supplierOrderId: string | null
+  /** The vendor replayed an earlier settled order, meaning the previous attempt actually succeeded. */
+  replayed: boolean
 }
 
 export interface SupplierEventPage {
@@ -1275,7 +1396,7 @@ export interface SupplierEventQuery {
 export interface PurchaseResponse {
   supplierId: string
   orderId: string
-  /** Points spent; `kiro-app` only. */
+  /** Points spent. `kiro-app` reports `pointsCost`; `kiroapp-io` reports `total_debit`. */
   pointsCost?: number | null
   requested: number
   purchased: number

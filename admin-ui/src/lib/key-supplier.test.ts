@@ -4,17 +4,20 @@ import type {
   SupplierEntryView,
   SupplierEvent,
   SupplierEventPage,
+  SupplierPoolStatus,
 } from '@/types/api'
 import {
   buildSupplierConfigPayload,
   buildSupplierEntryPayload,
   emptySupplierEntry,
+  emptySupplierPool,
   getSupplierEventStatusLabel,
   getSupplierKindLabel,
   hasUnreadSupplierEvents,
   isValidSupplierId,
   suggestSupplierId,
   toSupplierEntryUpdate,
+  validateSupplierPool,
 } from './key-supplier'
 import * as keySupplier from './key-supplier'
 
@@ -42,6 +45,7 @@ function event(id: number, readAt: string | null = null): SupplierEvent {
     eventId: `event-${id}`,
     eventType: 'purchase.requested',
     purchaseOrderId: null,
+    supplierBatchId: null,
     message: null,
     quantity: 1,
     receivedAt: '2026-07-24T00:00:00Z',
@@ -54,6 +58,10 @@ function event(id: number, readAt: string | null = null): SupplierEvent {
     webhookDuplicateCount: 0,
     failedCount: 0,
     readAt,
+    totalDebit: null,
+    unitPrice: null,
+    supplierOrderId: null,
+    replayed: false,
   }
 }
 
@@ -136,6 +144,80 @@ describe('key supplier helpers', () => {
     expect(parse('1.5', 0)).toBeNull()
     expect(parse('0', 0)).toBe(0)
     expect(parse('3', 1)).toBe(3)
+  })
+})
+
+describe('global key pool helpers', () => {
+  test('new pool drafts are off so upgrading changes nothing', () => {
+    const draft = emptySupplierPool()
+
+    expect(draft.enabled).toBe(false)
+    // 0 是「未配置」哨兵，不是业务默认值。
+    expect(draft.targetCount).toBe(0)
+    expect(draft.lowQuotaThreshold).toBe(0)
+    expect(validateSupplierPool(draft)).toBeNull()
+  })
+
+  test('enabling the pool requires an explicit target count', () => {
+    // 放过 0 会让人以为限住了采购，实际上每次到货都被跳过。
+    expect(validateSupplierPool({ enabled: true, targetCount: 0, lowQuotaThreshold: 0 })).toContain(
+      '1..=10000',
+    )
+    expect(validateSupplierPool({ enabled: true, targetCount: 1, lowQuotaThreshold: 0 })).toBeNull()
+    expect(
+      validateSupplierPool({ enabled: true, targetCount: 10000, lowQuotaThreshold: 0 }),
+    ).toBeNull()
+    expect(
+      validateSupplierPool({ enabled: true, targetCount: 10001, lowQuotaThreshold: 0 }),
+    ).toContain('1..=10000')
+  })
+
+  test('a disabled pool tolerates a stale target so the feature can be turned off', () => {
+    // 关闭状态下的旧值不参与任何判定，拦住保存会把人困在「想关都关不掉」。
+    expect(validateSupplierPool({ enabled: false, targetCount: 0, lowQuotaThreshold: 0 })).toBeNull()
+    expect(validateSupplierPool({ enabled: false, targetCount: 7, lowQuotaThreshold: 0 })).toBeNull()
+    // 但越界仍然拒绝：那是手滑，不是「未配置」。
+    expect(
+      validateSupplierPool({ enabled: false, targetCount: 10001, lowQuotaThreshold: 0 }),
+    ).toContain('0..=10000')
+  })
+
+  test('low quota threshold is range checked independently of the enable switch', () => {
+    expect(
+      validateSupplierPool({ enabled: false, targetCount: 0, lowQuotaThreshold: 100000 }),
+    ).toBeNull()
+    expect(
+      validateSupplierPool({ enabled: false, targetCount: 0, lowQuotaThreshold: 100001 }),
+    ).toContain('0..=100000')
+    expect(
+      validateSupplierPool({ enabled: true, targetCount: 3, lowQuotaThreshold: -1 }),
+    ).toContain('0..=100000')
+  })
+
+  test('pool status carries everything needed to explain a low usable count', () => {
+    // 界面要能回答三个问题，缺一个就得去翻日志。
+    const status: SupplierPoolStatus = {
+      enabled: true,
+      targetCount: 5,
+      lowQuotaThreshold: 0,
+      globalUsable: 2,
+      deficit: 3,
+      health: { total: 6, usable: 2, dead: 3, quotaExhausted: 1, lowQuota: 0 },
+      bySupplierId: 4,
+      byLegacyChannel: 2,
+      matchedChannels: ['Webhook 自动采购'],
+    }
+
+    // 「池里 6 个号怎么可用数只有 2」
+    expect(status.health.dead + status.health.quotaExhausted + status.health.lowQuota).toBe(
+      status.health.total - status.health.usable,
+    )
+    // 「还差几个」
+    expect(status.deficit).toBe(status.targetCount - status.globalUsable)
+    // 「备注匹配还生效吗」——两类识别计数之和等于池里的号数
+    expect(status.bySupplierId + status.byLegacyChannel).toBe(status.health.total)
+    // 「我买的号怎么没算进去」
+    expect(status.matchedChannels).toContain('Webhook 自动采购')
   })
 })
 
@@ -235,7 +317,7 @@ describe('multi-supplier helpers', () => {
   test('new supplier drafts prefill the vendor base url per protocol', () => {
     expect(emptySupplierEntry('kiro-app').baseUrl).toBe('https://kiroapp.cc')
     expect(emptySupplierEntry('kiro-rs').baseUrl).toBe('')
-    for (const kind of ['kiro-rs', 'kiro-app'] as const) {
+    for (const kind of ['kiro-rs', 'kiro-app', 'kiroapp-io'] as const) {
       const draft = emptySupplierEntry(kind)
       expect(draft.kind).toBe(kind)
       expect(draft.enabled).toBe(true)
@@ -244,8 +326,53 @@ describe('multi-supplier helpers', () => {
     }
   })
 
-  test('protocol labels name both vendors', () => {
+  test('kiroapp.io drafts default to https so the km_ token is not sent in the clear', () => {
+    // 对方文档写的是 http://kiroapp.io，但明文 HTTP 会把 km_ 令牌和 ksk_ 暴露在链路上。
+    expect(emptySupplierEntry('kiroapp-io').baseUrl).toBe('https://kiroapp.io')
+  })
+
+  test('protocol labels name every vendor', () => {
     expect(getSupplierKindLabel('kiro-app')).toContain('kiroapp')
     expect(getSupplierKindLabel('kiro-rs')).toContain('kiro.rs')
+    expect(getSupplierKindLabel('kiroapp-io')).toContain('kiroapp.io')
+    // 两家 kiroapp 的标签必须能区分，否则下拉框里认不出选了哪家。
+    expect(getSupplierKindLabel('kiroapp-io')).not.toBe(getSupplierKindLabel('kiro-app'))
+  })
+
+  test('new drafts enable the restock gate so a chatty supplier cannot bill on every arrival', () => {
+    const draft = emptySupplierEntry('kiroapp-io')
+
+    expect(draft.restockOnlyWhenExhausted).toBe(true)
+    // 0 = 一个能用的都没有了才买。
+    expect(draft.restockUsableThreshold).toBe(0)
+    expect(draft.lowQuotaThreshold).toBe(0)
+  })
+
+  test('the restock gate knobs survive the payload round-trip', () => {
+    const payload = buildSupplierEntryPayload({
+      ...emptySupplierEntry('kiroapp-io'),
+      id: 'io',
+      name: 'io',
+      restockOnlyWhenExhausted: true,
+      restockUsableThreshold: 2,
+      lowQuotaThreshold: 500,
+    })
+
+    // 水位必须真的发出去——丢了就是「额度水位静默失效」。
+    expect(payload.restockOnlyWhenExhausted).toBe(true)
+    expect(payload.restockUsableThreshold).toBe(2)
+    expect(payload.lowQuotaThreshold).toBe(500)
+  })
+
+  test('kiroapp.io round-trips through the entry payload builder', () => {
+    const payload = buildSupplierEntryPayload({
+      ...emptySupplierEntry('kiroapp-io'),
+      id: 'kiroapp-io',
+      name: ' kiroapp.io ',
+    })
+
+    expect(payload.kind).toBe('kiroapp-io')
+    expect(payload.id).toBe('kiroapp-io')
+    expect(payload.name).toBe('kiroapp.io')
   })
 })

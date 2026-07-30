@@ -9,7 +9,9 @@ const MAX_MESSAGE_CHARS: usize = 2000;
 /// `row_to_event` 的列顺序。所有单行查询共用，避免手抄漏列。
 const EVENT_COLUMNS: &str = "id,supplier_id,event_id,event_type,purchase_order_id,message,quantity,\
 received_at,status,attempts,last_error,purchased,imported,duplicate_count,\
-webhook_duplicate_count,failed_count,read_at,processing_started_at";
+webhook_duplicate_count,failed_count,read_at,processing_started_at,supplier_batch_id,\
+total_debit,unit_price,supplier_order_id,replayed,\
+pool_usable,pool_deficit,pool_requested";
 
 /// 历史行（单供货商时代）回填的供货商标识，与配置迁移出来的条目 id 一致。
 pub const LEGACY_SUPPLIER_ID: &str = "default";
@@ -33,7 +35,15 @@ CREATE TABLE IF NOT EXISTS supplier_events (
     webhook_duplicate_count INTEGER NOT NULL DEFAULT 0,
     failed_count INTEGER NOT NULL DEFAULT 0,
     read_at TEXT,
-    processing_started_at TEXT
+    processing_started_at TEXT,
+    supplier_batch_id TEXT,
+    total_debit INTEGER,
+    unit_price REAL,
+    supplier_order_id TEXT,
+    replayed INTEGER NOT NULL DEFAULT 0,
+    pool_usable INTEGER,
+    pool_deficit INTEGER,
+    pool_requested INTEGER
 );
 "#;
 
@@ -63,6 +73,30 @@ const MIGRATION_COLUMNS: &[(&str, &str)] = &[
     ("read_at", "TEXT"),
     ("processing_started_at", "TEXT"),
     ("supplier_id", "TEXT NOT NULL DEFAULT 'default'"),
+    // 供货商侧开号批次号（kiroapp-io 的 order_id），可空：其它协议没有批次概念。
+    ("supplier_batch_id", "TEXT"),
+    // 本单实际扣费（供货商积分）。阶梯定价下这是唯一权威数字，不能用单价 × 数量反推。
+    // 没有它就无法做跨供货商预算封顶，也算不出「每存活小时成本」。可空：历史行没有，
+    // 且 kiro-rs 协议不返回扣费。
+    ("total_debit", "INTEGER"),
+    // 本单均价 = total_debit / purchased。对方直接返回，落库省一次除法与精度纠缠。
+    ("unit_price", "REAL"),
+    // 供货商侧订单号（采购**响应**里的 order_id）。与 `supplier_batch_id`（推送里的
+    // 批次号）不是一回事：这个用来跟对方的订单历史对账，查「钱花了有没有拿到货」。
+    ("supplier_order_id", "TEXT"),
+    // 幂等重放标记。为真说明上一次其实已经成交，只是响应没回到我们手上——
+    // 那一次对应的事件很可能停在 failed，可据此自动对账出「假失败」。
+    ("replayed", "INTEGER NOT NULL DEFAULT 0"),
+    // 以下三列是全局号池闸的水位快照，回答「为什么买了这么多」和「为什么没买」。
+    // 只在号池闸启用时写入，其余情况（含历史行）为 NULL。
+    //
+    // 触发时全局可用的采购凭据数。
+    ("pool_usable", "INTEGER"),
+    // 触发时的缺口 = 目标存量 - pool_usable，下界 0。
+    ("pool_deficit", "INTEGER"),
+    // 经单家上下限与库存夹逼后实际请求的数量。与 `pool_deficit` 的差额说明是被
+    // 哪一道夹逼砍掉的。
+    ("pool_requested", "INTEGER"),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,17 +144,22 @@ pub struct IncomingSupplierEvent {
     pub event_id: String,
     pub event_type: String,
     pub purchase_order_id: Option<String>,
+    /// 供货商侧的开号批次号，采购时回传以定向拉取该批次产出。仅 `kiroapp-io` 有值。
+    pub supplier_batch_id: Option<String>,
     pub message: Option<String>,
     pub quantity: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// 不派生 `Eq`：`unit_price` 是 f64。金额本来就不该拿来做等价判定，
+// 需要比较的场景（测试断言）用 `PartialEq` 就够。
+#[derive(Debug, Clone, PartialEq)]
 pub struct StoredSupplierEvent {
     pub id: i64,
     pub supplier_id: String,
     pub event_id: String,
     pub event_type: String,
     pub purchase_order_id: Option<String>,
+    pub supplier_batch_id: Option<String>,
     pub message: Option<String>,
     pub quantity: i64,
     pub received_at: String,
@@ -134,23 +173,49 @@ pub struct StoredSupplierEvent {
     pub failed_count: i64,
     pub read_at: Option<String>,
     pub processing_started_at: Option<String>,
+    /// 本单实际扣费（供货商积分）。`None` = 该协议不返回扣费，或这条事件没花钱。
+    pub total_debit: Option<i64>,
+    /// 本单均价 = `total_debit / purchased_count`。
+    pub unit_price: Option<f64>,
+    /// 供货商侧订单号，用来和对方订单历史对账。
+    pub supplier_order_id: Option<String>,
+    /// 本单命中了对方的幂等重放（说明上一次其实已成交）。
+    pub replayed: bool,
+    /// 触发时全局可用的采购凭据数。`None` = 号池闸未启用。
+    pub pool_usable: Option<i64>,
+    /// 触发时的缺口（目标存量 - `pool_usable`，下界 0）。
+    pub pool_deficit: Option<i64>,
+    /// 经夹逼后实际请求的数量。与 `pool_deficit` 的差额说明被哪道夹逼砍掉了。
+    pub pool_requested: Option<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 一次处理的结果。`Default` 是「什么都没发生」，构造时只填关心的字段。
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProcessSummary {
     pub purchased_count: i64,
     pub imported_count: i64,
     pub duplicate_count: i64,
     pub failed_count: i64,
     pub message: Option<String>,
+    /// 实际扣费。`None` 表示「不知道/没花钱」，落库时不覆盖已有值。
+    pub total_debit: Option<i64>,
+    pub unit_price: Option<f64>,
+    pub supplier_order_id: Option<String>,
+    /// 命中幂等重放。只会从 false 翻成 true，不会被后续写回抹掉。
+    pub replayed: bool,
+    /// 号池闸的水位快照。三者必须在成功、跳过、失败三条路径上都落库——
+    /// 「为什么没买」正是它们要回答的问题，只在成功时记录等于没记录。
+    pub pool_usable: Option<i64>,
+    pub pool_deficit: Option<i64>,
+    pub pool_requested: Option<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SupplierEventPage {
     pub items: Vec<StoredSupplierEvent>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum InsertOutcome {
     Inserted(StoredSupplierEvent),
     Duplicate(StoredSupplierEvent),
@@ -197,8 +262,9 @@ impl SupplierEventStore {
             .map(|value| truncate_chars(&value, MAX_MESSAGE_CHARS));
         let inserted = tx.execute(
             "INSERT OR IGNORE INTO supplier_events
-             (supplier_id,event_id,event_type,purchase_order_id,message,quantity,received_at,status)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,'received')",
+             (supplier_id,event_id,event_type,purchase_order_id,message,quantity,received_at,status,
+              supplier_batch_id)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,'received',?8)",
             params![
                 event.supplier_id,
                 event.event_id,
@@ -206,7 +272,8 @@ impl SupplierEventStore {
                 event.purchase_order_id,
                 message,
                 event.quantity,
-                received_at
+                received_at,
+                event.supplier_batch_id
             ],
         )?;
         if inserted == 0 {
@@ -282,6 +349,20 @@ impl SupplierEventStore {
     }
 
     pub fn skip(&self, id: i64, message: Option<&str>) -> rusqlite::Result<()> {
+        self.skip_with_summary(id, message, ProcessSummary::default())
+    }
+
+    /// 跳过并附带一份 summary。号池闸用它把水位快照写进跳过的事件——
+    /// 「为什么没买」正是那三个数要回答的问题，只在成功时记录等于没记录。
+    ///
+    /// `summary` 里的计数字段会被清零：跳过意味着一个都没买、没导入、没失败。
+    /// 只有金额与水位这些「解释性」字段被保留，且走 `COALESCE` 只写不抹。
+    pub fn skip_with_summary(
+        &self,
+        id: i64,
+        message: Option<&str>,
+        summary: ProcessSummary,
+    ) -> rusqlite::Result<()> {
         self.transition_processing(
             id,
             "skipped",
@@ -291,6 +372,7 @@ impl SupplierEventStore {
                 duplicate_count: 0,
                 failed_count: 0,
                 message: message.map(|value| truncate_chars(value, MAX_MESSAGE_CHARS)),
+                ..summary
             },
         )
     }
@@ -299,11 +381,8 @@ impl SupplierEventStore {
         self.fail_with_summary(
             id,
             ProcessSummary {
-                purchased_count: 0,
-                imported_count: 0,
-                duplicate_count: 0,
                 failed_count: 1,
-                message: None,
+                ..Default::default()
             },
             error,
         )
@@ -357,13 +436,14 @@ impl SupplierEventStore {
     ) -> rusqlite::Result<SupplierEventPage> {
         let conn = self.conn.lock().unwrap();
         let limit = limit.clamp(1, 200) as i64;
-        let mut stmt = conn.prepare(
-            "SELECT id,supplier_id,event_id,event_type,purchase_order_id,message,quantity,received_at,status,attempts,last_error,
-                    purchased,imported,duplicate_count,webhook_duplicate_count,failed_count,read_at,processing_started_at
+        // 用共享的 EVENT_COLUMNS 而不是手抄一份：列顺序和 `row_to_event` 绑死，
+        // 手抄的那份漏列就会在运行时报 InvalidColumnIndex。
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {EVENT_COLUMNS}
              FROM supplier_events
              WHERE (?1 IS NULL OR id < ?1) AND (?2 IS NULL OR supplier_id = ?2)
              ORDER BY id DESC LIMIT ?3",
-        )?;
+        ))?;
         let rows = stmt.query_map(params![before, supplier_id, limit], Self::row_to_event)?;
         Ok(SupplierEventPage {
             items: rows.collect::<rusqlite::Result<_>>()?,
@@ -409,11 +489,18 @@ impl SupplierEventStore {
         summary: ProcessSummary,
     ) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
+        // 金额三列用 COALESCE、`replayed` 用 CASE：一律「只写不抹」。采购成功但导入失败时
+        // 走的是 `fail_with_summary`，钱的字段必须活下来——否则预算累计会把这单算成 0。
         let changed = conn.execute(
             "UPDATE supplier_events SET status=?1, message=COALESCE(?2,message), purchased=?3, imported=?4,
              duplicate_count=?5, failed_count=?6,
+             total_debit=COALESCE(?7,total_debit), unit_price=COALESCE(?8,unit_price),
+             supplier_order_id=COALESCE(?9,supplier_order_id),
+             replayed=CASE WHEN ?10=1 THEN 1 ELSE replayed END,
+             pool_usable=COALESCE(?11,pool_usable), pool_deficit=COALESCE(?12,pool_deficit),
+             pool_requested=COALESCE(?13,pool_requested),
              last_error=CASE WHEN ?1='failed' THEN ?2 ELSE last_error END, processing_started_at=NULL
-             WHERE id=?7 AND status='processing'",
+             WHERE id=?14 AND status='processing'",
             params![
                 status,
                 summary.message,
@@ -421,6 +508,13 @@ impl SupplierEventStore {
                 summary.imported_count,
                 summary.duplicate_count,
                 summary.failed_count,
+                summary.total_debit,
+                summary.unit_price,
+                summary.supplier_order_id,
+                i64::from(summary.replayed),
+                summary.pool_usable,
+                summary.pool_deficit,
+                summary.pool_requested,
                 id
             ],
         )?;
@@ -437,7 +531,9 @@ impl SupplierEventStore {
         event_id: &str,
     ) -> rusqlite::Result<Option<StoredSupplierEvent>> {
         conn.query_row(
-            &format!("SELECT {EVENT_COLUMNS} FROM supplier_events WHERE supplier_id=?1 AND event_id=?2"),
+            &format!(
+                "SELECT {EVENT_COLUMNS} FROM supplier_events WHERE supplier_id=?1 AND event_id=?2"
+            ),
             params![supplier_id, event_id],
             Self::row_to_event,
         )
@@ -476,6 +572,14 @@ impl SupplierEventStore {
             failed_count: row.get(15)?,
             read_at: row.get(16)?,
             processing_started_at: row.get(17)?,
+            supplier_batch_id: row.get(18)?,
+            total_debit: row.get(19)?,
+            unit_price: row.get(20)?,
+            supplier_order_id: row.get(21)?,
+            replayed: row.get::<_, i64>(22)? != 0,
+            pool_usable: row.get(23)?,
+            pool_deficit: row.get(24)?,
+            pool_requested: row.get(25)?,
         })
     }
 
@@ -519,15 +623,27 @@ CREATE TABLE supplier_events_migrated (
     webhook_duplicate_count INTEGER NOT NULL DEFAULT 0,
     failed_count INTEGER NOT NULL DEFAULT 0,
     read_at TEXT,
-    processing_started_at TEXT
+    processing_started_at TEXT,
+    supplier_batch_id TEXT,
+    total_debit INTEGER,
+    unit_price REAL,
+    supplier_order_id TEXT,
+    replayed INTEGER NOT NULL DEFAULT 0,
+    pool_usable INTEGER,
+    pool_deficit INTEGER,
+    pool_requested INTEGER
 );
 INSERT INTO supplier_events_migrated
     (id,supplier_id,event_id,event_type,purchase_order_id,message,quantity,received_at,status,
      attempts,last_error,purchased,imported,duplicate_count,webhook_duplicate_count,failed_count,
-     read_at,processing_started_at)
+     read_at,processing_started_at,supplier_batch_id,
+     total_debit,unit_price,supplier_order_id,replayed,
+     pool_usable,pool_deficit,pool_requested)
 SELECT id,supplier_id,event_id,event_type,purchase_order_id,message,quantity,received_at,status,
        attempts,last_error,purchased,imported,duplicate_count,webhook_duplicate_count,failed_count,
-       read_at,processing_started_at
+       read_at,processing_started_at,supplier_batch_id,
+       total_debit,unit_price,supplier_order_id,replayed,
+       pool_usable,pool_deficit,pool_requested
 FROM supplier_events;
 DROP TABLE supplier_events;
 ALTER TABLE supplier_events_migrated RENAME TO supplier_events;
@@ -584,6 +700,7 @@ mod tests {
             event_id: id.to_string(),
             event_type: "purchase.requested".to_string(),
             purchase_order_id: Some("po-1".to_string()),
+            supplier_batch_id: None,
             message: Some("hello".to_string()),
             quantity: 2,
         }
@@ -730,11 +847,8 @@ mod tests {
             .complete(
                 claimed.id,
                 ProcessSummary {
-                    purchased_count: 0,
-                    imported_count: 0,
-                    duplicate_count: 0,
-                    failed_count: 0,
                     message: Some(complete_message),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -766,6 +880,45 @@ mod tests {
                 .count(),
             MAX_MESSAGE_CHARS
         );
+    }
+
+    /// 迁移探针：对着**真实旧库的副本**跑一遍 `open()`，确认不丢行、新列可用。
+    ///
+    /// 默认 `#[ignore]`，合成 fixture 覆盖不到「线上那份库到底什么形状」时手动跑：
+    /// ```text
+    /// cp key_supplier.db /tmp/probe.db
+    /// PROBE_DB=/tmp/probe.db cargo test -- --ignored probe_migrates
+    /// ```
+    /// 它会往库里写一行探针数据，所以**只能对副本跑**。
+    #[test]
+    #[ignore = "manual probe against a real DB copy"]
+    fn probe_migrates_a_real_legacy_database() {
+        let path = std::env::var("PROBE_DB").expect("set PROBE_DB to a copy of the real db");
+        let before: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM supplier_events", [], |row| row.get(0))
+            .unwrap();
+
+        let store = SupplierEventStore::open(&path).unwrap();
+        let items = store.list(200, None, None).unwrap().items;
+
+        assert_eq!(items.len() as i64, before, "迁移不能丢行");
+        for item in &items {
+            assert_eq!(item.supplier_id, LEGACY_SUPPLIER_ID);
+            assert!(item.supplier_batch_id.is_none());
+        }
+        store
+            .insert_event(IncomingSupplierEvent {
+                supplier_id: "io".to_string(),
+                event_id: "probe-batched".to_string(),
+                event_type: "new_keys_available".to_string(),
+                purchase_order_id: Some("0123456789abcdef0123456789abcdef".to_string()),
+                supplier_batch_id: Some("batch-probe".to_string()),
+                message: None,
+                quantity: 1,
+            })
+            .unwrap();
+        println!("rows before={before} after={} (+1 probe)", items.len());
     }
 
     #[test]
@@ -823,6 +976,7 @@ mod tests {
                 event_id: "shared-1".to_string(),
                 event_type: "new_keys_available".to_string(),
                 purchase_order_id: None,
+                supplier_batch_id: None,
                 message: None,
                 quantity: 1,
             })
@@ -837,6 +991,7 @@ mod tests {
                     event_id: "shared-1".to_string(),
                     event_type: "new_keys_available".to_string(),
                     purchase_order_id: None,
+                    supplier_batch_id: None,
                     message: None,
                     quantity: 1,
                 })
@@ -860,6 +1015,29 @@ mod tests {
         drop(store);
         let reopened = SupplierEventStore::open(&path).unwrap();
         assert_eq!(reopened.list(10, None, None).unwrap().items.len(), 2);
+
+        // 重建后 supplier_batch_id 必须还在并可写：重建走的是自己那份列清单，
+        // 漏掉新列的话 ALTER 加上的列会在重建时被丢掉，插入才报错就太晚了。
+        reopened
+            .insert_event(IncomingSupplierEvent {
+                supplier_id: "io".to_string(),
+                event_id: "batched-1".to_string(),
+                event_type: "new_keys_available".to_string(),
+                purchase_order_id: Some("0123456789abcdef0123456789abcdef".to_string()),
+                supplier_batch_id: Some("batch-io".to_string()),
+                message: None,
+                quantity: 2,
+            })
+            .unwrap();
+        let stored = reopened.list(10, None, Some("io")).unwrap().items;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].supplier_batch_id.as_deref(), Some("batch-io"));
+        // 历史行的新列是 NULL，不是空串——别让它看起来像「有个空批次」。
+        let legacy = reopened
+            .list(10, None, Some(LEGACY_SUPPLIER_ID))
+            .unwrap()
+            .items;
+        assert!(legacy[0].supplier_batch_id.is_none());
 
         let _ = std::fs::remove_file(path);
     }
@@ -908,6 +1086,16 @@ mod tests {
                     imported_count: 1,
                     duplicate_count: 1,
                     failed_count: 1,
+                    // 金额与对账字段必须和计数一起原子落库：只落一半的话，
+                    // 预算累计和对方订单历史就永远对不上。
+                    total_debit: Some(190),
+                    unit_price: Some(38.0),
+                    supplier_order_id: Some("0d9f".to_owned()),
+                    replayed: true,
+                    // 号池水位快照与计数同批落库，缺一个就解释不了「为什么买了这么多」。
+                    pool_usable: Some(1),
+                    pool_deficit: Some(4),
+                    pool_requested: Some(3),
                     message: None,
                 },
             )
@@ -918,6 +1106,71 @@ mod tests {
         assert_eq!(stored.imported_count, 1);
         assert_eq!(stored.duplicate_count, 1);
         assert_eq!(stored.failed_count, 1);
+        assert_eq!(stored.total_debit, Some(190));
+        assert_eq!(stored.unit_price, Some(38.0));
+        assert_eq!(stored.supplier_order_id.as_deref(), Some("0d9f"));
+        assert!(stored.replayed);
+        assert_eq!(stored.pool_usable, Some(1));
+        assert_eq!(stored.pool_deficit, Some(4));
+        assert_eq!(stored.pool_requested, Some(3));
+    }
+
+    #[test]
+    fn skip_and_fail_persist_the_pool_snapshot() {
+        // 「为什么没买」正是水位三个数要回答的问题。只在成功路径记录等于没记录，
+        // 所以 skipped 与 failed 两条路径必须同样落库。
+        let store = SupplierEventStore::open_in_memory().unwrap();
+
+        store.insert_event(event("skipped-with-snapshot")).unwrap();
+        let claimed = store.claim_next().unwrap().unwrap();
+        store
+            .skip_with_summary(
+                claimed.id,
+                Some("号池已达目标存量"),
+                ProcessSummary {
+                    pool_usable: Some(3),
+                    pool_deficit: Some(0),
+                    pool_requested: Some(0),
+                    // 跳过时计数字段应被清零，即使调用方误传了非零值。
+                    purchased_count: 7,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let skipped = store.list(1, None, None).unwrap().items.remove(0);
+        assert_eq!(skipped.status, SupplierEventStatus::Skipped);
+        assert_eq!(skipped.message.as_deref(), Some("号池已达目标存量"));
+        assert_eq!(skipped.pool_usable, Some(3));
+        assert_eq!(skipped.pool_deficit, Some(0));
+        assert_eq!(skipped.pool_requested, Some(0));
+        assert_eq!(skipped.purchased_count, 0, "跳过不该记成买到了");
+
+        store.insert_event(event("failed-with-snapshot")).unwrap();
+        let claimed = store.claim_next().unwrap().unwrap();
+        store
+            .fail_with_summary(
+                claimed.id,
+                ProcessSummary {
+                    purchased_count: 2,
+                    failed_count: 2,
+                    // 采购成功但导入失败：钱花了，水位与金额都必须活下来。
+                    total_debit: Some(60),
+                    pool_usable: Some(0),
+                    pool_deficit: Some(3),
+                    pool_requested: Some(2),
+                    ..Default::default()
+                },
+                "导入失败",
+            )
+            .unwrap();
+
+        let failed = store.list(1, None, None).unwrap().items.remove(0);
+        assert_eq!(failed.status, SupplierEventStatus::Failed);
+        assert_eq!(failed.total_debit, Some(60));
+        assert_eq!(failed.pool_usable, Some(0));
+        assert_eq!(failed.pool_deficit, Some(3));
+        assert_eq!(failed.pool_requested, Some(2));
     }
 
     #[test]
@@ -925,10 +1178,18 @@ mod tests {
         let store = SupplierEventStore::open_in_memory().unwrap();
         store.insert_event(event("a")).unwrap();
 
-        let claimed = store.claim_by_event_id(LEGACY_SUPPLIER_ID, "a").unwrap().unwrap();
+        let claimed = store
+            .claim_by_event_id(LEGACY_SUPPLIER_ID, "a")
+            .unwrap()
+            .unwrap();
         assert_eq!(claimed.status, SupplierEventStatus::Processing);
         assert_eq!(claimed.attempts, 1);
-        assert!(store.claim_by_event_id(LEGACY_SUPPLIER_ID, "a").unwrap().is_none());
+        assert!(
+            store
+                .claim_by_event_id(LEGACY_SUPPLIER_ID, "a")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -942,9 +1203,7 @@ mod tests {
                 ProcessSummary {
                     purchased_count: 1,
                     imported_count: 1,
-                    duplicate_count: 0,
-                    failed_count: 0,
-                    message: None,
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -975,7 +1234,11 @@ mod tests {
         assert_eq!(page.items.len(), 3);
         assert_eq!(page.items[0].event_id, "c");
         assert_eq!(
-            store.list(2, Some(page.items[0].id), None).unwrap().items.len(),
+            store
+                .list(2, Some(page.items[0].id), None)
+                .unwrap()
+                .items
+                .len(),
             2
         );
         assert_eq!(store.unread_count(None).unwrap(), 3);

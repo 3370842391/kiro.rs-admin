@@ -286,8 +286,7 @@ fn cap_image_dimensions(
             return;
         }
         let original_len = image.source.bytes.len();
-        let Ok(processed) =
-            shrink_image_with_target(&image.format, &image.source.bytes, target)
+        let Ok(processed) = shrink_image_with_target(&image.format, &image.source.bytes, target)
         else {
             if is_history {
                 stats.unshrinkable_history_images += 1;

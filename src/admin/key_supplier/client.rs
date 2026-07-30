@@ -137,14 +137,16 @@ mod tests {
         let app = Router::new()
             .route(
                 "/openapi/stock",
-                get(|request: axum::http::Request<axum::body::Body>| async move {
-                    assert_eq!(
-                        request.headers().get("authorization").unwrap(),
-                        "Bearer app-secret"
-                    );
-                    assert!(request.headers().get("x-api-key").is_none());
-                    axum::Json(serde_json::json!({"availableKeys": 12, "keyPrice": 2.5}))
-                }),
+                get(
+                    |request: axum::http::Request<axum::body::Body>| async move {
+                        assert_eq!(
+                            request.headers().get("authorization").unwrap(),
+                            "Bearer app-secret"
+                        );
+                        assert!(request.headers().get("x-api-key").is_none());
+                        axum::Json(serde_json::json!({"availableKeys": 12, "keyPrice": 2.5}))
+                    },
+                ),
             )
             .route(
                 "/openapi/balance",
@@ -224,7 +226,12 @@ mod tests {
         assert_eq!(*calls.lock().unwrap(), 1);
 
         // 一个 key 都没拿到、或者给多了，才算错。
-        for body in [r#"{}"#, r#"{"keys":[]}"#, r#"{"keys":["  "]}"#, r#"{"keys":["ksk_a","ksk_b"]}"#] {
+        for body in [
+            r#"{}"#,
+            r#"{"keys":[]}"#,
+            r#"{"keys":["  "]}"#,
+            r#"{"keys":["ksk_a","ksk_b"]}"#,
+        ] {
             let app = Router::new().route(
                 "/openapi/claim",
                 post(move || async move { (axum::http::StatusCode::OK, body) }),
@@ -277,7 +284,8 @@ mod tests {
             }),
         );
         let strict_client =
-            SupplierClient::with_kind(server(strict).await, "secret", SupplierKind::KiroRs).unwrap();
+            SupplierClient::with_kind(server(strict).await, "secret", SupplierKind::KiroRs)
+                .unwrap();
         assert!(
             strict_client
                 .purchase(1, "0123456789abcdef0123456789abcdef")
@@ -303,9 +311,7 @@ mod tests {
 
         // 按 error.type 判定，不依赖中文文案。
         assert!(matches!(
-            client
-                .purchase(1, "0123456789abcdef0123456789abcdef")
-                .await,
+            client.purchase(1, "0123456789abcdef0123456789abcdef").await,
             Err(SupplierError::OutOfStock)
         ));
     }
@@ -371,6 +377,337 @@ mod tests {
         assert_eq!(*calls.lock().unwrap(), 0);
         assert!(!SupplierKind::KiroApp.supports_webhook_registration());
         assert!(SupplierKind::KiroRs.supports_webhook_registration());
+    }
+
+    #[tokio::test]
+    async fn kiroapp_io_reads_stock_with_the_tiered_price_range() {
+        let app = Router::new().route(
+            "/api/me/stock",
+            get(
+                |request: axum::http::Request<axum::body::Body>| async move {
+                    assert_eq!(
+                        request.headers().get("authorization").unwrap(),
+                        "Bearer km_secret"
+                    );
+                    assert!(request.headers().get("x-api-key").is_none());
+                    axum::Json(serde_json::json!({
+                        "stock": 120, "price": 30, "price_min": 30, "price_max": 65, "balance": 2060
+                    }))
+                },
+            ),
+        );
+        let client =
+            SupplierClient::with_kind(server(app).await, "km_secret", SupplierKind::KiroAppIo)
+                .unwrap();
+
+        let snapshot = client.snapshot().await.unwrap();
+
+        assert_eq!(snapshot.stock_available, Some(120));
+        // 阶梯定价：key_price 是最低价，key_price_max 是最高档。
+        assert_eq!(snapshot.key_price, Some(30.0));
+        assert_eq!(snapshot.key_price_max, Some(65.0));
+        assert_eq!(snapshot.balance, Some(2060));
+        // 一次 /api/me/stock 就够，不该再打 profile。
+        assert!(snapshot.profile.is_none() && snapshot.status.is_none());
+        assert_eq!(client.available_stock().await.unwrap(), 120);
+    }
+
+    #[tokio::test]
+    async fn kiroapp_io_purchase_sends_the_idempotency_key_and_bills_by_total_debit() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let observed = seen.clone();
+        let app = Router::new().route(
+            "/api/me/purchase",
+            post(move |body: axum::body::Bytes| {
+                let observed = observed.clone();
+                async move {
+                    observed
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8(body.to_vec()).unwrap());
+                    axum::Json(serde_json::json!({
+                        "purchased": 2, "requested": 2, "remaining": 115,
+                        // 阶梯定价：本单两个 key 单价不同，只有 total_debit 是权威数字。
+                        "unit_price": 38, "total_debit": 68, "order_id": "0d9f",
+                        "keys": [
+                            {"key": "ksk_a", "account": "user-a", "password": "pw",
+                             "issuer_url": "https://idc.example", "price": 30},
+                            {"key": "ksk_b", "account": "user-b", "password": "pw",
+                             "issuer_url": "https://idc.example", "price": 38}
+                        ],
+                        "replayed": false
+                    }))
+                }
+            }),
+        );
+        let client =
+            SupplierClient::with_kind(server(app).await, "km_secret", SupplierKind::KiroAppIo)
+                .unwrap();
+
+        let purchase = client
+            .purchase(2, "0123456789abcdef0123456789abcdef")
+            .await
+            .unwrap();
+
+        assert_eq!(purchase.purchased, 2);
+        assert_eq!(purchase.remaining, 115);
+        // 计费认 total_debit，不是 unit_price × count（那样会算出 76）。
+        assert_eq!(purchase.points_cost, Some(68));
+        // 均价、对方订单号、重放标记都必须带出来：前两个用于对账，后一个用于识别假失败。
+        assert_eq!(purchase.unit_price, Some(38.0));
+        assert_eq!(purchase.supplier_order_id.as_deref(), Some("0d9f"));
+        assert!(!purchase.replayed);
+        // 每个 key 的单价跟着 key 走。阶梯定价下按单摊会把 30 和 38 抹成同一个假均价，
+        // 而「每存活小时成本」要的是单个号的真实成本。
+        assert_eq!(
+            purchase
+                .keys
+                .iter()
+                .map(SupplierKey::price)
+                .collect::<Vec<_>>(),
+            vec![Some(30.0), Some(38.0)]
+        );
+        let request: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()[0]).unwrap();
+        assert_eq!(request["count"], 2);
+        assert_eq!(
+            request["client_order_id"],
+            "0123456789abcdef0123456789abcdef"
+        );
+        // 没有批次号时不该带 order_id 字段（带空值会被对方当成定向拉取）。
+        assert!(request.get("order_id").is_none());
+        assert!(!format!("{purchase:?}").contains("ksk_a"));
+    }
+
+    #[tokio::test]
+    async fn kiroapp_io_purchase_targets_a_batch_and_accepts_partial_fills() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let observed = seen.clone();
+        let app = Router::new().route(
+            "/api/me/purchase",
+            post(move |body: axum::body::Bytes| {
+                let observed = observed.clone();
+                async move {
+                    observed
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8(body.to_vec()).unwrap());
+                    // 余额不足时按买得起的数量成交：purchased < requested 是正常路径。
+                    axum::Json(serde_json::json!({
+                        "purchased": 1, "requested": 5, "remaining": 119,
+                        "total_debit": 30, "keys": [{"key": "ksk_partial"}]
+                    }))
+                }
+            }),
+        );
+        let client =
+            SupplierClient::with_kind(server(app).await, "km_secret", SupplierKind::KiroAppIo)
+                .unwrap();
+
+        let purchase = client
+            .purchase_batch(5, "0123456789abcdef0123456789abcdef", Some(" batch-7 "))
+            .await
+            .unwrap();
+
+        // 部分成交不报错，按实际到手数量记账。
+        assert_eq!(purchase.purchased, 1);
+        assert_eq!(purchase.keys.len(), 1);
+        let request: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()[0]).unwrap();
+        assert_eq!(request["order_id"], "batch-7");
+    }
+
+    #[tokio::test]
+    async fn kiroapp_io_purchase_is_retried_because_the_order_id_makes_it_idempotent() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = calls.clone();
+        let app = Router::new().route(
+            "/api/me/purchase",
+            post(move |body: axum::body::Bytes| {
+                let observed = observed.clone();
+                async move {
+                    let mut calls = observed.lock().unwrap();
+                    calls.push(String::from_utf8(body.to_vec()).unwrap());
+                    if calls.len() < 2 {
+                        (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            "boom".to_owned(),
+                        )
+                    } else {
+                        (
+                            axum::http::StatusCode::OK,
+                            r#"{"purchased":1,"remaining":9,"total_debit":30,
+                                "keys":[{"key":"ksk_retried"}],"replayed":true}"#
+                                .to_owned(),
+                        )
+                    }
+                }
+            }),
+        );
+        let client =
+            SupplierClient::with_kind(server(app).await, "km_secret", SupplierKind::KiroAppIo)
+                .unwrap();
+
+        let purchase = client
+            .purchase(1, "0123456789abcdef0123456789abcdef")
+            .await
+            .unwrap();
+
+        assert_eq!(purchase.purchased, 1);
+        let calls = calls.lock().unwrap();
+        // 幂等键在手，5xx 可以安全重试；两次请求体必须完全一致才算真幂等。
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], calls[1]);
+        assert!(SupplierKind::KiroAppIo.purchase_is_idempotent());
+        assert!(!SupplierKind::KiroApp.purchase_is_idempotent());
+    }
+
+    #[tokio::test]
+    async fn idempotent_protocols_map_409_to_order_conflict_and_never_retry_it() {
+        // 同一 client_order_id 换了 count：对方文档说返 409。这不是「请求失败」，
+        // 是原单已经成交——钱扣了、key 出货了、我们没拿到。必须能和普通 HTTP 错误分开，
+        // 否则只会变成一条 failed 事件让人反复点 retry，每次都撞同一个 409。
+        let calls = Arc::new(Mutex::new(0_usize));
+        let observed = calls.clone();
+        let app = Router::new().route(
+            "/api/me/purchase",
+            post(move || {
+                let observed = observed.clone();
+                async move {
+                    *observed.lock().unwrap() += 1;
+                    (
+                        axum::http::StatusCode::CONFLICT,
+                        r#"{"error":"该订单号已存在且参数不一致"}"#,
+                    )
+                }
+            }),
+        );
+        let client =
+            SupplierClient::with_kind(server(app).await, "km_secret", SupplierKind::KiroAppIo)
+                .unwrap();
+
+        let error = client
+            .purchase(3, "0123456789abcdef0123456789abcdef")
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, SupplierError::OrderConflict(_)),
+            "{error:?}"
+        );
+        // 4xx 不重试：再打一次只会拿到同一个 409。
+        assert_eq!(*calls.lock().unwrap(), 1);
+        // 错误文本要能说清该去干什么，且不能泄露 api key。
+        let rendered = error.to_string();
+        assert!(rendered.contains("already settled"));
+        assert!(!rendered.contains("km_secret"));
+    }
+
+    #[tokio::test]
+    async fn non_idempotent_claim_keeps_409_as_a_plain_http_error() {
+        // kiro-app 的 claim 没有幂等键，409 不代表「原单已成交」，不能套用那套语义。
+        let app = Router::new().route(
+            "/openapi/claim",
+            post(|| async {
+                (
+                    axum::http::StatusCode::CONFLICT,
+                    r#"{"error":{"type":"conflict"}}"#,
+                )
+            }),
+        );
+        let client =
+            SupplierClient::with_kind(server(app).await, "app-secret", SupplierKind::KiroApp)
+                .unwrap();
+
+        let error = client
+            .purchase(1, "0123456789abcdef0123456789abcdef")
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, SupplierError::Http { status: 409, .. }),
+            "{error:?}"
+        );
+        assert!(!SupplierKind::KiroApp.purchase_is_idempotent());
+    }
+
+    #[tokio::test]
+    async fn kiroapp_io_flat_error_envelope_maps_403_to_insufficient_balance() {
+        // kiroapp.io 用扁平 {"error":"原因"}，没有 error.type 可判定。
+        let app = Router::new().route(
+            "/api/me/purchase",
+            post(|| async {
+                (
+                    axum::http::StatusCode::FORBIDDEN,
+                    r#"{"error":"余额不足，无法购买任何密钥"}"#,
+                )
+            }),
+        );
+        let client =
+            SupplierClient::with_kind(server(app).await, "km_secret", SupplierKind::KiroAppIo)
+                .unwrap();
+
+        let error = client
+            .purchase(1, "0123456789abcdef0123456789abcdef")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, SupplierError::InsufficientBalance(_)));
+        assert!(error.to_string().contains("balance is insufficient"));
+    }
+
+    #[tokio::test]
+    async fn kiroapp_io_zero_purchased_is_treated_as_out_of_stock() {
+        let app = Router::new().route(
+            "/api/me/purchase",
+            post(|| async {
+                axum::Json(serde_json::json!({
+                    "purchased": 0, "requested": 3, "remaining": 0, "keys": []
+                }))
+            }),
+        );
+        let client =
+            SupplierClient::with_kind(server(app).await, "km_secret", SupplierKind::KiroAppIo)
+                .unwrap();
+
+        // 成交 0 个不能记成「成功买了 0 个」——那会让事件历史显示 succeeded。
+        assert!(matches!(
+            client.purchase(3, "0123456789abcdef0123456789abcdef").await,
+            Err(SupplierError::OutOfStock)
+        ));
+    }
+
+    #[tokio::test]
+    async fn kiroapp_io_rejects_key_count_mismatch_and_cannot_register_webhooks() {
+        let app = Router::new().route(
+            "/api/me/purchase",
+            post(|| async {
+                // 说买了 2 个却只给 1 个 key：对不上就别入账。
+                axum::Json(serde_json::json!({
+                    "purchased": 2, "remaining": 0, "keys": [{"key": "ksk_only_one"}]
+                }))
+            }),
+        );
+        let client =
+            SupplierClient::with_kind(server(app).await, "km_secret", SupplierKind::KiroAppIo)
+                .unwrap();
+        assert!(
+            client
+                .purchase(2, "0123456789abcdef0123456789abcdef")
+                .await
+                .is_err()
+        );
+
+        assert!(!SupplierKind::KiroAppIo.supports_webhook_registration());
+        let client =
+            SupplierClient::with_kind("https://kiroapp.io", "km_secret", SupplierKind::KiroAppIo)
+                .unwrap();
+        assert!(matches!(
+            client.register_webhook("https://admin.example/hook").await,
+            Err(SupplierError::Unsupported(_))
+        ));
+        assert!(matches!(
+            client.test_webhook().await,
+            Err(SupplierError::Unsupported(_))
+        ));
     }
 
     #[test]
@@ -555,12 +892,18 @@ mod tests {
 
     #[test]
     fn purchase_and_supplier_key_debug_redact_key_values() {
-        let key = SupplierKey("ksk_private".to_owned());
+        let key = SupplierKey {
+            key: "ksk_private".to_owned(),
+            price: Some(30.0),
+        };
         let purchase = Purchase {
             client_order_id: "0123456789abcdef0123456789abcdef".to_owned(),
             purchased: 1,
             remaining: 2,
             points_cost: Some(100),
+            unit_price: Some(100.0),
+            supplier_order_id: Some("0d9f".to_owned()),
+            replayed: false,
             keys: vec![key.clone()],
         };
         assert!(!format!("{key:?}").contains("ksk_private"));
@@ -671,6 +1014,7 @@ impl SupplierClient {
                 Ok(SupplierSnapshot {
                     stock_available: Some(stock.max),
                     key_price: None,
+                    key_price_max: None,
                     balance: Some(profile.remaining),
                     webhook_url: Some(profile.webhook_url.clone()),
                     profile: Some(profile),
@@ -682,12 +1026,33 @@ impl SupplierClient {
                     .request(Method::GET, "/openapi/stock", None, RetryPolicy::Retryable)
                     .await?;
                 let balance: KiroAppBalance = self
-                    .request(Method::GET, "/openapi/balance", None, RetryPolicy::Retryable)
+                    .request(
+                        Method::GET,
+                        "/openapi/balance",
+                        None,
+                        RetryPolicy::Retryable,
+                    )
                     .await?;
                 Ok(SupplierSnapshot {
                     stock_available: Some(stock.available_keys),
                     key_price: stock.key_price,
+                    key_price_max: None,
                     balance: Some(balance.balance),
+                    webhook_url: None,
+                    profile: None,
+                    status: None,
+                })
+            }
+            // `/api/me/stock` 一次给齐库存、报价区间和余额，不必再打 profile。
+            SupplierKind::KiroAppIo => {
+                let stock: KiroAppIoStock = self
+                    .request(Method::GET, "/api/me/stock", None, RetryPolicy::Retryable)
+                    .await?;
+                Ok(SupplierSnapshot {
+                    stock_available: Some(stock.stock),
+                    key_price: stock.price_min.or(stock.price),
+                    key_price_max: stock.price_max,
+                    balance: Some(stock.balance),
                     webhook_url: None,
                     profile: None,
                     status: None,
@@ -706,6 +1071,12 @@ impl SupplierClient {
                     .await?;
                 Ok(stock.available_keys)
             }
+            SupplierKind::KiroAppIo => {
+                let stock: KiroAppIoStock = self
+                    .request(Method::GET, "/api/me/stock", None, RetryPolicy::Retryable)
+                    .await?;
+                Ok(stock.stock)
+            }
         }
     }
 
@@ -714,10 +1085,25 @@ impl SupplierClient {
     /// `kiro-rs` 带 `client_order_id`，服务端幂等，网络抖动可安全重试。
     /// `kiro-app` 的 `/openapi/claim` **没有幂等键**，重试会重复扣积分，
     /// 因此走 `RetryPolicy::Never`：宁可报错让人工重放，也不冒重复购买的风险。
+    /// 不定向批次的采购。生产路径走 `purchase_batch`（webhook 可能带批次号）。
+    #[cfg(test)]
     pub async fn purchase(
         &self,
         count: u32,
         client_order_id: &str,
+    ) -> Result<Purchase, SupplierError> {
+        self.purchase_batch(count, client_order_id, None).await
+    }
+
+    /// 下单取 Key，可选定向到供货商的某个开号批次。
+    ///
+    /// `supplier_batch_id` 仅 `kiroapp-io` 有意义：webhook 推送里带 `order_id`，
+    /// 原样传回去就只拉这一车产出的 key，不必从公共池子里跟别人抢。
+    pub async fn purchase_batch(
+        &self,
+        count: u32,
+        client_order_id: &str,
+        supplier_batch_id: Option<&str>,
     ) -> Result<Purchase, SupplierError> {
         if count == 0 {
             return Err(SupplierError::invalid("purchase count must be positive"));
@@ -732,7 +1118,76 @@ impl SupplierClient {
         match self.kind {
             SupplierKind::KiroRs => self.purchase_kiro_rs(count, client_order_id).await,
             SupplierKind::KiroApp => self.claim_kiro_app(count, client_order_id).await,
+            SupplierKind::KiroAppIo => {
+                self.purchase_kiro_app_io(count, client_order_id, supplier_batch_id)
+                    .await
+            }
         }
+    }
+
+    /// `POST /api/me/purchase`。带 `client_order_id`，服务端幂等：
+    /// 同 id 重放返回字节一致的原响应，绝不重复扣款，所以网络抖动可安全重试。
+    ///
+    /// 部分成交是**正常路径**——余额不够时对方按买得起的数量成交，`purchased < count`
+    /// 不是错误。一个都买不起才返 403（映射成 `InsufficientBalance`）。
+    async fn purchase_kiro_app_io(
+        &self,
+        count: u32,
+        client_order_id: &str,
+        supplier_batch_id: Option<&str>,
+    ) -> Result<Purchase, SupplierError> {
+        let mut body = serde_json::json!({
+            "count": count,
+            "client_order_id": client_order_id,
+        });
+        // 只在拿到批次号时带上：缺省行为是从公共池子取，带上则只取该批次产出。
+        if let Some(batch_id) = supplier_batch_id.map(str::trim).filter(|id| !id.is_empty()) {
+            body["order_id"] = serde_json::Value::String(batch_id.to_owned());
+        }
+        let response: KiroAppIoPurchase = self
+            .request(
+                Method::POST,
+                "/api/me/purchase",
+                Some(body),
+                RetryPolicy::Retryable,
+            )
+            .await?;
+        if response.purchased > count {
+            return Err(SupplierError::invalid(
+                "purchase response purchased exceeds count",
+            ));
+        }
+        if response.keys.len() != response.purchased as usize {
+            return Err(SupplierError::invalid(
+                "purchase response key count mismatch",
+            ));
+        }
+        // 有货但一个都没成交：对方文档说这种情况返 403，走不到这里。真收到 0
+        // 就当竞争失败跳过，不记 failed——重试也只是再抢一次空气。
+        if response.purchased == 0 {
+            return Err(SupplierError::OutOfStock);
+        }
+        if response.replayed {
+            // 幂等重放：说明上一次其实成功了，只是响应没回到我们手上。
+            tracing::info!(
+                purchased = response.purchased,
+                "kiroapp-io 采购命中幂等重放，未重复扣费"
+            );
+        }
+        Ok(Purchase {
+            client_order_id: client_order_id.to_owned(),
+            purchased: response.purchased,
+            // kiroapp-io 的 remaining 是本次成交后对方剩余库存。
+            remaining: response.remaining,
+            // total_debit 是权威扣费数字；阶梯定价下不能用 unit_price 反推。
+            points_cost: response.total_debit,
+            unit_price: response.unit_price,
+            supplier_order_id: response.order_id,
+            replayed: response.replayed,
+            // 前缀走宽松校验：钱已经扣了，不能因为前缀不合预期就把 key 扔掉。
+            // 每个 key 的单价跟着 key 一起带走：阶梯定价下同一单里各 key 不同价。
+            keys: accept_paid_keys(response.keys.into_iter().map(|key| (key.key, key.price)))?,
+        })
     }
 
     async fn purchase_kiro_rs(
@@ -771,7 +1226,10 @@ impl SupplierClient {
             purchased: response.purchased,
             remaining: response.remaining,
             points_cost: None,
-            keys: validate_keys(response.keys.into_iter().map(|key| key.key))?,
+            unit_price: None,
+            supplier_order_id: None,
+            replayed: false,
+            keys: validate_keys(response.keys.into_iter().map(|key| (key.key, key.price)))?,
         })
     }
 
@@ -809,13 +1267,23 @@ impl SupplierClient {
             ));
         }
         // 走宽松校验：积分已经扣了，不能因为前缀不合预期就把 key 扔掉。
-        let keys = accept_paid_keys(raw_keys)?;
+        // claim 只给整单 pointsCost，不按 key 报价，所以每个 key 的单价是 None。
+        let keys = accept_paid_keys(raw_keys.into_iter().map(|key| (key, None)))?;
+        let purchased = keys.len() as u32;
         Ok(Purchase {
             client_order_id: client_order_id.to_owned(),
-            purchased: keys.len() as u32,
+            purchased,
             // claim 响应给的是扣费后余额；库存快照它不返回。
             remaining: response.balance.unwrap_or_default(),
             points_cost: response.points_cost,
+            // 按 key 摊出均价：claim 不给 unit_price，但整单扣费和数量都有。
+            unit_price: response
+                .points_cost
+                .filter(|_| purchased > 0)
+                .map(|cost| cost as f64 / f64::from(purchased)),
+            // claim 没有订单号，也没有幂等重放的概念。
+            supplier_order_id: None,
+            replayed: false,
             keys,
         })
     }
@@ -887,7 +1355,9 @@ impl SupplierClient {
             let mut request = self.client.request(method.clone(), url.clone());
             request = match self.kind {
                 SupplierKind::KiroRs => request.header("X-API-Key", &self.api_key.0),
-                SupplierKind::KiroApp => request.bearer_auth(&self.api_key.0),
+                SupplierKind::KiroApp | SupplierKind::KiroAppIo => {
+                    request.bearer_auth(&self.api_key.0)
+                }
             };
             if let Some(json) = body.clone() {
                 request = request.json(&json);
@@ -931,6 +1401,24 @@ impl SupplierClient {
                 // （对方文档明确说不要依赖中文错误文案）。
                 if error_type(&text).is_some_and(|kind| kind == "out_of_stock") {
                     return Err(SupplierError::OutOfStock);
+                }
+                // kiroapp.io 用扁平 `{"error":"原因"}`，没有机器可判定的 type 字段。
+                // 它对「有货但一个都买不起」用 403，这是余额问题而非故障：重试没用，
+                // 得先充值，所以单独归类，让事件历史能一眼看出该去充钱。
+                if self.kind == SupplierKind::KiroAppIo && status.as_u16() == 403 {
+                    return Err(SupplierError::InsufficientBalance(sanitize(
+                        &text,
+                        &self.api_key.0,
+                    )));
+                }
+                // 409 + 幂等协议 = 同一订单号换了参数，也就是原单已经成交。钱已经花了，
+                // 这不是「请求失败」而是「我们和对方的账对不上」，得单独归类去核对。
+                // 非幂等协议（kiro-app claim）没有订单号概念，409 是别的意思，不特判。
+                if status.as_u16() == 409 && self.kind.purchase_is_idempotent() {
+                    return Err(SupplierError::OrderConflict(sanitize(
+                        &text,
+                        &self.api_key.0,
+                    )));
                 }
                 return Err(SupplierError::http(status.as_u16(), &text, &self.api_key.0));
             }
@@ -1001,6 +1489,9 @@ pub struct SupplierSnapshot {
     pub stock_available: Option<u64>,
     /// 单个 Key 的价格（`kiro-app` 的 `keyPrice`）。
     pub key_price: Option<f64>,
+    /// 阶梯定价的最高档单价（`kiroapp-io` 的 `price_max`）。与 `key_price`（最低价）
+    /// 一起构成报价区间——单价按母号累计产量分档，下单前算不出确切总价。
+    pub key_price_max: Option<f64>,
     /// 剩余额度/积分。
     pub balance: Option<u64>,
     /// 供货商侧登记的回调地址（仅 `kiro-rs` 可读）。
@@ -1014,6 +1505,7 @@ impl fmt::Debug for SupplierSnapshot {
         f.debug_struct("SupplierSnapshot")
             .field("stock_available", &self.stock_available)
             .field("key_price", &self.key_price)
+            .field("key_price_max", &self.key_price_max)
             .field("balance", &self.balance)
             .field("webhook_url_configured", &self.webhook_url.is_some())
             .field("profile", &self.profile)
@@ -1048,29 +1540,49 @@ impl fmt::Debug for SupplierStatus {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
-pub struct SupplierKey(String);
+#[derive(Clone, PartialEq)]
+pub struct SupplierKey {
+    key: String,
+    /// 这一个 key 实际扣了多少（供货商积分）。
+    ///
+    /// 阶梯定价下同一单里各 key 可能不同价，所以单价必须跟着 key 走而不是按单摊——
+    /// 「每存活小时成本」要拿它和该凭据的 `added_at` / `died_at` 相除。
+    /// `None` = 该协议不按 key 返回单价。
+    price: Option<f64>,
+}
 
 impl SupplierKey {
     pub fn into_inner(self) -> String {
-        self.0
+        self.key
+    }
+
+    pub fn price(&self) -> Option<f64> {
+        self.price
     }
 }
 
 impl fmt::Debug for SupplierKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // 单价不是秘密，但和 key 一起出现容易在日志里被当成整体复制，索性都不打。
         f.write_str("[REDACTED]")
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq)]
 pub struct Purchase {
     pub client_order_id: String,
     pub purchased: u32,
-    /// kiro-rs：剩余可采购额度。kiro-app：扣费后剩余积分。
+    /// kiro-rs：剩余可采购额度。kiro-app / kiroapp-io：扣费后剩余积分或库存。
     pub remaining: u64,
-    /// 本次消耗积分，仅 kiro-app 返回。
+    /// 本单实际扣费总额（供货商积分）。kiro-app 的 `pointsCost`、
+    /// kiroapp-io 的 `total_debit`。阶梯定价下这是唯一权威数字。
     pub points_cost: Option<u64>,
+    /// 本单均价。对方直接给，不必用 `points_cost / purchased` 反推。
+    pub unit_price: Option<f64>,
+    /// 供货商侧订单号，用于和对方的订单历史对账。仅 kiroapp-io 返回。
+    pub supplier_order_id: Option<String>,
+    /// 命中对方的幂等重放：上一次其实已经成交，只是响应没回到我们手上。
+    pub replayed: bool,
     pub keys: Vec<SupplierKey>,
 }
 
@@ -1081,6 +1593,9 @@ impl fmt::Debug for Purchase {
             .field("purchased", &self.purchased)
             .field("remaining", &self.remaining)
             .field("points_cost", &self.points_cost)
+            .field("unit_price", &self.unit_price)
+            .field("supplier_order_id", &self.supplier_order_id)
+            .field("replayed", &self.replayed)
             .field("keys", &"[REDACTED]")
             .finish()
     }
@@ -1096,6 +1611,9 @@ struct PurchaseWire {
 #[derive(Deserialize)]
 struct KeyWire {
     key: String,
+    /// 这一个 key 实际扣了多少。只有 kiroapp-io 按 key 给价。
+    #[serde(default)]
+    price: Option<f64>,
 }
 
 /// `GET /openapi/stock` → `{availableKeys, keyPrice}`。
@@ -1113,6 +1631,50 @@ struct KiroAppStock {
 struct KiroAppBalance {
     #[serde(default)]
     balance: u64,
+}
+
+/// `GET /api/me/stock` → `{stock, price, price_min, price_max, balance}`。
+///
+/// `price` 是向后兼容的别名（等于 `price_min`），阶梯定价下只是**最低**价，
+/// 不能用来预估总价。
+#[derive(Deserialize)]
+struct KiroAppIoStock {
+    #[serde(default)]
+    stock: u64,
+    #[serde(default)]
+    price_min: Option<f64>,
+    #[serde(default)]
+    price_max: Option<f64>,
+    #[serde(default)]
+    price: Option<f64>,
+    #[serde(default)]
+    balance: u64,
+}
+
+/// `POST /api/me/purchase` → `{purchased, requested, remaining, unit_price, total_debit,
+/// order_id, keys:[{key, account, password, issuer_url, price}], replayed}`。
+///
+/// 注意它**不回显** `client_order_id`（只有自己的 `order_id`），所以没有回显比对可做。
+#[derive(Deserialize)]
+struct KiroAppIoPurchase {
+    #[serde(default)]
+    purchased: u32,
+    #[serde(default)]
+    remaining: u64,
+    /// 本单实际扣费总额，权威数字。阶梯定价下不能用 `unit_price × count` 反推。
+    #[serde(default)]
+    total_debit: Option<u64>,
+    /// 本单均价 = `total_debit / purchased`。对方算好给我们。
+    #[serde(default)]
+    unit_price: Option<f64>,
+    /// 对方自己的订单号，拿去 `/api/me/orders` 对账。
+    #[serde(default)]
+    order_id: Option<String>,
+    #[serde(default)]
+    keys: Vec<KeyWire>,
+    /// 幂等重放标记。重放返回的是原响应，不重复扣款。
+    #[serde(default)]
+    replayed: bool,
 }
 
 /// `POST /openapi/claim` → `{key, pointsCost, balance}`（单个）
@@ -1164,17 +1726,17 @@ fn error_type(body: &str) -> Option<String> {
 
 /// 严格校验：必须是 `ksk_` 前缀。用于 kiro-rs——它的响应格式已验证过。
 fn validate_keys(
-    keys: impl IntoIterator<Item = String>,
+    keys: impl IntoIterator<Item = (String, Option<f64>)>,
 ) -> Result<Vec<SupplierKey>, SupplierError> {
     keys.into_iter()
-        .map(|key| {
+        .map(|(key, price)| {
             let key = key.trim().to_owned();
             if !key.starts_with("ksk_") || key.len() <= "ksk_".len() {
                 Err(SupplierError::invalid(
                     "purchase response contains an invalid key",
                 ))
             } else {
-                Ok(SupplierKey(key))
+                Ok(SupplierKey { key, price })
             }
         })
         .collect()
@@ -1187,11 +1749,11 @@ fn validate_keys(
 /// 示例是 `"key-1"` / `"实际的 Kiro Key"`，并没有承诺 `ksk_` 前缀，所以这里
 /// 不能拿前缀当硬门槛——真正的有效性由后续凭据导入去判。
 fn accept_paid_keys(
-    keys: impl IntoIterator<Item = String>,
+    keys: impl IntoIterator<Item = (String, Option<f64>)>,
 ) -> Result<Vec<SupplierKey>, SupplierError> {
     let mut accepted = Vec::new();
     let mut unexpected_prefix = 0_usize;
-    for key in keys {
+    for (key, price) in keys {
         let key = key.trim().to_owned();
         if key.is_empty() {
             continue;
@@ -1199,7 +1761,7 @@ fn accept_paid_keys(
         if !key.starts_with("ksk_") {
             unexpected_prefix += 1;
         }
-        accepted.push(SupplierKey(key));
+        accepted.push(SupplierKey { key, price });
     }
     if unexpected_prefix > 0 {
         // 只报个数，绝不打 key 本身。
@@ -1221,6 +1783,14 @@ pub enum SupplierError {
     Unsupported(String),
     /// 库存被别人抢完了。正常竞争结果，不是故障，不该重试也不该记成失败。
     OutOfStock,
+    /// 有货但积分不够买。重试无用，得先充值——所以和普通 HTTP 错误分开记。
+    InsufficientBalance(String),
+    /// 同一 `client_order_id` 换了参数（409）。对幂等协议这意味着**上一单已经成交**：
+    /// 钱已经扣、key 已经出货，只是这次的参数和原单对不上。
+    ///
+    /// 必须和普通 HTTP 错误分开：记成失败会让人反复点 retry，而每次都拿到同一个 409，
+    /// 付过钱的 key 一直留在对方账上没人去捞。
+    OrderConflict(String),
     Http {
         status: u16,
         message: String,
@@ -1264,13 +1834,25 @@ impl fmt::Display for SupplierError {
             Self::InvalidInput(message) => write!(f, "invalid input: {message}"),
             Self::Unsupported(message) => write!(f, "unsupported operation: {message}"),
             Self::OutOfStock => f.write_str("supplier is out of stock"),
+            Self::InsufficientBalance(message) => {
+                write!(f, "supplier balance is insufficient: {message}")
+            }
+            Self::OrderConflict(message) => {
+                write!(
+                    f,
+                    "supplier order already settled with different parameters: {message}"
+                )
+            }
             Self::Http { status, message } => write!(f, "supplier HTTP {status}: {message}"),
             Self::RateLimited {
                 retry_after,
                 message,
             } => match retry_after {
                 Some(seconds) => {
-                    write!(f, "supplier rate limited (retry after {seconds}s): {message}")
+                    write!(
+                        f,
+                        "supplier rate limited (retry after {seconds}s): {message}"
+                    )
                 }
                 None => write!(f, "supplier rate limited: {message}"),
             },

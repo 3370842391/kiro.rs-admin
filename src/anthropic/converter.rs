@@ -2283,8 +2283,7 @@ fn build_history(
         } else if msg.role == "assistant" {
             // 先处理累积的 user 消息
             if !user_buffer.is_empty() {
-                let merged_user =
-                    merge_user_messages(&user_buffer, model_id, &mut image_dedup)?;
+                let merged_user = merge_user_messages(&user_buffer, model_id, &mut image_dedup)?;
                 history.push(Message::User(merged_user));
                 user_buffer.clear();
             }
@@ -4756,7 +4755,10 @@ mod tests {
         }]);
 
         let converted = convert_request(&req).expect("orphan result must not fail the turn");
-        let current = &converted.conversation_state.current_message.user_input_message;
+        let current = &converted
+            .conversation_state
+            .current_message
+            .user_input_message;
         assert!(
             current.user_input_message_context.tool_results.is_empty(),
             "orphan result is dropped rather than forwarded to Kiro"

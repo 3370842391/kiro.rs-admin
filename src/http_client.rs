@@ -227,7 +227,8 @@ mod tests {
         // 断言自身的字面量也会被扫到，写成否定式必然自我命中（本次就踩了）。
         // 改为正面断言 builder 链的形状 —— 一请求一连接不需要任何连接池参数。
         assert!(
-            client_source.contains(".timeout(Duration::from_secs(timeout_secs))\n        .http1_only()"),
+            client_source
+                .contains(".timeout(Duration::from_secs(timeout_secs))\n        .http1_only()"),
             "client builder 应保持「仅 timeout + http1_only」的最小形状"
         );
 

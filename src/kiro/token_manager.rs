@@ -1260,6 +1260,104 @@ pub struct CredentialEntrySnapshot {
     pub source_channel: Option<String>,
 }
 
+/// 凭据是否算在全局号池水位里，以及是靠什么认出来的。
+///
+/// 只回答「是不是自动采购来的」，**不回答「来自哪一家」**——水位是全局的，归属信息
+/// 对缺口计算没有任何作用，下单对象也恒为推送方那一家。
+///
+/// 区分两种识别方式仅为可观测性：备注匹配那条规则有已知弱点（某家的 `sourceChannel`
+/// 被改过后，之前用它买的号就不再命中），不分开计数就看不出它何时失效。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolMembership {
+    /// `supplier_id` 非空。新版采购写入的机器可判定标记，与该 id 是否仍在配置里无关。
+    BySupplierId,
+    /// `supplier_id` 为空，但 `source_channel` 与某家配置的 `sourceChannel` 精确相等。
+    ///
+    /// 已发布版本（v0.9.40）采购时只写 `source_channel`，`supplier_id` 那时还不存在。
+    /// 不认这一类的话，升级瞬间全部现存采购号都统计不到，缺口等于目标存量全额，
+    /// 会立刻重复买一批。
+    ByLegacySourceChannel,
+    /// 不算采购号：手动添加、批量导入，或备注不匹配任何已配置供货商。
+    NotPurchased,
+}
+
+/// 判定一个凭据是否算在全局号池水位里。
+///
+/// `configured_channels` 是当前所有已配置供货商的 `sourceChannel` 集合，**调用方必须
+/// 已剔除空串**。空串会命中所有无备注凭据，等于把全部手工号算进水位，缺口被顶成 0，
+/// 该补货时永远不补——表现为「自动采购静默失效」，而日志里只有一条「号池已达目标
+/// 存量」，极难定位。此处不再兜底剔空，是为了让这个契约留在唯一一处（服务层的
+/// `configured_source_channels`）而不是两处各判一次。
+///
+/// 备注匹配要求**完全相等**：不做前缀、子串或大小写不敏感匹配。放宽任何一项都会让
+/// 「Webhook 自动采购（临时）」这类用户自己写的备注意外命中默认值。
+pub fn classify_membership(
+    supplier_id: Option<&str>,
+    source_channel: Option<&str>,
+    configured_channels: &HashSet<String>,
+) -> PoolMembership {
+    if supplier_id.is_some_and(|id| !id.trim().is_empty()) {
+        return PoolMembership::BySupplierId;
+    }
+    match source_channel
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(channel) if configured_channels.contains(channel) => {
+            PoolMembership::ByLegacySourceChannel
+        }
+        _ => PoolMembership::NotPurchased,
+    }
+}
+
+/// 全局号池的可用统计：全部自动采购凭据的合计，外加两种识别方式的计数。
+///
+/// **不按供货商拆分。** 水位是全局的，缺口只看合计；下单对象恒为推送方那一家，
+/// 拆分出来也指导不了任何决策。两个识别计数只为可观测性：`by_legacy_channel`
+/// 突然掉到 0，基本就是有人改了某家的 `sourceChannel`。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PoolHealth {
+    /// 合计可用/不可用拆分。`usable` 就是全局可用数，`dead` 是判死但尚未被保留期
+    /// 清理的号——它们占位置但不算可用。
+    pub health: SupplierCredentialHealth,
+    /// 靠 `supplier_id` 认出来的凭据数（新版采购）。
+    pub by_supplier_id: usize,
+    /// 靠 `source_channel` 备注认出来的凭据数（旧版采购遗留）。
+    pub by_legacy_channel: usize,
+}
+
+/// 某家供货商采购来的凭据可用统计。用于「他的号都不能用了才补货」的判定。
+///
+/// `total` = `usable` + `dead` + `quota_exhausted` + `low_quota`。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupplierCredentialHealth {
+    /// 该供货商名下仍在池子里的凭据数（判死后被保留期清理掉的不计）。
+    pub total: usize,
+    /// 仍可用的凭据数。补货闸就是拿这个数和水位比。
+    ///
+    /// 手动禁用算可用——那是人主动暂停，不该触发采购。
+    pub usable: usize,
+    /// 已判死（封号，`died_at` 有值）但尚未被保留期清理的凭据数。
+    pub dead: usize,
+    /// 额度耗尽被禁（402 或一键超额，`quota_exhausted_at` 有值）的凭据数。
+    pub quota_exhausted: usize,
+    /// 剩余额度已跌到水位以下的凭据数。号还能用但快没了。
+    pub low_quota: usize,
+}
+
+impl SupplierCredentialHealth {
+    /// 不可用总数：封号 + 额度耗尽 + 额度低于水位。
+    ///
+    /// 补货闸直接比 `usable` 与水位，用不到这个和；留着是给测试断言
+    /// 「四个分类加起来等于 total」，防止将来加分类时漏改判定。
+    #[cfg(test)]
+    pub fn unusable(&self) -> usize {
+        self.dead + self.quota_exhausted + self.low_quota
+    }
+}
+
 /// 凭据管理器状态快照
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2798,6 +2896,9 @@ impl MultiTokenManager {
 
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
+            entry.credentials.disabled = true;
+            // 落到凭据上才能跨重启存活：disabled_reason 只在内存里。
+            entry.credentials.quota_exhausted_at = Some(Utc::now().to_rfc3339());
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             // 设为阈值，便于在管理面板中直观看到该凭据已不可用
             entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
@@ -2989,6 +3090,132 @@ impl MultiTokenManager {
             .collect()
     }
 
+    /// 统计某家供货商采购来的凭据可用情况，供补货判定使用。
+    ///
+    /// 「不可用」有三种，都算进 `unusable`（= `dead` + `quota_exhausted` + `low_quota`）：
+    ///
+    /// 1. **封号**（`died_at` 有值）：上游 403 且命中封禁标记。终态。
+    /// 2. **额度耗尽**（`quota_exhausted_at` 有值）：上游 402，或「一键超额」判定余额归零。
+    /// 3. **额度低于水位**（`remaining <= low_quota_threshold`，阈值 > 0 时才判）：
+    ///    号还能用但快没了。这一条是必需的——只等 402 意味着必须先把号跑干才补货，
+    ///    中间那段就是服务空窗。
+    ///
+    /// **手动禁用不算不可用**：那是人主动暂停，不是号没了。把它算进去会让「暂停一个号」
+    /// 变成「触发一次采购」。
+    ///
+    /// `remaining_quota` 传入按凭据 id 查剩余额度的函数（数据源是 AdminService 的余额缓存，
+    /// 后台每 5 分钟刷）。查不到就**当它还有额度**——缓存缺失时宁可少买。
+    ///
+    /// 判死后被保留期清理掉的凭据会从池子里消失，不再计入 `total`，`usable` 自然归零。
+    pub fn supplier_credential_health(
+        &self,
+        supplier_id: &str,
+        low_quota_threshold: f64,
+        remaining_quota: &dyn Fn(u64) -> Option<f64>,
+    ) -> SupplierCredentialHealth {
+        // 先只在锁内收集 id 与两个标记，把额度查询放到锁外——查询可能要读别的锁，
+        // 在 entries 锁里调外部闭包容易埋死锁。
+        let candidates: Vec<(u64, bool, bool)> = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .filter(|entry| entry.credentials.supplier_id.as_deref() == Some(supplier_id))
+                .map(|entry| {
+                    (
+                        entry.id,
+                        entry.credentials.died_at.is_some(),
+                        entry.credentials.quota_exhausted_at.is_some(),
+                    )
+                })
+                .collect()
+        };
+
+        let mut health = SupplierCredentialHealth::default();
+        for (id, died, quota_exhausted) in candidates {
+            health.total += 1;
+            if died {
+                health.dead += 1;
+            } else if quota_exhausted {
+                health.quota_exhausted += 1;
+            } else if low_quota_threshold > 0.0
+                && remaining_quota(id).is_some_and(|remaining| remaining <= low_quota_threshold)
+            {
+                health.low_quota += 1;
+            } else {
+                health.usable += 1;
+            }
+        }
+        health
+    }
+
+    /// 全部自动采购来的凭据的合计可用情况，用于全局号池水位判定。
+    ///
+    /// 与 [`Self::supplier_credential_health`] 的区别只在过滤条件：那个按单个
+    /// `supplier_id` 精确匹配，这个用 [`classify_membership`] 判定「是不是采购来的」，
+    /// **不区分来自哪一家**。水位是全局的，归属信息对缺口计算没有任何作用。
+    ///
+    /// `configured_channels` 是已配置供货商的 `sourceChannel` 集合，**调用方必须已
+    /// 剔除空串**（见 `classify_membership` 的说明）。
+    ///
+    /// 可用性判定与 `supplier_credential_health` 完全一致：封号、额度耗尽、额度跌到
+    /// 水位以下都算不可用；手动禁用仍算可用。判死的号即使还在保留期内没被清理，也算
+    /// `dead` 而不是 `usable`——它还占着池子的位置，但对流量而言已经是废号，算成可用
+    /// 会导致「号死了不补货、池子一路缩到 0」。
+    pub fn pool_credential_health(
+        &self,
+        low_quota_threshold: f64,
+        configured_channels: &HashSet<String>,
+        remaining_quota: &dyn Fn(u64) -> Option<f64>,
+    ) -> PoolHealth {
+        // 与 `supplier_credential_health` 同样的两阶段写法：锁内只收集判定所需的最小
+        // 字段，出锁后再查额度。`remaining_quota` 会去拿 AdminService 的余额缓存锁，
+        // 在 entries 锁内调用外部闭包就是一条死锁路径。
+        let candidates: Vec<(u64, PoolMembership, bool, bool)> = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    let membership = classify_membership(
+                        entry.credentials.supplier_id.as_deref(),
+                        entry.credentials.source_channel.as_deref(),
+                        configured_channels,
+                    );
+                    if membership == PoolMembership::NotPurchased {
+                        return None;
+                    }
+                    Some((
+                        entry.id,
+                        membership,
+                        entry.credentials.died_at.is_some(),
+                        entry.credentials.quota_exhausted_at.is_some(),
+                    ))
+                })
+                .collect()
+        };
+
+        let mut pool = PoolHealth::default();
+        for (id, membership, died, quota_exhausted) in candidates {
+            match membership {
+                PoolMembership::BySupplierId => pool.by_supplier_id += 1,
+                PoolMembership::ByLegacySourceChannel => pool.by_legacy_channel += 1,
+                PoolMembership::NotPurchased => unreachable!("已在上面过滤掉"),
+            }
+            pool.health.total += 1;
+            if died {
+                pool.health.dead += 1;
+            } else if quota_exhausted {
+                pool.health.quota_exhausted += 1;
+            } else if low_quota_threshold > 0.0
+                && remaining_quota(id).is_some_and(|remaining| remaining <= low_quota_threshold)
+            {
+                pool.health.low_quota += 1;
+            } else {
+                pool.health.usable += 1;
+            }
+        }
+        pool
+    }
+
     /// 获取管理器状态快照（用于 Admin API）
     pub fn snapshot(&self) -> ManagerSnapshot {
         let entries = self.entries.lock();
@@ -3105,6 +3332,7 @@ impl MultiTokenManager {
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
             entry.disabled = disabled;
+            entry.credentials.disabled = disabled;
             if !disabled {
                 // 启用时重置失败计数
                 entry.failure_count = 0;
@@ -3112,6 +3340,9 @@ impl MultiTokenManager {
                 entry.disabled_reason = None;
                 entry.throttled_until = None;
                 entry.rate_limited_until = None;
+                // 额度按月重置，人工重新启用就是「这号又能用了」。不清掉的话它会
+                // 一直算「不可用」，让补货闸误以为该补货。
+                entry.credentials.quota_exhausted_at = None;
             } else {
                 entry.disabled_reason = Some(DisabledReason::Manual);
             }
@@ -3240,6 +3471,8 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
+            entry.credentials.disabled = true;
+            entry.credentials.quota_exhausted_at = Some(Utc::now().to_rfc3339());
         }
         self.persist_credentials()?;
         Ok(())
@@ -8238,6 +8471,375 @@ mod tests {
         cred
     }
 
+    /// 补货判定的四分类：可用 / 封号 / 额度耗尽 / 额度低于水位。
+    ///
+    /// 这条盯住两个曾经的 bug：额度耗尽被算成「活号」（永远堵住补货），
+    /// 以及额度快跑光但没触发 402 的号也被算成「活号」（必须先把号跑干才补货）。
+    #[test]
+    fn supplier_credential_health_splits_dead_quota_and_low_quota() {
+        let path = tmp_creds_path("supplier_health");
+        let mut creds = Vec::new();
+        for (id, supplier) in [
+            (1_u64, Some("io")),
+            (2, Some("io")),
+            (3, Some("io")),
+            (4, Some("io")),
+            // 别家的号，以及手动添加的无归属号，都不该计入 io。
+            (5, Some("other")),
+            (6, None),
+        ] {
+            let mut cred = api_key_credential(id, &format!("ksk_{id}"), false);
+            cred.supplier_id = supplier.map(str::to_owned);
+            creds.push(cred);
+        }
+        let manager =
+            MultiTokenManager::new(Config::default(), creds, None, Some(path.clone()), true)
+                .unwrap();
+
+        // #1 封号，#2 额度耗尽，#3 手动禁用（仍算可用），#4 干净。
+        manager.mark_credential_dead(1).unwrap();
+        manager.disable_quota_exceeded(2).unwrap();
+        manager.set_disabled(3, true).unwrap();
+
+        // 不看额度：只认封号与 402。手动禁用的 #3 和干净的 #4 都算可用。
+        let health = manager.supplier_credential_health("io", 0.0, &|_| None);
+        assert_eq!(health.total, 4);
+        assert_eq!(health.dead, 1);
+        assert_eq!(health.quota_exhausted, 1);
+        assert_eq!(health.low_quota, 0);
+        assert_eq!(health.usable, 2, "手动禁用算可用——那是暂停不是号没了");
+        assert_eq!(health.unusable(), 2);
+
+        // 开额度水位 500：#4 剩 300 跌破水位，#3 剩 9000 仍可用。
+        let quota = |id: u64| match id {
+            3 => Some(9000.0),
+            4 => Some(300.0),
+            _ => None,
+        };
+        let health = manager.supplier_credential_health("io", 500.0, &quota);
+        assert_eq!(health.low_quota, 1);
+        assert_eq!(health.usable, 1);
+        assert_eq!(health.unusable(), 3);
+
+        // 查不到额度就当还有额度——缓存缺失时宁可少买。
+        let health = manager.supplier_credential_health("io", 500.0, &|_| None);
+        assert_eq!(health.low_quota, 0);
+        assert_eq!(health.usable, 2);
+
+        // 归属隔离：别家和无归属的号不串。
+        assert_eq!(
+            manager
+                .supplier_credential_health("other", 0.0, &|_| None)
+                .total,
+            1
+        );
+        assert_eq!(
+            manager
+                .supplier_credential_health("nobody", 0.0, &|_| None)
+                .total,
+            0
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn channels(values: &[&str]) -> HashSet<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    /// 全局号池统计：不区分谁家，但严格区分「采购来的」和「手工放进去的」。
+    #[test]
+    fn pool_health_counts_every_purchased_credential_regardless_of_supplier() {
+        let path = tmp_creds_path("pool_health_mixed");
+        let configured = channels(&["Webhook 自动采购"]);
+        let mut creds = Vec::new();
+        for (id, supplier, channel) in [
+            // 新版采购，两家不同——都要算进同一个水位。
+            (1_u64, Some("io"), Some("Webhook 自动采购")),
+            (2, Some("cc"), Some("Webhook 自动采购")),
+            // 已删除供货商名下的遗留号：id 不在配置里，但仍在承载流量，必须算。
+            (3, Some("已删除的家"), None),
+            // 旧版采购：没有 supplier_id，只能靠备注认出来。
+            (4, None, Some("Webhook 自动采购")),
+            // 手工号：自定义备注与无备注，都不算。
+            (5, None, Some("朋友手里收的")),
+            (6, None, None),
+        ] {
+            let mut cred = api_key_credential(id, &format!("ksk_{id}"), false);
+            cred.supplier_id = supplier.map(str::to_owned);
+            cred.source_channel = channel.map(str::to_owned);
+            creds.push(cred);
+        }
+        let manager =
+            MultiTokenManager::new(Config::default(), creds, None, Some(path.clone()), true)
+                .unwrap();
+
+        let pool = manager.pool_credential_health(0.0, &configured, &|_| None);
+        assert_eq!(pool.health.total, 4, "两个手工号不该计入");
+        assert_eq!(pool.health.usable, 4);
+        assert_eq!(pool.by_supplier_id, 3);
+        assert_eq!(pool.by_legacy_channel, 1);
+
+        // 备注集合为空时，旧版采购号认不出来——这正是「改掉 sourceChannel 就失效」
+        // 那个已知弱点的表现，必须是可观测的而不是静默的。
+        let without_channels = manager.pool_credential_health(0.0, &HashSet::new(), &|_| None);
+        assert_eq!(without_channels.by_supplier_id, 3);
+        assert_eq!(without_channels.by_legacy_channel, 0);
+        assert_eq!(without_channels.health.total, 3);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// 死号不占目标存量额度——包括判死后还在保留期内、尚未被清理的那些。
+    ///
+    /// 算成可用会导致「号死了不补货、池子一路缩到 0」，而缺口显示为 0、看起来一切正常。
+    #[test]
+    fn pool_health_never_counts_dead_credentials_as_usable() {
+        let path = tmp_creds_path("pool_health_dead");
+        let configured = channels(&["Webhook 自动采购"]);
+        let creds = (1_u64..=5)
+            .map(|id| {
+                let mut cred = api_key_credential(id, &format!("ksk_{id}"), false);
+                cred.supplier_id = Some("io".to_owned());
+                cred
+            })
+            .collect();
+        let manager =
+            MultiTokenManager::new(Config::default(), creds, None, Some(path.clone()), true)
+                .unwrap();
+
+        // #1 #2 判死（仍在保留期内，没被清理），#3 额度耗尽，#4 手动禁用，#5 干净。
+        manager.mark_credential_dead(1).unwrap();
+        manager.mark_credential_dead(2).unwrap();
+        manager.disable_quota_exceeded(3).unwrap();
+        manager.set_disabled(4, true).unwrap();
+
+        let pool = manager.pool_credential_health(0.0, &configured, &|_| None);
+        assert_eq!(pool.health.total, 5, "死号还在池子里，仍计入 total");
+        assert_eq!(pool.health.dead, 2);
+        assert_eq!(pool.health.quota_exhausted, 1);
+        assert_eq!(pool.health.usable, 2, "手动禁用算可用，判死与额度耗尽不算");
+
+        // 目标 5、可用 2 → 缺口 3。死号确实腾出了额度让系统去补新号。
+        assert_eq!(
+            crate::admin::key_supplier::pool::deficit(5, pool.health.usable),
+            3
+        );
+
+        // 额度水位：#4 剩 100 跌破，#5 剩 9000 仍可用。
+        let quota = |id: u64| match id {
+            4 => Some(100.0),
+            5 => Some(9000.0),
+            _ => None,
+        };
+        let pool = manager.pool_credential_health(500.0, &configured, &quota);
+        assert_eq!(pool.health.low_quota, 1);
+        assert_eq!(pool.health.usable, 1);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// 升级场景：池子里只有旧版采购号（无 `supplier_id`，只有默认备注）。
+    ///
+    /// 这条对应「已发布版本不写 `supplier_id`」这个事实。认不出来的话缺口等于目标
+    /// 存量全额，升级瞬间就会重复买一批。
+    #[test]
+    fn pool_health_recognises_pre_upgrade_purchases_by_note_alone() {
+        let path = tmp_creds_path("pool_health_upgrade");
+        let creds = (1_u64..=3)
+            .map(|id| {
+                let mut cred = api_key_credential(id, &format!("ksk_{id}"), false);
+                // 升级前采购写入的样子：只有备注，没有 supplier_id。
+                cred.supplier_id = None;
+                cred.source_channel = Some("Webhook 自动采购".to_owned());
+                cred
+            })
+            .collect();
+        let manager =
+            MultiTokenManager::new(Config::default(), creds, None, Some(path.clone()), true)
+                .unwrap();
+
+        let configured = channels(&["Webhook 自动采购"]);
+        let pool = manager.pool_credential_health(0.0, &configured, &|_| None);
+        assert_eq!(pool.by_legacy_channel, 3);
+        assert_eq!(pool.health.usable, 3);
+        // 目标 3 → 缺口 0，不会重复买。
+        assert_eq!(
+            crate::admin::key_supplier::pool::deficit(3, pool.health.usable),
+            0,
+            "认不出旧版采购号就会重复买一批"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// 号池识别的两级规则：`supplier_id` 权威，备注兜底旧版采购号。
+    ///
+    /// 第二级不是可选项：已发布版本（v0.9.40）采购时只写 `source_channel`，
+    /// `supplier_id` 那时还不存在。不认备注的话，升级瞬间全部现存采购号都统计不到，
+    /// 缺口等于目标存量全额，会立刻重复买一批。
+    #[test]
+    fn pool_membership_recognises_both_new_and_legacy_purchases() {
+        let configured = channels(&["Webhook 自动采购", "kiroapp-io"]);
+
+        // 新版：有 supplier_id 就是权威归属，与该 id 是否仍在配置里无关。
+        assert_eq!(
+            classify_membership(Some("io"), Some("随便什么备注"), &configured),
+            PoolMembership::BySupplierId
+        );
+        assert_eq!(
+            classify_membership(Some("已删除的家"), None, &configured),
+            PoolMembership::BySupplierId
+        );
+
+        // 旧版：没有 supplier_id，靠备注精确匹配认出来。
+        assert_eq!(
+            classify_membership(None, Some("Webhook 自动采购"), &configured),
+            PoolMembership::ByLegacySourceChannel
+        );
+
+        // 手工号：备注是自定义值，不算采购来的。
+        assert_eq!(
+            classify_membership(None, Some("朋友手里收的"), &configured),
+            PoolMembership::NotPurchased
+        );
+        assert_eq!(
+            classify_membership(None, None, &configured),
+            PoolMembership::NotPurchased
+        );
+
+        // 空白等同于缺失：`Some("  ")` 不该被当成有归属。
+        assert_eq!(
+            classify_membership(Some("   "), Some("Webhook 自动采购"), &configured),
+            PoolMembership::ByLegacySourceChannel
+        );
+        assert_eq!(
+            classify_membership(Some("  "), Some("   "), &configured),
+            PoolMembership::NotPurchased
+        );
+    }
+
+    /// 备注匹配必须完全相等。放宽成前缀/子串/忽略大小写会把用户自己写的备注
+    /// 意外算进水位，缺口被顶掉、该补货时不补。
+    #[test]
+    fn legacy_channel_matching_is_exact_only() {
+        let configured = channels(&["Webhook 自动采购"]);
+
+        for near_miss in [
+            "Webhook 自动采购（临时）", // 超集
+            "Webhook 自动",             // 前缀
+            "自动采购",                 // 子串
+            "webhook 自动采购",         // 仅大小写不同
+            " Webhook  自动采购",       // 内部空格不同
+        ] {
+            assert_eq!(
+                classify_membership(None, Some(near_miss), &configured),
+                PoolMembership::NotPurchased,
+                "近似备注不该命中: {near_miss:?}"
+            );
+        }
+
+        // 只有首尾空白被容忍（trim 后相等）。
+        assert_eq!(
+            classify_membership(None, Some("  Webhook 自动采购  "), &configured),
+            PoolMembership::ByLegacySourceChannel
+        );
+    }
+
+    /// 空串绝不能参与匹配。它会命中所有无备注凭据，把全部手工号算进水位，
+    /// 缺口顶成 0、自动采购静默失效——而日志里只有一条「号池已达目标存量」。
+    ///
+    /// 契约是调用方剔空，这里断言即使调用方失手传进来，无备注凭据也不被算入。
+    #[test]
+    fn empty_configured_channel_never_swallows_credentials_without_a_note() {
+        let with_empty = channels(&["", "Webhook 自动采购"]);
+
+        assert_eq!(
+            classify_membership(None, None, &with_empty),
+            PoolMembership::NotPurchased,
+            "空串命中无备注凭据会让全部手工号算进水位"
+        );
+        assert_eq!(
+            classify_membership(None, Some("   "), &with_empty),
+            PoolMembership::NotPurchased
+        );
+        // 正常那一项仍然生效。
+        assert_eq!(
+            classify_membership(None, Some("Webhook 自动采购"), &with_empty),
+            PoolMembership::ByLegacySourceChannel
+        );
+    }
+
+    /// 识别必须是逐个凭据独立的纯判定，不能按遍历顺序累积状态。
+    ///
+    /// 用有界网格穷举代替随机采样：这里的取值域很小，穷举是确定性的、比随机
+    /// 抽样更强，也不必引入属性测试依赖。
+    #[test]
+    fn pool_membership_is_independent_of_evaluation_order() {
+        let configured = channels(&["Webhook 自动采购"]);
+        let inputs: Vec<(Option<&str>, Option<&str>)> = vec![
+            (Some("io"), None),
+            (Some("cc"), Some("Webhook 自动采购")),
+            (None, Some("Webhook 自动采购")),
+            (None, Some("自定义")),
+            (None, None),
+            (Some("   "), Some("Webhook 自动采购")),
+        ];
+
+        let expected: Vec<PoolMembership> = inputs
+            .iter()
+            .map(|(supplier, channel)| classify_membership(*supplier, *channel, &configured))
+            .collect();
+
+        // 任意旋转输入顺序，逐项判定结果必须与原顺序一一对应不变。
+        for shift in 1..inputs.len() {
+            let mut rotated = inputs.clone();
+            rotated.rotate_left(shift);
+            for (index, (supplier, channel)) in rotated.iter().enumerate() {
+                let original_index = (index + shift) % inputs.len();
+                assert_eq!(
+                    classify_membership(*supplier, *channel, &configured),
+                    expected[original_index],
+                    "判定结果依赖了遍历顺序 (shift={shift}, index={index})"
+                );
+            }
+        }
+    }
+
+    /// 额度耗尽标记必须落到凭据上：`disabled_reason` 只在内存里，重启就丢。
+    #[test]
+    fn quota_exhausted_marker_persists_and_clears_on_reenable() {
+        let path = tmp_creds_path("quota_marker");
+        let mut cred = api_key_credential(1, "ksk_quota", false);
+        cred.supplier_id = Some("io".to_owned());
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+
+        manager.report_quota_exhausted(1);
+        let stored = &manager.clone_all_credentials()[0];
+        assert!(stored.quota_exhausted_at.is_some());
+        assert!(stored.disabled);
+
+        // 重新启用 = 「这号又能用了」，标记必须清掉，否则永远算不可用。
+        manager.set_disabled(1, false).unwrap();
+        let stored = &manager.clone_all_credentials()[0];
+        assert!(stored.quota_exhausted_at.is_none());
+        assert_eq!(
+            manager
+                .supplier_credential_health("io", 0.0, &|_| None)
+                .usable,
+            1
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
     /// 判死不再删除凭据，而是禁用 + 记录 `died_at`，把存活记录留给运营查看。
     #[test]
     fn mark_credential_dead_disables_and_records_death_time() {
@@ -8301,9 +8903,14 @@ mod tests {
         manual.disabled = true;
 
         let path = tmp_creds_path("dead_reload");
-        let manager =
-            MultiTokenManager::new(Config::default(), vec![dead, manual], None, Some(path.clone()), true)
-                .unwrap();
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![dead, manual],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
 
         let snapshot = manager.snapshot();
         let reasons: Vec<Option<&str>> = [1, 2]
@@ -8383,7 +8990,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(manager.dead_credential_retention_hours(), 24, "默认 24 小时");
+        assert_eq!(
+            manager.dead_credential_retention_hours(),
+            24,
+            "默认 24 小时"
+        );
         manager.set_dead_credential_retention_hours(6);
         assert_eq!(manager.dead_credential_retention_hours(), 6);
         // 0 会让所有死号立刻被删，收紧到最小 1 小时
@@ -8402,9 +9013,14 @@ mod tests {
         expired.died_at = Some(long_ago);
 
         let path = tmp_creds_path("auto_delete_switch");
-        let manager =
-            MultiTokenManager::new(Config::default(), vec![expired], None, Some(path.clone()), true)
-                .unwrap();
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![expired],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
 
         assert!(manager.dead_credential_auto_delete(), "默认开启");
 
@@ -8461,9 +9077,14 @@ mod tests {
         let cred = api_key_credential(1, "ksk_no_added_at", false);
         assert!(cred.added_at.is_none());
 
-        let manager =
-            MultiTokenManager::new(Config::default(), vec![cred], None, Some(path.clone()), true)
-                .unwrap();
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
 
         let added = manager.snapshot().entries[0].added_at.clone();
         assert!(added.is_some(), "加载时应回填 added_at");

@@ -2,13 +2,14 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import {
-  Bell, CheckCheck, Clipboard, CloudCog, Loader2, PackagePlus, Plus, RefreshCw,
+  Bell, Boxes, CheckCheck, Clipboard, CloudCog, Loader2, PackagePlus, Plus, RefreshCw,
   RotateCcw, Send, ShieldCheck, Trash2, Webhook,
 } from 'lucide-react'
 import {
   createSupplier, deleteSupplier, getSupplierCallbackUrl, getSupplierEntryOverview,
-  listSuppliers, listSupplierEvents, markSupplierEventsRead, purchaseFromSupplier,
-  registerSupplierEntryWebhook, retrySupplierEvent, testSupplierEntryWebhook, updateSupplier,
+  getSupplierPool, getSupplierPoolStatus, listSuppliers, listSupplierEvents,
+  markSupplierEventsRead, purchaseFromSupplier, registerSupplierEntryWebhook, retrySupplierEvent,
+  testSupplierEntryWebhook, updateSupplier, updateSupplierPool,
 } from '@/api/key-supplier'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -20,17 +21,24 @@ import { GroupMultiSelect } from '@/components/group-select'
 import { useGroupOptions } from '@/hooks/use-groups'
 import { extractErrorMessage } from '@/lib/utils'
 import {
-  emptySupplierEntry, getSupplierEventStatusLabel, getSupplierKindLabel, hasUnreadSupplierEvents,
-  isValidSupplierId, parseSupplierNumberDraft, suggestSupplierId, toSupplierEntryUpdate,
+  emptySupplierEntry, emptySupplierPool, getSupplierEventStatusLabel, getSupplierKindLabel,
+  hasUnreadSupplierEvents, isValidSupplierId, parseSupplierNumberDraft, suggestSupplierId,
+  toSupplierEntryUpdate, validateSupplierPool,
 } from '@/lib/key-supplier'
 import type {
-  SupplierEntryUpdate, SupplierEvent, SupplierEventStatus, SupplierKind,
+  SupplierEntryUpdate, SupplierEvent, SupplierEventStatus, SupplierKind, SupplierPoolConfig,
 } from '@/types/api'
 
 const EVENT_PAGE_SIZE = 20
-const SUPPLIER_KINDS: readonly SupplierKind[] = ['kiro-rs', 'kiro-app']
+const SUPPLIER_KINDS: readonly SupplierKind[] = ['kiro-rs', 'kiro-app', 'kiroapp-io']
 
-type SupplierNumericField = 'minPurchase' | 'maxPurchase' | 'rpmLimit' | 'priority'
+type SupplierNumericField =
+  | 'minPurchase'
+  | 'maxPurchase'
+  | 'rpmLimit'
+  | 'priority'
+  | 'restockUsableThreshold'
+  | 'lowQuotaThreshold'
 type NumericDrafts = Record<SupplierNumericField, string>
 
 function toNumericDrafts(config: Pick<SupplierEntryUpdate, SupplierNumericField>): NumericDrafts {
@@ -39,6 +47,8 @@ function toNumericDrafts(config: Pick<SupplierEntryUpdate, SupplierNumericField>
     maxPurchase: String(config.maxPurchase),
     rpmLimit: String(config.rpmLimit),
     priority: String(config.priority),
+    restockUsableThreshold: String(config.restockUsableThreshold),
+    lowQuotaThreshold: String(config.lowQuotaThreshold),
   }
 }
 
@@ -64,6 +74,17 @@ function eventDetail(event: SupplierEvent): string {
   return parts.join(' · ')
 }
 
+/**
+ * Renders a key price. `kiroapp-io` prices are tiered by each mother account's
+ * cumulative output, so we show the range rather than implying a single price —
+ * the actual charge is only known from `totalDebit` after the order lands.
+ */
+function formatKeyPrice(min: number | null, max: number | null): string {
+  if (min === null && max === null) return '—'
+  if (min !== null && max !== null && min !== max) return `${min} ~ ${max}`
+  return String(min ?? max)
+}
+
 function Metric({ label, value }: { label: string; value: number | string }) {
   return (
     <div className="border border-border/50 bg-secondary/20 p-3">
@@ -84,8 +105,12 @@ export function KeySupplierPage() {
   const groupOptions = useGroupOptions()
   const [numericDrafts, setNumericDrafts] = useState<NumericDrafts>({
     minPurchase: '', maxPurchase: '', rpmLimit: '', priority: '',
+    restockUsableThreshold: '', lowQuotaThreshold: '',
   })
   const [purchaseCountDraft, setPurchaseCountDraft] = useState('1')
+  const [poolDraft, setPoolDraft] = useState<SupplierPoolConfig>(emptySupplierPool)
+  const [poolTargetDraft, setPoolTargetDraft] = useState('0')
+  const [poolLowQuotaDraft, setPoolLowQuotaDraft] = useState('0')
   const [selectedIds, setSelectedIds] = useState<number[]>([])
   const [before, setBefore] = useState<number | undefined>()
   const [previousCursors, setPreviousCursors] = useState<Array<number | undefined>>([])
@@ -109,6 +134,44 @@ export function KeySupplierPage() {
     queryKey: ['supplier-events', before, eventSupplierId],
     queryFn: () => listSupplierEvents({ limit: EVENT_PAGE_SIZE, before, supplierId: eventSupplierId }),
     refetchInterval: 5000,
+  })
+
+  const poolQuery = useQuery({ queryKey: ['supplier-pool'], queryFn: getSupplierPool })
+  const poolStatusQuery = useQuery({
+    queryKey: ['supplier-pool-status'],
+    queryFn: getSupplierPoolStatus,
+    refetchInterval: 30000,
+  })
+
+  // 数量输入保持字符串草稿：直接绑 number 会让用户清空输入框时跳成 0。
+  const poolDraftFromServer = poolQuery.data ?? null
+  const poolTarget = parseSupplierNumberDraft(poolTargetDraft, 0)
+  const poolLowQuota = parseSupplierNumberDraft(poolLowQuotaDraft, 0)
+  const poolDraftValues: SupplierPoolConfig = {
+    enabled: poolDraft.enabled,
+    targetCount: poolTarget ?? -1,
+    lowQuotaThreshold: poolLowQuota ?? -1,
+  }
+  const poolValidationError =
+    poolTarget === null || poolLowQuota === null
+      ? '目标存量与额度水位必须是非负整数'
+      : validateSupplierPool(poolDraftValues)
+
+  useEffect(() => {
+    if (poolDraftFromServer === null) return
+    setPoolDraft(poolDraftFromServer)
+    setPoolTargetDraft(String(poolDraftFromServer.targetCount))
+    setPoolLowQuotaDraft(String(poolDraftFromServer.lowQuotaThreshold))
+  }, [poolDraftFromServer])
+
+  const savePool = useMutation({
+    mutationFn: () => updateSupplierPool(poolDraftValues),
+    onSuccess: (saved) => {
+      toast.success(saved.enabled ? `全局号池已启用，目标存量 ${saved.targetCount}` : '全局号池已关闭')
+      queryClient.invalidateQueries({ queryKey: ['supplier-pool'] })
+      queryClient.invalidateQueries({ queryKey: ['supplier-pool-status'] })
+    },
+    onError: (error) => toast.error(extractErrorMessage(error)),
   })
 
   // 首次拿到列表时选中第一家。
@@ -252,9 +315,15 @@ export function KeySupplierPage() {
   const parsedMaxPurchase = parseSupplierNumberDraft(numericDrafts.maxPurchase, 1)
   const parsedRpmLimit = parseSupplierNumberDraft(numericDrafts.rpmLimit, 0)
   const parsedPriority = parseSupplierNumberDraft(numericDrafts.priority, 0)
+  const parsedRestockUsableThreshold = parseSupplierNumberDraft(
+    numericDrafts.restockUsableThreshold,
+    0,
+  )
+  const parsedLowQuotaThreshold = parseSupplierNumberDraft(numericDrafts.lowQuotaThreshold, 0)
   const idValid = !creating || isValidSupplierId(config?.id ?? '')
   const configNumbersValid = parsedMinPurchase !== null && parsedMaxPurchase !== null &&
     parsedRpmLimit !== null && parsedPriority !== null && parsedMinPurchase <= parsedMaxPurchase &&
+    parsedRestockUsableThreshold !== null && parsedLowQuotaThreshold !== null &&
     idValid
   const parsedPurchaseCount = parseSupplierNumberDraft(purchaseCountDraft, 1)
   const purchaseCountValid = parsedPurchaseCount !== null && config !== null &&
@@ -264,7 +333,8 @@ export function KeySupplierPage() {
     if (!config) return
     if (
       parsedMinPurchase === null || parsedMaxPurchase === null ||
-      parsedRpmLimit === null || parsedPriority === null
+      parsedRpmLimit === null || parsedPriority === null ||
+      parsedRestockUsableThreshold === null || parsedLowQuotaThreshold === null
     ) {
       toast.error('请输入有效的非负整数配置')
       return
@@ -279,6 +349,8 @@ export function KeySupplierPage() {
       maxPurchase: parsedMaxPurchase,
       rpmLimit: parsedRpmLimit,
       priority: parsedPriority,
+      restockUsableThreshold: parsedRestockUsableThreshold,
+      lowQuotaThreshold: parsedLowQuotaThreshold,
       apiKey: apiKey || undefined,
       webhookToken: webhookToken || undefined,
       webhookSecret: webhookSecret || undefined,
@@ -346,6 +418,94 @@ export function KeySupplierPage() {
         </CardContent>
       </Card>
 
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="flex items-center gap-2"><Boxes className="h-4 w-4" />全局号池</CardTitle>
+          <CardDescription>
+            所有自动采购来的可用号合计不超过目标存量。任一供货商推来到货通知时，按「目标存量 − 当前可用数」算出缺口，
+            只向推送方那一家下单补齐；缺口为 0 就不买。不设优先级，谁先推来谁先拿到缺口。
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="flex flex-wrap items-center gap-4">
+            <label className="flex items-center gap-2 text-sm">
+              <Switch
+                checked={poolDraft.enabled}
+                onCheckedChange={(checked) => setPoolDraft({ ...poolDraft, enabled: checked })}
+                aria-label="启用全局号池"
+              />
+              <span>启用全局号池</span>
+            </label>
+            <label className="flex items-center gap-2 text-sm">
+              <span className="text-muted-foreground">目标存量</span>
+              <Input
+                className="w-24"
+                value={poolTargetDraft}
+                inputMode="numeric"
+                aria-label="目标存量"
+                onChange={(event) => setPoolTargetDraft(event.target.value)}
+              />
+            </label>
+            <label className="flex items-center gap-2 text-sm">
+              <span className="text-muted-foreground">额度水位</span>
+              <Input
+                className="w-24"
+                value={poolLowQuotaDraft}
+                inputMode="numeric"
+                aria-label="额度水位"
+                onChange={(event) => setPoolLowQuotaDraft(event.target.value)}
+              />
+            </label>
+            <Button
+              size="sm"
+              className="ml-auto"
+              onClick={() => savePool.mutate()}
+              disabled={savePool.isPending || poolValidationError !== null}
+            >
+              {savePool.isPending && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+              保存
+            </Button>
+          </div>
+
+          {poolValidationError !== null && (
+            <div className="text-sm text-destructive" role="alert">{poolValidationError}</div>
+          )}
+
+          {poolStatusQuery.isError ? (
+            <div className="text-sm text-destructive">{extractErrorMessage(poolStatusQuery.error)}</div>
+          ) : poolStatusQuery.data ? (
+            <>
+              <div className="grid gap-px overflow-hidden border border-border/50 sm:grid-cols-2 lg:grid-cols-4">
+                <Metric label="当前可用" value={poolStatusQuery.data.globalUsable} />
+                <Metric label="还差" value={poolStatusQuery.data.deficit} />
+                <Metric label="已判死" value={poolStatusQuery.data.health.dead} />
+                <Metric
+                  label="额度耗尽 / 低于水位"
+                  value={`${poolStatusQuery.data.health.quotaExhausted} / ${poolStatusQuery.data.health.lowQuota}`}
+                />
+              </div>
+              <div className="text-xs text-muted-foreground">
+                识别方式：按 supplierId {poolStatusQuery.data.bySupplierId} 个 · 按备注 {poolStatusQuery.data.byLegacyChannel} 个
+                {poolStatusQuery.data.matchedChannels.length > 0 && (
+                  <> · 参与备注匹配的来源渠道：{poolStatusQuery.data.matchedChannels.join('、')}</>
+                )}
+              </div>
+              {poolStatusQuery.data.byLegacyChannel > 0 && (
+                <div className="border border-warning/40 bg-warning/[0.06] p-3 text-xs text-muted-foreground">
+                  其中 {poolStatusQuery.data.byLegacyChannel} 个号是升级前买的，只能靠「来源渠道」备注认出来。
+                  改动对应供货商的来源渠道会让它们不再计入水位，缺口随之变大、可能重复采购。
+                </div>
+              )}
+              {poolStatusQuery.data.health.dead > 0 && (
+                <div className="text-xs text-muted-foreground">
+                  已判死的号仍留在池子里等保留期到点清理，但不计入可用数——系统会去补新号。
+                </div>
+              )}
+            </>
+          ) : null}
+        </CardContent>
+      </Card>
+
       {selectedId !== null && !creating && (
         <Card>
           <CardHeader className="pb-3">
@@ -366,10 +526,13 @@ export function KeySupplierPage() {
                 ) : (
                   <>
                     <Metric label="可用库存" value={overviewQuery.data.stockMax} />
-                    <Metric label="单价" value={overviewQuery.data.keyPrice ?? '—'} />
+                    <Metric
+                      label={overviewQuery.data.keyPriceMax !== null ? '单价区间（阶梯）' : '单价'}
+                      value={formatKeyPrice(overviewQuery.data.keyPrice, overviewQuery.data.keyPriceMax)}
+                    />
                     <Metric label="剩余积分" value={overviewQuery.data.balance ?? '—'} />
-                    <Metric label="协议" value={getSupplierKindLabel(overviewQuery.data.kind)} />
-                    <Metric label="回调注册" value="需在对方面板手填" />
+                    <Metric label="本地号池（可用 / 共）" value={`${overviewQuery.data.credentialHealth.usable} / ${overviewQuery.data.credentialHealth.total}`} />
+                    <Metric label="不可用构成（封 / 额度尽 / 额度低）" value={`${overviewQuery.data.credentialHealth.dead} / ${overviewQuery.data.credentialHealth.quotaExhausted} / ${overviewQuery.data.credentialHealth.lowQuota}`} />
                   </>
                 )}
               </div>
@@ -449,13 +612,25 @@ export function KeySupplierPage() {
                   <div><label htmlFor="auto-delete-forbidden" className="text-sm font-medium">403 时自动删除</label><p className="text-xs text-muted-foreground">仅删除按此预设导入的自动采购账号。</p></div>
                   <Switch id="auto-delete-forbidden" checked={config.autoDeleteForbidden} onCheckedChange={(checked) => updateField('autoDeleteForbidden', checked)} disabled={saveConfig.isPending} aria-label="403 时自动删除" />
                 </div>
+                {poolDraft.enabled && (
+                  <div className="border border-border/50 bg-secondary/20 p-3 text-xs text-muted-foreground">
+                    全局号池已启用：本页的「仅在号不够用时补货」「补货水位」「额度水位」都不再参与判定，改由全局号池统一决定买不买、买几个。
+                    「单次最大购买量」仍生效，但只作单笔安全上限——实际数量以全局缺口为准。
+                  </div>
+                )}
+                <div className="flex items-center justify-between gap-3 border-b border-border/50 pb-3">
+                  <div><label htmlFor="restock-only-when-exhausted" className="text-sm font-medium">仅在号不够用时补货</label><p className="text-xs text-muted-foreground">{poolDraft.enabled ? '全局号池启用中，此开关不参与判定。' : '开启后到货通知只表示「可以补货了」，不是「立刻买」。手动采购不受影响。'}</p></div>
+                  <Switch id="restock-only-when-exhausted" checked={config.restockOnlyWhenExhausted} onCheckedChange={(checked) => updateField('restockOnlyWhenExhausted', checked)} disabled={saveConfig.isPending} aria-label="仅在号不够用时补货" />
+                </div>
                 <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
                   <Field label="单次最小购买量"><Input type="number" min={1} value={numericDrafts.minPurchase} onChange={(event) => updateNumericDraft('minPurchase', event.target.value)} disabled={saveConfig.isPending} /></Field>
-                  <Field label="单次最大购买量"><Input type="number" min={1} value={numericDrafts.maxPurchase} onChange={(event) => updateNumericDraft('maxPurchase', event.target.value)} disabled={saveConfig.isPending} /></Field>
+                  <Field label={poolDraft.enabled ? '单次最大购买量（仅作安全上限）' : '单次最大购买量'}><Input type="number" min={1} value={numericDrafts.maxPurchase} onChange={(event) => updateNumericDraft('maxPurchase', event.target.value)} disabled={saveConfig.isPending} /></Field>
                   <Field label="API Region"><Input value={config.apiRegion} onChange={(event) => updateField('apiRegion', event.target.value)} disabled={saveConfig.isPending} /></Field>
                   <Field label="自动采购 RPM 预设"><Input type="number" min={0} value={numericDrafts.rpmLimit} onChange={(event) => updateNumericDraft('rpmLimit', event.target.value)} disabled={saveConfig.isPending} /></Field>
                   <Field label="Priority"><Input type="number" min={0} value={numericDrafts.priority} onChange={(event) => updateNumericDraft('priority', event.target.value)} disabled={saveConfig.isPending} /></Field>
                   <Field label="Source Channel"><Input value={config.sourceChannel} onChange={(event) => updateField('sourceChannel', event.target.value)} disabled={saveConfig.isPending} /></Field>
+                  <Field label="补货水位（可用号数）"><Input type="number" min={0} value={numericDrafts.restockUsableThreshold} onChange={(event) => updateNumericDraft('restockUsableThreshold', event.target.value)} disabled={saveConfig.isPending || !config.restockOnlyWhenExhausted} /></Field>
+                  <Field label="额度水位（剩余额度）"><Input type="number" min={0} value={numericDrafts.lowQuotaThreshold} onChange={(event) => updateNumericDraft('lowQuotaThreshold', event.target.value)} disabled={saveConfig.isPending || !config.restockOnlyWhenExhausted} /></Field>
                 </div>
                 <div className="grid gap-3 sm:grid-cols-2">
                   <Field label="自动采购分组预设"><GroupMultiSelect value={config.groups} options={groupOptions} onChange={(groups) => updateField('groups', groups)} disabled={saveConfig.isPending} /></Field>
@@ -504,7 +679,10 @@ export function KeySupplierPage() {
               <CardDescription>
                 {supportsWebhookRegistration
                   ? '注册状态来自供应商账号；测试消息只验证连通性，不会购买。'
-                  : '该供货商没有注册接口。复制下面的回调地址，粘贴到对方面板的「到货通知（Webhook）」里，再把它生成的签名密钥填到左边。'}
+                  : config?.kind === 'kiroapp-io'
+                    // kiroapp.io 的文档没有签名头，所以别让人去找一个不存在的密钥。
+                    ? '该供货商没有注册接口。复制下面的回调地址，粘贴到对方面板的「设置 → Webhook 配置」，可先发一条 test 事件验证连通。'
+                    : '该供货商没有注册接口。复制下面的回调地址，粘贴到对方面板的「到货通知（Webhook）」里，再把它生成的签名密钥填到左边。'}
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-3">

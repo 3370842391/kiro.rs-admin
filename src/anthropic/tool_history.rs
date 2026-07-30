@@ -594,7 +594,10 @@ mod tests {
         assert_eq!(report.dropped_duplicate_results, 1);
         assert!(current.is_empty(), "the second result is dropped");
         // 历史里那条先到的结果保留，配对仍然完整。
-        assert_eq!(historical_result_id(&history[1], 0), tool_use_id(&history[0], 0));
+        assert_eq!(
+            historical_result_id(&history[1], 0),
+            tool_use_id(&history[0], 0)
+        );
     }
 
     #[test]

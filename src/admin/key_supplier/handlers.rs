@@ -15,7 +15,8 @@ use crate::admin::{middleware::AdminState, types::AdminErrorResponse};
 
 use super::{
     config::{
-        SupplierConfigUpdate, SupplierEntryUpdate, SupplierEntryView, normalize_supplier_id,
+        PoolConfigUpdate, SupplierConfigUpdate, SupplierEntryUpdate, SupplierEntryView,
+        normalize_supplier_id,
     },
     service::{KeySupplierService, ManualPurchaseResult, SupplierOverview, SupplierServiceError},
     store::{StoredSupplierEvent, SupplierEventStatus},
@@ -222,6 +223,45 @@ pub async fn test_webhook(State(state): State<AdminState>) -> Response {
     };
     match service.test_webhook().await {
         Ok(()) => Json(serde_json::json!({ "success": true })).into_response(),
+        Err(error_value) => service_error_response(error_value),
+    }
+}
+
+// ============ 全局号池 ============
+
+pub async fn get_pool(State(state): State<AdminState>) -> Response {
+    match supplier(&state) {
+        Ok(service) => Json(service.pool_view()).into_response(),
+        Err(response) => response,
+    }
+}
+
+pub async fn put_pool(
+    State(state): State<AdminState>,
+    update: Result<Json<PoolConfigUpdate>, JsonRejection>,
+) -> Response {
+    let Json(update) = match update {
+        Ok(update) => update,
+        Err(rejection) => return json_rejection(rejection),
+    };
+    let service = match supplier(&state) {
+        Ok(service) => service,
+        Err(response) => return response,
+    };
+    match service.update_pool(update) {
+        Ok(view) => Json(view).into_response(),
+        Err(error_value) => service_error_response(error_value),
+    }
+}
+
+/// 号池当前状态。纯读，不发起采购。
+pub async fn pool_status(State(state): State<AdminState>) -> Response {
+    let service = match supplier(&state) {
+        Ok(service) => service,
+        Err(response) => return response,
+    };
+    match service.pool_status() {
+        Ok(status) => Json(status).into_response(),
         Err(error_value) => service_error_response(error_value),
     }
 }
@@ -557,6 +597,12 @@ fn service_error_response(error_value: SupplierServiceError) -> Response {
             "invalid_request",
             "invalid key supplier request",
         ),
+        // 校验错误要把取值范围说清楚：这是运维在管理端唯一能看到的提示。
+        SupplierServiceError::PoolConfig => error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "号池配置无效：启用时目标存量必须在 1..=10000，额度水位必须在 0..=100000",
+        ),
         SupplierServiceError::ImporterUnavailable | SupplierServiceError::ImportFailed => error(
             StatusCode::SERVICE_UNAVAILABLE,
             "service_unavailable",
@@ -673,8 +719,12 @@ struct OverviewResponse {
     kind: &'static str,
     stock_max: u64,
     key_price: Option<f64>,
+    /// 阶梯定价的最高档单价。与 `keyPrice`（最低价）一起构成报价区间。
+    key_price_max: Option<f64>,
     balance: Option<u64>,
     webhook_registered: bool,
+    /// 本地号池里这家名下的凭据存活情况，补货闸按 `alive` 判定。
+    credential_health: crate::kiro::token_manager::SupplierCredentialHealth,
     profile: ProfileView,
     status: StatusView,
 }
@@ -687,8 +737,10 @@ impl From<SupplierOverview> for OverviewResponse {
             kind: overview.kind,
             stock_max: snapshot.stock_available.unwrap_or_default(),
             key_price: snapshot.key_price,
+            key_price_max: snapshot.key_price_max,
             balance: snapshot.balance,
             webhook_registered: overview.webhook_registered,
+            credential_health: overview.credential_health,
             profile: snapshot
                 .profile
                 .as_ref()
@@ -783,6 +835,8 @@ struct EventView {
     event_id: String,
     event_type: String,
     purchase_order_id: Option<String>,
+    /// 供货商侧开号批次号，用于和对方后台的批次对账。仅 `kiroapp-io` 有值。
+    supplier_batch_id: Option<String>,
     message: Option<String>,
     quantity: i64,
     received_at: String,
@@ -795,6 +849,14 @@ struct EventView {
     webhook_duplicate_count: i64,
     failed_count: i64,
     read_at: Option<String>,
+    /// 本单实际扣费（供货商积分）。阶梯定价下这是唯一权威数字。
+    total_debit: Option<i64>,
+    /// 本单均价 = `totalDebit / purchasedCount`。
+    unit_price: Option<f64>,
+    /// 供货商侧订单号，用于和对方订单历史对账。
+    supplier_order_id: Option<String>,
+    /// 命中对方幂等重放：上一次其实已成交。
+    replayed: bool,
 }
 
 impl From<StoredSupplierEvent> for EventView {
@@ -805,6 +867,7 @@ impl From<StoredSupplierEvent> for EventView {
             event_id: event.event_id,
             event_type: event.event_type,
             purchase_order_id: event.purchase_order_id,
+            supplier_batch_id: event.supplier_batch_id,
             message: event.message,
             quantity: event.quantity,
             received_at: event.received_at,
@@ -817,6 +880,10 @@ impl From<StoredSupplierEvent> for EventView {
             webhook_duplicate_count: event.webhook_duplicate_count,
             failed_count: event.failed_count,
             read_at: event.read_at,
+            total_debit: event.total_debit,
+            unit_price: event.unit_price,
+            supplier_order_id: event.supplier_order_id,
+            replayed: event.replayed,
         }
     }
 }

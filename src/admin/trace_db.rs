@@ -669,14 +669,13 @@ impl TraceStore {
             .is_some_and(|percentage| percentage >= 80.0)
             && previous_client_tokens.is_some();
         let stayed_large = current.request_body_bytes >= 2_500_000
-            && current.request_body_bytes.saturating_mul(100)
-                >= previous_bytes.saturating_mul(85);
+            && current.request_body_bytes.saturating_mul(100) >= previous_bytes.saturating_mul(85);
         if previous_exposed_high_context && stayed_large {
             return Ok("suspected_client_compaction_not_triggered".to_string());
         }
 
-        let shrank_at_least_twenty_percent = current.request_body_bytes.saturating_mul(100)
-            <= previous_bytes.saturating_mul(80);
+        let shrank_at_least_twenty_percent =
+            current.request_body_bytes.saturating_mul(100) <= previous_bytes.saturating_mul(80);
         if current.diagnosis == "payload_limit_preempted" && shrank_at_least_twenty_percent {
             return Ok("suspected_compaction_insufficient".to_string());
         }
@@ -1277,8 +1276,7 @@ mod tests {
             upstream_context_percentage,
             client_reported_tokens: upstream_context_percentage
                 .map(|percentage| (percentage * 10_000.0) as u64),
-            diagnostics_json:
-                "{\"schemaVersion\":1,\"containsOnlySafeCounters\":true}".to_string(),
+            diagnostics_json: "{\"schemaVersion\":1,\"containsOnlySafeCounters\":true}".to_string(),
         }
     }
 
@@ -1374,7 +1372,11 @@ mod tests {
         assert_eq!(details.client_version.as_deref(), Some("2.1.220"));
         assert_eq!(details.request_body_bytes, 3_000_000);
         assert_eq!(details.upstream_context_percentage, Some(90.0));
-        assert!(details.diagnostics_json.contains("containsOnlySafeCounters"));
+        assert!(
+            details
+                .diagnostics_json
+                .contains("containsOnlySafeCounters")
+        );
 
         let by_session = store.query(&TraceQuery {
             session_hash: Some("session-normal".to_string()),
@@ -1459,9 +1461,7 @@ mod tests {
         store.insert(after_compaction);
 
         let not_triggered = store.query(&TraceQuery {
-            compaction_diagnosis: Some(
-                "suspected_client_compaction_not_triggered".to_string(),
-            ),
+            compaction_diagnosis: Some("suspected_client_compaction_not_triggered".to_string()),
             limit: 10,
             ..Default::default()
         });

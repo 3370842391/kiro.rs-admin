@@ -563,7 +563,8 @@ mod tests {
             let fast = peek_dimensions(format, &data);
             let full = full_decode_dims(format, &data);
             assert_eq!(
-                fast, full,
+                fast,
+                full,
                 "前缀路径与全量解码结果不一致: format={format} b64_len={}",
                 data.len()
             );

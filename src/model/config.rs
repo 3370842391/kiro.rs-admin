@@ -128,6 +128,28 @@ pub struct KeySupplierConfig {
     pub source_channel: String,
     #[serde(default = "default_supplier_nickname_prefix")]
     pub nickname_prefix: String,
+    /// 只在该供货商名下的活号数 <= `restockAliveThreshold` 时才自动采购。
+    ///
+    /// 供货商不断推到货通知时，不加这道闸就是每次到货都掏钱。开启后到货通知变成
+    /// 「可以补货了」而不是「立刻买」。
+    ///
+    /// 关闭（默认）保持历史行为：每条到货通知都尝试采购。手动采购不受此开关影响。
+    #[serde(default)]
+    pub restock_only_when_exhausted: bool,
+    /// 补货水位：可用号数 <= 这个值才买。0 = 一个能用的都没有了才买。
+    ///
+    /// 仅在 `restockOnlyWhenExhausted` 为真时生效。
+    #[serde(default)]
+    pub restock_usable_threshold: u32,
+    /// 额度水位：剩余额度 <= 这个数就不算「可用」。0 = 不看额度，只认封号与 402。
+    ///
+    /// 为什么需要它：号没被封、也没触发 402，但剩余额度只有几百，对流量来说已经接近
+    /// 废号。只等 402 意味着必须先把号跑干才补货，中间那段是服务空窗。
+    ///
+    /// 单位与上游 `usageLimit` 一致（KIRO POWER 满额 10000）。跨订阅档位混用时注意
+    /// 这是绝对值，不是百分比。
+    #[serde(default)]
+    pub low_quota_threshold: u32,
 }
 
 impl std::fmt::Debug for KeySupplierConfig {
@@ -154,6 +176,12 @@ impl std::fmt::Debug for KeySupplierConfig {
             .field("groups", &self.groups)
             .field("source_channel", &self.source_channel)
             .field("nickname_prefix", &self.nickname_prefix)
+            .field(
+                "restock_only_when_exhausted",
+                &self.restock_only_when_exhausted,
+            )
+            .field("restock_usable_threshold", &self.restock_usable_threshold)
+            .field("low_quota_threshold", &self.low_quota_threshold)
             .finish()
     }
 }
@@ -176,8 +204,46 @@ impl Default for KeySupplierConfig {
             groups: Vec::new(),
             source_channel: default_supplier_source_channel(),
             nickname_prefix: default_supplier_nickname_prefix(),
+            restock_only_when_exhausted: false,
+            restock_usable_threshold: 0,
+            low_quota_threshold: 0,
         }
     }
+}
+
+/// 全局号池采购配置。全实例一份，与 `keySuppliers` 并列在 `config.json` 顶层。
+///
+/// 语义是**目标存量**而不是「每次买几个」：所有自动采购来的可用凭据合计不得超过
+/// `targetCount`。任一供货商推来到货通知时，按「目标存量 - 当前全局可用数」算出缺口，
+/// 只向推送方那一家下单补齐。缺口为 0 就不买。
+///
+/// 为什么必须是存量：供货商之间不设优先级、谁先推来谁先买，若 `targetCount` 是每次
+/// 触发的上限，三家各推一次就买三倍，与逐家把 `maxPurchase` 设成该值完全等价，等于
+/// 没有这个功能。存量口径下三家抢的是同一个缺口。
+///
+/// 启用后接管补货判定：各家自己的 `restockOnlyWhenExhausted` /
+/// `restockUsableThreshold` / `lowQuotaThreshold` 不再参与，避免两套水位交叉出
+/// 第三种行为。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct KeySupplierPoolConfig {
+    /// 关闭（默认）时本特性完全不生效，逐家独立采购行为逐字节不变。
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// 目标存量：所有自动采购来的可用凭据合计上限。
+    ///
+    /// 默认 0 是「未配置」的哨兵值而非某个业务默认：有人手工把 `enabled` 改成 true
+    /// 却忘了填数量时，结果必须是不买，而不是按某个猜出来的默认值开始花钱。
+    #[serde(default)]
+    pub target_count: u32,
+
+    /// 剩余额度 <= 此值的号不算可用。0 = 不看额度，只认封号与 402。
+    ///
+    /// 与各家的同名字段语义一致（绝对值，单位对齐上游 `usageLimit`），但启用号池后
+    /// 只认这一份，各家自己配的那个不参与判定。
+    #[serde(default)]
+    pub low_quota_threshold: u32,
 }
 
 /// 供货商协议类型。
@@ -186,12 +252,20 @@ impl Default for KeySupplierConfig {
 ///   支持远程注册 webhook。
 /// - `KiroApp`：kiroapp.cc 协议。`Authorization: Bearer` 认证，`/openapi/*`，采购是
 ///   `POST /openapi/claim`，**没有幂等键**（因此绝不重试），回调地址在对方面板手填。
+/// - `KiroAppIo`：kiroapp.io 协议。`Authorization: Bearer km_…` 认证，`/api/me/*`，采购是
+///   `POST /api/me/purchase`，**带 `client_order_id` 幂等**（因此可安全重试）；阶梯定价，
+///   实际扣费只认响应里的 `total_debit`；回调地址在对方面板手填。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
+// 三家供货商都确实是 Kiro 号商，`Kiro` 前缀是事实而非冗余；去掉反而看不出卖的是什么。
+#[allow(clippy::enum_variant_names)]
 pub enum SupplierKind {
     #[default]
     KiroRs,
     KiroApp,
+    /// 显式 rename：避免依赖 serde 对连续大写的 kebab 化规则，且与 `as_str` 保持一致。
+    #[serde(rename = "kiroapp-io")]
+    KiroAppIo,
 }
 
 impl SupplierKind {
@@ -199,12 +273,24 @@ impl SupplierKind {
         match self {
             Self::KiroRs => "kiro-rs",
             Self::KiroApp => "kiro-app",
+            Self::KiroAppIo => "kiroapp-io",
         }
     }
 
-    /// 该协议是否能远程注册/测试 webhook。`kiro-app` 只能手填回调地址。
+    /// 该协议是否能远程注册/测试 webhook。只有 `kiro-rs` 提供注册接口，
+    /// 两家 kiroapp 都只能在对方面板手填回调地址。
     pub fn supports_webhook_registration(self) -> bool {
         matches!(self, Self::KiroRs)
+    }
+
+    /// 采购是否带幂等键。带幂等键才允许在网络抖动/5xx 后重试同一单。
+    ///
+    /// `kiro-app` 的 `/openapi/claim` 没有幂等键，重试等于重复扣积分。
+    ///
+    /// HTTP 重试策略仍然在客户端按 `kind` 直接分支决定（那里还要区分具体端点）；
+    /// 这个开关用在 409 的语义判定上：只有带幂等键的协议，409 才等于「原单已成交」。
+    pub fn purchase_is_idempotent(self) -> bool {
+        matches!(self, Self::KiroRs | Self::KiroAppIo)
     }
 }
 
@@ -221,6 +307,7 @@ impl std::str::FromStr for SupplierKind {
         match value {
             "kiro-rs" | "kirors" | "default" => Ok(Self::KiroRs),
             "kiro-app" | "kiroapp" => Ok(Self::KiroApp),
+            "kiroapp-io" | "kiroappio" | "kiro-app-io" => Ok(Self::KiroAppIo),
             other => anyhow::bail!("无效的供货商协议类型: {other}"),
         }
     }
@@ -589,6 +676,12 @@ pub struct Config {
     /// 多供货商 Key 采购配置。每项一家供货商，自带协议类型、凭据与导入预设。
     #[serde(default)]
     pub key_suppliers: Vec<KeySupplierEntryConfig>,
+
+    /// 全局号池采购配置。控制「所有采购来的号合计养几个」，跨供货商共享一个缺口。
+    ///
+    /// 缺失时整块取默认值（`enabled = false`），使老 `config.json` 升级后行为不变。
+    #[serde(default)]
+    pub key_supplier_pool: KeySupplierPoolConfig,
 
     /// 是否记录失败、中断和可选恢复请求的完整脱敏诊断快照。
     #[serde(default = "default_true")]
@@ -1016,6 +1109,7 @@ impl Default for Config {
             profit_quota_per_unit: default_profit_quota_per_unit(),
             key_supplier: KeySupplierConfig::default(),
             key_suppliers: Vec::new(),
+            key_supplier_pool: KeySupplierPoolConfig::default(),
             error_snapshot_enabled: true,
             dead_credential_auto_delete: true,
             dead_credential_retention_hours: default_dead_credential_retention_hours(),
@@ -1143,6 +1237,45 @@ mod tests {
     }
 
     #[test]
+    fn supplier_kind_wire_names_round_trip_and_are_all_distinct() {
+        // `kind` 落在 config.json 里，序列化名一变，线上配置就读不回来了。
+        for (kind, wire) in [
+            (SupplierKind::KiroRs, "kiro-rs"),
+            (SupplierKind::KiroApp, "kiro-app"),
+            (SupplierKind::KiroAppIo, "kiroapp-io"),
+        ] {
+            assert_eq!(kind.as_str(), wire);
+            assert_eq!(serde_json::to_value(kind).unwrap(), serde_json::json!(wire));
+            assert_eq!(
+                serde_json::from_value::<SupplierKind>(serde_json::json!(wire)).unwrap(),
+                kind
+            );
+            assert_eq!(wire.parse::<SupplierKind>().unwrap(), kind);
+            assert_eq!(kind.to_string(), wire);
+        }
+
+        // 两家 kiroapp 绝不能互相解析成对方——那会让采购走错协议和错误的重试策略。
+        assert_eq!(
+            "kiroappio".parse::<SupplierKind>().unwrap(),
+            SupplierKind::KiroAppIo
+        );
+        assert_eq!(
+            "kiro-app-io".parse::<SupplierKind>().unwrap(),
+            SupplierKind::KiroAppIo
+        );
+        assert_eq!(
+            "kiroapp".parse::<SupplierKind>().unwrap(),
+            SupplierKind::KiroApp
+        );
+        assert!("kiro-io".parse::<SupplierKind>().is_err());
+
+        // 幂等能力决定能不能重试；接错会导致重复扣费。
+        assert!(SupplierKind::KiroRs.purchase_is_idempotent());
+        assert!(SupplierKind::KiroAppIo.purchase_is_idempotent());
+        assert!(!SupplierKind::KiroApp.purchase_is_idempotent());
+    }
+
+    #[test]
     fn key_supplier_config_round_trips_in_camel_case() {
         let input = serde_json::json!({
             "keySupplier": {
@@ -1160,7 +1293,10 @@ mod tests {
                 "priority": 3,
                 "groups": ["paid"],
                 "sourceChannel": "supplier",
-                "nicknamePrefix": "auto"
+                "nicknamePrefix": "auto",
+                "restockOnlyWhenExhausted": true,
+                "restockUsableThreshold": 2,
+                "lowQuotaThreshold": 500
             }
         });
 

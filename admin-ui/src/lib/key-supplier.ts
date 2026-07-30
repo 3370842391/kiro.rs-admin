@@ -7,6 +7,7 @@ import type {
   SupplierEvent,
   SupplierEventPage,
   SupplierEventStatus,
+  SupplierPoolConfig,
   SupplierKind,
 } from '@/types/api'
 
@@ -24,6 +25,9 @@ export function buildSupplierConfigPayload(update: SupplierConfigUpdate): Suppli
     groups: [...update.groups],
     sourceChannel: update.sourceChannel,
     nicknamePrefix: update.nicknamePrefix,
+    restockOnlyWhenExhausted: update.restockOnlyWhenExhausted,
+    restockUsableThreshold: update.restockUsableThreshold,
+    lowQuotaThreshold: update.lowQuotaThreshold,
   }
 
   const apiKey = update.apiKey?.trim()
@@ -56,6 +60,16 @@ export function buildSupplierEntryPayload(update: SupplierEntryUpdate): Supplier
 const supplierKindLabels: Record<SupplierKind, string> = {
   'kiro-rs': '号商（kiro.rs 协议）',
   'kiro-app': 'kiroapp.cc',
+  'kiroapp-io': 'kiroapp.io',
+}
+
+/** Default base URL per protocol, so operators rarely have to type it. */
+const supplierKindBaseUrls: Record<SupplierKind, string> = {
+  'kiro-rs': '',
+  'kiro-app': 'https://kiroapp.cc',
+  // Their docs say `http://`, but the token and key travel in the clear over it.
+  // Default to https and let the operator downgrade if the host really lacks TLS.
+  'kiroapp-io': 'https://kiroapp.io',
 }
 
 export function getSupplierKindLabel(kind: SupplierKind): string {
@@ -93,7 +107,7 @@ export function emptySupplierEntry(kind: SupplierKind): SupplierEntryUpdate {
     name: '',
     kind,
     enabled: true,
-    baseUrl: kind === 'kiro-app' ? 'https://kiroapp.cc' : '',
+    baseUrl: supplierKindBaseUrls[kind] ?? '',
     publicBaseUrl: '',
     autoPurchase: true,
     autoDeleteForbidden: false,
@@ -105,6 +119,10 @@ export function emptySupplierEntry(kind: SupplierKind): SupplierEntryUpdate {
     groups: [],
     sourceChannel: 'Webhook 自动采购',
     nicknamePrefix: '自动采购',
+    // 新建默认开启补货闸：供货商不停推到货时，不加闸就是每次都掏钱。
+    restockOnlyWhenExhausted: true,
+    restockUsableThreshold: 0,
+    lowQuotaThreshold: 0,
   }
 }
 
@@ -126,6 +144,9 @@ export function toSupplierEntryUpdate(entry: SupplierEntryView): SupplierEntryUp
     groups: [...entry.groups],
     sourceChannel: entry.sourceChannel,
     nicknamePrefix: entry.nicknamePrefix,
+    restockOnlyWhenExhausted: entry.restockOnlyWhenExhausted,
+    restockUsableThreshold: entry.restockUsableThreshold,
+    lowQuotaThreshold: entry.lowQuotaThreshold,
   }
 }
 
@@ -135,6 +156,36 @@ export function parseSupplierNumberDraft(value: string, minimum: number): number
 
   const parsed = Number(normalized)
   return Number.isSafeInteger(parsed) && parsed >= minimum ? parsed : null
+}
+
+export const MAX_POOL_TARGET = 10_000
+export const MAX_POOL_LOW_QUOTA_THRESHOLD = 100_000
+
+/** Blank global pool config. Off by default so upgrading changes nothing. */
+export function emptySupplierPool(): SupplierPoolConfig {
+  return { enabled: false, targetCount: 0, lowQuotaThreshold: 0 }
+}
+
+/**
+ * Why the pool form can be saved at all while disabled: a stale `targetCount` on a
+ * disabled pool participates in no decision, so blocking the save would strand users
+ * who just want to turn the feature off.
+ *
+ * Enabling, on the other hand, requires an explicit target. `0` is the "not configured"
+ * sentinel — accepting it would let someone believe they capped purchasing when in fact
+ * every arrival gets skipped (or worse, a default gets guessed and money is spent).
+ */
+export function validateSupplierPool(draft: SupplierPoolConfig): string | null {
+  if (draft.lowQuotaThreshold < 0 || draft.lowQuotaThreshold > MAX_POOL_LOW_QUOTA_THRESHOLD) {
+    return `额度水位必须在 0..=${MAX_POOL_LOW_QUOTA_THRESHOLD} 之间`
+  }
+  if (draft.enabled && (draft.targetCount < 1 || draft.targetCount > MAX_POOL_TARGET)) {
+    return `启用号池时目标存量必须在 1..=${MAX_POOL_TARGET} 之间`
+  }
+  if (!draft.enabled && (draft.targetCount < 0 || draft.targetCount > MAX_POOL_TARGET)) {
+    return `目标存量必须在 0..=${MAX_POOL_TARGET} 之间`
+  }
+  return null
 }
 
 const supplierEventStatusLabels: Record<SupplierEventStatus, string> = {

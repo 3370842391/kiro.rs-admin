@@ -20,36 +20,36 @@ use super::{
         download_error_snapshot, enable_overage_all, error_snapshot_storage, export_credentials,
         fetch_model_profile, force_refresh_token, get_account_throttle_config, get_all_credentials,
         get_cache_hit_rate, get_cache_policy, get_compatibility_config, get_credential_balance,
-        get_credential_models, get_endpoint_chains, get_endpoint_mode, get_error_snapshot,
-        get_error_snapshot_payload, get_global_proxy, get_image_budget, get_load_balancing_mode,
-        get_dead_credential_config, get_log_governance_config, get_model_profiles, get_profit_config, get_proxy_balancing_mode,
-        get_proxy_pool, get_retry_policy, get_update_config, list_client_keys,
-        list_error_snapshots, list_groups, list_model_mappings, list_traces, patch_model_profile,
-        pin_error_snapshot, poll_idc_login, poll_idc_relogin, poll_social_login,
-        poll_social_relogin, preview_model_profiles, profit_report, pull_update_image,
-        replace_model_mappings, reset_all_success_count, reset_client_key_stats,
+        get_credential_models, get_dead_credential_config, get_endpoint_chains, get_endpoint_mode,
+        get_error_snapshot, get_error_snapshot_payload, get_global_proxy, get_image_budget,
+        get_load_balancing_mode, get_log_governance_config, get_model_profiles, get_profit_config,
+        get_proxy_balancing_mode, get_proxy_pool, get_retry_policy, get_update_config,
+        list_client_keys, list_error_snapshots, list_groups, list_model_mappings, list_traces,
+        patch_model_profile, pin_error_snapshot, poll_idc_login, poll_idc_relogin,
+        poll_social_login, poll_social_relogin, preview_model_profiles, profit_report,
+        pull_update_image, replace_model_mappings, reset_all_success_count, reset_client_key_stats,
         reset_failure_count, reset_success_count, rollback_image_update, rotate_client_key,
         set_account_throttle_config, set_cache_hit_rate, set_cache_policy, set_client_key_disabled,
         set_compatibility_config, set_credential_disabled, set_credential_overage,
-        set_credential_priority, set_endpoint_chains, set_endpoint_mode, set_global_proxy,
-        set_dead_credential_config, set_image_budget, set_load_balancing_mode,
-        set_log_governance_config,
-        set_model_profile_settings, set_profit_config, set_proxy_balancing_mode, set_proxy_enabled,
-        set_retry_policy, set_update_config, start_idc_login, start_idc_relogin,
-        start_social_login, start_social_relogin, stats_by_credential, stats_by_model,
-        stats_overview, stats_timeseries, sync_model_profiles, test_credential_response,
-        trace_failure_stats, unpin_error_snapshot, update_admin_key, update_client_key,
-        update_credential, update_group, update_refresh_token, upsert_model_mapping,
+        set_credential_priority, set_dead_credential_config, set_endpoint_chains,
+        set_endpoint_mode, set_global_proxy, set_image_budget, set_load_balancing_mode,
+        set_log_governance_config, set_model_profile_settings, set_profit_config,
+        set_proxy_balancing_mode, set_proxy_enabled, set_retry_policy, set_update_config,
+        start_idc_login, start_idc_relogin, start_social_login, start_social_relogin,
+        stats_by_credential, stats_by_model, stats_overview, stats_timeseries, sync_model_profiles,
+        test_credential_response, trace_failure_stats, unpin_error_snapshot, update_admin_key,
+        update_client_key, update_credential, update_group, update_refresh_token,
+        upsert_model_mapping,
     },
     key_supplier::handlers::{
         create_supplier as create_key_supplier, delete_supplier as delete_key_supplier,
-        get_config as get_key_supplier_config, list_events as list_key_supplier_events,
-        list_suppliers as list_key_suppliers, mark_events_read,
-        overview as key_supplier_overview, purchase as key_supplier_purchase,
-        put_config as put_key_supplier_config,
+        get_config as get_key_supplier_config, get_pool as get_key_supplier_pool,
+        list_events as list_key_supplier_events, list_suppliers as list_key_suppliers,
+        mark_events_read, overview as key_supplier_overview,
+        pool_status as key_supplier_pool_status, purchase as key_supplier_purchase,
+        put_config as put_key_supplier_config, put_pool as put_key_supplier_pool,
         register_supplier_webhook as register_single_key_supplier_webhook,
-        register_webhook as register_key_supplier_webhook,
-        retry_event as retry_key_supplier_event,
+        register_webhook as register_key_supplier_webhook, retry_event as retry_key_supplier_event,
         supplier_callback_url as key_supplier_callback_url,
         supplier_overview as single_key_supplier_overview,
         supplier_purchase as single_key_supplier_purchase,
@@ -206,6 +206,11 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/config/key-supplier",
             get(get_key_supplier_config).put(put_key_supplier_config),
         )
+        .route(
+            "/key-supplier/pool",
+            get(get_key_supplier_pool).put(put_key_supplier_pool),
+        )
+        .route("/key-supplier/pool/status", get(key_supplier_pool_status))
         .route("/key-supplier/overview", get(key_supplier_overview))
         .route("/key-supplier/purchase", post(key_supplier_purchase))
         .route(
@@ -410,6 +415,30 @@ mod tests {
         create_admin_router(state)
     }
 
+    /// 号池路由测试用的最小供货商配置。
+    fn pool_test_runtime() -> SupplierRuntimeConfig {
+        SupplierRuntimeConfig {
+            base_url: String::new(),
+            api_key: "supplier-api-key-canary".to_string(),
+            public_base_url: "https://public.example".to_string(),
+            webhook_token: "b".repeat(64),
+            webhook_secret: String::new(),
+            auto_purchase: false,
+            auto_delete_forbidden: false,
+            min_purchase: 1,
+            max_purchase: 10,
+            api_region: "us-east-1".to_string(),
+            rpm_limit: 0,
+            priority: 0,
+            groups: Vec::new(),
+            source_channel: "Webhook 自动采购".to_string(),
+            nickname_prefix: "supplier".to_string(),
+            restock_only_when_exhausted: false,
+            restock_usable_threshold: 0,
+            low_quota_threshold: 0,
+        }
+    }
+
     fn key_supplier_test_app() -> (Router, String, Arc<KeySupplierService>) {
         let token = "a".repeat(64);
         let runtime = SupplierRuntimeConfig {
@@ -428,6 +457,9 @@ mod tests {
             groups: Vec::new(),
             source_channel: "supplier".to_string(),
             nickname_prefix: "supplier".to_string(),
+            restock_only_when_exhausted: false,
+            restock_usable_threshold: 0,
+            low_quota_threshold: 0,
         };
         let supplier = Arc::new(KeySupplierService::new(
             Arc::new(SupplierEventStore::open_in_memory().unwrap()),
@@ -478,6 +510,14 @@ mod tests {
             _: KiroCredentials,
         ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
             Box::pin(async { Ok(()) })
+        }
+
+        fn supplier_health(
+            &self,
+            _supplier_id: &str,
+            _low_quota_threshold: f64,
+        ) -> crate::kiro::token_manager::SupplierCredentialHealth {
+            crate::kiro::token_manager::SupplierCredentialHealth::default()
         }
     }
 
@@ -638,7 +678,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        assert!(supplier.store().list(1, None, None).unwrap().items.is_empty());
+        assert!(
+            supplier
+                .store()
+                .list(1, None, None)
+                .unwrap()
+                .items
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -662,7 +709,14 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        assert!(supplier.store().list(1, None, None).unwrap().items.is_empty());
+        assert!(
+            supplier
+                .store()
+                .list(1, None, None)
+                .unwrap()
+                .items
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -678,6 +732,9 @@ mod tests {
             ("GET", "/api/admin/key-supplier/events"),
             ("POST", "/api/admin/key-supplier/events/read"),
             ("POST", "/api/admin/key-supplier/events/1/retry"),
+            ("GET", "/api/admin/key-supplier/pool"),
+            ("PUT", "/api/admin/key-supplier/pool"),
+            ("GET", "/api/admin/key-supplier/pool/status"),
         ] {
             let response = app
                 .clone()
@@ -696,6 +753,80 @@ mod tests {
                 "{method} {path}"
             );
         }
+    }
+
+    /// 号池端点：读、写、状态查询，以及校验错误必须把取值范围说清楚。
+    ///
+    /// 校验提示是运维在管理端唯一能看到的信息，只回一句「invalid request」
+    /// 等于让人去猜。
+    #[tokio::test]
+    async fn key_supplier_pool_routes_read_write_and_report_validation_ranges() {
+        // 状态查询需要凭据统计，因此这里必须挂 importer——不挂的话
+        // `pool_status` 会正确地报 503（统计不到号池就该说不可用）。
+        let supplier = Arc::new(KeySupplierService::with_importer(
+            Arc::new(SupplierEventStore::open_in_memory().unwrap()),
+            pool_test_runtime(),
+            Arc::new(AcceptingImporter),
+        ));
+        let app = key_supplier_admin_app(supplier);
+        let authorized = |method: &str, path: &str, body: Body| {
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header("x-api-key", "test-admin-key")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(body)
+                .unwrap()
+        };
+
+        // 默认未启用，使升级后行为不变。
+        let response = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                "/api/admin/key-supplier/pool",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["enabled"], false);
+        assert_eq!(json["targetCount"], 0);
+
+        // 启用但没填目标存量 → 400 且提示取值范围。
+        let response = app
+            .clone()
+            .oneshot(authorized(
+                "PUT",
+                "/api/admin/key-supplier/pool",
+                Body::from(r#"{"enabled":true,"targetCount":0,"lowQuotaThreshold":0}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let message = String::from_utf8_lossy(&body);
+        assert!(
+            message.contains("1..=10000"),
+            "校验提示要给出取值范围: {message}"
+        );
+
+        // 状态查询是纯读，未配置时也要能返回。
+        let response = app
+            .oneshot(authorized(
+                "GET",
+                "/api/admin/key-supplier/pool/status",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["deficit"], 0);
+        assert!(json["matchedChannels"].is_array());
     }
 
     #[tokio::test]
@@ -784,6 +915,7 @@ mod tests {
                 event_id: "ffffffffffffffffffffffffffffffff".to_string(),
                 event_type: "new_keys_available".to_string(),
                 purchase_order_id: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()),
+                supplier_batch_id: None,
                 message: None,
                 quantity: 1,
             })
@@ -890,6 +1022,9 @@ mod tests {
                 groups: Vec::new(),
                 source_channel: "supplier".to_string(),
                 nickname_prefix: "supplier".to_string(),
+                restock_only_when_exhausted: false,
+                restock_usable_threshold: 0,
+                low_quota_threshold: 0,
             },
             Arc::new(AcceptingImporter),
         ));

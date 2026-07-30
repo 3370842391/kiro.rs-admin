@@ -317,7 +317,9 @@ async fn main() {
     if let Some(store) = &trace_store {
         store.spawn_writer();
     }
-    usage_recorder.clone().spawn_flusher(std::time::Duration::from_secs(2));
+    usage_recorder
+        .clone()
+        .spawn_flusher(std::time::Duration::from_secs(2));
     client_key_manager
         .clone()
         .spawn_flusher(std::time::Duration::from_secs(5));
@@ -376,8 +378,8 @@ async fn main() {
             loop {
                 // 每轮重新读取，管理端改完保留期后下一轮即生效，无需重启
                 let hours = u64::from(manager.dead_credential_retention_hours());
-                let removed = manager
-                    .cleanup_dead_credentials(std::time::Duration::from_secs(hours * 3600));
+                let removed =
+                    manager.cleanup_dead_credentials(std::time::Duration::from_secs(hours * 3600));
                 if removed > 0 {
                     tracing::info!("已清理 {} 个超过 {} 小时保留期的判死凭据", removed, hours);
                 }
@@ -552,6 +554,13 @@ async fn main() {
                 .service
                 .start_balance_refresher(std::time::Duration::from_secs(300));
 
+            // 把余额缓存接到供货商补货闸上，让「额度水位」判定能拿到剩余额度。
+            // 必须在这里做而不是构造时：供货商服务先于 AdminService 建好。
+            // 漏掉这步是静默降级——补货只认封号与 402，额度快用光的号仍算可用。
+            if let Some(supplier_service) = key_supplier_service.as_ref() {
+                supplier_service.set_quota_source(admin_state.service.clone());
+            }
+
             // 启动代理池健康检查调度器（每 5 分钟一次）
             admin_state
                 .service
@@ -663,13 +672,37 @@ fn initialize_key_supplier_service(
             return None;
         }
     };
+    // 全局号池配置。校验失败时**不能**退回默认值（等于关闭）——那会让系统回到
+    // 不受限的逐家采购继续花钱，而用户配这个功能的意图明显是要限制采购。
+    // 装一份「中毒」配置（启用但目标存量 0），使后续每次触发都跳过。
+    let pool = match admin::key_supplier::config::PoolRuntimeConfig::from_persisted(
+        &config.key_supplier_pool,
+    ) {
+        Ok(pool) => pool,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "key supplier pool configuration is invalid; purchases will be skipped until it is fixed"
+            );
+            admin::key_supplier::config::PoolRuntimeConfig::poisoned()
+        }
+    };
+    if pool.enabled {
+        tracing::info!(
+            target_count = pool.target_count,
+            low_quota_threshold = pool.low_quota_threshold,
+            "全局号池已启用：所有采购来的可用号合计不超过目标存量，各家自己的补货闸不再参与判定"
+        );
+    }
+
     let service = Arc::new(
         admin::key_supplier::service::KeySupplierService::new_with_token_manager(
             store,
             suppliers,
             token_manager,
         )
-        .with_config_path(config_path),
+        .with_config_path(config_path)
+        .with_pool_config(pool),
     );
     service.start_processor();
     Some(service)

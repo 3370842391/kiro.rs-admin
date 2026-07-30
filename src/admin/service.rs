@@ -47,25 +47,25 @@ use super::types::{
     CacheHitRateResponse, CachePolicyResponse, CancelLoginResponse, CheckRateLimitRequest,
     ClearCacheResponse, CompatibilityConfigResponse, CompleteSocialLoginRequest,
     CredentialResponseTestResponse, CredentialStatusItem, CredentialsExportResponse,
-    CredentialsStatusResponse, EnableOverageAllResult, EndpointBucketOption,
-    EndpointChainsResponse, EndpointModeResponse, ExportedAccount, ExportedCredentials,
-    FetchModelProfileRequest, GitHubRateLimitInfo, ImageBudgetResponse, ImageUpdateResponse,
-    LoadBalancingModeResponse, LogGovernanceConfigResponse, ModelProfileFieldRefResponse,
-    ModelProfileFieldResponse, ModelProfilePreviewChangeResponse, ModelProfilePreviewResponse,
-    ModelProfileSettingsResponse, ModelProfileSourceSummaryResponse, ModelProfileSyncResponse,
-    ModelProfileSyncSummaryResponse, ModelProfileViewResponse, ModelProfilesResponse,
-    PatchModelProfileRequest, PollIdcLoginResponse, PreviewModelProfilesRequest,
-    ProfitConfigResponse, ProxyBalancingModeResponse, ProxyCheckAllResponse, ProxyCheckResponse,
-    ProxyCheckUrlRequest, ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult,
-    DeadCredentialConfigResponse, ResolvedModelProfileResponse, RetryPolicyResponse,
-    RevisionRequest, RpmSummary, SetDeadCredentialConfigRequest,
-    SetAccountThrottleConfigRequest, SetCacheHitRateRequest, SetCachePolicyRequest,
-    SetCompatibilityConfigRequest, SetEndpointChainsRequest, SetEndpointModeRequest,
-    SetImageBudgetRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
-    SetModelProfileSettingsRequest, SetProfitConfigRequest, SetProxyBalancingModeRequest,
-    SetRetryPolicyRequest, SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse,
-    StartSocialLoginRequest, StartSocialLoginResponse, SyncModelProfilesRequest, UpdateCheckInfo,
-    UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
+    CredentialsStatusResponse, DeadCredentialConfigResponse, EnableOverageAllResult,
+    EndpointBucketOption, EndpointChainsResponse, EndpointModeResponse, ExportedAccount,
+    ExportedCredentials, FetchModelProfileRequest, GitHubRateLimitInfo, ImageBudgetResponse,
+    ImageUpdateResponse, LoadBalancingModeResponse, LogGovernanceConfigResponse,
+    ModelProfileFieldRefResponse, ModelProfileFieldResponse, ModelProfilePreviewChangeResponse,
+    ModelProfilePreviewResponse, ModelProfileSettingsResponse, ModelProfileSourceSummaryResponse,
+    ModelProfileSyncResponse, ModelProfileSyncSummaryResponse, ModelProfileViewResponse,
+    ModelProfilesResponse, PatchModelProfileRequest, PollIdcLoginResponse,
+    PreviewModelProfilesRequest, ProfitConfigResponse, ProxyBalancingModeResponse,
+    ProxyCheckAllResponse, ProxyCheckResponse, ProxyCheckUrlRequest, ProxyPoolEntry,
+    ProxyPoolResponse, QuotaExceededResult, ResolvedModelProfileResponse, RetryPolicyResponse,
+    RevisionRequest, RpmSummary, SetAccountThrottleConfigRequest, SetCacheHitRateRequest,
+    SetCachePolicyRequest, SetCompatibilityConfigRequest, SetDeadCredentialConfigRequest,
+    SetEndpointChainsRequest, SetEndpointModeRequest, SetImageBudgetRequest,
+    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetModelProfileSettingsRequest,
+    SetProfitConfigRequest, SetProxyBalancingModeRequest, SetRetryPolicyRequest,
+    SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
+    StartSocialLoginResponse, SyncModelProfilesRequest, UpdateCheckInfo, UpdateConfigResponse,
+    UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -1450,6 +1450,20 @@ impl AdminService {
         }
     }
 
+    /// 读缓存里的剩余额度。过期或缺失返回 `None`。
+    ///
+    /// 只读缓存不打上游：补货判定跑在 webhook 路径上，不该为它引入一串网络往返。
+    /// 后台每 5 分钟刷一次余额（与 TTL 对齐），数据够新鲜。
+    pub fn cached_remaining_quota(&self, id: u64) -> Option<f64> {
+        let cache = self.balance_cache.lock();
+        let cached = cache.get(&id)?;
+        let now_ts = Utc::now().timestamp() as f64;
+        if (now_ts - cached.cached_at) >= BALANCE_CACHE_TTL_SECS as f64 {
+            return None;
+        }
+        Some(cached.data.remaining)
+    }
+
     /// 设置凭据禁用状态
     pub fn set_disabled(&self, id: u64, disabled: bool) -> Result<(), AdminServiceError> {
         // 先获取当前凭据 ID，用于判断是否需要切换
@@ -1946,7 +1960,13 @@ impl AdminService {
             endpoint: req.endpoint,
             groups: req.groups,
             source_channel: req.source_channel,
+            // 手动/批量导入的凭据不归属任何供货商：它们不该被算进某家的存活数，
+            // 否则会让「这家全死了」永远不成立而卡住补货。
+            supplier_id: None,
+            quota_exhausted_at: None,
             delete_on_forbidden: false,
+            // 手动/批量导入没有采购单价可记。
+            purchase_price: None,
             // 两个时间戳都由 token_manager::add_credential 统一打，
             // 这里留空避免多个入口各写一套导致口径不一致。
             added_at: None,
@@ -3260,9 +3280,7 @@ impl AdminService {
                 .as_ref()
                 .map(|s| s.is_enabled())
                 .unwrap_or(cfg.trace_enabled),
-            auto_compact_diagnostics_enabled: self
-                .token_manager
-                .auto_compact_diagnostics_enabled(),
+            auto_compact_diagnostics_enabled: self.token_manager.auto_compact_diagnostics_enabled(),
             trace_retention_days: self
                 .trace_store
                 .as_ref()
@@ -3338,7 +3356,11 @@ impl AdminService {
         req: &SetDeadCredentialConfigRequest,
     ) -> anyhow::Result<()> {
         use anyhow::Context;
-        let Some(config_path) = self.token_manager.config().config_path().map(|p| p.to_path_buf())
+        let Some(config_path) = self
+            .token_manager
+            .config()
+            .config_path()
+            .map(|p| p.to_path_buf())
         else {
             tracing::warn!("配置文件路径未知，死号治理配置仅在当前进程生效");
             return Ok(());
@@ -4970,6 +4992,12 @@ impl AdminService {
     }
 }
 
+impl crate::admin::key_supplier::service::QuotaSource for AdminService {
+    fn remaining_quota(&self, credential_id: u64) -> Option<f64> {
+        self.cached_remaining_quota(credential_id)
+    }
+}
+
 fn endpoint_mode_response(mode: EndpointMode) -> EndpointModeResponse {
     match mode {
         // 首跳 / 降级链取自 provider 的单一事实源，避免展示值与真实路由分叉
@@ -5594,9 +5622,8 @@ mod tests {
         config.trace_enabled = false;
         config.auto_compact_diagnostics_enabled = true;
         config.save().unwrap();
-        let manager = Arc::new(
-            MultiTokenManager::new(config, Vec::new(), None, None, true).unwrap(),
-        );
+        let manager =
+            Arc::new(MultiTokenManager::new(config, Vec::new(), None, None, true).unwrap());
         let service = AdminService::new(
             Arc::clone(&manager),
             vec!["ide".to_string()],

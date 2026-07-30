@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::kiro::region::validate_api_region;
-use crate::model::config::{Config, KeySupplierConfig, KeySupplierEntryConfig, SupplierKind};
+use crate::model::config::{
+    Config, KeySupplierConfig, KeySupplierEntryConfig, KeySupplierPoolConfig, SupplierKind,
+};
 
 const MAX_URL_CHARS: usize = 2_048;
 const MAX_SECRET_CHARS: usize = 4_096;
@@ -14,6 +16,12 @@ const MAX_GROUP_NAME_CHARS: usize = 64;
 const MAX_SOURCE_CHANNEL_CHARS: usize = 128;
 const MAX_NICKNAME_PREFIX_CHARS: usize = 128;
 const MAX_PURCHASE: u64 = 10_000;
+/// 补货水位上限。比号池现实规模留足余量，同时挡住手滑输入的天文数字
+/// ——水位配得比池子还大等于「永远都买」，那正是这道闸要防的事。
+const MAX_RESTOCK_USABLE_THRESHOLD: u64 = 10_000;
+/// 额度水位上限。上游满额是 10000（KIRO POWER），留一位余量应对更高档位。
+/// 配得比满额还大等于「所有号都算不可用」，也就是每次到货都买。
+const MAX_LOW_QUOTA_THRESHOLD: u64 = 100_000;
 const MAX_RPM_LIMIT: u64 = 100_000;
 const MAX_PRIORITY: u64 = u32::MAX as u64;
 const MAX_SUPPLIER_ID_CHARS: usize = 64;
@@ -149,6 +157,12 @@ pub struct SupplierRuntimeConfig {
     pub groups: Vec<String>,
     pub source_channel: String,
     pub nickname_prefix: String,
+    /// 只在该供货商名下活号数 <= `restock_usable_threshold` 时才自动采购。
+    pub restock_only_when_exhausted: bool,
+    /// 补货水位。0 = 一个能用的都没有了才买。仅在上面那个开关为真时生效。
+    pub restock_usable_threshold: u32,
+    /// 剩余额度 <= 这个数就不算「可用」。0 = 不看额度。
+    pub low_quota_threshold: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -169,6 +183,9 @@ pub struct SupplierConfigView {
     pub groups: Vec<String>,
     pub source_channel: String,
     pub nickname_prefix: String,
+    pub restock_only_when_exhausted: bool,
+    pub restock_usable_threshold: u32,
+    pub low_quota_threshold: u32,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,6 +211,13 @@ pub struct SupplierConfigUpdate {
     pub groups: Vec<String>,
     pub source_channel: String,
     pub nickname_prefix: String,
+    /// 旧前端不发这两个字段，`default` 保持历史行为（每条到货都买）。
+    #[serde(default)]
+    pub restock_only_when_exhausted: bool,
+    #[serde(default)]
+    pub restock_usable_threshold: u64,
+    #[serde(default)]
+    pub low_quota_threshold: u64,
 }
 
 impl std::fmt::Debug for SupplierRuntimeConfig {
@@ -220,6 +244,12 @@ impl std::fmt::Debug for SupplierRuntimeConfig {
             .field("groups", &self.groups)
             .field("source_channel", &self.source_channel)
             .field("nickname_prefix", &self.nickname_prefix)
+            .field(
+                "restock_only_when_exhausted",
+                &self.restock_only_when_exhausted,
+            )
+            .field("restock_usable_threshold", &self.restock_usable_threshold)
+            .field("low_quota_threshold", &self.low_quota_threshold)
             .finish()
     }
 }
@@ -251,6 +281,12 @@ impl std::fmt::Debug for SupplierConfigUpdate {
             .field("groups", &self.groups)
             .field("source_channel", &self.source_channel)
             .field("nickname_prefix", &self.nickname_prefix)
+            .field(
+                "restock_only_when_exhausted",
+                &self.restock_only_when_exhausted,
+            )
+            .field("restock_usable_threshold", &self.restock_usable_threshold)
+            .field("low_quota_threshold", &self.low_quota_threshold)
             .finish()
     }
 }
@@ -279,6 +315,18 @@ impl SupplierRuntimeConfig {
         }
         validate_number_range(update.rpm_limit, "rpmLimit", 0, MAX_RPM_LIMIT)?;
         validate_number_range(update.priority, "priority", 0, MAX_PRIORITY)?;
+        validate_number_range(
+            update.restock_usable_threshold,
+            "restockUsableThreshold",
+            0,
+            MAX_RESTOCK_USABLE_THRESHOLD,
+        )?;
+        validate_number_range(
+            update.low_quota_threshold,
+            "lowQuotaThreshold",
+            0,
+            MAX_LOW_QUOTA_THRESHOLD,
+        )?;
 
         let base_url = normalize_http_origin(&update.base_url, "baseUrl")?;
         let public_base_url = normalize_http_origin(&update.public_base_url, "publicBaseUrl")?;
@@ -332,6 +380,9 @@ impl SupplierRuntimeConfig {
                 "nicknamePrefix",
                 MAX_NICKNAME_PREFIX_CHARS,
             )?,
+            restock_only_when_exhausted: update.restock_only_when_exhausted,
+            restock_usable_threshold: update.restock_usable_threshold as u32,
+            low_quota_threshold: update.low_quota_threshold as u32,
         };
 
         Ok(runtime)
@@ -356,6 +407,9 @@ impl From<&SupplierRuntimeConfig> for KeySupplierConfig {
             groups: value.groups.clone(),
             source_channel: value.source_channel.clone(),
             nickname_prefix: value.nickname_prefix.clone(),
+            restock_only_when_exhausted: value.restock_only_when_exhausted,
+            restock_usable_threshold: value.restock_usable_threshold,
+            low_quota_threshold: value.low_quota_threshold,
         }
     }
 }
@@ -378,6 +432,113 @@ impl From<&SupplierRuntimeConfig> for SupplierConfigView {
             groups: value.groups.clone(),
             source_channel: value.source_channel.clone(),
             nickname_prefix: value.nickname_prefix.clone(),
+            restock_only_when_exhausted: value.restock_only_when_exhausted,
+            restock_usable_threshold: value.restock_usable_threshold,
+            low_quota_threshold: value.low_quota_threshold,
+        }
+    }
+}
+
+/// 全局号池的目标存量上限。与 `MAX_PURCHASE` 同量级：比号池现实规模留足余量，
+/// 同时挡住手滑输入的天文数字。
+pub const MAX_POOL_TARGET: u64 = 10_000;
+
+/// 全局号池的运行期配置。校验过的值才进得来。
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct PoolRuntimeConfig {
+    pub enabled: bool,
+    pub target_count: u32,
+    pub low_quota_threshold: u32,
+}
+
+/// 对外视图。没有 secret，因此与入参字段完全一致，不需要「留空不覆盖」那套处理。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PoolConfigView {
+    pub enabled: bool,
+    pub target_count: u32,
+    pub low_quota_threshold: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PoolConfigUpdate {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub target_count: u64,
+    #[serde(default)]
+    pub low_quota_threshold: u64,
+}
+
+impl PoolRuntimeConfig {
+    /// 校验并规范化一份号池配置。
+    ///
+    /// `enabled` 为假时**跳过数值校验**：关闭状态下的脏数据不该阻塞保存或启动，
+    /// 而它本来就不参与任何判定。开启时才要求 `targetCount` 落在合法区间——
+    /// 这也是「想启用就必须显式填一个数量」的强制点。
+    pub fn normalize(update: PoolConfigUpdate) -> anyhow::Result<Self> {
+        validate_number_range(
+            update.low_quota_threshold,
+            "poolLowQuotaThreshold",
+            0,
+            MAX_LOW_QUOTA_THRESHOLD,
+        )?;
+        if update.enabled {
+            validate_number_range(update.target_count, "poolTargetCount", 1, MAX_POOL_TARGET)?;
+        } else {
+            validate_number_range(update.target_count, "poolTargetCount", 0, MAX_POOL_TARGET)?;
+        }
+        Ok(Self {
+            enabled: update.enabled,
+            target_count: update.target_count as u32,
+            low_quota_threshold: update.low_quota_threshold as u32,
+        })
+    }
+
+    /// 从持久化结构读取。校验失败返回 `Err`，由调用方决定失效方向。
+    ///
+    /// 调用方（启动装配）不应把校验失败当成「关闭该功能」——那等于退回不受限的
+    /// 逐家采购模式偷偷花钱。正确做法见 `poisoned()`。
+    pub fn from_persisted(config: &KeySupplierPoolConfig) -> anyhow::Result<Self> {
+        Self::normalize(PoolConfigUpdate {
+            enabled: config.enabled,
+            target_count: u64::from(config.target_count),
+            low_quota_threshold: u64::from(config.low_quota_threshold),
+        })
+    }
+
+    /// 校验失败时装配的「中毒」配置：启用但目标存量为 0。
+    ///
+    /// 这与直觉相反——直觉是校验失败就关掉这个功能。但关掉意味着退回逐家独立采购、
+    /// 不受任何限制地花钱，而用户配这个功能的意图明显是要限制采购。配错时最坏的
+    /// 结果应该是不买，不是无限制买。目标存量 0 会让每次触发都命中
+    /// 「目标存量不可用」跳过。
+    pub fn poisoned() -> Self {
+        Self {
+            enabled: true,
+            target_count: 0,
+            low_quota_threshold: 0,
+        }
+    }
+}
+
+impl From<&PoolRuntimeConfig> for PoolConfigView {
+    fn from(value: &PoolRuntimeConfig) -> Self {
+        Self {
+            enabled: value.enabled,
+            target_count: value.target_count,
+            low_quota_threshold: value.low_quota_threshold,
+        }
+    }
+}
+
+impl From<&PoolRuntimeConfig> for KeySupplierPoolConfig {
+    fn from(value: &PoolRuntimeConfig) -> Self {
+        Self {
+            enabled: value.enabled,
+            target_count: value.target_count,
+            low_quota_threshold: value.low_quota_threshold,
         }
     }
 }
@@ -432,18 +593,22 @@ pub fn load_suppliers(config: &Config) -> anyhow::Result<(Vec<SupplierEntryRunti
 ///
 /// 同时把第一个 `kiro-rs` 供货商镜像回历史 `keySupplier` 字段：镜像本身不参与读取
 /// （启动时只在 `keySuppliers` 为空才看它），存在的意义是回滚到旧版本后主供货商仍可用。
+///
+/// **没有 `kiro-rs` 条目时必须把镜像清空。** 否则删掉最后一家供货商后 `keySuppliers`
+/// 变成空数组，而残留的镜像仍然「已配置」——下次启动 `load_suppliers` 会把它当历史配置
+/// 迁移回来，复活一家带着原 `autoPurchase` 的供货商，然后开始花钱。
 pub fn store_suppliers(config: &mut Config, entries: &[SupplierEntryRuntime]) {
     config.key_suppliers = entries.iter().map(KeySupplierEntryConfig::from).collect();
-    if let Some(primary) = entries
+    match entries
         .iter()
         .find(|entry| entry.enabled && entry.kind == SupplierKind::KiroRs)
         .or_else(|| {
             entries
                 .iter()
                 .find(|entry| entry.kind == SupplierKind::KiroRs)
-        })
-    {
-        config.key_supplier = KeySupplierConfig::from(&primary.settings);
+        }) {
+        Some(primary) => config.key_supplier = KeySupplierConfig::from(&primary.settings),
+        None => config.key_supplier = KeySupplierConfig::default(),
     }
 }
 
@@ -504,6 +669,9 @@ fn normalize_persisted(value: &KeySupplierConfig) -> anyhow::Result<SupplierRunt
         groups: value.groups.clone(),
         source_channel: value.source_channel.clone(),
         nickname_prefix: value.nickname_prefix.clone(),
+        restock_only_when_exhausted: value.restock_only_when_exhausted,
+        restock_usable_threshold: u64::from(value.restock_usable_threshold),
+        low_quota_threshold: u64::from(value.low_quota_threshold),
     };
     SupplierRuntimeConfig::normalize(None, update, false)
 }
@@ -602,6 +770,9 @@ mod tests {
             ],
             source_channel: " Webhook 自动采购 ".to_string(),
             nickname_prefix: " 自动采购 ".to_string(),
+            restock_only_when_exhausted: false,
+            restock_usable_threshold: 0,
+            low_quota_threshold: 0,
         }
     }
 
@@ -709,7 +880,15 @@ mod tests {
     fn supplier_ids_are_lowercased_and_restricted_to_url_safe_values() {
         assert_eq!(normalize_supplier_id("  KiroApp  ").unwrap(), "kiroapp");
         assert_eq!(normalize_supplier_id("vendor_1-x").unwrap(), "vendor_1-x");
-        for invalid in ["", "   ", "has space", "slash/es", "dots.", "中文", &"a".repeat(65)] {
+        for invalid in [
+            "",
+            "   ",
+            "has space",
+            "slash/es",
+            "dots.",
+            "中文",
+            &"a".repeat(65),
+        ] {
             assert!(normalize_supplier_id(invalid).is_err(), "{invalid}");
         }
     }
@@ -794,9 +973,155 @@ mod tests {
         assert!(!SupplierConfigView::from(&entries[0].settings).webhook_token_configured);
     }
 
+    fn pool_update(enabled: bool, target: u64, low_quota: u64) -> PoolConfigUpdate {
+        PoolConfigUpdate {
+            enabled,
+            target_count: target,
+            low_quota_threshold: low_quota,
+        }
+    }
+
+    #[test]
+    fn enabling_the_pool_requires_an_explicit_target_count() {
+        // 想启用就必须显式填数量。默认 0 是「未配置」哨兵，不是某个业务默认值——
+        // 放过 0 等于让人以为开了限制、实际上每次都跳过（或更糟，被当默认值去买）。
+        assert!(PoolRuntimeConfig::normalize(pool_update(true, 0, 0)).is_err());
+        assert!(PoolRuntimeConfig::normalize(pool_update(true, 1, 0)).is_ok());
+        assert!(PoolRuntimeConfig::normalize(pool_update(true, MAX_POOL_TARGET, 0)).is_ok());
+        assert!(PoolRuntimeConfig::normalize(pool_update(true, MAX_POOL_TARGET + 1, 0)).is_err());
+    }
+
+    #[test]
+    fn disabled_pool_config_skips_numeric_validation() {
+        // 关闭状态下的脏数据不该阻塞保存或启动——它本来就不参与任何判定。
+        let disabled = PoolRuntimeConfig::normalize(pool_update(false, 0, 0)).unwrap();
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.target_count, 0);
+
+        // 但越界值仍然拒绝：那是手滑而不是「未配置」。
+        assert!(PoolRuntimeConfig::normalize(pool_update(false, MAX_POOL_TARGET + 1, 0)).is_err());
+    }
+
+    #[test]
+    fn pool_low_quota_threshold_is_range_checked() {
+        assert!(PoolRuntimeConfig::normalize(pool_update(true, 3, 0)).is_ok());
+        assert!(
+            PoolRuntimeConfig::normalize(pool_update(true, 3, MAX_LOW_QUOTA_THRESHOLD)).is_ok()
+        );
+        assert!(
+            PoolRuntimeConfig::normalize(pool_update(true, 3, MAX_LOW_QUOTA_THRESHOLD + 1))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn poisoned_pool_config_fails_closed_instead_of_falling_back_to_unlimited_buying() {
+        // 校验失败时不能「关掉这个功能」——那等于退回不受限的逐家采购继续花钱。
+        // 中毒配置是启用但目标存量 0，使每次触发都跳过。
+        let poisoned = PoolRuntimeConfig::poisoned();
+        assert!(poisoned.enabled, "关掉就退回不受限采购了");
+        assert_eq!(
+            poisoned.target_count, 0,
+            "0 会让每次触发都命中「目标存量不可用」"
+        );
+    }
+
+    #[test]
+    fn pool_config_round_trips_through_json_and_missing_block_means_disabled() {
+        let runtime = PoolRuntimeConfig::normalize(pool_update(true, 7, 500)).unwrap();
+        let persisted = KeySupplierPoolConfig::from(&runtime);
+
+        let json = serde_json::to_string(&persisted).unwrap();
+        let parsed: KeySupplierPoolConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, persisted);
+        assert_eq!(PoolRuntimeConfig::from_persisted(&parsed).unwrap(), runtime);
+
+        // camelCase 线格式写死：字段名一变，线上配置就读不回来。
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["enabled"], true);
+        assert_eq!(value["targetCount"], 7);
+        assert_eq!(value["lowQuotaThreshold"], 500);
+
+        // 缺整块 = 未启用，使老 config.json 升级后行为不变。
+        let empty: KeySupplierPoolConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, KeySupplierPoolConfig::default());
+        assert!(!empty.enabled);
+        assert!(!PoolRuntimeConfig::from_persisted(&empty).unwrap().enabled);
+    }
+
+    #[test]
+    fn deleting_the_last_supplier_clears_the_legacy_mirror_so_it_cannot_resurrect() {
+        // 复活路径：删光供货商 → `keySuppliers` 变空 → 启动时 `load_suppliers` 看到
+        // legacy 镜像「已配置」就把它迁移回来，于是一家带着 autoPurchase 的供货商
+        // 自己回来了，然后开始花钱。镜像必须跟着一起清掉。
+        let mut config = Config::default();
+        config.key_supplier.base_url = "https://legacy.example".to_string();
+        config.key_supplier.api_key = "legacy-key".to_string();
+        config.key_supplier.webhook_token = "a".repeat(64);
+        config.key_supplier.auto_purchase = true;
+
+        let (entries, migrated) = load_suppliers(&config).unwrap();
+        assert!(migrated);
+        assert_eq!(entries.len(), 1);
+
+        // 迁移落盘：此时镜像和列表都在。
+        store_suppliers(&mut config, &entries);
+        assert!(!config.key_suppliers.is_empty());
+        assert!(KeySupplierEntryConfig::legacy_is_configured(
+            &config.key_supplier
+        ));
+
+        // 删掉唯一一家。
+        store_suppliers(&mut config, &[]);
+        assert!(config.key_suppliers.is_empty());
+        assert!(
+            !KeySupplierEntryConfig::legacy_is_configured(&config.key_supplier),
+            "镜像没清空，重启会把删掉的供货商迁移回来"
+        );
+
+        // 模拟重启：不该再长出任何供货商。
+        let (after_restart, migrated_again) = load_suppliers(&config).unwrap();
+        assert!(after_restart.is_empty());
+        assert!(!migrated_again);
+    }
+
+    #[test]
+    fn deleting_the_last_kiro_rs_supplier_clears_the_mirror_but_keeps_the_others() {
+        // 只剩非 kiro-rs 供货商时镜像也要清（镜像只服务 kiro-rs 的版本回滚），
+        // 但列表本身不能被动到。
+        let mut config = Config::default();
+        config.key_supplier.base_url = "https://legacy.example".to_string();
+        config.key_supplier.api_key = "legacy-key".to_string();
+
+        let mut io = SupplierEntryRuntime {
+            id: "io".to_string(),
+            name: "kiroapp.io".to_string(),
+            kind: SupplierKind::KiroAppIo,
+            enabled: true,
+            settings: SupplierRuntimeConfig::normalize_standalone(valid_update(), None).unwrap(),
+        };
+        io.settings.api_key = "km_secret".to_string();
+
+        store_suppliers(&mut config, std::slice::from_ref(&io));
+
+        assert_eq!(config.key_suppliers.len(), 1);
+        assert_eq!(config.key_suppliers[0].id, "io");
+        assert!(
+            !KeySupplierEntryConfig::legacy_is_configured(&config.key_supplier),
+            "没有 kiro-rs 条目时镜像必须清空"
+        );
+
+        // 列表非空，启动时根本不看镜像，读回来还是那一家。
+        let (entries, migrated) = load_suppliers(&config).unwrap();
+        assert!(!migrated);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, SupplierKind::KiroAppIo);
+    }
+
     #[test]
     fn debug_does_not_expose_supplier_runtime_secrets() {
-        let mut runtime = SupplierRuntimeConfig::normalize_standalone(valid_update(), None).unwrap();
+        let mut runtime =
+            SupplierRuntimeConfig::normalize_standalone(valid_update(), None).unwrap();
         runtime.api_key = "runtime-api-key-canary".to_string();
         runtime.webhook_token = "runtime-webhook-token-canary".to_string();
 

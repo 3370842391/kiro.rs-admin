@@ -8,15 +8,25 @@ pub(crate) struct ToolContract {
 pub(crate) enum ToolInputViolation {
     UndeclaredTool,
     MissingRequired(String),
-    TypeMismatch { path: String, expected: String },
-    ConstMismatch { path: String },
-    EnumMismatch { path: String },
+    TypeMismatch {
+        path: String,
+        expected: String,
+    },
+    ConstMismatch {
+        path: String,
+    },
+    EnumMismatch {
+        path: String,
+    },
     /// 多余字段。**生产路径已不再构造它**：`additionalProperties: false` 下的多余字段
     /// 改为丢弃（见 `validate_object` 的 `dropped_properties`），只有既有错误快照里的
     /// 历史记录和展示/测试路径还会用到，故保留该变体以免破坏 `display_violation` 口径。
     #[allow(dead_code)]
     AdditionalProperty(String),
-    ConstraintViolation { path: String, keyword: &'static str },
+    ConstraintViolation {
+        path: String,
+        keyword: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -60,8 +70,8 @@ const SAFE_REQUIRED_PROPERTY_ALIASES: &[(&str, &str)] = &[
     ("query", "pattern"),
     // 以下 6 条按线上实测补齐（见 traces `tool ... input violates schema`）：
     // 上游按自身方言吐参，客户端 schema 用另一套命名，此前无别名可用而整轮硬失败。
-    ("content", "text"),      // fs_write：上游 content → 客户端 text
-    ("pattern", "query"),     // grep_search：`query→pattern` 的反向缺失
+    ("content", "text"),       // fs_write：上游 content → 客户端 text
+    ("pattern", "query"),      // grep_search：`query→pattern` 的反向缺失
     ("old_string", "old_str"), // Edit：全称 → 缩写（snake_case）
     ("new_string", "new_str"),
     ("oldString", "oldStr"), // edit：全称 → 缩写（camelCase）
@@ -1495,7 +1505,10 @@ mod tests {
         let mut input = serde_json::json!({"note": "[1, 2, 3]"});
 
         assert!(
-            matches!(validate_and_repair(&schema, &mut input), ToolInputOutcome::Valid),
+            matches!(
+                validate_and_repair(&schema, &mut input),
+                ToolInputOutcome::Valid
+            ),
             "声明为 string 的字段不应被改动"
         );
         assert_eq!(

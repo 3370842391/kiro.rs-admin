@@ -129,6 +129,32 @@ describe('key supplier management UI contract', () => {
     expect(page).toContain('剩余积分')
   })
 
+  test('page offers all three protocols and shows the tiered price range', async () => {
+    const page = await readSource('components/key-supplier-page.tsx')
+
+    expect(page).toContain("'kiroapp-io'")
+    // 阶梯定价必须显示区间：只显示一个数会让人以为总价能预估。
+    expect(page).toContain('keyPriceMax')
+    expect(page).toContain('单价区间')
+    expect(page).toContain('formatKeyPrice')
+    // kiroapp.io 没有签名头，别把用户送去找一个不存在的密钥。
+    expect(page).toContain('Webhook 配置')
+  })
+
+  test('page exposes the restock gate and the pool health that explains its decision', async () => {
+    const page = await readSource('components/key-supplier-page.tsx')
+
+    expect(page).toContain('restockOnlyWhenExhausted')
+    expect(page).toContain('restockUsableThreshold')
+    expect(page).toContain('lowQuotaThreshold')
+    expect(page).toContain('仅在号不够用时补货')
+    // 「为什么没买」必须能在界面上看出来，而不是只能翻日志：
+    // 额度明显快干了但「额度低」一栏还是 0，就说明水位没配或余额源没接上。
+    expect(page).toContain('credentialHealth')
+    expect(page).toContain('quotaExhausted')
+    expect(page).toContain('不可用构成')
+  })
+
   test('page exposes the webhook signing secret and its verification state', async () => {
     const page = await readSource('components/key-supplier-page.tsx')
 
@@ -145,6 +171,46 @@ describe('key supplier management UI contract', () => {
 
     expect(page).toContain('同一条推送重复到达不会重复购买')
     expect(page).toContain('event.webhookDuplicateCount')
+  })
+
+  test('pool card explains the stock-target semantics rather than implying a per-arrival cap', async () => {
+    const page = await readSource('components/key-supplier-page.tsx')
+
+    expect(page).toContain('全局号池')
+    // 语义必须写清是「存量」而不是「每次买几个」，否则用户会按后者理解并配错。
+    expect(page).toContain('目标存量')
+    expect(page).toContain('缺口')
+    expect(page).toContain('谁先推来谁先拿到缺口')
+    expect(page).toContain('getSupplierPoolStatus')
+    expect(page).toContain('validateSupplierPool')
+  })
+
+  test('pool card surfaces the four-way health split so a low usable count is explainable', async () => {
+    const page = await readSource('components/key-supplier-page.tsx')
+
+    // 「池里 10 个号怎么可用数只有 3」——答案必须在界面上，不能只在日志里。
+    expect(page).toContain('poolStatusQuery.data.health.dead')
+    expect(page).toContain('poolStatusQuery.data.health.quotaExhausted')
+    expect(page).toContain('poolStatusQuery.data.health.lowQuota')
+    expect(page).toContain('已判死的号仍留在池子里')
+  })
+
+  test('pool card warns that editing sourceChannel drops legacy purchases from the watermark', async () => {
+    const page = await readSource('components/key-supplier-page.tsx')
+
+    // 备注匹配的已知弱点：改掉 sourceChannel 会让旧号静默不计入，缺口变大后重复采购。
+    expect(page).toContain('byLegacyChannel')
+    expect(page).toContain('只能靠「来源渠道」备注认出来')
+    expect(page).toContain('不再计入水位')
+    expect(page).toContain('matchedChannels')
+  })
+
+  test('per-supplier restock fields say they stop applying once the pool is on', async () => {
+    const page = await readSource('components/key-supplier-page.tsx')
+
+    // 两处水位并存最容易让人误判「为什么没买」，界面必须直说哪一处在生效。
+    expect(page).toContain('不再参与判定')
+    expect(page).toContain('仅作安全上限')
   })
 
   test('page validates supplier ids before creating and locks them afterwards', async () => {
