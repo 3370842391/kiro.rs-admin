@@ -255,6 +255,27 @@ pub struct KeySupplierPoolConfig {
 /// - `KiroAppIo`：kiroapp.io 协议。`Authorization: Bearer km_…` 认证，`/api/me/*`，采购是
 ///   `POST /api/me/purchase`，**带 `client_order_id` 幂等**（因此可安全重试）；阶梯定价，
 ///   实际扣费只认响应里的 `total_debit`；回调地址在对方面板手填。
+/// - `KiroDrop`：Kiro Drop 协议。`X-API-Key: usr-…` 认证，路径与 `kiro-rs` 大体相同
+///   （`/api/my/profile`、`POST /api/my/purchase`、`PUT /api/my/webhook`），带
+///   `client_order_id` 幂等，支持远程注册 webhook。但有四处硬差异，**不能复用
+///   `kiro-rs` 的实现**：
+///   1. 没有 `/api/my/stock`，库存在 `GET /api/status` 的 `keys_stock`
+///   2. 金额字段是**字符串**（`"884.400000"`），不是 JSON 数字
+///   3. 到货推送里**没有** `new_keys` 字段
+///   4. 推送的 `purchase_order_id` 不是 32 位十六进制（形如 `batch_xxx`）
+/// - `KiroCeo`：kiro.ceo 协议。`X-API-Key` 认证，`/api/my/*`，带 32 位十六进制
+///   `client_order_id` 幂等，支持远程注册/测试 webhook，**推送格式与 `kiro-rs`
+///   逐字段一致**（只多一个 `zone`）。但采购与概览有三处硬差异：
+///   1. **没有 `/api/status`**（也没有 `/api/my/status`）。这个站点是 SPA，未命中的
+///      路径会落到前端兜底路由并返回 `200` + HTML，所以按 `kiro-rs` 接会在概览的
+///      JSON 反序列化上炸掉，报出来只是一句「请求失败」，完全看不出是缺接口。
+///   2. 采购响应的 `keys` 是**纯字符串数组**（`["kiro-xxx", …]`），不是
+///      `[{"key": …}]`。按 `kiro-rs` 的 `KeyWire` 解析必然失败——而积分**已经扣了**，
+///      等于钱花了 key 丢了。账号密码另放在 `details` 数组里。
+///   3. key 前缀是 `kiro-` 而不是 `ksk_`。`kiro-rs` 走的是严格前缀校验，会把这些
+///      已付费的 key 全部判为无效。
+///   计费单位是**积分**而不是「还能提几个号」；`quota`/`remaining`/`used_quota`
+///   字段名没变，只是数字含义变了，所以概览可以照读。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 // 三家供货商都确实是 Kiro 号商，`Kiro` 前缀是事实而非冗余；去掉反而看不出卖的是什么。
@@ -266,6 +287,11 @@ pub enum SupplierKind {
     /// 显式 rename：避免依赖 serde 对连续大写的 kebab 化规则，且与 `as_str` 保持一致。
     #[serde(rename = "kiroapp-io")]
     KiroAppIo,
+    /// Kiro Drop。基本照 `kiro-rs` 抄的，但有四处硬差异，见枚举文档注释。
+    KiroDrop,
+    /// kiro.ceo。推送格式与 `kiro-rs` 一致，但采购与概览有三处硬差异，
+    /// 见枚举文档注释。
+    KiroCeo,
 }
 
 impl SupplierKind {
@@ -274,13 +300,19 @@ impl SupplierKind {
             Self::KiroRs => "kiro-rs",
             Self::KiroApp => "kiro-app",
             Self::KiroAppIo => "kiroapp-io",
+            Self::KiroDrop => "kiro-drop",
+            Self::KiroCeo => "kiro-ceo",
         }
     }
 
-    /// 该协议是否能远程注册/测试 webhook。只有 `kiro-rs` 提供注册接口，
-    /// 两家 kiroapp 都只能在对方面板手填回调地址。
+    /// 该协议是否能远程注册/测试 webhook。`kiro-rs`、`kiro-drop`、`kiro-ceo` 都提供
+    /// `PUT /api/my/webhook` 与 `POST /api/my/webhook/test`；两家 kiroapp 都没有
+    /// 注册接口，只能在对方面板手填回调地址。
+    ///
+    /// kiro.ceo 的文档没列 `webhook/test`，但那个端点确实存在（未带密钥探测返回
+    /// 401 而不是落到 SPA 兜底的 200 HTML）。
     pub fn supports_webhook_registration(self) -> bool {
-        matches!(self, Self::KiroRs)
+        matches!(self, Self::KiroRs | Self::KiroDrop | Self::KiroCeo)
     }
 
     /// 采购是否带幂等键。带幂等键才允许在网络抖动/5xx 后重试同一单。
@@ -290,7 +322,10 @@ impl SupplierKind {
     /// HTTP 重试策略仍然在客户端按 `kind` 直接分支决定（那里还要区分具体端点）；
     /// 这个开关用在 409 的语义判定上：只有带幂等键的协议，409 才等于「原单已成交」。
     pub fn purchase_is_idempotent(self) -> bool {
-        matches!(self, Self::KiroRs | Self::KiroAppIo)
+        matches!(
+            self,
+            Self::KiroRs | Self::KiroAppIo | Self::KiroDrop | Self::KiroCeo
+        )
     }
 }
 
@@ -308,6 +343,8 @@ impl std::str::FromStr for SupplierKind {
             "kiro-rs" | "kirors" | "default" => Ok(Self::KiroRs),
             "kiro-app" | "kiroapp" => Ok(Self::KiroApp),
             "kiroapp-io" | "kiroappio" | "kiro-app-io" => Ok(Self::KiroAppIo),
+            "kiro-drop" | "kirodrop" | "drop" => Ok(Self::KiroDrop),
+            "kiro-ceo" | "kiroceo" | "kiro.ceo" | "ceo" => Ok(Self::KiroCeo),
             other => anyhow::bail!("无效的供货商协议类型: {other}"),
         }
     }
@@ -1243,6 +1280,8 @@ mod tests {
             (SupplierKind::KiroRs, "kiro-rs"),
             (SupplierKind::KiroApp, "kiro-app"),
             (SupplierKind::KiroAppIo, "kiroapp-io"),
+            (SupplierKind::KiroDrop, "kiro-drop"),
+            (SupplierKind::KiroCeo, "kiro-ceo"),
         ] {
             assert_eq!(kind.as_str(), wire);
             assert_eq!(serde_json::to_value(kind).unwrap(), serde_json::json!(wire));
@@ -1269,9 +1308,30 @@ mod tests {
         );
         assert!("kiro-io".parse::<SupplierKind>().is_err());
 
+        // kiro-drop 的别名不能撞到别家：drop 协议的金额是字符串，接错会 Decode 失败。
+        assert_eq!(
+            "kirodrop".parse::<SupplierKind>().unwrap(),
+            SupplierKind::KiroDrop
+        );
+        assert_eq!(
+            "drop".parse::<SupplierKind>().unwrap(),
+            SupplierKind::KiroDrop
+        );
+
+        // kiro-ceo 的别名同样不能撞到别家：它的采购响应形状与 kiro-rs 不同，
+        // 接错就是钱扣了 key 解析不出来。
+        for alias in ["kiroceo", "kiro.ceo", "ceo"] {
+            assert_eq!(
+                alias.parse::<SupplierKind>().unwrap(),
+                SupplierKind::KiroCeo
+            );
+        }
+
         // 幂等能力决定能不能重试；接错会导致重复扣费。
         assert!(SupplierKind::KiroRs.purchase_is_idempotent());
         assert!(SupplierKind::KiroAppIo.purchase_is_idempotent());
+        assert!(SupplierKind::KiroDrop.purchase_is_idempotent());
+        assert!(SupplierKind::KiroCeo.purchase_is_idempotent());
         assert!(!SupplierKind::KiroApp.purchase_is_idempotent());
     }
 

@@ -567,10 +567,14 @@ fn service_error_response(error_value: SupplierServiceError) -> Response {
         SupplierServiceError::Store
         | SupplierServiceError::ConfigPathUnavailable
         | SupplierServiceError::ConfigPersistence => unavailable(),
-        SupplierServiceError::SupplierApi { .. } => error(
+        // 诊断必须回到界面。只回一句 "request failed" 的话，运维分不出是 401、
+        // 跨协议跳转把 Authorization 丢了、还是对方根本没这个接口——只能 SSH 进
+        // 容器逐个 curl 去猜。诊断在 `SupplierError` 里已经脱敏（密钥与 ksk_ 令牌
+        // 被替换）并限长，管理端接口本身也是鉴权后才能调。
+        SupplierServiceError::SupplierApi { diagnostic } => error(
             StatusCode::BAD_GATEWAY,
             "api_error",
-            "supplier API request failed",
+            &format!("supplier API request failed: {diagnostic}"),
         ),
         SupplierServiceError::SupplierNotFound => {
             error(StatusCode::NOT_FOUND, "not_found", "supplier not found")

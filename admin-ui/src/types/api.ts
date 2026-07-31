@@ -1203,9 +1203,12 @@ export type SupplierConfigPayload = Omit<
 
 /**
  * Supplier protocol. `kiro-rs` is the legacy vendor API; `kiro-app` is kiroapp.cc;
- * `kiroapp-io` is kiroapp.io (`/api/me/*`, Bearer `km_…`, idempotent purchases).
+ * `kiroapp-io` is kiroapp.io (`/api/me/*`, Bearer `km_…`, idempotent purchases);
+ * `kiro-drop` is Kiro Drop (`/api/my/*`, `X-API-Key: usr-…`, CNY amounts encoded
+ * as strings, stock reported by `/api/status`); `kiro-ceo` is kiro.ceo (`/api/my/*`,
+ * `X-API-Key`, credit-based pricing, plain-string `keys` array, no `/api/status`).
  */
-export type SupplierKind = 'kiro-rs' | 'kiro-app' | 'kiroapp-io'
+export type SupplierKind = 'kiro-rs' | 'kiro-app' | 'kiroapp-io' | 'kiro-drop' | 'kiro-ceo'
 
 /** One supplier in the multi-supplier list. Settings are flattened by the server. */
 export interface SupplierEntryView extends SupplierConfigView {

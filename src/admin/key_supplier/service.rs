@@ -88,9 +88,14 @@ impl IncomingWebhook {
     /// `kiro-app` 的推送体格式未文档化，走宽容解析。
     pub fn parse(kind: SupplierKind, body: &[u8]) -> Result<Self, SupplierServiceError> {
         match kind {
-            SupplierKind::KiroRs => Self::parse_kiro_rs(body),
+            // kiro.ceo 的推送与 kiro-rs 逐字段一致：`event` / 32 hex `event_id` /
+            // 32 hex `purchase_order_id` / `message` / `new_keys` / `dead`，只多一个
+            // `zone`（多出来的字段被忽略）。而且对方明确要求把 `purchase_order_id`
+            // 原样当 `client_order_id` 用——正是 kiro-rs 的做法。差异全在采购响应那侧。
+            SupplierKind::KiroRs | SupplierKind::KiroCeo => Self::parse_kiro_rs(body),
             SupplierKind::KiroApp => Self::parse_kiro_app(body),
             SupplierKind::KiroAppIo => Self::parse_kiro_app_io(body),
+            SupplierKind::KiroDrop => Self::parse_kiro_drop(body),
         }
     }
 
@@ -196,6 +201,63 @@ impl IncomingWebhook {
                 dead: required_quantity(object, "dead")?,
             }),
             "test" => Ok(Self::Test { event_id, message }),
+            _ => Err(SupplierServiceError::InvalidPayload),
+        }
+    }
+
+    /// Kiro Drop 的推送。字段名与 `kiro-rs` 一致，但有两处必须放宽，否则事件根本
+    /// 落不了库、永远不会触发采购：
+    ///
+    /// 1. **没有 `new_keys` 字段**。`kiro-rs` 那边要求必填且 > 0，这里按 0 处理——
+    ///    实际下单量由号池缺口或 `maxPurchase` 夹逼决定，本来就不依赖推送里的数字。
+    /// 2. **`purchase_order_id` 不是 32 位十六进制**（形如 `batch_xxx`）。它对我们只是
+    ///    批次标识，不能直接当幂等键用（客户端强校验 32 hex），所以放进
+    ///    `supplier_batch_id` 留痕，幂等键改由 `event_id` 确定性派生。
+    ///
+    /// `event_id` 也不走 `required_id` 的 32-hex 强校验：对方文档只写「32 位 ID」，
+    /// 没说是 hex。押错了就是每条推送都 400、整个对接静默失效。它只是去重键，
+    /// 取不到就退化成 body 指纹，同一车重复推仍映射到同一行。
+    ///
+    /// 「所有已配置 Webhook 的用户都会收到全部事件推送」——对方文档明说的。因此
+    /// `all_keys_dead` 这类事件可能是别人家的号死了，绝不能当采购信号；白名单机制
+    /// 已经挡住了，这里只负责如实解析。
+    fn parse_kiro_drop(body: &[u8]) -> Result<Self, SupplierServiceError> {
+        let value: Value =
+            serde_json::from_slice(body).map_err(|_| SupplierServiceError::InvalidJson)?;
+        let object = value
+            .as_object()
+            .ok_or(SupplierServiceError::InvalidPayload)?;
+        let event = object
+            .get("event")
+            .and_then(Value::as_str)
+            .ok_or(SupplierServiceError::InvalidPayload)?;
+        let event_id = optional_id(object, &["event_id", "eventId", "id"])
+            .unwrap_or_else(|| body_fingerprint(body));
+        let message = object
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("Kiro Drop 通知")
+            .to_string();
+
+        match event {
+            "new_keys_available" => Ok(Self::NewKeysAvailable {
+                event_id: event_id.clone(),
+                // 对方的 batch id 不是 32 hex，当不了幂等键；从 event_id 派生一个。
+                purchase_order_id: derive_order_id(&event_id),
+                // 批次号只留痕：Drop 的采购接口不接受定向批次参数。
+                supplier_batch_id: optional_id(object, &["purchase_order_id", "purchaseOrderId"]),
+                message,
+                // 推送不带数量，下单量由号池缺口/配置夹逼决定。
+                new_keys: 0,
+            }),
+            "all_keys_dead" => Ok(Self::AllKeysDead {
+                event_id,
+                message,
+                // 对方带 `dead`，缺了也不算错——这个事件不花钱，只留痕。
+                dead: optional_quantity(object, &["dead"]).unwrap_or(0),
+            }),
+            "test" => Ok(Self::Test { event_id, message }),
+            // 不认识的事件名一律拒收，避免将来新增事件被误当成到货信号。
             _ => Err(SupplierServiceError::InvalidPayload),
         }
     }
@@ -1483,7 +1545,10 @@ impl KeySupplierService {
                     SupplierKind::KiroApp | SupplierKind::KiroAppIo => {
                         u64::from(runtime.max_purchase)
                     }
-                    SupplierKind::KiroRs => client
+                    // Drop 的推送不带数量，库存必须查（否则只能盲发）。它的库存来自
+                    // `/api/status` 的 `keys_stock`，不是 kiro-rs 那个 `/api/my/stock`。
+                    // kiro.ceo 的文档也建议先查 `/api/my/stock` 的 `max` 再提货。
+                    SupplierKind::KiroRs | SupplierKind::KiroDrop | SupplierKind::KiroCeo => client
                         .available_stock()
                         .await
                         .map_err(SupplierServiceError::supplier_api)?,
@@ -3440,6 +3505,152 @@ mod tests {
             IncomingWebhook::Test { .. }
         ));
         assert!(IncomingWebhook::parse(SupplierKind::KiroAppIo, b"not json").is_err());
+    }
+
+    #[test]
+    fn kiro_drop_arrival_survives_the_missing_quantity_and_the_non_hex_batch_id() {
+        // Drop 的到货推送没有 `new_keys`，且 `purchase_order_id` 是 `batch_xxx`。
+        // 按 kiro-rs 的规则解析这两处都会失败，事件根本落不了库、永远不会采购。
+        let body = r#"{"event":"new_keys_available","event_id":"0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+            "purchase_order_id":"batch_20260731_01","message":"新一批 Key 已上架"}"#;
+
+        let first = IncomingWebhook::parse(SupplierKind::KiroDrop, body.as_bytes()).unwrap();
+        let second = IncomingWebhook::parse(SupplierKind::KiroDrop, body.as_bytes()).unwrap();
+
+        let (
+            IncomingWebhook::NewKeysAvailable {
+                event_id,
+                purchase_order_id,
+                supplier_batch_id,
+                new_keys,
+                ..
+            },
+            IncomingWebhook::NewKeysAvailable {
+                purchase_order_id: replayed_order,
+                ..
+            },
+        ) = (first, second)
+        else {
+            panic!("new_keys_available should trigger a purchase");
+        };
+
+        assert_eq!(event_id, "0f1e2d3c4b5a69788796a5b4c3d2e1f0");
+        // 对方的批次号只留痕，不能当幂等键（采购接口硬校验 32 hex）。
+        assert_eq!(supplier_batch_id.as_deref(), Some("batch_20260731_01"));
+        assert_ne!(purchase_order_id, "batch_20260731_01");
+        assert_eq!(purchase_order_id.len(), 32);
+        assert!(
+            purchase_order_id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        );
+        // 幂等键必须对同一事件稳定，否则重推会二次扣费。
+        assert_eq!(purchase_order_id, replayed_order);
+        // 推送不带数量，下单量由号池缺口/配置夹逼决定。
+        assert_eq!(new_keys, 0);
+    }
+
+    #[test]
+    fn kiro_drop_non_arrival_events_never_become_purchase_signals() {
+        // 对方文档明说「所有已配置 Webhook 的用户都会收到全部事件推送」，
+        // 所以 all_keys_dead 可能是别人家的号死了，绝不能当采购信号。
+        let dead = IncomingWebhook::parse(
+            SupplierKind::KiroDrop,
+            br#"{"event":"all_keys_dead","event_id":"e1","dead":5}"#,
+        )
+        .unwrap();
+        assert!(matches!(dead, IncomingWebhook::AllKeysDead { dead: 5, .. }));
+        // `dead` 缺失也不算错——这个事件不花钱，只留痕。
+        assert!(matches!(
+            IncomingWebhook::parse(
+                SupplierKind::KiroDrop,
+                br#"{"event":"all_keys_dead","event_id":"e2"}"#
+            )
+            .unwrap(),
+            IncomingWebhook::AllKeysDead { dead: 0, .. }
+        ));
+        assert!(matches!(
+            IncomingWebhook::parse(
+                SupplierKind::KiroDrop,
+                br#"{"event":"test","event_id":"e3","message":"hi"}"#
+            )
+            .unwrap(),
+            IncomingWebhook::Test { .. }
+        ));
+        // 未来新增的事件名一律拒收，不能被误当成到货信号。
+        assert!(
+            IncomingWebhook::parse(
+                SupplierKind::KiroDrop,
+                br#"{"event":"key_revoked_abuse","event_id":"e4"}"#
+            )
+            .is_err()
+        );
+        assert!(IncomingWebhook::parse(SupplierKind::KiroDrop, b"not json").is_err());
+    }
+
+    #[test]
+    fn kiro_ceo_arrival_reuses_the_vendor_order_id_as_the_idempotency_key() {
+        // 对方文档要求把 `purchase_order_id` 原样当 `client_order_id` 用——重投也只
+        // 成交一次。多出来的 `zone` 字段必须被忽略而不是让整条推送解析失败。
+        let body = r#"{"event":"new_keys_available",
+            "event_id":"7f3a9c2e1b4d5a6f8e9c0b1a2d3e4f5a",
+            "purchase_order_id":"7f3a9c2e1b4d5a6f8e9c0b1a2d3e4f5a",
+            "message":"美国区新增 20 个 Key 已就绪","new_keys":20,"zone":"us"}"#;
+
+        let IncomingWebhook::NewKeysAvailable {
+            event_id,
+            purchase_order_id,
+            new_keys,
+            ..
+        } = IncomingWebhook::parse(SupplierKind::KiroCeo, body.as_bytes()).unwrap()
+        else {
+            panic!("new_keys_available should trigger a purchase");
+        };
+        assert_eq!(event_id, "7f3a9c2e1b4d5a6f8e9c0b1a2d3e4f5a");
+        assert_eq!(purchase_order_id, "7f3a9c2e1b4d5a6f8e9c0b1a2d3e4f5a");
+        assert_eq!(new_keys, 20);
+
+        // 名下号全灭是通知而非采购信号。
+        assert!(matches!(
+            IncomingWebhook::parse(
+                SupplierKind::KiroCeo,
+                br#"{"event":"all_keys_dead","event_id":"3c8d1f0a5b7e2694c1d8a0f3b5e7c9d2",
+                    "message":"dead","dead":12}"#
+            )
+            .unwrap(),
+            IncomingWebhook::AllKeysDead { dead: 12, .. }
+        ));
+    }
+
+    #[test]
+    fn kiro_drop_tolerates_an_event_id_that_is_not_32_hex() {
+        // 对方文档只写「32 位 ID」，没说是 hex。押 kiro-rs 那套强校验就是每条推送都
+        // InvalidPayload——采购永远不会发生，而且从日志上看只是「格式不对」。
+        let body = br#"{"event":"new_keys_available","event_id":"evt_2026_07_31_a"}"#;
+        let IncomingWebhook::NewKeysAvailable {
+            event_id,
+            purchase_order_id,
+            ..
+        } = IncomingWebhook::parse(SupplierKind::KiroDrop, body).unwrap()
+        else {
+            panic!("a non-hex event id must not kill the arrival signal");
+        };
+        // 原样保留，方便和对方后台的投递记录对账。
+        assert_eq!(event_id, "evt_2026_07_31_a");
+        assert_eq!(purchase_order_id.len(), 32);
+
+        // 连 event_id 都没有时退化成 body 指纹：同一车重复推仍映射到同一行，
+        // 靠 (supplier_id, event_id) 唯一索引挡住第二次下单。
+        let anonymous = br#"{"event":"new_keys_available","purchase_order_id":"batch_7"}"#;
+        let other = br#"{"event":"new_keys_available","purchase_order_id":"batch_8"}"#;
+        let id_of =
+            |body: &[u8]| match IncomingWebhook::parse(SupplierKind::KiroDrop, body).unwrap() {
+                IncomingWebhook::NewKeysAvailable { event_id, .. } => event_id,
+                _ => panic!("an arrival push must stay an arrival push"),
+            };
+        assert_eq!(id_of(anonymous), id_of(anonymous));
+        // 不同批次不能塌成同一个去重键，否则第二车永远买不到。
+        assert_ne!(id_of(anonymous), id_of(other));
     }
 
     #[tokio::test]

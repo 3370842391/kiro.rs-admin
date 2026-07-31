@@ -317,7 +317,10 @@ describe('multi-supplier helpers', () => {
   test('new supplier drafts prefill the vendor base url per protocol', () => {
     expect(emptySupplierEntry('kiro-app').baseUrl).toBe('https://kiroapp.cc')
     expect(emptySupplierEntry('kiro-rs').baseUrl).toBe('')
-    for (const kind of ['kiro-rs', 'kiro-app', 'kiroapp-io'] as const) {
+    // Kiro Drop 的文档只给了 `/api` 路径，主机名随部署而变，没有能安全预填的值。
+    expect(emptySupplierEntry('kiro-drop').baseUrl).toBe('')
+    expect(emptySupplierEntry('kiro-ceo').baseUrl).toBe('https://kiro.ceo')
+    for (const kind of ['kiro-rs', 'kiro-app', 'kiroapp-io', 'kiro-drop', 'kiro-ceo'] as const) {
       const draft = emptySupplierEntry(kind)
       expect(draft.kind).toBe(kind)
       expect(draft.enabled).toBe(true)
@@ -335,8 +338,15 @@ describe('multi-supplier helpers', () => {
     expect(getSupplierKindLabel('kiro-app')).toContain('kiroapp')
     expect(getSupplierKindLabel('kiro-rs')).toContain('kiro.rs')
     expect(getSupplierKindLabel('kiroapp-io')).toContain('kiroapp.io')
+    expect(getSupplierKindLabel('kiro-drop')).toContain('Drop')
+    expect(getSupplierKindLabel('kiro-ceo')).toContain('kiro.ceo')
     // 两家 kiroapp 的标签必须能区分，否则下拉框里认不出选了哪家。
     expect(getSupplierKindLabel('kiroapp-io')).not.toBe(getSupplierKindLabel('kiro-app'))
+    // 每个协议都得有人话标签，不能漏一个直接把 wire 名怼给运维。
+    const kinds = ['kiro-rs', 'kiro-app', 'kiroapp-io', 'kiro-drop', 'kiro-ceo'] as const
+    const labels = kinds.map((kind) => getSupplierKindLabel(kind))
+    expect(new Set(labels).size).toBe(labels.length)
+    for (const kind of kinds) expect(labels).not.toContain(kind)
   })
 
   test('new drafts enable the restock gate so a chatty supplier cannot bill on every arrival', () => {

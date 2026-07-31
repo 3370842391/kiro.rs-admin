@@ -61,6 +61,8 @@ const supplierKindLabels: Record<SupplierKind, string> = {
   'kiro-rs': '号商（kiro.rs 协议）',
   'kiro-app': 'kiroapp.cc',
   'kiroapp-io': 'kiroapp.io',
+  'kiro-drop': 'Kiro Drop',
+  'kiro-ceo': 'kiro.ceo',
 }
 
 /** Default base URL per protocol, so operators rarely have to type it. */
@@ -70,6 +72,10 @@ const supplierKindBaseUrls: Record<SupplierKind, string> = {
   // Their docs say `http://`, but the token and key travel in the clear over it.
   // Default to https and let the operator downgrade if the host really lacks TLS.
   'kiroapp-io': 'https://kiroapp.io',
+  // Kiro Drop's docs only document the `/api` path, never the host — it differs per
+  // deployment, so there is nothing safe to prefill.
+  'kiro-drop': '',
+  'kiro-ceo': 'https://kiro.ceo',
 }
 
 export function getSupplierKindLabel(kind: SupplierKind): string {

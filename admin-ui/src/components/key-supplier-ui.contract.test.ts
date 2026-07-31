@@ -129,10 +129,13 @@ describe('key supplier management UI contract', () => {
     expect(page).toContain('剩余积分')
   })
 
-  test('page offers all three protocols and shows the tiered price range', async () => {
+  test('page offers every protocol and shows the tiered price range', async () => {
     const page = await readSource('components/key-supplier-page.tsx')
 
     expect(page).toContain("'kiroapp-io'")
+    // 漏掉一个协议就等于那家供货商在界面上加不进来。
+    expect(page).toContain("'kiro-drop'")
+    expect(page).toContain("'kiro-ceo'")
     // 阶梯定价必须显示区间：只显示一个数会让人以为总价能预估。
     expect(page).toContain('keyPriceMax')
     expect(page).toContain('单价区间')

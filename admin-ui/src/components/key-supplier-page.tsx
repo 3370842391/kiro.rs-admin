@@ -30,7 +30,9 @@ import type {
 } from '@/types/api'
 
 const EVENT_PAGE_SIZE = 20
-const SUPPLIER_KINDS: readonly SupplierKind[] = ['kiro-rs', 'kiro-app', 'kiroapp-io']
+const SUPPLIER_KINDS: readonly SupplierKind[] = [
+  'kiro-rs', 'kiro-app', 'kiroapp-io', 'kiro-drop', 'kiro-ceo',
+]
 
 type SupplierNumericField =
   | 'minPurchase'

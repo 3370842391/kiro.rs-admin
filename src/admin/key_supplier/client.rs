@@ -710,6 +710,272 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn kiro_drop_reads_string_amounts_and_takes_stock_from_the_status_endpoint() {
+        // Drop 把金额编码成字符串（"884.400000"）。复用 kiro-rs 的 wire（u64 字段）
+        // 会直接 Decode 失败，快照就只剩一个 API 错误。
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let profile_seen = seen.clone();
+        let status_seen = seen.clone();
+        let app = Router::new()
+            .route(
+                "/api/my/profile",
+                get(move |request: axum::http::Request<axum::body::Body>| {
+                    let seen = profile_seen.clone();
+                    async move {
+                        // Drop 的令牌前缀是 usr-，但认证头与 kiro-rs 同为 X-API-Key。
+                        assert_eq!(request.headers().get("x-api-key").unwrap(), "usr-secret");
+                        assert!(request.headers().get("authorization").is_none());
+                        seen.lock().unwrap().push(request.uri().path().to_owned());
+                        axum::Json(serde_json::json!({
+                            "name": "user@example.com",
+                            "quota": "2000.000000",
+                            "remaining": "884.400000",
+                            "used_quota": "1115.600000",
+                            "webhook_url": "https://your-server.example/hook"
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/api/status",
+                get(move |request: axum::http::Request<axum::body::Body>| {
+                    let seen = status_seen.clone();
+                    async move {
+                        seen.lock().unwrap().push(request.uri().path().to_owned());
+                        axum::Json(serde_json::json!({
+                            "keys_active": 5, "keys_dead": 0, "keys_stock": 25, "generating": false
+                        }))
+                    }
+                }),
+            );
+        let client =
+            SupplierClient::with_kind(server(app).await, "usr-secret", SupplierKind::KiroDrop)
+                .unwrap();
+
+        let snapshot = client.snapshot().await.unwrap();
+        // 可购买库存来自 keys_stock，不是 keys_active（那是对方已售出且仍活着的）。
+        assert_eq!(snapshot.stock_available, Some(25));
+        // 元转整数向下取整：额度用来判断「够不够买」，宁可少报不能多报。
+        assert_eq!(snapshot.balance, Some(884));
+        let profile = snapshot.profile.unwrap();
+        assert_eq!(profile.quota, 2000);
+        assert_eq!(profile.remaining, 884);
+        assert_eq!(profile.used_quota, 1115);
+        assert_eq!(
+            snapshot.webhook_url.as_deref(),
+            Some("https://your-server.example/hook")
+        );
+        // Drop 没有 /api/my/stock：真去打就是 404。
+        assert!(!seen.lock().unwrap().iter().any(|p| p == "/api/my/stock"));
+        assert_eq!(client.available_stock().await.unwrap(), 25);
+    }
+
+    #[tokio::test]
+    async fn kiro_drop_purchase_parses_the_string_remaining_and_keeps_the_order_id() {
+        // 采购响应的 remaining 也是字符串。解析失败意味着钱已经扣了却拿不到 key。
+        let body = Arc::new(Mutex::new(String::new()));
+        let observed = body.clone();
+        let app = Router::new().route(
+            "/api/my/purchase",
+            post(move |request: axum::http::Request<axum::body::Body>| {
+                let observed = observed.clone();
+                async move {
+                    assert_eq!(request.headers().get("x-api-key").unwrap(), "usr-secret");
+                    let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    *observed.lock().unwrap() = String::from_utf8(bytes.to_vec()).unwrap();
+                    axum::Json(serde_json::json!({
+                        "client_order_id": "0123456789abcdef0123456789abcdef",
+                        "purchased": 2,
+                        "remaining": "884.400000",
+                        "keys": [{"key": "ksk_one"}, {"key": "ksk_two"}]
+                    }))
+                }
+            }),
+        );
+        let client =
+            SupplierClient::with_kind(server(app).await, "usr-secret", SupplierKind::KiroDrop)
+                .unwrap();
+
+        let purchase = client
+            .purchase(2, "0123456789abcdef0123456789abcdef")
+            .await
+            .unwrap();
+        assert_eq!(purchase.purchased, 2);
+        assert_eq!(purchase.remaining, 884);
+        assert_eq!(purchase.keys.len(), 2);
+        // Drop 只报扣完的余额，不报本单扣费额；靠余额差反推不可靠，所以留空不猜。
+        assert_eq!(purchase.points_cost, None);
+        assert_eq!(purchase.unit_price, None);
+
+        let request: serde_json::Value =
+            serde_json::from_str(&body.lock().unwrap().clone()).unwrap();
+        assert_eq!(request["count"], 2);
+        assert_eq!(
+            request["client_order_id"],
+            "0123456789abcdef0123456789abcdef"
+        );
+        // 不发 max_total_cny：没有金额预算能力，凭空填一个数会在涨价时挡掉正常采购。
+        assert!(request.get("max_total_cny").is_none());
+    }
+
+    #[tokio::test]
+    async fn kiro_ceo_overview_never_touches_the_missing_status_endpoint() {
+        // kiro.ceo 是 SPA：未命中的路径落到前端兜底路由，返回 200 + HTML。
+        // 所以「顺手打一发 /api/status」不会报 404，而是在 JSON 反序列化上炸掉，
+        // 界面上只剩一句「请求失败」——这正是按 kiro-rs 协议接会失败的原因。
+        let app = Router::new()
+            .route(
+                "/api/my/profile",
+                get(
+                    |request: axum::http::Request<axum::body::Body>| async move {
+                        assert_eq!(request.headers().get("x-api-key").unwrap(), "ceo-secret");
+                        assert!(request.headers().get("authorization").is_none());
+                        axum::Json(serde_json::json!({
+                            "name": "codekjie", "quota": 6000, "remaining": 4500,
+                            "used_quota": 1500, "webhook_url": "https://admin.example/hook"
+                        }))
+                    },
+                ),
+            )
+            .route(
+                "/api/my/stock",
+                get(|| async { axum::Json(serde_json::json!({"max": 12})) }),
+            )
+            .fallback(|| async {
+                (
+                    axum::http::StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                    "<!DOCTYPE html><html><body><div id=\"app\"></div></body></html>",
+                )
+            });
+        let base = server(app).await;
+        let client = SupplierClient::with_kind(&base, "ceo-secret", SupplierKind::KiroCeo).unwrap();
+
+        let snapshot = client.snapshot().await.unwrap();
+        assert_eq!(snapshot.stock_available, Some(12));
+        // 积分余额：字段名没变，数字含义从「还能提几个号」变成积分。
+        assert_eq!(snapshot.balance, Some(4500));
+        // 没有 status 接口就别假装有一个。
+        assert!(snapshot.status.is_none());
+        assert_eq!(
+            snapshot.webhook_url.as_deref(),
+            Some("https://admin.example/hook")
+        );
+        assert_eq!(client.available_stock().await.unwrap(), 12);
+
+        // 反证：同一个站点用 kiro-rs 协议接就是这么坏的——它会去打 /api/status，
+        // 拿回 200 + HTML 然后在解析上失败。这是「协议选 kiro-rs 为什么失败」的原因。
+        let legacy = SupplierClient::with_kind(&base, "ceo-secret", SupplierKind::KiroRs).unwrap();
+        assert!(matches!(
+            legacy.snapshot().await,
+            Err(SupplierError::Decode(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn kiro_ceo_purchase_keeps_paid_keys_from_a_plain_string_array() {
+        // 两处会让已付费的 key 全丢：`keys` 是纯字符串数组（不是 [{"key":…}]），
+        // 前缀是 kiro- 而不是 ksk_。积分已经扣了，这两处都不能报错。
+        let app = Router::new().route(
+            "/api/my/purchase",
+            post(
+                |request: axum::http::Request<axum::body::Body>| async move {
+                    let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    let sent: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(sent["count"], 3);
+                    // 不发 zone：对方默认美国区，配置里还没有区域字段，乱填会买错区。
+                    assert!(sent.get("zone").is_none());
+                    axum::Json(serde_json::json!({
+                        "client_order_id": "0123456789abcdef0123456789abcdef",
+                        "purchased": 2,
+                        "remaining": 4200,
+                        "keys": ["kiro-aaa", "kiro-bbb"],
+                        "zone": "us",
+                        "unit_price": 15,
+                        "total_credits": 30,
+                        "order_id": "a1b2c3",
+                        "details": [{
+                            "key": "kiro-aaa", "account": "user@example.com", "password": "pw",
+                            "zone": "us", "aws_region": "us-east-1", "issuer_url": "https://idc"
+                        }]
+                    }))
+                },
+            ),
+        );
+        let client =
+            SupplierClient::with_kind(server(app).await, "ceo-secret", SupplierKind::KiroCeo)
+                .unwrap();
+
+        // 申请 3 个拿到 2 个是正常竞争结果，按 purchased 处理而不是按 count。
+        let purchase = client
+            .purchase(3, "0123456789abcdef0123456789abcdef")
+            .await
+            .unwrap();
+        assert_eq!(purchase.purchased, 2);
+        assert_eq!(purchase.keys.len(), 2);
+        assert_eq!(purchase.remaining, 4200);
+        // total_credits 是本单权威扣费额，落库记账靠它。
+        assert_eq!(purchase.points_cost, Some(30));
+        assert_eq!(purchase.unit_price, Some(15.0));
+        assert_eq!(purchase.supplier_order_id.as_deref(), Some("a1b2c3"));
+        assert!(!format!("{purchase:?}").contains("kiro-aaa"));
+    }
+
+    #[tokio::test]
+    async fn kiro_ceo_zero_purchased_is_out_of_stock_and_key_count_must_match() {
+        let app = Router::new().route(
+            "/api/my/purchase",
+            post(|| async {
+                axum::Json(serde_json::json!({
+                    "purchased": 0, "remaining": 4500, "keys": []
+                }))
+            }),
+        );
+        let client =
+            SupplierClient::with_kind(server(app).await, "ceo-secret", SupplierKind::KiroCeo)
+                .unwrap();
+        // 一个都没成交不能记成 succeeded，那会让事件历史看着像买到了。
+        assert!(matches!(
+            client.purchase(3, "0123456789abcdef0123456789abcdef").await,
+            Err(SupplierError::OutOfStock)
+        ));
+
+        let mismatch = Router::new().route(
+            "/api/my/purchase",
+            post(|| async {
+                axum::Json(serde_json::json!({
+                    "purchased": 2, "remaining": 0, "keys": ["kiro-only-one"]
+                }))
+            }),
+        );
+        let client =
+            SupplierClient::with_kind(server(mismatch).await, "ceo-secret", SupplierKind::KiroCeo)
+                .unwrap();
+        assert!(
+            client
+                .purchase(2, "0123456789abcdef0123456789abcdef")
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn kiro_drop_decimal_strings_never_overstate_the_balance() {
+        assert_eq!(decimal_string_to_u64("884.400000"), 884);
+        assert_eq!(decimal_string_to_u64("884.999999"), 884);
+        assert_eq!(decimal_string_to_u64(" 30 "), 30);
+        assert_eq!(decimal_string_to_u64("0.000000"), 0);
+        // 负数、空串、非数字、NaN/Inf 全部按 0 处理——宁可显示没钱也不能虚报余额。
+        for bogus in ["-1.5", "", "abc", "NaN", "inf", "1e400"] {
+            assert_eq!(decimal_string_to_u64(bogus), 0, "{bogus}");
+        }
+    }
+
     #[test]
     fn default_constructor_keeps_the_legacy_protocol() {
         assert_eq!(
@@ -1043,6 +1309,50 @@ impl SupplierClient {
                     status: None,
                 })
             }
+            // Drop 没有 `/api/my/stock`，库存在 `/api/status` 的 `keys_stock`。
+            // 金额字段是字符串，profile 必须走单独的 wire 结构。
+            SupplierKind::KiroDrop => {
+                let profile: KiroDropProfile = self
+                    .request(Method::GET, "/api/my/profile", None, RetryPolicy::Retryable)
+                    .await?;
+                let status = self.status().await?;
+                let webhook_url = profile.webhook_url.clone();
+                Ok(SupplierSnapshot {
+                    stock_available: Some(status.keys_stock),
+                    // Drop 不报单价：价格随行就市，只有 `max_total_cny` 那道保护。
+                    key_price: None,
+                    key_price_max: None,
+                    balance: Some(decimal_string_to_u64(&profile.remaining)),
+                    webhook_url: (!webhook_url.is_empty()).then_some(webhook_url),
+                    profile: Some(Profile {
+                        name: profile.name,
+                        quota: decimal_string_to_u64(&profile.quota),
+                        remaining: decimal_string_to_u64(&profile.remaining),
+                        used_quota: decimal_string_to_u64(&profile.used_quota),
+                        webhook_url: profile.webhook_url,
+                    }),
+                    status: Some(status),
+                })
+            }
+            // kiro.ceo 没有 `/api/status`，也没有 `/api/my/status`。它是个 SPA：
+            // 未命中的路径落到前端兜底路由，返回 200 + HTML。所以按 kiro-rs 那样
+            // 顺手打一发 status，会在 JSON 反序列化上炸掉，而界面只看到「请求失败」。
+            SupplierKind::KiroCeo => {
+                let profile = self.profile().await?;
+                let stock = self.stock().await?;
+                Ok(SupplierSnapshot {
+                    stock_available: Some(stock.max),
+                    // `/api/my/stock` 带各区单价，但字段名对方没文档化。猜错了就是
+                    // 在界面上显示一个错的单价，比不显示更糟。权威单价来自采购响应的
+                    // `unit_price`，那个是按 key 记账落库的。
+                    key_price: None,
+                    key_price_max: None,
+                    balance: Some(profile.remaining),
+                    webhook_url: Some(profile.webhook_url.clone()),
+                    profile: Some(profile),
+                    status: None,
+                })
+            }
             // `/api/me/stock` 一次给齐库存、报价区间和余额，不必再打 profile。
             SupplierKind::KiroAppIo => {
                 let stock: KiroAppIoStock = self
@@ -1064,7 +1374,11 @@ impl SupplierClient {
     /// 库存可用数。`kiro-rs` 是 `/api/my/stock` 的 `max`，`kiro-app` 是 `availableKeys`。
     pub async fn available_stock(&self) -> Result<u64, SupplierError> {
         match self.kind {
-            SupplierKind::KiroRs => Ok(self.stock().await?.max),
+            // kiro.ceo 的 `/api/my/stock` 与 kiro-rs 同形，`max` 是文档化字段。
+            SupplierKind::KiroRs | SupplierKind::KiroCeo => Ok(self.stock().await?.max),
+            // Drop 没有 `/api/my/stock`；`/api/status` 的 `keys_stock` 才是可购买库存
+            // （`keys_active` 是对方已售出且仍活着的数量，不是我们能买的）。
+            SupplierKind::KiroDrop => Ok(self.status().await?.keys_stock),
             SupplierKind::KiroApp => {
                 let stock: KiroAppStock = self
                     .request(Method::GET, "/openapi/stock", None, RetryPolicy::Retryable)
@@ -1117,6 +1431,8 @@ impl SupplierClient {
         }
         match self.kind {
             SupplierKind::KiroRs => self.purchase_kiro_rs(count, client_order_id).await,
+            SupplierKind::KiroDrop => self.purchase_kiro_drop(count, client_order_id).await,
+            SupplierKind::KiroCeo => self.purchase_kiro_ceo(count, client_order_id).await,
             SupplierKind::KiroApp => self.claim_kiro_app(count, client_order_id).await,
             SupplierKind::KiroAppIo => {
                 self.purchase_kiro_app_io(count, client_order_id, supplier_batch_id)
@@ -1187,6 +1503,120 @@ impl SupplierClient {
             // 前缀走宽松校验：钱已经扣了，不能因为前缀不合预期就把 key 扔掉。
             // 每个 key 的单价跟着 key 一起带走：阶梯定价下同一单里各 key 不同价。
             keys: accept_paid_keys(response.keys.into_iter().map(|key| (key.key, key.price)))?,
+        })
+    }
+
+    /// `POST /api/my/purchase`（Kiro Drop）。请求体与 kiro-rs 相同，响应的 `remaining`
+    /// 是字符串。带 `client_order_id` 幂等：同 id 同 count 可安全重试。
+    ///
+    /// 不发 `max_total_cny`：那是可选的总价保护，但我们目前没有金额预算能力，
+    /// 凭空填一个数会在对方涨价时把正常采购挡掉。等做了金额预算再接上。
+    async fn purchase_kiro_drop(
+        &self,
+        count: u32,
+        client_order_id: &str,
+    ) -> Result<Purchase, SupplierError> {
+        let response: KiroDropPurchase = self
+            .request(
+                Method::POST,
+                "/api/my/purchase",
+                Some(serde_json::json!({
+                    "count": count,
+                    "client_order_id": client_order_id,
+                })),
+                RetryPolicy::Retryable,
+            )
+            .await?;
+        // 对方回显了订单号就比对；空串说明这版没回显，不当成错误。
+        if !response.client_order_id.is_empty() && response.client_order_id != client_order_id {
+            return Err(SupplierError::invalid(
+                "purchase response client_order_id mismatch",
+            ));
+        }
+        if response.purchased > count {
+            return Err(SupplierError::invalid(
+                "purchase response purchased exceeds count",
+            ));
+        }
+        if response.keys.len() != response.purchased as usize {
+            return Err(SupplierError::invalid(
+                "purchase response key count mismatch",
+            ));
+        }
+        // 库存不足对方返 404，走不到这里。真收到 0 就当竞争失败跳过。
+        if response.purchased == 0 {
+            return Err(SupplierError::OutOfStock);
+        }
+        Ok(Purchase {
+            client_order_id: client_order_id.to_owned(),
+            purchased: response.purchased,
+            // Drop 的 remaining 是购买后的剩余余额（人民币，字符串）。
+            remaining: decimal_string_to_u64(&response.remaining),
+            // Drop 不报本单扣费额，只报扣完的余额；金额要靠前后余额差反推，
+            // 那不可靠（并发采购会互相干扰），所以这里留空不猜。
+            points_cost: None,
+            unit_price: None,
+            supplier_order_id: None,
+            replayed: false,
+            // 前缀走宽松校验：钱已经扣了，不能因为前缀不合预期就把 key 扔掉。
+            keys: accept_paid_keys(response.keys.into_iter().map(|key| (key.key, key.price)))?,
+        })
+    }
+
+    /// `POST /api/my/purchase`（kiro.ceo）。请求体与 kiro-rs 相同，响应形状不同：
+    /// `keys` 是**纯字符串数组**而不是 `[{"key": …}]`，另有 `unit_price`、
+    /// `total_credits`、`order_id` 和一个带账号密码的 `details` 数组。
+    ///
+    /// 不发 `zone`：对方默认美国区，而我们的配置里还没有区域字段。乱填一个区可能
+    /// 买到用不上的号。等配置加了区域再接上。
+    async fn purchase_kiro_ceo(
+        &self,
+        count: u32,
+        client_order_id: &str,
+    ) -> Result<Purchase, SupplierError> {
+        let response: KiroCeoPurchase = self
+            .request(
+                Method::POST,
+                "/api/my/purchase",
+                Some(serde_json::json!({
+                    "count": count,
+                    "client_order_id": client_order_id,
+                })),
+                RetryPolicy::Retryable,
+            )
+            .await?;
+        if !response.client_order_id.is_empty() && response.client_order_id != client_order_id {
+            return Err(SupplierError::invalid(
+                "purchase response client_order_id mismatch",
+            ));
+        }
+        if response.purchased > count {
+            return Err(SupplierError::invalid(
+                "purchase response purchased exceeds count",
+            ));
+        }
+        if response.keys.len() != response.purchased as usize {
+            return Err(SupplierError::invalid(
+                "purchase response key count mismatch",
+            ));
+        }
+        // 「库存是并发争抢的，申请 5 个拿到 3 个是正常结果」——按 purchased 处理。
+        // 但一个都没成交不能记成 succeeded，那会让事件历史看着像买到了。
+        if response.purchased == 0 {
+            return Err(SupplierError::OutOfStock);
+        }
+        Ok(Purchase {
+            client_order_id: client_order_id.to_owned(),
+            purchased: response.purchased,
+            remaining: response.remaining,
+            // `total_credits` 是本单权威扣费额，`unit_price` 是该区单价。
+            points_cost: response.total_credits,
+            unit_price: response.unit_price,
+            supplier_order_id: response.order_id.filter(|id| !id.trim().is_empty()),
+            replayed: false,
+            // 宽松前缀：kiro.ceo 的 key 是 `kiro-` 前缀而不是 `ksk_`，而积分已经扣了。
+            // 按 kiro-rs 的严格校验会把整单已付费的 key 全判无效——钱花了 key 扔了。
+            keys: accept_paid_keys(response.keys.into_iter().map(|key| (key, None)))?,
         })
     }
 
@@ -1354,7 +1784,10 @@ impl SupplierClient {
         for attempt in 0..attempts {
             let mut request = self.client.request(method.clone(), url.clone());
             request = match self.kind {
-                SupplierKind::KiroRs => request.header("X-API-Key", &self.api_key.0),
+                // Drop 与 kiro.ceo 的认证头都与 kiro-rs 相同（Drop 的令牌前缀是 `usr-`）。
+                SupplierKind::KiroRs | SupplierKind::KiroDrop | SupplierKind::KiroCeo => {
+                    request.header("X-API-Key", &self.api_key.0)
+                }
                 SupplierKind::KiroApp | SupplierKind::KiroAppIo => {
                     request.bearer_auth(&self.api_key.0)
                 }
@@ -1631,6 +2064,85 @@ struct KiroAppStock {
 struct KiroAppBalance {
     #[serde(default)]
     balance: u64,
+}
+
+/// Kiro Drop 把金额编码成**字符串**（`"884.400000"`），不是 JSON 数字。
+///
+/// 直接复用 `Profile` / `PurchaseWire`（字段是 `u64`）会在反序列化时报 Decode 错误。
+/// 采购响应也中招——那意味着钱已经扣了却解析不出 key，所以必须单独一套 wire。
+fn parse_decimal_string(value: &str) -> Option<f64> {
+    value.trim().parse::<f64>().ok().filter(|v| v.is_finite())
+}
+
+/// 把字符串金额转成对外统一的整数额度。
+///
+/// Drop 的单位是人民币元且带 6 位小数，而 `Profile` 对外是 `u64`。向下取整而不是
+/// 四舍五入：额度用于展示与「够不够买」的判断，宁可少报也不能多报。
+fn decimal_string_to_u64(value: &str) -> u64 {
+    parse_decimal_string(value)
+        .filter(|v| *v >= 0.0)
+        .map(|v| v.floor() as u64)
+        .unwrap_or(0)
+}
+
+/// `GET /api/my/profile`（Drop）→ 金额全是字符串。
+#[derive(Deserialize)]
+struct KiroDropProfile {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    quota: String,
+    #[serde(default)]
+    remaining: String,
+    #[serde(default)]
+    used_quota: String,
+    #[serde(default)]
+    webhook_url: String,
+}
+
+/// `POST /api/my/purchase`（Drop）→ `{client_order_id, purchased, remaining(字符串), keys}`。
+///
+/// 与 `kiro-rs` 的 `PurchaseWire` 唯一区别是 `remaining` 的类型，但这一个字段就足以
+/// 让整个响应解析失败，所以不能共用。
+#[derive(Deserialize)]
+struct KiroDropPurchase {
+    #[serde(default)]
+    client_order_id: String,
+    #[serde(default)]
+    purchased: u32,
+    #[serde(default)]
+    remaining: String,
+    #[serde(default)]
+    keys: Vec<KeyWire>,
+}
+
+/// `POST /api/my/purchase`（kiro.ceo）→ `{client_order_id, purchased, remaining,
+/// keys:["kiro-xxx", …], zone, unit_price, total_credits, order_id, details:[…]}`。
+///
+/// `keys` 是**纯字符串数组**，这一处就让 `PurchaseWire`（`Vec<KeyWire>`）整段解析失败，
+/// 而积分**已经扣了**——所以必须单独一套 wire，不能共用。
+///
+/// `details` 里带账号、密码、`issuer_url`、`aws_region`。目前采购链路只落 key 本身
+/// （与其它几家一致），所以先不读；真要用得先把凭据模型对齐，那是另一件事。
+#[derive(Deserialize)]
+struct KiroCeoPurchase {
+    #[serde(default)]
+    client_order_id: String,
+    #[serde(default)]
+    purchased: u32,
+    #[serde(default)]
+    remaining: u64,
+    #[serde(default)]
+    keys: Vec<String>,
+    /// 本单权威扣费总额（积分）。
+    #[serde(default)]
+    total_credits: Option<u64>,
+    /// 该区单价（积分/个）。
+    #[serde(default)]
+    unit_price: Option<f64>,
+    /// 对方订单号，用于和 `/api/my/purchase-orders` 对账。
+    #[serde(default)]
+    order_id: Option<String>,
 }
 
 /// `GET /api/me/stock` → `{stock, price, price_min, price_max, balance}`。
