@@ -2,3 +2,4 @@
 
 pub mod auth;
 pub mod error_snapshot;
+pub mod sse;

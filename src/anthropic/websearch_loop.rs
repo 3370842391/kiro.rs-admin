@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    http::{StatusCode, header},
+    http::StatusCode,
     response::{IntoResponse, Json, Response},
 };
 use bytes::Bytes;
@@ -1004,13 +1004,7 @@ fn render_sse(
             .into_iter()
             .map(|e| Ok::<Bytes, Infallible>(Bytes::from(e.to_sse_string()))),
     );
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(stream))
-        .unwrap()
+    crate::common::sse::sse_response(Body::from_stream(stream))
 }
 
 /// Renders the final content array into a sequence of SSE events

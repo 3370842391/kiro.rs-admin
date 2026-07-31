@@ -25,10 +25,10 @@ use axum::{
     Json as JsonExtractor,
     body::Body,
     extract::{Extension, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
 };
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use chrono::Utc;
 use futures::{Stream, StreamExt, stream};
 use serde_json::json;
@@ -849,14 +849,7 @@ fn local_text_stream_response(events: Vec<SseEvent>) -> Response {
             Some((Ok::<_, Infallible>(chunk), (chunks, false)))
         },
     );
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache, no-transform")
-        .header("x-accel-buffering", "no")
-        .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(body_stream))
-        .unwrap()
+    crate::common::sse::sse_response(Body::from_stream(body_stream))
 }
 
 #[derive(Debug)]
@@ -1416,13 +1409,7 @@ async fn handle_strict_json_request(
                     }),
                 )
                 .to_sse_string();
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "text/event-stream")
-                    .header(header::CACHE_CONTROL, "no-cache")
-                    .header(header::CONNECTION, "keep-alive")
-                    .body(Body::from(body))
-                    .unwrap()
+                crate::common::sse::sse_response(Body::from(body))
             } else {
                 (
                     StatusCode::BAD_GATEWAY,
@@ -3161,13 +3148,7 @@ struct PreparedSseStream {
 async fn prepared_sse_response(prepared: PreparedSseStream) -> Response {
     let PreparedSseStream { stream, start } = prepared;
     match start.await {
-        Ok(StreamStart::Ready) => Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/event-stream")
-            .header(header::CACHE_CONTROL, "no-cache")
-            .header(header::CONNECTION, "keep-alive")
-            .body(Body::from_stream(stream))
-            .unwrap(),
+        Ok(StreamStart::Ready) => crate::common::sse::sse_response(Body::from_stream(stream)),
         Ok(StreamStart::Failed(failure)) => stream_start_failure_response(failure),
         Err(_) => stream_start_canceled_response(),
     }
@@ -3247,6 +3228,8 @@ fn signal_stream_start_failure(
 
 #[cfg(test)]
 mod stream_gate_tests {
+    use axum::http::header;
+
     use super::*;
 
     fn continuation_fixture() -> String {
@@ -3456,6 +3439,12 @@ mod stream_gate_tests {
             response.headers().get(header::CONTENT_TYPE),
             Some(&header::HeaderValue::from_static("text/event-stream"))
         );
+        // 主流式路径必须带反代穿透头，否则客户侧 nginx 会缓冲整条流。
+        assert_eq!(response.headers()["x-accel-buffering"], "no");
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "no-cache, no-transform"
+        );
     }
 }
 
@@ -3493,6 +3482,9 @@ async fn send_sse_events(
     events: Vec<SseEvent>,
     start_tx: &mut Option<tokio::sync::oneshot::Sender<StreamStart>>,
 ) -> bool {
+    if events.is_empty() {
+        return true;
+    }
     let has_visible_content = events.iter().any(is_client_visible_content);
     if has_visible_content {
         mark_first_token_if_visible(tracer, &events);
@@ -3500,12 +3492,19 @@ async fn send_sse_events(
             let _ = tx.send(StreamStart::Ready);
         }
     }
-    for event in events {
-        let bytes = Bytes::from(event.to_sse_string());
-        if sender.send(Ok(bytes)).await.is_err() {
-            return false;
-        }
-        tracer.compaction.observe_client_event_enqueued(&event);
+    // 同一批事件（通常来自同一个上游 chunk）合并成一个 body chunk 再入队。
+    // 逐事件入队会变成「一次通道往返 + 一个 HTTP/1.1 chunk 框架 + 一次 socket 写」×N；
+    // SSE 按 `\n\n` 分帧，合并后客户端收到的字节序列完全一致。
+    let mut payload = BytesMut::new();
+    for event in &events {
+        payload.extend_from_slice(event.to_sse_string().as_bytes());
+    }
+    if sender.send(Ok(payload.freeze())).await.is_err() {
+        return false;
+    }
+    // 入队成功才记账：客户端断开时这批事件从未离开进程，不能算已下发。
+    for event in &events {
+        tracer.compaction.observe_client_event_enqueued(event);
     }
     true
 }
@@ -6142,6 +6141,7 @@ mod tests {
         atomic::{AtomicBool, Ordering},
     };
 
+    use axum::http::header;
     use futures::{StreamExt, future};
 
     use crate::admin::client_keys::ClientResponseMode;
@@ -6604,18 +6604,24 @@ mod tests {
 
     #[tokio::test]
     async fn compaction_diagnostics_preserve_sse_bytes_and_observe_only_successful_enqueue() {
-        async fn collect(enabled: bool) -> (Vec<Bytes>, Option<u64>, String) {
+        async fn collect(enabled: bool) -> (Vec<u8>, Option<u64>, String) {
             let (tracer, _snapshot_store, _trace_store) =
                 test_request_tracer_with_snapshot("trace-compaction-sse", enabled);
             let events = compaction_sse_events();
-            let event_count = events.len();
+            let expected_bytes: Vec<u8> = events
+                .iter()
+                .flat_map(|event| event.to_sse_string().into_bytes())
+                .collect();
             let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
             let mut start_tx = None;
             assert!(send_sse_events(&sender, &tracer, events, &mut start_tx).await);
+            // 一批事件合并成一个 body chunk 下发；契约是「字节流不变」，不是「分片数不变」。
+            drop(sender);
             let mut output = Vec::new();
-            for _ in 0..event_count {
-                output.push(receiver.recv().await.unwrap().unwrap());
+            while let Some(chunk) = receiver.recv().await {
+                output.extend_from_slice(&chunk.unwrap());
             }
+            assert_eq!(output, expected_bytes);
             let snapshot = tracer.compaction.finalize(
                 super::super::compaction_diagnostics::CompactionFinalize {
                     final_status: "success",

@@ -432,13 +432,7 @@ pub async fn batch_import_credentials(
         Ok::<_, std::io::Error>(Bytes::from(format!("data: {}\n\n", json)))
     });
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(body))
-        .unwrap()
+    crate::common::sse::sse_response(Body::from_stream(body))
 }
 
 /// DELETE /api/admin/credentials/:id

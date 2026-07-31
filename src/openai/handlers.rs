@@ -4,7 +4,7 @@ use axum::{
     Json as JsonExtractor,
     body::{Body, to_bytes},
     extract::{Extension, Path, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
 };
 use bytes::Bytes;
@@ -329,13 +329,7 @@ async fn convert_chat_stream_response(
         response.into_body(),
         ChatStreamTranslator::new(model, include_usage),
     );
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(stream))
-        .unwrap()
+    crate::common::sse::sse_response(Body::from_stream(stream))
 }
 
 struct ResponsesStreamMeta {
@@ -359,13 +353,7 @@ async fn convert_responses_stream_response(
 
     let stream =
         transform_anthropic_sse(response.into_body(), ResponsesStreamTranslator::new(meta));
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(stream))
-        .unwrap()
+    crate::common::sse::sse_response(Body::from_stream(stream))
 }
 
 trait AnthropicSseTranslator {

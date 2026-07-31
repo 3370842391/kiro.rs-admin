@@ -13,6 +13,7 @@ mod wholesale;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use axum::serve::ListenerExt;
 use clap::Parser;
 use kiro::endpoint::{
     AmazonQEndpoint, CliEndpoint, CodeWhispererEndpoint, IdeEndpoint, KiroEndpoint,
@@ -613,7 +614,16 @@ async fn main() {
     tracing::info!("Admin UI:");
     tracing::info!("  GET  /admin");
 
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    // 下游连接开 TCP_NODELAY：SSE 是「大量小写」，Nagle 会把小帧攒到对端 ACK 回来
+    // 才发，撞上 delayed ACK 时单次最坏加约 40ms。axum/tokio 都不默认开，必须自己设。
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .unwrap()
+        .tap_io(|tcp_stream| {
+            if let Err(err) = tcp_stream.set_nodelay(true) {
+                tracing::warn!(%err, "设置 TCP_NODELAY 失败，该连接的流式输出可能被 Nagle 攒包");
+            }
+        });
     axum::serve(listener, app).await.unwrap();
 }
 

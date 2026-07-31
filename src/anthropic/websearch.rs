@@ -6,7 +6,7 @@ use std::convert::Infallible;
 
 use axum::{
     body::Body,
-    http::{StatusCode, header},
+    http::StatusCode,
     response::{IntoResponse, Json, Response},
 };
 use bytes::Bytes;
@@ -539,13 +539,7 @@ pub async fn handle_websearch_request(
     let stream =
         create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(stream))
-        .unwrap()
+    crate::common::sse::sse_response(Body::from_stream(stream))
 }
 
 /// 调用 Kiro MCP API
