@@ -949,6 +949,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn each_protocol_maps_its_own_balance_and_stock_status_codes() {
+        // 同一个状态码在各家含义不同。接错的后果是把「该去充钱」记成故障（运维照着
+        // 排查网络），或把停用账号记成余额不足（去充钱但根本充不进去）。
+        for (kind, status, expected) in [
+            // kiroapp.io：403 = 有货但一个都买不起。
+            (SupplierKind::KiroAppIo, 403u16, "balance"),
+            // Kiro Drop：403 = 余额不足，404 = 库存不足无可用 Key。
+            (SupplierKind::KiroDrop, 403, "balance"),
+            (SupplierKind::KiroDrop, 404, "stock"),
+            // kiro.ceo：402 = 积分不足；403 是账号被停用，绝不能当成余额问题。
+            (SupplierKind::KiroCeo, 402, "balance"),
+            (SupplierKind::KiroCeo, 403, "other"),
+            // kiro-rs 没有这套语义，保持原样不特判。
+            (SupplierKind::KiroRs, 402, "other"),
+            (SupplierKind::KiroRs, 403, "other"),
+        ] {
+            let code = axum::http::StatusCode::from_u16(status).unwrap();
+            let app = Router::new()
+                .route(
+                    "/api/my/purchase",
+                    post(move || async move { (code, r#"{"error":"reason"}"#) }),
+                )
+                .route(
+                    "/api/me/purchase",
+                    post(move || async move { (code, r#"{"error":"reason"}"#) }),
+                );
+            let client = SupplierClient::with_kind(server(app).await, "secret", kind).unwrap();
+            let error = client
+                .purchase(1, "0123456789abcdef0123456789abcdef")
+                .await
+                .unwrap_err();
+            let actual = match error {
+                SupplierError::InsufficientBalance(_) => "balance",
+                SupplierError::OutOfStock => "stock",
+                _ => "other",
+            };
+            assert_eq!(actual, expected, "{kind} {status}");
+        }
+    }
+
+    #[tokio::test]
     async fn kiro_ceo_overview_shows_the_us_zone_unit_price() {
         // 各区单价独立。我们不发 zone，对方默认美国区，所以展示的必须是美国区价，
         // 不能随便挑一个区——欧洲区更便宜，显示它会让人以为买得更划算。
@@ -1907,18 +1948,38 @@ impl SupplierClient {
                 if error_type(&text).is_some_and(|kind| kind == "out_of_stock") {
                     return Err(SupplierError::OutOfStock);
                 }
-                // kiroapp.io 用扁平 `{"error":"原因"}`，没有机器可判定的 type 字段。
-                // 它对「有货但一个都买不起」用 403，这是余额问题而非故障：重试没用，
-                // 得先充值，所以单独归类，让事件历史能一眼看出该去充钱。
-                if self.kind == SupplierKind::KiroAppIo && status.as_u16() == 403 {
+                // 三家都用扁平 `{"error":"中文原因"}`，没有机器可判定的 type 字段，
+                // 只能按状态码分。而同一个码在各家含义不同，接错就会把「该去充钱」
+                // 记成故障、或把故障记成正常竞争：
+                //
+                // - kiroapp.io：403 = 有货但一个都买不起
+                // - Kiro Drop：403 = 余额不足，404 = 库存不足无可用 Key
+                // - kiro.ceo：402 = 积分不足，403 = 账号被停用（**不是**余额问题）
+                //
+                // 余额不足单独归类：重试没用，得先充值，事件历史要能一眼看出来。
+                let insufficient_balance = match self.kind {
+                    SupplierKind::KiroAppIo | SupplierKind::KiroDrop => status.as_u16() == 403,
+                    SupplierKind::KiroCeo => status.as_u16() == 402,
+                    SupplierKind::KiroRs | SupplierKind::KiroApp => false,
+                };
+                if insufficient_balance {
                     return Err(SupplierError::InsufficientBalance(sanitize(
                         &text,
                         &self.api_key.0,
                     )));
                 }
+                // Drop 用 404 表示「库存不足，无可用 Key」。那是别人抢先买走了，
+                // 属于正常竞争结果而不是故障，不该记成 failed。
+                if self.kind == SupplierKind::KiroDrop && status.as_u16() == 404 {
+                    return Err(SupplierError::OutOfStock);
+                }
                 // 409 + 幂等协议 = 同一订单号换了参数，也就是原单已经成交。钱已经花了，
                 // 这不是「请求失败」而是「我们和对方的账对不上」，得单独归类去核对。
                 // 非幂等协议（kiro-app claim）没有订单号概念，409 是别的意思，不特判。
+                //
+                // kiro.ceo 的 409 是二义的（文档：「库存不足、幂等键撞了别的订单」），
+                // 没有可判定字段能分开。仍然归到这里：对方的中文原因会原样带进事件
+                // 记录，运维能看出是哪种；而且这条路径既不扣钱也不丢 key，宁可多提醒。
                 if status.as_u16() == 409 && self.kind.purchase_is_idempotent() {
                     return Err(SupplierError::OrderConflict(sanitize(
                         &text,
