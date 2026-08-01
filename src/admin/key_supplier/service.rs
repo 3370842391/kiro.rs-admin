@@ -88,14 +88,13 @@ impl IncomingWebhook {
     /// `kiro-app` 的推送体格式未文档化，走宽容解析。
     pub fn parse(kind: SupplierKind, body: &[u8]) -> Result<Self, SupplierServiceError> {
         match kind {
-            // kiro.ceo 的推送与 kiro-rs 逐字段一致：`event` / 32 hex `event_id` /
-            // 32 hex `purchase_order_id` / `message` / `new_keys` / `dead`，只多一个
-            // `zone`（多出来的字段被忽略）。而且对方明确要求把 `purchase_order_id`
-            // 原样当 `client_order_id` 用——正是 kiro-rs 的做法。差异全在采购响应那侧。
-            SupplierKind::KiroRs | SupplierKind::KiroCeo => Self::parse_kiro_rs(body),
+            SupplierKind::KiroRs => Self::parse_kiro_rs(body),
             SupplierKind::KiroApp => Self::parse_kiro_app(body),
             SupplierKind::KiroAppIo => Self::parse_kiro_app_io(body),
-            SupplierKind::KiroDrop => Self::parse_kiro_drop(body),
+            // Kiro Drop 与 kiro.ceo 是同一族（`usr-` 令牌 + `/api/my/*`），推送格式相同，
+            // 只是各自缺的字段不同，所以共用一个宽容解析。
+            SupplierKind::KiroDrop => Self::parse_my_api_family(body, "Kiro Drop 通知"),
+            SupplierKind::KiroCeo => Self::parse_my_api_family(body, "kiro.ceo 通知"),
         }
     }
 
@@ -205,23 +204,29 @@ impl IncomingWebhook {
         }
     }
 
-    /// Kiro Drop 的推送。字段名与 `kiro-rs` 一致，但有两处必须放宽，否则事件根本
-    /// 落不了库、永远不会触发采购：
+    /// `/api/my/*` 号商协议族（Kiro Drop、kiro.ceo）的推送。事件名与字段名都和
+    /// `kiro-rs` 一致，但 `kiro-rs` 那套「全都必填、id 必须 32 hex」的校验在这一族
+    /// 上会把事件整条打回 400，于是采购永远不发生，而日志上只留一句「格式不对」。
     ///
-    /// 1. **没有 `new_keys` 字段**。`kiro-rs` 那边要求必填且 > 0，这里按 0 处理——
-    ///    实际下单量由号池缺口或 `maxPurchase` 夹逼决定，本来就不依赖推送里的数字。
-    /// 2. **`purchase_order_id` 不是 32 位十六进制**（形如 `batch_xxx`）。它对我们只是
-    ///    批次标识，不能直接当幂等键用（客户端强校验 32 hex），所以放进
-    ///    `supplier_batch_id` 留痕，幂等键改由 `event_id` 确定性派生。
+    /// 因此三处放宽（每一处都对应线上实际踩到的形状）：
     ///
-    /// `event_id` 也不走 `required_id` 的 32-hex 强校验：对方文档只写「32 位 ID」，
-    /// 没说是 hex。押错了就是每条推送都 400、整个对接静默失效。它只是去重键，
-    /// 取不到就退化成 body 指纹，同一车重复推仍映射到同一行。
+    /// 1. **`event_id` 不要求 32 hex**。文档只写「32 位 ID」，没说是 hex；测试/模拟
+    ///    推送的 id 往往是 `evt_…` 或带横线的 UUID。它只是去重键，取不到就退化成
+    ///    body 指纹，同一车重复推仍映射到同一行。
+    /// 2. **`message` 可缺**。它只是给人看的描述，缺了不影响采购决策。
+    /// 3. **数量字段可缺**。Kiro Drop 的到货推送根本没有 `new_keys`；实际下单量由
+    ///    号池缺口或 `maxPurchase` 夹逼决定，本来就不依赖推送里的数字。
     ///
-    /// 「所有已配置 Webhook 的用户都会收到全部事件推送」——对方文档明说的。因此
-    /// `all_keys_dead` 这类事件可能是别人家的号死了，绝不能当采购信号；白名单机制
-    /// 已经挡住了，这里只负责如实解析。
-    fn parse_kiro_drop(body: &[u8]) -> Result<Self, SupplierServiceError> {
+    /// `purchase_order_id` 的处理对两家统一成一条规则：**是 32 hex 就直接当幂等键**
+    /// （kiro.ceo 明确要求「原样作为 client_order_id 传回」），**不是**就从 `event_id`
+    /// 派生一个，并把原值放进 `supplier_batch_id` 留痕（Kiro Drop 的 `batch_xxx`）。
+    /// 采购客户端强校验 32 hex，直接透传非法值会在下单前就报错。
+    ///
+    /// 「所有已配置 Webhook 的用户都会收到全部事件推送」——Kiro Drop 文档明说的。
+    /// 因此 `all_keys_dead` 可能是别人家的号死了，绝不能当采购信号；白名单机制已经
+    /// 挡住了，这里只负责如实解析。不认识的事件名一律拒收，避免将来新增事件被误当
+    /// 成到货信号。
+    fn parse_my_api_family(body: &[u8], notice: &str) -> Result<Self, SupplierServiceError> {
         let value: Value =
             serde_json::from_slice(body).map_err(|_| SupplierServiceError::InvalidJson)?;
         let object = value
@@ -236,20 +241,29 @@ impl IncomingWebhook {
         let message = object
             .get("message")
             .and_then(Value::as_str)
-            .unwrap_or("Kiro Drop 通知")
+            .unwrap_or(notice)
             .to_string();
 
         match event {
-            "new_keys_available" => Ok(Self::NewKeysAvailable {
-                event_id: event_id.clone(),
-                // 对方的 batch id 不是 32 hex，当不了幂等键；从 event_id 派生一个。
-                purchase_order_id: derive_order_id(&event_id),
-                // 批次号只留痕：Drop 的采购接口不接受定向批次参数。
-                supplier_batch_id: optional_id(object, &["purchase_order_id", "purchaseOrderId"]),
-                message,
-                // 推送不带数量，下单量由号池缺口/配置夹逼决定。
-                new_keys: 0,
-            }),
+            "new_keys_available" => {
+                let raw_order = optional_id(object, &["purchase_order_id", "purchaseOrderId"]);
+                let usable_as_key = raw_order.as_deref().is_some_and(|id| {
+                    id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+                });
+                Ok(Self::NewKeysAvailable {
+                    purchase_order_id: if usable_as_key {
+                        raw_order.clone().unwrap_or_default()
+                    } else {
+                        derive_order_id(&event_id)
+                    },
+                    // 只有当原值当不了幂等键时才需要单独留痕；能当键时它就是订单号本身。
+                    supplier_batch_id: (!usable_as_key).then_some(raw_order).flatten(),
+                    event_id,
+                    message,
+                    new_keys: optional_quantity(object, &["new_keys", "newKeys", "count"])
+                        .unwrap_or(0),
+                })
+            }
             "all_keys_dead" => Ok(Self::AllKeysDead {
                 event_id,
                 message,
@@ -257,7 +271,6 @@ impl IncomingWebhook {
                 dead: optional_quantity(object, &["dead"]).unwrap_or(0),
             }),
             "test" => Ok(Self::Test { event_id, message }),
-            // 不认识的事件名一律拒收，避免将来新增事件被误当成到货信号。
             _ => Err(SupplierServiceError::InvalidPayload),
         }
     }
@@ -1253,7 +1266,27 @@ impl KeySupplierService {
             }
         }
 
-        let webhook = IncomingWebhook::parse(entry.kind, body.as_ref())?;
+        // 解析失败必须留痕。以前这里直接 `?` 返回 400，应用侧一行日志都没有：
+        // 只能从 nginx 访问日志看到 `400 72`，再靠猜是哪条校验不满足。
+        // 只记字段名、事件名和长度——载荷不含 key 明文，但也不必把值写进日志。
+        let webhook = IncomingWebhook::parse(entry.kind, body.as_ref()).inspect_err(|error| {
+            let fields = serde_json::from_slice::<Value>(body.as_ref())
+                .ok()
+                .and_then(|value| {
+                    value
+                        .as_object()
+                        .map(|object| object.keys().cloned().collect::<Vec<_>>().join(","))
+                })
+                .unwrap_or_else(|| "<not a json object>".to_owned());
+            tracing::warn!(
+                supplier = %entry.id,
+                kind = %entry.kind,
+                reason = processing_error_kind(error),
+                body_len = body.as_ref().len(),
+                fields = %fields,
+                "供货商 webhook 载荷被拒收"
+            );
+        })?;
         let mut event = webhook.into_event(&entry.id);
         event.message = event
             .message
@@ -3586,6 +3619,26 @@ mod tests {
             .is_err()
         );
         assert!(IncomingWebhook::parse(SupplierKind::KiroDrop, b"not json").is_err());
+    }
+
+    #[test]
+    fn kiro_ceo_test_and_simulated_pushes_are_no_longer_rejected() {
+        // 线上这四种载荷都被打回 400（nginx 日志里的 `400 72`），原因分别是
+        // event_id 不是 32 hex、message 缺失、dead 为 0。它们都只是连通性验证或
+        // 通知，不该因为 kiro-rs 那套「全都必填」的校验而进不了库。
+        for body in [
+            br#"{"event":"all_keys_dead","event_id":"evt_2026_08_01_a","message":"x","dead":12}"#
+                .as_slice(),
+            br#"{"event":"all_keys_dead","event_id":"a1000000000000000000000000000004","dead":12}"#,
+            br#"{"event":"all_keys_dead","event_id":"a1000000000000000000000000000005","message":"x","dead":0}"#,
+            br#"{"event":"test","event_id":"3f2b7c1d-9a4e-4b8f-8c2d-1e5a6b7c8d9e","message":"x"}"#,
+        ] {
+            assert!(
+                IncomingWebhook::parse(SupplierKind::KiroCeo, body).is_ok(),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
     }
 
     #[test]

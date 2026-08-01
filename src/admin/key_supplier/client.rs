@@ -876,54 +876,114 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kiro_ceo_purchase_keeps_paid_keys_from_a_plain_string_array() {
-        // 两处会让已付费的 key 全丢：`keys` 是纯字符串数组（不是 [{"key":…}]），
-        // 前缀是 kiro- 而不是 ksk_。积分已经扣了，这两处都不能报错。
-        let app = Router::new().route(
-            "/api/my/purchase",
-            post(
-                |request: axum::http::Request<axum::body::Body>| async move {
-                    let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
-                        .await
-                        .unwrap();
-                    let sent: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-                    assert_eq!(sent["count"], 3);
-                    // 不发 zone：对方默认美国区，配置里还没有区域字段，乱填会买错区。
-                    assert!(sent.get("zone").is_none());
+    async fn kiro_ceo_purchase_accepts_both_the_documented_and_the_real_key_shape() {
+        // 线上真实响应（用幂等重放取到的）：`keys` 是**对象数组**，且没有 `details`。
+        // 对方文档写的却是纯字符串数组 + 独立的 details。照文档接的代价是
+        // `invalid type: map, expected a string at line 1 column 62`——响应键名按字母序
+        // 排列，`"keys":[` 的 `[` 正好落在第 62 列——而积分已经扣了，线上因此连丢 7 单。
+        let real = serde_json::json!({
+            "client_order_id": "0123456789abcdef0123456789abcdef",
+            "keys": [
+                {"key": "kiro-aaa", "account": "user-a", "password": "pw",
+                 "issuer_url": "https://idc", "zone": "us", "aws_region": "us-east-1",
+                 "status": "sold", "created_at": "2026-08-01 03:39:04"},
+                {"key": "kiro-bbb", "account": "user-b", "password": "pw",
+                 "issuer_url": "https://idc", "zone": "us", "aws_region": "us-east-1",
+                 "status": "sold", "created_at": "2026-08-01 03:39:04"}
+            ],
+            "order_id": "9f0370b1d6dd32abcb1176303b81502d",
+            "purchased": 2, "remaining": 17, "replayed": true,
+            "total_credits": 30, "unit_price": 15, "zone": "us"
+        });
+        // 文档描述的形状也必须继续能接：哪天对方改回去，不能又是一次丢单。
+        let documented = serde_json::json!({
+            "client_order_id": "0123456789abcdef0123456789abcdef",
+            "purchased": 2, "remaining": 17,
+            "keys": ["kiro-aaa", "kiro-bbb"],
+            "zone": "us", "unit_price": 15, "total_credits": 30,
+            "order_id": "9f0370b1d6dd32abcb1176303b81502d"
+        });
+
+        for (label, body, replayed) in [("real", real, true), ("documented", documented, false)] {
+            let payload = body.clone();
+            let app = Router::new().route(
+                "/api/my/purchase",
+                post(move |request: axum::http::Request<axum::body::Body>| {
+                    let payload = payload.clone();
+                    async move {
+                        let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+                            .await
+                            .unwrap();
+                        let sent: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                        assert_eq!(sent["count"], 3);
+                        // 不发 zone：对方默认美国区，配置里还没有区域字段，乱填会买错区。
+                        assert!(sent.get("zone").is_none());
+                        axum::Json(payload)
+                    }
+                }),
+            );
+            let client =
+                SupplierClient::with_kind(server(app).await, "ceo-secret", SupplierKind::KiroCeo)
+                    .unwrap();
+
+            // 申请 3 个拿到 2 个是正常竞争结果，按 purchased 处理而不是按 count。
+            let purchase = client
+                .purchase(3, "0123456789abcdef0123456789abcdef")
+                .await
+                .unwrap();
+            assert_eq!(purchase.purchased, 2, "{label}");
+            assert_eq!(purchase.keys.len(), 2, "{label}");
+            assert_eq!(purchase.remaining, 17, "{label}");
+            // total_credits 是本单权威扣费额，落库记账靠它。
+            assert_eq!(purchase.points_cost, Some(30), "{label}");
+            assert_eq!(purchase.unit_price, Some(15.0), "{label}");
+            assert_eq!(
+                purchase.supplier_order_id.as_deref(),
+                Some("9f0370b1d6dd32abcb1176303b81502d"),
+                "{label}"
+            );
+            // 幂等重放标记必须透传：钱是上一单扣的，不能记成又买了一次。
+            assert_eq!(purchase.replayed, replayed, "{label}");
+            assert!(!format!("{purchase:?}").contains("kiro-aaa"), "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn kiro_ceo_overview_shows_the_us_zone_unit_price() {
+        // 各区单价独立。我们不发 zone，对方默认美国区，所以展示的必须是美国区价，
+        // 不能随便挑一个区——欧洲区更便宜，显示它会让人以为买得更划算。
+        let app = Router::new()
+            .route(
+                "/api/my/profile",
+                get(|| async {
                     axum::Json(serde_json::json!({
-                        "client_order_id": "0123456789abcdef0123456789abcdef",
-                        "purchased": 2,
-                        "remaining": 4200,
-                        "keys": ["kiro-aaa", "kiro-bbb"],
-                        "zone": "us",
-                        "unit_price": 15,
-                        "total_credits": 30,
-                        "order_id": "a1b2c3",
-                        "details": [{
-                            "key": "kiro-aaa", "account": "user@example.com", "password": "pw",
-                            "zone": "us", "aws_region": "us-east-1", "issuer_url": "https://idc"
-                        }]
+                        "max_purchase": 10, "min_purchase": 1, "name": "codekjie",
+                        "quota": 167, "remaining": 167, "used_quota": 15, "webhook_url": ""
                     }))
-                },
-            ),
-        );
+                }),
+            )
+            .route(
+                "/api/my/stock",
+                get(|| async {
+                    axum::Json(serde_json::json!({
+                        "max": 10, "max_purchase": 10, "min": 1, "quota": 167, "reserved": 0,
+                        "zones": [
+                            {"available": 11, "enabled": true, "label": "us zone",
+                             "max": 10, "stock": 11, "unit_price": 15, "zone": "us"},
+                            {"available": 0, "enabled": true, "label": "eu zone",
+                             "max": 0, "stock": 0, "unit_price": 10, "zone": "eu"}
+                        ]
+                    }))
+                }),
+            );
         let client =
             SupplierClient::with_kind(server(app).await, "ceo-secret", SupplierKind::KiroCeo)
                 .unwrap();
 
-        // 申请 3 个拿到 2 个是正常竞争结果，按 purchased 处理而不是按 count。
-        let purchase = client
-            .purchase(3, "0123456789abcdef0123456789abcdef")
-            .await
-            .unwrap();
-        assert_eq!(purchase.purchased, 2);
-        assert_eq!(purchase.keys.len(), 2);
-        assert_eq!(purchase.remaining, 4200);
-        // total_credits 是本单权威扣费额，落库记账靠它。
-        assert_eq!(purchase.points_cost, Some(30));
-        assert_eq!(purchase.unit_price, Some(15.0));
-        assert_eq!(purchase.supplier_order_id.as_deref(), Some("a1b2c3"));
-        assert!(!format!("{purchase:?}").contains("kiro-aaa"));
+        let snapshot = client.snapshot().await.unwrap();
+        assert_eq!(snapshot.stock_available, Some(10));
+        assert_eq!(snapshot.key_price, Some(15.0));
+        assert_eq!(snapshot.balance, Some(167));
     }
 
     #[tokio::test]
@@ -1339,13 +1399,25 @@ impl SupplierClient {
             // 顺手打一发 status，会在 JSON 反序列化上炸掉，而界面只看到「请求失败」。
             SupplierKind::KiroCeo => {
                 let profile = self.profile().await?;
-                let stock = self.stock().await?;
+                let stock: KiroCeoStock = self
+                    .request(Method::GET, "/api/my/stock", None, RetryPolicy::Retryable)
+                    .await?;
+                // 各区单价独立。我们目前不发 `zone`，对方默认美国区，所以展示的也是
+                // 美国区价；取不到就退回全区最低价，而不是随便挑一个。
+                let us_price = stock
+                    .zones
+                    .iter()
+                    .find(|zone| zone.zone == "us")
+                    .and_then(|zone| zone.unit_price);
                 Ok(SupplierSnapshot {
                     stock_available: Some(stock.max),
-                    // `/api/my/stock` 带各区单价，但字段名对方没文档化。猜错了就是
-                    // 在界面上显示一个错的单价，比不显示更糟。权威单价来自采购响应的
-                    // `unit_price`，那个是按 key 记账落库的。
-                    key_price: None,
+                    key_price: us_price.or_else(|| {
+                        stock
+                            .zones
+                            .iter()
+                            .filter_map(|zone| zone.unit_price)
+                            .min_by(f64::total_cmp)
+                    }),
                     key_price_max: None,
                     balance: Some(profile.remaining),
                     webhook_url: Some(profile.webhook_url.clone()),
@@ -1613,10 +1685,10 @@ impl SupplierClient {
             points_cost: response.total_credits,
             unit_price: response.unit_price,
             supplier_order_id: response.order_id.filter(|id| !id.trim().is_empty()),
-            replayed: false,
-            // 宽松前缀：kiro.ceo 的 key 是 `kiro-` 前缀而不是 `ksk_`，而积分已经扣了。
+            replayed: response.replayed,
+            // 宽松前缀：kiro.ceo 的 key 不是 `ksk_` 前缀，而积分已经扣了。
             // 按 kiro-rs 的严格校验会把整单已付费的 key 全判无效——钱花了 key 扔了。
-            keys: accept_paid_keys(response.keys.into_iter().map(|key| (key, None)))?,
+            keys: accept_paid_keys(response.keys.into_iter().map(|key| (key.into_key(), None)))?,
         })
     }
 
@@ -2119,11 +2191,53 @@ struct KiroDropPurchase {
 /// `POST /api/my/purchase`（kiro.ceo）→ `{client_order_id, purchased, remaining,
 /// keys:["kiro-xxx", …], zone, unit_price, total_credits, order_id, details:[…]}`。
 ///
-/// `keys` 是**纯字符串数组**，这一处就让 `PurchaseWire`（`Vec<KeyWire>`）整段解析失败，
-/// 而积分**已经扣了**——所以必须单独一套 wire，不能共用。
+/// `GET /api/my/stock`（kiro.ceo）→ `{max, max_purchase, min, quota, reserved,
+/// zones:[{zone, label, unit_price, stock, available, max, enabled}]}`。
 ///
-/// `details` 里带账号、密码、`issuer_url`、`aws_region`。目前采购链路只落 key 本身
-/// （与其它几家一致），所以先不读；真要用得先把凭据模型对齐，那是另一件事。
+/// `max` 是文档化的「可提取数量」，各区单价在 `zones` 里独立设置。
+#[derive(Deserialize)]
+struct KiroCeoStock {
+    #[serde(default)]
+    max: u64,
+    #[serde(default)]
+    zones: Vec<KiroCeoZone>,
+}
+
+#[derive(Deserialize)]
+struct KiroCeoZone {
+    #[serde(default)]
+    zone: String,
+    #[serde(default)]
+    unit_price: Option<f64>,
+}
+
+/// `keys` 的元素两种形状都要接。对方文档写的是**纯字符串数组**
+/// （`["kiro-xxx", …]`），线上实际返回的是**对象数组**：
+/// `{key, account, password, issuer_url, zone, aws_region, status, created_at}`。
+///
+/// 只按文档接过一次，代价是线上连丢 7 单：响应键名按字母序排列，`"keys":[` 的
+/// `[` 正好落在第 62 列，于是 `Vec<String>` 报
+/// `invalid type: map, expected a string at line 1 column 62`——而积分**已经扣了**，
+/// key 却因为解析失败进不了库。两种形状都接就不会再因为对方改形状而丢钱。
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum KiroCeoKey {
+    /// 文档描述的形状。
+    Plain(String),
+    /// 线上实际形状。只取 `key`；账号密码等字段由后续凭据导入自行处理。
+    Detailed { key: String },
+}
+
+impl KiroCeoKey {
+    fn into_key(self) -> String {
+        match self {
+            Self::Plain(key) => key,
+            Self::Detailed { key } => key,
+        }
+    }
+}
+
+/// `POST /api/my/purchase`（kiro.ceo）的响应。
 #[derive(Deserialize)]
 struct KiroCeoPurchase {
     #[serde(default)]
@@ -2133,7 +2247,7 @@ struct KiroCeoPurchase {
     #[serde(default)]
     remaining: u64,
     #[serde(default)]
-    keys: Vec<String>,
+    keys: Vec<KiroCeoKey>,
     /// 本单权威扣费总额（积分）。
     #[serde(default)]
     total_credits: Option<u64>,
@@ -2143,6 +2257,10 @@ struct KiroCeoPurchase {
     /// 对方订单号，用于和 `/api/my/purchase-orders` 对账。
     #[serde(default)]
     order_id: Option<String>,
+    /// 命中对方的幂等重放：上一单其实已经成交，钱早扣了。重放不会二次扣费，
+    /// 所以失败订单可以靠同一个 `client_order_id` 把已付费的 key 捞回来。
+    #[serde(default)]
+    replayed: bool,
 }
 
 /// `GET /api/me/stock` → `{stock, price, price_min, price_max, balance}`。
