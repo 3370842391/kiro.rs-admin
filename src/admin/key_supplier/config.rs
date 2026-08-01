@@ -18,7 +18,7 @@ const MAX_NICKNAME_PREFIX_CHARS: usize = 128;
 const MAX_PURCHASE: u64 = 10_000;
 /// 补货水位上限。比号池现实规模留足余量，同时挡住手滑输入的天文数字
 /// ——水位配得比池子还大等于「永远都买」，那正是这道闸要防的事。
-const MAX_RESTOCK_USABLE_THRESHOLD: u64 = 10_000;
+const MAX_TARGET_USABLE: u64 = 10_000;
 /// 额度水位上限。上游满额是 10000（KIRO POWER），留一位余量应对更高档位。
 /// 配得比满额还大等于「所有号都算不可用」，也就是每次到货都买。
 const MAX_LOW_QUOTA_THRESHOLD: u64 = 100_000;
@@ -30,7 +30,7 @@ const MAX_SUPPLIER_NAME_CHARS: usize = 128;
 pub const MAX_SUPPLIERS: usize = 32;
 
 /// 一家供货商的运行期配置：身份（id/name/kind/enabled）+ 连接与导入预设。
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq)]
 pub struct SupplierEntryRuntime {
     pub id: String,
     pub name: String,
@@ -82,7 +82,7 @@ impl From<&SupplierEntryRuntime> for KeySupplierEntryConfig {
 }
 
 /// 供货商列表项的对外视图，secret 只报「是否已配置」。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SupplierEntryView {
     pub id: String,
@@ -108,7 +108,7 @@ impl From<&SupplierEntryRuntime> for SupplierEntryView {
 }
 
 /// 新增/修改一家供货商的入参。`id` 仅新增时使用，修改时以路径参数为准。
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SupplierEntryUpdate {
     #[serde(default)]
@@ -139,7 +139,8 @@ impl std::fmt::Debug for SupplierEntryUpdate {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+// 不派生 `Eq`：`max_unit_price` 是 f64。金额本来就不该参与等价判定。
+#[derive(Clone, PartialEq)]
 pub struct SupplierRuntimeConfig {
     pub base_url: String,
     pub api_key: String,
@@ -157,15 +158,18 @@ pub struct SupplierRuntimeConfig {
     pub groups: Vec<String>,
     pub source_channel: String,
     pub nickname_prefix: String,
-    /// 只在该供货商名下活号数 <= `restock_usable_threshold` 时才自动采购。
+    /// 逐家水位闸开关。全局号池启用时它整个让位。
     pub restock_only_when_exhausted: bool,
-    /// 补货水位。0 = 一个能用的都没有了才买。仅在上面那个开关为真时生效。
-    pub restock_usable_threshold: u32,
+    /// 该供货商名下要常备的可用号数（**目标存量**，不是低水位）。
+    /// 到货时按 `target_usable - 当前可用` 的缺口补齐。0 = 失效保护，不买。
+    pub target_usable: u32,
     /// 剩余额度 <= 这个数就不算「可用」。0 = 不看额度。
     pub low_quota_threshold: u32,
+    /// 单价上限。0 = 不限。单位是**这家自己的计价单位**，不与别家可比。
+    pub max_unit_price: f64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SupplierConfigView {
     pub base_url: String,
@@ -184,11 +188,12 @@ pub struct SupplierConfigView {
     pub source_channel: String,
     pub nickname_prefix: String,
     pub restock_only_when_exhausted: bool,
-    pub restock_usable_threshold: u32,
+    pub target_usable: u32,
     pub low_quota_threshold: u32,
+    pub max_unit_price: f64,
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SupplierConfigUpdate {
     pub base_url: String,
@@ -214,8 +219,13 @@ pub struct SupplierConfigUpdate {
     /// 旧前端不发这两个字段，`default` 保持历史行为（每条到货都买）。
     #[serde(default)]
     pub restock_only_when_exhausted: bool,
+    /// 目标存量。alias 收下旧前端发的 `restockUsableThreshold`——否则会静默变成 0，
+    /// 而 0 是「不买」，用户只会看到采购全停而不知道是字段名换了。
+    #[serde(default, alias = "restockUsableThreshold")]
+    pub target_usable: u64,
+    /// 单价上限，0 = 不限。旧前端不发，`default` 即不限（保持历史行为）。
     #[serde(default)]
-    pub restock_usable_threshold: u64,
+    pub max_unit_price: f64,
     #[serde(default)]
     pub low_quota_threshold: u64,
 }
@@ -248,7 +258,7 @@ impl std::fmt::Debug for SupplierRuntimeConfig {
                 "restock_only_when_exhausted",
                 &self.restock_only_when_exhausted,
             )
-            .field("restock_usable_threshold", &self.restock_usable_threshold)
+            .field("target_usable", &self.target_usable)
             .field("low_quota_threshold", &self.low_quota_threshold)
             .finish()
     }
@@ -285,7 +295,7 @@ impl std::fmt::Debug for SupplierConfigUpdate {
                 "restock_only_when_exhausted",
                 &self.restock_only_when_exhausted,
             )
-            .field("restock_usable_threshold", &self.restock_usable_threshold)
+            .field("target_usable", &self.target_usable)
             .field("low_quota_threshold", &self.low_quota_threshold)
             .finish()
     }
@@ -315,12 +325,12 @@ impl SupplierRuntimeConfig {
         }
         validate_number_range(update.rpm_limit, "rpmLimit", 0, MAX_RPM_LIMIT)?;
         validate_number_range(update.priority, "priority", 0, MAX_PRIORITY)?;
-        validate_number_range(
-            update.restock_usable_threshold,
-            "restockUsableThreshold",
-            0,
-            MAX_RESTOCK_USABLE_THRESHOLD,
-        )?;
+        validate_number_range(update.target_usable, "targetUsable", 0, MAX_TARGET_USABLE)?;
+        // 单价上限必须是有限的非负数。NaN 参与任何比较都是 false，会让这道闸静默失效；
+        // 负数则等于「永不采购」但看起来像配了个价。两者都当配置错误挡在门口。
+        if !update.max_unit_price.is_finite() || update.max_unit_price < 0.0 {
+            anyhow::bail!("maxUnitPrice 必须是 0 或正数（0 = 不限价）");
+        }
         validate_number_range(
             update.low_quota_threshold,
             "lowQuotaThreshold",
@@ -381,8 +391,9 @@ impl SupplierRuntimeConfig {
                 MAX_NICKNAME_PREFIX_CHARS,
             )?,
             restock_only_when_exhausted: update.restock_only_when_exhausted,
-            restock_usable_threshold: update.restock_usable_threshold as u32,
+            target_usable: update.target_usable as u32,
             low_quota_threshold: update.low_quota_threshold as u32,
+            max_unit_price: update.max_unit_price,
         };
 
         Ok(runtime)
@@ -408,8 +419,9 @@ impl From<&SupplierRuntimeConfig> for KeySupplierConfig {
             source_channel: value.source_channel.clone(),
             nickname_prefix: value.nickname_prefix.clone(),
             restock_only_when_exhausted: value.restock_only_when_exhausted,
-            restock_usable_threshold: value.restock_usable_threshold,
+            target_usable: value.target_usable,
             low_quota_threshold: value.low_quota_threshold,
+            max_unit_price: value.max_unit_price,
         }
     }
 }
@@ -433,8 +445,9 @@ impl From<&SupplierRuntimeConfig> for SupplierConfigView {
             source_channel: value.source_channel.clone(),
             nickname_prefix: value.nickname_prefix.clone(),
             restock_only_when_exhausted: value.restock_only_when_exhausted,
-            restock_usable_threshold: value.restock_usable_threshold,
+            target_usable: value.target_usable,
             low_quota_threshold: value.low_quota_threshold,
+            max_unit_price: value.max_unit_price,
         }
     }
 }
@@ -670,8 +683,9 @@ fn normalize_persisted(value: &KeySupplierConfig) -> anyhow::Result<SupplierRunt
         source_channel: value.source_channel.clone(),
         nickname_prefix: value.nickname_prefix.clone(),
         restock_only_when_exhausted: value.restock_only_when_exhausted,
-        restock_usable_threshold: u64::from(value.restock_usable_threshold),
+        target_usable: u64::from(value.target_usable),
         low_quota_threshold: u64::from(value.low_quota_threshold),
+        max_unit_price: value.max_unit_price,
     };
     SupplierRuntimeConfig::normalize(None, update, false)
 }
@@ -771,8 +785,9 @@ mod tests {
             source_channel: " Webhook 自动采购 ".to_string(),
             nickname_prefix: " 自动采购 ".to_string(),
             restock_only_when_exhausted: false,
-            restock_usable_threshold: 0,
+            target_usable: 0,
             low_quota_threshold: 0,
+            max_unit_price: 0.0,
         }
     }
 

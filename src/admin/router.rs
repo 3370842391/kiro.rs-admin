@@ -434,8 +434,9 @@ mod tests {
             source_channel: "Webhook 自动采购".to_string(),
             nickname_prefix: "supplier".to_string(),
             restock_only_when_exhausted: false,
-            restock_usable_threshold: 0,
+            target_usable: 0,
             low_quota_threshold: 0,
+            max_unit_price: 0.0,
         }
     }
 
@@ -458,8 +459,9 @@ mod tests {
             source_channel: "supplier".to_string(),
             nickname_prefix: "supplier".to_string(),
             restock_only_when_exhausted: false,
-            restock_usable_threshold: 0,
+            target_usable: 0,
             low_quota_threshold: 0,
+            max_unit_price: 0.0,
         };
         let supplier = Arc::new(KeySupplierService::new(
             Arc::new(SupplierEventStore::open_in_memory().unwrap()),
@@ -1023,8 +1025,9 @@ mod tests {
                 source_channel: "supplier".to_string(),
                 nickname_prefix: "supplier".to_string(),
                 restock_only_when_exhausted: false,
-                restock_usable_threshold: 0,
+                target_usable: 0,
                 low_quota_threshold: 0,
+                max_unit_price: 0.0,
             },
             Arc::new(AcceptingImporter),
         ));

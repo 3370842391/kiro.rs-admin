@@ -91,7 +91,8 @@ impl std::str::FromStr for RetryMode {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+// 不派生 `Eq`：`max_unit_price` 是 f64。金额本来就不该参与等价判定。
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct KeySupplierConfig {
     #[serde(default)]
@@ -128,19 +129,36 @@ pub struct KeySupplierConfig {
     pub source_channel: String,
     #[serde(default = "default_supplier_nickname_prefix")]
     pub nickname_prefix: String,
-    /// 只在该供货商名下的活号数 <= `restockAliveThreshold` 时才自动采购。
+    /// 逐家水位闸的开关。开启后该供货商的到货通知按 `targetUsable` 的缺口补货。
     ///
-    /// 供货商不断推到货通知时，不加这道闸就是每次到货都掏钱。开启后到货通知变成
-    /// 「可以补货了」而不是「立刻买」。
+    /// 供货商不断推到货通知时，不加这道闸就是每次到货都掏钱。
     ///
     /// 关闭（默认）保持历史行为：每条到货通知都尝试采购。手动采购不受此开关影响。
+    /// 全局号池启用时这道闸整个让位——两套水位并存会交叉出第三种行为。
     #[serde(default)]
     pub restock_only_when_exhausted: bool,
-    /// 补货水位：可用号数 <= 这个值才买。0 = 一个能用的都没有了才买。
+    /// **目标存量**：该供货商名下要常备多少个可用号。
     ///
+    /// 语义与全局号池的 `targetCount` 一致：到货通知来了就按 `目标 - 当前可用` 的缺口
+    /// 补齐，补满就不再买。所以「每家常备 1 个」填 1，三家各填 1 就是全局 3 个。
+    ///
+    /// 0 = 配了开关没填数量，按失效保护不买（宁可少买）。
     /// 仅在 `restockOnlyWhenExhausted` 为真时生效。
+    ///
+    /// 旧字段名 `restockUsableThreshold` 是**低水位**语义（可用数 <= 它才买），
+    /// 那套语义下填 1 会在买到 1 个后仍然满足 `1 <= 1` 而继续买，同一家连推三次就
+    /// 买三次。alias 只为让老配置能读进来，读进来后按新语义解释。
+    #[serde(default, alias = "restockUsableThreshold")]
+    pub target_usable: u32,
+    /// 单价上限：对方现在的单价高于这个数就不自动采购。0 = 不限。
+    ///
+    /// 单位是**这家自己的计价单位**（Drop 报 USD，kiroapp 系报积分，kiro.ceo 报分区价），
+    /// 各家不通用，所以只和同一家的报价比较，绝不参与跨家算术。
+    ///
+    /// 配了上限但这家在下单前报不出价（kiro-rs 的 `/api/my/stock` 只有 `max`）时按
+    /// 「宁可少买」跳过：把「不知道价」当成免费会让这道闸在最需要它的时候失效。
     #[serde(default)]
-    pub restock_usable_threshold: u32,
+    pub max_unit_price: f64,
     /// 额度水位：剩余额度 <= 这个数就不算「可用」。0 = 不看额度，只认封号与 402。
     ///
     /// 为什么需要它：号没被封、也没触发 402，但剩余额度只有几百，对流量来说已经接近
@@ -180,7 +198,7 @@ impl std::fmt::Debug for KeySupplierConfig {
                 "restock_only_when_exhausted",
                 &self.restock_only_when_exhausted,
             )
-            .field("restock_usable_threshold", &self.restock_usable_threshold)
+            .field("target_usable", &self.target_usable)
             .field("low_quota_threshold", &self.low_quota_threshold)
             .finish()
     }
@@ -205,8 +223,10 @@ impl Default for KeySupplierConfig {
             source_channel: default_supplier_source_channel(),
             nickname_prefix: default_supplier_nickname_prefix(),
             restock_only_when_exhausted: false,
-            restock_usable_threshold: 0,
+            target_usable: 0,
             low_quota_threshold: 0,
+            // 0 = 不限价，保持历史行为。
+            max_unit_price: 0.0,
         }
     }
 }
@@ -327,6 +347,24 @@ impl SupplierKind {
             Self::KiroRs | Self::KiroAppIo | Self::KiroDrop | Self::KiroCeo
         )
     }
+
+    /// 409 是否意味着「原单已经成交」（钱扣了、货出了、我们没拿到）。
+    ///
+    /// 对大多数家是的：它们的 409 只有一个含义——同一 `client_order_id` 换了参数。
+    ///
+    /// **kiro.ceo 与 Kiro Drop 都不是**，它们的 409 是「状态冲突」的统称：
+    ///
+    /// - kiro.ceo：库存不足、已达最大持有库存上限、幂等键撞了别的订单
+    /// - Kiro Drop：余额不足、库存不足、订单号冲突、价格超过 `max_total_cny`
+    ///
+    /// 这些里面只有「订单号冲突」扣了钱，其余几种一分没动。按「已成交」去报会告诉运维
+    /// 「积分已扣，去订单历史补取 key」——一条不存在的订单，纯误导。
+    ///
+    /// Drop 早期文档把这些分开成 403（余额不足）/ 404（库存不足）/ 409（订单号冲突），
+    /// 后来全并进了 409，所以这个判断跟着改。
+    pub fn conflict_means_order_settled(self) -> bool {
+        !matches!(self, Self::KiroCeo | Self::KiroDrop)
+    }
 }
 
 impl std::fmt::Display for SupplierKind {
@@ -351,7 +389,9 @@ impl std::str::FromStr for SupplierKind {
 }
 
 /// 单个供货商的完整配置。`settings` 复用历史单供货商结构，避免两套字段。
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// 不派生 `Eq`：`settings.max_unit_price` 是 f64。
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct KeySupplierEntryConfig {
     /// 稳定标识。用于路由、事件表 `supplier_id` 与前端选择，创建后不可改。
@@ -1355,8 +1395,9 @@ mod tests {
                 "sourceChannel": "supplier",
                 "nicknamePrefix": "auto",
                 "restockOnlyWhenExhausted": true,
-                "restockUsableThreshold": 2,
-                "lowQuotaThreshold": 500
+                "targetUsable": 2,
+                "lowQuotaThreshold": 500,
+                "maxUnitPrice": 30.0
             }
         });
 
@@ -1364,6 +1405,28 @@ mod tests {
         let encoded = serde_json::to_value(config).unwrap();
         assert_eq!(encoded["keySupplier"], input["keySupplier"]);
         assert!(encoded.get("key_supplier").is_none());
+    }
+
+    #[test]
+    fn legacy_restock_usable_threshold_still_loads_as_the_target_count() {
+        // 字段改名前叫 `restockUsableThreshold`，语义是低水位。线上配置里存的是旧名，
+        // 读不进来就会静默变成 0，而 0 是「不买」——用户只会看到采购全停，
+        // 完全看不出是字段名换了。
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "keySupplier": { "restockOnlyWhenExhausted": true, "restockUsableThreshold": 2 }
+        }))
+        .unwrap();
+
+        assert_eq!(config.key_supplier.target_usable, 2);
+        assert!(config.key_supplier.restock_only_when_exhausted);
+        // 写回时统一用新名，不再产出旧名。
+        let encoded = serde_json::to_value(&config).unwrap();
+        assert_eq!(encoded["keySupplier"]["targetUsable"], 2);
+        assert!(
+            encoded["keySupplier"]
+                .get("restockUsableThreshold")
+                .is_none()
+        );
     }
 
     #[test]

@@ -27,6 +27,10 @@ pub enum PoolSkipReason {
     BelowSupplierMinimum,
     /// 该家库存不足（仅 `kiro-rs` 会先查库存）。
     SupplierOutOfStock,
+    /// 对方现在的单价高于该家配置的上限。
+    UnitPriceTooHigh,
+    /// 配了单价上限，但这家在下单前报不出单价。按「宁可少买」不买。
+    UnitPriceUnknown,
 }
 
 impl PoolSkipReason {
@@ -38,6 +42,8 @@ impl PoolSkipReason {
             Self::TargetReached => "号池已达目标存量",
             Self::BelowSupplierMinimum => "缺口低于该供货商单笔下限",
             Self::SupplierOutOfStock => "供货商库存不足",
+            Self::UnitPriceTooHigh => "单价高于配置的上限",
+            Self::UnitPriceUnknown => "配了单价上限但供货商不报价，已跳过",
         }
     }
 }

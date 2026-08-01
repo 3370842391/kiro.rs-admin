@@ -93,9 +93,14 @@ impl IncomingWebhook {
             SupplierKind::KiroAppIo => Self::parse_kiro_app_io(body),
             // Kiro Drop 与 kiro.ceo 是同一族（`usr-` 令牌 + `/api/my/*`），推送格式相同，
             // 只是各自缺的字段不同，所以共用一个宽容解析。
-            // Drop 的 `purchase_order_id` 是**它自己的批次号**，文档从没说要传回来；
-            // 它的采购接口写的是「client_order_id 32 位十六进制订单号」，由调用方生成。
-            SupplierKind::KiroDrop => Self::parse_my_api_family(body, "Kiro Drop 通知", false),
+            // Drop 的推送消息里就写着「自动购买时请把 purchase_order_id 原样传给
+            // /api/my/purchase」，文档里那个字段也已经从 `batch_xxx` 变成 32 位 ID。
+            //
+            // 我一度改成自己派生，理由是「回传对方的 id 导致 500」——**那个判断是错的**。
+            // 反证：2026-08-02 01:53 那条到货推送用的就是原样回传，成功导入 1 个；
+            // 而失败的几条也是同一个写法。500 的真正来源是对方上游不稳（新文档为此
+            // 专门加了 `503 上游 Store 暂时不可用`），与订单号无关。
+            SupplierKind::KiroDrop => Self::parse_my_api_family(body, "Kiro Drop 通知", true),
             // kiro.ceo 文档明确要求把推送里的订单号原样作为 `client_order_id` 传回。
             SupplierKind::KiroCeo => Self::parse_my_api_family(body, "kiro.ceo 通知", true),
         }
@@ -466,6 +471,20 @@ fn hex_prefix(digest: &[u8]) -> String {
 
 /// event id 的最大长度。对方的 `evt_8DX2ZPK9MR7Q4JWH` 远短于此，留足余量即可。
 const MAX_EVENT_ID_CHARS: usize = 128;
+
+/// 凭据备注名的上限，与 `nickname_prefix` 的校验上限一致。
+const MAX_NICKNAME_CHARS: usize = 128;
+
+/// 一次触发生效的水位口径。全局号池与逐家水位归约成同一个形状，好让缺口夹逼
+/// 只有一份实现——两套并存必然在 `minPurchase` 这类边界上漂移。
+struct RestockGate {
+    /// 只用于日志和事件原因，让「是哪道闸拦的」不必去翻配置。
+    scope: &'static str,
+    /// 目标存量。0 视为「配了开关没填数量」，按失效保护不买。
+    target: u32,
+    /// 该口径下当前可用的采购凭据数。
+    usable: usize,
+}
 
 /// 事件级自动重试的等待表，第 n 次尝试失败后取第 n-1 项；用完就转 `failed` 终态。
 ///
@@ -1502,7 +1521,7 @@ impl KeySupplierService {
             }
             Ok(ProcessAction::SkipWithReason { reason, summary }) => {
                 self.run_store_operation(move |store| {
-                    store.skip_with_summary(event.id, Some(reason), summary)
+                    store.skip_with_summary(event.id, Some(&reason), summary)
                 })
                 .await?;
                 Ok(empty_summary())
@@ -1567,6 +1586,10 @@ impl KeySupplierService {
         // 全 `None`，落库时走 `COALESCE` 不会覆盖任何已有值。
         let mut pool_snapshot = ProcessSummary::default();
 
+        // 报价来自哪个区，下单必须打同一个区（只有 kiro.ceo 有区的概念）。在这里声明
+        // 而不是在决定数量的那个分支里：下单发生在分支之外，值必须活到那时候。
+        let mut quote_zone: Option<String> = None;
+
         // 事件带 supplier_id，处理时按它找回供货商；供货商被删掉就跳过而不是报错。
         let entry = self
             .supplier(&event.supplier_id)
@@ -1592,47 +1615,65 @@ impl KeySupplierService {
         // 号池配置快照。整次触发用同一份，避免中途被改导致前后判定不一致。
         let pool = self.pool_config();
 
-        // 补货闸：供货商不停推到货通知时，把「到货了」当成「可以补货了」而不是「立刻买」。
-        // 只看该供货商自己名下的号——别家的号还能用不该阻止这家补货。
+        // 水位闸。两种口径互斥，但**语义完全一致**：填的数字都是「目标存量」，任一
+        // 供货商推来到货通知时按 `目标 - 当前可用` 的缺口补齐，只向推送方下单。
+        //
+        //   - 全局号池：可用数 = 所有自动采购来的号合计
+        //   - 逐家水位：可用数 = 只算该供货商名下的号
+        //
+        // 因此归约成同一个 `(target, usable)` 交给 `select_pool_purchase_count`，夹逼实现
+        // 只有一份。逐家那道闸以前是「可用数 > 水位就跳过」，而数量另外由推送里的数字
+        // 决定——于是同一家连推三次就买三次。归约成缺口后这不可能发生：第一次买完
+        // usable 就到 target，后续推送的缺口是 0。
         //
         // 「不可用」= 封号 + 额度耗尽 + 剩余额度跌到水位以下。只认封号是不够的：
         // 号没被封但额度跑光了，对流量来说一样是废的。
         //
-        // 只对 webhook 到货生效；手动采购是人明确要买，不该被拦。
-        //
-        // 号池闸启用时这道逐家闸整个让位：两套水位并存会交叉出第三种行为，而且
-        // 「为什么没买」会变成要同时看两处配置。互斥而非嵌套是刻意的。
-        if event.event_type == "new_keys_available"
-            && pinned.is_none()
-            && !pool.enabled
-            && runtime.restock_only_when_exhausted
-        {
-            let health =
-                importer.supplier_health(&entry.id, f64::from(runtime.low_quota_threshold));
-            if health.usable as u64 > u64::from(runtime.restock_usable_threshold) {
-                tracing::info!(
-                    supplier = %entry.id,
-                    usable = health.usable,
-                    dead = health.dead,
-                    quota_exhausted = health.quota_exhausted,
-                    low_quota = health.low_quota,
-                    threshold = runtime.restock_usable_threshold,
-                    "供货商名下仍有可用号，跳过本次到货采购"
-                );
-                return Ok(ProcessAction::SkipWithReason {
-                    reason: "仍有可用号，未到补货水位",
-                    summary: pool_snapshot,
-                });
-            }
+        // 只对 webhook 到货生效；手动采购是人明确要买，不该被拦。钉住数量的重放同样
+        // 绕过——那一单可能已经付过钱，取回它优先于水位。
+        let gate = if event.event_type != "new_keys_available" || pinned.is_some() {
+            None
+        } else if pool.enabled {
+            let channels = self.configured_source_channels();
+            let health = importer.pool_health(f64::from(pool.low_quota_threshold), &channels);
             tracing::info!(
                 supplier = %entry.id,
-                total = health.total,
+                scope = "全局号池",
+                target = pool.target_count,
+                usable = health.health.usable,
+                dead = health.health.dead,
+                quota_exhausted = health.health.quota_exhausted,
+                low_quota = health.health.low_quota,
+                by_supplier_id = health.by_supplier_id,
+                by_legacy_channel = health.by_legacy_channel,
+                "水位闸读到的存量"
+            );
+            Some(RestockGate {
+                scope: "全局号池",
+                target: pool.target_count,
+                usable: health.health.usable,
+            })
+        } else if runtime.restock_only_when_exhausted {
+            let health =
+                importer.supplier_health(&entry.id, f64::from(runtime.low_quota_threshold));
+            tracing::info!(
+                supplier = %entry.id,
+                scope = "供货商水位",
+                target = runtime.target_usable,
+                usable = health.usable,
                 dead = health.dead,
                 quota_exhausted = health.quota_exhausted,
                 low_quota = health.low_quota,
-                "供货商名下已无可用号，本次到货执行采购"
+                "水位闸读到的存量"
             );
-        }
+            Some(RestockGate {
+                scope: "供货商水位",
+                target: runtime.target_usable,
+                usable: health.usable,
+            })
+        } else {
+            None
+        };
 
         let (count, client) = match (event.event_type.as_str(), pinned) {
             // 重放已发出的那一单：跳过库存与水位判定，只求请求体与上次逐字节相同。
@@ -1649,21 +1690,17 @@ impl KeySupplierService {
             ("new_keys_available", None) => {
                 let client = self.client_for(&entry)?;
 
-                // 号池模式：缺口说了算，推送带的数量只留痕不作依据。
+                // 缺口说了算，推送带的数量只留痕不作依据。
                 //
-                // 缺口必须在查库存**之前**算完：查库存是一次 HTTP 往返，池子已满时
+                // 缺口必须在查库存**之前**算完：查库存是一次 HTTP 往返，存量已达标时
                 // 不该把请求打出去。这也是「缺口为 0 不发任何请求」那条测试要守的。
-                let pool_gap = if pool.enabled {
-                    let channels = self.configured_source_channels();
-                    let health =
-                        importer.pool_health(f64::from(pool.low_quota_threshold), &channels);
-                    let usable = health.health.usable;
-                    let gap = deficit(pool.target_count, usable);
-                    pool_snapshot.pool_usable = Some(usable as i64);
+                if let Some(gate) = &gate {
+                    let gap = deficit(gate.target, gate.usable);
+                    pool_snapshot.pool_usable = Some(gate.usable as i64);
                     pool_snapshot.pool_deficit = Some(i64::from(gap));
 
-                    if pool.target_count == 0 || gap == 0 {
-                        let reason = if pool.target_count == 0 {
+                    if gate.target == 0 || gap == 0 {
+                        let reason = if gate.target == 0 {
                             // 失效保护：有人开了开关却没填数量，宁可不买。
                             PoolSkipReason::TargetUnavailable
                         } else {
@@ -1672,54 +1709,98 @@ impl KeySupplierService {
                         pool_snapshot.pool_requested = Some(0);
                         tracing::info!(
                             supplier = %entry.id,
-                            target = pool.target_count,
-                            usable,
-                            dead = health.health.dead,
-                            quota_exhausted = health.health.quota_exhausted,
-                            low_quota = health.health.low_quota,
-                            by_supplier_id = health.by_supplier_id,
-                            by_legacy_channel = health.by_legacy_channel,
+                            scope = gate.scope,
+                            target = gate.target,
+                            usable = gate.usable,
                             reason = reason.as_str(),
-                            "号池闸拦下本次到货采购"
+                            "水位闸拦下本次到货采购"
                         );
                         return Ok(ProcessAction::SkipWithReason {
-                            reason: reason.as_str(),
+                            reason: reason.as_str().to_owned(),
                             summary: pool_snapshot,
                         });
                     }
-                    Some((usable, health))
-                } else {
-                    None
-                };
+                }
 
                 let event_count = u32::try_from(event.quantity)
                     .map_err(|_| SupplierServiceError::InvalidEvent)?;
                 // kiro-app 的库存通知自带 count，官方文档明确建议「直接尝试领取，
                 // 不要先查 /openapi/stock」——查询和领取不是一个事务，多一次往返
                 // 只会把货让给别人。kiro-rs 没这个说法，保持先查库存夹逼。
+                // 下单前问到的单价，`None` = 这家报不出价，或这条路径没去问。
+                let mut unit_price = None;
                 let available = match entry.kind {
                     // kiroapp-io 同理不先查库存：它的 purchase 本身就处理部分成交
                     // （买得起多少就成交多少），先查一次只是把货让给别人。
-                    SupplierKind::KiroApp | SupplierKind::KiroAppIo => {
+                    //
+                    // 但配了单价上限就必须问一次——上限的前提是知道价钱。多一次往返是
+                    // 用户开这个开关时明确接受的代价。
+                    SupplierKind::KiroApp | SupplierKind::KiroAppIo
+                        if runtime.max_unit_price <= 0.0 =>
+                    {
                         u64::from(runtime.max_purchase)
+                    }
+                    SupplierKind::KiroApp | SupplierKind::KiroAppIo => {
+                        match client.purchase_quote().await {
+                            Ok(quote) => {
+                                unit_price = quote.unit_price;
+                                quote_zone = quote.zone;
+                                quote.stock
+                            }
+                            Err(error) => return defer_or_fail(event, true, None, error),
+                        }
                     }
                     // Drop 的推送不带数量，库存必须查（否则只能盲发）。它的库存来自
                     // `/api/status` 的 `keys_stock`，不是 kiro-rs 那个 `/api/my/stock`。
                     // kiro.ceo 的文档也建议先查 `/api/my/stock` 的 `max` 再提货。
                     SupplierKind::KiroRs | SupplierKind::KiroDrop | SupplierKind::KiroCeo => {
-                        match client.available_stock().await {
-                            Ok(available) => available,
+                        match client.purchase_quote().await {
+                            Ok(quote) => {
+                                unit_price = quote.unit_price;
+                                quote_zone = quote.zone;
+                                quote.stock
+                            }
                             // 查库存是 GET，没花钱，重放永远安全。
                             Err(error) => return defer_or_fail(event, true, None, error),
                         }
                     }
                 };
 
-                match pool_gap {
-                    Some((usable, health)) => {
+                // 单价闸。放在库存夹逼**之后、下单之前**：能拿到价就比，拿不到就不买。
+                //
+                // 配了上限却问不到单价时跳过而不是放行，方向和其它闸一致——「宁可少买」。
+                // 把 `None` 当免费会让这道闸在最需要它的时候（对方不报价）完全失效。
+                if runtime.max_unit_price > 0.0 {
+                    let over_budget = match unit_price {
+                        Some(price) => price > runtime.max_unit_price,
+                        None => true,
+                    };
+                    if over_budget {
+                        let reason = if unit_price.is_some() {
+                            PoolSkipReason::UnitPriceTooHigh
+                        } else {
+                            PoolSkipReason::UnitPriceUnknown
+                        };
+                        pool_snapshot.pool_requested = Some(0);
+                        tracing::info!(
+                            supplier = %entry.id,
+                            unit_price = ?unit_price,
+                            max_unit_price = runtime.max_unit_price,
+                            reason = reason.as_str(),
+                            "单价闸拦下本次到货采购"
+                        );
+                        return Ok(ProcessAction::SkipWithReason {
+                            reason: reason.as_str().to_owned(),
+                            summary: pool_snapshot,
+                        });
+                    }
+                }
+
+                match &gate {
+                    Some(gate) => {
                         match select_pool_purchase_count(
-                            pool.target_count,
-                            usable,
+                            gate.target,
+                            gate.usable,
                             available,
                             runtime.max_purchase,
                             runtime.min_purchase,
@@ -1728,12 +1809,11 @@ impl KeySupplierService {
                                 pool_snapshot.pool_requested = Some(i64::from(count));
                                 tracing::info!(
                                     supplier = %entry.id,
-                                    target = pool.target_count,
-                                    usable,
-                                    by_supplier_id = health.by_supplier_id,
-                                    by_legacy_channel = health.by_legacy_channel,
+                                    scope = gate.scope,
+                                    target = gate.target,
+                                    usable = gate.usable,
                                     count,
-                                    "号池闸放行本次到货采购"
+                                    "水位闸放行本次到货采购"
                                 );
                                 (count, client)
                             }
@@ -1741,16 +1821,17 @@ impl KeySupplierService {
                                 pool_snapshot.pool_requested = Some(0);
                                 tracing::info!(
                                     supplier = %entry.id,
-                                    target = pool.target_count,
-                                    usable,
+                                    scope = gate.scope,
+                                    target = gate.target,
+                                    usable = gate.usable,
                                     available,
                                     min_purchase = runtime.min_purchase,
                                     max_purchase = runtime.max_purchase,
                                     reason = reason.as_str(),
-                                    "号池闸拦下本次到货采购"
+                                    "水位闸拦下本次到货采购"
                                 );
                                 return Ok(ProcessAction::SkipWithReason {
-                                    reason: reason.as_str(),
+                                    reason: reason.as_str().to_owned(),
                                     summary: pool_snapshot,
                                 });
                             }
@@ -1799,7 +1880,7 @@ impl KeySupplierService {
             );
             pool_snapshot.pool_requested = Some(0);
             return Ok(ProcessAction::SkipWithReason {
-                reason: "采购量超过号池缺口，已放弃本笔请求",
+                reason: "采购量超过号池缺口，已放弃本笔请求".to_owned(),
                 summary: pool_snapshot,
             });
         }
@@ -1811,7 +1892,12 @@ impl KeySupplierService {
         // 带上供货商的批次号（只有 kiroapp-io 有）：定向拉这一车产出的 key，
         // 不用从公共池子里跟别人抢。
         let purchase = match client
-            .purchase_batch(count, order_id, event.supplier_batch_id.as_deref())
+            .purchase_batch(
+                count,
+                order_id,
+                event.supplier_batch_id.as_deref(),
+                quote_zone.as_deref(),
+            )
             .await
         {
             Ok(purchase) => purchase,
@@ -1819,7 +1905,7 @@ impl KeySupplierService {
             // （重试只会再抢一次空气，还可能在真有货时变成额外下单）。
             Err(crate::admin::key_supplier::client::SupplierError::OutOfStock) => {
                 return Ok(ProcessAction::SkipWithReason {
-                    reason: "库存已被抢完",
+                    reason: "库存已被抢完".to_owned(),
                     summary: pool_snapshot,
                 });
             }
@@ -1827,22 +1913,46 @@ impl KeySupplierService {
             // 免得当成对方故障去查日志。
             Err(crate::admin::key_supplier::client::SupplierError::InsufficientBalance(_)) => {
                 return Ok(ProcessAction::SkipWithReason {
-                    reason: "供货商积分不足，需充值",
+                    reason: "供货商积分不足，需充值".to_owned(),
                     summary: pool_snapshot,
                 });
             }
             // 原单已成交但参数对不上：钱已经扣、key 已经出货，我们没拿到。
             // 记 failed 会让人反复点 retry 而每次都撞同一个 409，付过的钱一直挂在对方账上；
             // 所以记 skipped 并把该做的事写进原因里。这条必须能在日志里被告警抓到。
-            Err(crate::admin::key_supplier::client::SupplierError::OrderConflict(_)) => {
+            Err(crate::admin::key_supplier::client::SupplierError::OrderConflict(detail)) => {
                 tracing::error!(
                     supplier = %entry.id,
                     event_id = %event.event_id,
                     order_id = %order_id,
+                    detail = %detail,
                     "供货商返回 409：该订单号已成交但参数不一致，积分已扣但未取到 key，需人工核对"
                 );
                 return Ok(ProcessAction::SkipWithReason {
-                    reason: "订单号已成交但参数不一致：积分已扣，需到供货商订单历史核对并补取 key",
+                    reason: format!(
+                        "订单号已成交但参数不一致：积分已扣，需到供货商订单历史核对并补取 key（对方原话：{detail}）"
+                    ),
+                    summary: pool_snapshot,
+                });
+            }
+            // 409 但含义不止一种（kiro.ceo：库存不足 / 已达最大持有库存上限 / 幂等键撞单）。
+            // 前两种一分钱没扣，报成「积分已扣，去订单历史补取 key」会让人去查一条根本
+            // 不存在的订单。只有对方原文能分辨，所以原样写进事件记录。
+            //
+            // 本次订单号是由 event_id 派生/透传的、每条事件各不相同，从没用过的号不可能
+            // 撞单，所以实际几乎总是前两种——但代码不去猜，把话摆出来让人判断。
+            Err(crate::admin::key_supplier::client::SupplierError::StateConflict(detail)) => {
+                tracing::warn!(
+                    supplier = %entry.id,
+                    event_id = %event.event_id,
+                    order_id = %order_id,
+                    detail = %detail,
+                    "供货商返回 409 状态冲突（库存不足 / 已达持有上限 / 幂等键撞单），未下单"
+                );
+                return Ok(ProcessAction::SkipWithReason {
+                    reason: format!(
+                        "供货商状态冲突，未成交：可能是库存不足或已达对方的最大持有库存上限（对方原话：{detail}）"
+                    ),
                     summary: pool_snapshot,
                 });
             }
@@ -1878,6 +1988,7 @@ impl KeySupplierService {
             let credential = credential_from_supplier_key(
                 key.into_inner(),
                 &entry.id,
+                &entry.name,
                 runtime,
                 order_id,
                 index + 1,
@@ -1912,8 +2023,11 @@ enum ProcessAction {
     ///
     /// `summary` 携带解释性字段（号池水位快照、已知的金额）。跳过路径同样要落库：
     /// 「为什么没买」正是那些数字要回答的问题。
+    /// `reason` 是 `String` 而不是 `&'static str`：供货商回的原文常常是唯一能说清
+    /// 「到底为什么没买」的东西。kiro.ceo 的 409 同时表示库存不足 / 已达最大持有上限 /
+    /// 幂等键撞单，只有它的中文原文能分辨，丢掉就只剩一句猜出来的固定文案。
     SkipWithReason {
-        reason: &'static str,
+        reason: String,
         summary: ProcessSummary,
     },
     Failed {
@@ -1961,25 +2075,42 @@ fn empty_summary() -> ProcessSummary {
     ProcessSummary::default()
 }
 
+/// 自动采购来的号叫什么名字：`drop-a19fe933-1` = **来源 + 订单号片段 + 序号**。
+///
+/// 来源默认取供货商名——不配任何东西也能一眼看出这号是谁家的，这是以前缺的。
+/// 配了 `nickname_prefix` 就以它为准（去掉尾部分隔符再统一用 `-` 拼，免得出现 `a--b`）。
+///
+/// 后缀刻意用订单号片段而不是新掷的随机串。它看起来一样随机（自动采购的订单号由
+/// `event_id` 派生、手动是 uuid），但能一眼回查到是哪一单买的。丢掉它等于删掉凭据与
+/// 采购事件之间唯一的线索，出了「钱扣了号没到」只能靠时间戳猜。
+fn supplier_credential_nickname(
+    supplier_name: &str,
+    runtime: &SupplierRuntimeConfig,
+    order_id: &str,
+    index: usize,
+) -> String {
+    let source = if runtime.nickname_prefix.is_empty() {
+        supplier_name
+    } else {
+        runtime.nickname_prefix.as_str()
+    };
+    let source = source.trim_end_matches(['-', '_', ' ', ':']);
+    let trace: String = order_id.chars().take(8).collect();
+    let suffix = format!("-{trace}-{index}");
+    let room = MAX_NICKNAME_CHARS.saturating_sub(suffix.chars().count());
+    format!("{}{suffix}", source.chars().take(room).collect::<String>())
+}
+
 fn credential_from_supplier_key(
     key: String,
     supplier_id: &str,
+    supplier_name: &str,
     runtime: &SupplierRuntimeConfig,
     order_id: &str,
     index: usize,
     purchase_price: Option<f64>,
 ) -> KiroCredentials {
-    let suffix = format!("{}-{index}", &order_id[..8]);
-    let prefix_len = 128usize.saturating_sub(suffix.chars().count());
-    let nickname = format!(
-        "{}{}",
-        runtime
-            .nickname_prefix
-            .chars()
-            .take(prefix_len)
-            .collect::<String>(),
-        suffix
-    );
+    let nickname = supplier_credential_nickname(supplier_name, runtime, order_id, index);
     KiroCredentials {
         auth_method: Some("api_key".to_owned()),
         kiro_api_key: Some(key),
@@ -2104,8 +2235,9 @@ fn empty_runtime() -> SupplierRuntimeConfig {
         source_channel: String::new(),
         nickname_prefix: String::new(),
         restock_only_when_exhausted: false,
-        restock_usable_threshold: 0,
+        target_usable: 0,
         low_quota_threshold: 0,
+        max_unit_price: 0.0,
     }
 }
 
@@ -2410,8 +2542,9 @@ mod tests {
             source_channel: String::new(),
             nickname_prefix: String::new(),
             restock_only_when_exhausted: false,
-            restock_usable_threshold: 0,
+            target_usable: 0,
             low_quota_threshold: 0,
+            max_unit_price: 0.0,
         }
     }
 
@@ -2452,8 +2585,9 @@ mod tests {
             source_channel: runtime.source_channel.clone(),
             nickname_prefix: runtime.nickname_prefix.clone(),
             restock_only_when_exhausted: runtime.restock_only_when_exhausted,
-            restock_usable_threshold: u64::from(runtime.restock_usable_threshold),
+            target_usable: u64::from(runtime.target_usable),
             low_quota_threshold: u64::from(runtime.low_quota_threshold),
+            max_unit_price: runtime.max_unit_price,
         }
     }
 
@@ -2783,6 +2917,48 @@ mod tests {
         assert_eq!(credential.source_channel.as_deref(), Some("supplier-a"));
         assert!(credential.delete_on_forbidden);
         assert_eq!(credential.nickname.as_deref(), Some("supplier-fedcba98-1"));
+    }
+
+    #[test]
+    fn purchased_credentials_are_named_after_the_supplier_when_no_prefix_is_configured() {
+        let mut runtime = runtime(TOKEN);
+        let order = "a19fe933d889757410eb382be103c38e";
+
+        // 没配前缀：默认用供货商名，不配任何东西也能一眼看出号是谁家的。
+        assert_eq!(
+            supplier_credential_nickname("drop", &runtime, order, 1),
+            "drop-a19fe933-1"
+        );
+        // 同一单里多个 key 用序号区分，不会撞名。
+        assert_eq!(
+            supplier_credential_nickname("drop", &runtime, order, 2),
+            "drop-a19fe933-2"
+        );
+
+        // 配了前缀就以它为准，且尾部分隔符不重复（旧配置里普遍带尾巴）。
+        runtime.nickname_prefix = "supplier-".to_owned();
+        assert_eq!(
+            supplier_credential_nickname("drop", &runtime, order, 1),
+            "supplier-a19fe933-1"
+        );
+        runtime.nickname_prefix = "vip".to_owned();
+        assert_eq!(
+            supplier_credential_nickname("drop", &runtime, order, 1),
+            "vip-a19fe933-1"
+        );
+
+        // 名字再长也不能越过备注上限，且必须在字符边界上截断（中文名会踩到）。
+        runtime.nickname_prefix = String::new();
+        let long = "供".repeat(200);
+        let nickname = supplier_credential_nickname(&long, &runtime, order, 1);
+        assert_eq!(nickname.chars().count(), MAX_NICKNAME_CHARS);
+        assert!(nickname.ends_with("-a19fe933-1"));
+
+        // 订单号短于 8 位也不能 panic（手动采购是 uuid，但别人改了就未必）。
+        assert_eq!(
+            supplier_credential_nickname("drop", &runtime, "abc", 1),
+            "drop-abc-1"
+        );
     }
 
     #[tokio::test]
@@ -3827,11 +4003,13 @@ mod tests {
     }
 
     #[test]
-    fn kiro_drop_never_sends_the_vendors_own_batch_id_back_as_the_idempotency_key() {
-        // 生产事故：Drop 实际推的 `purchase_order_id` 是 32 hex，旧规则「形状对就当
-        // 幂等键」于是把**它自己的批次号**当成我们的 client_order_id 发回去，
-        // 四次自动采购四次 `500 INTERNAL_ERROR`；同一时刻用我们自己生成的订单号
-        // 手动买则成功。判据只能是对方文档怎么说，不能是字段长得像什么。
+    fn pushed_order_id_is_reused_as_the_idempotency_key_only_where_the_vendor_asks_for_it() {
+        // Kiro Drop 和 kiro.ceo 的推送都明确要求「把 purchase_order_id 原样传给
+        // /api/my/purchase」，Drop 的 message 里就写着这句话。所以 32 hex 的值直接当
+        // 幂等键，不另外派生——派生出来的 id 对方不认识，重复推送时也就失去了它那侧的去重。
+        //
+        // 判据是**对方文档怎么说**，不是字段长得像什么：非 32 hex 的值（Drop 早期的
+        // `batch_xxx`）当不了幂等键，那时才派生，原值进 `supplier_batch_id` 留痕。
         let vendor_id = "a19fe933d889757410eb382be103c38e";
         let body = format!(
             r#"{{"event":"new_keys_available","event_id":"{vendor_id}",
@@ -3847,25 +4025,35 @@ mod tests {
             panic!("arrival push must stay an arrival push");
         };
 
-        assert_ne!(purchase_order_id, vendor_id, "不能把对方的 id 当幂等键");
-        assert_eq!(purchase_order_id, derive_order_id(vendor_id));
-        // 仍然是合法的 32 hex，且对同一事件确定性——重推、重启后都是同一个键。
-        assert_eq!(purchase_order_id.len(), 32);
-        assert!(purchase_order_id.bytes().all(|b| b.is_ascii_hexdigit()));
-        // 对方的批次号不丢，留着和它后台对账。
-        assert_eq!(supplier_batch_id.as_deref(), Some(vendor_id));
+        // 原样传回，不派生。
+        assert_eq!(purchase_order_id, vendor_id);
+        // 值本身就是订单号，不需要再往 supplier_batch_id 里留一份。
+        assert_eq!(supplier_batch_id, None);
 
-        // kiro.ceo 相反：它文档明确要求原样传回，这条不能被一起改掉。
+        // kiro.ceo 同样是原样传回。
         let IncomingWebhook::NewKeysAvailable {
-            purchase_order_id,
-            supplier_batch_id,
-            ..
+            purchase_order_id, ..
         } = IncomingWebhook::parse(SupplierKind::KiroCeo, body.as_bytes()).unwrap()
         else {
             panic!("arrival push must stay an arrival push");
         };
         assert_eq!(purchase_order_id, vendor_id);
-        assert_eq!(supplier_batch_id, None);
+
+        // 非 32 hex 才派生，并把原值留痕——Drop 早期推的就是 `batch_xxx`。
+        let legacy = br#"{"event":"new_keys_available","event_id":"evt_a",
+            "purchase_order_id":"batch_20260731_01"}"#;
+        let IncomingWebhook::NewKeysAvailable {
+            purchase_order_id,
+            supplier_batch_id,
+            ..
+        } = IncomingWebhook::parse(SupplierKind::KiroDrop, legacy).unwrap()
+        else {
+            panic!("arrival push must stay an arrival push");
+        };
+        assert_eq!(purchase_order_id, derive_order_id("evt_a"));
+        assert_eq!(purchase_order_id.len(), 32);
+        assert!(purchase_order_id.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(supplier_batch_id.as_deref(), Some("batch_20260731_01"));
     }
 
     #[test]
@@ -3979,7 +4167,7 @@ mod tests {
         supplier.settings.min_purchase = 1;
         supplier.settings.max_purchase = 5;
         supplier.settings.restock_only_when_exhausted = gate_enabled;
-        supplier.settings.restock_usable_threshold = usable_threshold;
+        supplier.settings.target_usable = usable_threshold;
         supplier.settings.low_quota_threshold = low_quota_threshold;
         let store = Arc::new(SupplierEventStore::open_in_memory().unwrap());
         let importer = Arc::new(FakeImporter::default());
@@ -3996,8 +4184,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restock_gate_skips_purchase_while_usable_keys_remain() {
-        let (service, store, importer, calls, token) = restock_gate_fixture(true, 0, 0).await;
+    async fn restock_gate_skips_purchase_once_the_target_is_reached() {
+        let (service, store, importer, calls, token) = restock_gate_fixture(true, 3, 0).await;
         importer.set_health(
             "io",
             SupplierCredentialHealth {
@@ -4012,7 +4200,7 @@ mod tests {
             .unwrap();
         service.process_pending().await.unwrap();
 
-        assert_eq!(*calls.lock().unwrap(), 0, "有可用号就不该下单");
+        assert_eq!(*calls.lock().unwrap(), 0, "已达目标存量就不该下单");
         let stored = &store.list(1, None, None).unwrap().items[0];
         assert_eq!(stored.status, SupplierEventStatus::Skipped);
         assert!(
@@ -4020,13 +4208,61 @@ mod tests {
                 .message
                 .as_deref()
                 .unwrap_or_default()
-                .contains("仍有可用号")
+                .contains("已达目标存量"),
+            "{:?}",
+            stored.message
         );
+    }
+
+    /// 用户要的那条：**一家推三次只买到目标存量**，不是推三次买三次。
+    ///
+    /// 旧实现是「可用数 > 水位就跳过」。填 1 时买到第 1 个后 `1 > 1` 为假，于是继续买，
+    /// 同一家连推三次就买三次——这条测试锁住新的缺口语义。
+    #[tokio::test]
+    async fn per_supplier_target_of_one_buys_once_no_matter_how_many_pushes_arrive() {
+        let (service, store, importer, calls, token) = restock_gate_fixture(true, 1, 0).await;
+        importer.set_health(
+            "io",
+            SupplierCredentialHealth {
+                total: 0,
+                usable: 0,
+                ..Default::default()
+            },
+        );
+
+        service.ingest(&token, arrival_body("evt_push_1")).unwrap();
+        service.process_pending().await.unwrap();
+        assert_eq!(*calls.lock().unwrap(), 1, "第一次到货应当补到目标存量");
+
+        // 第一单已经把该家补到 1 个可用号。
+        importer.set_health(
+            "io",
+            SupplierCredentialHealth {
+                total: 1,
+                usable: 1,
+                ..Default::default()
+            },
+        );
+        for event_id in ["evt_push_2", "evt_push_3"] {
+            service.ingest(&token, arrival_body(event_id)).unwrap();
+            service.process_pending().await.unwrap();
+        }
+
+        assert_eq!(*calls.lock().unwrap(), 1, "目标存量 1，三次推送只该买一次");
+        let events = store.list(9, None, None).unwrap().items;
+        assert_eq!(events.len(), 3);
+        // 后两条都记跳过并写明原因，而不是静悄悄什么都没发生。
+        for skipped in events.iter().take(2) {
+            assert_eq!(skipped.status, SupplierEventStatus::Skipped);
+            assert_eq!(skipped.pool_usable, Some(1));
+            assert_eq!(skipped.pool_deficit, Some(0));
+            assert_eq!(skipped.pool_requested, Some(0));
+        }
     }
 
     #[tokio::test]
     async fn restock_gate_buys_when_every_key_is_dead() {
-        let (service, _store, importer, calls, token) = restock_gate_fixture(true, 0, 0).await;
+        let (service, _store, importer, calls, token) = restock_gate_fixture(true, 3, 0).await;
         importer.set_health(
             "io",
             SupplierCredentialHealth {
@@ -4048,7 +4284,7 @@ mod tests {
     /// 这条盯的是最初的 bug：额度耗尽被禁的号当时算「活」，永远堵住补货。
     #[tokio::test]
     async fn restock_gate_treats_quota_exhausted_keys_as_unusable() {
-        let (service, _store, importer, calls, token) = restock_gate_fixture(true, 0, 0).await;
+        let (service, _store, importer, calls, token) = restock_gate_fixture(true, 3, 0).await;
         importer.set_health(
             "io",
             SupplierCredentialHealth {
@@ -4076,7 +4312,7 @@ mod tests {
     /// 第二个 bug：号还能用但只剩几百额度。只等 402 就得先把号跑干才补货。
     #[tokio::test]
     async fn restock_gate_counts_low_quota_keys_as_unusable_and_passes_the_threshold_down() {
-        let (service, _store, importer, calls, token) = restock_gate_fixture(true, 0, 500).await;
+        let (service, _store, importer, calls, token) = restock_gate_fixture(true, 2, 500).await;
         importer.set_health(
             "io",
             SupplierCredentialHealth {
@@ -4098,8 +4334,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restock_gate_respects_a_nonzero_usable_threshold() {
-        let (service, _store, importer, calls, token) = restock_gate_fixture(true, 2, 0).await;
+    async fn restock_gate_buys_only_the_deficit_up_to_the_target() {
+        let (service, _store, importer, calls, token) = restock_gate_fixture(true, 3, 0).await;
         importer.set_health(
             "io",
             SupplierCredentialHealth {
@@ -4110,14 +4346,14 @@ mod tests {
             },
         );
 
-        // 水位 2、可用 2：已经跌到水位（<=），应该买。
+        // 目标 3、可用 2：缺口 1，买。
         service
-            .ingest(&token, arrival_body("evt_at_watermark"))
+            .ingest(&token, arrival_body("evt_below_target"))
             .unwrap();
         service.process_pending().await.unwrap();
         assert_eq!(*calls.lock().unwrap(), 1);
 
-        // 可用 3 > 水位 2：不买。
+        // 可用 3 = 目标 3：缺口 0，不买。
         importer.set_health(
             "io",
             SupplierCredentialHealth {
@@ -4128,15 +4364,296 @@ mod tests {
             },
         );
         service
-            .ingest(&token, arrival_body("evt_above_watermark"))
+            .ingest(&token, arrival_body("evt_at_target"))
             .unwrap();
         service.process_pending().await.unwrap();
-        assert_eq!(*calls.lock().unwrap(), 1, "高于水位不该再买");
+        assert_eq!(*calls.lock().unwrap(), 1, "已达目标存量不该再买");
+    }
+
+    /// 生产事故：kiro.ceo 按区严格隔离，不传 `zone` 只从美国区取号，美国区空了返 409
+    /// 而**不会**用欧洲区顶上。我们拿跨区合计的 `max > 0` 去下一个只打美国区的单，
+    /// 于是连续「购买失败」，而欧洲区一直有 4 个货。
+    #[tokio::test]
+    async fn kiro_ceo_buys_from_the_zone_that_actually_has_stock() {
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let observed = bodies.clone();
+        let app = Router::new()
+            .route(
+                "/api/my/stock",
+                get(|| async {
+                    // 线上真实形状：合计 2，但美国区 0、欧洲区 4（本区单笔上限 2）。
+                    axum::Json(serde_json::json!({
+                        "max": 2, "max_purchase": 10, "min": 1, "quota": 322, "reserved": 0,
+                        "zones": [
+                            {"zone": "us", "enabled": true, "available": 0, "max": 0,
+                             "stock": 0, "unit_price": 20},
+                            {"zone": "eu", "enabled": true, "available": 4, "max": 2,
+                             "stock": 4, "unit_price": 15}
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/api/my/purchase",
+                post(move |body: axum::body::Bytes| {
+                    let observed = observed.clone();
+                    async move {
+                        let text = String::from_utf8(body.to_vec()).unwrap();
+                        observed.lock().unwrap().push(text.clone());
+                        let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        // 对方的真实行为：没指定区就只看美国区，空了就 409。
+                        if request.get("zone").and_then(serde_json::Value::as_str) != Some("eu") {
+                            return (
+                                axum::http::StatusCode::CONFLICT,
+                                r#"{"error":"库存不足"}"#.to_owned(),
+                            );
+                        }
+                        (
+                            axum::http::StatusCode::OK,
+                            r#"{"client_order_id":"","purchased":1,"remaining":307,
+                                "zone":"eu","unit_price":15,"total_credits":15,
+                                "keys":[{"key":"kiro-eu-1"}]}"#
+                                .to_owned(),
+                        )
+                    }
+                }),
+            );
+        let token = "e".repeat(64);
+        let mut supplier = entry("ceo", SupplierKind::KiroCeo, &token);
+        supplier.settings.base_url = server(app).await;
+        let store = Arc::new(SupplierEventStore::open_in_memory().unwrap());
+        let importer = Arc::new(FakeImporter::default());
+        let service = KeySupplierService::with_suppliers_and_importer(
+            store.clone(),
+            vec![supplier],
+            importer.clone(),
+        );
+
+        service
+            .ingest(
+                &token,
+                r#"{"event":"new_keys_available","event_id":"7f3a9c2e1b4d5a6f8e9c0b1a2d3e4f5a",
+                    "purchase_order_id":"7f3a9c2e1b4d5a6f8e9c0b1a2d3e4f5a","new_keys":20,
+                    "zone":"eu"}"#,
+            )
+            .unwrap();
+        service.process_pending().await.unwrap();
+
+        let stored = &store.list(1, None, None).unwrap().items[0];
+        assert_eq!(
+            stored.status,
+            SupplierEventStatus::Succeeded,
+            "{:?}",
+            stored.message
+        );
+        assert_eq!(stored.imported_count, 1);
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1, "选对区就该一次成交，不该先撞一次 409");
+        let request: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        assert_eq!(request["zone"], "eu", "必须显式带上有货的那个区");
+        // 数量受该区单笔上限 2 夹逼，不是推送里的 20，也不是合计的那个数。
+        assert_eq!(request["count"], 2);
+    }
+
+    /// kiro.ceo 的 409 不等于「原单已成交」。
+    ///
+    /// 它的文档把 409 定义成「状态冲突」，同时覆盖库存不足、已达最大持有库存上限、
+    /// 幂等键撞单三件事，并明说「用同一个 id 重试是安全的」。按「积分已扣、去订单历史
+    /// 补取 key」去报，是让人去查一条根本不存在的订单。
+    #[tokio::test]
+    async fn kiro_ceo_conflict_is_reported_as_a_state_conflict_with_the_vendor_wording() {
+        let app = Router::new()
+            .route(
+                "/api/my/stock",
+                get(|| async {
+                    axum::Json(serde_json::json!({
+                        "max": 9,
+                        "zones": [{"zone": "us", "enabled": true, "available": 9,
+                                   "max": 0, "unit_price": 20}]
+                    }))
+                }),
+            )
+            .route(
+                "/api/my/purchase",
+                post(|| async {
+                    (
+                        axum::http::StatusCode::CONFLICT,
+                        r#"{"error":"已达最大持有库存上限"}"#,
+                    )
+                }),
+            );
+        let token = "c".repeat(64);
+        let mut supplier = entry("ceo", SupplierKind::KiroCeo, &token);
+        supplier.settings.base_url = server(app).await;
+        let store = Arc::new(SupplierEventStore::open_in_memory().unwrap());
+        let service = KeySupplierService::with_suppliers_and_importer(
+            store.clone(),
+            vec![supplier],
+            Arc::new(FakeImporter::default()),
+        );
+
+        service
+            .ingest(
+                &token,
+                r#"{"event":"new_keys_available","event_id":"43da1a1cf0e945c9000cbe12fb680ae6",
+                    "purchase_order_id":"43da1a1cf0e945c9000cbe12fb680ae6","new_keys":26}"#,
+            )
+            .unwrap();
+        service.process_pending().await.unwrap();
+
+        let stored = &store.list(1, None, None).unwrap().items[0];
+        assert_eq!(stored.status, SupplierEventStatus::Skipped);
+        let message = stored.message.as_deref().unwrap_or_default();
+        // 对方原话必须带出来——只有它能分辨这三种冲突。
+        assert!(message.contains("已达最大持有库存上限"), "{message}");
+        // 绝不能声称钱扣了：库存不足和持有上限这两种一分钱没动。
+        assert!(!message.contains("积分已扣"), "{message}");
+        assert!(!message.contains("补取 key"), "{message}");
+
+        // kiroapp-io 的 409 只有「同一订单号换了参数」一个含义，保持已成交语义。
+        assert!(SupplierKind::KiroAppIo.conflict_means_order_settled());
+        // ceo 和 Drop 的 409 都是多义的（缺货 / 余额不足 / 持有上限 / 撞单 / 超价），
+        // 里面只有撞单扣了钱，所以不能一律报「积分已扣」。
+        assert!(!SupplierKind::KiroCeo.conflict_means_order_settled());
+        assert!(!SupplierKind::KiroDrop.conflict_means_order_settled());
+    }
+
+    /// 单价闸：贵了不买，且「问不到价」也不买。
+    #[tokio::test]
+    async fn unit_price_ceiling_blocks_expensive_stock_and_unpriced_suppliers() {
+        let calls = Arc::new(Mutex::new(0_usize));
+        let observed = calls.clone();
+        let app = Router::new()
+            .route(
+                "/api/me/stock",
+                get(|| async {
+                    axum::Json(serde_json::json!({"stock": 9, "price_min": 38, "balance": 900}))
+                }),
+            )
+            .route(
+                "/api/me/purchase",
+                post(move || {
+                    let observed = observed.clone();
+                    async move {
+                        *observed.lock().unwrap() += 1;
+                        axum::Json(serde_json::json!({
+                            "purchased": 1, "remaining": 8, "total_debit": 38,
+                            "keys": [{"key": "ksk_pricey"}]
+                        }))
+                    }
+                }),
+            );
+        let token = "9".repeat(64);
+        let mut supplier = entry("io", SupplierKind::KiroAppIo, &token);
+        supplier.settings.base_url = server(app).await;
+        supplier.settings.api_key = "km_secret".to_string();
+        supplier.settings.max_unit_price = 30.0;
+        let store = Arc::new(SupplierEventStore::open_in_memory().unwrap());
+        let service = KeySupplierService::with_suppliers_and_importer(
+            store.clone(),
+            vec![supplier],
+            Arc::new(FakeImporter::default()),
+        );
+
+        service
+            .ingest(
+                &token,
+                r#"{"event":"new_keys_available","event_id":"evt_pricey","new_keys":1}"#,
+            )
+            .unwrap();
+        service.process_pending().await.unwrap();
+
+        // 38 > 30：不下单，并把原因写清楚。
+        assert_eq!(*calls.lock().unwrap(), 0, "单价超上限不该下单");
+        let stored = &store.list(1, None, None).unwrap().items[0];
+        assert_eq!(stored.status, SupplierEventStatus::Skipped);
+        assert!(
+            stored
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("单价高于"),
+            "{:?}",
+            stored.message
+        );
+    }
+
+    /// kiro-rs 在下单前报不出单价。配了上限就只能不买——把「不知道价」当免费放行，
+    /// 等于这道闸在最需要它的时候失效。
+    #[tokio::test]
+    async fn unit_price_ceiling_skips_suppliers_that_cannot_quote_a_price() {
+        let calls = Arc::new(Mutex::new(0_usize));
+        let observed = calls.clone();
+        let app = Router::new()
+            .route(
+                "/api/my/stock",
+                get(|| async { axum::Json(serde_json::json!({"max": 5})) }),
+            )
+            .route(
+                "/api/my/purchase",
+                post(move || {
+                    let observed = observed.clone();
+                    async move {
+                        *observed.lock().unwrap() += 1;
+                        purchase_json(ORDER_ID, &["ksk_unpriced"])
+                    }
+                }),
+            );
+        let mut config = runtime(TOKEN);
+        config.base_url = server(app).await;
+        config.auto_purchase = true;
+        config.max_unit_price = 30.0;
+        let store = Arc::new(SupplierEventStore::open_in_memory().unwrap());
+        queued_event(&store, "new_keys_available", Some(ORDER_ID), 1);
+        let service = KeySupplierService::with_importer(
+            store.clone(),
+            config,
+            Arc::new(FakeImporter::default()),
+        );
+
+        service.process_pending().await.unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), 0);
+        let stored = &store.list(1, None, None).unwrap().items[0];
+        assert_eq!(stored.status, SupplierEventStatus::Skipped);
+        assert!(
+            stored
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("不报价"),
+            "{:?}",
+            stored.message
+        );
+    }
+
+    /// 失效保护：开了闸却把目标存量留成 0，是配置没填完，不是「无限买」。
+    #[tokio::test]
+    async fn restock_gate_with_a_zero_target_buys_nothing() {
+        let (service, store, importer, calls, token) = restock_gate_fixture(true, 0, 0).await;
+        importer.set_health("io", SupplierCredentialHealth::default());
+
+        service.ingest(&token, arrival_body("evt_zero")).unwrap();
+        service.process_pending().await.unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), 0, "目标存量 0 时宁可不买");
+        let stored = &store.list(1, None, None).unwrap().items[0];
+        assert_eq!(stored.status, SupplierEventStatus::Skipped);
+        assert!(
+            stored
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("目标存量不可用"),
+            "{:?}",
+            stored.message
+        );
     }
 
     #[tokio::test]
     async fn restock_gate_allows_the_first_purchase_into_an_empty_pool() {
-        let (service, _store, importer, calls, token) = restock_gate_fixture(true, 0, 0).await;
+        let (service, _store, importer, calls, token) = restock_gate_fixture(true, 1, 0).await;
         // 什么都没买过：total=0，usable=0。必须放行，否则首次补货起不来。
         importer.set_health("io", SupplierCredentialHealth::default());
 
@@ -4621,7 +5138,7 @@ mod tests {
         supplier.settings.max_purchase = 50;
         // 逐家补货闸配成「名下还有 10 个可用就不买」，若它仍生效就会拦住本次采购。
         supplier.settings.restock_only_when_exhausted = true;
-        supplier.settings.restock_usable_threshold = 0;
+        supplier.settings.target_usable = 0;
 
         let store = Arc::new(SupplierEventStore::open_in_memory().unwrap());
         let importer = Arc::new(FakeImporter::default());

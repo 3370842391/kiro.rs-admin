@@ -22,7 +22,8 @@ import { useGroupOptions } from '@/hooks/use-groups'
 import { extractErrorMessage } from '@/lib/utils'
 import {
   emptySupplierEntry, emptySupplierPool, getSupplierEventStatusLabel, getSupplierKindLabel,
-  hasUnreadSupplierEvents, isValidSupplierId, parseSupplierNumberDraft, suggestSupplierId,
+  hasUnreadSupplierEvents, isValidSupplierId, parseSupplierDecimalDraft,
+  parseSupplierNumberDraft, suggestSupplierId,
   toSupplierEntryUpdate, validateSupplierPool,
 } from '@/lib/key-supplier'
 import type {
@@ -39,8 +40,9 @@ type SupplierNumericField =
   | 'maxPurchase'
   | 'rpmLimit'
   | 'priority'
-  | 'restockUsableThreshold'
+  | 'targetUsable'
   | 'lowQuotaThreshold'
+  | 'maxUnitPrice'
 type NumericDrafts = Record<SupplierNumericField, string>
 
 function toNumericDrafts(config: Pick<SupplierEntryUpdate, SupplierNumericField>): NumericDrafts {
@@ -49,8 +51,9 @@ function toNumericDrafts(config: Pick<SupplierEntryUpdate, SupplierNumericField>
     maxPurchase: String(config.maxPurchase),
     rpmLimit: String(config.rpmLimit),
     priority: String(config.priority),
-    restockUsableThreshold: String(config.restockUsableThreshold),
+    targetUsable: String(config.targetUsable),
     lowQuotaThreshold: String(config.lowQuotaThreshold),
+    maxUnitPrice: String(config.maxUnitPrice),
   }
 }
 
@@ -107,7 +110,7 @@ export function KeySupplierPage() {
   const groupOptions = useGroupOptions()
   const [numericDrafts, setNumericDrafts] = useState<NumericDrafts>({
     minPurchase: '', maxPurchase: '', rpmLimit: '', priority: '',
-    restockUsableThreshold: '', lowQuotaThreshold: '',
+    targetUsable: '', lowQuotaThreshold: '', maxUnitPrice: '',
   })
   const [purchaseCountDraft, setPurchaseCountDraft] = useState('1')
   const [poolDraft, setPoolDraft] = useState<SupplierPoolConfig>(emptySupplierPool)
@@ -317,15 +320,18 @@ export function KeySupplierPage() {
   const parsedMaxPurchase = parseSupplierNumberDraft(numericDrafts.maxPurchase, 1)
   const parsedRpmLimit = parseSupplierNumberDraft(numericDrafts.rpmLimit, 0)
   const parsedPriority = parseSupplierNumberDraft(numericDrafts.priority, 0)
-  const parsedRestockUsableThreshold = parseSupplierNumberDraft(
-    numericDrafts.restockUsableThreshold,
+  const parsedTargetUsable = parseSupplierNumberDraft(
+    numericDrafts.targetUsable,
     0,
   )
   const parsedLowQuotaThreshold = parseSupplierNumberDraft(numericDrafts.lowQuotaThreshold, 0)
+  // 单价可以是小数（Drop 报 2.20），所以不能走整数草稿解析。
+  const parsedMaxUnitPrice = parseSupplierDecimalDraft(numericDrafts.maxUnitPrice, 0)
   const idValid = !creating || isValidSupplierId(config?.id ?? '')
   const configNumbersValid = parsedMinPurchase !== null && parsedMaxPurchase !== null &&
     parsedRpmLimit !== null && parsedPriority !== null && parsedMinPurchase <= parsedMaxPurchase &&
-    parsedRestockUsableThreshold !== null && parsedLowQuotaThreshold !== null &&
+    parsedTargetUsable !== null && parsedLowQuotaThreshold !== null &&
+    parsedMaxUnitPrice !== null &&
     idValid
   const parsedPurchaseCount = parseSupplierNumberDraft(purchaseCountDraft, 1)
   const purchaseCountValid = parsedPurchaseCount !== null && config !== null &&
@@ -336,9 +342,10 @@ export function KeySupplierPage() {
     if (
       parsedMinPurchase === null || parsedMaxPurchase === null ||
       parsedRpmLimit === null || parsedPriority === null ||
-      parsedRestockUsableThreshold === null || parsedLowQuotaThreshold === null
+      parsedTargetUsable === null || parsedLowQuotaThreshold === null ||
+      parsedMaxUnitPrice === null
     ) {
-      toast.error('请输入有效的非负整数配置')
+      toast.error('请输入有效的非负数配置')
       return
     }
     if (creating && !isValidSupplierId(config.id ?? '')) {
@@ -351,8 +358,9 @@ export function KeySupplierPage() {
       maxPurchase: parsedMaxPurchase,
       rpmLimit: parsedRpmLimit,
       priority: parsedPriority,
-      restockUsableThreshold: parsedRestockUsableThreshold,
+      targetUsable: parsedTargetUsable,
       lowQuotaThreshold: parsedLowQuotaThreshold,
+      maxUnitPrice: parsedMaxUnitPrice,
       apiKey: apiKey || undefined,
       webhookToken: webhookToken || undefined,
       webhookSecret: webhookSecret || undefined,
@@ -631,8 +639,8 @@ export function KeySupplierPage() {
                   <Field label="自动采购 RPM 预设"><Input type="number" min={0} value={numericDrafts.rpmLimit} onChange={(event) => updateNumericDraft('rpmLimit', event.target.value)} disabled={saveConfig.isPending} /></Field>
                   <Field label="Priority"><Input type="number" min={0} value={numericDrafts.priority} onChange={(event) => updateNumericDraft('priority', event.target.value)} disabled={saveConfig.isPending} /></Field>
                   <Field label="Source Channel"><Input value={config.sourceChannel} onChange={(event) => updateField('sourceChannel', event.target.value)} disabled={saveConfig.isPending} /></Field>
-                  <Field label="补货水位（可用号数）"><Input type="number" min={0} value={numericDrafts.restockUsableThreshold} onChange={(event) => updateNumericDraft('restockUsableThreshold', event.target.value)} disabled={saveConfig.isPending || !config.restockOnlyWhenExhausted} /></Field>
-                  <Field label="额度水位（剩余额度）"><Input type="number" min={0} value={numericDrafts.lowQuotaThreshold} onChange={(event) => updateNumericDraft('lowQuotaThreshold', event.target.value)} disabled={saveConfig.isPending || !config.restockOnlyWhenExhausted} /></Field>
+                  <Field label="目标存量（本家常备可用号数）"><Input type="number" min={0} value={numericDrafts.targetUsable} onChange={(event) => updateNumericDraft('targetUsable', event.target.value)} disabled={saveConfig.isPending || !config.restockOnlyWhenExhausted} /></Field>
+                  <Field label="单价上限（0 = 不限，按本家计价单位）"><Input type="number" min={0} step="0.01" value={numericDrafts.maxUnitPrice} onChange={(event) => updateNumericDraft('maxUnitPrice', event.target.value)} disabled={saveConfig.isPending} /></Field><Field label="额度水位（剩余额度）"><Input type="number" min={0} value={numericDrafts.lowQuotaThreshold} onChange={(event) => updateNumericDraft('lowQuotaThreshold', event.target.value)} disabled={saveConfig.isPending || !config.restockOnlyWhenExhausted} /></Field>
                 </div>
                 <div className="grid gap-3 sm:grid-cols-2">
                   <Field label="自动采购分组预设"><GroupMultiSelect value={config.groups} options={groupOptions} onChange={(groups) => updateField('groups', groups)} disabled={saveConfig.isPending} /></Field>

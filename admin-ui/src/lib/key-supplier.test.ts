@@ -15,6 +15,8 @@ import {
   getSupplierKindLabel,
   hasUnreadSupplierEvents,
   isValidSupplierId,
+  parseSupplierDecimalDraft,
+  parseSupplierNumberDraft,
   suggestSupplierId,
   toSupplierEntryUpdate,
   validateSupplierPool,
@@ -353,9 +355,27 @@ describe('multi-supplier helpers', () => {
     const draft = emptySupplierEntry('kiroapp-io')
 
     expect(draft.restockOnlyWhenExhausted).toBe(true)
-    // 0 = 一个能用的都没有了才买。
-    expect(draft.restockUsableThreshold).toBe(0)
+    // 目标存量语义：1 = 这家常备一个可用号，补满就停。0 是失效保护（什么都不买），
+    // 拿它当默认会让新建的供货商永远不采购。
+    expect(draft.targetUsable).toBe(1)
     expect(draft.lowQuotaThreshold).toBe(0)
+    // 默认不限价：对方不报价时限价会导致一个都买不到，不该是开箱行为。
+    expect(draft.maxUnitPrice).toBe(0)
+  })
+
+  test('the unit price cap accepts fractions but rejects NaN and negatives', () => {
+    // 价格不是整数（Drop 报 "2.20"），整数解析会把所有现实的上限都判为无效。
+    expect(parseSupplierDecimalDraft('2.20', 0)).toBe(2.2)
+    expect(parseSupplierDecimalDraft('0', 0)).toBe(0)
+    expect(parseSupplierDecimalDraft(' 38 ', 0)).toBe(38)
+    // 空白当「没填」，交给调用方决定，而不是当 0（0 是「不限价」）。
+    expect(parseSupplierDecimalDraft('', 0)).toBeNull()
+    // NaN 参与任何比较都是 false，会静默关掉这道闸；负数则是「永不采购」伪装成价格。
+    expect(parseSupplierDecimalDraft('abc', 0)).toBeNull()
+    expect(parseSupplierDecimalDraft('Infinity', 0)).toBeNull()
+    expect(parseSupplierDecimalDraft('-1', 0)).toBeNull()
+    // 整数解析仍然拒绝小数，两个函数不能混用。
+    expect(parseSupplierNumberDraft('2.20', 0)).toBeNull()
   })
 
   test('the restock gate knobs survive the payload round-trip', () => {
@@ -364,13 +384,13 @@ describe('multi-supplier helpers', () => {
       id: 'io',
       name: 'io',
       restockOnlyWhenExhausted: true,
-      restockUsableThreshold: 2,
+      targetUsable: 2,
       lowQuotaThreshold: 500,
     })
 
     // 水位必须真的发出去——丢了就是「额度水位静默失效」。
     expect(payload.restockOnlyWhenExhausted).toBe(true)
-    expect(payload.restockUsableThreshold).toBe(2)
+    expect(payload.targetUsable).toBe(2)
     expect(payload.lowQuotaThreshold).toBe(500)
   })
 

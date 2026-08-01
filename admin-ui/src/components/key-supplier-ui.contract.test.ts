@@ -148,7 +148,7 @@ describe('key supplier management UI contract', () => {
     const page = await readSource('components/key-supplier-page.tsx')
 
     expect(page).toContain('restockOnlyWhenExhausted')
-    expect(page).toContain('restockUsableThreshold')
+    expect(page).toContain('targetUsable')
     expect(page).toContain('lowQuotaThreshold')
     expect(page).toContain('仅在号不够用时补货')
     // 「为什么没买」必须能在界面上看出来，而不是只能翻日志：

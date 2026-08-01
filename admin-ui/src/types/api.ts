@@ -1145,18 +1145,34 @@ export interface SupplierConfigView {
   sourceChannel: string
   nicknamePrefix: string
   /**
-   * Only auto-purchase on webhook arrival when this supplier's usable key count has
-   * dropped to `restockUsableThreshold` or below. Off keeps the legacy behaviour of
-   * buying on every arrival notification.
+   * Per-supplier watermark gate. On, an arrival webhook tops this supplier up to
+   * `targetUsable`; off keeps the legacy behaviour of buying on every notification.
+   * The global pool, when enabled, replaces this gate entirely.
    */
   restockOnlyWhenExhausted: boolean
-  /** Restock watermark. 0 = only buy once nothing is usable. */
-  restockUsableThreshold: number
+  /**
+   * Target stock: how many usable keys to keep on hand for this supplier. Same meaning
+   * as the global pool's `targetCount` - an arrival buys `target - usable`, then stops.
+   * So "one per supplier" is 1, and three suppliers at 1 each means three in total.
+   * 0 means the switch was turned on without a number, and nothing is bought.
+   */
+  targetUsable: number
   /**
    * Remaining quota at or below this counts as *not* usable. 0 = ignore quota and only
    * treat bans and 402s as unusable. Absolute value, same unit as upstream `usageLimit`.
    */
   lowQuotaThreshold: number
+  /**
+   * Skip auto-purchase while the vendor's current unit price is above this. 0 = no cap.
+   * The unit is whatever that vendor prices in (Drop quotes USD, the kiroapp family
+   * quotes credits, kiro.ceo quotes per zone), so it is only ever compared against that
+   * same vendor's quote and never used in cross-vendor arithmetic.
+   *
+   * With a cap set but no price available before ordering (kiro-rs only reports `max`),
+   * the purchase is skipped. Treating "price unknown" as free would disable the cap
+   * exactly when it matters most.
+   */
+  maxUnitPrice: number
   apiKeyConfigured: boolean
   webhookTokenConfigured: boolean
   /** HMAC signing key for `X-Kiro-Signature`. Blank means signatures are not checked. */
@@ -1178,18 +1194,25 @@ export interface SupplierConfigUpdate {
   sourceChannel: string
   nicknamePrefix: string
   /**
-   * Only auto-purchase on webhook arrival when this supplier's usable key count has
-   * dropped to `restockUsableThreshold` or below. Off keeps the legacy behaviour of
-   * buying on every arrival notification.
+   * Per-supplier watermark gate. On, an arrival webhook tops this supplier up to
+   * `targetUsable`; off keeps the legacy behaviour of buying on every notification.
+   * The global pool, when enabled, replaces this gate entirely.
    */
   restockOnlyWhenExhausted: boolean
-  /** Restock watermark. 0 = only buy once nothing is usable. */
-  restockUsableThreshold: number
+  /**
+   * Target stock: how many usable keys to keep on hand for this supplier. Same meaning
+   * as the global pool's `targetCount` - an arrival buys `target - usable`, then stops.
+   * So "one per supplier" is 1, and three suppliers at 1 each means three in total.
+   * 0 means the switch was turned on without a number, and nothing is bought.
+   */
+  targetUsable: number
   /**
    * Remaining quota at or below this counts as *not* usable. 0 = ignore quota and only
    * treat bans and 402s as unusable. Absolute value, same unit as upstream `usageLimit`.
    */
   lowQuotaThreshold: number
+  /** Skip auto-purchase above this unit price, in the vendor's own unit. 0 = no cap. */
+  maxUnitPrice: number
   apiKey?: string
   webhookToken?: string
   webhookSecret?: string
@@ -1298,7 +1321,7 @@ export interface SupplierCallbackUrlResponse {
  * deficit, which the existing global FIFO event queue already gives us.
  *
  * Enabling this takes over restock decisions: each supplier's own
- * `restockOnlyWhenExhausted` / `restockUsableThreshold` / `lowQuotaThreshold` stop
+ * `restockOnlyWhenExhausted` / `targetUsable` / `lowQuotaThreshold` stop
  * participating, so there is never a second watermark to reason about.
  */
 export interface SupplierPoolConfig {

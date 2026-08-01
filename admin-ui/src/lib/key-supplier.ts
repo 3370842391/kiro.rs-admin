@@ -26,8 +26,9 @@ export function buildSupplierConfigPayload(update: SupplierConfigUpdate): Suppli
     sourceChannel: update.sourceChannel,
     nicknamePrefix: update.nicknamePrefix,
     restockOnlyWhenExhausted: update.restockOnlyWhenExhausted,
-    restockUsableThreshold: update.restockUsableThreshold,
+    targetUsable: update.targetUsable,
     lowQuotaThreshold: update.lowQuotaThreshold,
+    maxUnitPrice: update.maxUnitPrice,
   }
 
   const apiKey = update.apiKey?.trim()
@@ -127,8 +128,11 @@ export function emptySupplierEntry(kind: SupplierKind): SupplierEntryUpdate {
     nicknamePrefix: '自动采购',
     // 新建默认开启补货闸：供货商不停推到货时，不加闸就是每次都掏钱。
     restockOnlyWhenExhausted: true,
-    restockUsableThreshold: 0,
+    // 目标存量：每家常备 1 个。填 0 是失效保护（不买），所以默认给 1。
+    targetUsable: 1,
     lowQuotaThreshold: 0,
+    // 0 = 不限价。默认不限，避免新建的供货商因为对方不报价而一个都买不到。
+    maxUnitPrice: 0,
   }
 }
 
@@ -151,8 +155,9 @@ export function toSupplierEntryUpdate(entry: SupplierEntryView): SupplierEntryUp
     sourceChannel: entry.sourceChannel,
     nicknamePrefix: entry.nicknamePrefix,
     restockOnlyWhenExhausted: entry.restockOnlyWhenExhausted,
-    restockUsableThreshold: entry.restockUsableThreshold,
+    targetUsable: entry.targetUsable,
     lowQuotaThreshold: entry.lowQuotaThreshold,
+    maxUnitPrice: entry.maxUnitPrice,
   }
 }
 
@@ -162,6 +167,21 @@ export function parseSupplierNumberDraft(value: string, minimum: number): number
 
   const parsed = Number(normalized)
   return Number.isSafeInteger(parsed) && parsed >= minimum ? parsed : null
+}
+
+/**
+ * Same as {@link parseSupplierNumberDraft} but accepts fractions, for money fields.
+ *
+ * Prices are not integers (Drop quotes `"2.20"`), so the integer parser would reject every
+ * realistic cap. `NaN` and `Infinity` are rejected: a comparison against `NaN` is always
+ * false, which would silently disable the very gate this value configures.
+ */
+export function parseSupplierDecimalDraft(value: string, minimum: number): number | null {
+  const normalized = value.trim()
+  if (!normalized) return null
+
+  const parsed = Number(normalized)
+  return Number.isFinite(parsed) && parsed >= minimum ? parsed : null
 }
 
 export const MAX_POOL_TARGET = 10_000

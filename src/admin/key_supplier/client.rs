@@ -189,7 +189,7 @@ mod tests {
         // kiro-app 读不到 profile/status，也读不到对方登记的回调地址。
         assert!(snapshot.profile.is_none() && snapshot.status.is_none());
         assert!(snapshot.webhook_url.is_none());
-        assert_eq!(client.available_stock().await.unwrap(), 12);
+        assert_eq!(client.purchase_quote().await.unwrap().stock, 12);
 
         // 取 1 个时对方返回 {key} 而不是 {keys:[...]}，也要能收下。
         let purchase = client
@@ -347,7 +347,7 @@ mod tests {
             SupplierClient::with_kind(server(app).await, "app-secret", SupplierKind::KiroApp)
                 .unwrap();
 
-        let error = client.available_stock().await.unwrap_err();
+        let error = client.purchase_quote().await.unwrap_err();
 
         assert!(matches!(
             error,
@@ -419,7 +419,7 @@ mod tests {
         assert_eq!(snapshot.balance, Some(2060));
         // 一次 /api/me/stock 就够，不该再打 profile。
         assert!(snapshot.profile.is_none() && snapshot.status.is_none());
-        assert_eq!(client.available_stock().await.unwrap(), 120);
+        assert_eq!(client.purchase_quote().await.unwrap().stock, 120);
     }
 
     #[tokio::test]
@@ -514,7 +514,12 @@ mod tests {
                 .unwrap();
 
         let purchase = client
-            .purchase_batch(5, "0123456789abcdef0123456789abcdef", Some(" batch-7 "))
+            .purchase_batch(
+                5,
+                "0123456789abcdef0123456789abcdef",
+                Some(" batch-7 "),
+                None,
+            )
             .await
             .unwrap();
 
@@ -796,7 +801,7 @@ mod tests {
         );
         // Drop 没有 /api/my/stock：真去打就是 404。
         assert!(!seen.lock().unwrap().iter().any(|p| p == "/api/my/stock"));
-        assert_eq!(client.available_stock().await.unwrap(), 3);
+        assert_eq!(client.purchase_quote().await.unwrap().stock, 3);
     }
 
     #[tokio::test]
@@ -870,7 +875,16 @@ mod tests {
             )
             .route(
                 "/api/my/stock",
-                get(|| async { axum::Json(serde_json::json!({"max": 12})) }),
+                get(|| async {
+                    // 顶层 max 是跨区合计；能买到的是各区自己的 available。
+                    axum::Json(serde_json::json!({
+                        "max": 12,
+                        "zones": [
+                            {"zone": "us", "enabled": true, "available": 0, "max": 0, "unit_price": 20},
+                            {"zone": "eu", "enabled": true, "available": 12, "max": 0, "unit_price": 15}
+                        ]
+                    }))
+                }),
             )
             .fallback(|| async {
                 (
@@ -884,6 +898,9 @@ mod tests {
 
         let snapshot = client.snapshot().await.unwrap();
         assert_eq!(snapshot.stock_available, Some(12));
+        // 单价跟着真正能买到的那个区走：美国区空了，报的必须是欧洲区的 15，
+        // 而不是美国区的 20——否则单价上限会拿一个买不到的价去判定。
+        assert_eq!(snapshot.key_price, Some(15.0));
         // 积分余额：字段名没变，数字含义从「还能提几个号」变成积分。
         assert_eq!(snapshot.balance, Some(4500));
         // 没有 status 接口就别假装有一个。
@@ -892,7 +909,7 @@ mod tests {
             snapshot.webhook_url.as_deref(),
             Some("https://admin.example/hook")
         );
-        assert_eq!(client.available_stock().await.unwrap(), 12);
+        assert_eq!(client.purchase_quote().await.unwrap().stock, 12);
 
         // 反证：同一个站点用 kiro-rs 协议接就是这么坏的——它会去打 /api/status，
         // 拿回 200 + HTML 然后在解析上失败。这是「协议选 kiro-rs 为什么失败」的原因。
@@ -1018,9 +1035,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kiro_ceo_overview_shows_the_us_zone_unit_price() {
-        // 各区单价独立。我们不发 zone，对方默认美国区，所以展示的必须是美国区价，
-        // 不能随便挑一个区——欧洲区更便宜，显示它会让人以为买得更划算。
+    async fn kiro_ceo_overview_prices_the_zone_it_would_actually_buy_from() {
+        // 各区单价独立。展示的必须是**真正会成交的那个区**的价：欧洲区更便宜但一个
+        // 都没有，显示 10 会让人以为买得更划算，而实际成交价是美国区的 15。
+        // 也不能反过来固定显示美国区——美国区空了的时候那个数字同样买不到。
         let app = Router::new()
             .route(
                 "/api/my/profile",
@@ -1051,8 +1069,55 @@ mod tests {
 
         let snapshot = client.snapshot().await.unwrap();
         assert_eq!(snapshot.stock_available, Some(10));
+        // 欧洲区 10 更便宜但库存 0，所以报美国区的 15。
         assert_eq!(snapshot.key_price, Some(15.0));
         assert_eq!(snapshot.balance, Some(167));
+        // 可购量按区算：available 11 被本区单笔上限 10 夹住。
+        let quote = client.purchase_quote().await.unwrap();
+        assert_eq!(quote.stock, 10);
+        assert_eq!(quote.zone.as_deref(), Some("us"));
+        assert_eq!(quote.unit_price, Some(15.0));
+
+        // 两个区都有货时选便宜的那个，并且下单要打的就是这个区。
+        let cheaper = Router::new().route(
+            "/api/my/stock",
+            get(|| async {
+                axum::Json(serde_json::json!({
+                    "max": 14,
+                    "zones": [
+                        {"zone": "us", "enabled": true, "available": 10, "max": 0, "unit_price": 20},
+                        {"zone": "eu", "enabled": true, "available": 4, "max": 0, "unit_price": 15}
+                    ]
+                }))
+            }),
+        );
+        let client =
+            SupplierClient::with_kind(server(cheaper).await, "ceo-secret", SupplierKind::KiroCeo)
+                .unwrap();
+        let quote = client.purchase_quote().await.unwrap();
+        assert_eq!(quote.zone.as_deref(), Some("eu"));
+        assert_eq!(quote.stock, 4);
+        assert_eq!(quote.unit_price, Some(15.0));
+
+        // 关闭的区不算，全区都空时报 0 而不是拿跨区合计去撞一个注定 409 的下单。
+        let empty = Router::new().route(
+            "/api/my/stock",
+            get(|| async {
+                axum::Json(serde_json::json!({
+                    "max": 7,
+                    "zones": [
+                        {"zone": "us", "enabled": true, "available": 0, "max": 0, "unit_price": 20},
+                        {"zone": "eu", "enabled": false, "available": 7, "max": 0, "unit_price": 15}
+                    ]
+                }))
+            }),
+        );
+        let client =
+            SupplierClient::with_kind(server(empty).await, "ceo-secret", SupplierKind::KiroCeo)
+                .unwrap();
+        let quote = client.purchase_quote().await.unwrap();
+        assert_eq!(quote.stock, 0);
+        assert_eq!(quote.zone, None);
     }
 
     #[tokio::test]
@@ -1499,22 +1564,15 @@ impl SupplierClient {
                 let stock: KiroCeoStock = self
                     .request(Method::GET, "/api/my/stock", None, RetryPolicy::Retryable)
                     .await?;
-                // 各区单价独立。我们目前不发 `zone`，对方默认美国区，所以展示的也是
-                // 美国区价；取不到就退回全区最低价，而不是随便挑一个。
-                let us_price = stock
-                    .zones
-                    .iter()
-                    .find(|zone| zone.zone == "us")
-                    .and_then(|zone| zone.unit_price);
+                // 展示的单价必须是**真正会成交的那个区**的价，和采购路径挑同一个区。
+                // 以前固定显示美国区价：美国区空了、实际会从欧洲区成交时，界面上那个
+                // 数字既不是能买到的价，也解释不了为什么采购失败。
+                let key_price = pick_kiro_ceo_zone(&stock.zones).and_then(|zone| zone.unit_price);
                 Ok(SupplierSnapshot {
+                    // 顶层 `max` 是跨区合计，作为「对方一共还有多少」展示是对的；
+                    // 能买几个由 `purchase_quote()` 按区算。
                     stock_available: Some(stock.max),
-                    key_price: us_price.or_else(|| {
-                        stock
-                            .zones
-                            .iter()
-                            .filter_map(|zone| zone.unit_price)
-                            .min_by(f64::total_cmp)
-                    }),
+                    key_price,
                     key_price_max: None,
                     balance: Some(profile.remaining),
                     webhook_url: Some(profile.webhook_url.clone()),
@@ -1540,11 +1598,45 @@ impl SupplierClient {
         }
     }
 
-    /// 库存可用数。`kiro-rs` 是 `/api/my/stock` 的 `max`，`kiro-app` 是 `availableKeys`。
-    pub async fn available_stock(&self) -> Result<u64, SupplierError> {
+    /// 下单前的报价：可买数量，以及**该协议能报出来的**单价。
+    ///
+    /// `unit_price` 为 `None` 表示这家在下单前拿不到单价（kiro-rs 的 `/api/my/stock`
+    /// 只有 `max`）。调用方要把它和「单价是 0」严格区分开：配了单价上限却拿不到单价时
+    /// 只能不买，不能当成免费放行。
+    ///
+    /// 各家的币种/单位不通用（Drop 报 USD、kiroapp 系报积分），所以这个数只允许和
+    /// **同一家**配置的上限比较，绝不能跨家做算术。
+    pub async fn purchase_quote(&self) -> Result<PurchaseQuote, SupplierError> {
         match self.kind {
             // kiro.ceo 的 `/api/my/stock` 与 kiro-rs 同形，`max` 是文档化字段。
-            SupplierKind::KiroRs | SupplierKind::KiroCeo => Ok(self.stock().await?.max),
+            // ceo 另有分区单价，kiro-rs 什么价都不报。
+            SupplierKind::KiroRs => Ok(PurchaseQuote {
+                zone: None,
+                stock: self.stock().await?.max,
+                unit_price: None,
+            }),
+            // kiro.ceo 按区严格隔离：不传 `zone` 只从美国区取，美国区空了**不会**用
+            // 欧洲区顶上，直接返 409 库存不足。所以必须挑一个真有货的区，并把它的
+            // 可购量和单价一起带出去——顶层 `max` 是跨区合计，据它下单必然踩空。
+            SupplierKind::KiroCeo => {
+                let stock: KiroCeoStock = self
+                    .request(Method::GET, "/api/my/stock", None, RetryPolicy::Retryable)
+                    .await?;
+                match pick_kiro_ceo_zone(&stock.zones) {
+                    Some(zone) => Ok(PurchaseQuote {
+                        stock: zone.purchasable(),
+                        unit_price: zone.unit_price,
+                        zone: Some(zone.zone.clone()),
+                    }),
+                    // 所有区都空了。报 0 让上层按「库存不足」跳过，而不是拿合计数去
+                    // 撞一个注定 409 的下单。
+                    None => Ok(PurchaseQuote {
+                        stock: 0,
+                        unit_price: None,
+                        zone: None,
+                    }),
+                }
+            }
             // Drop 没有 `/api/my/stock`，可提取数量在 `/api/me/stock` 的 `stock`。
             //
             // 曾经读 `/api/status` 的 `keys_stock`，四次自动采购四次拿到 500：那个数
@@ -1554,19 +1646,35 @@ impl SupplierClient {
                 let stock: KiroDropStock = self
                     .request(Method::GET, "/api/me/stock", None, RetryPolicy::Retryable)
                     .await?;
-                Ok(stock.stock)
+                Ok(PurchaseQuote {
+                    zone: None,
+                    stock: stock.stock,
+                    // 按对方文档这个 price 是 USD，而余额是 CNY。只和本家配置的上限比，
+                    // 不参与任何跨家或跨币种的算术。
+                    unit_price: parse_decimal_string(&stock.price),
+                })
             }
             SupplierKind::KiroApp => {
                 let stock: KiroAppStock = self
                     .request(Method::GET, "/openapi/stock", None, RetryPolicy::Retryable)
                     .await?;
-                Ok(stock.available_keys)
+                Ok(PurchaseQuote {
+                    zone: None,
+                    stock: stock.available_keys,
+                    unit_price: stock.key_price,
+                })
             }
             SupplierKind::KiroAppIo => {
                 let stock: KiroAppIoStock = self
                     .request(Method::GET, "/api/me/stock", None, RetryPolicy::Retryable)
                     .await?;
-                Ok(stock.stock)
+                Ok(PurchaseQuote {
+                    zone: None,
+                    stock: stock.stock,
+                    // 阶梯定价：`price_min` 是最低档。判上限用最低价是刻意的——
+                    // 「便宜的先出货」，一单里贵的那些由 `total_debit` 事后记账。
+                    unit_price: stock.price_min.or(stock.price),
+                })
             }
         }
     }
@@ -1583,18 +1691,23 @@ impl SupplierClient {
         count: u32,
         client_order_id: &str,
     ) -> Result<Purchase, SupplierError> {
-        self.purchase_batch(count, client_order_id, None).await
+        self.purchase_batch(count, client_order_id, None, None)
+            .await
     }
 
     /// 下单取 Key，可选定向到供货商的某个开号批次。
     ///
     /// `supplier_batch_id` 仅 `kiroapp-io` 有意义：webhook 推送里带 `order_id`，
     /// 原样传回去就只拉这一车产出的 key，不必从公共池子里跟别人抢。
+    /// `zone` 仅 `kiro-ceo` 有意义，且**必须**带上：它按区严格隔离，不传就只从美国区
+    /// 取号，美国区空了直接返 409 库存不足，绝不会用别的区顶上。值取自同一次
+    /// `purchase_quote()` 选中的区，保证「按哪个区的库存和价格决定的，就买哪个区」。
     pub async fn purchase_batch(
         &self,
         count: u32,
         client_order_id: &str,
         supplier_batch_id: Option<&str>,
+        zone: Option<&str>,
     ) -> Result<Purchase, SupplierError> {
         if count == 0 {
             return Err(SupplierError::invalid("purchase count must be positive"));
@@ -1609,7 +1722,7 @@ impl SupplierClient {
         match self.kind {
             SupplierKind::KiroRs => self.purchase_kiro_rs(count, client_order_id).await,
             SupplierKind::KiroDrop => self.purchase_kiro_drop(count, client_order_id).await,
-            SupplierKind::KiroCeo => self.purchase_kiro_ceo(count, client_order_id).await,
+            SupplierKind::KiroCeo => self.purchase_kiro_ceo(count, client_order_id, zone).await,
             SupplierKind::KiroApp => self.claim_kiro_app(count, client_order_id).await,
             SupplierKind::KiroAppIo => {
                 self.purchase_kiro_app_io(count, client_order_id, supplier_batch_id)
@@ -1744,21 +1857,30 @@ impl SupplierClient {
     /// `keys` 是**纯字符串数组**而不是 `[{"key": …}]`，另有 `unit_price`、
     /// `total_credits`、`order_id` 和一个带账号密码的 `details` 数组。
     ///
-    /// 不发 `zone`：对方默认美国区，而我们的配置里还没有区域字段。乱填一个区可能
-    /// 买到用不上的号。等配置加了区域再接上。
+    /// `zone` 必须带：对方按区严格隔离，不传就只从美国区取号，美国区空了返 409
+    /// 库存不足而**不会**用欧洲区顶上。值来自同一次 `purchase_quote()` 选中的区。
+    ///
+    /// 之前不传，于是拿跨区合计的 `max > 0` 去下一个只打美国区的单，美国区一空就
+    /// 连续 409——线上表现是「一直购买失败」，而欧洲区其实一直有货。
     async fn purchase_kiro_ceo(
         &self,
         count: u32,
         client_order_id: &str,
+        zone: Option<&str>,
     ) -> Result<Purchase, SupplierError> {
+        let mut body = serde_json::json!({
+            "count": count,
+            "client_order_id": client_order_id,
+        });
+        // 传 us / eu 以外的值对方直接 400，所以空值一律不带，让它走默认。
+        if let Some(zone) = zone.map(str::trim).filter(|zone| !zone.is_empty()) {
+            body["zone"] = serde_json::Value::String(zone.to_owned());
+        }
         let response: KiroCeoPurchase = self
             .request(
                 Method::POST,
                 "/api/my/purchase",
-                Some(serde_json::json!({
-                    "count": count,
-                    "client_order_id": client_order_id,
-                })),
+                Some(body),
                 RetryPolicy::Retryable,
             )
             .await?;
@@ -2039,8 +2161,8 @@ impl SupplierClient {
                         &self.api_key.0,
                     )));
                 }
-                // Drop 用 404 表示「库存不足，无可用 Key」。那是别人抢先买走了，
-                // 属于正常竞争结果而不是故障，不该记成 failed。
+                // Drop 早期用 404 表示「库存不足，无可用 Key」。新版文档把它并进了 409，
+                // 但保留这条映射：万一还有旧行为，把缺货判成缺货比判成硬故障好。
                 if self.kind == SupplierKind::KiroDrop && status.as_u16() == 404 {
                     return Err(SupplierError::OutOfStock);
                 }
@@ -2052,10 +2174,16 @@ impl SupplierClient {
                 // 没有可判定字段能分开。仍然归到这里：对方的中文原因会原样带进事件
                 // 记录，运维能看出是哪种；而且这条路径既不扣钱也不丢 key，宁可多提醒。
                 if status.as_u16() == 409 && self.kind.purchase_is_idempotent() {
-                    return Err(SupplierError::OrderConflict(sanitize(
-                        &text,
-                        &self.api_key.0,
-                    )));
+                    let detail = sanitize(&text, &self.api_key.0);
+                    // kiro.ceo 和 Kiro Drop 的 409 都是多义的（库存不足 / 余额不足 /
+                    // 持有上限 / 幂等键撞单 / 价格超上限），里面只有一种扣了钱。
+                    // 按「已成交」去报等于让人去查一条不存在的订单。
+                    // 只有对方原文能分开这几种，所以必须把它带出去。
+                    return Err(if self.kind.conflict_means_order_settled() {
+                        SupplierError::OrderConflict(detail)
+                    } else {
+                        SupplierError::StateConflict(detail)
+                    });
                 }
                 return Err(SupplierError::http(status.as_u16(), &text, &self.api_key.0));
             }
@@ -2092,6 +2220,20 @@ impl RetryPolicy {
 
 #[derive(Clone)]
 struct Secret(String);
+
+/// 下单前问到的报价。
+///
+/// 不派生 `Eq`：`unit_price` 是 f64。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PurchaseQuote {
+    /// 现在能买到的数量。
+    pub stock: u64,
+    /// 单价，`None` = 这家在下单前报不出价。单位由各家自己定，不可跨家比较。
+    pub unit_price: Option<f64>,
+    /// 这份报价对应的区域，下单时必须原样带回去。仅 kiro.ceo 有：它按区严格隔离，
+    /// 不传就默认美国区，而报价可能来自欧洲区。
+    pub zone: Option<String>,
+}
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Profile {
@@ -2306,16 +2448,17 @@ struct KiroDropProfile {
 
 /// `GET /api/me/stock`（Drop）→ `{stock, price(字符串), balance(字符串)}`。
 ///
-/// 这才是**可提取**的数量。`/api/status` 的 `keys_stock` 不是同一个东西：它跟着
+/// `stock` 才是**可提取**的数量。`/api/status` 的 `keys_stock` 不是同一个东西：它跟着
 /// `keys_active` 一起动，我们据它下单时对方却返 500，而它自己的文档说没货该返 404。
+///
+/// 响应里的 `balance` 不读：余额统一从 `/api/my/profile` 的 `remaining` 取，
+/// 两处都读只会多一个可能不一致的来源。
 #[derive(Deserialize)]
 struct KiroDropStock {
     #[serde(default)]
     stock: u64,
     #[serde(default)]
     price: String,
-    #[serde(default)]
-    balance: String,
 }
 
 /// `POST /api/my/purchase`（Drop）→ `{client_order_id, purchased, remaining(字符串), keys}`。
@@ -2349,12 +2492,57 @@ struct KiroCeoStock {
     zones: Vec<KiroCeoZone>,
 }
 
+/// 一个区的报价与可购量。
+///
+/// 顶层的 `max` 是**跨区合计**，不能当成某一区的可购量用：美国区 0、欧洲区 4 时
+/// `max` 也是正数，据它下单而又不指定 `zone`（默认美国区）就一定拿到 409 库存不足。
 #[derive(Deserialize)]
 struct KiroCeoZone {
     #[serde(default)]
     zone: String,
     #[serde(default)]
     unit_price: Option<f64>,
+    /// 本区当前可购数量。线上字段是 `available`，`max` 是本区允许的单笔上限。
+    #[serde(default)]
+    available: u64,
+    #[serde(default)]
+    max: u64,
+    /// 关闭的区不能买。缺省按可用处理：老版本响应没有这个字段。
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl KiroCeoZone {
+    /// 本区这次实际能买几个。`available` 是本区库存，`max` 是本区单笔上限；
+    /// 上限为 0 视为「没设上限」而不是「不许买」，否则老版本响应会被判成全区无货。
+    fn purchasable(&self) -> u64 {
+        if self.max == 0 {
+            self.available
+        } else {
+            self.available.min(self.max)
+        }
+    }
+}
+
+/// 挑一个能买的区：**只看真有货且启用的区，取单价最低的那个**。
+///
+/// 取最低价而不是固定美国区：区之间价格不同（线上美国区 20、欧洲区 15），而且
+/// 单价上限那道闸也只有拿到真正要成交的那个区的价才有意义。
+fn pick_kiro_ceo_zone(zones: &[KiroCeoZone]) -> Option<&KiroCeoZone> {
+    zones
+        .iter()
+        .filter(|zone| zone.enabled && zone.purchasable() > 0 && !zone.zone.trim().is_empty())
+        .min_by(|left, right| match (left.unit_price, right.unit_price) {
+            (Some(a), Some(b)) => a.total_cmp(&b),
+            // 报不出价的区排在后面：宁可买知道价的那个。
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        })
 }
 
 /// `keys` 的元素两种形状都要接。对方文档写的是**纯字符串数组**
@@ -2567,6 +2755,9 @@ pub enum SupplierError {
     /// 必须和普通 HTTP 错误分开：记成失败会让人反复点 retry，而每次都拿到同一个 409，
     /// 付过钱的 key 一直留在对方账上没人去捞。
     OrderConflict(String),
+    /// 409，但含义不止「原单已成交」。kiro.ceo 用同一个码表示库存不足、已达最大持有
+    /// 库存上限、以及幂等键撞单——前两种没扣钱。只有对方原文能分辨，所以原样带走。
+    StateConflict(String),
     Http {
         status: u16,
         message: String,
@@ -2617,6 +2808,12 @@ impl fmt::Display for SupplierError {
                 write!(
                     f,
                     "supplier order already settled with different parameters: {message}"
+                )
+            }
+            Self::StateConflict(message) => {
+                write!(
+                    f,
+                    "supplier rejected the order as a state conflict: {message}"
                 )
             }
             Self::Http { status, message } => write!(f, "supplier HTTP {status}: {message}"),
