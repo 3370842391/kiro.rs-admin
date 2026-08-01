@@ -70,12 +70,22 @@ mod tests {
                 if state.lock().unwrap().len() < 2 { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "retry") } else { (axum::http::StatusCode::OK, r#"{"client_order_id":"0123456789abcdef0123456789abcdef","purchased":1,"remaining":2,"keys":[{"key":"ksk_good"}]}"#) }
             }
         }));
+        // 这一个用例刻意保留真实的 `RETRY_BACKOFF`：重试之间必须真的隔开。
+        // 供货商广播到货的那一瞬间它自己还没准备好，三连请求挤在几百毫秒里
+        // 会一起撞进同一个坏窗口，重试就白做了（Kiro Drop 的生产实例）。
         let client = SupplierClient::new(server(app).await, "secret").unwrap();
+        let started = std::time::Instant::now();
         let result = client
             .purchase(1, "0123456789abcdef0123456789abcdef")
             .await
             .unwrap();
         assert_eq!(result.purchased, 1);
+        assert!(
+            started.elapsed() >= RETRY_BACKOFF[0],
+            "第一次重试前必须等 {:?}，实际只用了 {:?}",
+            RETRY_BACKOFF[0],
+            started.elapsed()
+        );
         let requests = seen.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].0, requests[1].0);
@@ -544,7 +554,8 @@ mod tests {
         );
         let client =
             SupplierClient::with_kind(server(app).await, "km_secret", SupplierKind::KiroAppIo)
-                .unwrap();
+                .unwrap()
+                .without_backoff();
 
         let purchase = client
             .purchase(1, "0123456789abcdef0123456789abcdef")
@@ -1220,7 +1231,9 @@ mod tests {
                 }
             }
         });
-        let client = SupplierClient::new(format!("http://{address}"), "secret").unwrap();
+        let client = SupplierClient::new(format!("http://{address}"), "secret")
+            .unwrap()
+            .without_backoff();
         assert_eq!(client.status().await.unwrap().keys_active, 0);
     }
 
@@ -1279,12 +1292,23 @@ mod tests {
 }
 use reqwest::{Method, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{fmt, sync::OnceLock};
+use std::{fmt, sync::OnceLock, time::Duration};
 
 use crate::model::config::SupplierKind;
 
 const MAX_ATTEMPTS: usize = 3;
 const SUPPLIER_USER_AGENT: &str = "kiro-rs-key-supplier/1.0";
+
+/// 重试之间的等待，第 n 次重试取第 n-1 项。**首次尝试从不等待**——抢货拼的就是延迟。
+///
+/// 没有退避的重试等于没有重试：供货商刚广播「新一批 Key 已上架」的那一瞬间，
+/// 它自己的批次往往还没落库，`POST /api/my/purchase` 会短暂返回 5xx。三次尝试
+/// 全挤在几百毫秒里，只会落在同一个坏窗口里一起失败，事件直接进 failed 终态
+/// （failed 不会被 `claim_next` 捡回来，只能人工点重试）。
+/// 生产实例：Kiro Drop 的 `new_keys_available` 三连 500 用掉 554ms，
+/// 30 秒后同样的请求体手动下单一次就成了。
+const RETRY_BACKOFF: [Duration; MAX_ATTEMPTS - 1] =
+    [Duration::from_secs(1), Duration::from_secs(3)];
 
 #[derive(Clone)]
 pub struct SupplierClient {
@@ -1292,6 +1316,8 @@ pub struct SupplierClient {
     base_url: Url,
     api_key: Secret,
     kind: SupplierKind,
+    /// 重试等待表，生产恒为 `RETRY_BACKOFF`；测试里置空以免真的睡满 4 秒。
+    retry_backoff: &'static [Duration],
 }
 
 impl fmt::Debug for SupplierClient {
@@ -1338,7 +1364,7 @@ impl SupplierClient {
             return Err(SupplierError::invalid("api_key must not be empty"));
         }
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
+            .timeout(Duration::from_secs(15))
             .no_proxy()
             .user_agent(SUPPLIER_USER_AGENT)
             .build()
@@ -1348,7 +1374,15 @@ impl SupplierClient {
             base_url,
             api_key: Secret(key.to_owned()),
             kind,
+            retry_backoff: &RETRY_BACKOFF,
         })
+    }
+
+    /// 测试用：去掉重试等待。只有专门断言退避的用例才保留真实等待表。
+    #[cfg(test)]
+    fn without_backoff(mut self) -> Self {
+        self.retry_backoff = &[];
+        self
     }
 
     #[cfg(test)]
@@ -1895,6 +1929,13 @@ impl SupplierClient {
         let mut last_network = None;
         let attempts = policy.attempts();
         for attempt in 0..attempts {
+            // 首发不等；只有重试才退避，见 `RETRY_BACKOFF`。
+            if let Some(delay) = attempt
+                .checked_sub(1)
+                .and_then(|index| self.retry_backoff.get(index))
+            {
+                tokio::time::sleep(*delay).await;
+            }
             let mut request = self.client.request(method.clone(), url.clone());
             request = match self.kind {
                 // Drop 与 kiro.ceo 的认证头都与 kiro-rs 相同（Drop 的令牌前缀是 `usr-`）。
