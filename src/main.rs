@@ -614,6 +614,10 @@ async fn main() {
     tracing::info!("Admin UI:");
     tracing::info!("  GET  /admin");
 
+    // 统计在途流式响应，供在线更新挑「没有流在跑」的时刻退出，避免把客户的回答
+    // 砍在半句话上。只包 SSE：非流式响应是毫秒级，计入会让计数永远不归零。
+    let app = app.layer(axum::middleware::from_fn(track_streaming_responses));
+
     // 下游连接开 TCP_NODELAY：SSE 是「大量小写」，Nagle 会把小帧攒到对端 ACK 回来
     // 才发，撞上 delayed ACK 时单次最坏加约 40ms。axum/tokio 都不默认开，必须自己设。
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -625,6 +629,36 @@ async fn main() {
             }
         });
     axum::serve(listener, app).await.unwrap();
+}
+
+/// 把在途流凭证绑到 SSE 响应体上。
+///
+/// 凭证必须活到 body 传完：SSE 的 handler 拿到上游第一个字节就返回了，绑在返回值上
+/// 会让计数在流刚开始时就归零。客户端中途断开时 body 是被 drop 的，`StreamGuard`
+/// 的 `Drop` 同样会释放，不会漏计导致进程永远等不到安静时刻。
+async fn track_streaming_responses(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use futures::StreamExt;
+
+    let response = next.run(request).await;
+    let is_stream = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .is_some_and(|value| value.as_bytes().starts_with(b"text/event-stream"));
+    if !is_stream {
+        return response;
+    }
+    let guard = common::drain::StreamGuard::acquire();
+    response.map(|body| {
+        // 闭包持有凭证，流被读完或被 drop 时闭包一起析构，计数随之释放。
+        let chunks = body.into_data_stream().map(move |chunk| {
+            let _hold = &guard;
+            chunk
+        });
+        axum::body::Body::from_stream(chunks)
+    })
 }
 
 fn initialize_key_supplier_service(
@@ -821,5 +855,86 @@ mod logging_filter_tests {
             effective_log_filter(None),
             "info,h2=info,hyper=info,reqwest=info"
         );
+    }
+}
+
+#[cfg(test)]
+mod drain_layer_tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use axum::routing::get;
+    use axum::{Router, middleware};
+    use futures::StreamExt;
+    use tower::ServiceExt;
+
+    use crate::common::drain::{TEST_SERIAL, streams_in_flight};
+
+    fn app() -> Router {
+        Router::new()
+            .route(
+                "/sse",
+                get(|| async {
+                    // 两块数据之间不结束，模拟一条还在传的流。
+                    let chunks = futures::stream::iter(vec![
+                        Ok::<_, std::io::Error>("data: a\n\n"),
+                        Ok("data: b\n\n"),
+                    ]);
+                    crate::common::sse::sse_response(Body::from_stream(chunks))
+                }),
+            )
+            .route("/json", get(|| async { axum::Json(serde_json::json!({})) }))
+            .layer(middleware::from_fn(super::track_streaming_responses))
+    }
+
+    #[tokio::test]
+    async fn only_streaming_responses_are_counted_and_they_release_when_the_body_ends() {
+        let _serial = TEST_SERIAL.lock().unwrap();
+        let before = streams_in_flight();
+
+        // 非流式响应不能计数：它们是毫秒级的，计入会让计数几乎永不归零，
+        // 于是每次更新都被迫走超时硬退，等于这套机制白做。
+        let json = app()
+            .oneshot(Request::builder().uri("/json").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(json.status(), StatusCode::OK);
+        assert_eq!(streams_in_flight(), before);
+
+        let sse = app()
+            .oneshot(Request::builder().uri("/sse").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            sse.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/event-stream"
+        );
+        // handler 早就返回了，body 还没读完——此时必须已经在计数，否则进程会以为
+        // 现在就是安静时刻，把客户的回答砍在半句话上。
+        let mut chunks = sse.into_body().into_data_stream();
+        assert!(chunks.next().await.is_some());
+        assert_eq!(streams_in_flight(), before + 1);
+
+        // 读完剩余数据并释放流，计数必须归零，否则永远等不到安静时刻。
+        while chunks.next().await.is_some() {}
+        drop(chunks);
+        assert_eq!(streams_in_flight(), before);
+    }
+
+    #[tokio::test]
+    async fn a_client_that_disconnects_mid_stream_still_releases_the_slot() {
+        let _serial = TEST_SERIAL.lock().unwrap();
+        // 客户端中途断开时 body 是被 drop 而不是读完的。漏了这条路径，计数会永久
+        // 泄漏，之后每次在线更新都退化成超时硬退。
+        let before = streams_in_flight();
+        let sse = app()
+            .oneshot(Request::builder().uri("/sse").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let mut chunks = sse.into_body().into_data_stream();
+        assert!(chunks.next().await.is_some());
+        assert_eq!(streams_in_flight(), before + 1);
+
+        drop(chunks);
+        assert_eq!(streams_in_flight(), before);
     }
 }

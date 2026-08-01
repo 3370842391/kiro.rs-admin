@@ -79,6 +79,12 @@ const UPDATE_CHECK_TTL_SECS: i64 = 1800;
 
 const DEFAULT_RESPONSE_TEST_MODEL: &str = "claude-sonnet-4-6";
 
+/// 在线更新/回退后，等在途流式响应传完的上限。
+///
+/// 取 10 分钟：`max_tokens=64000` 的长回答实测能跑一两分钟，留足余量；同时不能无限
+/// 等下去——新版本迟迟不生效同样是问题。到点仍未清空就强制退出，那是改动前的行为。
+const SELF_EXIT_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+
 fn is_invalid_add_credential_error(msg: &str) -> bool {
     msg.contains("缺少 refreshToken")
         || msg.contains("refreshToken 为空")
@@ -2327,13 +2333,16 @@ impl AdminService {
             c.update_last_applied_at = Some(applied_at_to_persist);
         });
 
-        super::binary_update::schedule_self_exit(std::time::Duration::from_secs(2));
+        // 等在途流传完再退，避免把客户的回答砍在半句话上。上限到点仍未清空就照旧
+        // 硬退（改动前的行为），所以最坏情况持平。
+        super::binary_update::schedule_self_exit_when_idle(SELF_EXIT_MAX_WAIT);
 
         Ok(ImageUpdateResponse {
             success: true,
             message: format!(
-                "已替换为 v{}，进程将在 2 秒后退出，由容器重启策略接管",
-                version
+                "已替换为 v{}，等在途流式响应传完后退出（最多 {} 分钟），由容器重启策略接管",
+                version,
+                SELF_EXIT_MAX_WAIT.as_secs() / 60
             ),
             output: Some(format!(
                 "previous: v{}\n{}: v{}",
@@ -2378,13 +2387,14 @@ impl AdminService {
             c.update_last_applied_at = None;
         });
 
-        super::binary_update::schedule_self_exit(std::time::Duration::from_secs(2));
+        super::binary_update::schedule_self_exit_when_idle(SELF_EXIT_MAX_WAIT);
 
         Ok(ImageUpdateResponse {
             success: true,
             message: format!(
-                "已回退到 {}，进程将在 2 秒后退出，由容器重启策略接管",
-                previous_label
+                "已回退到 {}，等在途流式响应传完后退出（最多 {} 分钟），由容器重启策略接管",
+                previous_label,
+                SELF_EXIT_MAX_WAIT.as_secs() / 60
             ),
             output: Some(format!("rolled back to: {}", previous_label)),
             applied: true,

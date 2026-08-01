@@ -24,8 +24,11 @@ interface ImageUpdateDialogProps {
 /**
  * 极简在线更新：只保留「版本号 + 更新按钮 + 进度条」。
  * - 打开时自动查一次版本（后端 30 分钟缓存 + 前端 5 分钟 staleTime，不会打爆 GitHub 限流）。
- * - 「更新并重启」调用 applyImageUpdate：服务端解析最新版本→下载→校验 SHA256→替换 exe→退出，
- *   由容器 restart 策略拉起新版本。真实下载在服务端一次性完成，前端用平滑爬升的进度条表示进行中。
+ * - 「更新并重启」调用 applyImageUpdate：服务端解析最新版本→下载→校验 SHA256→替换 exe→
+ *   等在途流式响应传完后退出，由容器 restart 策略拉起新版本。真实下载在服务端一次性完成，
+ *   前端用平滑爬升的进度条表示进行中。
+ * - 退出不是立刻发生的：进程会先等正在传输的 SSE 流跑完（有上限），避免把客户的回答砍在
+ *   半句话上。所以「更新完成」之后到真正重启之间可能还有一段等待，文案不能承诺秒级重启。
  */
 export function ImageUpdateDialog({ open, onOpenChange }: ImageUpdateDialogProps) {
   const queryClient = useQueryClient()
@@ -129,7 +132,7 @@ export function ImageUpdateDialog({ open, onOpenChange }: ImageUpdateDialogProps
                 {progress >= 100 ? (
                   <>
                     <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600" />
-                    更新完成，服务正在重启…
+                    更新完成，等在途流式响应传完后重启…
                   </>
                 ) : (
                   <>

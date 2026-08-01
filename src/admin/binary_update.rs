@@ -449,11 +449,46 @@ pub fn restore_backup(exe: &Path) -> Result<(), AdminServiceError> {
     Ok(())
 }
 
-/// 启动一个异步任务，在 `delay` 之后让进程退出（exit code 0）。
+/// 在途流全部传完后退出（exit code 0），最多等 `max_wait`。
 /// docker 的 `restart: unless-stopped` 会接管重启，新二进制随之生效。
-pub fn schedule_self_exit(delay: std::time::Duration) {
+///
+/// 为什么是「等安静时刻」而不是 axum 的 `with_graceful_shutdown`：本进程单实例单端口，
+/// 容器里 `PID 1` 就是它。一关监听 socket 就没有第二个后端能接活，上游被拒连的时长
+/// 等于 drain 上限——在线更新如果把上限设成几分钟，就是用救几条流换来更长时间的 502。
+/// 反过来先等再退，则拒连窗口和原来一样短（只有新进程冷启动那一下），而已经在跑的
+/// 回答不会被砍在半句话上。
+///
+/// `max_wait` 到点仍未归零就照旧硬退，那正是改动前的行为，所以最坏情况持平。
+///
+/// `grace` 是归零后的额外静默期：计数可能只是恰好在两条流之间瞬时归零，多等一下能
+/// 避开这种假归零。等不到就退，不会因此拖长。
+pub fn schedule_self_exit_when_idle(max_wait: std::time::Duration) {
+    const POLL: std::time::Duration = std::time::Duration::from_millis(500);
+    const GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
     tokio::spawn(async move {
-        tokio::time::sleep(delay).await;
+        let started = std::time::Instant::now();
+        // 至少等 GRACE：让触发更新的那个 HTTP 响应本身先发回去。
+        tokio::time::sleep(GRACE).await;
+        loop {
+            let in_flight = crate::common::drain::streams_in_flight();
+            if in_flight == 0 {
+                tracing::info!(
+                    waited_secs = started.elapsed().as_secs(),
+                    "在途流已清空，进程退出以启用新版本"
+                );
+                break;
+            }
+            if started.elapsed() >= max_wait {
+                tracing::warn!(
+                    in_flight,
+                    waited_secs = started.elapsed().as_secs(),
+                    "等待在途流超时，仍有流在跑，按原行为强制退出"
+                );
+                break;
+            }
+            tokio::time::sleep(POLL).await;
+        }
         // 给 stdout 一个 flush 机会，避免最后一行日志丢失
         let _ = std::io::stdout().flush();
         std::process::exit(0);
