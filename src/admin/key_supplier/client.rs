@@ -722,12 +722,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kiro_drop_reads_string_amounts_and_takes_stock_from_the_status_endpoint() {
+    async fn kiro_drop_reads_string_amounts_and_takes_stock_from_the_me_stock_endpoint() {
         // Drop 把金额编码成字符串（"884.400000"）。复用 kiro-rs 的 wire（u64 字段）
         // 会直接 Decode 失败，快照就只剩一个 API 错误。
+        //
+        // 可购买数量必须取 `/api/me/stock` 的 `stock`。`/api/status` 的 `keys_stock`
+        // 跟着 `keys_active` 走，据它下单四次全拿到 500——这里刻意让两个数不相等。
         let seen = Arc::new(Mutex::new(Vec::new()));
         let profile_seen = seen.clone();
         let status_seen = seen.clone();
+        let stock_seen = seen.clone();
         let app = Router::new()
             .route(
                 "/api/my/profile",
@@ -759,14 +763,27 @@ mod tests {
                         }))
                     }
                 }),
+            )
+            .route(
+                "/api/me/stock",
+                get(move |request: axum::http::Request<axum::body::Body>| {
+                    let seen = stock_seen.clone();
+                    async move {
+                        seen.lock().unwrap().push(request.uri().path().to_owned());
+                        axum::Json(serde_json::json!({
+                            "stock": 3, "price": "2.20", "balance": "884.400000"
+                        }))
+                    }
+                }),
             );
         let client =
             SupplierClient::with_kind(server(app).await, "usr-secret", SupplierKind::KiroDrop)
                 .unwrap();
 
         let snapshot = client.snapshot().await.unwrap();
-        // 可购买库存来自 keys_stock，不是 keys_active（那是对方已售出且仍活着的）。
-        assert_eq!(snapshot.stock_available, Some(25));
+        // 3 而不是 25：可提取数量只认 /api/me/stock。
+        assert_eq!(snapshot.stock_available, Some(3));
+        assert_eq!(snapshot.key_price, Some(2.20));
         // 元转整数向下取整：额度用来判断「够不够买」，宁可少报不能多报。
         assert_eq!(snapshot.balance, Some(884));
         let profile = snapshot.profile.unwrap();
@@ -779,7 +796,7 @@ mod tests {
         );
         // Drop 没有 /api/my/stock：真去打就是 404。
         assert!(!seen.lock().unwrap().iter().any(|p| p == "/api/my/stock"));
-        assert_eq!(client.available_stock().await.unwrap(), 25);
+        assert_eq!(client.available_stock().await.unwrap(), 3);
     }
 
     #[tokio::test]
@@ -1444,18 +1461,23 @@ impl SupplierClient {
                     status: None,
                 })
             }
-            // Drop 没有 `/api/my/stock`，库存在 `/api/status` 的 `keys_stock`。
-            // 金额字段是字符串，profile 必须走单独的 wire 结构。
+            // Drop 的可购买数量在 `/api/me/stock`，不是 `/api/status` 的 `keys_stock`。
+            // `/api/status` 仍然要读：`generating` / `keys_active` / `keys_dead` 是概览
+            // 里唯一能看出对方号池状态的东西。金额字段是字符串，profile 走单独的 wire。
             SupplierKind::KiroDrop => {
                 let profile: KiroDropProfile = self
                     .request(Method::GET, "/api/my/profile", None, RetryPolicy::Retryable)
                     .await?;
+                let stock: KiroDropStock = self
+                    .request(Method::GET, "/api/me/stock", None, RetryPolicy::Retryable)
+                    .await?;
                 let status = self.status().await?;
                 let webhook_url = profile.webhook_url.clone();
                 Ok(SupplierSnapshot {
-                    stock_available: Some(status.keys_stock),
-                    // Drop 不报单价：价格随行就市，只有 `max_total_cny` 那道保护。
-                    key_price: None,
+                    stock_available: Some(stock.stock),
+                    // 注意单价按对方文档是 USD，而余额是 CNY。两者不能相加相减，
+                    // 做金额预算前必须先确认汇率口径。
+                    key_price: parse_decimal_string(&stock.price),
                     key_price_max: None,
                     balance: Some(decimal_string_to_u64(&profile.remaining)),
                     webhook_url: (!webhook_url.is_empty()).then_some(webhook_url),
@@ -1523,9 +1545,17 @@ impl SupplierClient {
         match self.kind {
             // kiro.ceo 的 `/api/my/stock` 与 kiro-rs 同形，`max` 是文档化字段。
             SupplierKind::KiroRs | SupplierKind::KiroCeo => Ok(self.stock().await?.max),
-            // Drop 没有 `/api/my/stock`；`/api/status` 的 `keys_stock` 才是可购买库存
-            // （`keys_active` 是对方已售出且仍活着的数量，不是我们能买的）。
-            SupplierKind::KiroDrop => Ok(self.status().await?.keys_stock),
+            // Drop 没有 `/api/my/stock`，可提取数量在 `/api/me/stock` 的 `stock`。
+            //
+            // 曾经读 `/api/status` 的 `keys_stock`，四次自动采购四次拿到 500：那个数
+            // 跟着 `keys_active` 走，不代表能买到货。按对方文档没货该返 404，返 500
+            // 是他们的 bug，但我们据一个错的字段去下单等于主动往里踩。
+            SupplierKind::KiroDrop => {
+                let stock: KiroDropStock = self
+                    .request(Method::GET, "/api/me/stock", None, RetryPolicy::Retryable)
+                    .await?;
+                Ok(stock.stock)
+            }
             SupplierKind::KiroApp => {
                 let stock: KiroAppStock = self
                     .request(Method::GET, "/openapi/stock", None, RetryPolicy::Retryable)
@@ -2272,6 +2302,20 @@ struct KiroDropProfile {
     used_quota: String,
     #[serde(default)]
     webhook_url: String,
+}
+
+/// `GET /api/me/stock`（Drop）→ `{stock, price(字符串), balance(字符串)}`。
+///
+/// 这才是**可提取**的数量。`/api/status` 的 `keys_stock` 不是同一个东西：它跟着
+/// `keys_active` 一起动，我们据它下单时对方却返 500，而它自己的文档说没货该返 404。
+#[derive(Deserialize)]
+struct KiroDropStock {
+    #[serde(default)]
+    stock: u64,
+    #[serde(default)]
+    price: String,
+    #[serde(default)]
+    balance: String,
 }
 
 /// `POST /api/my/purchase`（Drop）→ `{client_order_id, purchased, remaining(字符串), keys}`。
