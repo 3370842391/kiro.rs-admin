@@ -1008,6 +1008,57 @@ mod drain_layer_tests {
     }
 
     #[tokio::test]
+    async fn wrapping_the_body_must_not_buffer_chunks() {
+        // 这是这层中间件最危险的失手方式：为了统计而重新包装响应体，如果包装引入了
+        // 缓冲，第一块就要等整条流结束才吐出去——那等于把 `common::sse` 那套首字节
+        // 优化（x-accel-buffering / no-transform / TCP_NODELAY）悄悄抵消掉，而且本地
+        // 直连和单测都看不出来，只有反代后面的真实客户会感觉到卡。
+        let _serial = TEST_SERIAL.lock().unwrap();
+        let before = streams_in_flight();
+
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let handler_gate = gate.clone();
+        let app = Router::new()
+            .route(
+                "/slow",
+                get(move || {
+                    let gate = handler_gate.clone();
+                    async move {
+                        let first = futures::stream::once(async {
+                            Ok::<_, std::io::Error>("data: first\n\n")
+                        });
+                        // 第二块被闸门挡住，模拟「上游还没吐下一段」。
+                        let second = futures::stream::once(async move {
+                            gate.notified().await;
+                            Ok("data: second\n\n")
+                        });
+                        crate::common::sse::sse_response(Body::from_stream(first.chain(second)))
+                    }
+                }),
+            )
+            .layer(middleware::from_fn(super::track_streaming_responses));
+
+        let response = app
+            .oneshot(Request::builder().uri("/slow").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let mut chunks = response.into_body().into_data_stream();
+
+        // 第二块还被闸门挡着，第一块必须已经能拿到。超时即证明包装层在攒包。
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), chunks.next())
+            .await
+            .expect("包装层缓冲了 SSE：第二块还没放行，第一块就应该已经到达");
+        assert!(first.is_some());
+        // 流还在跑，计数必须是 1。
+        assert_eq!(streams_in_flight(), before + 1);
+
+        gate.notify_one();
+        while chunks.next().await.is_some() {}
+        drop(chunks);
+        assert_eq!(streams_in_flight(), before);
+    }
+
+    #[tokio::test]
     async fn a_client_that_disconnects_mid_stream_still_releases_the_slot() {
         let _serial = TEST_SERIAL.lock().unwrap();
         // 客户端中途断开时 body 是被 drop 而不是读完的。漏了这条路径，计数会永久
