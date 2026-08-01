@@ -56,6 +56,50 @@ fn log_env_filter() -> tracing_subscriber::EnvFilter {
     })
 }
 
+/// 启动关键路径分段计时。
+///
+/// 只在 `main` 里用一次，但没有它就只能猜哪一段慢——而线上日志轮转得比一次启动的
+/// 回溯需求快得多，事后补不上。
+struct BootTimer {
+    started: std::time::Instant,
+    last: std::time::Instant,
+    phases: Vec<(&'static str, u128)>,
+}
+
+impl BootTimer {
+    fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            started: now,
+            last: now,
+            phases: Vec::new(),
+        }
+    }
+
+    fn mark(&mut self, phase: &'static str) {
+        let now = std::time::Instant::now();
+        self.phases
+            .push((phase, now.duration_since(self.last).as_millis()));
+        self.last = now;
+    }
+
+    /// 输出一行「总耗时 + 各段耗时」。放在 `bind` 之后、`serve` 之前，
+    /// 这样这行日志的时间点就等于「开始能接客户流量」的时刻。
+    fn log_summary(&self) {
+        let breakdown = self
+            .phases
+            .iter()
+            .map(|(phase, ms)| format!("{phase}={ms}ms"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        tracing::info!(
+            total_ms = self.started.elapsed().as_millis(),
+            "启动完成，开始接受连接：{}",
+            breakdown
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // 解析命令行参数
@@ -65,6 +109,10 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(log_env_filter())
         .init();
+
+    // 绑定端口之前的每一步都挡在客户流量前面，但线上日志轮转很快（实测 9 小时 124 MB），
+    // 事后回溯不到启动那一段。所以把分段耗时打进启动横幅，别让优化只能靠猜。
+    let mut boot = BootTimer::new();
 
     // 解析配置/凭证路径
     let config_path = args
@@ -215,6 +263,8 @@ async fn main() {
         );
     }
 
+    boot.mark("config_and_credentials_parse");
+
     // 创建 MultiTokenManager 和 KiroProvider
     let token_manager = MultiTokenManager::new(
         config.clone(),
@@ -240,6 +290,7 @@ async fn main() {
         config.default_endpoint.clone(),
         Some(proxy_pool.clone()),
     ));
+    boot.mark("token_manager_and_provider");
 
     // 初始化 count_tokens 配置
     token::init_config(token::CountTokensConfig {
@@ -260,6 +311,8 @@ async fn main() {
         &cache_dir,
         token_manager.clone(),
     );
+    boot.mark("open_key_supplier_db");
+
     let client_keys_path = admin::client_keys::default_path_in(&cache_dir);
     let client_key_manager = std::sync::Arc::new(
         admin::ClientKeyManager::load(&client_keys_path).unwrap_or_else(|e| {
@@ -296,6 +349,8 @@ async fn main() {
         }
     }
 
+    boot.mark("pre_trace_db");
+
     // 请求链路追踪存储（SQLite，traces.db）。失败不致命：trace 不可用但服务正常。
     let trace_store: Option<admin::SharedTraceStore> = match admin::TraceStore::open(
         cache_dir.join("traces.db"),
@@ -308,6 +363,16 @@ async fn main() {
             None
         }
     };
+    boot.mark("open_traces_db");
+
+    if let Some(store) = &trace_store {
+        let store = store.clone();
+        common::drain::register_exit_task("traces.db wal_checkpoint", move || {
+            if let Err(error) = store.checkpoint_truncate() {
+                tracing::warn!(%error, "traces.db WAL 截断失败，下次启动仍需为它做恢复");
+            }
+        });
+    }
 
     // ───── 把请求路径上的同步磁盘 I/O 全部挪到后台 ─────
     //
@@ -343,6 +408,16 @@ async fn main() {
             )
         }
     };
+    boot.mark("open_error_snapshots_db");
+
+    {
+        let store = error_snapshot_store.clone();
+        common::drain::register_exit_task("error_snapshots.db wal_checkpoint", move || {
+            if let Err(error) = store.checkpoint_truncate() {
+                tracing::warn!(%error, "error_snapshots.db WAL 截断失败，下次启动仍需为它做恢复");
+            }
+        });
+    }
 
     // fallback 导入、清理与 trace 回链全部在 blocking pool 中分批执行。
     // 服务会先继续启动，历史快照库再大也不会占住 Tokio 请求线程。
@@ -617,6 +692,7 @@ async fn main() {
     // 统计在途流式响应，供在线更新挑「没有流在跑」的时刻退出，避免把客户的回答
     // 砍在半句话上。只包 SSE：非流式响应是毫秒级，计入会让计数永远不归零。
     let app = app.layer(axum::middleware::from_fn(track_streaming_responses));
+    boot.mark("build_router");
 
     // 下游连接开 TCP_NODELAY：SSE 是「大量小写」，Nagle 会把小帧攒到对端 ACK 回来
     // 才发，撞上 delayed ACK 时单次最坏加约 40ms。axum/tokio 都不默认开，必须自己设。
@@ -628,6 +704,9 @@ async fn main() {
                 tracing::warn!(%err, "设置 TCP_NODELAY 失败，该连接的流式输出可能被 Nagle 攒包");
             }
         });
+    boot.mark("bind_listener");
+    // 这行日志的时间点就是「开始能接客户流量」的时刻，减去容器 StartedAt 即完整冷启动。
+    boot.log_summary();
     axum::serve(listener, app).await.unwrap();
 }
 
@@ -716,6 +795,14 @@ fn initialize_key_supplier_service(
             return None;
         }
     };
+    {
+        let store = store.clone();
+        common::drain::register_exit_task("key_supplier.db wal_checkpoint", move || {
+            if let Err(error) = store.checkpoint_truncate() {
+                tracing::warn!(%error, "key_supplier.db WAL 截断失败，下次启动仍需为它做恢复");
+            }
+        });
+    }
     // 全局号池配置。校验失败时**不能**退回默认值（等于关闭）——那会让系统回到
     // 不受限的逐家采购继续花钱，而用户配这个功能的意图明显是要限制采购。
     // 装一份「中毒」配置（启用但目标存量 0），使后续每次触发都跳过。

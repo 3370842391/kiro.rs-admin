@@ -41,6 +41,38 @@ impl Drop for StreamGuard {
     }
 }
 
+type ExitTask = Box<dyn Fn() + Send + Sync>;
+
+static EXIT_TASKS: std::sync::Mutex<Vec<(&'static str, ExitTask)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// 登记一个退出前要跑的收尾动作（目前用于 SQLite WAL 截断）。
+///
+/// 用注册表而不是把各个 store 传进退出路径：退出是从 `AdminService` 触发的，而
+/// `key_supplier.db` 之类的库并不挂在它下面。注册表让「谁需要收尾」和「什么时候退出」
+/// 彻底解耦，新增一个库时不用再改退出路径。
+pub fn register_exit_task(name: &'static str, task: impl Fn() + Send + Sync + 'static) {
+    if let Ok(mut tasks) = EXIT_TASKS.lock() {
+        tasks.push((name, Box::new(task)));
+    }
+}
+
+/// 跑完所有收尾动作。单个动作自己负责不要卡住——卡住退出等于把新版本无限期推迟。
+pub fn run_exit_tasks() {
+    let Ok(tasks) = EXIT_TASKS.lock() else {
+        return;
+    };
+    for (name, task) in tasks.iter() {
+        let started = std::time::Instant::now();
+        task();
+        tracing::info!(
+            task = name,
+            elapsed_ms = started.elapsed().as_millis(),
+            "退出前收尾完成"
+        );
+    }
+}
+
 /// 断言绝对计数的测试必须串行：计数器是进程级的，并行跑会互相看到对方的凭证。
 #[cfg(test)]
 pub static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());

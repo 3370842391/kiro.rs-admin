@@ -36,7 +36,10 @@ mod tests {
         let response = sse_response(Body::empty());
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()[header::CONTENT_TYPE], "text/event-stream");
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/event-stream"
+        );
         assert_eq!(
             response.headers()[header::CACHE_CONTROL],
             "no-cache, no-transform"

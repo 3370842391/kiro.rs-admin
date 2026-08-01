@@ -378,6 +378,16 @@ impl ErrorSnapshotStore {
         })
     }
 
+    /// 退出前把 WAL 截断。理由与 [`crate::admin::TraceStore::checkpoint_truncate`] 相同：
+    /// PASSIVE 自动检查点只复用不缩文件，硬退出又从不截断，于是启动时白付恢复开销。
+    ///
+    /// 拿不到写锁就放弃——卡住退出比留着一个大 WAL 严重得多。
+    pub fn checkpoint_truncate(&self) -> rusqlite::Result<()> {
+        let conn = self.conn.lock();
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+    }
+
     pub fn open_in_memory_with_fallback(
         fallback_dir: PathBuf,
         policy: ErrorSnapshotPolicy,

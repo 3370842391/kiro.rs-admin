@@ -251,6 +251,20 @@ impl SupplierEventStore {
         })
     }
 
+    /// 退出前把 WAL 截断。库本体只有几百 KB，WAL 却能涨到几 MB——同样是
+    /// PASSIVE 自动检查点只复用不缩文件、硬退出又从不截断造成的。
+    ///
+    /// 拿不到写锁就放弃：卡住退出比留着一个大 WAL 严重得多。
+    pub fn checkpoint_truncate(&self) -> rusqlite::Result<()> {
+        // 锁中毒说明某个持有者 panic 过。此时数据可能不一致，但截断 WAL 本身无害，
+        // 而且这是退出路径——放弃比传播 panic 好。
+        let Ok(conn) = self.conn.lock() else {
+            return Ok(());
+        };
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+    }
+
     /// 落库一条 webhook 事件。`(supplier_id, event_id)` 唯一，重复推送只累加
     /// `webhook_duplicate_count`，绝不产生第二条待处理事件——这是「不重复购买」的第一道闸。
     pub fn insert_event(&self, event: IncomingSupplierEvent) -> rusqlite::Result<InsertOutcome> {

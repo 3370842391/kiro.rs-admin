@@ -318,6 +318,20 @@ impl TraceStore {
         })
     }
 
+    /// 退出前把 WAL 截断。
+    ///
+    /// 自动检查点是 PASSIVE 语义：把页搬回主库后只是**从头复用** WAL，并不缩文件。
+    /// 所以某次高峰把 WAL 涨到几百 MB 之后，它就永远是那么大；而进程一直是硬退出，
+    /// 没有任何时机去截断它。代价是下次启动 `Connection::open` 要为这个文件做恢复，
+    /// 白付启动时间——而启动时间是挡在客户流量前面的。
+    ///
+    /// 拿不到写锁就放弃：卡住退出等于把新版本无限期推迟，比留着一个大 WAL 严重得多。
+    pub fn checkpoint_truncate(&self) -> rusqlite::Result<()> {
+        let conn = self.conn.lock();
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+    }
+
     /// 内存数据库（traces.db 打开失败时的兜底；进程退出即丢，但保证 Admin 查询不崩）
     pub fn open_in_memory() -> rusqlite::Result<Self> {
         let conn = Connection::open_in_memory()?;
@@ -1176,14 +1190,14 @@ mod tests {
     use super::*;
     use chrono::DateTime;
 
-    struct TraceSample<'a> {
-        trace_id: &'a str,
-        status: &'a str,
-        credential_id: u64,
-        model: &'a str,
+    pub(super) struct TraceSample<'a> {
+        pub(super) trace_id: &'a str,
+        pub(super) status: &'a str,
+        pub(super) credential_id: u64,
+        pub(super) model: &'a str,
     }
 
-    fn sample(input: TraceSample<'_>) -> TraceRecord {
+    pub(super) fn sample(input: TraceSample<'_>) -> TraceRecord {
         TraceRecord {
             trace_id: input.trace_id.to_string(),
             ts: Utc::now().to_rfc3339(),
@@ -1934,5 +1948,57 @@ mod tests {
         let out = truncate_snippet(&long).unwrap();
         assert!(out.ends_with("…(truncated)"));
         assert!(out.len() <= ERROR_SNIPPET_MAX + 20);
+    }
+}
+
+#[cfg(test)]
+mod wal_checkpoint_tests {
+    use super::*;
+
+    /// 唯一目录，避免并行测试互相踩同一个 traces.db。
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kiro-rs-wal-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn checkpoint_truncate_actually_shrinks_the_wal_file() {
+        // 这是 Step 1 的全部意义所在。PASSIVE 自动检查点只把页搬回主库、从头复用
+        // WAL，**不缩文件**；进程又一直硬退出，没人截断。线上 traces.db-wal 因此涨到
+        // 307 MB，每次启动都要为它做恢复。断言必须落在「文件真的变小了」上，
+        // 只断言 checkpoint 返回 Ok 会让这个 bug 原样溜回来。
+        let dir = scratch_dir("shrink");
+        let db = dir.join("traces.db");
+        let wal = dir.join("traces.db-wal");
+
+        let store = TraceStore::open(db.clone(), true, 7).unwrap();
+        for index in 0..200 {
+            store.insert(super::tests::sample(super::tests::TraceSample {
+                trace_id: &format!("trace-{index}"),
+                status: "success",
+                credential_id: 1,
+                model: "claude-sonnet-4-6",
+            }));
+        }
+        let grown = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert!(grown > 0, "WAL 应该已经有内容，否则这个测试没在测东西");
+
+        store.checkpoint_truncate().unwrap();
+
+        let after = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(after, 0, "截断后 WAL 必须是 0 字节，涨到 {grown} 却没缩");
+
+        // 数据不能被截断带走：checkpoint 是把页搬回主库，不是丢弃。
+        drop(store);
+        let reopened = TraceStore::open(db, true, 7).unwrap();
+        let (_, total) = reopened.query_paged(&TraceQuery::default());
+        assert_eq!(total, 200, "截断不能丢数据，页应该已经搬回主库");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

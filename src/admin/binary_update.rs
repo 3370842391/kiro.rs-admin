@@ -489,6 +489,10 @@ pub fn schedule_self_exit_when_idle(max_wait: std::time::Duration) {
             }
             tokio::time::sleep(POLL).await;
         }
+        // 收尾（SQLite WAL 截断）。这是硬退出唯一的收尾时机：少了它 WAL 只会一路涨，
+        // 下次启动还要为它做恢复，白付启动时间——而启动时间挡在客户流量前面。
+        // 这些动作会阻塞，放到阻塞线程池，别占着 runtime 线程。
+        let _ = tokio::task::spawn_blocking(crate::common::drain::run_exit_tasks).await;
         // 给 stdout 一个 flush 机会，避免最后一行日志丢失
         let _ = std::io::stdout().flush();
         std::process::exit(0);
