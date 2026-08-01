@@ -453,6 +453,79 @@ fn hex_prefix(digest: &[u8]) -> String {
 /// event id 的最大长度。对方的 `evt_8DX2ZPK9MR7Q4JWH` 远短于此，留足余量即可。
 const MAX_EVENT_ID_CHARS: usize = 128;
 
+/// 事件级自动重试的等待表，第 n 次尝试失败后取第 n-1 项；用完就转 `failed` 终态。
+///
+/// 与 `client.rs` 的 `RETRY_BACKOFF` 是两层不同的东西：那层管一次处理内的三连
+/// 请求（供货商抖动几秒），这层管「供货商整段时间都在 500」（分钟级）。少了这层，
+/// 一条到货通知撞上一次上游故障就永久丢单——`failed` 是终态，`claim_next` 只捡
+/// `received`，除了人工点重试没有任何东西会再碰它。
+const EVENT_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(30),
+    Duration::from_secs(120),
+    Duration::from_secs(600),
+];
+
+/// 瞬时上游故障压回队列，等 `EVENT_RETRY_DELAYS` 到点再试；重试额度用尽则失败。
+///
+/// `replayable` = 这次失败的请求可以原样再发一遍。查库存永远可以；下单只有带幂等键
+/// 的协议可以（kiro-app 的 `/openapi/claim` 没有订单号，重发就是再扣一次积分）。
+///
+/// `purchase_count` 是已经发出去的数量，非 `None` 时钉进事件行。重放必须原样重发：
+/// `purchase_order_id` 由 `event_id` 派生，同一订单号换数量会让幂等协议返 409
+/// （原单已成交、钱扣了、key 没到手），正是这次重试要避免的结果。
+fn defer_or_fail(
+    event: &StoredSupplierEvent,
+    replayable: bool,
+    purchase_count: Option<u32>,
+    error: crate::admin::key_supplier::client::SupplierError,
+) -> Result<ProcessAction, SupplierServiceError> {
+    use crate::admin::key_supplier::client::SupplierError;
+
+    // 只有「等一会儿可能就好了」才值得重试。4xx、解码失败、参数错误重放一万次
+    // 也是同一个结果；`OutOfStock` / `InsufficientBalance` / `OrderConflict`
+    // 在调用方已经归成 skipped，走不到这里。
+    let transient = match &error {
+        SupplierError::Http { status, .. } => (500..=599).contains(status),
+        SupplierError::Network(_) => true,
+        // 429 自带 `retry_after`：这是它第一次真正被用上，之前只解析了没人读。
+        SupplierError::RateLimited { .. } => true,
+        _ => false,
+    };
+    // 手动采购不自动重试：人就在旁边等结果，十分钟后突然冒出一笔扣款是惊吓。
+    // 他看到错误自己再点一次即可。
+    if !transient || !replayable || event.event_type != "new_keys_available" {
+        return Err(SupplierServiceError::supplier_api(error));
+    }
+    // `attempts` 在领取时就 +1 了，所以本次是第 `attempts` 次尝试。
+    let slot = usize::try_from(event.attempts.max(1) - 1).unwrap_or(usize::MAX);
+    let Some(delay) = EVENT_RETRY_DELAYS.get(slot).copied() else {
+        return Err(SupplierServiceError::supplier_api(error));
+    };
+    // 对方明说了要等多久就听它的，别比它更急。
+    let delay = match &error {
+        SupplierError::RateLimited {
+            retry_after: Some(seconds),
+            ..
+        } => delay.max(Duration::from_secs(*seconds)),
+        _ => delay,
+    };
+    let retry_after = Utc::now()
+        + ChronoDuration::from_std(delay).unwrap_or_else(|_| ChronoDuration::seconds(30));
+    tracing::warn!(
+        supplier = %event.supplier_id,
+        event_id = %event.event_id,
+        attempts = event.attempts,
+        delay_secs = delay.as_secs(),
+        pinned_count = ?purchase_count,
+        "供货商瞬时故障，事件压回队列等待自动重试"
+    );
+    Ok(ProcessAction::Deferred {
+        retry_after,
+        purchase_count,
+        error: SupplierServiceError::supplier_api(error),
+    })
+}
+
 /// 在候选字段名里找第一个可用的 id。
 ///
 /// **原样保留**对方给的 id（例如 `evt_8DX2ZPK9MR7Q4JWH`），这样事件历史里的 id
@@ -1060,12 +1133,17 @@ impl KeySupplierService {
         if !entry.is_operable() {
             return Err(SupplierServiceError::SupplierConfiguration);
         }
-        SupplierClient::with_kind(
+        let client = SupplierClient::with_kind(
             &entry.settings.base_url,
             &entry.settings.api_key,
             entry.kind,
         )
-        .map_err(|_| SupplierServiceError::SupplierConfiguration)
+        .map_err(|_| SupplierServiceError::SupplierConfiguration)?;
+        // 服务层测试里造 5xx 是常事，真按生产退避表等 4 秒会把整套测试拖垮。
+        // 退避本身在 `client.rs` 有专门用例断言。
+        #[cfg(test)]
+        let client = client.without_backoff();
+        Ok(client)
     }
 
     pub async fn overview(&self) -> Result<SupplierOverview, SupplierServiceError> {
@@ -1423,6 +1501,18 @@ impl KeySupplierService {
                 .await?;
                 Err(error)
             }
+            Ok(ProcessAction::Deferred {
+                retry_after,
+                purchase_count,
+                error,
+            }) => {
+                let persistence_error = self.sanitize_for(&event.supplier_id, &error);
+                self.run_store_operation(move |store| {
+                    store.defer(event.id, retry_after, purchase_count, &persistence_error)
+                })
+                .await?;
+                Err(error)
+            }
             Err(error) => {
                 let persistence_error = self.sanitize_for(&event.supplier_id, &error);
                 self.run_store_operation(move |store| store.fail(event.id, &persistence_error))
@@ -1476,6 +1566,15 @@ impl KeySupplierService {
             .as_ref()
             .ok_or(SupplierServiceError::ImporterUnavailable)?;
 
+        // 上一轮已经把这个数量发出去过（瞬时故障压回队列时钉下来的）。必须原样重放：
+        // `purchase_order_id` 由 `event_id` 派生，同一订单号换数量会让幂等协议返 409
+        // （原单已成交、钱扣了、key 没到手）。所以钉住的数量优先于所有水位判定——
+        // 可能因此多买一个，但换来的是把可能已经付过钱的那一单取回来。
+        let pinned = event
+            .purchase_count
+            .and_then(|count| u32::try_from(count).ok())
+            .filter(|count| *count > 0);
+
         // 号池配置快照。整次触发用同一份，避免中途被改导致前后判定不一致。
         let pool = self.pool_config();
 
@@ -1490,6 +1589,7 @@ impl KeySupplierService {
         // 号池闸启用时这道逐家闸整个让位：两套水位并存会交叉出第三种行为，而且
         // 「为什么没买」会变成要同时看两处配置。互斥而非嵌套是刻意的。
         if event.event_type == "new_keys_available"
+            && pinned.is_none()
             && !pool.enabled
             && runtime.restock_only_when_exhausted
         {
@@ -1520,8 +1620,19 @@ impl KeySupplierService {
             );
         }
 
-        let (count, client) = match event.event_type.as_str() {
-            "new_keys_available" => {
+        let (count, client) = match (event.event_type.as_str(), pinned) {
+            // 重放已发出的那一单：跳过库存与水位判定，只求请求体与上次逐字节相同。
+            ("new_keys_available", Some(count)) => {
+                tracing::warn!(
+                    supplier = %entry.id,
+                    event_id = %event.event_id,
+                    attempts = event.attempts,
+                    count,
+                    "重放上一轮已发出的采购数量（订单号相同，命中幂等即不会重复扣费）"
+                );
+                (count, self.client_for(&entry)?)
+            }
+            ("new_keys_available", None) => {
                 let client = self.client_for(&entry)?;
 
                 // 号池模式：缺口说了算，推送带的数量只留痕不作依据。
@@ -1581,10 +1692,13 @@ impl KeySupplierService {
                     // Drop 的推送不带数量，库存必须查（否则只能盲发）。它的库存来自
                     // `/api/status` 的 `keys_stock`，不是 kiro-rs 那个 `/api/my/stock`。
                     // kiro.ceo 的文档也建议先查 `/api/my/stock` 的 `max` 再提货。
-                    SupplierKind::KiroRs | SupplierKind::KiroDrop | SupplierKind::KiroCeo => client
-                        .available_stock()
-                        .await
-                        .map_err(SupplierServiceError::supplier_api)?,
+                    SupplierKind::KiroRs | SupplierKind::KiroDrop | SupplierKind::KiroCeo => {
+                        match client.available_stock().await {
+                            Ok(available) => available,
+                            // 查库存是 GET，没花钱，重放永远安全。
+                            Err(error) => return defer_or_fail(event, true, None, error),
+                        }
+                    }
                 };
 
                 match pool_gap {
@@ -1647,7 +1761,7 @@ impl KeySupplierService {
                     }
                 }
             }
-            "manual_purchase" => {
+            ("manual_purchase", _) => {
                 let count = u32::try_from(event.quantity)
                     .map_err(|_| SupplierServiceError::InvalidEvent)?;
                 let client = self.client_for(&entry)?;
@@ -1718,7 +1832,17 @@ impl KeySupplierService {
                     summary: pool_snapshot,
                 });
             }
-            Err(error) => return Err(SupplierServiceError::supplier_api(error)),
+            // 瞬时故障（5xx / 网络 / 429）压回队列自动重试，而不是直接进 failed 终态。
+            // 重放安全性取决于协议是否有幂等键：kiro-app 的 claim 没有订单号，
+            // 5xx 之后我们分不清积分扣没扣，只能停在失败让人工处理。
+            Err(error) => {
+                return defer_or_fail(
+                    event,
+                    entry.kind.purchase_is_idempotent(),
+                    Some(count),
+                    error,
+                );
+            }
         };
         // 钱的数字先进 summary 再做导入：导入失败走 `Failed { summary }`，
         // 金额必须跟着一起落库，否则预算累计会把这单算成 0 花费。
@@ -1780,6 +1904,15 @@ enum ProcessAction {
     },
     Failed {
         summary: ProcessSummary,
+        error: SupplierServiceError,
+    },
+    /// 瞬时上游故障：压回队列，`retry_after` 到点自动再试一次。
+    ///
+    /// 不带 `summary`：一次都没买成、也没导入，事件行里已有的金额与水位快照
+    /// 应当原样留着等下一轮，不该被一份空 summary 抹掉。
+    Deferred {
+        retry_after: chrono::DateTime<Utc>,
+        purchase_count: Option<u32>,
         error: SupplierServiceError,
     },
 }
@@ -2916,7 +3049,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_failures_are_retriable_and_errors_never_contain_keys() {
+    async fn transient_api_failures_are_requeued_and_errors_never_contain_keys() {
         let attempts = Arc::new(Mutex::new(0));
         let state = attempts.clone();
         let app = Router::new()
@@ -2954,10 +3087,14 @@ mod tests {
             Arc::new(FakeImporter::default()),
         );
         service.process_pending().await.unwrap();
-        let failed = store.list(1, None, None).unwrap().items.remove(0);
-        assert_eq!(failed.status, SupplierEventStatus::Failed);
-        assert!(!format!("{failed:?}").contains("ksk_api_failure_canary"));
-        store.retry(failed.id).unwrap();
+        // 查库存拿到 502：瞬时故障 + 是个 GET，压回队列等自动重试而不是进 failed 终态。
+        // 没走到下单，所以不钉数量——下一轮该按当时的水位重算。
+        let deferred = store.list(1, None, None).unwrap().items.remove(0);
+        assert_eq!(deferred.status, SupplierEventStatus::Received);
+        assert!(deferred.retry_after.is_some());
+        assert!(deferred.purchase_count.is_none());
+        assert!(!format!("{deferred:?}").contains("ksk_api_failure_canary"));
+        store.retry(deferred.id).unwrap();
         service.process_pending().await.unwrap();
         assert_eq!(
             store.list(1, None, None).unwrap().items[0].status,
@@ -4786,6 +4923,221 @@ mod tests {
             stored.message
         );
         assert!(stored.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn transient_supplier_failure_is_deferred_and_replayed_with_the_same_request() {
+        // 供货商广播「新一批已上架」的那一瞬间它自己往往还没准备好，采购接口短暂返 500。
+        // 以前这条事件直接进 failed 终态（`claim_next` 只捡 received），一次几秒的抖动
+        // 就等于永久丢一条到货通知。现在压回队列等自动重试，并钉住已经发出去的数量：
+        // 订单号由 event_id 派生，重放时数量变了幂等协议会返 409（原单已成交、钱扣了、
+        // key 没到手）——那恰好是重试要避免的结果。
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let observed = bodies.clone();
+        let app = Router::new().route(
+            "/api/me/purchase",
+            post(move |body: axum::body::Bytes| {
+                let observed = observed.clone();
+                async move {
+                    let mut bodies = observed.lock().unwrap();
+                    bodies.push(String::from_utf8(body.to_vec()).unwrap());
+                    // 一轮处理里客户端自己会试三次，都撞在同一个坏窗口上。
+                    if bodies.len() <= 3 {
+                        (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            r#"{"error":"服务暂时不可用"}"#.to_owned(),
+                        )
+                    } else {
+                        (
+                            axum::http::StatusCode::OK,
+                            r#"{"purchased":2,"remaining":9,"total_debit":60,
+                                "keys":[{"key":"ksk_a"},{"key":"ksk_b"}]}"#
+                                .to_owned(),
+                        )
+                    }
+                }
+            }),
+        );
+        let token = "7".repeat(64);
+        let mut supplier = entry("io", SupplierKind::KiroAppIo, &token);
+        supplier.settings.base_url = server(app).await;
+        supplier.settings.api_key = "km_secret".to_string();
+        let store = Arc::new(SupplierEventStore::open_in_memory().unwrap());
+        let importer = Arc::new(FakeImporter::default());
+        let service = KeySupplierService::with_suppliers_and_importer(
+            store.clone(),
+            vec![supplier],
+            importer.clone(),
+        );
+
+        service
+            .ingest(
+                &token,
+                r#"{"event":"new_keys_available","event_id":"evt_flaky","new_keys":2}"#,
+            )
+            .unwrap();
+        assert_eq!(service.process_pending().await.unwrap(), 1);
+
+        let deferred = store.list(1, None, None).unwrap().items.remove(0);
+        assert_eq!(deferred.status, SupplierEventStatus::Received);
+        assert_eq!(deferred.purchase_count, Some(2));
+        assert!(deferred.retry_after.is_some());
+        assert!(
+            deferred
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("500"),
+            "{:?}",
+            deferred.last_error
+        );
+        // 还没到点，这一轮不该再动它。
+        assert_eq!(service.process_pending().await.unwrap(), 0);
+        assert_eq!(bodies.lock().unwrap().len(), 3);
+
+        // 人工重试跳过退避，第四次请求命中恢复后的供货商。
+        store.retry(deferred.id).unwrap();
+        assert_eq!(service.process_pending().await.unwrap(), 1);
+
+        let settled = store.list(1, None, None).unwrap().items.remove(0);
+        assert_eq!(settled.status, SupplierEventStatus::Succeeded);
+        assert_eq!(settled.purchased_count, 2);
+        assert_eq!(settled.imported_count, 2);
+        assert_eq!(importer.credentials.lock().unwrap().len(), 2);
+
+        // 重放必须逐字节等于第一次：同一订单号 + 同一数量才会命中幂等而不是 409。
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 4);
+        assert_eq!(bodies[0], bodies[3]);
+    }
+
+    #[tokio::test]
+    async fn non_idempotent_claim_failure_is_never_auto_retried() {
+        // kiro-app 的 `/openapi/claim` 没有订单号。5xx 之后我们分不清积分扣没扣，
+        // 自动重放一次就可能是第二笔扣款——只能停在 failed 让人工核对。
+        let calls = Arc::new(Mutex::new(0_usize));
+        let observed = calls.clone();
+        let app = Router::new().route(
+            "/openapi/claim",
+            post(move || {
+                let observed = observed.clone();
+                async move {
+                    *observed.lock().unwrap() += 1;
+                    (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        r#"{"error":{"type":"server_error"}}"#,
+                    )
+                }
+            }),
+        );
+        let token = "8".repeat(64);
+        let mut supplier = entry("app", SupplierKind::KiroApp, &token);
+        supplier.settings.base_url = server(app).await;
+        supplier.settings.api_key = "app-secret".to_string();
+        let store = Arc::new(SupplierEventStore::open_in_memory().unwrap());
+        let service = KeySupplierService::with_suppliers_and_importer(
+            store.clone(),
+            vec![supplier],
+            Arc::new(FakeImporter::default()),
+        );
+
+        service
+            .ingest(&token, r#"{"id":"batch-app-500","count":1}"#)
+            .unwrap();
+        service.process_pending().await.unwrap();
+
+        let failed = store.list(1, None, None).unwrap().items.remove(0);
+        assert_eq!(failed.status, SupplierEventStatus::Failed);
+        assert!(failed.retry_after.is_none());
+        assert!(failed.purchase_count.is_none());
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn auto_retry_is_bounded_and_only_covers_transient_failures() {
+        use crate::admin::key_supplier::client::SupplierError;
+
+        let store = SupplierEventStore::open_in_memory().unwrap();
+        store
+            .insert_event(IncomingSupplierEvent {
+                supplier_id: "io".to_string(),
+                event_id: "evt".to_string(),
+                event_type: "new_keys_available".to_string(),
+                purchase_order_id: Some("a".repeat(32)),
+                supplier_batch_id: None,
+                message: None,
+                quantity: 1,
+            })
+            .unwrap();
+        let mut event = store.claim_next().unwrap().unwrap();
+
+        let deferred = defer_or_fail(
+            &event,
+            true,
+            Some(1),
+            SupplierError::Http {
+                status: 500,
+                message: "boom".to_string(),
+            },
+        );
+        assert!(matches!(
+            deferred,
+            Ok(ProcessAction::Deferred {
+                purchase_count: Some(1),
+                ..
+            })
+        ));
+
+        // 4xx 重放一万次也是同一个结果，直接失败。
+        for status in [400, 401, 404] {
+            let error = SupplierError::Http {
+                status,
+                message: "nope".to_string(),
+            };
+            assert!(
+                defer_or_fail(&event, true, Some(1), error).is_err(),
+                "{status} 不该自动重试"
+            );
+        }
+
+        // 429 给了建议等待时间就听它的，别比它更急。这是 `retry_after` 第一次被用上。
+        let Ok(ProcessAction::Deferred { retry_after, .. }) = defer_or_fail(
+            &event,
+            true,
+            None,
+            SupplierError::RateLimited {
+                retry_after: Some(600),
+                message: "slow down".to_string(),
+            },
+        ) else {
+            panic!("429 应当压回队列");
+        };
+        assert!(retry_after >= Utc::now() + ChronoDuration::seconds(590));
+
+        // 手动采购不自动重试：人就在旁边等，十分钟后突然冒出一笔扣款是惊吓。
+        let mut manual = event.clone();
+        manual.event_type = "manual_purchase".to_string();
+        assert!(
+            defer_or_fail(
+                &manual,
+                true,
+                Some(1),
+                SupplierError::Network("reset".to_string())
+            )
+            .is_err()
+        );
+
+        // 重试额度用尽后转终态，免得一条坏事件永远在队列里打转。
+        event.attempts = EVENT_RETRY_DELAYS.len() as i64 + 1;
+        assert!(
+            defer_or_fail(
+                &event,
+                true,
+                Some(1),
+                SupplierError::Network("reset".to_string())
+            )
+            .is_err()
+        );
     }
 
     #[test]

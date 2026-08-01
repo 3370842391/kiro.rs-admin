@@ -1382,6 +1382,14 @@ export interface SupplierEvent {
   supplierOrderId: string | null
   /** The vendor replayed an earlier settled order, meaning the previous attempt actually succeeded. */
   replayed: boolean
+  /**
+   * Earliest time this event may be picked up again. Non-null means it hit a transient
+   * vendor failure (5xx / network / 429) and is queued for an automatic retry, which is
+   * a different situation from a `received` event that simply has not been reached yet.
+   */
+  retryAfter: string | null
+  /** Purchase count already sent upstream. A retry replays this exact count to hit the vendor's idempotency. */
+  purchaseCount: number | null
 }
 
 export interface SupplierEventPage {

@@ -861,6 +861,11 @@ struct EventView {
     supplier_order_id: Option<String>,
     /// 命中对方幂等重放：上一次其实已成交。
     replayed: bool,
+    /// 正在等自动重试，值是最早重试时间。撞上供货商瞬时故障（5xx / 网络 / 429）时
+    /// 事件回到 `received` 并压到这个时间之后，界面要能和「还没轮到」区分开。
+    retry_after: Option<String>,
+    /// 已经发出去的采购数量。重试会原样重放这个数量以命中对方的幂等。
+    purchase_count: Option<i64>,
 }
 
 impl From<StoredSupplierEvent> for EventView {
@@ -888,6 +893,8 @@ impl From<StoredSupplierEvent> for EventView {
             unit_price: event.unit_price,
             supplier_order_id: event.supplier_order_id,
             replayed: event.replayed,
+            retry_after: event.retry_after,
+            purchase_count: event.purchase_count,
         }
     }
 }

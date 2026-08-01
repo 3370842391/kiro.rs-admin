@@ -1380,7 +1380,7 @@ impl SupplierClient {
 
     /// 测试用：去掉重试等待。只有专门断言退避的用例才保留真实等待表。
     #[cfg(test)]
-    fn without_backoff(mut self) -> Self {
+    pub(crate) fn without_backoff(mut self) -> Self {
         self.retry_backoff = &[];
         self
     }

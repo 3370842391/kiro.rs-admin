@@ -11,7 +11,7 @@ const EVENT_COLUMNS: &str = "id,supplier_id,event_id,event_type,purchase_order_i
 received_at,status,attempts,last_error,purchased,imported,duplicate_count,\
 webhook_duplicate_count,failed_count,read_at,processing_started_at,supplier_batch_id,\
 total_debit,unit_price,supplier_order_id,replayed,\
-pool_usable,pool_deficit,pool_requested";
+pool_usable,pool_deficit,pool_requested,retry_after,purchase_count";
 
 /// 历史行（单供货商时代）回填的供货商标识，与配置迁移出来的条目 id 一致。
 pub const LEGACY_SUPPLIER_ID: &str = "default";
@@ -43,7 +43,9 @@ CREATE TABLE IF NOT EXISTS supplier_events (
     replayed INTEGER NOT NULL DEFAULT 0,
     pool_usable INTEGER,
     pool_deficit INTEGER,
-    pool_requested INTEGER
+    pool_requested INTEGER,
+    retry_after TEXT,
+    purchase_count INTEGER
 );
 "#;
 
@@ -97,6 +99,13 @@ const MIGRATION_COLUMNS: &[(&str, &str)] = &[
     // 经单家上下限与库存夹逼后实际请求的数量。与 `pool_deficit` 的差额说明是被
     // 哪一道夹逼砍掉的。
     ("pool_requested", "INTEGER"),
+    // 最早可再次领取的时间（RFC3339）。瞬时上游故障把事件压回队列时写入，
+    // 到点前 `claim_next` 不会捡它。为空 = 立即可领。
+    ("retry_after", "TEXT"),
+    // 上一轮实际发出去的采购数量。重放必须原样重发：`purchase_order_id` 由
+    // `event_id` 派生，同一订单号换数量会让幂等协议返 409（原单已成交、钱扣了、
+    // key 没到手），那恰好是重试要避免的结果。
+    ("purchase_count", "INTEGER"),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,6 +196,10 @@ pub struct StoredSupplierEvent {
     pub pool_deficit: Option<i64>,
     /// 经夹逼后实际请求的数量。与 `pool_deficit` 的差额说明被哪道夹逼砍掉了。
     pub pool_requested: Option<i64>,
+    /// 最早可再次领取的时间。`Some` 说明这条事件正在等一次自动重试。
+    pub retry_after: Option<String>,
+    /// 上一轮实际发出去的采购数量。`Some` 说明本次必须原样重放这个数量。
+    pub purchase_count: Option<i64>,
 }
 
 /// 一次处理的结果。`Default` 是「什么都没发生」，构造时只填关心的字段。
@@ -310,10 +323,14 @@ impl SupplierEventStore {
     pub fn claim_next(&self) -> rusqlite::Result<Option<StoredSupplierEvent>> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // `retry_after` 未到点的事件跳过而不是阻塞队列：它后面那些新到货的通知
+        // 还得抢货，不能被一条正在等退避的事件挡住。
         let id: Option<i64> = tx
             .query_row(
-                "SELECT id FROM supplier_events WHERE status='received' ORDER BY id ASC LIMIT 1",
-                [],
+                "SELECT id FROM supplier_events
+                 WHERE status='received' AND (retry_after IS NULL OR retry_after <= ?1)
+                 ORDER BY id ASC LIMIT 1",
+                params![Utc::now().to_rfc3339()],
                 |row| row.get(0),
             )
             .optional()?;
@@ -336,7 +353,8 @@ impl SupplierEventStore {
         let id: Option<i64> = tx
             .query_row(
                 "SELECT id FROM supplier_events
-                 WHERE supplier_id=?1 AND event_id=?2 AND status='received'",
+                 WHERE supplier_id=?1 AND event_id=?2 AND status='received'
+                   AND retry_after IS NULL",
                 params![supplier_id, event_id],
                 |row| row.get(0),
             )
@@ -418,12 +436,52 @@ impl SupplierEventStore {
         )
     }
 
+    /// 人工重试。也接受正在等自动重试的事件（`received` + `retry_after`）：
+    /// 人明确要求现在就试，不该还让他等退避走完。
+    ///
+    /// 不清 `purchase_count`：钉住的数量正是为了原样重放。数量变了幂等协议会返 409，
+    /// 那单钱可能已经扣了、key 却取不回来。
     pub fn retry(&self, id: i64) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         let changed = conn.execute(
-            "UPDATE supplier_events SET status='received', processing_started_at=NULL, last_error=NULL
-             WHERE id=?1 AND status IN ('failed','skipped')",
+            "UPDATE supplier_events
+             SET status='received', processing_started_at=NULL, last_error=NULL, retry_after=NULL
+             WHERE id=?1
+               AND (status IN ('failed','skipped')
+                    OR (status='received' AND retry_after IS NOT NULL))",
             params![id],
+        )?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(rusqlite::Error::QueryReturnedNoRows)
+        }
+    }
+
+    /// 把事件压回队列，`retry_after` 到点后再领，并钉住上一轮发出去的采购数量。
+    ///
+    /// 只用于**瞬时**上游故障（5xx / 网络 / 429）。在这之前这类故障直接进 `failed`，
+    /// 而 `failed` 是终态——`claim_next` 只捡 `received`——所以供货商抖动几秒钟就等于
+    /// 永久丢一条到货通知，只能靠人去点重试。
+    pub fn defer(
+        &self,
+        id: i64,
+        retry_after: DateTime<Utc>,
+        purchase_count: Option<u32>,
+        error: &str,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE supplier_events
+             SET status='received', processing_started_at=NULL, retry_after=?2,
+                 purchase_count=COALESCE(?3, purchase_count), last_error=?4
+             WHERE id=?1 AND status='processing'",
+            params![
+                id,
+                retry_after.to_rfc3339(),
+                purchase_count,
+                truncate_chars(error, 300)
+            ],
         )?;
         if changed == 1 {
             Ok(())
@@ -594,6 +652,8 @@ impl SupplierEventStore {
             pool_usable: row.get(23)?,
             pool_deficit: row.get(24)?,
             pool_requested: row.get(25)?,
+            retry_after: row.get(26)?,
+            purchase_count: row.get(27)?,
         })
     }
 
@@ -603,7 +663,7 @@ impl SupplierEventStore {
     ) -> rusqlite::Result<Option<StoredSupplierEvent>> {
         let now = Utc::now().to_rfc3339();
         let changed = tx.execute(
-            "UPDATE supplier_events SET status='processing', attempts=attempts+1, processing_started_at=?1 WHERE id=?2 AND status='received'",
+            "UPDATE supplier_events SET status='processing', attempts=attempts+1, processing_started_at=?1, retry_after=NULL WHERE id=?2 AND status='received'",
             params![now, id],
         )?;
         if changed == 1 {
@@ -618,6 +678,10 @@ impl SupplierEventStore {
 
 /// 多供货商改造前的表把 `event_id` 声明成列级 `UNIQUE`，SQLite 无法直接 drop，
 /// 会让两家供货商推同名 event id 时误判重复丢单，因此整表重建。
+///
+/// 重建在 `MIGRATION_COLUMNS` 之后执行，所以**每加一列都要同时改这里的三处**
+/// （CREATE 的列定义、INSERT 的列名、SELECT 的列名），否则新列会在重建时被丢掉。
+/// `open_rebuilds_the_table_so_two_suppliers_can_share_an_event_id` 守着这一点。
 const REBUILD_TABLE: &str = r#"
 CREATE TABLE supplier_events_migrated (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -645,19 +709,21 @@ CREATE TABLE supplier_events_migrated (
     replayed INTEGER NOT NULL DEFAULT 0,
     pool_usable INTEGER,
     pool_deficit INTEGER,
-    pool_requested INTEGER
+    pool_requested INTEGER,
+    retry_after TEXT,
+    purchase_count INTEGER
 );
 INSERT INTO supplier_events_migrated
     (id,supplier_id,event_id,event_type,purchase_order_id,message,quantity,received_at,status,
      attempts,last_error,purchased,imported,duplicate_count,webhook_duplicate_count,failed_count,
      read_at,processing_started_at,supplier_batch_id,
      total_debit,unit_price,supplier_order_id,replayed,
-     pool_usable,pool_deficit,pool_requested)
+     pool_usable,pool_deficit,pool_requested,retry_after,purchase_count)
 SELECT id,supplier_id,event_id,event_type,purchase_order_id,message,quantity,received_at,status,
        attempts,last_error,purchased,imported,duplicate_count,webhook_duplicate_count,failed_count,
        read_at,processing_started_at,supplier_batch_id,
        total_debit,unit_price,supplier_order_id,replayed,
-       pool_usable,pool_deficit,pool_requested
+       pool_usable,pool_deficit,pool_requested,retry_after,purchase_count
 FROM supplier_events;
 DROP TABLE supplier_events;
 ALTER TABLE supplier_events_migrated RENAME TO supplier_events;
@@ -1236,6 +1302,77 @@ mod tests {
         assert_eq!(store.claim_next().unwrap().unwrap().event_id, "b");
         assert_eq!(store.claim_next().unwrap().unwrap().event_id, "c");
         assert_eq!(stale.attempts, 1);
+    }
+
+    #[test]
+    fn deferred_event_waits_for_retry_after_without_blocking_the_queue() {
+        let store = SupplierEventStore::open_in_memory().unwrap();
+        store.insert_event(event("a")).unwrap();
+        store.insert_event(event("b")).unwrap();
+
+        let first = store.claim_next().unwrap().unwrap();
+        assert_eq!(first.event_id, "a");
+        store
+            .defer(
+                first.id,
+                Utc::now() + Duration::seconds(60),
+                Some(3),
+                "supplier HTTP 500",
+            )
+            .unwrap();
+
+        // 回到 received 而不是 failed，数量被钉住，错误仍然可见。
+        let deferred = store.list(999, None, None).unwrap();
+        let deferred = deferred
+            .items
+            .iter()
+            .find(|item| item.event_id == "a")
+            .unwrap();
+        assert_eq!(deferred.status, SupplierEventStatus::Received);
+        assert_eq!(deferred.purchase_count, Some(3));
+        assert!(deferred.retry_after.is_some());
+        assert_eq!(deferred.last_error.as_deref(), Some("supplier HTTP 500"));
+
+        // 未到点不该被领走，但也不该挡住后面新到货的事件——抢货是拼延迟的。
+        assert_eq!(store.claim_next().unwrap().unwrap().event_id, "b");
+
+        // 人工重试无视退避：人明确要求现在就试。钉住的数量必须留着，
+        // 换了数量幂等协议会返 409（原单已成交、钱扣了、key 没到手）。
+        store.retry(first.id).unwrap();
+        let claimed = store.claim_next().unwrap().unwrap();
+        assert_eq!(claimed.event_id, "a");
+        assert_eq!(claimed.purchase_count, Some(3));
+        assert_eq!(claimed.attempts, 2);
+        // 领取时清空退避标记，否则下一轮 stale 回收后会把旧时间再算一次。
+        assert!(claimed.retry_after.is_none());
+        assert!(claimed.last_error.is_none());
+    }
+
+    #[test]
+    fn defer_only_applies_to_in_flight_events_and_expired_waits_are_claimable() {
+        let store = SupplierEventStore::open_in_memory().unwrap();
+        store.insert_event(event("a")).unwrap();
+
+        // 没在处理中的事件不能被压回队列。
+        let id = store.claim_next().unwrap().unwrap().id;
+        store.complete(id, ProcessSummary::default()).unwrap();
+        assert!(
+            store
+                .defer(id, Utc::now() + Duration::seconds(1), None, "boom")
+                .is_err()
+        );
+
+        store.insert_event(event("b")).unwrap();
+        let claimed = store.claim_next().unwrap().unwrap();
+        store
+            .defer(claimed.id, Utc::now() - Duration::seconds(1), None, "boom")
+            .unwrap();
+
+        // 到点即可再领，且不带数量时不钉任何东西。
+        let again = store.claim_next().unwrap().unwrap();
+        assert_eq!(again.event_id, "b");
+        assert_eq!(again.attempts, 2);
+        assert_eq!(again.purchase_count, None);
     }
 
     #[test]
