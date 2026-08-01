@@ -93,8 +93,11 @@ impl IncomingWebhook {
             SupplierKind::KiroAppIo => Self::parse_kiro_app_io(body),
             // Kiro Drop 与 kiro.ceo 是同一族（`usr-` 令牌 + `/api/my/*`），推送格式相同，
             // 只是各自缺的字段不同，所以共用一个宽容解析。
-            SupplierKind::KiroDrop => Self::parse_my_api_family(body, "Kiro Drop 通知"),
-            SupplierKind::KiroCeo => Self::parse_my_api_family(body, "kiro.ceo 通知"),
+            // Drop 的 `purchase_order_id` 是**它自己的批次号**，文档从没说要传回来；
+            // 它的采购接口写的是「client_order_id 32 位十六进制订单号」，由调用方生成。
+            SupplierKind::KiroDrop => Self::parse_my_api_family(body, "Kiro Drop 通知", false),
+            // kiro.ceo 文档明确要求把推送里的订单号原样作为 `client_order_id` 传回。
+            SupplierKind::KiroCeo => Self::parse_my_api_family(body, "kiro.ceo 通知", true),
         }
     }
 
@@ -217,16 +220,22 @@ impl IncomingWebhook {
     /// 3. **数量字段可缺**。Kiro Drop 的到货推送根本没有 `new_keys`；实际下单量由
     ///    号池缺口或 `maxPurchase` 夹逼决定，本来就不依赖推送里的数字。
     ///
-    /// `purchase_order_id` 的处理对两家统一成一条规则：**是 32 hex 就直接当幂等键**
-    /// （kiro.ceo 明确要求「原样作为 client_order_id 传回」），**不是**就从 `event_id`
-    /// 派生一个，并把原值放进 `supplier_batch_id` 留痕（Kiro Drop 的 `batch_xxx`）。
-    /// 采购客户端强校验 32 hex，直接透传非法值会在下单前就报错。
+    /// `purchase_order_id` 能否当幂等键**由 `reuse_pushed_order_id` 决定，不看形状**。
+    /// kiro.ceo 文档要求「原样作为 client_order_id 传回」，所以它是 `true`；Kiro Drop
+    /// 文档从没这么说——那个字段是它自己的批次号，回传过去会让它的采购接口 500。
+    /// 不能当键时就从 `event_id` 派生一个（确定性，重推/重启后同值，幂等仍然成立），
+    /// 原值放进 `supplier_batch_id` 留痕。采购客户端强校验 32 hex，
+    /// 直接透传非法值会在下单前就报错。
     ///
     /// 「所有已配置 Webhook 的用户都会收到全部事件推送」——Kiro Drop 文档明说的。
     /// 因此 `all_keys_dead` 可能是别人家的号死了，绝不能当采购信号；白名单机制已经
     /// 挡住了，这里只负责如实解析。不认识的事件名一律拒收，避免将来新增事件被误当
     /// 成到货信号。
-    fn parse_my_api_family(body: &[u8], notice: &str) -> Result<Self, SupplierServiceError> {
+    fn parse_my_api_family(
+        body: &[u8],
+        notice: &str,
+        reuse_pushed_order_id: bool,
+    ) -> Result<Self, SupplierServiceError> {
         let value: Value =
             serde_json::from_slice(body).map_err(|_| SupplierServiceError::InvalidJson)?;
         let object = value
@@ -247,9 +256,14 @@ impl IncomingWebhook {
         match event {
             "new_keys_available" => {
                 let raw_order = optional_id(object, &["purchase_order_id", "purchaseOrderId"]);
-                let usable_as_key = raw_order.as_deref().is_some_and(|id| {
-                    id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
-                });
+                // 只有对方文档说了「把这个值原样传回当幂等键」才能这么用。
+                // 光看形状（32 hex）不够：Drop 推的就是 32 hex，但那是**它自己的**
+                // 批次号，回传给它的采购接口会让它 500（四次自动采购四次 500，而同一
+                // 时刻用我们自己生成的订单号手动买就成功）。
+                let usable_as_key = reuse_pushed_order_id
+                    && raw_order.as_deref().is_some_and(|id| {
+                        id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    });
                 Ok(Self::NewKeysAvailable {
                     purchase_order_id: if usable_as_key {
                         raw_order.clone().unwrap_or_default()
@@ -3810,6 +3824,48 @@ mod tests {
             .unwrap(),
             IncomingWebhook::AllKeysDead { dead: 12, .. }
         ));
+    }
+
+    #[test]
+    fn kiro_drop_never_sends_the_vendors_own_batch_id_back_as_the_idempotency_key() {
+        // 生产事故：Drop 实际推的 `purchase_order_id` 是 32 hex，旧规则「形状对就当
+        // 幂等键」于是把**它自己的批次号**当成我们的 client_order_id 发回去，
+        // 四次自动采购四次 `500 INTERNAL_ERROR`；同一时刻用我们自己生成的订单号
+        // 手动买则成功。判据只能是对方文档怎么说，不能是字段长得像什么。
+        let vendor_id = "a19fe933d889757410eb382be103c38e";
+        let body = format!(
+            r#"{{"event":"new_keys_available","event_id":"{vendor_id}",
+                "purchase_order_id":"{vendor_id}","message":"新一批 Key 已上架"}}"#
+        );
+
+        let IncomingWebhook::NewKeysAvailable {
+            purchase_order_id,
+            supplier_batch_id,
+            ..
+        } = IncomingWebhook::parse(SupplierKind::KiroDrop, body.as_bytes()).unwrap()
+        else {
+            panic!("arrival push must stay an arrival push");
+        };
+
+        assert_ne!(purchase_order_id, vendor_id, "不能把对方的 id 当幂等键");
+        assert_eq!(purchase_order_id, derive_order_id(vendor_id));
+        // 仍然是合法的 32 hex，且对同一事件确定性——重推、重启后都是同一个键。
+        assert_eq!(purchase_order_id.len(), 32);
+        assert!(purchase_order_id.bytes().all(|b| b.is_ascii_hexdigit()));
+        // 对方的批次号不丢，留着和它后台对账。
+        assert_eq!(supplier_batch_id.as_deref(), Some(vendor_id));
+
+        // kiro.ceo 相反：它文档明确要求原样传回，这条不能被一起改掉。
+        let IncomingWebhook::NewKeysAvailable {
+            purchase_order_id,
+            supplier_batch_id,
+            ..
+        } = IncomingWebhook::parse(SupplierKind::KiroCeo, body.as_bytes()).unwrap()
+        else {
+            panic!("arrival push must stay an arrival push");
+        };
+        assert_eq!(purchase_order_id, vendor_id);
+        assert_eq!(supplier_batch_id, None);
     }
 
     #[test]
