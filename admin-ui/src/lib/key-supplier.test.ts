@@ -7,11 +7,13 @@ import type {
   SupplierPoolStatus,
 } from '@/types/api'
 import {
+  buildSupplierNicknamePreview,
   buildSupplierConfigPayload,
   buildSupplierEntryPayload,
   emptySupplierEntry,
   emptySupplierPool,
   getSupplierEventStatusLabel,
+  getSupplierCapabilities,
   getSupplierKindLabel,
   hasUnreadSupplierEvents,
   isValidSupplierId,
@@ -329,6 +331,69 @@ describe('multi-supplier helpers', () => {
       expect(draft.autoPurchase).toBe(true)
       expect(draft.minPurchase).toBeLessThanOrEqual(draft.maxPurchase)
     }
+  })
+
+  test('new CEO drafts buy only US inventory by default', () => {
+    const draft = emptySupplierEntry('kiro-ceo')
+
+    expect(draft.purchaseRegionMode).toBe('fixed')
+    expect(draft.purchaseRegion).toBe('us')
+    expect(draft.credentialApiRegionFallback).toBe('us-east-1')
+  })
+
+  test('supplier capabilities match each protocol without sharing mutable arrays', () => {
+    const ceo = getSupplierCapabilities('kiro-ceo')
+    const anotherCeo = getSupplierCapabilities('kiro-ceo')
+
+    expect(ceo.regionModes).toEqual(['fixed', 'webhook', 'bestAvailable'])
+    expect(getSupplierCapabilities('kiroapp-io').regionModes).toEqual(['fixed', 'batch'])
+    expect(getSupplierCapabilities('kiro-drop').regionModes).toEqual(['omit'])
+    ceo.regionModes.push('omit')
+    expect(anotherCeo.regionModes).not.toContain('omit')
+  })
+
+  test('nickname preview always keeps the supplier name before the optional label', () => {
+    expect(buildSupplierNicknamePreview('ceo', 'ceo-id', '')).toBe('ceo-1df694d5-1')
+    expect(buildSupplierNicknamePreview('ceo', 'ceo-id', '生产')).toBe(
+      'ceo-生产-1df694d5-1',
+    )
+    expect(buildSupplierNicknamePreview('', 'ceo-id', '生产')).toBe(
+      'ceo-id-生产-1df694d5-1',
+    )
+  })
+
+  test('new suppliers inherit common import settings without creating overrides', () => {
+    const common = {
+      sourceChannel: '统一采购',
+      nicknameLabel: '生产',
+      rpmLimit: 23,
+      priority: 7,
+      groups: ['common'],
+      autoDeleteForbidden: true,
+    }
+    const draft = emptySupplierEntry('kiro-ceo', common)
+
+    expect(draft.importOverrides).toEqual({})
+    expect(draft.sourceChannel).toBe('统一采购')
+    expect(draft.nicknamePrefix).toBe('生产')
+    expect(draft.rpmLimit).toBe(23)
+    expect(draft.priority).toBe(7)
+    expect(draft.groups).toEqual(['common'])
+    expect(draft.autoDeleteForbidden).toBe(true)
+  })
+
+  test('entry payload carries region settings and explicit import overrides', () => {
+    const payload = buildSupplierEntryPayload({
+      ...emptySupplierEntry('kiro-ceo'),
+      id: 'ceo',
+      name: 'ceo',
+      importOverrides: { nicknameLabel: '生产', groups: ['vip'] },
+    })
+
+    expect(payload.purchaseRegionMode).toBe('fixed')
+    expect(payload.purchaseRegion).toBe('us')
+    expect(payload.credentialApiRegionFallback).toBe('us-east-1')
+    expect(payload.importOverrides).toEqual({ nicknameLabel: '生产', groups: ['vip'] })
   })
 
   test('kiroapp.io drafts default to https so the km_ token is not sent in the clear', () => {

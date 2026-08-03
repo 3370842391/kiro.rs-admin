@@ -1,6 +1,8 @@
 import type {
   SupplierConfigPayload,
   SupplierConfigUpdate,
+  SupplierCapabilities,
+  SupplierCommonConfig,
   SupplierEntryPayload,
   SupplierEntryUpdate,
   SupplierEntryView,
@@ -20,6 +22,9 @@ export function buildSupplierConfigPayload(update: SupplierConfigUpdate): Suppli
     minPurchase: update.minPurchase,
     maxPurchase: update.maxPurchase,
     apiRegion: update.apiRegion,
+    purchaseRegionMode: update.purchaseRegionMode,
+    purchaseRegion: update.purchaseRegion,
+    credentialApiRegionFallback: update.credentialApiRegionFallback,
     rpmLimit: update.rpmLimit,
     priority: update.priority,
     groups: [...update.groups],
@@ -50,6 +55,12 @@ export function buildSupplierEntryPayload(update: SupplierEntryUpdate): Supplier
     name: update.name.trim(),
     kind: update.kind,
     enabled: update.enabled,
+    importOverrides: {
+      ...update.importOverrides,
+      ...(update.importOverrides.groups
+        ? { groups: [...update.importOverrides.groups] }
+        : {}),
+    },
   }
 
   const id = update.id?.trim()
@@ -79,8 +90,79 @@ const supplierKindBaseUrls: Record<SupplierKind, string> = {
   'kiro-ceo': 'https://kiro.ceo',
 }
 
+const supplierKindCapabilities: Record<SupplierKind, SupplierCapabilities> = {
+  'kiro-rs': {
+    regionModes: ['omit'],
+    supportsWebhookRegistration: true,
+    purchaseIsIdempotent: true,
+    supportsPrice: false,
+  },
+  'kiro-app': {
+    regionModes: ['omit'],
+    supportsWebhookRegistration: false,
+    purchaseIsIdempotent: false,
+    supportsPrice: true,
+  },
+  'kiroapp-io': {
+    regionModes: ['fixed', 'batch'],
+    supportsWebhookRegistration: false,
+    purchaseIsIdempotent: true,
+    supportsPrice: true,
+  },
+  'kiro-drop': {
+    regionModes: ['omit'],
+    supportsWebhookRegistration: true,
+    purchaseIsIdempotent: true,
+    supportsPrice: true,
+  },
+  'kiro-ceo': {
+    regionModes: ['fixed', 'webhook', 'bestAvailable'],
+    supportsWebhookRegistration: true,
+    purchaseIsIdempotent: true,
+    supportsPrice: true,
+  },
+}
+
+const supplierKindRegionDefaults: Record<
+  SupplierKind,
+  Pick<SupplierEntryUpdate, 'purchaseRegionMode' | 'purchaseRegion'>
+> = {
+  'kiro-rs': { purchaseRegionMode: 'omit', purchaseRegion: null },
+  'kiro-app': { purchaseRegionMode: 'omit', purchaseRegion: null },
+  'kiroapp-io': { purchaseRegionMode: 'batch', purchaseRegion: null },
+  'kiro-drop': { purchaseRegionMode: 'omit', purchaseRegion: null },
+  'kiro-ceo': { purchaseRegionMode: 'fixed', purchaseRegion: 'us' },
+}
+
+const defaultSupplierCommon: SupplierCommonConfig = {
+  sourceChannel: 'Webhook 自动采购',
+  nicknameLabel: '',
+  rpmLimit: 10,
+  priority: 0,
+  groups: [],
+  autoDeleteForbidden: false,
+}
+
 export function getSupplierKindLabel(kind: SupplierKind): string {
   return supplierKindLabels[kind] ?? kind
+}
+
+export function getSupplierCapabilities(kind: SupplierKind): SupplierCapabilities {
+  const capabilities = supplierKindCapabilities[kind]
+  return { ...capabilities, regionModes: [...capabilities.regionModes] }
+}
+
+export function buildSupplierNicknamePreview(
+  supplierName: string,
+  supplierId: string | undefined,
+  nicknameLabel: string,
+): string {
+  const supplier = supplierName.trim() || supplierId?.trim() || 'supplier'
+  const label = nicknameLabel.trim()
+  const segments = label && label.toLocaleLowerCase() !== supplier.toLocaleLowerCase()
+    ? [supplier, label]
+    : [supplier]
+  return [...segments, '1df694d5', '1'].join('-')
 }
 
 /** Server rule: lowercase letters, digits, `-` and `_`; immutable once created. */
@@ -108,7 +190,11 @@ export function suggestSupplierId(name: string, taken: readonly string[]): strin
 }
 
 /** Blank config that the "add supplier" form starts from. */
-export function emptySupplierEntry(kind: SupplierKind): SupplierEntryUpdate {
+export function emptySupplierEntry(
+  kind: SupplierKind,
+  common: SupplierCommonConfig = defaultSupplierCommon,
+): SupplierEntryUpdate {
+  const regionDefaults = supplierKindRegionDefaults[kind]
   return {
     id: '',
     name: '',
@@ -117,15 +203,18 @@ export function emptySupplierEntry(kind: SupplierKind): SupplierEntryUpdate {
     baseUrl: supplierKindBaseUrls[kind] ?? '',
     publicBaseUrl: '',
     autoPurchase: true,
-    autoDeleteForbidden: false,
+    autoDeleteForbidden: common.autoDeleteForbidden,
     minPurchase: 1,
     maxPurchase: 1,
     apiRegion: 'us-east-1',
-    rpmLimit: 10,
-    priority: 0,
-    groups: [],
-    sourceChannel: 'Webhook 自动采购',
-    nicknamePrefix: '自动采购',
+    ...regionDefaults,
+    credentialApiRegionFallback: 'us-east-1',
+    rpmLimit: common.rpmLimit,
+    priority: common.priority,
+    groups: [...common.groups],
+    sourceChannel: common.sourceChannel,
+    nicknamePrefix: common.nicknameLabel,
+    importOverrides: {},
     // 新建默认开启补货闸：供货商不停推到货时，不加闸就是每次都掏钱。
     restockOnlyWhenExhausted: true,
     // 目标存量：每家常备 1 个。填 0 是失效保护（不买），所以默认给 1。
@@ -137,6 +226,7 @@ export function emptySupplierEntry(kind: SupplierKind): SupplierEntryUpdate {
 }
 
 export function toSupplierEntryUpdate(entry: SupplierEntryView): SupplierEntryUpdate {
+  const importOverrides = entry.importOverrides ?? {}
   return {
     id: entry.id,
     name: entry.name,
@@ -149,11 +239,18 @@ export function toSupplierEntryUpdate(entry: SupplierEntryView): SupplierEntryUp
     minPurchase: entry.minPurchase,
     maxPurchase: entry.maxPurchase,
     apiRegion: entry.apiRegion,
+    purchaseRegionMode: entry.purchaseRegionMode,
+    purchaseRegion: entry.purchaseRegion,
+    credentialApiRegionFallback: entry.credentialApiRegionFallback,
     rpmLimit: entry.rpmLimit,
     priority: entry.priority,
     groups: [...entry.groups],
     sourceChannel: entry.sourceChannel,
     nicknamePrefix: entry.nicknamePrefix,
+    importOverrides: {
+      ...importOverrides,
+      ...(importOverrides.groups ? { groups: [...importOverrides.groups] } : {}),
+    },
     restockOnlyWhenExhausted: entry.restockOnlyWhenExhausted,
     targetUsable: entry.targetUsable,
     lowQuotaThreshold: entry.lowQuotaThreshold,

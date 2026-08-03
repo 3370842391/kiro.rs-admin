@@ -119,6 +119,16 @@ pub struct KeySupplierConfig {
     pub max_purchase: u32,
     #[serde(default = "default_region")]
     pub api_region: String,
+    /// 采购请求的区域选择策略。旧配置缺失时由协议类型在运行时补默认值。
+    #[serde(default, skip_serializing_if = "purchase_region_mode_is_omit")]
+    pub purchase_region_mode: PurchaseRegionMode,
+    /// fixed 模式下要采购的区域。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purchase_region: Option<SupplierRegion>,
+    /// 无法从采购响应、Webhook 或请求确定区域时，写入凭据的 API 区域兜底。
+    /// 空值兼容旧配置，运行时回退读取 `apiRegion`。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub credential_api_region_fallback: String,
     #[serde(default = "default_supplier_rpm_limit")]
     pub rpm_limit: u32,
     #[serde(default)]
@@ -189,6 +199,12 @@ impl std::fmt::Debug for KeySupplierConfig {
             .field("min_purchase", &self.min_purchase)
             .field("max_purchase", &self.max_purchase)
             .field("api_region", &self.api_region)
+            .field("purchase_region_mode", &self.purchase_region_mode)
+            .field("purchase_region", &self.purchase_region)
+            .field(
+                "credential_api_region_fallback",
+                &self.credential_api_region_fallback,
+            )
             .field("rpm_limit", &self.rpm_limit)
             .field("priority", &self.priority)
             .field("groups", &self.groups)
@@ -217,6 +233,9 @@ impl Default for KeySupplierConfig {
             min_purchase: default_supplier_purchase(),
             max_purchase: default_supplier_purchase(),
             api_region: default_region(),
+            purchase_region_mode: PurchaseRegionMode::Omit,
+            purchase_region: None,
+            credential_api_region_fallback: String::new(),
             rpm_limit: default_supplier_rpm_limit(),
             priority: 0,
             groups: Vec::new(),
@@ -314,6 +333,114 @@ pub enum SupplierKind {
     KiroCeo,
 }
 
+/// 供货商协议使用的标准采购区域。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum SupplierRegion {
+    Us,
+    Eu,
+}
+
+impl SupplierRegion {
+    pub const fn as_wire(self) -> &'static str {
+        match self {
+            Self::Us => "us",
+            Self::Eu => "eu",
+        }
+    }
+
+    pub const fn as_api_region(self) -> &'static str {
+        match self {
+            Self::Us => "us-east-1",
+            Self::Eu => "eu-central-1",
+        }
+    }
+}
+
+/// 所有供货商共享的凭据导入预设。连接、采购与区域协议仍由单家配置负责。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct KeySupplierCommonConfig {
+    #[serde(default = "default_supplier_source_channel")]
+    pub source_channel: String,
+    /// Nickname 中位于供货商名之后的可选标签。供货商名由服务端强制保留。
+    #[serde(default)]
+    pub nickname_label: String,
+    #[serde(default = "default_supplier_rpm_limit")]
+    pub rpm_limit: u32,
+    #[serde(default)]
+    pub priority: u32,
+    #[serde(default)]
+    pub groups: Vec<String>,
+    #[serde(default)]
+    pub auto_delete_forbidden: bool,
+}
+
+impl Default for KeySupplierCommonConfig {
+    fn default() -> Self {
+        Self {
+            source_channel: default_supplier_source_channel(),
+            nickname_label: String::new(),
+            rpm_limit: default_supplier_rpm_limit(),
+            priority: 0,
+            groups: Vec::new(),
+            auto_delete_forbidden: false,
+        }
+    }
+}
+
+/// 单家供货商对公共导入预设的显式覆盖。`None` 表示继承公共值。
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SupplierImportOverrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_channel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nickname_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpm_limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub groups: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_delete_forbidden: Option<bool>,
+}
+
+impl std::str::FromStr for SupplierRegion {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "us" | "us-east-1" => Ok(Self::Us),
+            "eu" | "eu-central-1" => Ok(Self::Eu),
+            _ => anyhow::bail!("无效的供应商区域: {value}"),
+        }
+    }
+}
+
+impl std::fmt::Display for SupplierRegion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_wire())
+    }
+}
+
+/// 采购请求怎样选择或省略区域。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum PurchaseRegionMode {
+    #[default]
+    Omit,
+    Fixed,
+    Webhook,
+    BestAvailable,
+    Batch,
+}
+
+fn purchase_region_mode_is_omit(mode: &PurchaseRegionMode) -> bool {
+    *mode == PurchaseRegionMode::Omit
+}
+
 impl SupplierKind {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -405,6 +532,9 @@ pub struct KeySupplierEntryConfig {
     /// 关闭后不参与自动采购，webhook 仍然落库（标记 skipped）。
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// `None` 仅表示来自 v0.9.45 或更早的旧配置；加载时会把旧扁平字段迁移成显式覆盖。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_overrides: Option<SupplierImportOverrides>,
     #[serde(flatten)]
     pub settings: KeySupplierConfig,
 }
@@ -416,6 +546,7 @@ impl std::fmt::Debug for KeySupplierEntryConfig {
             .field("name", &self.name)
             .field("kind", &self.kind)
             .field("enabled", &self.enabled)
+            .field("import_overrides", &self.import_overrides)
             .field("settings", &self.settings)
             .finish()
     }
@@ -429,6 +560,7 @@ impl KeySupplierEntryConfig {
             name: "默认供货商".to_string(),
             kind: SupplierKind::KiroRs,
             enabled: true,
+            import_overrides: None,
             settings,
         }
     }
@@ -753,6 +885,10 @@ pub struct Config {
     /// 多供货商 Key 采购配置。每项一家供货商，自带协议类型、凭据与导入预设。
     #[serde(default)]
     pub key_suppliers: Vec<KeySupplierEntryConfig>,
+
+    /// 供货商公共凭据导入预设。单家只在 `importOverrides` 中声明差异。
+    #[serde(default)]
+    pub key_supplier_common: KeySupplierCommonConfig,
 
     /// 全局号池采购配置。控制「所有采购来的号合计养几个」，跨供货商共享一个缺口。
     ///
@@ -1186,6 +1322,7 @@ impl Default for Config {
             profit_quota_per_unit: default_profit_quota_per_unit(),
             key_supplier: KeySupplierConfig::default(),
             key_suppliers: Vec::new(),
+            key_supplier_common: KeySupplierCommonConfig::default(),
             key_supplier_pool: KeySupplierPoolConfig::default(),
             error_snapshot_enabled: true,
             dead_credential_auto_delete: true,

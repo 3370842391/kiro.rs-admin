@@ -4,6 +4,7 @@ import { storage } from '@/lib/storage'
 import type {
   PurchaseResponse,
   SupplierCallbackUrlResponse,
+  SupplierCommonConfig,
   SupplierConfigUpdate,
   SupplierConfigView,
   SupplierDeleteResponse,
@@ -92,6 +93,18 @@ export async function retrySupplierEvent(id: number): Promise<SupplierRetryEvent
 }
 
 // ============ Global key pool ============
+
+export async function getSupplierCommon(): Promise<SupplierCommonConfig> {
+  const { data } = await api.get<SupplierCommonConfig>('/key-supplier/common')
+  return data
+}
+
+export async function updateSupplierCommon(
+  update: SupplierCommonConfig,
+): Promise<SupplierCommonConfig> {
+  const { data } = await api.put<SupplierCommonConfig>('/key-supplier/common', update)
+  return data
+}
 
 export async function getSupplierPool(): Promise<SupplierPoolConfig> {
   const { data } = await api.get<SupplierPoolConfig>('/key-supplier/pool')

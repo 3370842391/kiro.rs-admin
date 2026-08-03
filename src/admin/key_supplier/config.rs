@@ -6,8 +6,12 @@ use uuid::Uuid;
 
 use crate::kiro::region::validate_api_region;
 use crate::model::config::{
-    Config, KeySupplierConfig, KeySupplierEntryConfig, KeySupplierPoolConfig, SupplierKind,
+    Config, KeySupplierCommonConfig, KeySupplierConfig, KeySupplierEntryConfig,
+    KeySupplierPoolConfig, PurchaseRegionMode, SupplierImportOverrides, SupplierKind,
+    SupplierRegion,
 };
+
+use super::capabilities::SupplierCapabilities;
 
 const MAX_URL_CHARS: usize = 2_048;
 const MAX_SECRET_CHARS: usize = 4_096;
@@ -29,6 +33,228 @@ const MAX_SUPPLIER_NAME_CHARS: usize = 128;
 /// 单实例能挂的供货商上限。够用又不至于让 webhook token 反查退化成长列表扫描。
 pub const MAX_SUPPLIERS: usize = 32;
 
+/// 公共预设与单家覆盖合并后的、已经校验过的凭据导入模板。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedSupplierImportPreset {
+    pub source_channel: String,
+    pub nickname_label: String,
+    pub rpm_limit: u32,
+    pub priority: u32,
+    pub groups: Vec<String>,
+    pub auto_delete_forbidden: bool,
+}
+
+impl Default for ResolvedSupplierImportPreset {
+    fn default() -> Self {
+        Self {
+            source_channel: "Webhook 自动采购".to_owned(),
+            nickname_label: String::new(),
+            rpm_limit: 10,
+            priority: 0,
+            groups: Vec::new(),
+            auto_delete_forbidden: false,
+        }
+    }
+}
+
+impl ResolvedSupplierImportPreset {
+    pub fn from_persisted(value: &KeySupplierCommonConfig) -> anyhow::Result<Self> {
+        validate_number_range(u64::from(value.rpm_limit), "rpmLimit", 0, MAX_RPM_LIMIT)?;
+        validate_number_range(u64::from(value.priority), "priority", 0, MAX_PRIORITY)?;
+        Ok(Self {
+            source_channel: normalize_text(
+                &value.source_channel,
+                "sourceChannel",
+                MAX_SOURCE_CHANNEL_CHARS,
+            )?,
+            nickname_label: normalize_text(
+                &value.nickname_label,
+                "nicknameLabel",
+                MAX_NICKNAME_PREFIX_CHARS,
+            )?,
+            rpm_limit: value.rpm_limit,
+            priority: value.priority,
+            groups: normalize_groups(value.groups.clone())?,
+            auto_delete_forbidden: value.auto_delete_forbidden,
+        })
+    }
+
+    pub fn resolve(&self, overrides: &SupplierImportOverrides) -> anyhow::Result<Self> {
+        let rpm_limit = overrides.rpm_limit.unwrap_or(self.rpm_limit);
+        let priority = overrides.priority.unwrap_or(self.priority);
+        validate_number_range(u64::from(rpm_limit), "rpmLimit", 0, MAX_RPM_LIMIT)?;
+        validate_number_range(u64::from(priority), "priority", 0, MAX_PRIORITY)?;
+        Ok(Self {
+            source_channel: normalize_text(
+                overrides
+                    .source_channel
+                    .as_deref()
+                    .unwrap_or(&self.source_channel),
+                "sourceChannel",
+                MAX_SOURCE_CHANNEL_CHARS,
+            )?,
+            nickname_label: normalize_text(
+                overrides
+                    .nickname_label
+                    .as_deref()
+                    .unwrap_or(&self.nickname_label),
+                "nicknameLabel",
+                MAX_NICKNAME_PREFIX_CHARS,
+            )?,
+            rpm_limit,
+            priority,
+            groups: normalize_groups(
+                overrides
+                    .groups
+                    .clone()
+                    .unwrap_or_else(|| self.groups.clone()),
+            )?,
+            auto_delete_forbidden: overrides
+                .auto_delete_forbidden
+                .unwrap_or(self.auto_delete_forbidden),
+        })
+    }
+
+    fn materialize(&self, settings: &mut KeySupplierConfig) {
+        settings.source_channel = self.source_channel.clone();
+        settings.nickname_prefix = self.nickname_label.clone();
+        settings.rpm_limit = self.rpm_limit;
+        settings.priority = self.priority;
+        settings.groups = self.groups.clone();
+        settings.auto_delete_forbidden = self.auto_delete_forbidden;
+    }
+
+    fn materialize_update(&self, settings: &mut SupplierConfigUpdate) {
+        settings.source_channel = self.source_channel.clone();
+        settings.nickname_prefix = self.nickname_label.clone();
+        settings.rpm_limit = u64::from(self.rpm_limit);
+        settings.priority = u64::from(self.priority);
+        settings.groups = self.groups.clone();
+        settings.auto_delete_forbidden = self.auto_delete_forbidden;
+    }
+
+    pub fn materialize_runtime(&self, settings: &mut SupplierRuntimeConfig) {
+        settings.source_channel = self.source_channel.clone();
+        settings.nickname_prefix = self.nickname_label.clone();
+        settings.rpm_limit = self.rpm_limit;
+        settings.priority = self.priority;
+        settings.groups = self.groups.clone();
+        settings.auto_delete_forbidden = self.auto_delete_forbidden;
+    }
+}
+
+impl From<&ResolvedSupplierImportPreset> for KeySupplierCommonConfig {
+    fn from(value: &ResolvedSupplierImportPreset) -> Self {
+        Self {
+            source_channel: value.source_channel.clone(),
+            nickname_label: value.nickname_label.clone(),
+            rpm_limit: value.rpm_limit,
+            priority: value.priority,
+            groups: value.groups.clone(),
+            auto_delete_forbidden: value.auto_delete_forbidden,
+        }
+    }
+}
+
+impl SupplierImportOverrides {
+    pub(crate) fn from_legacy(settings: &KeySupplierConfig) -> Self {
+        Self {
+            source_channel: Some(settings.source_channel.clone()),
+            nickname_label: Some(settings.nickname_prefix.clone()),
+            rpm_limit: Some(settings.rpm_limit),
+            priority: Some(settings.priority),
+            groups: Some(settings.groups.clone()),
+            auto_delete_forbidden: Some(settings.auto_delete_forbidden),
+        }
+    }
+
+    fn from_legacy_against(
+        settings: &KeySupplierConfig,
+        common: &ResolvedSupplierImportPreset,
+    ) -> Self {
+        Self {
+            source_channel: (settings.source_channel != common.source_channel)
+                .then(|| settings.source_channel.clone()),
+            nickname_label: (settings.nickname_prefix != common.nickname_label)
+                .then(|| settings.nickname_prefix.clone()),
+            rpm_limit: (settings.rpm_limit != common.rpm_limit).then_some(settings.rpm_limit),
+            priority: (settings.priority != common.priority).then_some(settings.priority),
+            groups: (settings.groups != common.groups).then(|| settings.groups.clone()),
+            auto_delete_forbidden: (settings.auto_delete_forbidden != common.auto_delete_forbidden)
+                .then_some(settings.auto_delete_forbidden),
+        }
+    }
+
+    fn from_legacy_update(settings: &SupplierConfigUpdate) -> anyhow::Result<Self> {
+        validate_number_range(settings.rpm_limit, "rpmLimit", 0, MAX_RPM_LIMIT)?;
+        validate_number_range(settings.priority, "priority", 0, MAX_PRIORITY)?;
+        Ok(Self {
+            source_channel: Some(settings.source_channel.clone()),
+            nickname_label: Some(settings.nickname_prefix.clone()),
+            rpm_limit: Some(settings.rpm_limit as u32),
+            priority: Some(settings.priority as u32),
+            groups: Some(settings.groups.clone()),
+            auto_delete_forbidden: Some(settings.auto_delete_forbidden),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupplierCommonConfigView {
+    pub source_channel: String,
+    pub nickname_label: String,
+    pub rpm_limit: u32,
+    pub priority: u32,
+    pub groups: Vec<String>,
+    pub auto_delete_forbidden: bool,
+}
+
+impl From<&ResolvedSupplierImportPreset> for SupplierCommonConfigView {
+    fn from(value: &ResolvedSupplierImportPreset) -> Self {
+        Self {
+            source_channel: value.source_channel.clone(),
+            nickname_label: value.nickname_label.clone(),
+            rpm_limit: value.rpm_limit,
+            priority: value.priority,
+            groups: value.groups.clone(),
+            auto_delete_forbidden: value.auto_delete_forbidden,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupplierCommonConfigUpdate {
+    #[serde(default)]
+    pub source_channel: String,
+    #[serde(default)]
+    pub nickname_label: String,
+    #[serde(default)]
+    pub rpm_limit: u64,
+    #[serde(default)]
+    pub priority: u64,
+    #[serde(default)]
+    pub groups: Vec<String>,
+    #[serde(default)]
+    pub auto_delete_forbidden: bool,
+}
+
+impl ResolvedSupplierImportPreset {
+    pub fn normalize_update(update: SupplierCommonConfigUpdate) -> anyhow::Result<Self> {
+        validate_number_range(update.rpm_limit, "rpmLimit", 0, MAX_RPM_LIMIT)?;
+        validate_number_range(update.priority, "priority", 0, MAX_PRIORITY)?;
+        Self::from_persisted(&KeySupplierCommonConfig {
+            source_channel: update.source_channel,
+            nickname_label: update.nickname_label,
+            rpm_limit: update.rpm_limit as u32,
+            priority: update.priority as u32,
+            groups: update.groups,
+            auto_delete_forbidden: update.auto_delete_forbidden,
+        })
+    }
+}
+
 /// 一家供货商的运行期配置：身份（id/name/kind/enabled）+ 连接与导入预设。
 #[derive(Clone, PartialEq)]
 pub struct SupplierEntryRuntime {
@@ -36,6 +262,8 @@ pub struct SupplierEntryRuntime {
     pub name: String,
     pub kind: SupplierKind,
     pub enabled: bool,
+    /// 仅保存单家显式差异；`settings` 中的导入字段始终是公共值合并后的结果。
+    pub import_overrides: SupplierImportOverrides,
     pub settings: SupplierRuntimeConfig,
 }
 
@@ -46,6 +274,7 @@ impl std::fmt::Debug for SupplierEntryRuntime {
             .field("name", &self.name)
             .field("kind", &self.kind)
             .field("enabled", &self.enabled)
+            .field("import_overrides", &self.import_overrides)
             .field("settings", &self.settings)
             .finish()
     }
@@ -54,12 +283,27 @@ impl std::fmt::Debug for SupplierEntryRuntime {
 impl SupplierEntryRuntime {
     /// 从持久化条目读取，校验但不生成缺失的 webhook token。
     pub fn from_persisted(entry: &KeySupplierEntryConfig) -> anyhow::Result<Self> {
+        Self::from_persisted_with_common(entry, &ResolvedSupplierImportPreset::default())
+    }
+
+    pub fn from_persisted_with_common(
+        entry: &KeySupplierEntryConfig,
+        common: &ResolvedSupplierImportPreset,
+    ) -> anyhow::Result<Self> {
+        let import_overrides = entry
+            .import_overrides
+            .clone()
+            .unwrap_or_else(|| SupplierImportOverrides::from_legacy(&entry.settings));
+        let resolved_import = common.resolve(&import_overrides)?;
+        let mut settings = entry.settings.clone();
+        resolved_import.materialize(&mut settings);
         Ok(Self {
             id: normalize_supplier_id(&entry.id)?,
             name: normalize_text(&entry.name, "name", MAX_SUPPLIER_NAME_CHARS)?,
             kind: entry.kind,
             enabled: entry.enabled,
-            settings: normalize_persisted(&entry.settings)?,
+            import_overrides,
+            settings: normalize_persisted(entry.kind, &settings)?,
         })
     }
 
@@ -76,6 +320,7 @@ impl From<&SupplierEntryRuntime> for KeySupplierEntryConfig {
             name: value.name.clone(),
             kind: value.kind,
             enabled: value.enabled,
+            import_overrides: Some(value.import_overrides.clone()),
             settings: KeySupplierConfig::from(&value.settings),
         }
     }
@@ -90,6 +335,8 @@ pub struct SupplierEntryView {
     pub kind: &'static str,
     pub enabled: bool,
     pub supports_webhook_registration: bool,
+    pub capabilities: SupplierCapabilities,
+    pub import_overrides: SupplierImportOverrides,
     #[serde(flatten)]
     pub settings: SupplierConfigView,
 }
@@ -102,6 +349,8 @@ impl From<&SupplierEntryRuntime> for SupplierEntryView {
             kind: value.kind.as_str(),
             enabled: value.enabled,
             supports_webhook_registration: value.kind.supports_webhook_registration(),
+            capabilities: SupplierCapabilities::for_kind(value.kind),
+            import_overrides: value.import_overrides.clone(),
             settings: SupplierConfigView::from(&value.settings),
         }
     }
@@ -119,6 +368,9 @@ pub struct SupplierEntryUpdate {
     pub kind: SupplierKind,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// 缺失表示旧管理端请求：把旧扁平导入字段视为显式覆盖，避免升级时静默改行为。
+    #[serde(default)]
+    pub import_overrides: Option<SupplierImportOverrides>,
     #[serde(flatten)]
     pub settings: SupplierConfigUpdate,
 }
@@ -153,6 +405,9 @@ pub struct SupplierRuntimeConfig {
     pub min_purchase: u32,
     pub max_purchase: u32,
     pub api_region: String,
+    pub purchase_region_mode: PurchaseRegionMode,
+    pub purchase_region: Option<SupplierRegion>,
+    pub credential_api_region_fallback: String,
     pub rpm_limit: u32,
     pub priority: u32,
     pub groups: Vec<String>,
@@ -182,6 +437,9 @@ pub struct SupplierConfigView {
     pub min_purchase: u32,
     pub max_purchase: u32,
     pub api_region: String,
+    pub purchase_region_mode: PurchaseRegionMode,
+    pub purchase_region: Option<SupplierRegion>,
+    pub credential_api_region_fallback: String,
     pub rpm_limit: u32,
     pub priority: u32,
     pub groups: Vec<String>,
@@ -210,6 +468,12 @@ pub struct SupplierConfigUpdate {
     pub min_purchase: u64,
     pub max_purchase: u64,
     pub api_region: String,
+    #[serde(default)]
+    pub purchase_region_mode: Option<PurchaseRegionMode>,
+    #[serde(default)]
+    pub purchase_region: Option<SupplierRegion>,
+    #[serde(default)]
+    pub credential_api_region_fallback: Option<String>,
     pub rpm_limit: u64,
     pub priority: u64,
     #[serde(default)]
@@ -249,6 +513,12 @@ impl std::fmt::Debug for SupplierRuntimeConfig {
             .field("min_purchase", &self.min_purchase)
             .field("max_purchase", &self.max_purchase)
             .field("api_region", &self.api_region)
+            .field("purchase_region_mode", &self.purchase_region_mode)
+            .field("purchase_region", &self.purchase_region)
+            .field(
+                "credential_api_region_fallback",
+                &self.credential_api_region_fallback,
+            )
             .field("rpm_limit", &self.rpm_limit)
             .field("priority", &self.priority)
             .field("groups", &self.groups)
@@ -286,6 +556,12 @@ impl std::fmt::Debug for SupplierConfigUpdate {
             .field("min_purchase", &self.min_purchase)
             .field("max_purchase", &self.max_purchase)
             .field("api_region", &self.api_region)
+            .field("purchase_region_mode", &self.purchase_region_mode)
+            .field("purchase_region", &self.purchase_region)
+            .field(
+                "credential_api_region_fallback",
+                &self.credential_api_region_fallback,
+            )
             .field("rpm_limit", &self.rpm_limit)
             .field("priority", &self.priority)
             .field("groups", &self.groups)
@@ -310,10 +586,11 @@ impl SupplierRuntimeConfig {
         update: SupplierConfigUpdate,
         existing: Option<&Self>,
     ) -> anyhow::Result<Self> {
-        Self::normalize(existing, update, false)
+        Self::normalize(SupplierKind::KiroRs, existing, update, false)
     }
 
     fn normalize(
+        kind: SupplierKind,
         existing: Option<&Self>,
         update: SupplierConfigUpdate,
         generate_missing_webhook_token: bool,
@@ -340,7 +617,34 @@ impl SupplierRuntimeConfig {
 
         let base_url = normalize_http_origin(&update.base_url, "baseUrl")?;
         let public_base_url = normalize_http_origin(&update.public_base_url, "publicBaseUrl")?;
-        let api_region = validate_api_region(&update.api_region)?.to_string();
+        let fallback_input = update
+            .credential_api_region_fallback
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(&update.api_region);
+        let credential_api_region_fallback = validate_api_region(fallback_input)?.to_string();
+        let api_region = credential_api_region_fallback.clone();
+        let purchase_region_was_defaulted = update.purchase_region_mode.is_none();
+        let purchase_region_mode = update
+            .purchase_region_mode
+            .unwrap_or_else(|| default_purchase_region_mode(kind));
+        let purchase_region = update.purchase_region.or_else(|| {
+            (purchase_region_was_defaulted
+                && kind == SupplierKind::KiroCeo
+                && purchase_region_mode == PurchaseRegionMode::Fixed)
+                .then_some(SupplierRegion::Us)
+        });
+        let capabilities = SupplierCapabilities::for_kind(kind);
+        if !capabilities.supports_region_mode(purchase_region_mode) {
+            anyhow::bail!(
+                "purchaseRegionMode={:?} 不受供货商协议 {} 支持",
+                purchase_region_mode,
+                kind
+            );
+        }
+        if purchase_region_mode == PurchaseRegionMode::Fixed && purchase_region.is_none() {
+            anyhow::bail!("purchaseRegionMode=fixed 时必须指定 purchaseRegion");
+        }
         let api_key = normalize_secret(
             update
                 .api_key
@@ -377,6 +681,9 @@ impl SupplierRuntimeConfig {
             min_purchase: update.min_purchase as u32,
             max_purchase: update.max_purchase as u32,
             api_region,
+            purchase_region_mode,
+            purchase_region,
+            credential_api_region_fallback,
             rpm_limit: update.rpm_limit as u32,
             priority: update.priority as u32,
             groups: normalize_groups(update.groups)?,
@@ -413,6 +720,9 @@ impl From<&SupplierRuntimeConfig> for KeySupplierConfig {
             min_purchase: value.min_purchase,
             max_purchase: value.max_purchase,
             api_region: value.api_region.clone(),
+            purchase_region_mode: value.purchase_region_mode,
+            purchase_region: value.purchase_region,
+            credential_api_region_fallback: value.credential_api_region_fallback.clone(),
             rpm_limit: value.rpm_limit,
             priority: value.priority,
             groups: value.groups.clone(),
@@ -439,6 +749,9 @@ impl From<&SupplierRuntimeConfig> for SupplierConfigView {
             min_purchase: value.min_purchase,
             max_purchase: value.max_purchase,
             api_region: value.api_region.clone(),
+            purchase_region_mode: value.purchase_region_mode,
+            purchase_region: value.purchase_region,
+            credential_api_region_fallback: value.credential_api_region_fallback.clone(),
             rpm_limit: value.rpm_limit,
             priority: value.priority,
             groups: value.groups.clone(),
@@ -581,25 +894,121 @@ pub fn normalize_supplier_id(value: &str) -> anyhow::Result<String> {
 /// 读取整份供货商列表。空列表且历史单供货商已配置时，迁移出 `default` 一项。
 ///
 /// 返回 `(列表, 是否发生迁移)`；迁移标记由调用方决定要不要落盘。
-pub fn load_suppliers(config: &Config) -> anyhow::Result<(Vec<SupplierEntryRuntime>, bool)> {
+pub fn load_suppliers_with_common(
+    config: &Config,
+) -> anyhow::Result<(
+    Vec<SupplierEntryRuntime>,
+    ResolvedSupplierImportPreset,
+    bool,
+)> {
+    let configured_common =
+        ResolvedSupplierImportPreset::from_persisted(&config.key_supplier_common)?;
     if config.key_suppliers.is_empty() {
         if !KeySupplierEntryConfig::legacy_is_configured(&config.key_supplier) {
-            return Ok((Vec::new(), false));
+            return Ok((Vec::new(), configured_common, false));
         }
-        let migrated = KeySupplierEntryConfig::from_legacy(config.key_supplier.clone());
-        return Ok((vec![SupplierEntryRuntime::from_persisted(&migrated)?], true));
+        let common = if config.key_supplier_common == KeySupplierCommonConfig::default() {
+            ResolvedSupplierImportPreset {
+                source_channel: config.key_supplier.source_channel.clone(),
+                nickname_label: config.key_supplier.nickname_prefix.clone(),
+                rpm_limit: config.key_supplier.rpm_limit,
+                priority: config.key_supplier.priority,
+                groups: config.key_supplier.groups.clone(),
+                auto_delete_forbidden: config.key_supplier.auto_delete_forbidden,
+            }
+        } else {
+            configured_common
+        };
+        let mut migrated = KeySupplierEntryConfig::from_legacy(config.key_supplier.clone());
+        migrated.import_overrides = Some(SupplierImportOverrides::from_legacy_against(
+            &migrated.settings,
+            &common,
+        ));
+        return Ok((
+            vec![SupplierEntryRuntime::from_persisted_with_common(
+                &migrated, &common,
+            )?],
+            common,
+            true,
+        ));
     }
+
+    let all_entries_are_legacy = config
+        .key_suppliers
+        .iter()
+        .all(|entry| entry.import_overrides.is_none());
+    let common = if all_entries_are_legacy
+        && config.key_supplier_common == KeySupplierCommonConfig::default()
+    {
+        shared_legacy_common(&config.key_suppliers, &configured_common)
+    } else {
+        configured_common
+    };
 
     let mut seen = HashSet::new();
     let mut entries = Vec::with_capacity(config.key_suppliers.len());
+    let mut migrated = false;
     for entry in &config.key_suppliers {
-        let runtime = SupplierEntryRuntime::from_persisted(entry)?;
+        migrated |= entry.import_overrides.is_none();
+        let migrated_entry;
+        let entry = if entry.import_overrides.is_none() {
+            migrated_entry = KeySupplierEntryConfig {
+                import_overrides: Some(SupplierImportOverrides::from_legacy_against(
+                    &entry.settings,
+                    &common,
+                )),
+                ..entry.clone()
+            };
+            &migrated_entry
+        } else {
+            entry
+        };
+        let runtime = SupplierEntryRuntime::from_persisted_with_common(entry, &common)?;
         if !seen.insert(runtime.id.clone()) {
             anyhow::bail!("供货商 id 重复: {}", runtime.id);
         }
         entries.push(runtime);
     }
-    Ok((entries, false))
+    Ok((entries, common, migrated))
+}
+
+pub fn load_suppliers(config: &Config) -> anyhow::Result<(Vec<SupplierEntryRuntime>, bool)> {
+    let (entries, _, migrated) = load_suppliers_with_common(config)?;
+    Ok((entries, migrated))
+}
+
+fn shared_legacy_common(
+    entries: &[KeySupplierEntryConfig],
+    fallback: &ResolvedSupplierImportPreset,
+) -> ResolvedSupplierImportPreset {
+    let Some(first) = entries.first() else {
+        return fallback.clone();
+    };
+    let all = |matches: &dyn Fn(&KeySupplierConfig) -> bool| {
+        entries.iter().all(|entry| matches(&entry.settings))
+    };
+    ResolvedSupplierImportPreset {
+        source_channel: all(&|settings| settings.source_channel == first.settings.source_channel)
+            .then(|| first.settings.source_channel.clone())
+            .unwrap_or_else(|| fallback.source_channel.clone()),
+        nickname_label: all(&|settings| settings.nickname_prefix == first.settings.nickname_prefix)
+            .then(|| first.settings.nickname_prefix.clone())
+            .unwrap_or_else(|| fallback.nickname_label.clone()),
+        rpm_limit: all(&|settings| settings.rpm_limit == first.settings.rpm_limit)
+            .then_some(first.settings.rpm_limit)
+            .unwrap_or(fallback.rpm_limit),
+        priority: all(&|settings| settings.priority == first.settings.priority)
+            .then_some(first.settings.priority)
+            .unwrap_or(fallback.priority),
+        groups: all(&|settings| settings.groups == first.settings.groups)
+            .then(|| first.settings.groups.clone())
+            .unwrap_or_else(|| fallback.groups.clone()),
+        auto_delete_forbidden: all(&|settings| {
+            settings.auto_delete_forbidden == first.settings.auto_delete_forbidden
+        })
+        .then_some(first.settings.auto_delete_forbidden)
+        .unwrap_or(fallback.auto_delete_forbidden),
+    }
 }
 
 /// 把内存里的供货商列表写回 `Config`（调用方负责 `save()`）。
@@ -634,6 +1043,20 @@ impl SupplierEntryRuntime {
         update: SupplierEntryUpdate,
         existing: Option<&SupplierEntryRuntime>,
     ) -> anyhow::Result<Self> {
+        Self::normalize_update_with_common(
+            id,
+            update,
+            existing,
+            &ResolvedSupplierImportPreset::default(),
+        )
+    }
+
+    pub fn normalize_update_with_common(
+        id: Option<&str>,
+        mut update: SupplierEntryUpdate,
+        existing: Option<&SupplierEntryRuntime>,
+        common: &ResolvedSupplierImportPreset,
+    ) -> anyhow::Result<Self> {
         let id = match id {
             Some(id) => normalize_supplier_id(id)?,
             None => normalize_supplier_id(
@@ -644,9 +1067,17 @@ impl SupplierEntryRuntime {
             )?,
         };
         let name = normalize_text(&update.name, "name", MAX_SUPPLIER_NAME_CHARS)?;
-        let mut settings = SupplierRuntimeConfig::normalize_standalone(
-            update.settings,
+        let import_overrides = match update.import_overrides.take() {
+            Some(overrides) => overrides,
+            None => SupplierImportOverrides::from_legacy_update(&update.settings)?,
+        };
+        let resolved_import = common.resolve(&import_overrides)?;
+        resolved_import.materialize_update(&mut update.settings);
+        let mut settings = SupplierRuntimeConfig::normalize(
+            update.kind,
             existing.map(|entry| &entry.settings),
+            update.settings,
+            false,
         )?;
         if settings.webhook_token.is_empty() {
             settings.webhook_token = generate_webhook_token();
@@ -656,6 +1087,7 @@ impl SupplierEntryRuntime {
             name,
             kind: update.kind,
             enabled: update.enabled,
+            import_overrides,
             settings,
         })
     }
@@ -665,7 +1097,26 @@ pub fn is_valid_webhook_token(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn normalize_persisted(value: &KeySupplierConfig) -> anyhow::Result<SupplierRuntimeConfig> {
+fn default_purchase_region_mode(kind: SupplierKind) -> PurchaseRegionMode {
+    match kind {
+        SupplierKind::KiroCeo => PurchaseRegionMode::Fixed,
+        SupplierKind::KiroAppIo => PurchaseRegionMode::Batch,
+        SupplierKind::KiroRs | SupplierKind::KiroApp | SupplierKind::KiroDrop => {
+            PurchaseRegionMode::Omit
+        }
+    }
+}
+
+fn normalize_persisted(
+    kind: SupplierKind,
+    value: &KeySupplierConfig,
+) -> anyhow::Result<SupplierRuntimeConfig> {
+    let capabilities = SupplierCapabilities::for_kind(kind);
+    let persisted_mode = if capabilities.supports_region_mode(value.purchase_region_mode) {
+        Some(value.purchase_region_mode)
+    } else {
+        None
+    };
     let update = SupplierConfigUpdate {
         base_url: value.base_url.clone(),
         api_key: Some(value.api_key.clone()),
@@ -677,6 +1128,13 @@ fn normalize_persisted(value: &KeySupplierConfig) -> anyhow::Result<SupplierRunt
         min_purchase: u64::from(value.min_purchase),
         max_purchase: u64::from(value.max_purchase),
         api_region: value.api_region.clone(),
+        purchase_region_mode: persisted_mode,
+        purchase_region: value.purchase_region,
+        credential_api_region_fallback: if value.credential_api_region_fallback.trim().is_empty() {
+            None
+        } else {
+            Some(value.credential_api_region_fallback.clone())
+        },
         rpm_limit: u64::from(value.rpm_limit),
         priority: u64::from(value.priority),
         groups: value.groups.clone(),
@@ -687,7 +1145,7 @@ fn normalize_persisted(value: &KeySupplierConfig) -> anyhow::Result<SupplierRunt
         low_quota_threshold: u64::from(value.low_quota_threshold),
         max_unit_price: value.max_unit_price,
     };
-    SupplierRuntimeConfig::normalize(None, update, false)
+    SupplierRuntimeConfig::normalize(kind, None, update, false)
 }
 
 fn normalize_http_origin(value: &str, field: &str) -> anyhow::Result<String> {
@@ -775,6 +1233,9 @@ mod tests {
             min_purchase: 2,
             max_purchase: 5,
             api_region: " us-east-1 ".to_string(),
+            purchase_region_mode: None,
+            purchase_region: None,
+            credential_api_region_fallback: None,
             rpm_limit: 100,
             priority: 10,
             groups: vec![
@@ -861,6 +1322,91 @@ mod tests {
     }
 
     #[test]
+    fn purchase_region_mode_is_validated_against_supplier_capabilities() {
+        let mut fixed_us = valid_update();
+        fixed_us.purchase_region_mode = Some(PurchaseRegionMode::Fixed);
+        fixed_us.purchase_region = Some(SupplierRegion::Us);
+        let ceo = SupplierEntryRuntime::normalize_update(
+            None,
+            SupplierEntryUpdate {
+                id: Some("ceo".to_owned()),
+                name: "CEO".to_owned(),
+                kind: SupplierKind::KiroCeo,
+                enabled: true,
+                import_overrides: None,
+                settings: fixed_us,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(ceo.settings.purchase_region_mode, PurchaseRegionMode::Fixed);
+        assert_eq!(ceo.settings.purchase_region, Some(SupplierRegion::Us));
+
+        let mut missing_region = valid_update();
+        missing_region.purchase_region_mode = Some(PurchaseRegionMode::Fixed);
+        assert!(
+            SupplierEntryRuntime::normalize_update(
+                None,
+                SupplierEntryUpdate {
+                    id: Some("ceo-invalid".to_owned()),
+                    name: "CEO".to_owned(),
+                    kind: SupplierKind::KiroCeo,
+                    enabled: true,
+                    import_overrides: None,
+                    settings: missing_region,
+                },
+                None,
+            )
+            .is_err()
+        );
+
+        let mut unsupported = valid_update();
+        unsupported.purchase_region_mode = Some(PurchaseRegionMode::Fixed);
+        unsupported.purchase_region = Some(SupplierRegion::Us);
+        assert!(
+            SupplierEntryRuntime::normalize_update(
+                None,
+                SupplierEntryUpdate {
+                    id: Some("drop".to_owned()),
+                    name: "Drop".to_owned(),
+                    kind: SupplierKind::KiroDrop,
+                    enabled: true,
+                    import_overrides: None,
+                    settings: unsupported,
+                },
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_ceo_defaults_to_fixed_us_and_keeps_credential_region_fallback() {
+        let persisted = KeySupplierEntryConfig {
+            id: "ceo".to_owned(),
+            name: "CEO".to_owned(),
+            kind: SupplierKind::KiroCeo,
+            enabled: true,
+            import_overrides: None,
+            settings: KeySupplierConfig {
+                api_region: "eu-central-1".to_owned(),
+                ..Default::default()
+            },
+        };
+
+        let runtime = SupplierEntryRuntime::from_persisted(&persisted).unwrap();
+        assert_eq!(
+            runtime.settings.purchase_region_mode,
+            PurchaseRegionMode::Fixed
+        );
+        assert_eq!(runtime.settings.purchase_region, Some(SupplierRegion::Us));
+        assert_eq!(
+            runtime.settings.credential_api_region_fallback,
+            "eu-central-1"
+        );
+    }
+
+    #[test]
     fn entry_normalization_generates_a_missing_webhook_token() {
         let mut update = valid_update();
         update.webhook_token = None;
@@ -871,6 +1417,7 @@ mod tests {
                 name: " kiroapp.cc ".to_owned(),
                 kind: SupplierKind::KiroApp,
                 enabled: true,
+                import_overrides: None,
                 settings: update,
             },
             None,
@@ -1113,6 +1660,7 @@ mod tests {
             name: "kiroapp.io".to_string(),
             kind: SupplierKind::KiroAppIo,
             enabled: true,
+            import_overrides: SupplierImportOverrides::default(),
             settings: SupplierRuntimeConfig::normalize_standalone(valid_update(), None).unwrap(),
         };
         io.settings.api_key = "km_secret".to_string();
@@ -1134,6 +1682,184 @@ mod tests {
     }
 
     #[test]
+    fn common_import_preset_is_shared_and_explicit_supplier_overrides_win() {
+        let json = serde_json::json!({
+            "keySupplierCommon": {
+                "sourceChannel": "统一采购",
+                "nicknameLabel": "生产",
+                "rpmLimit": 23,
+                "priority": 7,
+                "groups": ["common-a", "common-b"],
+                "autoDeleteForbidden": true
+            },
+            "keySuppliers": [
+                {
+                    "id": "ceo",
+                    "name": "ceo",
+                    "kind": "kiro-ceo",
+                    "enabled": true,
+                    "baseUrl": "https://ceo.example",
+                    "apiKey": "ceo-secret",
+                    "publicBaseUrl": "https://admin.example",
+                    "webhookToken": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "minPurchase": 1,
+                    "maxPurchase": 10,
+                    "apiRegion": "us-east-1",
+                    "purchaseRegionMode": "fixed",
+                    "purchaseRegion": "us",
+                    "importOverrides": {}
+                },
+                {
+                    "id": "drop",
+                    "name": "drop",
+                    "kind": "kiro-drop",
+                    "enabled": true,
+                    "baseUrl": "https://drop.example",
+                    "apiKey": "drop-secret",
+                    "publicBaseUrl": "https://admin.example",
+                    "webhookToken": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "minPurchase": 1,
+                    "maxPurchase": 10,
+                    "apiRegion": "us-east-1",
+                    "importOverrides": {
+                        "sourceChannel": "Drop 专用",
+                        "nicknameLabel": "备用",
+                        "rpmLimit": 5,
+                        "groups": ["drop-only"]
+                    }
+                }
+            ]
+        });
+        let config: Config = serde_json::from_value(json).unwrap();
+
+        let (entries, migrated) = load_suppliers(&config).unwrap();
+
+        assert!(!migrated);
+        let ceo = entries.iter().find(|entry| entry.id == "ceo").unwrap();
+        assert_eq!(ceo.settings.source_channel, "统一采购");
+        assert_eq!(ceo.settings.nickname_prefix, "生产");
+        assert_eq!(ceo.settings.rpm_limit, 23);
+        assert_eq!(ceo.settings.priority, 7);
+        assert_eq!(ceo.settings.groups, vec!["common-a", "common-b"]);
+        assert!(ceo.settings.auto_delete_forbidden);
+
+        let drop = entries.iter().find(|entry| entry.id == "drop").unwrap();
+        assert_eq!(drop.settings.source_channel, "Drop 专用");
+        assert_eq!(drop.settings.nickname_prefix, "备用");
+        assert_eq!(drop.settings.rpm_limit, 5);
+        assert_eq!(drop.settings.priority, 7);
+        assert_eq!(drop.settings.groups, vec!["drop-only"]);
+        assert!(drop.settings.auto_delete_forbidden);
+    }
+
+    #[test]
+    fn legacy_flat_entries_promote_identical_import_values_to_common() {
+        let json = serde_json::json!({
+            "keySuppliers": [
+                {
+                    "id": "drop-a",
+                    "name": "Drop A",
+                    "kind": "kiro-drop",
+                    "baseUrl": "https://drop-a.example",
+                    "apiKey": "secret-a",
+                    "sourceChannel": "统一采购",
+                    "nicknamePrefix": "生产",
+                    "rpmLimit": 23,
+                    "priority": 7,
+                    "groups": ["common"],
+                    "autoDeleteForbidden": true
+                },
+                {
+                    "id": "drop-b",
+                    "name": "Drop B",
+                    "kind": "kiro-drop",
+                    "baseUrl": "https://drop-b.example",
+                    "apiKey": "secret-b",
+                    "sourceChannel": "统一采购",
+                    "nicknamePrefix": "备用",
+                    "rpmLimit": 23,
+                    "priority": 7,
+                    "groups": ["common"],
+                    "autoDeleteForbidden": true
+                }
+            ]
+        });
+        let config: Config = serde_json::from_value(json).unwrap();
+
+        let (entries, common, migrated) = load_suppliers_with_common(&config).unwrap();
+
+        assert!(migrated);
+        assert_eq!(common.source_channel, "统一采购");
+        assert_eq!(common.nickname_label, "");
+        assert_eq!(common.rpm_limit, 23);
+        assert_eq!(common.priority, 7);
+        assert_eq!(common.groups, vec!["common"]);
+        assert!(common.auto_delete_forbidden);
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.import_overrides.source_channel.is_none())
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.import_overrides.rpm_limit.is_none())
+        );
+        assert_eq!(
+            entries[0].import_overrides.nickname_label.as_deref(),
+            Some("生产")
+        );
+        assert_eq!(
+            entries[1].import_overrides.nickname_label.as_deref(),
+            Some("备用")
+        );
+    }
+
+    #[test]
+    fn storing_new_import_config_materializes_legacy_flat_fields_for_rollback() {
+        let json = serde_json::json!({
+            "keySupplierCommon": {
+                "sourceChannel": "统一采购",
+                "nicknameLabel": "生产",
+                "rpmLimit": 23,
+                "priority": 7,
+                "groups": ["common"],
+                "autoDeleteForbidden": true
+            },
+            "keySuppliers": [{
+                "id": "ceo",
+                "name": "ceo",
+                "kind": "kiro-ceo",
+                "enabled": true,
+                "baseUrl": "https://ceo.example",
+                "apiKey": "secret",
+                "publicBaseUrl": "https://admin.example",
+                "webhookToken": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "minPurchase": 1,
+                "maxPurchase": 10,
+                "apiRegion": "us-east-1",
+                "purchaseRegionMode": "fixed",
+                "purchaseRegion": "us",
+                "importOverrides": { "priority": 9 }
+            }]
+        });
+        let mut config: Config = serde_json::from_value(json).unwrap();
+        let (entries, _) = load_suppliers(&config).unwrap();
+
+        store_suppliers(&mut config, &entries);
+        let encoded = serde_json::to_value(&config).unwrap();
+        let ceo = &encoded["keySuppliers"][0];
+
+        assert_eq!(ceo["sourceChannel"], "统一采购");
+        assert_eq!(ceo["nicknamePrefix"], "生产");
+        assert_eq!(ceo["rpmLimit"], 23);
+        assert_eq!(ceo["priority"], 9);
+        assert_eq!(ceo["groups"], serde_json::json!(["common"]));
+        assert_eq!(ceo["autoDeleteForbidden"], true);
+        assert_eq!(ceo["importOverrides"]["priority"], 9);
+    }
+
+    #[test]
     fn debug_does_not_expose_supplier_runtime_secrets() {
         let mut runtime =
             SupplierRuntimeConfig::normalize_standalone(valid_update(), None).unwrap();
@@ -1151,6 +1877,7 @@ mod tests {
             name: "kiroapp.cc".to_owned(),
             kind: SupplierKind::KiroApp,
             enabled: true,
+            import_overrides: SupplierImportOverrides::default(),
             settings: runtime,
         };
         let debug = format!("{entry:?}");

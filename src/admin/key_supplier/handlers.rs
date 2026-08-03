@@ -15,11 +15,11 @@ use crate::admin::{middleware::AdminState, types::AdminErrorResponse};
 
 use super::{
     config::{
-        PoolConfigUpdate, SupplierConfigUpdate, SupplierEntryUpdate, SupplierEntryView,
-        normalize_supplier_id,
+        PoolConfigUpdate, SupplierCommonConfigUpdate, SupplierConfigUpdate, SupplierEntryUpdate,
+        SupplierEntryView, normalize_supplier_id,
     },
     service::{KeySupplierService, ManualPurchaseResult, SupplierOverview, SupplierServiceError},
-    store::{StoredSupplierEvent, SupplierEventStatus},
+    store::{StoredSupplierEvent, SupplierDecisionSnapshot, SupplierEventStatus},
 };
 
 const MAX_WEBHOOK_BODY_BYTES: usize = 64 * 1024;
@@ -249,6 +249,31 @@ pub async fn put_pool(
         Err(response) => return response,
     };
     match service.update_pool(update) {
+        Ok(view) => Json(view).into_response(),
+        Err(error_value) => service_error_response(error_value),
+    }
+}
+
+pub async fn get_common_import(State(state): State<AdminState>) -> Response {
+    match supplier(&state) {
+        Ok(service) => Json(service.common_import_view()).into_response(),
+        Err(response) => response,
+    }
+}
+
+pub async fn put_common_import(
+    State(state): State<AdminState>,
+    update: Result<Json<SupplierCommonConfigUpdate>, JsonRejection>,
+) -> Response {
+    let Json(update) = match update {
+        Ok(update) => update,
+        Err(rejection) => return json_rejection(rejection),
+    };
+    let service = match supplier(&state) {
+        Ok(service) => service,
+        Err(response) => return response,
+    };
+    match service.update_common_import(update) {
         Ok(view) => Json(view).into_response(),
         Err(error_value) => service_error_response(error_value),
     }
@@ -866,6 +891,8 @@ struct EventView {
     retry_after: Option<String>,
     /// 已经发出去的采购数量。重试会原样重放这个数量以命中对方的幂等。
     purchase_count: Option<i64>,
+    /// 处理当时的结构化采购判定快照。
+    decision_snapshot: Option<SupplierDecisionSnapshot>,
 }
 
 impl From<StoredSupplierEvent> for EventView {
@@ -895,6 +922,7 @@ impl From<StoredSupplierEvent> for EventView {
             replayed: event.replayed,
             retry_after: event.retry_after,
             purchase_count: event.purchase_count,
+            decision_snapshot: event.decision_snapshot,
         }
     }
 }

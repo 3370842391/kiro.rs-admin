@@ -3,6 +3,11 @@ use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::Type};
+use serde::{Deserialize, Serialize};
+
+use crate::admin::key_supplier::capabilities::RegionSource;
+use crate::kiro::token_manager::SupplierCredentialHealth;
+use crate::model::config::{PurchaseRegionMode, SupplierKind, SupplierRegion};
 
 const MAX_MESSAGE_CHARS: usize = 2000;
 
@@ -11,7 +16,7 @@ const EVENT_COLUMNS: &str = "id,supplier_id,event_id,event_type,purchase_order_i
 received_at,status,attempts,last_error,purchased,imported,duplicate_count,\
 webhook_duplicate_count,failed_count,read_at,processing_started_at,supplier_batch_id,\
 total_debit,unit_price,supplier_order_id,replayed,\
-pool_usable,pool_deficit,pool_requested,retry_after,purchase_count";
+pool_usable,pool_deficit,pool_requested,retry_after,purchase_count,event_region,decision_snapshot_json";
 
 /// 历史行（单供货商时代）回填的供货商标识，与配置迁移出来的条目 id 一致。
 pub const LEGACY_SUPPLIER_ID: &str = "default";
@@ -46,6 +51,8 @@ CREATE TABLE IF NOT EXISTS supplier_events (
     pool_requested INTEGER,
     retry_after TEXT,
     purchase_count INTEGER
+    ,event_region TEXT
+    ,decision_snapshot_json TEXT
 );
 "#;
 
@@ -106,6 +113,9 @@ const MIGRATION_COLUMNS: &[(&str, &str)] = &[
     // `event_id` 派生，同一订单号换数量会让幂等协议返 409（原单已成交、钱扣了、
     // key 没到手），那恰好是重试要避免的结果。
     ("purchase_count", "INTEGER"),
+    ("event_region", "TEXT"),
+    // 结构化采购判定快照。JSON 只含配置、计数、区域和结果，不含密钥或购买到的 Key。
+    ("decision_snapshot_json", "TEXT"),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +157,93 @@ impl SupplierEventStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SupplierDecisionOutcome {
+    Succeeded,
+    Skipped,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SupplierDecisionTrigger {
+    pub event_type: String,
+    pub quantity: i64,
+    pub attempt: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SupplierDecisionSupplier {
+    pub id: String,
+    pub kind: Option<SupplierKind>,
+    pub enabled: Option<bool>,
+    pub auto_purchase: Option<bool>,
+    pub min_purchase: Option<u32>,
+    pub max_purchase: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SupplierDecisionTarget {
+    pub scope: Option<String>,
+    pub configured: Option<u32>,
+    pub credited_at_decision: Option<i64>,
+    pub deficit: Option<i64>,
+    pub requested: Option<i64>,
+    pub reached: Option<bool>,
+    pub health: Option<SupplierCredentialHealth>,
+    pub global_pool_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SupplierDecisionQuote {
+    pub vendor_stock: Option<u64>,
+    pub unit_price: Option<f64>,
+    pub max_unit_price: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SupplierDecisionRegion {
+    pub mode: Option<PurchaseRegionMode>,
+    pub configured_purchase_region: Option<SupplierRegion>,
+    pub webhook_region: Option<SupplierRegion>,
+    pub requested_region: Option<SupplierRegion>,
+    pub requested_region_source: Option<RegionSource>,
+    pub actual_region: Option<SupplierRegion>,
+    pub actual_region_source: Option<RegionSource>,
+    pub credential_api_region_fallback: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SupplierDecisionResult {
+    pub purchased: i64,
+    pub imported: i64,
+    pub duplicate: i64,
+    pub failed: i64,
+    pub total_debit: Option<i64>,
+    pub supplier_order_id: Option<String>,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SupplierDecisionSnapshot {
+    pub version: u32,
+    pub outcome: SupplierDecisionOutcome,
+    pub reason: Option<String>,
+    pub trigger: SupplierDecisionTrigger,
+    pub supplier: SupplierDecisionSupplier,
+    pub target: SupplierDecisionTarget,
+    pub quote: SupplierDecisionQuote,
+    pub region: SupplierDecisionRegion,
+    pub result: SupplierDecisionResult,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IncomingSupplierEvent {
     pub supplier_id: String,
@@ -155,6 +252,7 @@ pub struct IncomingSupplierEvent {
     pub purchase_order_id: Option<String>,
     /// 供货商侧的开号批次号，采购时回传以定向拉取该批次产出。仅 `kiroapp-io` 有值。
     pub supplier_batch_id: Option<String>,
+    pub event_region: Option<SupplierRegion>,
     pub message: Option<String>,
     pub quantity: i64,
 }
@@ -169,6 +267,7 @@ pub struct StoredSupplierEvent {
     pub event_type: String,
     pub purchase_order_id: Option<String>,
     pub supplier_batch_id: Option<String>,
+    pub event_region: Option<SupplierRegion>,
     pub message: Option<String>,
     pub quantity: i64,
     pub received_at: String,
@@ -200,6 +299,8 @@ pub struct StoredSupplierEvent {
     pub retry_after: Option<String>,
     /// 上一轮实际发出去的采购数量。`Some` 说明本次必须原样重放这个数量。
     pub purchase_count: Option<i64>,
+    /// 处理当时的结构化采购判定。历史行为空。
+    pub decision_snapshot: Option<SupplierDecisionSnapshot>,
 }
 
 /// 一次处理的结果。`Default` 是「什么都没发生」，构造时只填关心的字段。
@@ -221,6 +322,19 @@ pub struct ProcessSummary {
     pub pool_usable: Option<i64>,
     pub pool_deficit: Option<i64>,
     pub pool_requested: Option<i64>,
+    /// 处理当时的结构化采购判定，最终以 JSON 文本落库。
+    pub decision_snapshot: Option<SupplierDecisionSnapshot>,
+    /// 以下字段只在服务层组装 `decision_snapshot` 时使用，不单独建列。
+    pub decision_gate_scope: Option<String>,
+    pub decision_target: Option<u32>,
+    pub decision_health: Option<SupplierCredentialHealth>,
+    pub decision_vendor_stock: Option<u64>,
+    pub decision_quoted_unit_price: Option<f64>,
+    pub decision_requested_count: Option<u32>,
+    pub decision_requested_region: Option<SupplierRegion>,
+    pub decision_requested_region_source: Option<RegionSource>,
+    pub decision_actual_region: Option<SupplierRegion>,
+    pub decision_actual_region_source: Option<RegionSource>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -290,8 +404,8 @@ impl SupplierEventStore {
         let inserted = tx.execute(
             "INSERT OR IGNORE INTO supplier_events
              (supplier_id,event_id,event_type,purchase_order_id,message,quantity,received_at,status,
-              supplier_batch_id)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,'received',?8)",
+              supplier_batch_id,event_region)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,'received',?8,?9)",
             params![
                 event.supplier_id,
                 event.event_id,
@@ -300,7 +414,8 @@ impl SupplierEventStore {
                 message,
                 event.quantity,
                 received_at,
-                event.supplier_batch_id
+                event.supplier_batch_id,
+                event.event_region.map(|region| region.as_wire())
             ],
         )?;
         if inserted == 0 {
@@ -571,8 +686,9 @@ impl SupplierEventStore {
              replayed=CASE WHEN ?10=1 THEN 1 ELSE replayed END,
              pool_usable=COALESCE(?11,pool_usable), pool_deficit=COALESCE(?12,pool_deficit),
              pool_requested=COALESCE(?13,pool_requested),
+             decision_snapshot_json=COALESCE(?14,decision_snapshot_json),
              last_error=CASE WHEN ?1='failed' THEN ?2 ELSE last_error END, processing_started_at=NULL
-             WHERE id=?14 AND status='processing'",
+             WHERE id=?15 AND status='processing'",
             params![
                 status,
                 summary.message,
@@ -587,6 +703,11 @@ impl SupplierEventStore {
                 summary.pool_usable,
                 summary.pool_deficit,
                 summary.pool_requested,
+                summary
+                    .decision_snapshot
+                    .map(|value| serde_json::to_string(&value))
+                    .transpose()
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
                 id
             ],
         )?;
@@ -654,6 +775,8 @@ impl SupplierEventStore {
             pool_requested: row.get(25)?,
             retry_after: row.get(26)?,
             purchase_count: row.get(27)?,
+            event_region: parse_region_column(row.get(28)?, 28)?,
+            decision_snapshot: parse_json_column(row.get(29)?, 29)?,
         })
     }
 
@@ -712,18 +835,20 @@ CREATE TABLE supplier_events_migrated (
     pool_requested INTEGER,
     retry_after TEXT,
     purchase_count INTEGER
+    ,event_region TEXT
+    ,decision_snapshot_json TEXT
 );
 INSERT INTO supplier_events_migrated
     (id,supplier_id,event_id,event_type,purchase_order_id,message,quantity,received_at,status,
      attempts,last_error,purchased,imported,duplicate_count,webhook_duplicate_count,failed_count,
      read_at,processing_started_at,supplier_batch_id,
      total_debit,unit_price,supplier_order_id,replayed,
-     pool_usable,pool_deficit,pool_requested,retry_after,purchase_count)
+     pool_usable,pool_deficit,pool_requested,retry_after,purchase_count,event_region,decision_snapshot_json)
 SELECT id,supplier_id,event_id,event_type,purchase_order_id,message,quantity,received_at,status,
        attempts,last_error,purchased,imported,duplicate_count,webhook_duplicate_count,failed_count,
        read_at,processing_started_at,supplier_batch_id,
        total_debit,unit_price,supplier_order_id,replayed,
-       pool_usable,pool_deficit,pool_requested,retry_after,purchase_count
+       pool_usable,pool_deficit,pool_requested,retry_after,purchase_count,event_region,decision_snapshot_json
 FROM supplier_events;
 DROP TABLE supplier_events;
 ALTER TABLE supplier_events_migrated RENAME TO supplier_events;
@@ -764,6 +889,39 @@ fn has_column_level_unique(conn: &Connection) -> rusqlite::Result<bool> {
     )
 }
 
+fn parse_region_column(
+    value: Option<String>,
+    column: usize,
+) -> rusqlite::Result<Option<SupplierRegion>> {
+    value
+        .map(|value| {
+            value.parse::<SupplierRegion>().map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    column,
+                    Type::Text,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        error.to_string(),
+                    )),
+                )
+            })
+        })
+        .transpose()
+}
+
+fn parse_json_column(
+    value: Option<String>,
+    column: usize,
+) -> rusqlite::Result<Option<SupplierDecisionSnapshot>> {
+    value
+        .map(|value| {
+            serde_json::from_str(&value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(error))
+            })
+        })
+        .transpose()
+}
+
 fn truncate_chars(value: &str, max: usize) -> String {
     value.chars().take(max).collect()
 }
@@ -781,6 +939,7 @@ mod tests {
             event_type: "purchase.requested".to_string(),
             purchase_order_id: Some("po-1".to_string()),
             supplier_batch_id: None,
+            event_region: None,
             message: Some("hello".to_string()),
             quantity: 2,
         }
@@ -994,6 +1153,7 @@ mod tests {
                 event_type: "new_keys_available".to_string(),
                 purchase_order_id: Some("0123456789abcdef0123456789abcdef".to_string()),
                 supplier_batch_id: Some("batch-probe".to_string()),
+                event_region: None,
                 message: None,
                 quantity: 1,
             })
@@ -1057,6 +1217,7 @@ mod tests {
                 event_type: "new_keys_available".to_string(),
                 purchase_order_id: None,
                 supplier_batch_id: None,
+                event_region: None,
                 message: None,
                 quantity: 1,
             })
@@ -1072,6 +1233,7 @@ mod tests {
                     event_type: "new_keys_available".to_string(),
                     purchase_order_id: None,
                     supplier_batch_id: None,
+                    event_region: None,
                     message: None,
                     quantity: 1,
                 })
@@ -1105,6 +1267,7 @@ mod tests {
                 event_type: "new_keys_available".to_string(),
                 purchase_order_id: Some("0123456789abcdef0123456789abcdef".to_string()),
                 supplier_batch_id: Some("batch-io".to_string()),
+                event_region: None,
                 message: None,
                 quantity: 2,
             })
@@ -1136,6 +1299,114 @@ mod tests {
         let items = store.list(10, None, None).unwrap().items;
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].webhook_duplicate_count, 1);
+    }
+
+    #[test]
+    fn event_region_round_trips_through_sqlite() {
+        let store = SupplierEventStore::open_in_memory().unwrap();
+        let mut incoming = event("region-eu");
+        incoming.event_region = Some(SupplierRegion::Eu);
+        store.insert_event(incoming).unwrap();
+
+        let stored = store.list(1, None, None).unwrap().items.remove(0);
+        assert_eq!(stored.event_region, Some(SupplierRegion::Eu));
+    }
+
+    #[test]
+    fn schema_contains_a_structured_purchase_decision_snapshot_column() {
+        let store = SupplierEventStore::open_in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+        let mut statement = conn.prepare("PRAGMA table_info(supplier_events)").unwrap();
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+
+        assert!(columns.iter().any(|name| name == "decision_snapshot_json"));
+    }
+
+    #[test]
+    fn structured_decision_snapshot_round_trips_through_sqlite() {
+        use crate::admin::key_supplier::capabilities::RegionSource;
+        use crate::kiro::token_manager::SupplierCredentialHealth;
+        use crate::model::config::{PurchaseRegionMode, SupplierKind, SupplierRegion};
+
+        let store = SupplierEventStore::open_in_memory().unwrap();
+        store.insert_event(event("typed-decision")).unwrap();
+        let claimed = store.claim_next().unwrap().unwrap();
+        let snapshot = SupplierDecisionSnapshot {
+            version: 1,
+            outcome: SupplierDecisionOutcome::Succeeded,
+            reason: None,
+            trigger: SupplierDecisionTrigger {
+                event_type: "new_keys_available".to_owned(),
+                quantity: 2,
+                attempt: 1,
+            },
+            supplier: SupplierDecisionSupplier {
+                id: "ceo".to_owned(),
+                kind: Some(SupplierKind::KiroCeo),
+                enabled: Some(true),
+                auto_purchase: Some(true),
+                min_purchase: Some(1),
+                max_purchase: Some(5),
+            },
+            target: SupplierDecisionTarget {
+                scope: Some("supplier".to_owned()),
+                configured: Some(5),
+                credited_at_decision: Some(3),
+                deficit: Some(2),
+                requested: Some(2),
+                reached: Some(false),
+                health: Some(SupplierCredentialHealth {
+                    total: 4,
+                    usable: 3,
+                    ready: 2,
+                    target_credited: 3,
+                    manual_reserved: 1,
+                    ..Default::default()
+                }),
+                global_pool_enabled: false,
+            },
+            quote: SupplierDecisionQuote {
+                vendor_stock: Some(8),
+                unit_price: Some(30.0),
+                max_unit_price: Some(35.0),
+            },
+            region: SupplierDecisionRegion {
+                mode: Some(PurchaseRegionMode::Fixed),
+                configured_purchase_region: Some(SupplierRegion::Us),
+                webhook_region: None,
+                requested_region: Some(SupplierRegion::Us),
+                requested_region_source: Some(RegionSource::Request),
+                actual_region: Some(SupplierRegion::Us),
+                actual_region_source: Some(RegionSource::PurchaseResponse),
+                credential_api_region_fallback: Some("us-east-1".to_owned()),
+            },
+            result: SupplierDecisionResult {
+                purchased: 2,
+                imported: 2,
+                duplicate: 0,
+                failed: 0,
+                total_debit: Some(60),
+                supplier_order_id: Some("ceo-order".to_owned()),
+                replayed: false,
+            },
+        };
+
+        store
+            .complete(
+                claimed.id,
+                ProcessSummary {
+                    decision_snapshot: Some(snapshot.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let stored = store.list(1, None, None).unwrap().items.remove(0);
+        assert_eq!(stored.decision_snapshot, Some(snapshot));
     }
 
     #[test]
@@ -1177,6 +1448,7 @@ mod tests {
                     pool_deficit: Some(4),
                     pool_requested: Some(3),
                     message: None,
+                    ..Default::default()
                 },
             )
             .unwrap();

@@ -118,7 +118,8 @@ describe('key supplier management UI contract', () => {
     const page = await readSource('components/key-supplier-page.tsx')
 
     expect(page).toContain('supportsWebhookRegistration')
-    expect(page).toContain("config?.kind === 'kiro-rs'")
+    expect(page).toContain('capabilities.supportsWebhookRegistration')
+    expect(page).not.toContain("config?.kind === 'kiro-rs'")
     expect(page).toContain('getSupplierCallbackUrl')
     expect(page).toContain('获取回调地址')
     expect(page).toContain('需手动填写')
@@ -127,6 +128,14 @@ describe('key supplier management UI contract', () => {
     expect(page).toContain('keyPrice')
     expect(page).toContain('balance')
     expect(page).toContain('剩余积分')
+  })
+
+  test('page cannot run webhook actions against the previous supplier while creating', async () => {
+    const page = await readSource('components/key-supplier-page.tsx')
+
+    expect(page).toContain('registerWebhook.isPending || creating || selectedId === null')
+    expect(page).toContain('testWebhook.isPending || creating || selectedId === null')
+    expect(page).toContain('callbackUrlQuery.isPending || creating || selectedId === null')
   })
 
   test('page offers every protocol and shows the tiered price range', async () => {
@@ -238,5 +247,63 @@ describe('key supplier management UI contract', () => {
     expect(page).toContain('configNumbersValid')
     expect(page).not.toContain("updateField('minPurchase', Number(event.target.value))")
     expect(page).not.toContain('purchase.mutate(purchaseCount)')
+  })
+
+  test('page separates common import settings from per-supplier overrides', async () => {
+    const page = await readSource('components/key-supplier-page.tsx')
+
+    expect(page).toContain('公共导入设置')
+    expect(page).toContain('getSupplierCommon')
+    expect(page).toContain('updateSupplierCommon')
+    expect(page).toContain('importOverrides')
+    expect(page).toContain('继承公共设置')
+    expect(page).toContain('Nickname 预览')
+  })
+
+  test('page uses protocol capabilities for purchase region controls and defaults CEO to US', async () => {
+    const page = await readSource('components/key-supplier-page.tsx')
+    const helpers = await readSource('lib/key-supplier.ts')
+
+    expect(page).toContain('purchaseRegionMode')
+    expect(page).toContain('capabilities.regionModes')
+    expect(page).toContain('采购区域')
+    expect(page).toContain('凭据 API 区域兜底')
+    expect(helpers).toContain("purchaseRegionMode: 'fixed'")
+    expect(helpers).toContain("purchaseRegion: 'us'")
+  })
+
+  test('event rows expose the structured decision snapshot', async () => {
+    const page = await readSource('components/key-supplier-page.tsx')
+
+    expect(page).toContain('decisionSnapshot')
+    expect(page).toContain('判定详情')
+    expect(page).toContain('creditedAtDecision')
+    expect(page).toContain('requestedRegionSource')
+  })
+
+  test('callback URLs are scoped to the supplier that produced them', async () => {
+    const page = await readSource('components/key-supplier-page.tsx')
+
+    expect(page).toContain('callbackUrlQuery.data?.supplierId === selectedId')
+    expect(page).toContain('registerWebhook.data?.supplierId === selectedId')
+    expect(page).not.toContain(
+      'callbackUrlQuery.data?.callbackUrl ?? registerWebhook.data?.callbackUrl',
+    )
+  })
+
+  test('editing a supplier derives region capabilities from the draft kind', async () => {
+    const page = await readSource('components/key-supplier-page.tsx')
+
+    expect(page).toContain('config ? getSupplierCapabilities(config.kind)')
+    expect(page).not.toContain('selectedEntry.capabilities\n    : config')
+  })
+
+  test('webhook actions keep using the saved supplier capabilities while editing', async () => {
+    const page = await readSource('components/key-supplier-page.tsx')
+
+    expect(page).toContain('selectedEntry?.capabilities.supportsWebhookRegistration')
+    expect(page).not.toContain(
+      'supportsWebhookRegistration = capabilities',
+    )
   })
 })

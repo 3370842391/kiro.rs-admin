@@ -1962,6 +1962,7 @@ impl AdminService {
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
             disabled: false, // 新添加的凭据默认启用
+            disable_reason: None,
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
             groups: req.groups,

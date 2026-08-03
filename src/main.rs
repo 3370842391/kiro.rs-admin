@@ -747,16 +747,17 @@ fn initialize_key_supplier_service(
     token_manager: Arc<MultiTokenManager>,
 ) -> Option<Arc<admin::key_supplier::service::KeySupplierService>> {
     // 历史单供货商配置 → 多供货商列表。迁移只做一次，落盘后后续启动走正常分支。
-    let (mut suppliers, migrated) = match admin::key_supplier::config::load_suppliers(config) {
-        Ok(result) => result,
-        Err(error) => {
-            tracing::error!(
-                %error,
-                "key supplier configuration is invalid; supplier service is disabled"
-            );
-            return None;
-        }
-    };
+    let (mut suppliers, common_import, migrated) =
+        match admin::key_supplier::config::load_suppliers_with_common(config) {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "key supplier configuration is invalid; supplier service is disabled"
+                );
+                return None;
+            }
+        };
 
     // 每家供货商都需要一个 webhook token 才能收回调；缺的补上。
     let mut needs_save = migrated;
@@ -767,6 +768,7 @@ fn initialize_key_supplier_service(
         }
     }
     if needs_save {
+        config.key_supplier_common = (&common_import).into();
         admin::key_supplier::config::store_suppliers(config, &suppliers);
         if let Err(error) = config.save() {
             tracing::error!(
@@ -825,7 +827,6 @@ fn initialize_key_supplier_service(
             "全局号池已启用：所有采购来的可用号合计不超过目标存量，各家自己的补货闸不再参与判定"
         );
     }
-
     let service = Arc::new(
         admin::key_supplier::service::KeySupplierService::new_with_token_manager(
             store,
@@ -833,6 +834,7 @@ fn initialize_key_supplier_service(
             token_manager,
         )
         .with_config_path(config_path)
+        .with_common_import(common_import)
         .with_pool_config(pool),
     );
     service.start_processor();

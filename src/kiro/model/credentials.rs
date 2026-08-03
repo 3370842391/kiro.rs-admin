@@ -20,6 +20,34 @@ pub const SOCIAL_PROFILE_ARN: &str =
 ///
 /// `Debug` 输出经过脱敏处理：access_token / refresh_token / client_secret /
 /// kiro_api_key / proxy_password 等敏感字段只显示长度，不会泄露明文。
+/// 凭据被禁用的原因。必须随凭据持久化，否则重启后系统禁用会退化成人工暂停，
+/// 进而被补货水位错误地计入目标存量。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CredentialDisableReason {
+    Manual,
+    TooManyFailures,
+    TooManyRefreshFailures,
+    QuotaExceeded,
+    InvalidRefreshToken,
+    InvalidConfig,
+    Forbidden,
+}
+
+impl CredentialDisableReason {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Manual => "Manual",
+            Self::TooManyFailures => "TooManyFailures",
+            Self::TooManyRefreshFailures => "TooManyRefreshFailures",
+            Self::QuotaExceeded => "QuotaExceeded",
+            Self::InvalidRefreshToken => "InvalidRefreshToken",
+            Self::InvalidConfig => "InvalidConfig",
+            Self::Forbidden => "Forbidden",
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct KiroCredentials {
@@ -139,6 +167,11 @@ pub struct KiroCredentials {
     /// 凭据是否被禁用（默认为 false）
     #[serde(default)]
     pub disabled: bool,
+
+    /// 禁用原因。旧凭据没有该字段，加载时由 `disabled`、`diedAt` 与
+    /// `quotaExhaustedAt` 按保守规则回填。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disable_reason: Option<CredentialDisableReason>,
 
     /// Kiro API Key（headless 模式）
     /// 格式: ksk_xxxxxxxx
@@ -286,6 +319,7 @@ impl std::fmt::Debug for KiroCredentials {
             .field("proxy_username", &self.proxy_username)
             .field("proxy_password", &fmt_redacted(&self.proxy_password))
             .field("disabled", &self.disabled)
+            .field("disable_reason", &self.disable_reason)
             .field("kiro_api_key", &fmt_redacted(&self.kiro_api_key))
             .field("endpoint", &self.endpoint)
             .field("groups", &self.groups)
@@ -945,6 +979,23 @@ impl KiroCredentials {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disable_reason_round_trips_in_camel_case() {
+        let credentials = KiroCredentials {
+            disabled: true,
+            disable_reason: Some(CredentialDisableReason::TooManyFailures),
+            ..Default::default()
+        };
+
+        let json = credentials.to_pretty_json().unwrap();
+        assert!(json.contains(r#""disableReason": "tooManyFailures""#));
+        let decoded = KiroCredentials::from_json(&json).unwrap();
+        assert_eq!(
+            decoded.disable_reason,
+            Some(CredentialDisableReason::TooManyFailures)
+        );
+    }
     use crate::model::config::Config;
 
     #[test]
@@ -1058,6 +1109,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disable_reason: None,
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],
@@ -1306,6 +1358,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disable_reason: None,
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],
@@ -1353,6 +1406,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disable_reason: None,
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],
@@ -1483,6 +1537,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disable_reason: None,
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],

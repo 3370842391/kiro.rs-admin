@@ -994,6 +994,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kiro_ceo_fixed_us_sends_zone_and_reports_actual_region() {
+        let app = Router::new().route(
+            "/api/my/purchase",
+            post(
+                |request: axum::http::Request<axum::body::Body>| async move {
+                    let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    let sent: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(sent["zone"], "us");
+                    axum::Json(serde_json::json!({
+                        "client_order_id": "0123456789abcdef0123456789abcdef",
+                        "purchased": 1,
+                        "remaining": 2,
+                        "keys": ["kiro-us"],
+                        "zone": "us"
+                    }))
+                },
+            ),
+        );
+        let client =
+            SupplierClient::with_kind(server(app).await, "secret", SupplierKind::KiroCeo).unwrap();
+        let purchase = client
+            .purchase_with_context(
+                1,
+                "0123456789abcdef0123456789abcdef",
+                PurchaseContext {
+                    supplier_batch_id: None,
+                    requested_region: Some(SupplierRegion::Us),
+                    region_source: Some(RegionSource::Request),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(purchase.actual_region, Some(SupplierRegion::Us));
+        assert_eq!(purchase.region_source, Some(RegionSource::PurchaseResponse));
+    }
+
+    #[tokio::test]
+    async fn kiro_ceo_fixed_us_quote_ignores_europe_stock_and_price() {
+        let app = Router::new().route(
+            "/api/my/stock",
+            get(|| async {
+                axum::Json(serde_json::json!({
+                    "max": 12,
+                    "zones": [
+                        {"zone": "us", "enabled": true, "available": 2, "max": 0, "unit_price": 20},
+                        {"zone": "eu", "enabled": true, "available": 10, "max": 0, "unit_price": 1}
+                    ]
+                }))
+            }),
+        );
+        let client =
+            SupplierClient::with_kind(server(app).await, "secret", SupplierKind::KiroCeo).unwrap();
+        let quote = client
+            .purchase_quote_for(Some(SupplierRegion::Us))
+            .await
+            .unwrap();
+        assert_eq!(quote.zone.as_deref(), Some("us"));
+        assert_eq!(quote.stock, 2);
+        assert_eq!(quote.unit_price, Some(20.0));
+    }
+
+    #[tokio::test]
+    async fn kiroapp_io_region_is_sent_only_without_batch_id() {
+        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let state = bodies.clone();
+        let app = Router::new().route(
+            "/api/me/purchase",
+            post(move |request: axum::http::Request<axum::body::Body>| {
+                let state = state.clone();
+                async move {
+                    let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    state
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::from_slice(&bytes).unwrap());
+                    axum::Json(serde_json::json!({
+                        "purchased": 1, "remaining": 2,
+                        "keys": [{"key": "ksk-io"}]
+                    }))
+                }
+            }),
+        );
+        let client =
+            SupplierClient::with_kind(server(app).await, "secret", SupplierKind::KiroAppIo)
+                .unwrap();
+        let order = "0123456789abcdef0123456789abcdef";
+        client
+            .purchase_with_context(
+                1,
+                order,
+                PurchaseContext {
+                    supplier_batch_id: None,
+                    requested_region: Some(SupplierRegion::Eu),
+                    region_source: Some(RegionSource::Request),
+                },
+            )
+            .await
+            .unwrap();
+        client
+            .purchase_with_context(
+                1,
+                "fedcba9876543210fedcba9876543210",
+                PurchaseContext {
+                    supplier_batch_id: Some("batch-1"),
+                    requested_region: Some(SupplierRegion::Eu),
+                    region_source: Some(RegionSource::Webhook),
+                },
+            )
+            .await
+            .unwrap();
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies[0]["region"], "eu");
+        assert!(bodies[0].get("order_id").is_none());
+        assert_eq!(bodies[1]["order_id"], "batch-1");
+        assert!(bodies[1].get("region").is_none());
+    }
+
+    #[tokio::test]
     async fn each_protocol_maps_its_own_balance_and_stock_status_codes() {
         // 同一个状态码在各家含义不同。接错的后果是把「该去充钱」记成故障（运维照着
         // 排查网络），或把停用账号记成余额不足（去充钱但根本充不进去）。
@@ -1118,6 +1241,43 @@ mod tests {
         let quote = client.purchase_quote().await.unwrap();
         assert_eq!(quote.stock, 0);
         assert_eq!(quote.zone, None);
+    }
+
+    #[tokio::test]
+    async fn kiro_ceo_fixed_us_overview_ignores_cheaper_eu_zone() {
+        let app = Router::new()
+            .route(
+                "/api/my/profile",
+                get(|| async {
+                    axum::Json(serde_json::json!({
+                        "max_purchase": 10, "min_purchase": 1, "name": "ceo",
+                        "quota": 200, "remaining": 180, "used_quota": 20,
+                        "webhook_url": ""
+                    }))
+                }),
+            )
+            .route(
+                "/api/my/stock",
+                get(|| async {
+                    axum::Json(serde_json::json!({
+                        "max": 20,
+                        "zones": [
+                            {"zone": "us", "enabled": true, "available": 9,
+                             "max": 0, "unit_price": 20},
+                            {"zone": "eu", "enabled": true, "available": 11,
+                             "max": 0, "unit_price": 1}
+                        ]
+                    }))
+                }),
+            );
+        let client =
+            SupplierClient::with_kind(server(app).await, "ceo-secret", SupplierKind::KiroCeo)
+                .unwrap();
+
+        let snapshot = client.snapshot_for(Some(SupplierRegion::Us)).await.unwrap();
+
+        assert_eq!(snapshot.stock_available, Some(9));
+        assert_eq!(snapshot.key_price, Some(20.0));
     }
 
     #[tokio::test]
@@ -1366,6 +1526,8 @@ mod tests {
             unit_price: Some(100.0),
             supplier_order_id: Some("0d9f".to_owned()),
             replayed: false,
+            actual_region: None,
+            region_source: None,
             keys: vec![key.clone()],
         };
         assert!(!format!("{key:?}").contains("ksk_private"));
@@ -1376,7 +1538,8 @@ use reqwest::{Method, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{fmt, sync::OnceLock, time::Duration};
 
-use crate::model::config::SupplierKind;
+use crate::admin::key_supplier::capabilities::RegionSource;
+use crate::model::config::{SupplierKind, SupplierRegion};
 
 const MAX_ATTEMPTS: usize = 3;
 const SUPPLIER_USER_AGENT: &str = "kiro-rs-key-supplier/1.0";
@@ -1489,6 +1652,13 @@ impl SupplierClient {
 
     /// 跨协议统一的概览。缺的字段留 `None`，由调用方决定怎么展示。
     pub async fn snapshot(&self) -> Result<SupplierSnapshot, SupplierError> {
+        self.snapshot_for(None).await
+    }
+
+    pub async fn snapshot_for(
+        &self,
+        requested_region: Option<SupplierRegion>,
+    ) -> Result<SupplierSnapshot, SupplierError> {
         match self.kind {
             SupplierKind::KiroRs => {
                 let profile = self.profile().await?;
@@ -1567,12 +1737,17 @@ impl SupplierClient {
                 // 展示的单价必须是**真正会成交的那个区**的价，和采购路径挑同一个区。
                 // 以前固定显示美国区价：美国区空了、实际会从欧洲区成交时，界面上那个
                 // 数字既不是能买到的价，也解释不了为什么采购失败。
-                let key_price = pick_kiro_ceo_zone(&stock.zones).and_then(|zone| zone.unit_price);
+                let selected_zone = match requested_region {
+                    Some(region) => stock.zones.iter().find(|zone| {
+                        zone.enabled && zone.zone.parse::<SupplierRegion>().ok() == Some(region)
+                    }),
+                    None => pick_kiro_ceo_zone(&stock.zones),
+                };
                 Ok(SupplierSnapshot {
-                    // 顶层 `max` 是跨区合计，作为「对方一共还有多少」展示是对的；
-                    // 能买几个由 `purchase_quote()` 按区算。
-                    stock_available: Some(stock.max),
-                    key_price,
+                    stock_available: Some(
+                        selected_zone.map(|zone| zone.purchasable()).unwrap_or(0),
+                    ),
+                    key_price: selected_zone.and_then(|zone| zone.unit_price),
                     key_price_max: None,
                     balance: Some(profile.remaining),
                     webhook_url: Some(profile.webhook_url.clone()),
@@ -1586,7 +1761,11 @@ impl SupplierClient {
                     .request(Method::GET, "/api/me/stock", None, RetryPolicy::Retryable)
                     .await?;
                 Ok(SupplierSnapshot {
-                    stock_available: Some(stock.stock),
+                    stock_available: Some(match requested_region {
+                        Some(SupplierRegion::Us) => stock.stock_us,
+                        Some(SupplierRegion::Eu) => stock.stock_eu,
+                        None => stock.stock,
+                    }),
                     key_price: stock.price_min.or(stock.price),
                     key_price_max: stock.price_max,
                     balance: Some(stock.balance),
@@ -1607,6 +1786,13 @@ impl SupplierClient {
     /// 各家的币种/单位不通用（Drop 报 USD、kiroapp 系报积分），所以这个数只允许和
     /// **同一家**配置的上限比较，绝不能跨家做算术。
     pub async fn purchase_quote(&self) -> Result<PurchaseQuote, SupplierError> {
+        self.purchase_quote_for(None).await
+    }
+
+    pub async fn purchase_quote_for(
+        &self,
+        requested_region: Option<SupplierRegion>,
+    ) -> Result<PurchaseQuote, SupplierError> {
         match self.kind {
             // kiro.ceo 的 `/api/my/stock` 与 kiro-rs 同形，`max` 是文档化字段。
             // ceo 另有分区单价，kiro-rs 什么价都不报。
@@ -1622,7 +1808,15 @@ impl SupplierClient {
                 let stock: KiroCeoStock = self
                     .request(Method::GET, "/api/my/stock", None, RetryPolicy::Retryable)
                     .await?;
-                match pick_kiro_ceo_zone(&stock.zones) {
+                let selected = match requested_region {
+                    Some(region) => stock.zones.iter().find(|zone| {
+                        zone.enabled
+                            && zone.purchasable() > 0
+                            && zone.zone.parse::<SupplierRegion>().ok() == Some(region)
+                    }),
+                    None => pick_kiro_ceo_zone(&stock.zones),
+                };
+                match selected {
                     Some(zone) => Ok(PurchaseQuote {
                         stock: zone.purchasable(),
                         unit_price: zone.unit_price,
@@ -1669,8 +1863,12 @@ impl SupplierClient {
                     .request(Method::GET, "/api/me/stock", None, RetryPolicy::Retryable)
                     .await?;
                 Ok(PurchaseQuote {
-                    zone: None,
-                    stock: stock.stock,
+                    zone: requested_region.map(|region| region.as_wire().to_owned()),
+                    stock: match requested_region {
+                        Some(SupplierRegion::Us) => stock.stock_us,
+                        Some(SupplierRegion::Eu) => stock.stock_eu,
+                        None => stock.stock,
+                    },
                     // 阶梯定价：`price_min` 是最低档。判上限用最低价是刻意的——
                     // 「便宜的先出货」，一单里贵的那些由 `total_debit` 事后记账。
                     unit_price: stock.price_min.or(stock.price),
@@ -1691,7 +1889,7 @@ impl SupplierClient {
         count: u32,
         client_order_id: &str,
     ) -> Result<Purchase, SupplierError> {
-        self.purchase_batch(count, client_order_id, None, None)
+        self.purchase_with_context(count, client_order_id, PurchaseContext::default())
             .await
     }
 
@@ -1709,6 +1907,28 @@ impl SupplierClient {
         supplier_batch_id: Option<&str>,
         zone: Option<&str>,
     ) -> Result<Purchase, SupplierError> {
+        let requested_region = zone
+            .map(str::parse::<SupplierRegion>)
+            .transpose()
+            .map_err(|_| SupplierError::invalid("zone must be us or eu"))?;
+        self.purchase_with_context(
+            count,
+            client_order_id,
+            PurchaseContext {
+                supplier_batch_id,
+                requested_region,
+                region_source: requested_region.map(|_| RegionSource::Request),
+            },
+        )
+        .await
+    }
+
+    pub async fn purchase_with_context(
+        &self,
+        count: u32,
+        client_order_id: &str,
+        context: PurchaseContext<'_>,
+    ) -> Result<Purchase, SupplierError> {
         if count == 0 {
             return Err(SupplierError::invalid("purchase count must be positive"));
         }
@@ -1722,10 +1942,13 @@ impl SupplierClient {
         match self.kind {
             SupplierKind::KiroRs => self.purchase_kiro_rs(count, client_order_id).await,
             SupplierKind::KiroDrop => self.purchase_kiro_drop(count, client_order_id).await,
-            SupplierKind::KiroCeo => self.purchase_kiro_ceo(count, client_order_id, zone).await,
+            SupplierKind::KiroCeo => {
+                self.purchase_kiro_ceo(count, client_order_id, context)
+                    .await
+            }
             SupplierKind::KiroApp => self.claim_kiro_app(count, client_order_id).await,
             SupplierKind::KiroAppIo => {
-                self.purchase_kiro_app_io(count, client_order_id, supplier_batch_id)
+                self.purchase_kiro_app_io(count, client_order_id, context)
                     .await
             }
         }
@@ -1740,15 +1963,21 @@ impl SupplierClient {
         &self,
         count: u32,
         client_order_id: &str,
-        supplier_batch_id: Option<&str>,
+        context: PurchaseContext<'_>,
     ) -> Result<Purchase, SupplierError> {
         let mut body = serde_json::json!({
             "count": count,
             "client_order_id": client_order_id,
         });
         // 只在拿到批次号时带上：缺省行为是从公共池子取，带上则只取该批次产出。
-        if let Some(batch_id) = supplier_batch_id.map(str::trim).filter(|id| !id.is_empty()) {
+        if let Some(batch_id) = context
+            .supplier_batch_id
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
             body["order_id"] = serde_json::Value::String(batch_id.to_owned());
+        } else if let Some(region) = context.requested_region {
+            body["region"] = serde_json::Value::String(region.as_wire().to_owned());
         }
         let response: KiroAppIoPurchase = self
             .request(
@@ -1790,6 +2019,8 @@ impl SupplierClient {
             unit_price: response.unit_price,
             supplier_order_id: response.order_id,
             replayed: response.replayed,
+            actual_region: context.requested_region,
+            region_source: context.requested_region.and(context.region_source),
             // 前缀走宽松校验：钱已经扣了，不能因为前缀不合预期就把 key 扔掉。
             // 每个 key 的单价跟着 key 一起带走：阶梯定价下同一单里各 key 不同价。
             keys: accept_paid_keys(response.keys.into_iter().map(|key| (key.key, key.price)))?,
@@ -1848,6 +2079,8 @@ impl SupplierClient {
             unit_price: None,
             supplier_order_id: None,
             replayed: false,
+            actual_region: None,
+            region_source: None,
             // 前缀走宽松校验：钱已经扣了，不能因为前缀不合预期就把 key 扔掉。
             keys: accept_paid_keys(response.keys.into_iter().map(|key| (key.key, key.price)))?,
         })
@@ -1866,15 +2099,15 @@ impl SupplierClient {
         &self,
         count: u32,
         client_order_id: &str,
-        zone: Option<&str>,
+        context: PurchaseContext<'_>,
     ) -> Result<Purchase, SupplierError> {
         let mut body = serde_json::json!({
             "count": count,
             "client_order_id": client_order_id,
         });
         // 传 us / eu 以外的值对方直接 400，所以空值一律不带，让它走默认。
-        if let Some(zone) = zone.map(str::trim).filter(|zone| !zone.is_empty()) {
-            body["zone"] = serde_json::Value::String(zone.to_owned());
+        if let Some(region) = context.requested_region {
+            body["zone"] = serde_json::Value::String(region.as_wire().to_owned());
         }
         let response: KiroCeoPurchase = self
             .request(
@@ -1913,6 +2146,12 @@ impl SupplierClient {
             unit_price: response.unit_price,
             supplier_order_id: response.order_id.filter(|id| !id.trim().is_empty()),
             replayed: response.replayed,
+            actual_region: response.zone.or(context.requested_region),
+            region_source: if response.zone.is_some() {
+                Some(RegionSource::PurchaseResponse)
+            } else {
+                context.requested_region.and(context.region_source)
+            },
             // 宽松前缀：kiro.ceo 的 key 不是 `ksk_` 前缀，而积分已经扣了。
             // 按 kiro-rs 的严格校验会把整单已付费的 key 全判无效——钱花了 key 扔了。
             keys: accept_paid_keys(response.keys.into_iter().map(|key| (key.into_key(), None)))?,
@@ -1958,6 +2197,8 @@ impl SupplierClient {
             unit_price: None,
             supplier_order_id: None,
             replayed: false,
+            actual_region: None,
+            region_source: None,
             keys: validate_keys(response.keys.into_iter().map(|key| (key.key, key.price)))?,
         })
     }
@@ -2013,6 +2254,8 @@ impl SupplierClient {
             // claim 没有订单号，也没有幂等重放的概念。
             supplier_order_id: None,
             replayed: false,
+            actual_region: None,
+            region_source: None,
             keys,
         })
     }
@@ -2235,6 +2478,13 @@ pub struct PurchaseQuote {
     pub zone: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PurchaseContext<'a> {
+    pub supplier_batch_id: Option<&'a str>,
+    pub requested_region: Option<SupplierRegion>,
+    pub region_source: Option<RegionSource>,
+}
+
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Profile {
     pub name: String,
@@ -2362,6 +2612,8 @@ pub struct Purchase {
     pub supplier_order_id: Option<String>,
     /// 命中对方的幂等重放：上一次其实已经成交，只是响应没回到我们手上。
     pub replayed: bool,
+    pub actual_region: Option<SupplierRegion>,
+    pub region_source: Option<RegionSource>,
     pub keys: Vec<SupplierKey>,
 }
 
@@ -2375,6 +2627,8 @@ impl fmt::Debug for Purchase {
             .field("unit_price", &self.unit_price)
             .field("supplier_order_id", &self.supplier_order_id)
             .field("replayed", &self.replayed)
+            .field("actual_region", &self.actual_region)
+            .field("region_source", &self.region_source)
             .field("keys", &"[REDACTED]")
             .finish()
     }
@@ -2483,11 +2737,9 @@ struct KiroDropPurchase {
 /// `GET /api/my/stock`（kiro.ceo）→ `{max, max_purchase, min, quota, reserved,
 /// zones:[{zone, label, unit_price, stock, available, max, enabled}]}`。
 ///
-/// `max` 是文档化的「可提取数量」，各区单价在 `zones` 里独立设置。
+/// 固定区域概览只读取对应的 `zones` 项；顶层 `max` 是跨区合计，不能表示美国区库存。
 #[derive(Deserialize)]
 struct KiroCeoStock {
-    #[serde(default)]
-    max: u64,
     #[serde(default)]
     zones: Vec<KiroCeoZone>,
 }
@@ -2595,6 +2847,8 @@ struct KiroCeoPurchase {
     /// 所以失败订单可以靠同一个 `client_order_id` 把已付费的 key 捞回来。
     #[serde(default)]
     replayed: bool,
+    #[serde(default)]
+    zone: Option<SupplierRegion>,
 }
 
 /// `GET /api/me/stock` → `{stock, price, price_min, price_max, balance}`。
@@ -2613,6 +2867,10 @@ struct KiroAppIoStock {
     price: Option<f64>,
     #[serde(default)]
     balance: u64,
+    #[serde(default)]
+    stock_us: u64,
+    #[serde(default)]
+    stock_eu: u64,
 }
 
 /// `POST /api/me/purchase` → `{purchased, requested, remaining, unit_price, total_debit,

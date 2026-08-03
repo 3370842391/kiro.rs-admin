@@ -1131,6 +1131,35 @@ export interface ImageBudgetConfig {
 
 // ============ Supplier key automation ============
 
+export type PurchaseRegionMode = 'omit' | 'fixed' | 'webhook' | 'bestAvailable' | 'batch'
+
+export type SupplierRegion = 'us' | 'eu'
+
+export interface SupplierCapabilities {
+  regionModes: PurchaseRegionMode[]
+  supportsWebhookRegistration: boolean
+  purchaseIsIdempotent: boolean
+  supportsPrice: boolean
+}
+
+export interface SupplierImportOverrides {
+  sourceChannel?: string
+  nicknameLabel?: string
+  rpmLimit?: number
+  priority?: number
+  groups?: string[]
+  autoDeleteForbidden?: boolean
+}
+
+export interface SupplierCommonConfig {
+  sourceChannel: string
+  nicknameLabel: string
+  rpmLimit: number
+  priority: number
+  groups: string[]
+  autoDeleteForbidden: boolean
+}
+
 export interface SupplierConfigView {
   baseUrl: string
   publicBaseUrl: string
@@ -1139,6 +1168,9 @@ export interface SupplierConfigView {
   minPurchase: number
   maxPurchase: number
   apiRegion: string
+  purchaseRegionMode: PurchaseRegionMode
+  purchaseRegion: SupplierRegion | null
+  credentialApiRegionFallback: string
   rpmLimit: number
   priority: number
   groups: string[]
@@ -1188,6 +1220,9 @@ export interface SupplierConfigUpdate {
   minPurchase: number
   maxPurchase: number
   apiRegion: string
+  purchaseRegionMode: PurchaseRegionMode
+  purchaseRegion: SupplierRegion | null
+  credentialApiRegionFallback: string
   rpmLimit: number
   priority: number
   groups: string[]
@@ -1241,6 +1276,8 @@ export interface SupplierEntryView extends SupplierConfigView {
   enabled: boolean
   /** Neither kiroapp protocol can register callbacks remotely; the URL must be pasted manually. */
   supportsWebhookRegistration: boolean
+  capabilities: SupplierCapabilities
+  importOverrides: SupplierImportOverrides
 }
 
 export interface SupplierEntryUpdate extends SupplierConfigUpdate {
@@ -1249,6 +1286,7 @@ export interface SupplierEntryUpdate extends SupplierConfigUpdate {
   name: string
   kind: SupplierKind
   enabled: boolean
+  importOverrides: SupplierImportOverrides
 }
 
 export type SupplierEntryPayload = Omit<
@@ -1285,17 +1323,7 @@ export interface SupplierOverview {
    * Local pool health for keys bought from this supplier. The restock gate compares
    * `usable` against the watermark, so this is what explains "why didn't it buy".
    */
-  credentialHealth: {
-    total: number
-    /** Manually disabled keys count as usable — that's a pause, not a dead key. */
-    usable: number
-    /** Banned (upstream 403 with a ban marker). */
-    dead: number
-    /** Quota used up (402, or the one-click over-quota sweep). */
-    quotaExhausted: number
-    /** Remaining quota at or below `lowQuotaThreshold`. */
-    lowQuota: number
-  }
+  credentialHealth: SupplierCredentialHealth
   webhookRegistered: boolean
   status: {
     keysActive: number
@@ -1336,15 +1364,28 @@ export interface SupplierPoolConfig {
   lowQuotaThreshold: number
 }
 
-/** Per-credential health split, reused from the supplier overview. */
-export interface SupplierPoolHealth {
+/** Per-credential health split, reused from supplier and global pool overviews. */
+export interface SupplierCredentialHealth {
   total: number
+  /** Compatibility alias for targetCredited. */
   usable: number
+  /** Credentials that can be scheduled immediately. */
+  ready: number
+  /** Credentials credited toward the stock target. */
+  targetCredited: number
+  /** Manually paused credentials retained by operations. */
+  manualReserved: number
+  /** Credentials temporarily cooling down after rate-limit or risk responses. */
+  cooling: number
+  /** Automatically disabled credentials excluded from the stock target. */
+  systemDisabled: number
   /** Banned. Still in the pool until the retention window expires, but never counted usable. */
   dead: number
   quotaExhausted: number
   lowQuota: number
 }
+
+export type SupplierPoolHealth = SupplierCredentialHealth
 
 export interface SupplierPoolStatus {
   enabled: boolean
@@ -1376,6 +1417,65 @@ export interface SupplierDeleteResponse {
 }
 
 export type SupplierEventStatus = 'received' | 'processing' | 'succeeded' | 'skipped' | 'failed'
+
+export type SupplierRegionSource =
+  | 'purchaseResponse'
+  | 'webhook'
+  | 'request'
+  | 'configFallback'
+
+export interface SupplierDecisionSnapshot {
+  version: number
+  outcome: string
+  reason: string | null
+  trigger: {
+    eventType: string
+    quantity: number
+    attempt: number
+  }
+  supplier: {
+    id: string
+    kind: SupplierKind | null
+    enabled: boolean | null
+    autoPurchase: boolean | null
+    minPurchase: number | null
+    maxPurchase: number | null
+  }
+  target: {
+    scope: string | null
+    configured: number | null
+    creditedAtDecision: number | null
+    deficit: number | null
+    requested: number | null
+    reached: boolean | null
+    health: SupplierCredentialHealth | null
+    globalPoolEnabled: boolean
+  }
+  quote: {
+    vendorStock: number | null
+    unitPrice: number | null
+    maxUnitPrice: number | null
+  }
+  region: {
+    mode: PurchaseRegionMode | null
+    configuredPurchaseRegion: SupplierRegion | null
+    webhookRegion: SupplierRegion | null
+    requestedRegion: SupplierRegion | null
+    requestedRegionSource: SupplierRegionSource | null
+    actualRegion: SupplierRegion | null
+    actualRegionSource: SupplierRegionSource | null
+    credentialApiRegionFallback: string | null
+  }
+  result: {
+    purchased: number
+    imported: number
+    duplicate: number
+    failed: number
+    totalDebit: number | null
+    supplierOrderId: string | null
+    replayed: boolean
+  }
+}
 
 export interface SupplierEvent {
   id: number
@@ -1413,6 +1513,8 @@ export interface SupplierEvent {
   retryAfter: string | null
   /** Purchase count already sent upstream. A retry replays this exact count to hit the vendor's idempotency. */
   purchaseCount: number | null
+  /** Safe, structured evidence captured at the time the purchase decision was made. */
+  decisionSnapshot: SupplierDecisionSnapshot | null
 }
 
 export interface SupplierEventPage {
