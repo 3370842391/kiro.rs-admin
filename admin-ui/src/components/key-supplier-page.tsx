@@ -2,14 +2,14 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import {
-  Bell, Boxes, CheckCheck, Clipboard, CloudCog, Loader2, PackagePlus, Plus, RefreshCw,
-  RotateCcw, Send, ShieldCheck, Trash2, Webhook,
+  Bell, Boxes, CheckCheck, ChevronDown, Clipboard, CloudCog, Loader2, PackagePlus, Plus,
+  RefreshCw, RotateCcw, Send, Settings2, ShieldCheck, Trash2, Webhook,
 } from 'lucide-react'
 import {
   createSupplier, deleteSupplier, getSupplierCallbackUrl, getSupplierEntryOverview,
-  getSupplierPool, getSupplierPoolStatus, listSuppliers, listSupplierEvents,
+  getSupplierCommon, getSupplierPool, getSupplierPoolStatus, listSuppliers, listSupplierEvents,
   markSupplierEventsRead, purchaseFromSupplier, registerSupplierEntryWebhook, retrySupplierEvent,
-  testSupplierEntryWebhook, updateSupplier, updateSupplierPool,
+  testSupplierEntryWebhook, updateSupplier, updateSupplierCommon, updateSupplierPool,
 } from '@/api/key-supplier'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -21,19 +21,37 @@ import { GroupMultiSelect } from '@/components/group-select'
 import { useGroupOptions } from '@/hooks/use-groups'
 import { extractErrorMessage } from '@/lib/utils'
 import {
-  emptySupplierEntry, emptySupplierPool, getSupplierEventStatusLabel, getSupplierKindLabel,
-  hasUnreadSupplierEvents, isValidSupplierId, parseSupplierDecimalDraft,
-  parseSupplierNumberDraft, suggestSupplierId,
+  buildSupplierNicknamePreview, emptySupplierEntry, emptySupplierPool, getSupplierCapabilities,
+  getSupplierEventStatusLabel, getSupplierKindLabel, hasUnreadSupplierEvents, isValidSupplierId,
+  parseSupplierDecimalDraft, parseSupplierNumberDraft, suggestSupplierId,
   toSupplierEntryUpdate, validateSupplierPool,
 } from '@/lib/key-supplier'
 import type {
-  SupplierEntryUpdate, SupplierEvent, SupplierEventStatus, SupplierKind, SupplierPoolConfig,
+  PurchaseRegionMode, SupplierCommonConfig, SupplierDecisionSnapshot, SupplierEntryUpdate,
+  SupplierEvent, SupplierEventStatus, SupplierImportOverrides, SupplierKind, SupplierPoolConfig,
+  SupplierRegion,
 } from '@/types/api'
 
 const EVENT_PAGE_SIZE = 20
 const SUPPLIER_KINDS: readonly SupplierKind[] = [
   'kiro-rs', 'kiro-app', 'kiroapp-io', 'kiro-drop', 'kiro-ceo',
 ]
+const REGION_MODE_LABELS: Record<PurchaseRegionMode, string> = {
+  omit: '不传区域',
+  fixed: '固定区域',
+  webhook: '跟随 Webhook',
+  bestAvailable: '库存优先',
+  batch: '跟随供货批次',
+}
+const SUPPLIER_REGIONS: readonly SupplierRegion[] = ['us', 'eu']
+const SUPPLIER_REGION_LABELS: Record<SupplierRegion, string> = {
+  us: '美国区（us）',
+  eu: '欧洲区（eu）',
+}
+const CREDENTIAL_API_REGIONS = [
+  { value: 'us-east-1', label: '美国区（us-east-1）' },
+  { value: 'eu-central-1', label: '欧洲区（eu-central-1）' },
+] as const
 
 type SupplierNumericField =
   | 'minPurchase'
@@ -44,6 +62,8 @@ type SupplierNumericField =
   | 'lowQuotaThreshold'
   | 'maxUnitPrice'
 type NumericDrafts = Record<SupplierNumericField, string>
+type ImportOverrideField = keyof SupplierImportOverrides
+type ImportOverrideValue = string | number | string[] | boolean
 
 function toNumericDrafts(config: Pick<SupplierEntryUpdate, SupplierNumericField>): NumericDrafts {
   return {
@@ -99,11 +119,149 @@ function Metric({ label, value }: { label: string; value: number | string }) {
   )
 }
 
+function importValueFromConfig(
+  config: SupplierEntryUpdate,
+  field: ImportOverrideField,
+): ImportOverrideValue {
+  switch (field) {
+    case 'sourceChannel': return config.sourceChannel
+    case 'nicknameLabel': return config.nicknamePrefix
+    case 'rpmLimit': return config.rpmLimit
+    case 'priority': return config.priority
+    case 'groups': return [...config.groups]
+    case 'autoDeleteForbidden': return config.autoDeleteForbidden
+  }
+}
+
+function importValueFromCommon(
+  common: SupplierCommonConfig,
+  field: ImportOverrideField,
+): ImportOverrideValue {
+  return field === 'groups' ? [...common.groups] : common[field]
+}
+
+function importConfigPatch(
+  field: ImportOverrideField,
+  value: ImportOverrideValue,
+): Partial<SupplierEntryUpdate> {
+  switch (field) {
+    case 'sourceChannel': return { sourceChannel: value as string }
+    case 'nicknameLabel': return { nicknamePrefix: value as string }
+    case 'rpmLimit': return { rpmLimit: value as number }
+    case 'priority': return { priority: value as number }
+    case 'groups': return { groups: [...value as string[]] }
+    case 'autoDeleteForbidden': return { autoDeleteForbidden: value as boolean }
+  }
+}
+
+function formatDecisionValue(value: string | number | boolean | null | undefined): string {
+  if (value === null || value === undefined || value === '') return '—'
+  if (typeof value === 'boolean') return value ? '是' : '否'
+  return String(value)
+}
+
+function DecisionValue({
+  label,
+  value,
+}: {
+  label: string
+  value: string | number | boolean | null | undefined
+}) {
+  return (
+    <div className="min-w-0">
+      <div className="text-[11px] text-muted-foreground">{label}</div>
+      <div className="break-words font-mono text-xs text-foreground">
+        {formatDecisionValue(value)}
+      </div>
+    </div>
+  )
+}
+
+function DecisionSnapshotDetails({ snapshot }: { snapshot: SupplierDecisionSnapshot }) {
+  const health = snapshot.target.health
+  return (
+    <details className="group mt-2 border-t border-border/50 pt-2">
+      <summary className="flex cursor-pointer list-none items-center gap-1.5 text-xs font-medium text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+        <ChevronDown className="h-3.5 w-3.5 transition-transform group-open:rotate-180" />
+        判定详情
+      </summary>
+      <div className="mt-3 space-y-3 border-l-2 border-primary/20 pl-3">
+        <div className="grid gap-2 sm:grid-cols-3 lg:grid-cols-6">
+          <DecisionValue label="结果" value={snapshot.outcome} />
+          <DecisionValue label="原因" value={snapshot.reason} />
+          <DecisionValue label="目标范围" value={snapshot.target.scope} />
+          <DecisionValue label="当时目标" value={snapshot.target.configured} />
+          <DecisionValue label="当时计入目标" value={snapshot.target.creditedAtDecision} />
+          <DecisionValue label="当时缺口 / 请求" value={`${formatDecisionValue(snapshot.target.deficit)} / ${formatDecisionValue(snapshot.target.requested)}`} />
+        </div>
+        {health ? (
+          <div className="grid gap-2 sm:grid-cols-3 lg:grid-cols-6">
+            <DecisionValue label="可调度" value={health.ready} />
+            <DecisionValue label="人工保留" value={health.manualReserved} />
+            <DecisionValue label="临时冷却" value={health.cooling} />
+            <DecisionValue label="系统禁用" value={health.systemDisabled} />
+            <DecisionValue label="封禁 / 额度尽" value={`${health.dead} / ${health.quotaExhausted}`} />
+            <DecisionValue label="低于额度水位" value={health.lowQuota} />
+          </div>
+        ) : null}
+        <div className="grid gap-2 sm:grid-cols-3 lg:grid-cols-6">
+          <DecisionValue label="区域模式" value={snapshot.region.mode} />
+          <DecisionValue label="请求区域" value={snapshot.region.requestedRegion} />
+          <DecisionValue label="请求区域证据" value={snapshot.region.requestedRegionSource} />
+          <DecisionValue label="实际区域" value={snapshot.region.actualRegion} />
+          <DecisionValue label="实际区域证据" value={snapshot.region.actualRegionSource} />
+          <DecisionValue label="凭据 API 区域兜底" value={snapshot.region.credentialApiRegionFallback} />
+        </div>
+        <div className="grid gap-2 sm:grid-cols-3 lg:grid-cols-6">
+          <DecisionValue label="供货商库存" value={snapshot.quote.vendorStock} />
+          <DecisionValue label="报价 / 限价" value={`${formatDecisionValue(snapshot.quote.unitPrice)} / ${formatDecisionValue(snapshot.quote.maxUnitPrice)}`} />
+          <DecisionValue label="购买 / 导入" value={`${snapshot.result.purchased} / ${snapshot.result.imported}`} />
+          <DecisionValue label="重复 / 失败" value={`${snapshot.result.duplicate} / ${snapshot.result.failed}`} />
+          <DecisionValue label="实际扣费" value={snapshot.result.totalDebit} />
+          <DecisionValue label="供货商订单" value={snapshot.result.supplierOrderId} />
+        </div>
+      </div>
+    </details>
+  )
+}
+
+function ImportOverrideSetting({
+  children,
+  inherited,
+  label,
+  onInheritedChange,
+}: {
+  children: React.ReactNode
+  inherited: boolean
+  label: string
+  onInheritedChange: (inherited: boolean) => void
+}) {
+  return (
+    <div className="space-y-2 border border-border/50 p-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className="text-xs font-medium text-muted-foreground">{label}</span>
+        <label className="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+          <Checkbox
+            checked={inherited}
+            onCheckedChange={(checked) => onInheritedChange(checked === true)}
+            aria-label={`${label}继承公共设置`}
+          />
+          继承公共设置
+        </label>
+      </div>
+      {children}
+    </div>
+  )
+}
+
 export function KeySupplierPage() {
   const queryClient = useQueryClient()
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [creating, setCreating] = useState(false)
   const [config, setConfig] = useState<SupplierEntryUpdate | null>(null)
+  const [commonDraft, setCommonDraft] = useState<SupplierCommonConfig | null>(null)
+  const [commonRpmDraft, setCommonRpmDraft] = useState('')
+  const [commonPriorityDraft, setCommonPriorityDraft] = useState('')
   const [apiKey, setApiKey] = useState('')
   const [webhookToken, setWebhookToken] = useState('')
   const [webhookSecret, setWebhookSecret] = useState('')
@@ -125,6 +283,7 @@ export function KeySupplierPage() {
 
   // 供货商列表就是这个页面的「配置」来源，沿用 configQuery 这个名字。
   const configQuery = useQuery({ queryKey: ['supplier-config'], queryFn: listSuppliers })
+  const commonQuery = useQuery({ queryKey: ['supplier-common'], queryFn: getSupplierCommon })
   const suppliers = configQuery.data?.items ?? []
   const selectedEntry = suppliers.find((entry) => entry.id === selectedId) ?? null
   const eventSupplierId = scopeToSupplier && selectedId ? selectedId : undefined
@@ -146,6 +305,37 @@ export function KeySupplierPage() {
     queryKey: ['supplier-pool-status'],
     queryFn: getSupplierPoolStatus,
     refetchInterval: 30000,
+  })
+
+  const commonRpm = parseSupplierNumberDraft(commonRpmDraft, 0)
+  const commonPriority = parseSupplierNumberDraft(commonPriorityDraft, 0)
+  const commonNumbersValid = commonRpm !== null && commonPriority !== null
+
+  useEffect(() => {
+    if (!commonQuery.data) return
+    setCommonDraft({ ...commonQuery.data, groups: [...commonQuery.data.groups] })
+    setCommonRpmDraft(String(commonQuery.data.rpmLimit))
+    setCommonPriorityDraft(String(commonQuery.data.priority))
+  }, [commonQuery.data])
+
+  const saveCommon = useMutation({
+    mutationFn: () => {
+      if (!commonDraft || commonRpm === null || commonPriority === null) {
+        throw new Error('公共导入设置包含无效数字')
+      }
+      return updateSupplierCommon({
+        ...commonDraft,
+        rpmLimit: commonRpm,
+        priority: commonPriority,
+        groups: [...commonDraft.groups],
+      })
+    },
+    onSuccess: (saved) => {
+      queryClient.setQueryData(['supplier-common'], saved)
+      queryClient.invalidateQueries({ queryKey: ['supplier-config'] })
+      toast.success('公共导入设置已保存')
+    },
+    onError: (error) => toast.error(extractErrorMessage(error)),
   })
 
   // 数量输入保持字符串草稿：直接绑 number 会让用户清空输入框时跳成 0。
@@ -261,7 +451,10 @@ export function KeySupplierPage() {
     onError: (error) => toast.error(extractErrorMessage(error)),
   })
   const registerWebhook = useMutation({
-    mutationFn: () => registerSupplierEntryWebhook(selectedId as string),
+    mutationFn: async (supplierId: string) => ({
+      supplierId,
+      ...(await registerSupplierEntryWebhook(supplierId)),
+    }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['supplier-overview'] })
       toast.success('Webhook 已注册')
@@ -274,7 +467,10 @@ export function KeySupplierPage() {
     onError: (error) => toast.error(extractErrorMessage(error)),
   })
   const callbackUrlQuery = useMutation({
-    mutationFn: () => getSupplierCallbackUrl(selectedId as string),
+    mutationFn: async (supplierId: string) => ({
+      supplierId,
+      ...(await getSupplierCallbackUrl(supplierId)),
+    }),
     onError: (error) => toast.error(extractErrorMessage(error)),
   })
   const markRead = useMutation({
@@ -301,8 +497,52 @@ export function KeySupplierPage() {
   const updateNumericDraft = (field: SupplierNumericField, value: string) => {
     setNumericDrafts((current) => ({ ...current, [field]: value }))
   }
+  const updateImportOverride = (
+    field: ImportOverrideField,
+    value: ImportOverrideValue,
+  ) => {
+    setConfig((current) => current ? {
+      ...current,
+      ...importConfigPatch(field, value),
+      importOverrides: {
+        ...current.importOverrides,
+        [field]: field === 'groups' ? [...value as string[]] : value,
+      },
+    } : current)
+  }
+  const setImportFieldInherited = (field: ImportOverrideField, inherited: boolean) => {
+    if (inherited && !commonDraft) return
+    const commonValue = commonDraft ? importValueFromCommon(commonDraft, field) : null
+    setConfig((current) => {
+      if (!current) return current
+      const importOverrides = { ...current.importOverrides }
+      if (inherited && commonValue !== null) {
+        delete importOverrides[field]
+        return {
+          ...current,
+          ...importConfigPatch(field, commonValue),
+          importOverrides,
+        }
+      }
+      const value = importValueFromConfig(current, field)
+      return {
+        ...current,
+        importOverrides: {
+          ...importOverrides,
+          [field]: field === 'groups' ? [...value as string[]] : value,
+        },
+      }
+    })
+    if (inherited && commonValue !== null && field === 'rpmLimit') setNumericDrafts((values) => ({ ...values, rpmLimit: String(commonValue) }))
+    if (inherited && commonValue !== null && field === 'priority') setNumericDrafts((values) => ({ ...values, priority: String(commonValue) }))
+  }
+  const updateImportNumberDraft = (field: 'rpmLimit' | 'priority', value: string) => {
+    updateNumericDraft(field, value)
+    const parsed = parseSupplierNumberDraft(value, 0)
+    if (parsed !== null) updateImportOverride(field, parsed)
+  }
   const startCreating = () => {
-    const draft = emptySupplierEntry('kiro-app')
+    const draft = emptySupplierEntry('kiro-app', commonDraft ?? undefined)
     setCreating(true)
     setConfig(draft)
     setNumericDrafts(toNumericDrafts(draft))
@@ -336,7 +576,24 @@ export function KeySupplierPage() {
   const parsedPurchaseCount = parseSupplierNumberDraft(purchaseCountDraft, 1)
   const purchaseCountValid = parsedPurchaseCount !== null && config !== null &&
     parsedPurchaseCount >= config.minPurchase && parsedPurchaseCount <= config.maxPurchase
-  const supportsWebhookRegistration = config?.kind === 'kiro-rs'
+  const capabilities = config ? getSupplierCapabilities(config.kind) : null
+  const supportsWebhookRegistration =
+    selectedEntry?.capabilities.supportsWebhookRegistration ?? false
+  const nicknamePreview = config
+    ? buildSupplierNicknamePreview(config.name, config.id, config.nicknamePrefix)
+    : ''
+  const changeSupplierKind = (kind: SupplierKind) => {
+    const defaults = emptySupplierEntry(kind, commonDraft ?? undefined)
+    setConfig((current) => current ? {
+      ...current,
+      kind,
+      baseUrl: defaults.baseUrl,
+      purchaseRegionMode: defaults.purchaseRegionMode,
+      purchaseRegion: defaults.purchaseRegion,
+      apiRegion: defaults.apiRegion,
+      credentialApiRegionFallback: defaults.credentialApiRegionFallback,
+    } : current)
+  }
   const handleSave = () => {
     if (!config) return
     if (
@@ -361,13 +618,13 @@ export function KeySupplierPage() {
       targetUsable: parsedTargetUsable,
       lowQuotaThreshold: parsedLowQuotaThreshold,
       maxUnitPrice: parsedMaxUnitPrice,
+      apiRegion: config.credentialApiRegionFallback,
       apiKey: apiKey || undefined,
       webhookToken: webhookToken || undefined,
       webhookSecret: webhookSecret || undefined,
     })
   }
   const copyCallbackUrl = async () => {
-    const callbackUrl = callbackUrlQuery.data?.callbackUrl ?? registerWebhook.data?.callbackUrl
     if (!callbackUrl) return
     try {
       await navigator.clipboard.writeText(callbackUrl)
@@ -382,7 +639,11 @@ export function KeySupplierPage() {
   const rows = eventsQuery.data?.items ?? []
   const showNext = rows.length === EVENT_PAGE_SIZE
   const purchaseResultSummary = '购买结果只显示计数，不展示 Key。'
-  const callbackUrl = callbackUrlQuery.data?.callbackUrl ?? registerWebhook.data?.callbackUrl
+  const callbackUrl = callbackUrlQuery.data?.supplierId === selectedId
+    ? callbackUrlQuery.data.callbackUrl
+    : registerWebhook.data?.supplierId === selectedId
+      ? registerWebhook.data.callbackUrl
+      : undefined
 
   return (
     <div className="space-y-5">
@@ -425,6 +686,105 @@ export function KeySupplierPage() {
             <Plus className="h-3.5 w-3.5" />
             添加供货商
           </Button>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="flex items-center gap-2">
+            <Settings2 className="h-4 w-4" />
+            公共导入设置
+          </CardTitle>
+          <CardDescription>新供应商默认继承这里的凭据导入属性；单家只保存明确覆盖的字段。</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {commonQuery.isLoading ? (
+            <div className="py-4 text-sm text-muted-foreground">加载公共设置中...</div>
+          ) : commonQuery.isError ? (
+            <div className="flex flex-wrap items-center gap-3 text-sm text-destructive" role="alert">
+              <span>{extractErrorMessage(commonQuery.error)}</span>
+              <Button size="sm" variant="outline" onClick={() => commonQuery.refetch()}>
+                <RefreshCw className="h-3.5 w-3.5" />
+                重试加载
+              </Button>
+            </div>
+          ) : commonDraft ? (
+            <>
+              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                <Field label="来源渠道">
+                  <Input
+                    value={commonDraft.sourceChannel}
+                    onChange={(event) => setCommonDraft({ ...commonDraft, sourceChannel: event.target.value })}
+                    disabled={saveCommon.isPending}
+                  />
+                </Field>
+                <Field label="Nickname 标签（可选）">
+                  <Input
+                    value={commonDraft.nicknameLabel}
+                    onChange={(event) => setCommonDraft({ ...commonDraft, nicknameLabel: event.target.value })}
+                    disabled={saveCommon.isPending}
+                  />
+                </Field>
+                <Field label="自动采购 RPM 预设">
+                  <Input
+                    type="number"
+                    min={0}
+                    value={commonRpmDraft}
+                    onChange={(event) => setCommonRpmDraft(event.target.value)}
+                    disabled={saveCommon.isPending}
+                  />
+                </Field>
+                <Field label="Priority">
+                  <Input
+                    type="number"
+                    min={0}
+                    value={commonPriorityDraft}
+                    onChange={(event) => setCommonPriorityDraft(event.target.value)}
+                    disabled={saveCommon.isPending}
+                  />
+                </Field>
+              </div>
+              <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(18rem,0.7fr)] lg:items-end">
+                <Field label="自动采购分组">
+                  <GroupMultiSelect
+                    value={commonDraft.groups}
+                    options={groupOptions}
+                    onChange={(groups) => setCommonDraft({ ...commonDraft, groups })}
+                    disabled={saveCommon.isPending}
+                  />
+                </Field>
+                <div className="flex min-h-9 items-center justify-between gap-3 border border-border/50 px-3 py-2">
+                  <label htmlFor="common-auto-delete-forbidden" className="text-sm font-medium">403 时自动删除</label>
+                  <Switch
+                    id="common-auto-delete-forbidden"
+                    checked={commonDraft.autoDeleteForbidden}
+                    onCheckedChange={(checked) => setCommonDraft({ ...commonDraft, autoDeleteForbidden: checked })}
+                    disabled={saveCommon.isPending}
+                  />
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-3 border-t border-border/50 pt-3">
+                <div className="min-w-0 text-xs text-muted-foreground">
+                  Nickname 预览：
+                  <code className="ml-1 break-all text-foreground">
+                    {buildSupplierNicknamePreview('ceo', 'ceo', commonDraft.nicknameLabel)}
+                  </code>
+                </div>
+                {!commonNumbersValid && (
+                  <span className="text-xs text-destructive" role="alert">RPM 和 Priority 必须是非负整数。</span>
+                )}
+                <Button
+                  className="ml-auto"
+                  size="sm"
+                  onClick={() => saveCommon.mutate()}
+                  disabled={saveCommon.isPending || !commonNumbersValid}
+                >
+                  {saveCommon.isPending && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                  保存公共设置
+                </Button>
+              </div>
+            </>
+          ) : null}
         </CardContent>
       </Card>
 
@@ -485,14 +845,20 @@ export function KeySupplierPage() {
             <div className="text-sm text-destructive">{extractErrorMessage(poolStatusQuery.error)}</div>
           ) : poolStatusQuery.data ? (
             <>
-              <div className="grid gap-px overflow-hidden border border-border/50 sm:grid-cols-2 lg:grid-cols-4">
-                <Metric label="当前可用" value={poolStatusQuery.data.globalUsable} />
+              <div className="grid gap-px overflow-hidden border border-border/50 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
+                <Metric label="目标存量" value={poolStatusQuery.data.targetCount} />
+                <Metric label="计入目标" value={poolStatusQuery.data.health.targetCredited} />
+                <Metric label="当前可调度" value={poolStatusQuery.data.health.ready} />
                 <Metric label="还差" value={poolStatusQuery.data.deficit} />
-                <Metric label="已判死" value={poolStatusQuery.data.health.dead} />
                 <Metric
-                  label="额度耗尽 / 低于水位"
-                  value={`${poolStatusQuery.data.health.quotaExhausted} / ${poolStatusQuery.data.health.lowQuota}`}
+                  label="人工暂停 / 冷却"
+                  value={`${poolStatusQuery.data.health.manualReserved} / ${poolStatusQuery.data.health.cooling}`}
                 />
+                <Metric label="系统禁用" value={poolStatusQuery.data.health.systemDisabled} />
+              </div>
+              <div className="text-xs text-muted-foreground">
+                系统禁用不计入目标存量；人工暂停和临时冷却仍计入，避免短时状态触发重复采购。
+                已判死 {poolStatusQuery.data.health.dead} 个 · 额度耗尽 {poolStatusQuery.data.health.quotaExhausted} 个 · 低于水位 {poolStatusQuery.data.health.lowQuota} 个。
               </div>
               <div className="text-xs text-muted-foreground">
                 识别方式：按 supplierId {poolStatusQuery.data.bySupplierId} 个 · 按备注 {poolStatusQuery.data.byLegacyChannel} 个
@@ -522,7 +888,7 @@ export function KeySupplierPage() {
             <CardTitle className="flex items-center gap-2"><ShieldCheck className="h-4 w-4" />供应概览</CardTitle>
             <CardDescription>安全额度与库存状态，每 30 秒刷新。</CardDescription>
           </CardHeader>
-          <CardContent>
+          <CardContent className="space-y-3">
             {overviewQuery.isLoading ? <div className="py-4 text-sm text-muted-foreground">加载中...</div> : overviewQuery.isError ? <div className="py-4 text-sm text-destructive">{extractErrorMessage(overviewQuery.error)}</div> : overviewQuery.data ? (
               <div className="grid gap-px overflow-hidden border border-border/50 sm:grid-cols-2 lg:grid-cols-5">
                 {overviewQuery.data.kind === 'kiro-rs' ? (
@@ -541,10 +907,17 @@ export function KeySupplierPage() {
                       value={formatKeyPrice(overviewQuery.data.keyPrice, overviewQuery.data.keyPriceMax)}
                     />
                     <Metric label="剩余积分" value={overviewQuery.data.balance ?? '—'} />
-                    <Metric label="本地号池（可用 / 共）" value={`${overviewQuery.data.credentialHealth.usable} / ${overviewQuery.data.credentialHealth.total}`} />
-                    <Metric label="不可用构成（封 / 额度尽 / 额度低）" value={`${overviewQuery.data.credentialHealth.dead} / ${overviewQuery.data.credentialHealth.quotaExhausted} / ${overviewQuery.data.credentialHealth.lowQuota}`} />
+                    <Metric label="本地号池（计入目标 / 共）" value={`${overviewQuery.data.credentialHealth.targetCredited} / ${overviewQuery.data.credentialHealth.total}`} />
+                    <Metric label="可调度 / 系统禁用" value={`${overviewQuery.data.credentialHealth.ready} / ${overviewQuery.data.credentialHealth.systemDisabled}`} />
                   </>
                 )}
+              </div>
+            ) : null}
+            {overviewQuery.data ? (
+              <div className="text-xs text-muted-foreground">
+                人工暂停 {overviewQuery.data.credentialHealth.manualReserved} · 临时冷却 {overviewQuery.data.credentialHealth.cooling} ·
+                不可用构成：封禁 {overviewQuery.data.credentialHealth.dead} · 额度耗尽 {overviewQuery.data.credentialHealth.quotaExhausted} ·
+                低于额度水位 {overviewQuery.data.credentialHealth.lowQuota}。系统禁用的凭据不占目标存量。
               </div>
             ) : null}
           </CardContent>
@@ -594,7 +967,7 @@ export function KeySupplierPage() {
                       className="h-9 w-full border border-input bg-transparent px-3 text-sm"
                       aria-label="协议类型"
                       value={config.kind}
-                      onChange={(event) => updateField('kind', event.target.value as SupplierKind)}
+                      onChange={(event) => changeSupplierKind(event.target.value as SupplierKind)}
                       disabled={!creating || saveConfig.isPending}
                     >
                       {SUPPLIER_KINDS.map((kind) => <option key={kind} value={kind}>{getSupplierKindLabel(kind)}</option>)}
@@ -618,10 +991,6 @@ export function KeySupplierPage() {
                   <div><label htmlFor="auto-purchase" className="text-sm font-medium">自动购买</label><p className="text-xs text-muted-foreground">收到新 Key 就绪 Webhook 后自动发起一次购买。同一条推送重复到达不会重复购买。</p></div>
                   <Switch id="auto-purchase" checked={config.autoPurchase} onCheckedChange={(checked) => updateField('autoPurchase', checked)} disabled={saveConfig.isPending} aria-label="自动购买" />
                 </div>
-                <div className="flex items-center justify-between gap-3 border-b border-border/50 pb-3">
-                  <div><label htmlFor="auto-delete-forbidden" className="text-sm font-medium">403 时自动删除</label><p className="text-xs text-muted-foreground">仅删除按此预设导入的自动采购账号。</p></div>
-                  <Switch id="auto-delete-forbidden" checked={config.autoDeleteForbidden} onCheckedChange={(checked) => updateField('autoDeleteForbidden', checked)} disabled={saveConfig.isPending} aria-label="403 时自动删除" />
-                </div>
                 {poolDraft.enabled && (
                   <div className="border border-border/50 bg-secondary/20 p-3 text-xs text-muted-foreground">
                     全局号池已启用：本页的「仅在号不够用时补货」「补货水位」「额度水位」都不再参与判定，改由全局号池统一决定买不买、买几个。
@@ -635,16 +1004,145 @@ export function KeySupplierPage() {
                 <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
                   <Field label="单次最小购买量"><Input type="number" min={1} value={numericDrafts.minPurchase} onChange={(event) => updateNumericDraft('minPurchase', event.target.value)} disabled={saveConfig.isPending} /></Field>
                   <Field label={poolDraft.enabled ? '单次最大购买量（仅作安全上限）' : '单次最大购买量'}><Input type="number" min={1} value={numericDrafts.maxPurchase} onChange={(event) => updateNumericDraft('maxPurchase', event.target.value)} disabled={saveConfig.isPending} /></Field>
-                  <Field label="API Region"><Input value={config.apiRegion} onChange={(event) => updateField('apiRegion', event.target.value)} disabled={saveConfig.isPending} /></Field>
-                  <Field label="自动采购 RPM 预设"><Input type="number" min={0} value={numericDrafts.rpmLimit} onChange={(event) => updateNumericDraft('rpmLimit', event.target.value)} disabled={saveConfig.isPending} /></Field>
-                  <Field label="Priority"><Input type="number" min={0} value={numericDrafts.priority} onChange={(event) => updateNumericDraft('priority', event.target.value)} disabled={saveConfig.isPending} /></Field>
-                  <Field label="Source Channel"><Input value={config.sourceChannel} onChange={(event) => updateField('sourceChannel', event.target.value)} disabled={saveConfig.isPending} /></Field>
                   <Field label="目标存量（本家常备可用号数）"><Input type="number" min={0} value={numericDrafts.targetUsable} onChange={(event) => updateNumericDraft('targetUsable', event.target.value)} disabled={saveConfig.isPending || !config.restockOnlyWhenExhausted} /></Field>
-                  <Field label="单价上限（0 = 不限，按本家计价单位）"><Input type="number" min={0} step="0.01" value={numericDrafts.maxUnitPrice} onChange={(event) => updateNumericDraft('maxUnitPrice', event.target.value)} disabled={saveConfig.isPending} /></Field><Field label="额度水位（剩余额度）"><Input type="number" min={0} value={numericDrafts.lowQuotaThreshold} onChange={(event) => updateNumericDraft('lowQuotaThreshold', event.target.value)} disabled={saveConfig.isPending || !config.restockOnlyWhenExhausted} /></Field>
+                  <Field label="单价上限（0 = 不限，按本家计价单位）"><Input type="number" min={0} step="0.01" value={numericDrafts.maxUnitPrice} onChange={(event) => updateNumericDraft('maxUnitPrice', event.target.value)} disabled={saveConfig.isPending} /></Field>
+                  <Field label="额度水位（剩余额度）"><Input type="number" min={0} value={numericDrafts.lowQuotaThreshold} onChange={(event) => updateNumericDraft('lowQuotaThreshold', event.target.value)} disabled={saveConfig.isPending || !config.restockOnlyWhenExhausted} /></Field>
+                  {capabilities && capabilities.regionModes.some((mode) => mode !== 'omit') ? (
+                    <Field label="采购区域模式">
+                      <select
+                        className="h-9 w-full border border-input bg-transparent px-3 text-sm"
+                        aria-label="采购区域模式"
+                        value={config.purchaseRegionMode}
+                        onChange={(event) => {
+                          const mode = event.target.value as PurchaseRegionMode
+                          updateField('purchaseRegionMode', mode)
+                          if (mode === 'fixed' && config.purchaseRegion === null) updateField('purchaseRegion', 'us')
+                        }}
+                        disabled={saveConfig.isPending}
+                      >
+                        {capabilities.regionModes.map((mode) => (
+                          <option key={mode} value={mode}>{REGION_MODE_LABELS[mode]}</option>
+                        ))}
+                      </select>
+                    </Field>
+                  ) : null}
+                  {config.purchaseRegionMode === 'fixed' ? (
+                    <Field label="采购区域">
+                      <select
+                        className="h-9 w-full border border-input bg-transparent px-3 text-sm"
+                        aria-label="采购区域"
+                        value={config.purchaseRegion ?? 'us'}
+                        onChange={(event) => updateField('purchaseRegion', event.target.value as SupplierRegion)}
+                        disabled={saveConfig.isPending}
+                      >
+                        {SUPPLIER_REGIONS.map((region) => (
+                          <option key={region} value={region}>{SUPPLIER_REGION_LABELS[region]}</option>
+                        ))}
+                      </select>
+                    </Field>
+                  ) : null}
+                  <Field label="凭据 API 区域兜底">
+                    <select
+                      className="h-9 w-full border border-input bg-transparent px-3 text-sm"
+                      aria-label="凭据 API 区域兜底"
+                      value={config.credentialApiRegionFallback}
+                      onChange={(event) => {
+                        updateField('credentialApiRegionFallback', event.target.value)
+                        updateField('apiRegion', event.target.value)
+                      }}
+                      disabled={saveConfig.isPending}
+                    >
+                      {CREDENTIAL_API_REGIONS.map((region) => (
+                        <option key={region.value} value={region.value}>{region.label}</option>
+                      ))}
+                    </select>
+                  </Field>
                 </div>
-                <div className="grid gap-3 sm:grid-cols-2">
-                  <Field label="自动采购分组预设"><GroupMultiSelect value={config.groups} options={groupOptions} onChange={(groups) => updateField('groups', groups)} disabled={saveConfig.isPending} /></Field>
-                  <Field label="Nickname Prefix"><Input value={config.nicknamePrefix} onChange={(event) => updateField('nicknamePrefix', event.target.value)} disabled={saveConfig.isPending} /></Field>
+                <div className="space-y-3 border-t border-border/50 pt-4">
+                  <div>
+                    <h3 className="text-sm font-semibold">本家导入设置</h3>
+                    <p className="text-xs text-muted-foreground">默认继承公共导入设置；关闭继承后，仅本供应商使用覆盖值。</p>
+                  </div>
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <ImportOverrideSetting
+                      label="来源渠道"
+                      inherited={config.importOverrides.sourceChannel === undefined}
+                      onInheritedChange={(inherited) => setImportFieldInherited('sourceChannel', inherited)}
+                    >
+                      <Input
+                        value={config.sourceChannel}
+                        onChange={(event) => updateImportOverride('sourceChannel', event.target.value)}
+                        disabled={saveConfig.isPending || config.importOverrides.sourceChannel === undefined}
+                      />
+                    </ImportOverrideSetting>
+                    <ImportOverrideSetting
+                      label="Nickname 标签（可选）"
+                      inherited={config.importOverrides.nicknameLabel === undefined}
+                      onInheritedChange={(inherited) => setImportFieldInherited('nicknameLabel', inherited)}
+                    >
+                      <Input
+                        value={config.nicknamePrefix}
+                        onChange={(event) => updateImportOverride('nicknameLabel', event.target.value)}
+                        disabled={saveConfig.isPending || config.importOverrides.nicknameLabel === undefined}
+                      />
+                    </ImportOverrideSetting>
+                    <ImportOverrideSetting
+                      label="RPM"
+                      inherited={config.importOverrides.rpmLimit === undefined}
+                      onInheritedChange={(inherited) => setImportFieldInherited('rpmLimit', inherited)}
+                    >
+                      <Input
+                        type="number"
+                        min={0}
+                        value={numericDrafts.rpmLimit}
+                        onChange={(event) => updateImportNumberDraft('rpmLimit', event.target.value)}
+                        disabled={saveConfig.isPending || config.importOverrides.rpmLimit === undefined}
+                      />
+                    </ImportOverrideSetting>
+                    <ImportOverrideSetting
+                      label="Priority"
+                      inherited={config.importOverrides.priority === undefined}
+                      onInheritedChange={(inherited) => setImportFieldInherited('priority', inherited)}
+                    >
+                      <Input
+                        type="number"
+                        min={0}
+                        value={numericDrafts.priority}
+                        onChange={(event) => updateImportNumberDraft('priority', event.target.value)}
+                        disabled={saveConfig.isPending || config.importOverrides.priority === undefined}
+                      />
+                    </ImportOverrideSetting>
+                    <ImportOverrideSetting
+                      label="自动采购分组"
+                      inherited={config.importOverrides.groups === undefined}
+                      onInheritedChange={(inherited) => setImportFieldInherited('groups', inherited)}
+                    >
+                      <GroupMultiSelect
+                        value={config.groups}
+                        options={groupOptions}
+                        onChange={(groups) => updateImportOverride('groups', groups)}
+                        disabled={saveConfig.isPending || config.importOverrides.groups === undefined}
+                      />
+                    </ImportOverrideSetting>
+                    <ImportOverrideSetting
+                      label="403 时自动删除"
+                      inherited={config.importOverrides.autoDeleteForbidden === undefined}
+                      onInheritedChange={(inherited) => setImportFieldInherited('autoDeleteForbidden', inherited)}
+                    >
+                      <div className="flex min-h-9 items-center justify-between gap-3 px-1">
+                        <span className="text-xs text-muted-foreground">当前值：{config.autoDeleteForbidden ? '开启' : '关闭'}</span>
+                        <Switch
+                          checked={config.autoDeleteForbidden}
+                          onCheckedChange={(checked) => updateImportOverride('autoDeleteForbidden', checked)}
+                          disabled={saveConfig.isPending || config.importOverrides.autoDeleteForbidden === undefined}
+                          aria-label="本家 403 时自动删除"
+                        />
+                      </div>
+                    </ImportOverrideSetting>
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    Nickname 预览：<code className="break-all text-foreground">{nicknamePreview}</code>
+                  </div>
                 </div>
                 {!idValid && <p className="text-xs text-destructive">供货商 ID 必填，且只能包含字母、数字、- 和 _。</p>}
                 {!configNumbersValid && idValid && <p className="text-xs text-destructive">购买量需为正整数，且最小值不能大于最大值；RPM 和 Priority 需为非负整数。</p>}
@@ -689,7 +1187,7 @@ export function KeySupplierPage() {
               <CardDescription>
                 {supportsWebhookRegistration
                   ? '注册状态来自供应商账号；测试消息只验证连通性，不会购买。'
-                  : config?.kind === 'kiroapp-io'
+                  : selectedEntry?.kind === 'kiroapp-io'
                     // kiroapp.io 的文档没有签名头，所以别让人去找一个不存在的密钥。
                     ? '该供货商没有注册接口。复制下面的回调地址，粘贴到对方面板的「设置 → Webhook 配置」，可先发一条 test 事件验证连通。'
                     : '该供货商没有注册接口。复制下面的回调地址，粘贴到对方面板的「到货通知（Webhook）」里，再把它生成的签名密钥填到左边。'}
@@ -700,11 +1198,11 @@ export function KeySupplierPage() {
               <div className="flex flex-wrap gap-2">
                 {supportsWebhookRegistration ? (
                   <>
-                    <Button variant="outline" onClick={() => registerWebhook.mutate()} disabled={registerWebhook.isPending || selectedId === null}><Webhook className="h-3.5 w-3.5" />{overviewQuery.data?.webhookRegistered ? '重新注册 Webhook' : '注册 Webhook'}</Button>
-                    <Button variant="outline" onClick={() => testWebhook.mutate()} disabled={testWebhook.isPending || selectedId === null}><Send className="h-3.5 w-3.5" />测试 Webhook</Button>
+                    <Button variant="outline" onClick={() => registerWebhook.mutate(selectedId as string)} disabled={registerWebhook.isPending || creating || selectedId === null}><Webhook className="h-3.5 w-3.5" />{overviewQuery.data?.webhookRegistered ? '重新注册 Webhook' : '注册 Webhook'}</Button>
+                    <Button variant="outline" onClick={() => testWebhook.mutate()} disabled={testWebhook.isPending || creating || selectedId === null}><Send className="h-3.5 w-3.5" />测试 Webhook</Button>
                   </>
                 ) : (
-                  <Button variant="outline" onClick={() => callbackUrlQuery.mutate()} disabled={callbackUrlQuery.isPending || selectedId === null}><Clipboard className="h-3.5 w-3.5" />获取回调地址</Button>
+                  <Button variant="outline" onClick={() => callbackUrlQuery.mutate(selectedId as string)} disabled={callbackUrlQuery.isPending || creating || selectedId === null}><Clipboard className="h-3.5 w-3.5" />获取回调地址</Button>
                 )}
               </div>
             </CardContent>
@@ -715,7 +1213,7 @@ export function KeySupplierPage() {
       <Card>
         <CardHeader className="pb-3">
           <div className="flex flex-wrap items-center gap-2"><CardTitle className="flex items-center gap-2"><Bell className="h-4 w-4" />事件历史</CardTitle><Badge variant="secondary">{eventsQuery.data?.unreadCount ?? 0} 未读</Badge><div className="ml-auto flex flex-wrap gap-2"><Button size="sm" variant={scopeToSupplier ? 'default' : 'outline'} onClick={() => { setScopeToSupplier((current) => !current); setBefore(undefined); setPreviousCursors([]) }} disabled={selectedId === null}>{scopeToSupplier ? '只看当前供货商' : '全部供货商'}</Button><Button size="sm" variant="outline" onClick={() => markRead.mutate({ ids: selectedIds })} disabled={selectedIds.length === 0 || markRead.isPending}><CheckCheck className="h-3.5 w-3.5" />标记所选已读</Button><Button size="sm" variant="outline" onClick={() => markRead.mutate({ markAll: true, supplierId: eventSupplierId })} disabled={(eventsQuery.data?.unreadCount ?? 0) === 0 || markRead.isPending}><CheckCheck className="h-3.5 w-3.5" />全部标记已读</Button></div></div>
-          <CardDescription>每 5 秒刷新；仅展示事件元数据与处理计数。</CardDescription>
+          <CardDescription>每 5 秒刷新；记录处理计数以及当时的存量、报价与区域判定。</CardDescription>
         </CardHeader>
         <CardContent className="space-y-2">
           {eventsQuery.isLoading ? <div className="py-5 text-sm text-muted-foreground">加载事件中...</div> : eventsQuery.isError ? <div className="py-5 text-sm text-destructive">{extractErrorMessage(eventsQuery.error)}</div> : rows.length === 0 ? <div className="py-5 text-sm text-muted-foreground">暂无事件。</div> : rows.map((event) => {
@@ -723,7 +1221,23 @@ export function KeySupplierPage() {
             const retryable = event.status === 'failed' || event.status === 'skipped' || event.retryAfter !== null
             return <div key={event.id} className={`grid gap-2 border border-border/50 p-3 sm:grid-cols-[auto_minmax(0,1fr)_auto] sm:items-center ${event.readAt === null ? 'border-primary/40 bg-primary/[0.03]' : ''}`}>
               <Checkbox checked={selectedIds.includes(event.id)} onCheckedChange={(checked) => toggleSelected(event.id, checked === true)} aria-label={`选择事件 ${event.id}`} />
-              <div className="min-w-0 space-y-1"><div className="flex flex-wrap items-center gap-2"><Badge variant="outline">{event.supplierId}</Badge><span className="break-all font-mono text-xs text-muted-foreground">{event.eventId}</span><Badge variant={eventBadgeVariant(event.status)}>{getSupplierEventStatusLabel(event.status)}</Badge>{event.retryAfter !== null && <Badge variant="warning">{formatTime(event.retryAfter)} 自动重试</Badge>}<span className="min-w-0 break-all text-sm font-medium">{event.eventType}</span><Badge variant="outline">{event.readAt === null ? '未读' : '已读'}</Badge></div><div className="break-words text-xs text-muted-foreground">{eventDetail(event)} · 尝试 {event.attempts} · 重复推送 {event.webhookDuplicateCount} · {formatTime(event.receivedAt)}</div>{event.purchaseOrderId && <div className="break-all text-xs text-muted-foreground">订单 ID：{event.purchaseOrderId}</div>}{event.message && <div className="break-words text-xs text-muted-foreground">{event.message}</div>}{event.lastError && <div className="break-words text-xs text-destructive">{event.lastError}</div>}</div>
+              <div className="min-w-0 space-y-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <Badge variant="outline">{event.supplierId}</Badge>
+                  <span className="break-all font-mono text-xs text-muted-foreground">{event.eventId}</span>
+                  <Badge variant={eventBadgeVariant(event.status)}>{getSupplierEventStatusLabel(event.status)}</Badge>
+                  {event.retryAfter !== null && <Badge variant="warning">{formatTime(event.retryAfter)} 自动重试</Badge>}
+                  <span className="min-w-0 break-all text-sm font-medium">{event.eventType}</span>
+                  <Badge variant="outline">{event.readAt === null ? '未读' : '已读'}</Badge>
+                </div>
+                <div className="break-words text-xs text-muted-foreground">
+                  {eventDetail(event)} · 尝试 {event.attempts} · 重复推送 {event.webhookDuplicateCount} · {formatTime(event.receivedAt)}
+                </div>
+                {event.purchaseOrderId && <div className="break-all text-xs text-muted-foreground">订单 ID：{event.purchaseOrderId}</div>}
+                {event.message && <div className="break-words text-xs text-muted-foreground">{event.message}</div>}
+                {event.lastError && <div className="break-words text-xs text-destructive">{event.lastError}</div>}
+                {event.decisionSnapshot ? <DecisionSnapshotDetails snapshot={event.decisionSnapshot} /> : null}
+              </div>
               {retryable && <Button size="sm" variant="outline" onClick={() => retryEvent.mutate(event.id)} disabled={retryEvent.isPending}><RotateCcw className="h-3.5 w-3.5" />重试</Button>}
             </div>
           })}

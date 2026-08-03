@@ -10,23 +10,30 @@ use std::time::Duration;
 use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::Value;
 
-use crate::admin::key_supplier::client::{SupplierClient, SupplierSnapshot};
+use crate::admin::key_supplier::capabilities::RegionSource;
+use crate::admin::key_supplier::client::{PurchaseContext, SupplierClient, SupplierSnapshot};
 use crate::admin::key_supplier::config::{
-    MAX_SUPPLIERS, PoolConfigUpdate, PoolConfigView, PoolRuntimeConfig, SupplierConfigUpdate,
-    SupplierConfigView, SupplierEntryRuntime, SupplierEntryUpdate, SupplierEntryView,
-    SupplierRuntimeConfig, is_valid_webhook_token, normalize_supplier_id, store_suppliers,
+    MAX_SUPPLIERS, PoolConfigUpdate, PoolConfigView, PoolRuntimeConfig,
+    ResolvedSupplierImportPreset, SupplierCommonConfigUpdate, SupplierCommonConfigView,
+    SupplierConfigUpdate, SupplierConfigView, SupplierEntryRuntime, SupplierEntryUpdate,
+    SupplierEntryView, SupplierRuntimeConfig, is_valid_webhook_token, normalize_supplier_id,
+    store_suppliers,
 };
 use crate::admin::key_supplier::pool::{
     PoolDecision, PoolSkipReason, deficit, select_pool_purchase_count,
 };
 use crate::admin::key_supplier::store::{
     IncomingSupplierEvent, InsertOutcome, LEGACY_SUPPLIER_ID, ProcessSummary, StoredSupplierEvent,
-    SupplierEventStore,
+    SupplierDecisionOutcome, SupplierDecisionQuote, SupplierDecisionRegion, SupplierDecisionResult,
+    SupplierDecisionSnapshot, SupplierDecisionSupplier, SupplierDecisionTarget,
+    SupplierDecisionTrigger, SupplierEventStore,
 };
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::region::API_KEY_AUTH_REGION;
 use crate::kiro::token_manager::{MultiTokenManager, PoolHealth, SupplierCredentialHealth};
-use crate::model::config::{Config, KeySupplierPoolConfig, SupplierKind};
+use crate::model::config::{
+    Config, KeySupplierPoolConfig, PurchaseRegionMode, SupplierKind, SupplierRegion,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CountDecision {
@@ -58,6 +65,7 @@ pub enum IncomingWebhook {
         /// 供货商侧的开号批次号（`kiroapp-io` 的 `order_id`）。带上它采购就只拉
         /// 这一车产出的 key。对方没给就是 `None`，退化成从公共池子取。
         supplier_batch_id: Option<String>,
+        event_region: Option<SupplierRegion>,
         message: String,
         new_keys: u32,
     },
@@ -161,6 +169,7 @@ impl IncomingWebhook {
 
         let new_keys = optional_quantity(object, &["new_keys", "newKeys", "count"]).unwrap_or(0);
         let supplier_batch_id = optional_id(object, &["order_id", "orderId"]);
+        let event_region = optional_region(object, &["region", "zone"]);
         // 优先用对方派生的幂等键：拉取超时后原样重发即命中幂等重放，不会二次扣费。
         // 它必须是 32 hex（采购接口的硬要求），不合格就从 event_id 自己派生。
         let purchase_order_id = optional_id(object, &["client_order_id", "clientOrderId"])
@@ -171,6 +180,7 @@ impl IncomingWebhook {
             event_id,
             purchase_order_id,
             supplier_batch_id,
+            event_region,
             message,
             new_keys,
         })
@@ -199,6 +209,7 @@ impl IncomingWebhook {
                 purchase_order_id: required_id(object, "purchase_order_id")?,
                 // kiro-rs 没有批次概念。
                 supplier_batch_id: None,
+                event_region: None,
                 message,
                 new_keys: required_quantity(object, "new_keys")?,
             }),
@@ -277,6 +288,7 @@ impl IncomingWebhook {
                     },
                     // 只有当原值当不了幂等键时才需要单独留痕；能当键时它就是订单号本身。
                     supplier_batch_id: (!usable_as_key).then_some(raw_order).flatten(),
+                    event_region: optional_region(object, &["zone", "region"]),
                     event_id,
                     message,
                     new_keys: optional_quantity(object, &["new_keys", "newKeys", "count"])
@@ -346,6 +358,7 @@ impl IncomingWebhook {
             purchase_order_id,
             // kiroapp.cc 的 claim 不接受批次定向。
             supplier_batch_id: None,
+            event_region: None,
             message,
             new_keys,
         })
@@ -358,6 +371,7 @@ impl IncomingWebhook {
                 event_id,
                 purchase_order_id,
                 supplier_batch_id,
+                event_region,
                 message,
                 new_keys,
             } => IncomingSupplierEvent {
@@ -366,6 +380,7 @@ impl IncomingWebhook {
                 event_type: "new_keys_available".to_string(),
                 purchase_order_id: Some(purchase_order_id),
                 supplier_batch_id,
+                event_region,
                 message: Some(message),
                 quantity: i64::from(new_keys),
             },
@@ -379,6 +394,7 @@ impl IncomingWebhook {
                 event_type: "all_keys_dead".to_string(),
                 purchase_order_id: None,
                 supplier_batch_id: None,
+                event_region: None,
                 message: Some(message),
                 quantity: i64::from(dead),
             },
@@ -388,6 +404,7 @@ impl IncomingWebhook {
                 event_type: "test".to_string(),
                 purchase_order_id: None,
                 supplier_batch_id: None,
+                event_region: None,
                 message: Some(message),
                 quantity: 0,
             },
@@ -402,6 +419,7 @@ impl IncomingWebhook {
                 event_type,
                 purchase_order_id: None,
                 supplier_batch_id: None,
+                event_region: None,
                 message: Some(message),
                 quantity: i64::from(quantity),
             },
@@ -579,6 +597,18 @@ fn optional_id(object: &serde_json::Map<String, Value>, fields: &[&str]) -> Opti
         return Some(if usable { raw } else { derive_order_id(&raw) });
     }
     None
+}
+
+fn optional_region(
+    object: &serde_json::Map<String, Value>,
+    fields: &[&str],
+) -> Option<SupplierRegion> {
+    fields.iter().find_map(|field| {
+        object
+            .get(*field)
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse::<SupplierRegion>().ok())
+    })
 }
 
 /// 在候选字段名里找第一个能当数量用的值。数组按长度算（`{"keys":[...]}`）。
@@ -780,6 +810,8 @@ pub struct KeySupplierService {
     /// 全局号池配置。读多写少，与 `suppliers` 同构；写路径同样由
     /// `config_update_lock` 串行化并与它共用同一把锁。
     pool: parking_lot::RwLock<PoolRuntimeConfig>,
+    /// 所有供货商共享的凭据导入预设；单家只保存显式覆盖。
+    common_import: parking_lot::RwLock<ResolvedSupplierImportPreset>,
 }
 
 impl fmt::Debug for KeySupplierService {
@@ -788,6 +820,7 @@ impl fmt::Debug for KeySupplierService {
             .debug_struct("KeySupplierService")
             .field("suppliers", &*self.suppliers.read())
             .field("pool", &*self.pool.read())
+            .field("common_import", &*self.common_import.read())
             .field("config_path", &self.config_path)
             .field(
                 "processor_started",
@@ -820,6 +853,7 @@ impl KeySupplierService {
             processor_started: AtomicBool::new(false),
             wakeup: tokio::sync::Notify::new(),
             pool: parking_lot::RwLock::new(PoolRuntimeConfig::default()),
+            common_import: parking_lot::RwLock::new(ResolvedSupplierImportPreset::default()),
         }
     }
 
@@ -847,6 +881,7 @@ impl KeySupplierService {
             processor_started: AtomicBool::new(false),
             wakeup: tokio::sync::Notify::new(),
             pool: parking_lot::RwLock::new(PoolRuntimeConfig::default()),
+            common_import: parking_lot::RwLock::new(ResolvedSupplierImportPreset::default()),
         }
     }
 
@@ -912,6 +947,44 @@ impl KeySupplierService {
     pub fn with_pool_config(self, pool: PoolRuntimeConfig) -> Self {
         *self.pool.write() = pool;
         self
+    }
+
+    pub fn with_common_import(self, common: ResolvedSupplierImportPreset) -> Self {
+        {
+            let mut suppliers = self.suppliers.write();
+            for entry in suppliers.iter_mut() {
+                let resolved = common
+                    .resolve(&entry.import_overrides)
+                    .expect("启动时已校验供货商导入覆盖");
+                resolved.materialize_runtime(&mut entry.settings);
+            }
+        }
+        *self.common_import.write() = common;
+        self
+    }
+
+    pub fn common_import_view(&self) -> SupplierCommonConfigView {
+        SupplierCommonConfigView::from(&*self.common_import.read())
+    }
+
+    pub fn update_common_import(
+        &self,
+        update: SupplierCommonConfigUpdate,
+    ) -> Result<SupplierCommonConfigView, SupplierServiceError> {
+        let _guard = self.config_update_lock.lock();
+        let common = ResolvedSupplierImportPreset::normalize_update(update)
+            .map_err(|_| SupplierServiceError::SupplierConfiguration)?;
+        let mut entries = self.suppliers.read().clone();
+        for entry in &mut entries {
+            let resolved = common
+                .resolve(&entry.import_overrides)
+                .map_err(|_| SupplierServiceError::SupplierConfiguration)?;
+            resolved.materialize_runtime(&mut entry.settings);
+        }
+        self.persist_common_import(&common, &entries)?;
+        *self.common_import.write() = common.clone();
+        *self.suppliers.write() = entries;
+        Ok(SupplierCommonConfigView::from(&common))
     }
 
     pub fn pool_config(&self) -> PoolRuntimeConfig {
@@ -1080,6 +1153,7 @@ impl KeySupplierService {
                     .unwrap_or_else(|| "默认供货商".to_owned()),
                 kind: primary.as_ref().map_or(SupplierKind::KiroRs, |e| e.kind),
                 enabled: primary.as_ref().is_none_or(|entry| entry.enabled),
+                import_overrides: None,
                 settings: update,
             },
         )?;
@@ -1108,9 +1182,14 @@ impl KeySupplierService {
             None => None,
         };
         let existing = existing_index.map(|index| entries[index].clone());
-        let runtime =
-            SupplierEntryRuntime::normalize_update(id.as_deref(), update, existing.as_ref())
-                .map_err(|_| SupplierServiceError::SupplierConfiguration)?;
+        let common = self.common_import.read().clone();
+        let runtime = SupplierEntryRuntime::normalize_update_with_common(
+            id.as_deref(),
+            update,
+            existing.as_ref(),
+            &common,
+        )
+        .map_err(|_| SupplierServiceError::SupplierConfiguration)?;
 
         match existing_index {
             Some(index) => entries[index] = runtime.clone(),
@@ -1159,6 +1238,23 @@ impl KeySupplierService {
             .map_err(|_| SupplierServiceError::ConfigPersistence)
     }
 
+    fn persist_common_import(
+        &self,
+        common: &ResolvedSupplierImportPreset,
+        entries: &[SupplierEntryRuntime],
+    ) -> Result<(), SupplierServiceError> {
+        let path = self
+            .config_path
+            .as_ref()
+            .ok_or(SupplierServiceError::ConfigPathUnavailable)?;
+        let mut config = Config::load(path).map_err(|_| SupplierServiceError::ConfigPersistence)?;
+        config.key_supplier_common = crate::model::config::KeySupplierCommonConfig::from(common);
+        store_suppliers(&mut config, entries);
+        config
+            .save()
+            .map_err(|_| SupplierServiceError::ConfigPersistence)
+    }
+
     fn client_for(
         &self,
         entry: &SupplierEntryRuntime,
@@ -1191,9 +1287,10 @@ impl KeySupplierService {
         let entry = self
             .supplier(id)
             .ok_or(SupplierServiceError::SupplierNotFound)?;
+        let (overview_region, _) = requested_purchase_region(&entry.settings, None);
         let snapshot = self
             .client_for(&entry)?
-            .snapshot()
+            .snapshot_for(overview_region)
             .await
             .map_err(SupplierServiceError::supplier_api)?;
         let webhook_registered = match (&snapshot.webhook_url, self.supplier_callback_url(id).ok())
@@ -1476,6 +1573,7 @@ impl KeySupplierService {
             purchase_order_id: Some(order_id.clone()),
             // 手动采购不定向批次：从对方公共库存里取。
             supplier_batch_id: None,
+            event_region: None,
             message: None,
             quantity: i64::from(count),
         };
@@ -1505,21 +1603,47 @@ impl KeySupplierService {
         &self,
         event: StoredSupplierEvent,
     ) -> Result<ProcessSummary, SupplierServiceError> {
+        let decision_entry = self.supplier(&event.supplier_id);
+        let decision_pool = self.pool_config();
         match self.execute_claimed(&event).await {
             Ok(ProcessAction::Complete(summary)) => {
+                let summary = attach_decision_snapshot(
+                    summary,
+                    &event,
+                    decision_entry.as_ref(),
+                    &decision_pool,
+                    SupplierDecisionOutcome::Succeeded,
+                    None,
+                );
                 let stored_summary = summary.clone();
                 self.run_store_operation(move |store| store.complete(event.id, stored_summary))
                     .await?;
                 Ok(summary)
             }
             Ok(ProcessAction::Skip) => {
+                let summary = attach_decision_snapshot(
+                    empty_summary(),
+                    &event,
+                    decision_entry.as_ref(),
+                    &decision_pool,
+                    SupplierDecisionOutcome::Skipped,
+                    Some("purchase skipped"),
+                );
                 self.run_store_operation(move |store| {
-                    store.skip(event.id, Some("purchase skipped"))
+                    store.skip_with_summary(event.id, Some("purchase skipped"), summary)
                 })
                 .await?;
                 Ok(empty_summary())
             }
             Ok(ProcessAction::SkipWithReason { reason, summary }) => {
+                let summary = attach_decision_snapshot(
+                    summary,
+                    &event,
+                    decision_entry.as_ref(),
+                    &decision_pool,
+                    SupplierDecisionOutcome::Skipped,
+                    Some(&reason),
+                );
                 self.run_store_operation(move |store| {
                     store.skip_with_summary(event.id, Some(&reason), summary)
                 })
@@ -1528,6 +1652,14 @@ impl KeySupplierService {
             }
             Ok(ProcessAction::Failed { summary, error }) => {
                 let persistence_error = self.sanitize_for(&event.supplier_id, &error);
+                let summary = attach_decision_snapshot(
+                    summary,
+                    &event,
+                    decision_entry.as_ref(),
+                    &decision_pool,
+                    SupplierDecisionOutcome::Failed,
+                    Some(&persistence_error),
+                );
                 self.run_store_operation(move |store| {
                     store.fail_with_summary(event.id, summary, &persistence_error)
                 })
@@ -1548,8 +1680,21 @@ impl KeySupplierService {
             }
             Err(error) => {
                 let persistence_error = self.sanitize_for(&event.supplier_id, &error);
-                self.run_store_operation(move |store| store.fail(event.id, &persistence_error))
-                    .await?;
+                let summary = attach_decision_snapshot(
+                    ProcessSummary {
+                        failed_count: 1,
+                        ..Default::default()
+                    },
+                    &event,
+                    decision_entry.as_ref(),
+                    &decision_pool,
+                    SupplierDecisionOutcome::Failed,
+                    Some(&persistence_error),
+                );
+                self.run_store_operation(move |store| {
+                    store.fail_with_summary(event.id, summary, &persistence_error)
+                })
+                .await?;
                 Err(error)
             }
         }
@@ -1586,15 +1731,15 @@ impl KeySupplierService {
         // 全 `None`，落库时走 `COALESCE` 不会覆盖任何已有值。
         let mut pool_snapshot = ProcessSummary::default();
 
-        // 报价来自哪个区，下单必须打同一个区（只有 kiro.ceo 有区的概念）。在这里声明
-        // 而不是在决定数量的那个分支里：下单发生在分支之外，值必须活到那时候。
-        let mut quote_zone: Option<String> = None;
-
         // 事件带 supplier_id，处理时按它找回供货商；供货商被删掉就跳过而不是报错。
         let entry = self
             .supplier(&event.supplier_id)
             .ok_or(SupplierServiceError::SupplierNotFound)?;
         let runtime = &entry.settings;
+        let (mut requested_region, mut requested_region_source) =
+            requested_purchase_region(runtime, event.event_region);
+        pool_snapshot.decision_requested_region = requested_region;
+        pool_snapshot.decision_requested_region_source = requested_region_source;
         if event.event_type == "new_keys_available" && (!runtime.auto_purchase || !entry.enabled) {
             return Ok(ProcessAction::Skip);
         }
@@ -1653,6 +1798,11 @@ impl KeySupplierService {
                 target: pool.target_count,
                 usable: health.health.usable,
             })
+            .inspect(|gate| {
+                pool_snapshot.decision_gate_scope = Some(gate.scope.to_owned());
+                pool_snapshot.decision_target = Some(gate.target);
+                pool_snapshot.decision_health = Some(health.health);
+            })
         } else if runtime.restock_only_when_exhausted {
             let health =
                 importer.supplier_health(&entry.id, f64::from(runtime.low_quota_threshold));
@@ -1670,6 +1820,11 @@ impl KeySupplierService {
                 scope: "供货商水位",
                 target: runtime.target_usable,
                 usable: health.usable,
+            })
+            .inspect(|gate| {
+                pool_snapshot.decision_gate_scope = Some(gate.scope.to_owned());
+                pool_snapshot.decision_target = Some(gate.target);
+                pool_snapshot.decision_health = Some(health);
             })
         } else {
             None
@@ -1741,10 +1896,17 @@ impl KeySupplierService {
                         u64::from(runtime.max_purchase)
                     }
                     SupplierKind::KiroApp | SupplierKind::KiroAppIo => {
-                        match client.purchase_quote().await {
+                        match client.purchase_quote_for(requested_region).await {
                             Ok(quote) => {
                                 unit_price = quote.unit_price;
-                                quote_zone = quote.zone;
+                                if let Some(region) = quote
+                                    .zone
+                                    .as_deref()
+                                    .and_then(|zone| zone.parse::<SupplierRegion>().ok())
+                                {
+                                    requested_region = Some(region);
+                                    requested_region_source = Some(RegionSource::Request);
+                                }
                                 quote.stock
                             }
                             Err(error) => return defer_or_fail(event, true, None, error),
@@ -1754,10 +1916,17 @@ impl KeySupplierService {
                     // `/api/status` 的 `keys_stock`，不是 kiro-rs 那个 `/api/my/stock`。
                     // kiro.ceo 的文档也建议先查 `/api/my/stock` 的 `max` 再提货。
                     SupplierKind::KiroRs | SupplierKind::KiroDrop | SupplierKind::KiroCeo => {
-                        match client.purchase_quote().await {
+                        match client.purchase_quote_for(requested_region).await {
                             Ok(quote) => {
                                 unit_price = quote.unit_price;
-                                quote_zone = quote.zone;
+                                if let Some(region) = quote
+                                    .zone
+                                    .as_deref()
+                                    .and_then(|zone| zone.parse::<SupplierRegion>().ok())
+                                {
+                                    requested_region = Some(region);
+                                    requested_region_source = Some(RegionSource::Request);
+                                }
                                 quote.stock
                             }
                             // 查库存是 GET，没花钱，重放永远安全。
@@ -1765,6 +1934,10 @@ impl KeySupplierService {
                         }
                     }
                 };
+                pool_snapshot.decision_vendor_stock = Some(available);
+                pool_snapshot.decision_quoted_unit_price = unit_price;
+                pool_snapshot.decision_requested_region = requested_region;
+                pool_snapshot.decision_requested_region_source = requested_region_source;
 
                 // 单价闸。放在库存夹逼**之后、下单之前**：能拿到价就比，拿不到就不买。
                 //
@@ -1864,6 +2037,7 @@ impl KeySupplierService {
             }
             _ => unreachable!("event type was validated before purchase"),
         };
+        pool_snapshot.decision_requested_count = Some(count);
 
         // 发请求前再校验一次「不超过本次缺口」。上面算完到这里之间没有 await，
         // 但这道校验是廉价的最后一关：任何将来插进来的逻辑一旦把数量放大，
@@ -1889,14 +2063,22 @@ impl KeySupplierService {
             .purchase_order_id
             .as_deref()
             .ok_or(SupplierServiceError::InvalidEvent)?;
-        // 带上供货商的批次号（只有 kiroapp-io 有）：定向拉这一车产出的 key，
-        // 不用从公共池子里跟别人抢。
+        // 只有 batch 模式才用供货商批次号定向拉取。fixed 模式必须忽略事件里的批次，
+        // 否则客户端会优先发送 order_id，静默覆盖用户配置的采购区域。
         let purchase = match client
-            .purchase_batch(
+            .purchase_with_context(
                 count,
                 order_id,
-                event.supplier_batch_id.as_deref(),
-                quote_zone.as_deref(),
+                PurchaseContext {
+                    supplier_batch_id: if runtime.purchase_region_mode == PurchaseRegionMode::Batch
+                    {
+                        event.supplier_batch_id.as_deref()
+                    } else {
+                        None
+                    },
+                    requested_region,
+                    region_source: requested_region_source,
+                },
             )
             .await
         {
@@ -1982,6 +2164,18 @@ impl KeySupplierService {
             // 解释「这次为什么买了这么多」。
             ..pool_snapshot
         };
+        summary.decision_actual_region = purchase.actual_region;
+        summary.decision_actual_region_source = purchase.region_source;
+        let purchase_response_region = (purchase.region_source
+            == Some(RegionSource::PurchaseResponse))
+        .then_some(purchase.actual_region)
+        .flatten();
+        let credential_region = resolve_credential_region(
+            purchase_response_region,
+            event.event_region,
+            requested_region,
+            runtime,
+        );
         let mut import_failed = false;
         for (index, key) in purchase.keys.into_iter().enumerate() {
             let price = key.price();
@@ -1993,6 +2187,7 @@ impl KeySupplierService {
                 order_id,
                 index + 1,
                 price,
+                &credential_region.api_region,
             );
             match importer.import(credential).await {
                 Ok(()) => summary.imported_count += 1,
@@ -2075,10 +2270,96 @@ fn empty_summary() -> ProcessSummary {
     ProcessSummary::default()
 }
 
+fn decision_snapshot(
+    event: &StoredSupplierEvent,
+    entry: Option<&SupplierEntryRuntime>,
+    pool: &PoolRuntimeConfig,
+    summary: &ProcessSummary,
+    outcome: SupplierDecisionOutcome,
+    reason: Option<&str>,
+) -> SupplierDecisionSnapshot {
+    let settings = entry.map(|entry| &entry.settings);
+    let target = summary.decision_target.or_else(|| {
+        summary
+            .pool_usable
+            .zip(summary.pool_deficit)
+            .and_then(|(usable, deficit)| u32::try_from(usable.saturating_add(deficit)).ok())
+    });
+    SupplierDecisionSnapshot {
+        version: 1,
+        outcome,
+        reason: reason.map(str::to_owned),
+        trigger: SupplierDecisionTrigger {
+            event_type: event.event_type.clone(),
+            quantity: event.quantity,
+            attempt: event.attempts,
+        },
+        supplier: SupplierDecisionSupplier {
+            id: event.supplier_id.clone(),
+            kind: entry.map(|entry| entry.kind),
+            enabled: entry.map(|entry| entry.enabled),
+            auto_purchase: settings.map(|settings| settings.auto_purchase),
+            min_purchase: settings.map(|settings| settings.min_purchase),
+            max_purchase: settings.map(|settings| settings.max_purchase),
+        },
+        target: SupplierDecisionTarget {
+            scope: summary.decision_gate_scope.clone(),
+            configured: target,
+            credited_at_decision: summary.pool_usable,
+            deficit: summary.pool_deficit,
+            requested: summary
+                .pool_requested
+                .or(summary.decision_requested_count.map(i64::from)),
+            reached: summary.pool_deficit.map(|deficit| deficit == 0),
+            health: summary.decision_health,
+            global_pool_enabled: pool.enabled,
+        },
+        quote: SupplierDecisionQuote {
+            vendor_stock: summary.decision_vendor_stock,
+            unit_price: summary.decision_quoted_unit_price.or(summary.unit_price),
+            max_unit_price: settings.map(|settings| settings.max_unit_price),
+        },
+        region: SupplierDecisionRegion {
+            mode: settings.map(|settings| settings.purchase_region_mode),
+            configured_purchase_region: settings.and_then(|settings| settings.purchase_region),
+            webhook_region: event.event_region,
+            requested_region: summary.decision_requested_region,
+            requested_region_source: summary.decision_requested_region_source,
+            actual_region: summary.decision_actual_region,
+            actual_region_source: summary.decision_actual_region_source,
+            credential_api_region_fallback: settings
+                .map(|settings| settings.credential_api_region_fallback.clone()),
+        },
+        result: SupplierDecisionResult {
+            purchased: summary.purchased_count,
+            imported: summary.imported_count,
+            duplicate: summary.duplicate_count,
+            failed: summary.failed_count,
+            total_debit: summary.total_debit,
+            supplier_order_id: summary.supplier_order_id.clone(),
+            replayed: summary.replayed,
+        },
+    }
+}
+
+fn attach_decision_snapshot(
+    mut summary: ProcessSummary,
+    event: &StoredSupplierEvent,
+    entry: Option<&SupplierEntryRuntime>,
+    pool: &PoolRuntimeConfig,
+    outcome: SupplierDecisionOutcome,
+    reason: Option<&str>,
+) -> ProcessSummary {
+    summary.decision_snapshot = Some(decision_snapshot(
+        event, entry, pool, &summary, outcome, reason,
+    ));
+    summary
+}
+
 /// 自动采购来的号叫什么名字：`drop-a19fe933-1` = **来源 + 订单号片段 + 序号**。
 ///
 /// 来源默认取供货商名——不配任何东西也能一眼看出这号是谁家的，这是以前缺的。
-/// 配了 `nickname_prefix` 就以它为准（去掉尾部分隔符再统一用 `-` 拼，免得出现 `a--b`）。
+/// 配了 `nickname_prefix` 就把它当标签附在供货商名后面，绝不能替换供货商名。
 ///
 /// 后缀刻意用订单号片段而不是新掷的随机串。它看起来一样随机（自动采购的订单号由
 /// `event_id` 派生、手动是 uuid），但能一眼回查到是哪一单买的。丢掉它等于删掉凭据与
@@ -2089,12 +2370,13 @@ fn supplier_credential_nickname(
     order_id: &str,
     index: usize,
 ) -> String {
-    let source = if runtime.nickname_prefix.is_empty() {
-        supplier_name
+    let supplier = supplier_name.trim_matches(['-', '_', ' ', ':']);
+    let label = runtime.nickname_prefix.trim_matches(['-', '_', ' ', ':']);
+    let source = if label.is_empty() || label.eq_ignore_ascii_case(supplier) {
+        supplier.to_owned()
     } else {
-        runtime.nickname_prefix.as_str()
+        format!("{supplier}-{label}")
     };
-    let source = source.trim_end_matches(['-', '_', ' ', ':']);
     let trace: String = order_id.chars().take(8).collect();
     let suffix = format!("-{trace}-{index}");
     let room = MAX_NICKNAME_CHARS.saturating_sub(suffix.chars().count());
@@ -2109,13 +2391,19 @@ fn credential_from_supplier_key(
     order_id: &str,
     index: usize,
     purchase_price: Option<f64>,
+    api_region: &str,
 ) -> KiroCredentials {
-    let nickname = supplier_credential_nickname(supplier_name, runtime, order_id, index);
+    let nickname_source = if supplier_name.trim().is_empty() {
+        supplier_id
+    } else {
+        supplier_name
+    };
+    let nickname = supplier_credential_nickname(nickname_source, runtime, order_id, index);
     KiroCredentials {
         auth_method: Some("api_key".to_owned()),
         kiro_api_key: Some(key),
         auth_region: Some(API_KEY_AUTH_REGION.to_owned()),
-        api_region: Some(runtime.api_region.clone()),
+        api_region: Some(api_region.to_owned()),
         rpm_limit: runtime.rpm_limit,
         priority: runtime.priority,
         groups: runtime.groups.clone(),
@@ -2129,6 +2417,65 @@ fn credential_from_supplier_key(
         purchase_price,
         nickname: Some(nickname),
         ..Default::default()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedCredentialRegion {
+    api_region: String,
+    source: RegionSource,
+}
+
+fn resolve_credential_region(
+    purchase_response_region: Option<SupplierRegion>,
+    webhook_region: Option<SupplierRegion>,
+    requested_region: Option<SupplierRegion>,
+    runtime: &SupplierRuntimeConfig,
+) -> ResolvedCredentialRegion {
+    if let Some(region) = purchase_response_region {
+        return ResolvedCredentialRegion {
+            api_region: region.as_api_region().to_owned(),
+            source: RegionSource::PurchaseResponse,
+        };
+    }
+    if let Some(region) = webhook_region {
+        return ResolvedCredentialRegion {
+            api_region: region.as_api_region().to_owned(),
+            source: RegionSource::Webhook,
+        };
+    }
+    if let Some(region) = requested_region {
+        return ResolvedCredentialRegion {
+            api_region: region.as_api_region().to_owned(),
+            source: RegionSource::Request,
+        };
+    }
+    ResolvedCredentialRegion {
+        api_region: runtime.credential_api_region_fallback.clone(),
+        source: RegionSource::ConfigFallback,
+    }
+}
+
+fn requested_purchase_region(
+    runtime: &SupplierRuntimeConfig,
+    event_region: Option<SupplierRegion>,
+) -> (Option<SupplierRegion>, Option<RegionSource>) {
+    match runtime.purchase_region_mode {
+        PurchaseRegionMode::Omit | PurchaseRegionMode::BestAvailable => (None, None),
+        PurchaseRegionMode::Fixed => (
+            runtime.purchase_region,
+            runtime.purchase_region.map(|_| RegionSource::Request),
+        ),
+        PurchaseRegionMode::Webhook | PurchaseRegionMode::Batch => match event_region {
+            Some(region) => (Some(region), Some(RegionSource::Webhook)),
+            None => (
+                runtime
+                    .credential_api_region_fallback
+                    .parse::<SupplierRegion>()
+                    .ok(),
+                Some(RegionSource::ConfigFallback),
+            ),
+        },
     }
 }
 
@@ -2212,6 +2559,9 @@ fn default_entry(runtime: SupplierRuntimeConfig) -> SupplierEntryRuntime {
         name: "默认供货商".to_owned(),
         kind: SupplierKind::KiroRs,
         enabled: true,
+        import_overrides: crate::model::config::SupplierImportOverrides::from_legacy(
+            &crate::model::config::KeySupplierConfig::from(&runtime),
+        ),
         settings: runtime,
     }
 }
@@ -2229,6 +2579,9 @@ fn empty_runtime() -> SupplierRuntimeConfig {
         min_purchase: 1,
         max_purchase: 1,
         api_region: API_KEY_AUTH_REGION.to_owned(),
+        purchase_region_mode: PurchaseRegionMode::Omit,
+        purchase_region: None,
+        credential_api_region_fallback: API_KEY_AUTH_REGION.to_owned(),
         rpm_limit: 0,
         priority: 0,
         groups: Vec::new(),
@@ -2536,6 +2889,9 @@ mod tests {
             min_purchase: 1,
             max_purchase: 10,
             api_region: "us-east-1".to_string(),
+            purchase_region_mode: PurchaseRegionMode::Omit,
+            purchase_region: None,
+            credential_api_region_fallback: "us-east-1".to_string(),
             rpm_limit: 0,
             priority: 0,
             groups: Vec::new(),
@@ -2579,6 +2935,9 @@ mod tests {
             min_purchase: u64::from(runtime.min_purchase),
             max_purchase: u64::from(runtime.max_purchase),
             api_region: runtime.api_region.clone(),
+            purchase_region_mode: Some(runtime.purchase_region_mode),
+            purchase_region: runtime.purchase_region,
+            credential_api_region_fallback: Some(runtime.credential_api_region_fallback.clone()),
             rpm_limit: u64::from(runtime.rpm_limit),
             priority: u64::from(runtime.priority),
             groups: runtime.groups.clone(),
@@ -2624,6 +2983,7 @@ mod tests {
                 event_type: event_type.to_owned(),
                 purchase_order_id: order_id.map(str::to_owned),
                 supplier_batch_id: None,
+                event_region: None,
                 message: Some("event message".to_owned()),
                 quantity,
             })
@@ -2868,6 +3228,10 @@ mod tests {
         let item = &store.list(1, None, None).unwrap().items[0];
         assert_eq!(item.status, SupplierEventStatus::Succeeded);
         assert_eq!(item.purchased_count, 1);
+        let decision = item.decision_snapshot.as_ref().unwrap();
+        assert_eq!(decision.outcome, SupplierDecisionOutcome::Succeeded);
+        assert_eq!(decision.quote.vendor_stock, Some(4));
+        assert_eq!(decision.target.requested, Some(3));
     }
 
     #[tokio::test]
@@ -2916,7 +3280,38 @@ mod tests {
         assert_eq!(credential.groups, config.groups);
         assert_eq!(credential.source_channel.as_deref(), Some("supplier-a"));
         assert!(credential.delete_on_forbidden);
-        assert_eq!(credential.nickname.as_deref(), Some("supplier-fedcba98-1"));
+        assert_eq!(
+            credential.nickname.as_deref(),
+            Some("默认供货商-supplier-fedcba98-1")
+        );
+    }
+
+    #[test]
+    fn credential_region_evidence_uses_documented_precedence() {
+        let mut runtime = runtime(TOKEN);
+        runtime.credential_api_region_fallback = "us-east-1".to_owned();
+
+        let resolved = resolve_credential_region(
+            Some(SupplierRegion::Eu),
+            Some(SupplierRegion::Us),
+            Some(SupplierRegion::Us),
+            &runtime,
+        );
+        assert_eq!(resolved.api_region, "eu-central-1");
+        assert_eq!(resolved.source, RegionSource::PurchaseResponse);
+
+        let webhook = resolve_credential_region(
+            None,
+            Some(SupplierRegion::Eu),
+            Some(SupplierRegion::Us),
+            &runtime,
+        );
+        assert_eq!(webhook.api_region, "eu-central-1");
+        assert_eq!(webhook.source, RegionSource::Webhook);
+
+        let fallback = resolve_credential_region(None, None, None, &runtime);
+        assert_eq!(fallback.api_region, "us-east-1");
+        assert_eq!(fallback.source, RegionSource::ConfigFallback);
     }
 
     #[test]
@@ -2935,16 +3330,16 @@ mod tests {
             "drop-a19fe933-2"
         );
 
-        // 配了前缀就以它为准，且尾部分隔符不重复（旧配置里普遍带尾巴）。
+        // 配了标签也只能附加，不能替换供货商名；否则凭据备注又会失去归属信息。
         runtime.nickname_prefix = "supplier-".to_owned();
         assert_eq!(
             supplier_credential_nickname("drop", &runtime, order, 1),
-            "supplier-a19fe933-1"
+            "drop-supplier-a19fe933-1"
         );
         runtime.nickname_prefix = "vip".to_owned();
         assert_eq!(
             supplier_credential_nickname("drop", &runtime, order, 1),
-            "vip-a19fe933-1"
+            "drop-vip-a19fe933-1"
         );
 
         // 名字再长也不能越过备注上限，且必须在字符边界上截断（中文名会踩到）。
@@ -3022,6 +3417,10 @@ mod tests {
             (3, 1, 1, 1)
         );
         assert_eq!(failed.status, SupplierEventStatus::Failed);
+        let decision = failed.decision_snapshot.as_ref().unwrap();
+        assert_eq!(decision.outcome, SupplierDecisionOutcome::Failed);
+        assert_eq!(decision.result.purchased, 3);
+        assert_eq!(decision.result.failed, 1);
 
         service.retry_event(failed.id).unwrap();
         service.process_pending().await.unwrap();
@@ -3091,6 +3490,7 @@ mod tests {
                 event_type: "new_keys_available".to_owned(),
                 purchase_order_id: Some("0123456789abcdef0123456789abcdef".to_owned()),
                 supplier_batch_id: None,
+                event_region: None,
                 message: Some("below minimum".to_owned()),
                 quantity: 3,
             })
@@ -3525,6 +3925,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fixed_us_supplier_overview_uses_the_configured_ceo_zone() {
+        let app = Router::new()
+            .route(
+                "/api/my/profile",
+                get(|| async {
+                    axum::Json(serde_json::json!({
+                        "name": "ceo", "quota": 200, "remaining": 180,
+                        "used_quota": 20, "webhook_url": ""
+                    }))
+                }),
+            )
+            .route(
+                "/api/my/stock",
+                get(|| async {
+                    axum::Json(serde_json::json!({
+                        "max": 20,
+                        "zones": [
+                            {"zone": "us", "enabled": true, "available": 9,
+                             "max": 0, "unit_price": 20},
+                            {"zone": "eu", "enabled": true, "available": 11,
+                             "max": 0, "unit_price": 1}
+                        ]
+                    }))
+                }),
+            );
+        let mut ceo = entry("ceo", SupplierKind::KiroCeo, &"f".repeat(64));
+        ceo.settings.base_url = server(app).await;
+        ceo.settings.purchase_region_mode = PurchaseRegionMode::Fixed;
+        ceo.settings.purchase_region = Some(SupplierRegion::Us);
+        let service = KeySupplierService::with_suppliers(
+            Arc::new(SupplierEventStore::open_in_memory().unwrap()),
+            vec![ceo],
+        );
+
+        let overview = service.supplier_overview("ceo").await.unwrap();
+
+        assert_eq!(overview.snapshot.stock_available, Some(9));
+        assert_eq!(overview.snapshot.key_price, Some(20.0));
+    }
+
+    #[tokio::test]
     async fn processing_cycle_recovers_stale_work_and_processor_starts_once() {
         let path = temp_config_path("events");
         let store = Arc::new(SupplierEventStore::open(&path).unwrap());
@@ -3535,6 +3976,7 @@ mod tests {
                 event_type: "all_keys_dead".to_string(),
                 purchase_order_id: None,
                 supplier_batch_id: None,
+                event_region: None,
                 message: Some("stale".to_string()),
                 quantity: 1,
             })
@@ -3646,6 +4088,7 @@ mod tests {
             name: format!("supplier {id}"),
             kind,
             enabled: true,
+            import_overrides: crate::model::config::SupplierImportOverrides::default(),
             settings,
         }
     }
@@ -3685,6 +4128,47 @@ mod tests {
             service.supplier_callback_url("second").unwrap()
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn updating_common_import_recomputes_inherited_values_and_persists_flat_compatibility() {
+        let mut supplier = entry("ceo", SupplierKind::KiroCeo, &"a".repeat(64));
+        supplier.import_overrides.priority = Some(99);
+        let (service, path) = multi_service(vec![supplier]);
+
+        let view = service
+            .update_common_import(
+                crate::admin::key_supplier::config::SupplierCommonConfigUpdate {
+                    source_channel: "统一采购".to_owned(),
+                    nickname_label: "生产".to_owned(),
+                    rpm_limit: 23,
+                    priority: 7,
+                    groups: vec!["common".to_owned()],
+                    auto_delete_forbidden: true,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(view.nickname_label, "生产");
+        let current = service.supplier("ceo").unwrap();
+        assert_eq!(current.settings.source_channel, "统一采购");
+        assert_eq!(current.settings.nickname_prefix, "生产");
+        assert_eq!(current.settings.rpm_limit, 23);
+        assert_eq!(current.settings.priority, 99);
+        assert_eq!(current.settings.groups, vec!["common"]);
+        assert!(current.settings.auto_delete_forbidden);
+
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.key_supplier_common.nickname_label, "生产");
+        assert_eq!(config.key_suppliers[0].settings.nickname_prefix, "生产");
+        assert_eq!(config.key_suppliers[0].settings.priority, 99);
+        assert_eq!(
+            config.key_suppliers[0]
+                .import_overrides
+                .as_ref()
+                .and_then(|value| value.priority),
+            Some(99)
+        );
     }
 
     #[test]
@@ -4755,6 +5239,7 @@ mod tests {
         supplier.settings.api_key = "km_secret".to_string();
         supplier.settings.min_purchase = 1;
         supplier.settings.max_purchase = 5;
+        supplier.settings.purchase_region_mode = PurchaseRegionMode::Batch;
         let store = Arc::new(SupplierEventStore::open_in_memory().unwrap());
         let importer = Arc::new(FakeImporter::default());
         let service = KeySupplierService::with_suppliers_and_importer(
@@ -4803,6 +5288,60 @@ mod tests {
         // 对方订单号和批次号是两个不同的东西，别混用：这个用来查对方的订单历史。
         assert_eq!(stored.supplier_order_id.as_deref(), Some("ord-io-9"));
         assert!(!stored.replayed);
+    }
+
+    #[tokio::test]
+    async fn kiroapp_io_fixed_region_ignores_the_webhook_batch_id() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let observed = seen.clone();
+        let app = Router::new().route(
+            "/api/me/purchase",
+            post(move |body: axum::body::Bytes| {
+                let observed = observed.clone();
+                async move {
+                    observed
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::from_slice::<serde_json::Value>(&body).unwrap());
+                    axum::Json(serde_json::json!({
+                        "purchased": 1,
+                        "requested": 1,
+                        "remaining": 4,
+                        "total_debit": 30,
+                        "unit_price": 30,
+                        "order_id": "ord-fixed-us",
+                        "replayed": false,
+                        "region": "us",
+                        "keys": [{"key": "ksk_fixed_us", "price": 30}]
+                    }))
+                }
+            }),
+        );
+        let token = "7".repeat(64);
+        let mut supplier = entry("io-fixed", SupplierKind::KiroAppIo, &token);
+        supplier.settings.base_url = server(app).await;
+        supplier.settings.api_key = "km_secret".to_string();
+        supplier.settings.purchase_region_mode = PurchaseRegionMode::Fixed;
+        supplier.settings.purchase_region = Some(SupplierRegion::Us);
+        let service = KeySupplierService::with_suppliers_and_importer(
+            Arc::new(SupplierEventStore::open_in_memory().unwrap()),
+            vec![supplier],
+            Arc::new(FakeImporter::default()),
+        );
+
+        service
+            .ingest(
+                &token,
+                r#"{"event":"new_keys_available","event_id":"evt_io_fixed","order_id":"batch-eu",
+                    "client_order_id":"95c4fd9460b70fb8e944bd7faa519897","region":"eu","new_keys":1}"#,
+            )
+            .unwrap();
+        service.process_pending().await.unwrap();
+
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["region"], "us");
+        assert!(requests[0].get("order_id").is_none());
     }
 
     /// 搭一套开着号池闸的服务：一家 kiroapp-io 供货商 + 可控的全局可用数。
@@ -4925,6 +5464,13 @@ mod tests {
         assert_eq!(stored.pool_usable, Some(3));
         assert_eq!(stored.pool_deficit, Some(0));
         assert_eq!(stored.pool_requested, Some(0));
+        let decision = stored.decision_snapshot.as_ref().unwrap();
+        assert_eq!(decision.outcome, SupplierDecisionOutcome::Skipped);
+        assert_eq!(decision.reason.as_deref(), Some("号池已达目标存量"));
+        assert_eq!(decision.target.configured, Some(3));
+        assert_eq!(decision.target.credited_at_decision, Some(3));
+        assert_eq!(decision.target.deficit, Some(0));
+        assert_eq!(decision.target.reached, Some(true));
     }
 
     /// 可用数已经超过目标存量时也只是不买，绝不去处置多出来的凭据。
@@ -5638,6 +6184,7 @@ mod tests {
                 event_type: "new_keys_available".to_string(),
                 purchase_order_id: Some("a".repeat(32)),
                 supplier_batch_id: None,
+                event_region: None,
                 message: None,
                 quantity: 1,
             })
@@ -6076,6 +6623,7 @@ mod tests {
             name: "kiroapp.cc".to_owned(),
             kind: SupplierKind::KiroApp,
             enabled: true,
+            import_overrides: None,
             settings: supplier_update(&entry("x", SupplierKind::KiroApp, &"b".repeat(64)).settings),
         };
         update.settings.api_key = Some("kiroapp-secret".to_owned());

@@ -21,7 +21,7 @@ use crate::kiro::kiro_version::USAGE_API_KIRO_VERSION;
 use crate::kiro::machine_id;
 use crate::kiro::model::available_models::ListAvailableModelsResponse;
 use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
-use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::credentials::{CredentialDisableReason as DisabledReason, KiroCredentials};
 use crate::kiro::model::token_refresh::{
     ExternalIdpRefreshResponse, IdcRefreshRequest, IdcRefreshResponse, RefreshRequest,
     RefreshResponse,
@@ -1102,8 +1102,6 @@ struct CredentialEntry {
     refresh_failure_count: u32,
     /// 是否已禁用
     disabled: bool,
-    /// 禁用原因（用于区分手动禁用 vs 自动禁用，便于自愈）
-    disabled_reason: Option<DisabledReason>,
     /// API 调用成功次数
     success_count: u64,
     /// 负载均衡使用的内部累计次数。
@@ -1135,29 +1133,6 @@ struct CredentialEntry {
 struct SessionAffinity {
     credential_id: u64,
     expires_at: Instant,
-}
-
-/// 禁用原因
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DisabledReason {
-    /// Admin API 手动禁用
-    Manual,
-    /// 连续失败达到阈值后自动禁用
-    TooManyFailures,
-    /// Token 刷新连续失败达到阈值后自动禁用
-    TooManyRefreshFailures,
-    /// 额度已用尽（如 MONTHLY_REQUEST_COUNT）
-    QuotaExceeded,
-    /// Refresh Token 永久失效（服务端返回 invalid_grant）
-    InvalidRefreshToken,
-    /// 凭据配置无效（如 authMethod=api_key 但缺少 kiroApiKey）
-    InvalidConfig,
-    /// 上游 403 且响应体命中封禁标记 —— 账号已死。
-    ///
-    /// 与 `TooManyFailures` 的区别：这是**终态**，不参与
-    /// `acquire_context_excluding_with_affinity` 里「全灭时重置失败计数自愈」那段逻辑
-    /// （账号真被封了，重置计数再试也只是白打一轮请求）。
-    Forbidden,
 }
 
 /// 统计数据持久化条目
@@ -1327,18 +1302,24 @@ pub struct PoolHealth {
     pub by_legacy_channel: usize,
 }
 
-/// 某家供货商采购来的凭据可用统计。用于「他的号都不能用了才补货」的判定。
-///
-/// `total` = `usable` + `dead` + `quota_exhausted` + `low_quota`。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+/// 某家供货商采购来的凭据健康统计。目标存量与实际可调度数分开计算。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct SupplierCredentialHealth {
     /// 该供货商名下仍在池子里的凭据数（判死后被保留期清理掉的不计）。
     pub total: usize,
-    /// 仍可用的凭据数。补货闸就是拿这个数和水位比。
-    ///
-    /// 手动禁用算可用——那是人主动暂停，不该触发采购。
+    /// 旧接口兼容字段，始终等于 `target_credited`。
     pub usable: usize,
+    /// 当前可直接参与调度的凭据数。
+    pub ready: usize,
+    /// 计入目标存量的凭据数：可调度、人工保留和临时冷却。
+    pub target_credited: usize,
+    /// 人工暂停但仍为运营保留的凭据数。
+    pub manual_reserved: usize,
+    /// 正在临时限流/风控冷却的凭据数。
+    pub cooling: usize,
+    /// 因连续失败、刷新失败或配置无效被系统禁用的凭据数。
+    pub system_disabled: usize,
     /// 已判死（封号，`died_at` 有值）但尚未被保留期清理的凭据数。
     pub dead: usize,
     /// 额度耗尽被禁（402 或一键超额，`quota_exhausted_at` 有值）的凭据数。
@@ -1348,14 +1329,65 @@ pub struct SupplierCredentialHealth {
 }
 
 impl SupplierCredentialHealth {
-    /// 不可用总数：封号 + 额度耗尽 + 额度低于水位。
-    ///
-    /// 补货闸直接比 `usable` 与水位，用不到这个和；留着是给测试断言
-    /// 「四个分类加起来等于 total」，防止将来加分类时漏改判定。
     #[cfg(test)]
     pub fn unusable(&self) -> usize {
-        self.dead + self.quota_exhausted + self.low_quota
+        self.dead + self.quota_exhausted + self.low_quota + self.system_disabled
     }
+
+    fn credit_target(&mut self) {
+        self.target_credited += 1;
+        self.usable += 1;
+    }
+
+    fn record(
+        &mut self,
+        candidate: CredentialHealthCandidate,
+        low_quota_threshold: f64,
+        remaining_quota: &dyn Fn(u64) -> Option<f64>,
+    ) {
+        self.total += 1;
+        if candidate.died || candidate.disable_reason == Some(DisabledReason::Forbidden) {
+            self.dead += 1;
+        } else if candidate.quota_exhausted
+            || candidate.disable_reason == Some(DisabledReason::QuotaExceeded)
+        {
+            self.quota_exhausted += 1;
+        } else if matches!(
+            candidate.disable_reason,
+            Some(
+                DisabledReason::TooManyFailures
+                    | DisabledReason::TooManyRefreshFailures
+                    | DisabledReason::InvalidRefreshToken
+                    | DisabledReason::InvalidConfig
+            )
+        ) {
+            self.system_disabled += 1;
+        } else if candidate.disabled {
+            self.manual_reserved += 1;
+            self.credit_target();
+        } else if candidate.cooling {
+            self.cooling += 1;
+            self.credit_target();
+        } else if low_quota_threshold > 0.0
+            && remaining_quota(candidate.id)
+                .is_some_and(|remaining| remaining <= low_quota_threshold)
+        {
+            self.low_quota += 1;
+        } else {
+            self.ready += 1;
+            self.credit_target();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CredentialHealthCandidate {
+    id: u64,
+    disabled: bool,
+    disable_reason: Option<DisabledReason>,
+    died: bool,
+    quota_exhausted: bool,
+    cooling: bool,
 }
 
 /// 凭据管理器状态快照
@@ -1642,18 +1674,25 @@ impl MultiTokenManager {
                     cred.added_at_backfilled = true;
                     has_new_ids = true; // 复用「需要回写」标志，触发一次持久化
                 }
-                // disabled_reason 是运行时状态、不持久化。重启后已判死的凭据只剩
-                // disabled=true，会退化成 Manual。用 died_at 是否存在把它还原成
-                // Forbidden，否则保留期清理在重启后就再也认不出这些死号。
-                let disabled_reason = if cred.disabled {
-                    if cred.died_at.is_some() {
-                        Some(DisabledReason::Forbidden)
-                    } else {
-                        Some(DisabledReason::Manual)
-                    }
+                // 老文件没有 disableReason。终态时间戳优先恢复系统原因；只剩
+                // disabled=true 时按人工暂停处理，避免升级瞬间误触发采购。
+                let disable_reason = if cred.disabled {
+                    cred.disable_reason.or_else(|| {
+                        if cred.died_at.is_some() {
+                            Some(DisabledReason::Forbidden)
+                        } else if cred.quota_exhausted_at.is_some() {
+                            Some(DisabledReason::QuotaExceeded)
+                        } else {
+                            Some(DisabledReason::Manual)
+                        }
+                    })
                 } else {
                     None
                 };
+                if cred.disable_reason != disable_reason {
+                    cred.disable_reason = disable_reason;
+                    has_new_ids = true;
+                }
                 CredentialEntry {
                     id,
                     credentials: cred.clone(),
@@ -1661,7 +1700,6 @@ impl MultiTokenManager {
                     total_failure_count: 0,
                     refresh_failure_count: 0,
                     disabled: cred.disabled, // 从配置文件读取 disabled 状态
-                    disabled_reason,
                     success_count: 0,
                     balance_count: 0,
                     last_used_at: None,
@@ -1700,7 +1738,8 @@ impl MultiTokenManager {
                     entry.id
                 );
                 entry.disabled = true;
-                entry.disabled_reason = Some(DisabledReason::InvalidConfig);
+                entry.credentials.disabled = true;
+                entry.credentials.disable_reason = Some(DisabledReason::InvalidConfig);
             }
         }
 
@@ -2228,19 +2267,27 @@ impl MultiTokenManager {
                     if best.is_none() {
                         let mut entries = self.entries.lock();
                         if entries.iter().any(|e| {
-                            e.disabled && e.disabled_reason == Some(DisabledReason::TooManyFailures)
+                            e.disabled
+                                && e.credentials.disable_reason
+                                    == Some(DisabledReason::TooManyFailures)
                         }) {
                             tracing::warn!(
                                 "所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（等价于重启）"
                             );
                             for e in entries.iter_mut() {
-                                if e.disabled_reason == Some(DisabledReason::TooManyFailures) {
+                                if e.credentials.disable_reason
+                                    == Some(DisabledReason::TooManyFailures)
+                                {
                                     e.disabled = false;
-                                    e.disabled_reason = None;
+                                    e.credentials.disabled = false;
+                                    e.credentials.disable_reason = None;
                                     e.failure_count = 0;
                                 }
                             }
                             drop(entries);
+                            if let Err(error) = self.persist_credentials() {
+                                tracing::warn!(%error, "自动禁用自愈状态持久化失败");
+                            }
                             best = self.select_next_credential_with_affinity(
                                 model,
                                 group,
@@ -2475,6 +2522,17 @@ impl MultiTokenManager {
         self.persist_credentials_locked(&credentials)
     }
 
+    fn persist_automatic_disable(&self, id: u64, reason: DisabledReason) {
+        if let Err(error) = self.persist_credentials() {
+            tracing::warn!(
+                %error,
+                credential_id = id,
+                disable_reason = reason.as_label(),
+                "自动禁用凭据后持久化失败"
+            );
+        }
+    }
+
     fn credentials_snapshot(entries: &[CredentialEntry]) -> Vec<KiroCredentials> {
         entries
             .iter()
@@ -2618,7 +2676,8 @@ impl MultiTokenManager {
                 entry.credentials.access_token = new_access_token;
                 entry.credentials.expires_at = new_expires_at;
                 entry.disabled = false;
-                entry.disabled_reason = None;
+                entry.credentials.disabled = false;
+                entry.credentials.disable_reason = None;
                 entry.refresh_failure_count = 0;
                 entry.failure_count = 0;
             }
@@ -2821,7 +2880,7 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_failure(&self, id: u64) -> bool {
-        let result = {
+        let (result, disabled_now) = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
 
@@ -2846,9 +2905,11 @@ impl MultiTokenManager {
                 MAX_FAILURES_PER_CREDENTIAL
             );
 
-            if failure_count >= MAX_FAILURES_PER_CREDENTIAL {
+            let disabled_now = failure_count >= MAX_FAILURES_PER_CREDENTIAL;
+            if disabled_now {
                 entry.disabled = true;
-                entry.disabled_reason = Some(DisabledReason::TooManyFailures);
+                entry.credentials.disabled = true;
+                entry.credentials.disable_reason = Some(DisabledReason::TooManyFailures);
                 tracing::error!("凭据 #{} 已连续失败 {} 次，已被禁用", id, failure_count);
 
                 // 切换到优先级最高的可用凭据
@@ -2868,8 +2929,11 @@ impl MultiTokenManager {
                 }
             }
 
-            entries.iter().any(|e| !e.disabled)
+            (entries.iter().any(|e| !e.disabled), disabled_now)
         };
+        if disabled_now {
+            self.persist_automatic_disable(id, DisabledReason::TooManyFailures);
+        }
         self.save_stats_debounced();
         result
     }
@@ -2895,9 +2959,8 @@ impl MultiTokenManager {
             }
 
             entry.disabled = true;
-            entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
             entry.credentials.disabled = true;
-            // 落到凭据上才能跨重启存活：disabled_reason 只在内存里。
+            entry.credentials.disable_reason = Some(DisabledReason::QuotaExceeded);
             entry.credentials.quota_exhausted_at = Some(Utc::now().to_rfc3339());
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             // 设为阈值，便于在管理面板中直观看到该凭据已不可用
@@ -2927,6 +2990,7 @@ impl MultiTokenManager {
                 false
             }
         };
+        self.persist_automatic_disable(id, DisabledReason::QuotaExceeded);
         self.save_stats_debounced();
         result
     }
@@ -2936,7 +3000,7 @@ impl MultiTokenManager {
     /// 连续刷新失败达到阈值后禁用凭据并切换，阈值内保持当前凭据不切换，
     /// 与 API 401/403 的累计失败策略保持一致。
     pub fn report_refresh_failure(&self, id: u64) -> bool {
-        let result = {
+        let (result, disabled_now) = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
 
@@ -2961,35 +3025,40 @@ impl MultiTokenManager {
             );
 
             if refresh_failure_count < MAX_FAILURES_PER_CREDENTIAL {
-                return entries.iter().any(|e| !e.disabled);
-            }
-
-            entry.disabled = true;
-            entry.disabled_reason = Some(DisabledReason::TooManyRefreshFailures);
-
-            tracing::error!(
-                "凭据 #{} Token 已连续刷新失败 {} 次，已被禁用",
-                id,
-                refresh_failure_count
-            );
-
-            if let Some(next) = entries
-                .iter()
-                .filter(|e| !e.disabled)
-                .min_by_key(|e| e.credentials.priority)
-            {
-                *current_id = next.id;
-                tracing::info!(
-                    "已切换到凭据 #{}（优先级 {}）",
-                    next.id,
-                    next.credentials.priority
-                );
-                true
+                (entries.iter().any(|e| !e.disabled), false)
             } else {
-                tracing::error!("所有凭据均已禁用！");
-                false
+                entry.disabled = true;
+                entry.credentials.disabled = true;
+                entry.credentials.disable_reason = Some(DisabledReason::TooManyRefreshFailures);
+
+                tracing::error!(
+                    "凭据 #{} Token 已连续刷新失败 {} 次，已被禁用",
+                    id,
+                    refresh_failure_count
+                );
+
+                let has_available = if let Some(next) = entries
+                    .iter()
+                    .filter(|e| !e.disabled)
+                    .min_by_key(|e| e.credentials.priority)
+                {
+                    *current_id = next.id;
+                    tracing::info!(
+                        "已切换到凭据 #{}（优先级 {}）",
+                        next.id,
+                        next.credentials.priority
+                    );
+                    true
+                } else {
+                    tracing::error!("所有凭据均已禁用！");
+                    false
+                };
+                (has_available, true)
             }
         };
+        if disabled_now {
+            self.persist_automatic_disable(id, DisabledReason::TooManyRefreshFailures);
+        }
         self.save_stats_debounced();
         result
     }
@@ -3014,7 +3083,8 @@ impl MultiTokenManager {
 
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             entry.disabled = true;
-            entry.disabled_reason = Some(DisabledReason::InvalidRefreshToken);
+            entry.credentials.disabled = true;
+            entry.credentials.disable_reason = Some(DisabledReason::InvalidRefreshToken);
 
             tracing::error!(
                 "凭据 #{} refreshToken 已失效 (invalid_grant)，已立即禁用",
@@ -3038,6 +3108,7 @@ impl MultiTokenManager {
                 false
             }
         };
+        self.persist_automatic_disable(id, DisabledReason::InvalidRefreshToken);
         self.save_stats_debounced();
         result
     }
@@ -3115,35 +3186,27 @@ impl MultiTokenManager {
     ) -> SupplierCredentialHealth {
         // 先只在锁内收集 id 与两个标记，把额度查询放到锁外——查询可能要读别的锁，
         // 在 entries 锁里调外部闭包容易埋死锁。
-        let candidates: Vec<(u64, bool, bool)> = {
+        let candidates: Vec<CredentialHealthCandidate> = {
             let entries = self.entries.lock();
+            let now = Instant::now();
             entries
                 .iter()
                 .filter(|entry| entry.credentials.supplier_id.as_deref() == Some(supplier_id))
-                .map(|entry| {
-                    (
-                        entry.id,
-                        entry.credentials.died_at.is_some(),
-                        entry.credentials.quota_exhausted_at.is_some(),
-                    )
+                .map(|entry| CredentialHealthCandidate {
+                    id: entry.id,
+                    disabled: entry.disabled,
+                    disable_reason: entry.credentials.disable_reason,
+                    died: entry.credentials.died_at.is_some(),
+                    quota_exhausted: entry.credentials.quota_exhausted_at.is_some(),
+                    cooling: entry.throttled_until.is_some_and(|until| until > now)
+                        || entry.rate_limited_until.is_some_and(|until| until > now),
                 })
                 .collect()
         };
 
         let mut health = SupplierCredentialHealth::default();
-        for (id, died, quota_exhausted) in candidates {
-            health.total += 1;
-            if died {
-                health.dead += 1;
-            } else if quota_exhausted {
-                health.quota_exhausted += 1;
-            } else if low_quota_threshold > 0.0
-                && remaining_quota(id).is_some_and(|remaining| remaining <= low_quota_threshold)
-            {
-                health.low_quota += 1;
-            } else {
-                health.usable += 1;
-            }
+        for candidate in candidates {
+            health.record(candidate, low_quota_threshold, remaining_quota);
         }
         health
     }
@@ -3170,8 +3233,9 @@ impl MultiTokenManager {
         // 与 `supplier_credential_health` 同样的两阶段写法：锁内只收集判定所需的最小
         // 字段，出锁后再查额度。`remaining_quota` 会去拿 AdminService 的余额缓存锁，
         // 在 entries 锁内调用外部闭包就是一条死锁路径。
-        let candidates: Vec<(u64, PoolMembership, bool, bool)> = {
+        let candidates: Vec<(PoolMembership, CredentialHealthCandidate)> = {
             let entries = self.entries.lock();
+            let now = Instant::now();
             entries
                 .iter()
                 .filter_map(|entry| {
@@ -3184,34 +3248,30 @@ impl MultiTokenManager {
                         return None;
                     }
                     Some((
-                        entry.id,
                         membership,
-                        entry.credentials.died_at.is_some(),
-                        entry.credentials.quota_exhausted_at.is_some(),
+                        CredentialHealthCandidate {
+                            id: entry.id,
+                            disabled: entry.disabled,
+                            disable_reason: entry.credentials.disable_reason,
+                            died: entry.credentials.died_at.is_some(),
+                            quota_exhausted: entry.credentials.quota_exhausted_at.is_some(),
+                            cooling: entry.throttled_until.is_some_and(|until| until > now)
+                                || entry.rate_limited_until.is_some_and(|until| until > now),
+                        },
                     ))
                 })
                 .collect()
         };
 
         let mut pool = PoolHealth::default();
-        for (id, membership, died, quota_exhausted) in candidates {
+        for (membership, candidate) in candidates {
             match membership {
                 PoolMembership::BySupplierId => pool.by_supplier_id += 1,
                 PoolMembership::ByLegacySourceChannel => pool.by_legacy_channel += 1,
                 PoolMembership::NotPurchased => unreachable!("已在上面过滤掉"),
             }
-            pool.health.total += 1;
-            if died {
-                pool.health.dead += 1;
-            } else if quota_exhausted {
-                pool.health.quota_exhausted += 1;
-            } else if low_quota_threshold > 0.0
-                && remaining_quota(id).is_some_and(|remaining| remaining <= low_quota_threshold)
-            {
-                pool.health.low_quota += 1;
-            } else {
-                pool.health.usable += 1;
-            }
+            pool.health
+                .record(candidate, low_quota_threshold, remaining_quota);
         }
         pool
     }
@@ -3290,18 +3350,10 @@ impl MultiTokenManager {
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
                     refresh_failure_count: e.refresh_failure_count,
-                    disabled_reason: e.disabled_reason.map(|r| {
-                        match r {
-                            DisabledReason::Manual => "Manual",
-                            DisabledReason::TooManyFailures => "TooManyFailures",
-                            DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
-                            DisabledReason::QuotaExceeded => "QuotaExceeded",
-                            DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
-                            DisabledReason::InvalidConfig => "InvalidConfig",
-                            DisabledReason::Forbidden => "Forbidden",
-                        }
-                        .to_string()
-                    }),
+                    disabled_reason: e
+                        .credentials
+                        .disable_reason
+                        .map(|reason| reason.as_label().to_string()),
                     added_at: e.credentials.added_at.clone(),
                     added_at_backfilled: e.credentials.added_at_backfilled,
                     delete_on_forbidden: e.credentials.delete_on_forbidden,
@@ -3337,14 +3389,14 @@ impl MultiTokenManager {
                 // 启用时重置失败计数
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
-                entry.disabled_reason = None;
+                entry.credentials.disable_reason = None;
                 entry.throttled_until = None;
                 entry.rate_limited_until = None;
                 // 额度按月重置，人工重新启用就是「这号又能用了」。不清掉的话它会
                 // 一直算「不可用」，让补货闸误以为该补货。
                 entry.credentials.quota_exhausted_at = None;
             } else {
-                entry.disabled_reason = Some(DisabledReason::Manual);
+                entry.credentials.disable_reason = Some(DisabledReason::Manual);
             }
         }
         // 持久化更改
@@ -3470,8 +3522,8 @@ impl MultiTokenManager {
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
             entry.disabled = true;
-            entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
             entry.credentials.disabled = true;
+            entry.credentials.disable_reason = Some(DisabledReason::QuotaExceeded);
             entry.credentials.quota_exhausted_at = Some(Utc::now().to_rfc3339());
         }
         self.persist_credentials()?;
@@ -3506,14 +3558,15 @@ impl MultiTokenManager {
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            if entry.disabled_reason == Some(DisabledReason::InvalidConfig) {
+            if entry.credentials.disable_reason == Some(DisabledReason::InvalidConfig) {
                 anyhow::bail!("凭据 #{} 因配置无效被禁用，请修正配置后重启服务", id);
             }
             entry.failure_count = 0;
             entry.total_failure_count = 0;
             entry.refresh_failure_count = 0;
             entry.disabled = false;
-            entry.disabled_reason = None;
+            entry.credentials.disabled = false;
+            entry.credentials.disable_reason = None;
             entry.throttled_until = None;
             entry.rate_limited_until = None;
         }
@@ -4330,7 +4383,6 @@ impl MultiTokenManager {
                 total_failure_count: 0,
                 refresh_failure_count: 0,
                 disabled: false,
-                disabled_reason: None,
                 success_count: 0,
                 balance_count: baseline_balance,
                 last_used_at: None,
@@ -4420,9 +4472,12 @@ impl MultiTokenManager {
                         .kiro_api_key
                         .as_deref()
                         .is_some_and(|key| !key.trim().is_empty());
-                    if has_api_key && entry.disabled_reason == Some(DisabledReason::InvalidConfig) {
+                    if has_api_key
+                        && entry.credentials.disable_reason == Some(DisabledReason::InvalidConfig)
+                    {
                         entry.disabled = false;
-                        entry.disabled_reason = None;
+                        entry.credentials.disabled = false;
+                        entry.credentials.disable_reason = None;
                         reenabled = true;
                     }
                 }
@@ -4778,8 +4833,8 @@ impl MultiTokenManager {
                 return Ok(None);
             }
             entry.disabled = true;
-            entry.disabled_reason = Some(DisabledReason::Forbidden);
             entry.credentials.disabled = true;
+            entry.credentials.disable_reason = Some(DisabledReason::Forbidden);
             entry.credentials.died_at = Some(died_at);
         }
 
@@ -4832,7 +4887,7 @@ impl MultiTokenManager {
             .iter()
             .filter(|entry| {
                 entry.disabled
-                    && entry.disabled_reason == Some(DisabledReason::Forbidden)
+                    && entry.credentials.disable_reason == Some(DisabledReason::Forbidden)
                     && entry.credentials.delete_on_forbidden
                     && entry
                         .credentials
@@ -8543,6 +8598,104 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// 系统连续失败禁用已经不能承载流量，不能继续占住供应商采购目标。
+    #[test]
+    fn supplier_credential_health_excludes_system_disabled_from_target() {
+        let path = tmp_creds_path("supplier_health_system_disabled");
+        let mut cred = api_key_credential(1, "ksk_system_disabled", false);
+        cred.supplier_id = Some("ceo".to_owned());
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+            manager.report_failure(1);
+        }
+
+        let health = manager.supplier_credential_health("ceo", 0.0, &|_| None);
+        assert_eq!(health.total, 1);
+        assert_eq!(health.usable, 0, "系统禁用的号不能再挡住补货");
+        assert_eq!(health.ready, 0);
+        assert_eq!(health.target_credited, 0);
+        assert_eq!(health.system_disabled, 1);
+        assert_eq!(health.manual_reserved, 0);
+        assert_eq!(health.cooling, 0);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn supplier_credential_health_credits_manual_and_cooling_credentials() {
+        let path = tmp_creds_path("supplier_health_reserved");
+        let mut manual = api_key_credential(1, "ksk_manual", false);
+        manual.supplier_id = Some("ceo".to_owned());
+        let mut cooling = api_key_credential(2, "ksk_cooling", false);
+        cooling.supplier_id = Some("ceo".to_owned());
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![manual, cooling],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+
+        manager.set_disabled(1, true).unwrap();
+        manager.report_account_throttled(2, std::time::Duration::from_secs(60));
+
+        let health = manager.supplier_credential_health("ceo", 0.0, &|_| None);
+        assert_eq!(health.total, 2);
+        assert_eq!(health.ready, 0);
+        assert_eq!(health.target_credited, 2);
+        assert_eq!(health.usable, health.target_credited);
+        assert_eq!(health.manual_reserved, 1);
+        assert_eq!(health.cooling, 1);
+        assert_eq!(health.system_disabled, 0);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn automatic_disable_reason_survives_reload_and_stays_out_of_target() {
+        let path = tmp_creds_path("supplier_health_reload");
+        let mut cred = api_key_credential(1, "ksk_reload_disabled", false);
+        cred.supplier_id = Some("ceo".to_owned());
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+            manager.report_failure(1);
+        }
+        drop(manager);
+
+        let persisted: Vec<KiroCredentials> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            persisted[0].disable_reason,
+            Some(DisabledReason::TooManyFailures),
+            "自动禁用原因必须立即持久化"
+        );
+        let reloaded =
+            MultiTokenManager::new(Config::default(), persisted, None, Some(path.clone()), true)
+                .unwrap();
+        let health = reloaded.supplier_credential_health("ceo", 0.0, &|_| None);
+        assert_eq!(health.system_disabled, 1);
+        assert_eq!(health.target_credited, 0);
+
+        let _ = std::fs::remove_file(path);
+    }
+
     fn channels(values: &[&str]) -> HashSet<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
     }
@@ -8626,15 +8779,17 @@ mod tests {
             3
         );
 
-        // 额度水位：#4 剩 100 跌破，#5 剩 9000 仍可用。
+        // 额度水位只作用于可调度号。#4 是人工保留，仍计入目标；#5 剩 9000 可调度。
         let quota = |id: u64| match id {
             4 => Some(100.0),
             5 => Some(9000.0),
             _ => None,
         };
         let pool = manager.pool_credential_health(500.0, &configured, &quota);
-        assert_eq!(pool.health.low_quota, 1);
-        assert_eq!(pool.health.usable, 1);
+        assert_eq!(pool.health.low_quota, 0);
+        assert_eq!(pool.health.manual_reserved, 1);
+        assert_eq!(pool.health.ready, 1);
+        assert_eq!(pool.health.usable, 2);
 
         let _ = std::fs::remove_file(path);
     }

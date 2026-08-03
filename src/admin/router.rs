@@ -43,11 +43,12 @@ use super::{
     },
     key_supplier::handlers::{
         create_supplier as create_key_supplier, delete_supplier as delete_key_supplier,
-        get_config as get_key_supplier_config, get_pool as get_key_supplier_pool,
-        list_events as list_key_supplier_events, list_suppliers as list_key_suppliers,
-        mark_events_read, overview as key_supplier_overview,
+        get_common_import as get_key_supplier_common, get_config as get_key_supplier_config,
+        get_pool as get_key_supplier_pool, list_events as list_key_supplier_events,
+        list_suppliers as list_key_suppliers, mark_events_read, overview as key_supplier_overview,
         pool_status as key_supplier_pool_status, purchase as key_supplier_purchase,
-        put_config as put_key_supplier_config, put_pool as put_key_supplier_pool,
+        put_common_import as put_key_supplier_common, put_config as put_key_supplier_config,
+        put_pool as put_key_supplier_pool,
         register_supplier_webhook as register_single_key_supplier_webhook,
         register_webhook as register_key_supplier_webhook, retry_event as retry_key_supplier_event,
         supplier_callback_url as key_supplier_callback_url,
@@ -209,6 +210,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/key-supplier/pool",
             get(get_key_supplier_pool).put(put_key_supplier_pool),
+        )
+        .route(
+            "/key-supplier/common",
+            get(get_key_supplier_common).put(put_key_supplier_common),
         )
         .route("/key-supplier/pool/status", get(key_supplier_pool_status))
         .route("/key-supplier/overview", get(key_supplier_overview))
@@ -379,7 +384,7 @@ mod tests {
             proxy_pool::ProxyPoolManager,
         },
         kiro::{model::credentials::KiroCredentials, token_manager::MultiTokenManager},
-        model::config::{Config, TlsBackend},
+        model::config::{Config, PurchaseRegionMode, TlsBackend},
     };
 
     fn batch_update_test_router() -> Router {
@@ -428,6 +433,9 @@ mod tests {
             min_purchase: 1,
             max_purchase: 10,
             api_region: "us-east-1".to_string(),
+            purchase_region_mode: PurchaseRegionMode::Omit,
+            purchase_region: None,
+            credential_api_region_fallback: "us-east-1".to_string(),
             rpm_limit: 0,
             priority: 0,
             groups: Vec::new(),
@@ -453,6 +461,9 @@ mod tests {
             min_purchase: 1,
             max_purchase: 10,
             api_region: "us-east-1".to_string(),
+            purchase_region_mode: PurchaseRegionMode::Omit,
+            purchase_region: None,
+            credential_api_region_fallback: "us-east-1".to_string(),
             rpm_limit: 0,
             priority: 0,
             groups: Vec::new(),
@@ -832,6 +843,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn key_supplier_common_import_settings_have_a_dedicated_admin_route() {
+        let (app, _, _) = key_supplier_test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/admin/key-supplier/common")
+                    .header("x-api-key", "test-admin-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["sourceChannel"], "Webhook 自动采购");
+        assert_eq!(json["nicknameLabel"], "");
+        assert_eq!(json["rpmLimit"], 10);
+        assert_eq!(json["autoDeleteForbidden"], false);
+    }
+
+    #[tokio::test]
     async fn key_supplier_admin_routes_map_config_events_read_retry_and_purchase() {
         let (app, token, supplier) = key_supplier_test_app();
         let authorized = |method: &str, path: &str, body: Body| {
@@ -918,6 +953,7 @@ mod tests {
                 event_type: "new_keys_available".to_string(),
                 purchase_order_id: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()),
                 supplier_batch_id: None,
+                event_region: None,
                 message: None,
                 quantity: 1,
             })
@@ -1019,6 +1055,9 @@ mod tests {
                 min_purchase: 1,
                 max_purchase: 10,
                 api_region: "us-east-1".to_string(),
+                purchase_region_mode: PurchaseRegionMode::Omit,
+                purchase_region: None,
+                credential_api_region_fallback: "us-east-1".to_string(),
                 rpm_limit: 0,
                 priority: 0,
                 groups: Vec::new(),
