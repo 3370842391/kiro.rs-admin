@@ -66,6 +66,7 @@ function Get-TargetVersion {
 function Get-ReleaseSummary {
     param(
         [Parameter(Mandatory = $true)]
+        [AllowNull()]
         [AllowEmptyCollection()]
         [string[]]$Subjects
     )

@@ -57,6 +57,11 @@ $emptySummary = @(Get-ReleaseSummary -Subjects @())
 Assert-Equal $emptySummary.Count 1 '空提交范围应生成维护说明'
 Assert-Equal $emptySummary[0] '其他：仅版本维护' '空提交范围说明错误'
 
+$collapsedSubjects = if ($true) { @() } else { @('unused') }
+$collapsedSummary = @(Get-ReleaseSummary -Subjects $collapsedSubjects)
+Assert-Equal $collapsedSummary.Count 1 '条件表达式折叠的空提交范围应生成维护说明'
+Assert-Equal $collapsedSummary[0] '其他：仅版本维护' '条件表达式折叠的空提交范围说明错误'
+
 $nativeWarnings = @()
 $nativeOutput = @(Invoke-NativeChecked `
     -FilePath 'powershell.exe' `
