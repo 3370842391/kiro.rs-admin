@@ -1619,6 +1619,26 @@ impl SseStateManager {
             .is_some_and(|b| b.started && !b.stopped && b.block_type == expected_type)
     }
 
+    /// 断流时仍未闭合的块类型（取索引最小的那个）。
+    ///
+    /// 这是判断续写是否安全的关键输入，三种情形结论完全不同：
+    /// - 断在 `text` 中：可以续写，把已下发文本作为 assistant 历史接上；
+    /// - 断在 `tool_use` 中：**不能**续写。半截入参 JSON 接不回来，更要紧的是续写
+    ///   可能产出重复的 tool_use，客户端会把副作用真的执行两遍（同一个文件写两次）；
+    /// - 断在 `thinking` 中：危险。续写产生的新 thinking 块签名对不上，客户端校验
+    ///   失败会直接报错，比不续写更糟。
+    ///
+    /// 返回 `None` 表示断在块边界上——那是最安全的续写位置。
+    pub(crate) fn open_block_type(&self) -> Option<&str> {
+        let mut open = self
+            .active_blocks
+            .iter()
+            .filter(|(_, block)| block.started && !block.stopped)
+            .collect::<Vec<_>>();
+        open.sort_by_key(|(index, _)| **index);
+        open.first().map(|(_, block)| block.block_type.as_str())
+    }
+
     /// 获取下一个块索引
     pub fn next_block_index(&mut self) -> i32 {
         let index = self.next_block_index;
@@ -1907,6 +1927,8 @@ pub struct StreamContext {
     pub model: String,
     /// 本请求开始时解析出的不可变上下文窗口快照。
     context_window_size: i32,
+    /// 见 [`Self::set_context_window_signal_threshold_pct`]。默认 85%。
+    context_window_signal_threshold_pct: f64,
     /// 消息 ID
     pub message_id: String,
     /// 客户端可见输入与 Kiro 整体上下文占用的双轨计量。
@@ -2081,6 +2103,18 @@ impl StreamContext {
         self.context_window_size = value.max(1);
     }
 
+    /// 设置下发 `model_context_window_exceeded` 的占比阈值。
+    ///
+    /// 夹到 `(0, 100]`：0 或负数会让每个请求都被判超限，>100 等于永不触发。
+    /// 非法值退回 100.0（原行为），宁可不触发也不误触发。
+    pub fn set_context_window_signal_threshold_pct(&mut self, value: f64) {
+        self.context_window_signal_threshold_pct = if value.is_finite() && value > 0.0 {
+            value.min(100.0)
+        } else {
+            100.0
+        };
+    }
+
     pub(crate) fn set_tool_contracts(
         &mut self,
         contracts: HashMap<String, super::tool_schema::ToolContract>,
@@ -2121,6 +2155,17 @@ impl StreamContext {
     /// 它不算本轮失败，正文与工具调用照常交付，故不进入这个判定。
     pub fn repetition_guard_tripped(&self) -> bool {
         self.repeat_guard_tripped
+    }
+
+    /// 断流时未闭合的块类型，`None` 表示断在块边界上。
+    /// 语义与续写安全性的对应关系见 [`SseStateManager::open_block_type`]。
+    pub(crate) fn open_block_type(&self) -> Option<&str> {
+        self.state_manager.open_block_type()
+    }
+
+    /// 供断流路径打点用的稳定标签，不返回 `Option` 以便直接进日志与 trace。
+    pub(crate) fn break_block_label(&self) -> &str {
+        self.open_block_type().unwrap_or("block_boundary")
     }
 
     /// thinking 通道是否已被复读熔断器静音。
@@ -2245,6 +2290,7 @@ impl StreamContext {
             state_manager: SseStateManager::new(),
             model,
             context_window_size,
+            context_window_signal_threshold_pct: 85.0,
             message_id: format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
             input_usage: super::usage::InputTokenUsage::new(input_tokens),
             output_tokens: 0,
@@ -2375,8 +2421,17 @@ impl StreamContext {
                     / 100.0) as i32;
                 self.input_usage
                     .observe_upstream_context(actual_input_tokens);
-                // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
-                if context_usage.context_usage_percentage >= 100.0 {
+                // 上下文占比越过阈值时下发 model_context_window_exceeded，让客户端压缩历史。
+                //
+                // 原实现写死 100%，是**事后通知**：那时压缩自己也没余量了——compact 请求
+                // 同样带全量历史、同样撞上游字节上限，形成死锁。线上实测 240 分钟内信号
+                // 发了 5 次，会话仍然一路死在 400。阈值默认降到 85%，给压缩留 15% 窗口。
+                //
+                // 这条路径不动 usage 上报，所以对下游（NewAPI 按 message_start.input_tokens
+                // 扣费）零计费影响。
+                if context_usage.context_usage_percentage
+                    >= self.context_window_signal_threshold_pct
+                {
                     self.state_manager
                         .set_stop_reason("model_context_window_exceeded");
                 }
@@ -3825,10 +3880,9 @@ impl StreamContext {
             && self.terminal_protocol_error.is_none()
             && self.terminal_attempt_failure.is_none()
         {
-            tracing::warn!(
-                model = %self.model,
-                "客户端请求了 thinking，但 Kiro 未返回 reasoning；流式保留有效正文或工具调用"
-            );
+            // 这一条曾占全部 WARN 的 70%，把 docker 日志可回溯窗口压到 4 小时。
+            // 请求本身正常完成，属正常降级，改为按模型聚合上报（每分钟一行 INFO）。
+            super::thinking_degradation::record(&self.model);
         }
         if self.thinking_enabled
             && self.strict_thinking_validation
@@ -4049,6 +4103,14 @@ impl BufferedStreamContext {
 
     pub fn set_context_window_size(&mut self, value: i32) {
         self.inner.set_context_window_size(value);
+    }
+
+    pub fn set_context_window_signal_threshold_pct(&mut self, value: f64) {
+        self.inner.set_context_window_signal_threshold_pct(value);
+    }
+
+    pub(crate) fn break_block_label(&self) -> &str {
+        self.inner.break_block_label()
     }
 
     pub(crate) fn set_tool_contracts(
@@ -9107,6 +9169,61 @@ mod tests {
             1
         );
         assert_eq!(collect_text_content(&events), "alpha beta gamma");
+    }
+
+    /// 断点块类型是第 2 批续写方案的必需输入：断在 tool_use 中续写会让客户端
+    /// 把副作用执行两遍，断在 thinking 中会让签名校验失败。这条钉住标签本身。
+    #[test]
+    fn break_block_label_reports_open_block_or_boundary() {
+        let mut manager = SseStateManager::new();
+        // 没有任何块打开 → 断在边界上，是最安全的续写位置。
+        assert_eq!(manager.open_block_type(), None);
+
+        let text_index = manager.next_block_index();
+        manager.handle_content_block_start(text_index, "text", serde_json::json!({}));
+        assert_eq!(manager.open_block_type(), Some("text"));
+
+        // 已闭合的块不再算「未闭合」。
+        manager.handle_content_block_stop(text_index);
+        assert_eq!(manager.open_block_type(), None);
+
+        let tool_index = manager.next_block_index();
+        manager.handle_content_block_start(tool_index, "tool_use", serde_json::json!({}));
+        assert_eq!(
+            manager.open_block_type(),
+            Some("tool_use"),
+            "断在 tool_use 中必须能被识别出来——这是不可续写的情形"
+        );
+    }
+
+    /// 阈值默认 85%，且非法值必须退回 100%（宁可不触发也不误触发）。
+    ///
+    /// 如果 0 或负数被原样接受，`percentage >= threshold` 会对**每个**请求成立，
+    /// 客户端会被逼着无谓压缩每一轮对话——比不修更糟。
+    #[test]
+    fn context_window_signal_threshold_defaults_to_85_and_clamps_illegal_values() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-5",
+            10,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        assert_eq!(ctx.context_window_signal_threshold_pct, 85.0);
+
+        for illegal in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            ctx.set_context_window_signal_threshold_pct(illegal);
+            assert_eq!(
+                ctx.context_window_signal_threshold_pct, 100.0,
+                "非法阈值 {illegal} 必须退回 100，避免每个请求都误判超限"
+            );
+        }
+
+        // >100 夹到 100（等于永不触发），合法值原样保留。
+        ctx.set_context_window_signal_threshold_pct(150.0);
+        assert_eq!(ctx.context_window_signal_threshold_pct, 100.0);
+        ctx.set_context_window_signal_threshold_pct(90.0);
+        assert_eq!(ctx.context_window_signal_threshold_pct, 90.0);
     }
 
     #[test]

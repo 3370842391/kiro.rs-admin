@@ -220,7 +220,16 @@ pub fn decode_payload_parts(
     Ok(output)
 }
 
-const STREAM_TAIL_MAX_BYTES: usize = 256 * 1024;
+/// 断点尾部保留上限。
+///
+/// 上游是 AWS event-stream 二进制帧，续写只需要末尾几帧就能定位断点；实测样本
+/// 92 KB 里绝大部分是无用前段。从 256 KB 压到 32 KB 同时压住两件事：磁盘占用，
+/// 以及「对话正文落盘」的暴露面——尾部里就是模型输出的明文。
+const STREAM_TAIL_MAX_BYTES: usize = 32 * 1024;
+
+/// `client_disconnected` 在快照库里占 19088 条 / 3.2 GB，而客户端主动断开基本
+/// 不是缺陷。只按比例留一小部分请求体，用于排查「是不是我们太慢把客户逼断的」。
+const CLIENT_DISCONNECTED_BODY_SAMPLE_PERMILLE: u64 = 10;
 
 pub struct ErrorSnapshotContext {
     store: SharedErrorSnapshotStore,
@@ -394,28 +403,51 @@ impl StreamTail {
         if excess == 0 {
             return;
         }
-        let mut start = excess;
-        while start < self.bytes.len() && std::str::from_utf8(&self.bytes[start..]).is_err() {
-            start += 1;
-        }
-        if start < self.bytes.len() {
-            self.bytes.drain(..start);
-        } else {
-            self.bytes.drain(..excess);
-        }
+        // 缓冲的是 AWS event-stream 二进制帧（4 字节长度前缀 + CRC32 + 头部），
+        // 不存在可对齐的「UTF-8 边界」。旧实现先试着把截断点推到一个合法 UTF-8
+        // 起点，对二进制帧永远失败，于是每次都退到按 excess 硬截——绕一圈等于没做。
+        // 直接环形截断。
+        self.bytes.drain(..excess);
     }
 
+    /// 原样返回尾部字节。
+    ///
+    /// 旧实现只在尾部是合法 UTF-8 时才返回原文，否则替换成一个 sha256 摘要。
+    /// 但 event-stream 帧**永远**过不了 `from_utf8`，所以线上 34307 条快照的尾部
+    /// 无一例外都退化成了 120 字节摘要——续写要用的断点内容一条都没存下来。
+    ///
+    /// 承载列本来就是 BLOB、`content_type` 本来就写的 `application/octet-stream`、
+    /// 外层本来就套了 zstd，直接存原始字节即可。
+    ///
+    /// 是否被环形截断可以由消费方判断：`tool_diagnostics.interrupted_after_bytes`
+    /// 记的是本轮下发总量，与这里的长度一比即知，不需要额外字段。
     fn snapshot_bytes(&self) -> Vec<u8> {
-        if std::str::from_utf8(&self.bytes).is_ok() {
-            return self.bytes.clone();
-        }
-        serde_json::to_vec(&serde_json::json!({
-            "invalid_utf8": true,
-            "original_bytes": self.bytes.len(),
-            "sha256": hex::encode(Sha256::digest(&self.bytes)),
-        }))
-        .unwrap_or_default()
+        self.bytes.clone()
     }
+}
+
+/// 只有断流类错误的尾部对续写和排障有用。
+///
+/// 其余类型——尤其占了 3.2 GB 的 `client_disconnected`——存原始尾部只是把对话正文
+/// 落盘，没有对应收益。
+fn stream_tail_worth_storing(error_type: &str) -> bool {
+    matches!(
+        error_type,
+        outcome::STREAM_IDLE_TIMEOUT | outcome::STREAM_READ_ERROR | outcome::STREAM_INTERRUPTED
+    )
+}
+
+/// 按 `trace_id` 哈希做确定性采样。
+///
+/// 用哈希而不是 RNG：同一请求重复 finalize 的判定一致，且不引入随机源。
+///
+/// 历史数据的回填清理（`error_snapshot_db::prune_legacy_client_disconnected_bodies`）
+/// 复用同一个谓词，保证「已落库」与「新写入」两边的采样口径完全一致。
+pub(crate) fn client_disconnected_body_sampled(trace_id: &str) -> bool {
+    let digest = Sha256::digest(trace_id.as_bytes());
+    let mut head = [0u8; 8];
+    head.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(head) % 1000 < CLIENT_DISCONNECTED_BODY_SAMPLE_PERMILLE
 }
 
 pub struct SnapshotFinalState {
@@ -697,7 +729,13 @@ impl ErrorSnapshotContext {
         let retention_exempt = severity == SnapshotSeverity::Critical;
         let metadata_only = self.store.capture_mode() == CaptureMode::MetadataOnly;
         let tool_schema_safe_only = draft.tool_schema_safe_only;
-        let include_bodies = policy.capture_bodies && !metadata_only && !tool_schema_safe_only;
+        let include_bodies = policy.capture_bodies
+            && !metadata_only
+            && !tool_schema_safe_only
+            // client_disconnected 只留 1% 的请求体：客户端主动断开基本不是缺陷，
+            // 但全量存 body 让它一类就占了快照库 3.2 GB。
+            && (error_type != outcome::CLIENT_DISCONNECTED
+                || client_disconnected_body_sampled(&self.trace_id));
         let mut raw_payloads = Vec::new();
         if include_bodies {
             raw_payloads.push(RawSnapshotPayload {
@@ -745,7 +783,10 @@ impl ErrorSnapshotContext {
                 data: serde_json::to_vec(&draft.protocol_errors)?,
             });
         }
-        if !tool_schema_safe_only && !draft.stream_tail.bytes.is_empty() {
+        if !tool_schema_safe_only
+            && !draft.stream_tail.bytes.is_empty()
+            && stream_tail_worth_storing(&error_type)
+        {
             raw_payloads.push(RawSnapshotPayload {
                 kind: SnapshotPayloadKind::StreamTail,
                 attempt: None,
@@ -1425,26 +1466,63 @@ mod tests {
     }
 
     #[test]
-    fn stream_tail_keeps_latest_256_kib_on_utf8_boundary() {
+    fn stream_tail_keeps_latest_window_and_final_event() {
         let mut tail = StreamTail::default();
         tail.push("开头".repeat(100_000).as_bytes());
         tail.push(b"FINAL_EVENT");
         let bytes = tail.snapshot_bytes();
 
         assert!(bytes.len() <= STREAM_TAIL_MAX_BYTES);
-        assert!(std::str::from_utf8(&bytes).is_ok());
+        // 断点在尾部，所以最后一帧必须留住。不再要求整体是合法 UTF-8——
+        // 上游本来就是二进制帧，那个要求是旧实现丢数据的根源。
         assert!(bytes.ends_with(b"FINAL_EVENT"));
     }
 
+    /// 钉住「二进制尾部必须原样存」这条契约。
+    ///
+    /// 回归背景：旧实现只在尾部是合法 UTF-8 时存原文，否则替换成 sha256 摘要。
+    /// event-stream 帧永远过不了 `from_utf8`，于是线上 34307 条快照的尾部
+    /// **无一例外**退化成 120 字节摘要，续写拿不到任何断点内容。
     #[test]
-    fn stream_tail_replaces_invalid_utf8_with_length_and_digest() {
+    fn stream_tail_preserves_binary_event_stream_frames() {
         let mut tail = StreamTail::default();
-        tail.push(&[0xff, 0xfe, 0xfd]);
-        let value: serde_json::Value = serde_json::from_slice(&tail.snapshot_bytes()).unwrap();
+        // 典型 event-stream 帧头：长度前缀 + CRC，含 0xff / 0x00 等非 UTF-8 字节。
+        let frame = [0x00u8, 0x00, 0x01, 0x2c, 0xff, 0xfe, 0xfd, 0x00];
+        tail.push(&frame);
 
-        assert_eq!(value["invalid_utf8"], true);
-        assert_eq!(value["original_bytes"], 3);
-        assert_eq!(value["sha256"].as_str().unwrap().len(), 64);
+        let bytes = tail.snapshot_bytes();
+        assert_eq!(bytes, frame, "二进制尾部必须原样保留，不能退化成摘要");
+        assert!(
+            std::str::from_utf8(&bytes).is_err(),
+            "样本本身就不是合法 UTF-8，否则这条测试没有意义"
+        );
+    }
+
+    #[test]
+    fn stream_tail_only_stored_for_stream_break_errors() {
+        assert!(stream_tail_worth_storing(outcome::STREAM_IDLE_TIMEOUT));
+        assert!(stream_tail_worth_storing(outcome::STREAM_READ_ERROR));
+        assert!(stream_tail_worth_storing(outcome::STREAM_INTERRUPTED));
+        // 客户端主动断开不存尾部：那只是把对话正文落盘，没有对应收益。
+        assert!(!stream_tail_worth_storing(outcome::CLIENT_DISCONNECTED));
+        assert!(!stream_tail_worth_storing("upstream_empty_response"));
+    }
+
+    #[test]
+    fn client_disconnected_body_sampling_is_deterministic_and_rare() {
+        // 同一 trace_id 的判定必须稳定，否则重复 finalize 会表现出两种行为。
+        for id in ["trace-a", "trace-b", "trace-c"] {
+            assert_eq!(
+                client_disconnected_body_sampled(id),
+                client_disconnected_body_sampled(id)
+            );
+        }
+        // 目标采样率 1%。2000 个样本落在 [0.2%, 3%] 区间即认为分布合理，
+        // 区间给得宽是为了不让哈希分布的自然抖动把测试搞成 flaky。
+        let hits = (0..2000)
+            .filter(|i| client_disconnected_body_sampled(&format!("trace-{i}")))
+            .count();
+        assert!((4..=60).contains(&hits), "采样命中 {hits} 次，偏离 1% 太远");
     }
 
     #[test]

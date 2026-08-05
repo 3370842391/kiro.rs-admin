@@ -1031,6 +1031,7 @@ async fn collect_buffered_attempt(
         },
     );
     context.set_context_window_size(context_window_size);
+    context.set_context_window_signal_threshold_pct(provider.context_window_signal_threshold_pct());
     context.set_cache_usage(cache_usage);
     if identity_normalization {
         context.enable_identity_filter();
@@ -2595,6 +2596,7 @@ struct StreamAttemptSetup {
     auto_continue_max: u32,
     partial_stream_recovery_enabled: bool,
     partial_stream_recovery_window_ms: u64,
+    context_window_signal_threshold_pct: f64,
 }
 
 fn prepare_retry_request_body(
@@ -2710,6 +2712,7 @@ impl StreamAttemptSetup {
             self.tool_choice_policy.clone(),
         );
         ctx.set_context_window_size(self.context_window_size);
+        ctx.set_context_window_signal_threshold_pct(self.context_window_signal_threshold_pct);
         ctx.set_tool_contracts(self.tool_contracts.clone());
         ctx.cache_usage = self.cache_usage;
         if self.identity_normalization {
@@ -2729,6 +2732,7 @@ impl StreamAttemptSetup {
             self.tool_choice_policy.clone(),
         );
         ctx.set_context_window_size(self.context_window_size);
+        ctx.set_context_window_signal_threshold_pct(self.context_window_signal_threshold_pct);
         ctx.set_tool_contracts(self.tool_contracts.clone());
         ctx.set_cache_usage(self.cache_usage);
         if self.identity_normalization {
@@ -2836,6 +2840,7 @@ async fn handle_stream_request(
         auto_continue_max: provider.auto_continue_max(),
         partial_stream_recovery_enabled: provider.partial_stream_recovery_enabled(),
         partial_stream_recovery_window_ms: provider.partial_stream_recovery_window_ms(),
+        context_window_signal_threshold_pct: provider.context_window_signal_threshold_pct(),
     };
 
     // 创建 SSE 流（带 idle watchdog：上游首字节前挂死 / 中途停流超阈值主动收尾）
@@ -2910,6 +2915,7 @@ fn create_early_sse_stream(
             auto_continue_max: provider.auto_continue_max(),
             partial_stream_recovery_enabled: provider.partial_stream_recovery_enabled(),
             partial_stream_recovery_window_ms: provider.partial_stream_recovery_window_ms(),
+            context_window_signal_threshold_pct: provider.context_window_signal_threshold_pct(),
         },
         hook,
         tracer,
@@ -3656,7 +3662,10 @@ async fn read_continuation_round(
                     }
                 }
                 Some(Err(error)) => {
-                    tracer.record_protocol_error("stream_read_error", &error.to_string());
+                    tracer.record_protocol_error(
+                        "stream_read_error",
+                        &format!("{error} (break_block={})", ctx.break_block_label()),
+                    );
                     break AttemptTermination::ReadError(error.to_string());
                 }
                 None => break AttemptTermination::Eof,
@@ -3669,7 +3678,10 @@ async fn read_continuation_round(
             _ = idle_fut => {
                 tracer.record_protocol_error(
                     "stream_idle_timeout",
-                    &format!("stream idle timeout after {idle_timeout_secs}s"),
+                    &format!(
+                        "stream idle timeout after {idle_timeout_secs}s (break_block={})",
+                        ctx.break_block_label()
+                    ),
                 );
                 break AttemptTermination::IdleTimeout;
             }
@@ -3857,7 +3869,10 @@ async fn run_realtime_sse_attempts(
                     }
                     Some(Err(error)) => {
                         tracing::error!(%error, attempt = attempt_index + 1, "读取响应流失败");
-                        tracer.record_protocol_error("stream_read_error", &error.to_string());
+                        tracer.record_protocol_error(
+                        "stream_read_error",
+                        &format!("{error} (break_block={})", ctx.break_block_label()),
+                    );
                         break AttemptTermination::ReadError(error.to_string());
                     }
                     None => break AttemptTermination::Eof,
@@ -4092,9 +4107,10 @@ async fn run_realtime_sse_attempts(
                     );
                 } else if let Some(message) = ctx.terminal_error_message() {
                     record_stream_usage(&hook, &ctx, credential_id, "error");
+                    // 同 §3.2：优先记真实失败类型，拿不到才退回 bad_request。
                     tracer.finalize(
                         "error",
-                        Some(outcome::BAD_REQUEST),
+                        Some(ctx.terminal_error_type().unwrap_or(outcome::BAD_REQUEST)),
                         Some(&message),
                         None,
                         stream_trace_usage(&ctx),
@@ -4851,9 +4867,16 @@ async fn handle_non_stream_request(
         let (status, error_type, message) = non_stream_attempt_error(&failure, attempt_count);
         hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
         tracer.record_protocol_error(error_type, &message);
+        // 用真实失败类型，不再一律记 bad_request。
+        //
+        // 原实现这里写死 outcome::BAD_REQUEST，导致同一条失败在 API 侧是
+        // `upstream_tool_schema_error`、在 traces.db 里却是 `bad_request` ——
+        // 线上表现为同一条 schema 违规同时出现在两个桶里（`AskUserQuestion`
+        // 缺 multiSelect 在 bad_request 桶 61 条、在 schema 桶 2 条），
+        // 按 error_type 做的统计因此全部不可信。
         tracer.finalize(
             "error",
-            Some(outcome::BAD_REQUEST),
+            Some(error_type),
             Some(&message),
             None,
             TraceUsage::zero(),
@@ -4864,11 +4887,8 @@ async fn handle_non_stream_request(
     let content = normalize_required_tool_content(content, &tool_choice_policy);
     let strict_thinking_validation = provider.strict_thinking_validation();
     if require_thinking && !strict_thinking_validation && !content_has_reasoning(&content) {
-        tracing::warn!(
-            model,
-            credential_id,
-            "客户端请求了 thinking，但 Kiro 未返回 reasoning；保留有效正文或工具调用"
-        );
+        // 与流式路径同一口径：聚合上报而不是逐条 WARN（见 thinking_degradation）。
+        super::thinking_degradation::record(model);
     }
     if let Err(message) =
         validate_required_thinking(require_thinking, strict_thinking_validation, &content)
@@ -5728,6 +5748,7 @@ async fn handle_stream_request_buffered(
         auto_continue_max: provider.auto_continue_max(),
         partial_stream_recovery_enabled: provider.partial_stream_recovery_enabled(),
         partial_stream_recovery_window_ms: provider.partial_stream_recovery_window_ms(),
+        context_window_signal_threshold_pct: provider.context_window_signal_threshold_pct(),
     };
 
     // 创建缓冲 SSE 流
@@ -5921,7 +5942,10 @@ async fn run_buffered_sse_attempts(
                     }
                     Some(Err(error)) => {
                         tracing::error!(%error, attempt = attempt_index + 1, "读取缓冲响应流失败");
-                        tracer.record_protocol_error("stream_read_error", &error.to_string());
+                        tracer.record_protocol_error(
+                        "stream_read_error",
+                        &format!("{error} (break_block={})", ctx.break_block_label()),
+                    );
                         break AttemptTermination::ReadError(error.to_string());
                     }
                     None => break AttemptTermination::Eof,

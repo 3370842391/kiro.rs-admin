@@ -16,6 +16,12 @@ const DEDUP_WINDOW_SECS: i64 = 60;
 const DEFAULT_QUERY_LIMIT: usize = 50;
 const MAX_QUERY_LIMIT: usize = 1000;
 const MAINTENANCE_BATCH_SIZE: usize = 512;
+
+/// `stream_tail` 的独立保留期：48 小时。
+///
+/// 短于快照库自身的 `retention_days`，因为尾部里是模型输出明文，而断流排障
+/// 基本在 1–2 天内完成。见 [`ErrorSnapshotStore::prune_expired_stream_tails`]。
+const STREAM_TAIL_RETENTION_SECS: i64 = 48 * 3600;
 const SNAPSHOT_ROW_OVERHEAD_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -915,6 +921,16 @@ impl ErrorSnapshotStore {
             }
             tx.commit()?;
         }
+        self.prune_expired_stream_tails(now_epoch)?;
+        // 历史 client_disconnected 请求体的回填清理。每轮有上界，靠 needs_follow_up
+        // 驱动维护循环继续推进；清完后不再匹配候选条件，自然停下。
+        let legacy_bodies_stripped = self.prune_legacy_client_disconnected_bodies()?;
+        if legacy_bodies_stripped > 0 {
+            tracing::info!(
+                stripped_payloads = legacy_bodies_stripped,
+                "清理历史 client_disconnected 请求体（保留元数据与 1% 采样）"
+            );
+        }
         let status = self.storage_status()?;
         let (has_more_expired, has_capacity_candidates): (bool, bool) =
             self.conn.lock().query_row(
@@ -934,6 +950,8 @@ impl ErrorSnapshotStore {
             )?;
         let needs_follow_up = fallback_may_have_more
             || has_more_expired
+            // 本轮确实清掉了历史请求体，说明可能还有——再来一轮。
+            || legacy_bodies_stripped > 0
             || (status.live_bytes > target_bytes && has_capacity_candidates);
         let disk_pressure = status.available_bytes < policy.min_free_disk_bytes;
         self.capture_mode
@@ -949,6 +967,140 @@ impl ErrorSnapshotStore {
 
     pub fn capture_mode(&self) -> CaptureMode {
         CaptureMode::from_u8(self.capture_mode.load(Ordering::Acquire))
+    }
+
+    /// 回填清理：把历史 `client_disconnected` 快照的请求体删掉，只留元数据。
+    ///
+    /// 写入侧的 1% 采样只拦**新**快照，已经落库的那批（线上 19088 条 / 3.2 GB）
+    /// 不会自己消失——保留期到了才会整条过期。这一步按**同一个采样谓词**回填：
+    /// 命中 1% 的保留请求体，其余只留 `tool_diagnostics` / `internal_error` 诊断分片。
+    /// 复用同一谓词是为了让历史与新数据的采样口径一致，不出现两套行为。
+    ///
+    /// 顺带清掉这批快照上的 `stream_tail`：按新规则，尾部只对三类断流才存，
+    /// `client_disconnected` 的尾部既无用又是正文。
+    ///
+    /// 三条安全性质：
+    /// - `pinned` / `retention_exempt` 一律不动——那是运维显式保下来的证据；
+    /// - 只删 payload 行，快照元数据（时间、模型、凭据、attempt 链）全部保留；
+    /// - 每轮有 LIMIT 上界，靠维护循环分批推进，不在单次事务里啃 3 GB。
+    ///
+    /// 清完后这些快照不再匹配候选条件，因此该步骤天然自终止，可反复执行。
+    fn prune_legacy_client_disconnected_bodies(&self) -> anyhow::Result<usize> {
+        /// 每轮处理的快照条数上界。取 256：与 `MAINTENANCE_BATCH_SIZE` 同量级，
+        /// 单次事务足够短，靠维护循环多跑几轮把历史啃完。
+        const BATCH: usize = 256;
+
+        let candidates: Vec<(String, String)> = {
+            let conn = self.conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT s.snapshot_id, s.trace_id FROM error_snapshots s
+                   WHERE s.error_type = 'client_disconnected'
+                     AND s.pinned = 0 AND s.retention_exempt = 0
+                     AND EXISTS (
+                         SELECT 1 FROM error_snapshot_payloads p
+                          WHERE p.snapshot_id = s.snapshot_id
+                            AND p.kind IN ('client_request', 'kiro_request',
+                                           'upstream_response', 'stream_tail')
+                     )
+                   LIMIT ?1",
+            )?;
+            stmt.query_map(params![BATCH], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        // 采样命中的整条留着，作为「是不是我们太慢把客户逼断的」的排查素材。
+        let strip: Vec<String> = candidates
+            .into_iter()
+            .filter(|(_, trace_id)| {
+                !crate::anthropic::error_snapshot::client_disconnected_body_sampled(trace_id)
+            })
+            .map(|(snapshot_id, _)| snapshot_id)
+            .collect();
+        if strip.is_empty() {
+            return Ok(0);
+        }
+
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let mut deleted = 0usize;
+        for snapshot_id in &strip {
+            deleted += tx.execute(
+                "DELETE FROM error_snapshot_payloads
+                   WHERE snapshot_id = ?1
+                     AND kind IN ('client_request', 'kiro_request',
+                                  'upstream_response', 'stream_tail')",
+                params![snapshot_id],
+            )?;
+            // 聚合字段按剩余分片重算：Admin UI 直接展示这几个值，
+            // 不重算会出现「分片数与字节数对不上」。
+            tx.execute(
+                "UPDATE error_snapshots SET
+                     payload_count = (
+                         SELECT COUNT(*) FROM error_snapshot_payloads p
+                         WHERE p.snapshot_id = ?1
+                     ),
+                     original_bytes = COALESCE((
+                         SELECT SUM(p.original_bytes) FROM error_snapshot_payloads p
+                         WHERE p.snapshot_id = ?1
+                     ), 0),
+                     compressed_bytes = COALESCE((
+                         SELECT SUM(p.compressed_bytes) FROM error_snapshot_payloads p
+                         WHERE p.snapshot_id = ?1
+                     ), 0)
+                   WHERE snapshot_id = ?1",
+                params![snapshot_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(deleted)
+    }
+
+    /// 单独清理超期的 `stream_tail` payload，保留其余分片与快照元数据。
+    ///
+    /// `stream_tail` 存的是上游 event-stream 原始帧，里面就是**模型输出的明文**。
+    /// 它对续写/断流排障有用，但排障基本在 1–2 天内完成，没有理由跟着快照库的
+    /// 保留期躺 7 天。缩短这个窗口是「对话正文落盘」这件事最有效的缓解手段。
+    ///
+    /// 只删 payload 行、不删快照：断流的元数据（时间、模型、凭据、attempt 链）
+    /// 仍然要能查到，丢的只是正文。
+    fn prune_expired_stream_tails(&self, now_epoch: i64) -> anyhow::Result<usize> {
+        let cutoff = now_epoch.saturating_sub(STREAM_TAIL_RETENTION_SECS);
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let deleted = tx.execute(
+            "DELETE FROM error_snapshot_payloads
+               WHERE kind = 'stream_tail'
+                 AND snapshot_id IN (
+                     SELECT snapshot_id FROM error_snapshots WHERE ts_epoch < ?1
+                 )",
+            params![cutoff],
+        )?;
+        if deleted > 0 {
+            // payload 行删掉后，快照上的聚合字段会失真（Admin UI 直接展示这几个值），
+            // 在同一事务里按剩余分片重算，避免出现「有 3 个分片但字节数含已删尾部」。
+            tx.execute(
+                "UPDATE error_snapshots SET
+                     payload_count = (
+                         SELECT COUNT(*) FROM error_snapshot_payloads p
+                         WHERE p.snapshot_id = error_snapshots.snapshot_id
+                     ),
+                     original_bytes = COALESCE((
+                         SELECT SUM(p.original_bytes) FROM error_snapshot_payloads p
+                         WHERE p.snapshot_id = error_snapshots.snapshot_id
+                     ), 0),
+                     compressed_bytes = COALESCE((
+                         SELECT SUM(p.compressed_bytes) FROM error_snapshot_payloads p
+                         WHERE p.snapshot_id = error_snapshots.snapshot_id
+                     ), 0)
+                   WHERE ts_epoch < ?1",
+                params![cutoff],
+            )?;
+        }
+        tx.commit()?;
+        Ok(deleted)
     }
 
     pub fn storage_status(&self) -> anyhow::Result<StorageStatus> {
@@ -1603,6 +1755,201 @@ mod tests {
             omitted_due_to_disk_pressure: false,
             payloads: first,
         }
+    }
+
+    /// 带一个 `stream_tail` 分片的快照，用于验证尾部的独立保留期。
+    fn sample_write_with_stream_tail(
+        snapshot_id: &str,
+        trace_id: &str,
+        ts_epoch: i64,
+    ) -> SnapshotWrite {
+        let mut write = sample_write(snapshot_id, trace_id);
+        write.ts_epoch = ts_epoch;
+        let mut tail = crate::anthropic::error_snapshot::encode_payload(
+            crate::common::error_snapshot::SnapshotPayloadKind::StreamTail,
+            None,
+            "application/octet-stream",
+            // 故意用非 UTF-8 字节：这正是线上尾部的形态。
+            &[0x00u8, 0x00, 0x01, 0x2c, 0xff, 0xfe],
+        )
+        .unwrap();
+        for part in &mut tail {
+            part.seq = 2;
+        }
+        write.payloads.extend(tail);
+        write
+    }
+
+    fn stream_tail_part_count(store: &ErrorSnapshotStore, snapshot_id: &str) -> i64 {
+        store
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM error_snapshot_payloads
+                   WHERE snapshot_id = ?1 AND kind = 'stream_tail'",
+                params![snapshot_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// `stream_tail` 里是模型输出明文，必须比快照库自身的保留期更早清掉，
+    /// 且只清尾部——断流的元数据仍要能查。
+    #[test]
+    fn stream_tail_expires_before_snapshot_and_keeps_metadata() {
+        let store = ErrorSnapshotStore::open_in_memory(test_policy()).unwrap();
+        let now = 1_800_000_000i64;
+        // 一条 49 小时前（尾部应过期），一条 1 小时前（尾部应保留）。
+        let stale_ts = now - 49 * 3600;
+        let fresh_ts = now - 3600;
+        store
+            .insert_with_fallback(&sample_write_with_stream_tail(
+                "snap-stale",
+                "t-stale",
+                stale_ts,
+            ))
+            .unwrap();
+        store
+            .insert_with_fallback(&sample_write_with_stream_tail(
+                "snap-fresh",
+                "t-fresh",
+                fresh_ts,
+            ))
+            .unwrap();
+
+        assert_eq!(stream_tail_part_count(&store, "snap-stale"), 1);
+        let deleted = store.prune_expired_stream_tails(now).unwrap();
+
+        assert_eq!(deleted, 1, "只应删掉超过 48 小时的那一条尾部");
+        assert_eq!(stream_tail_part_count(&store, "snap-stale"), 0);
+        assert_eq!(
+            stream_tail_part_count(&store, "snap-fresh"),
+            1,
+            "48 小时内的尾部必须保留，否则续写排障没有素材"
+        );
+
+        // 快照本身与其余分片不能被带走。
+        let (payload_count, error_type): (i64, String) = store
+            .conn
+            .lock()
+            .query_row(
+                "SELECT payload_count, error_type FROM error_snapshots WHERE snapshot_id = ?1",
+                params!["snap-stale"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(error_type, "upstream_error", "元数据必须留下");
+        assert_eq!(payload_count, 2, "聚合字段应按剩余分片重算（3 - 1 = 2）");
+    }
+
+    fn body_part_count(store: &ErrorSnapshotStore, snapshot_id: &str) -> i64 {
+        store
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM error_snapshot_payloads
+                   WHERE snapshot_id = ?1
+                     AND kind IN ('client_request', 'kiro_request',
+                                  'upstream_response', 'stream_tail')",
+                params![snapshot_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// 找一个采样**未**命中的 trace_id：这批才会被剥掉请求体。
+    fn unsampled_trace_id() -> String {
+        (0..10_000)
+            .map(|i| format!("cd-trace-{i}"))
+            .find(|id| !crate::anthropic::error_snapshot::client_disconnected_body_sampled(id))
+            .expect("1% 采样率下必然存在未命中的 trace_id")
+    }
+
+    /// 找一个采样命中的 trace_id：这批要整条保留。
+    fn sampled_trace_id() -> String {
+        (0..100_000)
+            .map(|i| format!("cd-trace-{i}"))
+            .find(|id| crate::anthropic::error_snapshot::client_disconnected_body_sampled(id))
+            .expect("1% 采样率下 10 万个样本必然有命中")
+    }
+
+    fn client_disconnected_write(snapshot_id: &str, trace_id: &str) -> SnapshotWrite {
+        let mut write = sample_write(snapshot_id, trace_id);
+        write.error_type = "client_disconnected".to_string();
+        write
+    }
+
+    /// 写入侧采样只拦新快照，历史 3.2 GB 不会自己消失，所以要回填清理。
+    /// 这条同时钉住三件事：非采样的剥 body、采样的整条保留、元数据不丢。
+    #[test]
+    fn legacy_client_disconnected_bodies_are_stripped_except_the_sample() {
+        let store = ErrorSnapshotStore::open_in_memory(test_policy()).unwrap();
+        let unsampled = unsampled_trace_id();
+        let sampled = sampled_trace_id();
+
+        store
+            .insert_with_fallback(&client_disconnected_write("snap-strip", &unsampled))
+            .unwrap();
+        store
+            .insert_with_fallback(&client_disconnected_write("snap-keep", &sampled))
+            .unwrap();
+        // 非 client_disconnected 的快照一律不受影响。
+        store
+            .insert_with_fallback(&sample_write("snap-other", "trace-other"))
+            .unwrap();
+
+        assert_eq!(body_part_count(&store, "snap-strip"), 1);
+        let stripped = store.prune_legacy_client_disconnected_bodies().unwrap();
+
+        assert_eq!(stripped, 1, "只应剥掉采样未命中的那一条");
+        assert_eq!(body_part_count(&store, "snap-strip"), 0);
+        assert_eq!(
+            body_part_count(&store, "snap-keep"),
+            1,
+            "采样命中的 1% 必须留住请求体，否则丢掉全部排查素材"
+        );
+        assert_eq!(
+            body_part_count(&store, "snap-other"),
+            1,
+            "其它错误类型的快照不能被牵连"
+        );
+
+        // 元数据与诊断分片必须留下，且聚合字段按剩余分片重算。
+        let (payload_count, error_type, model): (i64, String, String) = store
+            .conn
+            .lock()
+            .query_row(
+                "SELECT payload_count, error_type, model FROM error_snapshots
+                   WHERE snapshot_id = ?1",
+                params!["snap-strip"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(error_type, "client_disconnected");
+        assert_eq!(model, "claude-opus-4-8", "元数据必须留下");
+        assert_eq!(payload_count, 1, "剩下 internal_error 一个分片");
+
+        // 幂等：清完不再匹配候选条件，重复执行是 no-op。
+        assert_eq!(store.prune_legacy_client_disconnected_bodies().unwrap(), 0);
+    }
+
+    /// `pinned` / `retention_exempt` 是运维显式保下来的证据，回填清理不能碰。
+    #[test]
+    fn legacy_cleanup_never_touches_pinned_or_exempt_snapshots() {
+        let store = ErrorSnapshotStore::open_in_memory(test_policy()).unwrap();
+        let unsampled = unsampled_trace_id();
+
+        let mut pinned = client_disconnected_write("snap-pinned", &unsampled);
+        pinned.pinned = true;
+        store.insert_with_fallback(&pinned).unwrap();
+
+        let mut exempt = client_disconnected_write("snap-exempt", "cd-trace-exempt");
+        exempt.retention_exempt = true;
+        store.insert_with_fallback(&exempt).unwrap();
+
+        assert_eq!(store.prune_legacy_client_disconnected_bodies().unwrap(), 0);
+        assert_eq!(body_part_count(&store, "snap-pinned"), 1);
+        assert_eq!(body_part_count(&store, "snap-exempt"), 1);
     }
 
     fn test_store_with_probe(tree_bytes: u64, available_bytes: u64) -> ErrorSnapshotStore {

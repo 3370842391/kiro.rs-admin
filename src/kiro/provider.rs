@@ -569,6 +569,13 @@ impl KiroProvider {
         self.token_manager.config().strict_thinking_validation
     }
 
+    /// 下发 `model_context_window_exceeded` 的上下文占比阈值（百分比）。
+    pub fn context_window_signal_threshold_pct(&self) -> f64 {
+        self.token_manager
+            .config()
+            .context_window_signal_threshold_pct
+    }
+
     /// 是否对助手输出做身份归一化（Kiro/AWS → Claude/Anthropic）。见 anthropic::identity。
     pub fn identity_normalization(&self) -> bool {
         self.token_manager.config().identity_normalization

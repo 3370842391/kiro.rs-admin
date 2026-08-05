@@ -12,6 +12,7 @@
   "traceRetentionDays": 7,
   "usageLogRetentionDays": 31,
   "earlyStreamHandshake": false,
+  "contextWindowSignalThresholdPct": 85,
   "autoContinueEnabled": false,
   "autoContinueMax": 3,
   "partialStreamRecoveryEnabled": false,

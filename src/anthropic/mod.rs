@@ -37,6 +37,7 @@ pub(crate) mod model_profile_answer;
 mod router;
 pub mod stream;
 pub(crate) mod structured_output;
+pub(crate) mod thinking_degradation;
 pub(crate) mod thinking_signature;
 pub(crate) mod tool_attempt;
 pub(crate) mod tool_history;
