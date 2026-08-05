@@ -181,6 +181,12 @@ pub mod outcome {
     pub const UNKNOWN: &str = "unknown";
     /// 仅用作 record.error_type：流式响应已开始但上游中途断开
     pub const STREAM_INTERRUPTED: &str = "stream_interrupted";
+    /// 上游流读取出错（已下发部分内容后断开）
+    pub const STREAM_READ_ERROR: &str = "stream_read_error";
+    /// 上游流空闲超时，服务端主动收尾
+    pub const STREAM_IDLE_TIMEOUT: &str = "stream_idle_timeout";
+    /// 客户端主动断开连接
+    pub const CLIENT_DISCONNECTED: &str = "client_disconnected";
 }
 
 /// 把上游错误体截断到安全长度（按字符边界，避免切碎 UTF-8）
@@ -692,6 +698,19 @@ impl TraceStore {
             current.request_body_bytes.saturating_mul(100) <= previous_bytes.saturating_mul(80);
         if current.diagnosis == "payload_limit_preempted" && shrank_at_least_twenty_percent {
             return Ok("suspected_compaction_insufficient".to_string());
+        }
+
+        // 正向观测：上一轮已处于高压且本轮请求体明显缩小 → 客户端确实压缩了。
+        //
+        // 加这一条是为了验证「压缩信号阈值降到 85%」这个改动到底有没有生效。
+        // 原先只有 `suspected_client_compaction_not_triggered` 这个**否定**判定，
+        // 而否定判定的缺席是弱证据——请求可能只是没进高压区。有了正向计数，
+        // 两者的比值才能直接回答「客户端认不认这个 stop_reason」。
+        //
+        // 命名用 observed 而非 confirmed：这是相关性推断（上一轮高压 + 本轮变小），
+        // 不能证明因果，客户端也可能因为别的原因缩小了请求。
+        if previous_exposed_high_context && shrank_at_least_twenty_percent {
+            return Ok("client_compaction_observed".to_string());
         }
         Ok(current.diagnosis.clone())
     }
@@ -1489,6 +1508,43 @@ mod tests {
                 .diagnostics_json,
             "{\"schemaVersion\":1,\"containsOnlySafeCounters\":true}"
         );
+
+        // 正向观测：上一轮高压 + 本轮明显缩小 → 客户端确实压缩了。
+        // 这一条是验证「压缩信号阈值降到 85%」是否生效的关键计数。
+        let mut compacted_previous = sample(TraceSample {
+            trace_id: "compacted-previous",
+            status: "success",
+            credential_id: 5,
+            model: "claude-opus-4-8",
+        });
+        compacted_previous.ts = base.to_rfc3339();
+        compacted_previous.compaction = Some(compaction(
+            "session-compacted",
+            "context_signal_enqueued",
+            3_000_000,
+            Some(90.0),
+        ));
+        store.insert(compacted_previous);
+
+        let mut compacted_next = sample(TraceSample {
+            trace_id: "compacted-next",
+            status: "success",
+            credential_id: 5,
+            model: "claude-opus-4-8",
+        });
+        compacted_next.ts = (base + chrono::Duration::seconds(1)).to_rfc3339();
+        // 缩到 40%，远低于 80% 的门槛，且不是 payload_limit_preempted。
+        compacted_next.compaction =
+            Some(compaction("session-compacted", "normal", 1_200_000, None));
+        store.insert(compacted_next);
+
+        let compacted = store.query(&TraceQuery {
+            compaction_diagnosis: Some("client_compaction_observed".to_string()),
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(compacted.len(), 1, "客户端压缩必须被正向观测到");
+        assert_eq!(compacted[0].trace_id, "compacted-next");
 
         let insufficient = store.query(&TraceQuery {
             compaction_diagnosis: Some("suspected_compaction_insufficient".to_string()),

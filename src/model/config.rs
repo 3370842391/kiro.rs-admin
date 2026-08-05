@@ -951,6 +951,21 @@ pub struct Config {
     #[serde(default)]
     pub early_stream_handshake: bool,
 
+    /// 下发 `model_context_window_exceeded` 的上下文占比阈值（百分比）。
+    ///
+    /// 客户端（Claude Code 等）收到这个 stop_reason 才会压缩历史。原实现硬编码
+    /// 100%，属**事后通知**：那时压缩自己也没余量了——compact 请求同样带全量历史、
+    /// 同样撞上游字节上限，形成死锁（线上实测 240 分钟内发了 5 次信号，会话仍死在
+    /// 400）。降到 85% 是为了给压缩本身留出 15% 窗口。
+    ///
+    /// 取 85 的依据：社区报告的 Claude Code auto-compact 触发点在 83.5%–92%，
+    /// 取下沿确保我们的信号先到。做成配置项而非常量，是为了线上可灰度、可回滚：
+    /// 触发太频繁往 88–90 调，仍撞 400 往 80 调。
+    ///
+    /// 注意：这条路径**不改 usage 上报**，因此对下游计费零影响。
+    #[serde(default = "default_context_window_signal_threshold_pct")]
+    pub context_window_signal_threshold_pct: f64,
+
     /// 纯文本响应因 `max_tokens` 截断时是否自动向 Kiro 发起续写。
     /// 默认关闭；开启后可能增加上游调用次数、总耗时和计费。
     #[serde(default)]
@@ -1191,6 +1206,11 @@ fn default_stream_idle_timeout_secs() -> u64 {
     120
 }
 
+/// 见 [`Config::context_window_signal_threshold_pct`]。85% 留 15% 窗口给压缩本身。
+fn default_context_window_signal_threshold_pct() -> f64 {
+    85.0
+}
+
 fn default_auto_continue_max() -> u32 {
     3
 }
@@ -1334,6 +1354,7 @@ impl Default for Config {
             error_snapshot_min_free_disk_gb: default_error_snapshot_min_free_disk_gb(),
             stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
             early_stream_handshake: false,
+            context_window_signal_threshold_pct: default_context_window_signal_threshold_pct(),
             auto_continue_enabled: false,
             auto_continue_max: default_auto_continue_max(),
             partial_stream_recovery_enabled: false,
@@ -1750,6 +1771,21 @@ mod tests {
     fn early_stream_handshake_accepts_camel_case_json() {
         let config: Config = serde_json::from_str(r#"{"earlyStreamHandshake":true}"#).unwrap();
         assert!(config.early_stream_handshake);
+    }
+
+    /// 阈值默认 85 而非 100：100 是「事后通知」，压缩那时已经没有余量。
+    /// 这条测试同时防止有人把默认值改回 100 而不留痕迹。
+    #[test]
+    fn context_window_signal_threshold_defaults_to_85_pct() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.context_window_signal_threshold_pct, 85.0);
+    }
+
+    #[test]
+    fn context_window_signal_threshold_accepts_camel_case_json() {
+        let config: Config =
+            serde_json::from_str(r#"{"contextWindowSignalThresholdPct":90.5}"#).unwrap();
+        assert_eq!(config.context_window_signal_threshold_pct, 90.5);
     }
 
     #[test]
