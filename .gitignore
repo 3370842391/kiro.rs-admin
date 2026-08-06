@@ -54,7 +54,22 @@ demo/
 # oh-my-claudecode 运行时状态（不提交）
 .omc/
 # 内部任务分析文档（含生产服务器 IP 等私密信息，不公开）
+#
+# 注意：这条规则加上之前，docs/ 下已有 120 个文件被跟踪，而 gitignore 管不到
+# 已跟踪文件，所以它们一直留在公开仓库里。已用 `git rm -r --cached docs/` 落实
+# 这条规则的原意；本地文件未删。
 /docs/
+
+# 批量登录工具的账号清单（账号 + 密码明文）。README 里用 `--input .\accounts.txt`
+# 举例，所以这个文件名很容易被人放在仓库根目录再顺手提交进来——已经发生过一次。
+# 同时忽略 README 提到的另外两种命名。
+/accounts.txt
+/enterprise-accounts.txt
+/microsoft-accounts.txt
+
+# 一次性排障脚本与草稿：只在特定容器/时间点有意义，不是项目资产
+/.classify.sh
+/scripts/11.txt
 /batch-login-*.jsonl
 /scripts/__pycache__/
 /scripts/batch_login/__pycache__/
