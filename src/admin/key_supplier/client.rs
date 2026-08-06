@@ -804,6 +804,212 @@ mod tests {
         assert_eq!(client.purchase_quote().await.unwrap().stock, 3);
     }
 
+    /// 线上实测的缺货 409 原文（2026-08-07，订单 600b6fbd…）。
+    ///
+    /// 这条钉住两个曾经踩过的坑：
+    /// 1. `STORE_INVENTORY_SHORTAGE` 不含 "insufficient stock" 这类英文短语，
+    ///    纯词表匹配抓不到 → 必须先读 `error.code`。
+    /// 2. 正文里的中文是 `\uXXXX` 转义（`response.text()` 给的是原始字节），
+    ///    `contains("库存不足")` 永远不成立。
+    ///
+    /// 判不出缺货 → 不回退 → 「webhook 到了却一直买不到」的原始故障复现。
+    #[test]
+    fn real_world_store_inventory_shortage_is_recognised_as_out_of_stock() {
+        let body = concat!(
+            r#"{"error":{"code":"STORE_INVENTORY_SHORTAGE","details":{"available":0},"#,
+            r#""message":"Store 库存不足","#,
+            r#""request_id":"req_c5be2ed926434b6db19e6284a13eba5e"}}"#
+        );
+        assert_eq!(DropConflictKind::OutOfStock, classify_drop_conflict(body));
+
+        // 去掉 code 只剩转义中文，文案回退路径也必须认出来
+        let text_only = r#"{"error":{"message":"Store 库存不足"}}"#;
+        assert_eq!(
+            DropConflictKind::OutOfStock,
+            classify_drop_conflict(text_only),
+            "转义形态的中文必须能匹配上"
+        );
+
+        // 只剩 details.available == 0 也足以判缺货
+        let details_only = r#"{"error":{"details":{"available":0}}}"#;
+        assert_eq!(
+            DropConflictKind::OutOfStock,
+            classify_drop_conflict(details_only)
+        );
+    }
+
+    #[test]
+    fn drop_409_classifier_only_switches_region_on_an_explicit_stock_shortage() {
+        // 缺货 → 可换区
+        for body in [
+            r#"{"error":"库存不足"}"#,
+            r#"{"message":"当前区域没有库存"}"#,
+            r#"{"detail":"insufficient stock for region us-east-1"}"#,
+            r#"{"error":"Out Of Stock"}"#,
+            r#"{"msg":"无可用 Key"}"#,
+        ] {
+            assert_eq!(
+                DropConflictKind::OutOfStock,
+                classify_drop_conflict(body),
+                "应判为缺货: {body}"
+            );
+        }
+
+        // 余额不足 → 换区照样买不起，必须单独归类
+        for body in [
+            r#"{"error":"余额不足"}"#,
+            r#"{"message":"Insufficient balance"}"#,
+            r#"{"detail":"not enough balance"}"#,
+        ] {
+            assert_eq!(
+                DropConflictKind::InsufficientBalance,
+                classify_drop_conflict(body),
+                "应判为余额不足: {body}"
+            );
+        }
+
+        // 读不出来 → 不换区（失败关闭）。把这些误判成缺货会白打一次欧区并掩盖真因。
+        for body in [
+            r#"{"error":"订单号冲突"}"#,
+            r#"{"error":"价格超过 max_total_cny"}"#,
+            r#"{"error":"order id conflict"}"#,
+            "",
+            "{}",
+        ] {
+            assert_eq!(
+                DropConflictKind::Indeterminate,
+                classify_drop_conflict(body),
+                "应判为无法确定: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn drop_409_balance_shortage_is_not_mistaken_for_stock() {
+        // 「余额不足」与「库存不足」都含「不足」，只看子串会互相误命中。
+        // 同时提到两者时必须判成余额不足——那才是真正的阻塞原因。
+        assert_eq!(
+            DropConflictKind::InsufficientBalance,
+            classify_drop_conflict(r#"{"error":"余额不足，无法购买当前库存"}"#)
+        );
+    }
+
+    #[test]
+    fn region_fallback_order_id_is_derived_stable_and_distinct() {
+        let base = "0123456789abcdef0123456789abcdef";
+        let eu = derive_region_order_id(base, SupplierRegion::Eu);
+
+        // 32 位十六进制：purchase() 入口会校验这个格式
+        assert_eq!(32, eu.len(), "幂等号必须是 32 位");
+        assert!(eu.chars().all(|c| c.is_ascii_hexdigit()), "必须是十六进制");
+        // 不能与美区那个号相同，否则可能被当成重放美区单
+        assert_ne!(base, eu.as_str());
+        // 同一事件重试要得到同一个号，幂等性才成立
+        assert_eq!(eu, derive_region_order_id(base, SupplierRegion::Eu));
+        // 两个区互不相同
+        assert_ne!(eu, derive_region_order_id(base, SupplierRegion::Us));
+    }
+
+    #[tokio::test]
+    async fn kiro_drop_falls_back_to_eu_when_the_default_region_is_out_of_stock() {
+        // 线上表现：webhook 到了却一直买不到——默认只打美区，美区空了就 409，
+        // 而欧区其实有货。这条钉住「缺货自动改打欧区」且「换区换了幂等号」。
+        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let observed = bodies.clone();
+        let app = Router::new().route(
+            "/api/my/purchase",
+            post(move |request: axum::http::Request<axum::body::Body>| {
+                let observed = observed.clone();
+                async move {
+                    let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    let is_eu = body.get("region").and_then(|v| v.as_str()) == Some("eu");
+                    observed.lock().unwrap().push(body);
+                    if is_eu {
+                        return axum::http::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(
+                                serde_json::json!({
+                                    "client_order_id": "",
+                                    "purchased": 1,
+                                    "remaining": "884.400000",
+                                    "region": "eu-central-1",
+                                    "order_id": "store_eu_1",
+                                    "keys": [{"key": "ksk_eu_one", "region": "eu-central-1"}]
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap();
+                    }
+                    axum::http::Response::builder()
+                        .status(409)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(
+                            serde_json::json!({"error": "库存不足"}).to_string(),
+                        ))
+                        .unwrap()
+                }
+            }),
+        );
+        let client =
+            SupplierClient::with_kind(server(app).await, "usr-secret", SupplierKind::KiroDrop)
+                .unwrap();
+
+        let base = "0123456789abcdef0123456789abcdef";
+        let purchase = client.purchase(1, base).await.unwrap();
+
+        assert_eq!(purchase.purchased, 1);
+        // 实际出货区域取自响应，不再一路按美区落库
+        assert_eq!(purchase.actual_region, Some(SupplierRegion::Eu));
+        assert_eq!(purchase.region_source, Some(RegionSource::PurchaseResponse));
+        assert_eq!(purchase.supplier_order_id.as_deref(), Some("store_eu_1"));
+
+        let sent = bodies.lock().unwrap().clone();
+        assert_eq!(2, sent.len(), "应当只回退一次：默认区 + 欧区");
+        // 第一发不带 region（走对方默认美区）
+        assert!(sent[0].get("region").is_none(), "首发不该带 region");
+        assert_eq!(sent[0]["client_order_id"], base);
+        // 第二发带 eu，且换了幂等号
+        assert_eq!(sent[1]["region"], "eu");
+        assert_ne!(
+            sent[1]["client_order_id"], sent[0]["client_order_id"],
+            "换区必须换幂等号，否则可能被当成重放美区那单"
+        );
+    }
+
+    #[tokio::test]
+    async fn kiro_drop_does_not_fall_back_when_the_shortage_reason_is_unreadable() {
+        // 409 是多义的。读不出缺货就不该换区——否则余额不足也会白打一次欧区。
+        let hits = Arc::new(Mutex::new(0usize));
+        let counter = hits.clone();
+        let app = Router::new().route(
+            "/api/my/purchase",
+            post(move || {
+                let counter = counter.clone();
+                async move {
+                    *counter.lock().unwrap() += 1;
+                    axum::http::Response::builder()
+                        .status(409)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(
+                            serde_json::json!({"error": "订单号冲突"}).to_string(),
+                        ))
+                        .unwrap()
+                }
+            }),
+        );
+        let client =
+            SupplierClient::with_kind(server(app).await, "usr-secret", SupplierKind::KiroDrop)
+                .unwrap();
+
+        let result = client.purchase(1, "0123456789abcdef0123456789abcdef").await;
+        assert!(result.is_err(), "无法判定的 409 不该被当成成功");
+        assert_eq!(1, *hits.lock().unwrap(), "不该发生换区重试");
+    }
+
     #[tokio::test]
     async fn kiro_drop_purchase_parses_the_string_remaining_and_keeps_the_order_id() {
         // 采购响应的 remaining 也是字符串。解析失败意味着钱已经扣了却拿不到 key。
@@ -1941,7 +2147,10 @@ impl SupplierClient {
         }
         match self.kind {
             SupplierKind::KiroRs => self.purchase_kiro_rs(count, client_order_id).await,
-            SupplierKind::KiroDrop => self.purchase_kiro_drop(count, client_order_id).await,
+            SupplierKind::KiroDrop => {
+                self.purchase_kiro_drop(count, client_order_id, context)
+                    .await
+            }
             SupplierKind::KiroCeo => {
                 self.purchase_kiro_ceo(count, client_order_id, context)
                     .await
@@ -2032,19 +2241,69 @@ impl SupplierClient {
     ///
     /// 不发 `max_total_cny`：那是可选的总价保护，但我们目前没有金额预算能力，
     /// 凭空填一个数会在对方涨价时把正常采购挡掉。等做了金额预算再接上。
+    /// `POST /api/my/purchase`（Kiro Drop）。
+    ///
+    /// **区域回退**：不传 `region` 时对方默认只从美区出货，美区空了就 409 缺货，
+    /// 而欧区往往还有货——线上表现是「webhook 到了却一直买不到」。所以美区判定缺货后
+    /// 自动改打欧区一次。
+    ///
+    /// 换区必须换幂等号（见 [`derive_region_order_id`]），否则可能被当成重放美区那单。
+    ///
+    /// 只回退一次、且只在**明确读出缺货**时回退：409 是多义的，余额不足换区照样买不起。
     async fn purchase_kiro_drop(
         &self,
         count: u32,
         client_order_id: &str,
+        context: PurchaseContext<'_>,
     ) -> Result<Purchase, SupplierError> {
+        // 上层显式指定了区就尊重它，不再自作主张回退——那是运维配死的意图。
+        if let Some(region) = context.requested_region {
+            return self
+                .purchase_kiro_drop_in(count, client_order_id, Some(region), context)
+                .await;
+        }
+
+        // 未指定：先打默认区（对方默认美区），缺货再试欧区。
+        match self
+            .purchase_kiro_drop_in(count, client_order_id, None, context)
+            .await
+        {
+            Err(SupplierError::OutOfStock) => {}
+            other => return other,
+        }
+
+        let fallback = SupplierRegion::Eu;
+        let fallback_order_id = derive_region_order_id(client_order_id, fallback);
+        tracing::info!(
+            supplier = %self.kind,
+            fallback_region = fallback.as_api_region(),
+            "默认区缺货，改打欧区一次（换用派生幂等号）"
+        );
+        self.purchase_kiro_drop_in(count, &fallback_order_id, Some(fallback), context)
+            .await
+    }
+
+    /// 单次下单，`region` 为 `None` 时不带该字段（走对方默认区）。
+    async fn purchase_kiro_drop_in(
+        &self,
+        count: u32,
+        client_order_id: &str,
+        region: Option<SupplierRegion>,
+        _context: PurchaseContext<'_>,
+    ) -> Result<Purchase, SupplierError> {
+        let mut body = serde_json::json!({
+            "count": count,
+            "client_order_id": client_order_id,
+        });
+        // 传 us / eu 以外的值对方直接 400，所以只在明确有值时带。
+        if let Some(region) = region {
+            body["region"] = serde_json::Value::String(region.as_wire().to_owned());
+        }
         let response: KiroDropPurchase = self
             .request(
                 Method::POST,
                 "/api/my/purchase",
-                Some(serde_json::json!({
-                    "count": count,
-                    "client_order_id": client_order_id,
-                })),
+                Some(body),
                 RetryPolicy::Retryable,
             )
             .await?;
@@ -2068,6 +2327,20 @@ impl SupplierClient {
         if response.purchased == 0 {
             return Err(SupplierError::OutOfStock);
         }
+        // 实际出货区域以对方响应为准（文档：「本单实际出货区域，始终为完整区域值」）。
+        // 解析不出来时不猜——留 None 让上层退到自己的兜底链，而不是硬写成美区。
+        let actual_region = response
+            .region
+            .as_deref()
+            .and_then(|value| value.trim().parse::<SupplierRegion>().ok())
+            .or(region);
+        let region_source = actual_region.map(|_| {
+            if response.region.is_some() {
+                RegionSource::PurchaseResponse
+            } else {
+                RegionSource::Request
+            }
+        });
         Ok(Purchase {
             client_order_id: client_order_id.to_owned(),
             purchased: response.purchased,
@@ -2077,10 +2350,10 @@ impl SupplierClient {
             // 那不可靠（并发采购会互相干扰），所以这里留空不猜。
             points_cost: None,
             unit_price: None,
-            supplier_order_id: None,
+            supplier_order_id: response.order_id.filter(|id| !id.trim().is_empty()),
             replayed: false,
-            actual_region: None,
-            region_source: None,
+            actual_region,
+            region_source,
             // 前缀走宽松校验：钱已经扣了，不能因为前缀不合预期就把 key 扔掉。
             keys: accept_paid_keys(response.keys.into_iter().map(|key| (key.key, key.price)))?,
         })
@@ -2416,6 +2689,19 @@ impl SupplierClient {
                 // kiro.ceo 的 409 是二义的（文档：「库存不足、幂等键撞了别的订单」），
                 // 没有可判定字段能分开。仍然归到这里：对方的中文原因会原样带进事件
                 // 记录，运维能看出是哪种；而且这条路径既不扣钱也不丢 key，宁可多提醒。
+                // Drop 把四种原因都塞进 409。缺货和余额不足能从原文读出来时单独归类：
+                // 缺货要能触发换区重试（原先归成 StateConflict，回退根本不会发生），
+                // 余额不足要能提示充值。读不出来就沿用下面的多义处理，不猜。
+                if status.as_u16() == 409 && self.kind == SupplierKind::KiroDrop {
+                    let detail = sanitize(&text, &self.api_key.0);
+                    match classify_drop_conflict(&text) {
+                        DropConflictKind::OutOfStock => return Err(SupplierError::OutOfStock),
+                        DropConflictKind::InsufficientBalance => {
+                            return Err(SupplierError::InsufficientBalance(detail));
+                        }
+                        DropConflictKind::Indeterminate => {}
+                    }
+                }
                 if status.as_u16() == 409 && self.kind.purchase_is_idempotent() {
                     let detail = sanitize(&text, &self.api_key.0);
                     // kiro.ceo 和 Kiro Drop 的 409 都是多义的（库存不足 / 余额不足 /
@@ -2476,6 +2762,118 @@ pub struct PurchaseQuote {
     /// 这份报价对应的区域，下单时必须原样带回去。仅 kiro.ceo 有：它按区严格隔离，
     /// 不传就默认美国区，而报价可能来自欧洲区。
     pub zone: Option<String>,
+}
+
+/// Kiro Drop 的 409 语义分类。
+///
+/// 文档把四种原因合并到 409：余额不足 / 库存不足 / 订单号冲突 / 价格超 `max_total_cny`。
+/// 只有「库存不足」适合换区重试——余额不足换区照样买不起，订单号冲突换区可能重复下单。
+/// 对方没有可判定字段，只能读原文。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DropConflictKind {
+    /// 明确是缺货 → 可以换区再试。
+    OutOfStock,
+    /// 明确是余额不足 → 换区无用，直接归类让人去充值。
+    InsufficientBalance,
+    /// 读不出来 → **不换区**。宁可少买不可乱花：把「余额不足」误判成缺货去打欧区，
+    /// 既浪费一次请求又会掩盖真实原因。
+    Indeterminate,
+}
+
+/// 从 409 响应正文判断是哪一种冲突。
+///
+/// **优先读机器可判定的 `error.code`**，读不到再退回文案匹配。线上实测的缺货响应：
+///
+/// ```json
+/// {"error":{"code":"STORE_INVENTORY_SHORTAGE","details":{"available":0},
+///           "message":"Store 库存不足","request_id":"req_…"}}
+/// ```
+///
+/// 两个教训都来自这条真实样本：
+/// 1. 有 `code` 就别猜文案。`STORE_INVENTORY_SHORTAGE` 不含 "insufficient stock"
+///    这类英文短语，纯词表匹配抓不到。
+/// 2. 正文里的中文是 **`\uXXXX` 转义**的（`response.text()` 拿到的是原始字节），
+///    所以 `contains("库存不足")` 永远不成立——必须同时匹配转义形态。
+///
+/// 判定不出来一律 `Indeterminate`，即维持改动前的行为，不会误切区。
+pub(crate) fn classify_drop_conflict(body: &str) -> DropConflictKind {
+    // 先走结构化字段：对方给了 code 就以它为准。
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        let code = value
+            .pointer("/error/code")
+            .or_else(|| value.pointer("/code"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_ascii_uppercase);
+        if let Some(code) = code.as_deref() {
+            // 缺货：实测 STORE_INVENTORY_SHORTAGE。用「含 SHORTAGE / INVENTORY /
+            // OUT_OF_STOCK」而不是全等，兼容对方给同族 code 换前缀。
+            if code.contains("SHORTAGE")
+                || code.contains("INVENTORY")
+                || code.contains("OUT_OF_STOCK")
+                || code.contains("NO_STOCK")
+            {
+                return DropConflictKind::OutOfStock;
+            }
+            if code.contains("BALANCE") || code.contains("INSUFFICIENT_FUND") {
+                return DropConflictKind::InsufficientBalance;
+            }
+        }
+        // 没有 code 但有 details.available == 0 也足以判缺货。
+        if value
+            .pointer("/error/details/available")
+            .and_then(serde_json::Value::as_i64)
+            == Some(0)
+        {
+            return DropConflictKind::OutOfStock;
+        }
+    }
+
+    // 退回文案匹配。同时列 UTF-8 与 `\uXXXX` 转义两种形态——原始正文里是后者。
+    let text = body.to_ascii_lowercase();
+    let has = |needles: &[&str]| needles.iter().any(|needle| text.contains(needle));
+
+    // 余额优先：余额不足时对方也可能顺带提到库存，反过来一般不会。
+    if has(&[
+        "余额不足",
+        // `\uXXXX` 转义形态：原始正文里的中文长这样
+        r"\u4f59\u989d\u4e0d\u8db3",
+        "insufficient balance",
+        "insufficient_balance",
+        "not enough balance",
+    ]) {
+        return DropConflictKind::InsufficientBalance;
+    }
+    if has(&[
+        "库存不足",
+        r"\u5e93\u5b58\u4e0d\u8db3",
+        "没有库存",
+        r"\u6ca1\u6709\u5e93\u5b58",
+        "无可用",
+        r"\u65e0\u53ef\u7528",
+        "insufficient stock",
+        "insufficient_stock",
+        "out of stock",
+        "out_of_stock",
+        "no stock",
+        "not enough stock",
+        "no available key",
+    ]) {
+        return DropConflictKind::OutOfStock;
+    }
+    DropConflictKind::Indeterminate
+}
+
+/// 为「同一次采购换区重试」派生一个稳定的幂等号。
+///
+/// 不能复用美区那个号：文档说「同一 client_order_id + 同一 count 会原样重放」，
+/// 拿它去打欧区可能被当成重放美区那单。官方双区 webhook 自己就按区各给一个
+/// `purchase_order_ids_by_region`，这里遵循同一模型。
+///
+/// 用哈希而不是随机：同一事件重试能得到同一个号，幂等性仍然成立。
+pub(crate) fn derive_region_order_id(base_client_order_id: &str, region: SupplierRegion) -> String {
+    use sha2::{Digest as _, Sha256};
+    let digest = Sha256::digest(format!("{base_client_order_id}|{}", region.as_api_region()));
+    hex::encode(digest)[..32].to_owned()
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2729,6 +3127,13 @@ struct KiroDropPurchase {
     remaining: String,
     #[serde(default)]
     keys: Vec<KeyWire>,
+    /// 本单**实际**出货区域，按文档「始终为完整区域值」（`us-east-1` / `eu-central-1`）。
+    /// 原先不解析，于是买到的欧区号一路按美区落库。
+    #[serde(default)]
+    region: Option<String>,
+    /// Drop 侧购买订单 ID。事件记录里带上，出问题能直接跟对方对单。
+    #[serde(default)]
+    order_id: Option<String>,
 }
 
 /// `POST /api/my/purchase`（kiro.ceo）→ `{client_order_id, purchased, remaining,

@@ -5,6 +5,41 @@ async function readSource(path: string): Promise<string> {
   return readFile(new URL(`../${path}`, import.meta.url), 'utf8').catch(() => '')
 }
 
+/** 读 Rust 侧源码，用于跨语言比对能力表。 */
+async function readRustSource(path: string): Promise<string> {
+  return readFile(new URL(`../../../${path}`, import.meta.url), 'utf8').catch(() => '')
+}
+
+/** 从 capabilities.rs 解析出某个供货商的 region_modes（后端是权威）。 */
+function backendRegionModes(rust: string, kind: string): string[] {
+  // const XXX_REGION_MODES: &[PurchaseRegionMode] = &[ Fixed, Webhook, ... ];
+  const constants = new Map<string, string[]>()
+  for (const match of rust.matchAll(
+    /const\s+(\w+_REGION_MODES|OMIT_ONLY)\s*:\s*&\[PurchaseRegionMode\]\s*=\s*&\[([^\]]*)\]/g,
+  )) {
+    const modes = [...match[2].matchAll(/PurchaseRegionMode::(\w+)/g)].map(
+      (m) => m[1][0].toLowerCase() + m[1].slice(1),
+    )
+    constants.set(match[1], modes)
+  }
+  // SupplierKind::KiroDrop => Self { region_modes: DROP_REGION_MODES,
+  // 显式映射：'kiroapp-io' 的 Rust 变体是 KiroAppIo，机械大小写转换得不出来。
+  const variants: Record<string, string> = {
+    'kiro-rs': 'KiroRs',
+    'kiro-app': 'KiroApp',
+    'kiroapp-io': 'KiroAppIo',
+    'kiro-drop': 'KiroDrop',
+    'kiro-ceo': 'KiroCeo',
+  }
+  const variant = variants[kind]
+  if (!variant) return []
+  const arm = new RegExp(
+    `SupplierKind::${variant}\\s*=>\\s*Self\\s*\\{[^}]*?region_modes:\\s*(\\w+)`,
+  ).exec(rust)
+  if (!arm) return []
+  return constants.get(arm[1]) ?? []
+}
+
 describe('key supplier management UI contract', () => {
   test('App lazy-loads the key supplier tab and shows its unread event badge', async () => {
     const app = await readSource('App.tsx')
@@ -258,6 +293,27 @@ describe('key supplier management UI contract', () => {
     expect(page).toContain('importOverrides')
     expect(page).toContain('继承公共设置')
     expect(page).toContain('Nickname 预览')
+  })
+
+  // 前端有一份写死的能力表副本。它和 Rust 侧 capabilities.rs 走偏过一次：
+  // 后端把 kiro-drop 从「仅 omit」改成支持三种模式，前端没跟着改，
+  // 结果界面上压根不给选采购区域——配置能力有了却用不上。
+  test('frontend capability table matches the Rust protocol matrix for every supplier', async () => {
+    const helpers = await readSource('lib/key-supplier.ts')
+    const rust = await readRustSource('src/admin/key_supplier/capabilities.rs')
+    expect(rust).not.toBe('')
+
+    for (const kind of ['kiro-rs', 'kiro-app', 'kiroapp-io', 'kiro-drop', 'kiro-ceo']) {
+      const expected = backendRegionModes(rust, kind)
+      expect(expected.length).toBeGreaterThan(0)
+      // 从前端表里取该 kind 的 regionModes
+      const block = new RegExp(
+        `'${kind}':\\s*\\{[\\s\\S]*?regionModes:\\s*\\[([^\\]]*)\\]`,
+      ).exec(helpers)
+      expect(block).not.toBeNull()
+      const actual = [...block![1].matchAll(/'([^']+)'/g)].map((m) => m[1])
+      expect(actual.sort()).toEqual(expected.sort())
+    }
   })
 
   test('page uses protocol capabilities for purchase region controls and defaults CEO to US', async () => {

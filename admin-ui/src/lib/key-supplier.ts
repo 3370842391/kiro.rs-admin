@@ -110,7 +110,10 @@ const supplierKindCapabilities: Record<SupplierKind, SupplierCapabilities> = {
     supportsPrice: true,
   },
   'kiro-drop': {
-    regionModes: ['omit'],
+    // 购买接口接受 region（us / eu / us-east-1 / eu-central-1），webhook 也带区域，
+    // 且缺货时客户端会自动改打另一个区。与 src/admin/key_supplier/capabilities.rs
+    // 的 DROP_REGION_MODES 保持一致——两边不一致的话界面上就不给选区。
+    regionModes: ['fixed', 'webhook', 'bestAvailable'],
     supportsWebhookRegistration: true,
     purchaseIsIdempotent: true,
     supportsPrice: true,
@@ -130,7 +133,9 @@ const supplierKindRegionDefaults: Record<
   'kiro-rs': { purchaseRegionMode: 'omit', purchaseRegion: null },
   'kiro-app': { purchaseRegionMode: 'omit', purchaseRegion: null },
   'kiroapp-io': { purchaseRegionMode: 'batch', purchaseRegion: null },
-  'kiro-drop': { purchaseRegionMode: 'omit', purchaseRegion: null },
+  // 默认 bestAvailable：先打对方默认区（美区），明确判定缺货再自动改打欧区。
+  // 与后端 default_purchase_region_mode 一致。
+  'kiro-drop': { purchaseRegionMode: 'bestAvailable', purchaseRegion: null },
   'kiro-ceo': { purchaseRegionMode: 'fixed', purchaseRegion: 'us' },
 }
 

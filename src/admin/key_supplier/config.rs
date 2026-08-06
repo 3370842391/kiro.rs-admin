@@ -1101,9 +1101,11 @@ fn default_purchase_region_mode(kind: SupplierKind) -> PurchaseRegionMode {
     match kind {
         SupplierKind::KiroCeo => PurchaseRegionMode::Fixed,
         SupplierKind::KiroAppIo => PurchaseRegionMode::Batch,
-        SupplierKind::KiroRs | SupplierKind::KiroApp | SupplierKind::KiroDrop => {
-            PurchaseRegionMode::Omit
-        }
+        // Drop 默认给 BestAvailable：不指定区时先打对方默认区（美区），
+        // 明确判定缺货再自动改打欧区。这正是「美区常被抢空、欧区还有货」
+        // 那个场景需要的默认行为——老配置升级后不用手工改也能生效。
+        SupplierKind::KiroDrop => PurchaseRegionMode::BestAvailable,
+        SupplierKind::KiroRs | SupplierKind::KiroApp => PurchaseRegionMode::Omit,
     }
 }
 
@@ -1360,9 +1362,32 @@ mod tests {
             .is_err()
         );
 
+        // 换用 kiro-app 当反例：它的协议里压根没有区域字段（仅 Omit）。
+        // 原先这里用 Kiro Drop，但 Drop 的购买接口是接受 region 的，
+        // 已改为支持 Fixed / Webhook / BestAvailable，不再是有效反例。
         let mut unsupported = valid_update();
         unsupported.purchase_region_mode = Some(PurchaseRegionMode::Fixed);
         unsupported.purchase_region = Some(SupplierRegion::Us);
+        assert!(
+            SupplierEntryRuntime::normalize_update(
+                None,
+                SupplierEntryUpdate {
+                    id: Some("app".to_owned()),
+                    name: "App".to_owned(),
+                    kind: SupplierKind::KiroApp,
+                    enabled: true,
+                    import_overrides: None,
+                    settings: unsupported,
+                },
+                None,
+            )
+            .is_err()
+        );
+
+        // Drop 现在应当**接受** Fixed + 指定区（运维想固定只买某个区时用）。
+        let mut drop_fixed = valid_update();
+        drop_fixed.purchase_region_mode = Some(PurchaseRegionMode::Fixed);
+        drop_fixed.purchase_region = Some(SupplierRegion::Eu);
         assert!(
             SupplierEntryRuntime::normalize_update(
                 None,
@@ -1372,11 +1397,12 @@ mod tests {
                     kind: SupplierKind::KiroDrop,
                     enabled: true,
                     import_overrides: None,
-                    settings: unsupported,
+                    settings: drop_fixed,
                 },
                 None,
             )
-            .is_err()
+            .is_ok(),
+            "Drop 支持固定区采购，配置不该被拒"
         );
     }
 

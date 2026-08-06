@@ -6,6 +6,39 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 🔧 修复 — Kiro Drop 缺货时自动改打欧区
+
+- **缺货能被识别了**：Drop 把「余额不足 / 库存不足 / 订单号冲突 / 价格超上限」四种原因
+  都合并进 409，而原实现只把 **404** 当缺货，于是真实的缺货 409 被归成「订单状态冲突」，
+  换区回退永远不会触发。现按 `error.code` 判定（实测 `STORE_INVENTORY_SHORTAGE`），
+  读不到 code 再看 `details.available` 与文案，判不出来一律维持原行为不换区。
+- **请求终于带上 region**：原先请求体只有 `count` + `client_order_id`，而对方文档说
+  「不传默认 US」——所以**永远只买美区**，美区被抢空就一直失败，欧区其实有货。
+- **响应的实际区域不再丢弃**：`KiroDropPurchase` 原先连 `region` 字段都没解析
+  （`actual_region` 恒为 `None`），买到的欧区号一路按美区落库。现按对方响应回填，
+  并带上 Drop 的 `order_id` 便于对单。
+- **换区必须换幂等号**：由「原幂等号 + 区域」哈希派生，与官方双区 webhook 的
+  `purchase_order_ids_by_region` 同一模型；用哈希而非随机，同一事件重试仍幂等。
+- **支持指定只买某个区**：Drop 的能力从「仅 omit」改为支持 `fixed` / `webhook` /
+  `bestAvailable`；配了固定区就只买该区，不会自作主张回退。默认给 `bestAvailable`，
+  老配置升级后不用手工改也能获得缺货换区。
+- **前端能力表跟着对齐**：`admin-ui` 里有一份写死的副本仍是「仅 omit」，界面上压根不给
+  选采购区域。新增跨语言契约测试，直接解析 `capabilities.rs` 与前端表逐项比对，
+  以后改一边忘另一边会立刻失败。
+
+### ✨ 优化 — 账号管理按区域分组，API Key 按区域分文件导出
+
+- **账号列表按区域分组**：数据库里 `region` 一直有，但表格十列里没有它，美区与欧区的号
+  混在一张平表里分不开。现改为可折叠的区域分组（`美区 (us-east-1)` / `欧区 (eu-central-1)`
+  带条数），并记住折叠状态——刷新是整树重建，不记的话手动折起来的区每次都会弹开。
+- **选中区域节点 = 选中该区全部账号**：分组后父节点的 iid 不是数字，原先的选择逻辑
+  直接 `int(item)` 会抛 `ValueError`；批量操作现按此语义工作。
+- **API Key 按区域分文件导出**：`kiro-apikeys-us-east-1-<时间>.txt` /
+  `kiro-apikeys-eu-central-1-<时间>.txt`，下游按区导入时不用再人工挑。报告新增
+  `paths_by_region` / `counts_by_region`，`path` 保留指向首个区的文件，既有调用方不用改。
+- ⚠️ **导出文件名格式变更**：从 `kiro-apikeys-<时间>.txt` 变为带区域段，按旧名 glob 的
+  脚本需要跟着改。
+
 ### 🔧 修复 — 自动压缩信号改在 85% 下发，不再等到撞墙
 
 - **压缩信号提前到 85%**：`model_context_window_exceeded` 原先只在上下文占比达到

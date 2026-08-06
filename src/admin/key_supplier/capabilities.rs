@@ -10,6 +10,15 @@ const CEO_REGION_MODES: &[PurchaseRegionMode] = &[
 ];
 const IO_REGION_MODES: &[PurchaseRegionMode] =
     &[PurchaseRegionMode::Fixed, PurchaseRegionMode::Batch];
+/// Kiro Drop 的购买接口接受 `region`（us / eu / us-east-1 / eu-central-1），
+/// webhook 也带区域，且缺货时客户端会自动改打另一个区，所以三种模式都支持。
+/// 原先标成 `OMIT_ONLY`——那时既不传 region 也不读响应里的 region，
+/// 买到的欧区号一路按美区落库。
+const DROP_REGION_MODES: &[PurchaseRegionMode] = &[
+    PurchaseRegionMode::Fixed,
+    PurchaseRegionMode::Webhook,
+    PurchaseRegionMode::BestAvailable,
+];
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -42,7 +51,7 @@ impl SupplierCapabilities {
                 supports_price: true,
             },
             SupplierKind::KiroDrop => Self {
-                region_modes: OMIT_ONLY,
+                region_modes: DROP_REGION_MODES,
                 supports_webhook_registration: true,
                 purchase_is_idempotent: true,
                 supports_price: true,
@@ -88,14 +97,24 @@ mod tests {
         assert!(io.supports_region_mode(PurchaseRegionMode::Batch));
         assert!(!io.supports_region_mode(PurchaseRegionMode::BestAvailable));
 
-        for kind in [
-            SupplierKind::KiroRs,
-            SupplierKind::KiroApp,
-            SupplierKind::KiroDrop,
-        ] {
+        for kind in [SupplierKind::KiroRs, SupplierKind::KiroApp] {
             let capabilities = SupplierCapabilities::for_kind(kind);
             assert_eq!(capabilities.region_modes, &[PurchaseRegionMode::Omit]);
         }
+
+        // Kiro Drop 的购买接口接受 region、webhook 带区域、缺货还会自动换区，
+        // 所以它和 kiro.ceo 一样支持三种模式（原先被标成仅 Omit）。
+        let drop = SupplierCapabilities::for_kind(SupplierKind::KiroDrop);
+        assert_eq!(
+            drop.region_modes,
+            &[
+                PurchaseRegionMode::Fixed,
+                PurchaseRegionMode::Webhook,
+                PurchaseRegionMode::BestAvailable,
+            ]
+        );
+        assert!(!drop.supports_region_mode(PurchaseRegionMode::Omit));
+        assert!(!drop.supports_region_mode(PurchaseRegionMode::Batch));
     }
 
     #[test]

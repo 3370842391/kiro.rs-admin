@@ -347,7 +347,13 @@ describe('multi-supplier helpers', () => {
 
     expect(ceo.regionModes).toEqual(['fixed', 'webhook', 'bestAvailable'])
     expect(getSupplierCapabilities('kiroapp-io').regionModes).toEqual(['fixed', 'batch'])
-    expect(getSupplierCapabilities('kiro-drop').regionModes).toEqual(['omit'])
+    // Drop 的购买接口接受 region、webhook 带区域，缺货还会自动换区，
+    // 所以和 CEO 一样支持三种模式（原先是 ['omit']）。
+    expect(getSupplierCapabilities('kiro-drop').regionModes).toEqual([
+      'fixed',
+      'webhook',
+      'bestAvailable',
+    ])
     ceo.regionModes.push('omit')
     expect(anotherCeo.regionModes).not.toContain('omit')
   })
