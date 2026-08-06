@@ -118,7 +118,10 @@ class InputParserTests(unittest.TestCase):
         self.assertEqual(f"admin-user|part|two|{portal}", rendered)
 
     def test_full_line_template_parses_literal_prefix_suffix_and_special_password(self):
-        password = r"^_S!Ibq1xcU*EwBD$\_AsY8/Oo)"
+        # 合成口令，不是真实凭据。原先这里抄的是某个账号的真实一次性密码，
+        # 而本仓库是公开的。字符集保持等价（含 ^ _ ! * $ \ / ) 等正则元字符与
+        # 转义字符），测试意图——「模板解析不能被特殊字符带偏」——不变。
+        password = r"^_Z!Qbt7xdV*FwCE$\_BsZ9/Pp)"
         result = parse_accounts(
             f"login = admin-user30 / onetime password = {password}\n",
             "login = {account} / onetime password = {password}",
