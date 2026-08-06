@@ -845,8 +845,17 @@ class AccountLoginCoordinator:
             )
             if report_out is not None:
                 export_path = str(report_out.path)
-                emit(WorkerEvent("api_key_exported",
-                                 {"path": export_path, "count": report_out.with_key}))
+                # 按区分文件后，事件里带上每个区的路径与条数，UI/日志不用再猜
+                # 「这批 key 分别落到哪几个清单里」。
+                emit(WorkerEvent("api_key_exported", {
+                    "path": export_path,
+                    "count": report_out.with_key,
+                    "regions": {
+                        region: {"path": str(path),
+                                 "count": report_out.counts_by_region.get(region, 0)}
+                        for region, path in report_out.paths_by_region.items()
+                    },
+                }))
 
         if cancelled:
             emit(WorkerEvent("security_warning", {"message": "并发流水线已终止：已完成的号已保存。"}))

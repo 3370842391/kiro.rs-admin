@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import stat
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -15,15 +15,39 @@ class ApiKeyExportError(RuntimeError):
     pass
 
 
+#: 与 `account_manager_app.REGION_DISPLAY_NAMES` 同源的默认区。空 region 归到这里，
+#: 免得导出一个文件名带空字段的清单。
+DEFAULT_REGION = "us-east-1"
+
+
+def normalize_region(region: str | None) -> str:
+    """归一化区域，供文件名使用。大小写/空白不该分出两个文件。"""
+    return (region or "").strip().lower() or DEFAULT_REGION
+
+
 @dataclass(frozen=True, slots=True)
 class ApiKeyExportReport:
+    #: 主清单路径。多区时指第一个区（按 `paths_by_region` 的顺序）的文件，
+    #: 保持既有调用方（读 `report.path` 发事件）不用改。
     path: Path
     with_key: int
     without_key: int
+    #: 区域 → 该区清单路径。单区时也填，调用方可统一按这个展示。
+    paths_by_region: dict[str, Path] = field(default_factory=dict)
+    #: 区域 → 该区导出的 key 数量。
+    counts_by_region: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def region_count(self) -> int:
+        return len(self.paths_by_region)
 
 
 class ApiKeyExporter:
-    """把 ksk_ API Key 导出成纯清单:每行一个 ksk_xxx,无前缀无注释。"""
+    """把 ksk_ API Key 导出成纯清单:每行一个 ksk_xxx,无前缀无注释。
+
+    **按区域分文件**:美区与欧区的 key 不能混在一个清单里——下游按区导入时
+    混着的清单要人工挑。文件名形如 `kiro-apikeys-us-east-1-20260806-101530.txt`。
+    """
 
     def __init__(
         self,
@@ -47,23 +71,35 @@ class ApiKeyExporter:
 
         output_directory = Path(output_directory)
         stamp = self.now().strftime("%Y%m%d-%H%M%S")
-        path = self._unused_path(output_directory / f"kiro-apikeys-{stamp}.txt")
 
-        lines = [(r.kiro_api_key or "").strip() for r in with_key]
-        body = "\n".join(lines) + "\n"
+        # 按区域分桶。dict 保插入序 → 文件生成顺序与记录顺序一致，可复现。
+        buckets: dict[str, list[str]] = {}
+        for record in with_key:
+            key = normalize_region(record.region)
+            buckets.setdefault(key, []).append((record.kiro_api_key or "").strip())
 
+        paths_by_region: dict[str, Path] = {}
+        counts_by_region: dict[str, int] = {}
         try:
             output_directory.mkdir(parents=True, exist_ok=True)
-            self._atomic_write(path, body)
+            for region, keys in buckets.items():
+                path = self._unused_path(
+                    output_directory / f"kiro-apikeys-{region}-{stamp}.txt"
+                )
+                self._atomic_write(path, "\n".join(keys) + "\n")
+                paths_by_region[region] = path
+                counts_by_region[region] = len(keys)
         except ApiKeyExportError:
             raise
         except OSError as error:
             raise ApiKeyExportError("API Key 清单导出目录无法创建或写入") from error
 
         return ApiKeyExportReport(
-            path=path,
+            path=next(iter(paths_by_region.values())),
             with_key=len(with_key),
             without_key=len(without_key),
+            paths_by_region=paths_by_region,
+            counts_by_region=counts_by_region,
         )
 
     @staticmethod

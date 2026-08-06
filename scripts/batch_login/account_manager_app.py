@@ -170,7 +170,28 @@ def quota_cell_text(quota) -> str:
     return f"剩余 {fmt(remaining)} / 总 {fmt(total)}"
 
 
+#: 区域的中文显示名。只覆盖 `src/kiro/region.rs` 里声明支持的两个区
+#: （`US_EAST_1` / `EU_CENTRAL_1`），其余区域原样显示区域码而不是猜一个名字。
+REGION_DISPLAY_NAMES = {
+    "us-east-1": "美区",
+    "eu-central-1": "欧区",
+}
+
+
+def region_display_name(region: str | None) -> str:
+    """渲染成「美区 (us-east-1)」。区域码一并带上，排查时不用猜别名指向哪个区。"""
+    key = (region or "").strip().lower()
+    if not key:
+        return "未指定区域"
+    label = REGION_DISPLAY_NAMES.get(key)
+    return f"{label} ({key})" if label else key
+
+
 class AccountManagerApp:
+    #: 区域分组父节点的 iid 前缀。必须是非数字开头，好和账号 ID 的 iid 区分——
+    #: 选择逻辑靠这个前缀判断「这是分组节点还是账号行」。
+    REGION_NODE_PREFIX = "region:"
+
     TABLE_COLUMNS = (
         "account",
         "password",
@@ -327,12 +348,16 @@ class AccountManagerApp:
 
         table_frame = ttk.Frame(outer)
         table_frame.pack(fill="both", expand=True)
+        # show 带上 "tree"：账号按区域分组挂在可折叠的父节点下，需要 #0 列画层级。
+        # 原先是纯 "headings"（隐藏 #0），美区欧区的号混在一张平表里分不开。
         self.tree = ttk.Treeview(
             table_frame,
             columns=self.TABLE_COLUMNS,
-            show="headings",
+            show="tree headings",
             selectmode="extended",
         )
+        self.tree.heading("#0", text="区域")
+        self.tree.column("#0", width=190, minwidth=140, stretch=False, anchor="w")
         headings = {
             "account": "账号", "password": "当前密码",
             "start_url": "Start URL", "login_status": "登录状态",
@@ -469,39 +494,100 @@ class AccountManagerApp:
             quotas = {}
         self._refreshing_tree = True
         try:
+            # 记住折叠状态：刷新是整树重建，不记的话每次刷新都会全部展开，
+            # 用户手动折起来的区又弹开。
+            collapsed = {
+                node
+                for node in self.tree.get_children("")
+                if node.startswith(self.REGION_NODE_PREFIX)
+                and not self.tree.item(node, "open")
+            }
             self.tree.delete(*self.tree.get_children())
+
+            # 按区域分组。dict 保插入序，所以同一批账号的区域顺序稳定；
+            # 组内保持 accounts 原有排序（由 service 决定），不在这里二次排序。
+            grouped: dict[str, list] = {}
             for item in accounts:
-                self.tree.insert("", "end", iid=str(item.id), values=(
-                    item.account, password_cell_text(item), item.start_url or "",
-                    item.login_status.value, item.credential_status.value,
-                    json_status_text(
-                        item, self.json_status_by_id.get(item.id)
-                    ),
-                    quota_cell_text(quotas.get(item.id)),
-                    "已售出" if item.lifecycle_status is LifecycleStatus.SOLD else "管理中",
-                    item.note, item.updated_at,
-                ))
-                if item.id in selected:
-                    self.tree.selection_add(str(item.id))
+                grouped.setdefault(self._region_key(item.region), []).append(item)
+
+            for region_key in self._sorted_region_keys(grouped):
+                members = grouped[region_key]
+                node_id = f"{self.REGION_NODE_PREFIX}{region_key}"
+                self.tree.insert(
+                    "", "end", iid=node_id,
+                    text=f"{region_display_name(region_key)} — {len(members)} 个",
+                    open=node_id not in collapsed,
+                    tags=("region_group",),
+                )
+                for item in members:
+                    self.tree.insert(node_id, "end", iid=str(item.id), values=(
+                        item.account, password_cell_text(item), item.start_url or "",
+                        item.login_status.value, item.credential_status.value,
+                        json_status_text(
+                            item, self.json_status_by_id.get(item.id)
+                        ),
+                        quota_cell_text(quotas.get(item.id)),
+                        "已售出" if item.lifecycle_status is LifecycleStatus.SOLD else "管理中",
+                        item.note, item.updated_at,
+                    ))
+                    if item.id in selected:
+                        self.tree.selection_add(str(item.id))
         finally:
             self._refreshing_tree = False
         self._update_selected_count()
         self.status_var.set(f"显示 {len(accounts)} 个账号")
 
+    def _row_within_selection(self, row: str, selected_ids: set[int]) -> bool:
+        """右键那一行是否已在当前选择里。父节点按「该区账号是否全在选中集」判定。"""
+        if row.startswith(self.REGION_NODE_PREFIX):
+            children = {int(child) for child in self.tree.get_children(row)}
+            return bool(children) and children <= selected_ids
+        return int(row) in selected_ids
+
+    @staticmethod
+    def _region_key(region: str | None) -> str:
+        """归一化区域键。空值按库里的默认值算，避免出现一个「未知」空组。"""
+        return (region or "").strip().lower() or "us-east-1"
+
+    @staticmethod
+    def _sorted_region_keys(grouped: dict[str, list]) -> list[str]:
+        """美区在前、欧区次之，其余按字母序垫底——顺序稳定，不随账号增删跳动。"""
+        priority = {"us-east-1": 0, "eu-central-1": 1}
+        return sorted(grouped, key=lambda key: (priority.get(key, 2), key))
+
+    def _account_ids_from_selection(self, items) -> set[int]:
+        """把树选中项翻译成账号 ID 集合。
+
+        分组后选中项可能是区域父节点（iid 形如 `region:us-east-1`，不是数字），
+        原先这里直接 `int(item)` 会抛 ValueError。约定：
+        **选中区域节点 = 选中该区当前可见的全部账号**，这样「勾一个区再点批量登录」
+        是能用的。父节点自身不是账号，不进结果集。
+        """
+        ids: set[int] = set()
+        for item in items:
+            if item.startswith(self.REGION_NODE_PREFIX):
+                ids.update(int(child) for child in self.tree.get_children(item))
+            else:
+                ids.add(int(item))
+        return ids
+
     def _tree_selection(self, _event=None) -> None:
         if self._refreshing_tree:
             return
-        self.service.set_selected(int(item) for item in self.tree.selection())
+        self.service.set_selected(
+            self._account_ids_from_selection(self.tree.selection())
+        )
         self._update_selected_count()
 
     def _tree_context_menu(self, event):
         row = self.tree.identify_row(event.y)
         if not row:
             return "break"
-        highlighted = {int(item) for item in self.tree.selection()}
-        if int(row) not in highlighted:
+        highlighted = self._account_ids_from_selection(self.tree.selection())
+        # 右键点在未选中的行上：改选它。父节点则等于选中该区全部账号。
+        if not self._row_within_selection(row, highlighted):
             self.tree.selection_set(row)
-            highlighted = {int(row)}
+            highlighted = self._account_ids_from_selection((row,))
         self.service.set_selected(highlighted)
         self._update_selected_count()
         try:

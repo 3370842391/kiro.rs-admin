@@ -16,6 +16,7 @@ from batch_login.account_manager_app import (
     atomic_write_text,
     clear_secret_vars,
     password_cell_text,
+    region_display_name,
 )
 from batch_login.account_login_coordinator import LoginProgressEvent
 from batch_login.account_repository import CredentialStatus, LoginStatus
@@ -210,6 +211,73 @@ class AccountManagerAppTests(unittest.TestCase):
 
         self.assertEqual(["run", "run", "extract", "quota"], [name for name, _ in calls])
         self.assertEqual([3, 3, 3, 3], [kwargs["concurrency"] for _, kwargs in calls])
+
+    def test_region_display_name_labels_known_regions_and_passes_through_others(self):
+        # 只有 region.rs 声明支持的两个区有中文名；其余原样显示区域码，不猜别名。
+        self.assertEqual("美区 (us-east-1)", region_display_name("us-east-1"))
+        self.assertEqual("欧区 (eu-central-1)", region_display_name("eu-central-1"))
+        self.assertEqual("ap-southeast-1", region_display_name("ap-southeast-1"))
+        self.assertEqual("未指定区域", region_display_name(""))
+        self.assertEqual("未指定区域", region_display_name(None))
+        # 大小写与空白不该分出两个组
+        self.assertEqual("美区 (us-east-1)", region_display_name("  US-East-1 "))
+
+    def test_region_key_normalizes_blank_to_default(self):
+        # 空区域归到默认区，避免界面上多出一个空标题的分组
+        self.assertEqual("us-east-1", AccountManagerApp._region_key(None))
+        self.assertEqual("us-east-1", AccountManagerApp._region_key("   "))
+        self.assertEqual("eu-central-1", AccountManagerApp._region_key(" EU-Central-1 "))
+
+    def test_region_group_order_is_stable_with_us_first(self):
+        # 顺序必须稳定：不能随账号增删而跳动
+        grouped = {"ap-southeast-1": [], "eu-central-1": [], "us-east-1": []}
+        self.assertEqual(
+            ["us-east-1", "eu-central-1", "ap-southeast-1"],
+            AccountManagerApp._sorted_region_keys(grouped),
+        )
+
+    def test_selecting_region_node_selects_every_account_in_that_region(self):
+        """选中区域父节点 = 选中该区全部账号。
+
+        这是分组改造最容易出 bug 的地方：父节点 iid 是 `region:us-east-1`，
+        不是数字，原先的 `int(item)` 会直接抛 ValueError。
+        """
+        app = SimpleNamespace(
+            REGION_NODE_PREFIX=AccountManagerApp.REGION_NODE_PREFIX,
+            tree=SimpleNamespace(
+                get_children=lambda node: {
+                    "region:us-east-1": ("1", "3"),
+                    "region:eu-central-1": ("2",),
+                }.get(node, ())
+            ),
+        )
+        resolve = AccountManagerApp._account_ids_from_selection
+
+        # 只选美区父节点 → 该区两个号
+        self.assertEqual({1, 3}, resolve(app, ("region:us-east-1",)))
+        # 父节点 + 另一个区的单个号
+        self.assertEqual({1, 3, 2}, resolve(app, ("region:us-east-1", "2")))
+        # 纯账号行，行为与改造前一致
+        self.assertEqual({2}, resolve(app, ("2",)))
+        # 父节点自身不作为账号进入结果集
+        self.assertNotIn(0, resolve(app, ("region:us-east-1",)))
+
+    def test_right_click_on_region_node_counts_as_selected_only_when_all_children_are(self):
+        app = SimpleNamespace(
+            REGION_NODE_PREFIX=AccountManagerApp.REGION_NODE_PREFIX,
+            tree=SimpleNamespace(
+                get_children=lambda node: ("1", "3") if node == "region:us-east-1" else ()
+            ),
+        )
+        within = AccountManagerApp._row_within_selection
+        self.assertTrue(within(app, "region:us-east-1", {1, 3}))
+        # 只选中了一半 → 右键该区应改选整区，而不是沿用局部选择
+        self.assertFalse(within(app, "region:us-east-1", {1}))
+        # 空分组不该被当成「已全选」
+        self.assertFalse(within(app, "region:empty", {1, 3}))
+        # 账号行按原语义判定
+        self.assertTrue(within(app, "3", {1, 3}))
+        self.assertFalse(within(app, "9", {1, 3}))
 
     def test_main_table_contains_management_columns(self):
         self.assertEqual(
