@@ -4408,6 +4408,82 @@ mod tests {
         assert!(IncomingWebhook::parse(SupplierKind::KiroAppIo, b"not json").is_err());
     }
 
+    /// Drop 新版 US/EU 合并到货通知（2026-08 改版）的**原文**。
+    ///
+    /// 改版把 dual 标记从 `region` 挪到了 `notification_scope`，`region` 改成真实的主区域，
+    /// 并在顶层补上了对应主区域的 `purchase_order_id` / `order_id`。这是向后兼容的设计：
+    /// 旧客户端读顶层三个字段就能买主区域。
+    ///
+    /// 旧版 `region:"dual"` 解析不出区域（得 `None`），落库要靠配置兜底；
+    /// 新版能解析出真区域，所以这条同时是「改版没让我们变差」的证据。
+    /// `notification_scope` / `regions` / `*_by_region` 等新字段不认识也不能让解析失败。
+    #[test]
+    fn kiro_drop_parses_the_new_dual_arrival_notification() {
+        let body = r#"{
+          "event": "new_keys_available",
+          "event_id": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+          "purchase_order_id": "95c4fd9460b70fb8e944bd7faa519897",
+          "order_id": "batch_us_1",
+          "dispatch_id": "monitor_auto_xxx",
+          "region": "us-east-1",
+          "notification_scope": "dual",
+          "regions": ["us-east-1", "eu-central-1"],
+          "message": "新一批 Key 已上架：US 10 个，EU 12 个",
+          "new_keys": 22,
+          "new_keys_by_region": {"us-east-1": 10, "eu-central-1": 12},
+          "batch_ids_by_region": {
+            "us-east-1": ["batch_us_1", "batch_us_2"],
+            "eu-central-1": ["batch_eu_1", "batch_eu_2"]
+          },
+          "purchase_order_ids_by_region": {
+            "us-east-1": "95c4fd9460b70fb8e944bd7faa519897",
+            "eu-central-1": "0123456789abcdef0123456789abcdef"
+          },
+          "created_at": "2026-08-06T12:34:56.000000Z"
+        }"#;
+
+        let IncomingWebhook::NewKeysAvailable {
+            event_id,
+            purchase_order_id,
+            event_region,
+            new_keys,
+            ..
+        } = IncomingWebhook::parse(SupplierKind::KiroDrop, body.as_bytes()).unwrap()
+        else {
+            panic!("合并到货通知必须触发采购");
+        };
+
+        assert_eq!(event_id, "0f1e2d3c4b5a69788796a5b4c3d2e1f0");
+        // 顶层 purchase_order_id 是 32 hex，直接当幂等键回传（对方文档要求）。
+        assert_eq!(purchase_order_id, "95c4fd9460b70fb8e944bd7faa519897");
+        // 关键：`us-east-1` 全形式必须解析成美区。旧版这里是 "dual" → None。
+        assert_eq!(
+            event_region,
+            Some(SupplierRegion::Us),
+            "新版顶层 region 是真实主区域，必须解析出来"
+        );
+        // 合并通知的 new_keys 是 US+EU 合计。这个数只是个上界：真实下单量由
+        // 按区库存查询（见 `kiro_drop_stock_is_queried_per_region`）和配置上限夹逼，
+        // 所以取到 22 而美区只有 10 不会造成超买。
+        assert_eq!(new_keys, 22);
+    }
+
+    /// 旧版 `region:"dual"` 仍不能让解析炸掉——对方可能灰度、也可能回滚。
+    #[test]
+    fn kiro_drop_still_tolerates_the_legacy_dual_region_literal() {
+        let body = r#"{"event":"new_keys_available","event_id":"0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+            "purchase_order_id":"95c4fd9460b70fb8e944bd7faa519897","region":"dual",
+            "regions":["us-east-1","eu-central-1"],"new_keys":22,"message":"合并到货"}"#;
+
+        let IncomingWebhook::NewKeysAvailable { event_region, .. } =
+            IncomingWebhook::parse(SupplierKind::KiroDrop, body.as_bytes()).unwrap()
+        else {
+            panic!("旧版合并通知也必须能落库");
+        };
+        // "dual" 不是区域，解析不出来就留 None，由落库兜底链决定——不能猜成美区。
+        assert_eq!(event_region, None);
+    }
+
     #[test]
     fn kiro_drop_arrival_survives_the_missing_quantity_and_the_non_hex_batch_id() {
         // Drop 的到货推送没有 `new_keys`，且 `purchase_order_id` 是 `batch_xxx`。

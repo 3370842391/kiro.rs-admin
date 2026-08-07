@@ -910,6 +910,104 @@ mod tests {
         assert_ne!(eu, derive_region_order_id(base, SupplierRegion::Us));
     }
 
+    /// Drop 的库存查询必须按区。这条覆盖三种情形，是「缺货换欧区」真正生效的前提。
+    ///
+    /// 原实现固定不带 `region`（对方按美区算），造成两个需求同时失效：
+    /// ① 美区库存 0 会让上层 `select_purchase_count` 判 0 而**跳过**，购买请求根本发不
+    ///    出去，`purchase_kiro_drop` 里那条 409→欧区回退成了死代码；
+    /// ② 指定只买欧区时库存却查的美区，美区一空就跳过，欧区有货也不买。
+    #[tokio::test]
+    async fn kiro_drop_stock_is_queried_per_region() {
+        // region 参数 → 该区库存。不带参数按对方文档等于美区。
+        let app = Router::new().route(
+            "/api/me/stock",
+            get(|uri: axum::http::Uri| async move {
+                let region = uri.query().unwrap_or("");
+                let (region, stock) = match region {
+                    "region=eu" => ("eu-central-1", 120),
+                    _ => ("us-east-1", 0), // 美区空了
+                };
+                axum::Json(serde_json::json!({
+                    "region": region,
+                    "stock": stock,
+                    "price": "30.00",
+                    "balance": "2060.00"
+                }))
+            }),
+        );
+        let base = server(app).await;
+        let client = SupplierClient::with_kind(base, "usr-secret", SupplierKind::KiroDrop).unwrap();
+
+        // ① 未指定区：默认区空 → 自动去看欧区，并把欧区带出去。
+        //    上层据 `zone` 把 requested_region 切成欧区，于是下单直接打欧区。
+        let auto = client.purchase_quote_for(None).await.unwrap();
+        assert_eq!(
+            auto.stock, 120,
+            "默认区空了必须报欧区的库存，否则上层判 0 跳过"
+        );
+        assert_eq!(
+            auto.zone.as_deref(),
+            Some("eu"),
+            "必须把欧区带出去，上层才会把下单切到欧区"
+        );
+
+        // ② 指定欧区：只看欧区，不受美区为空影响。
+        let fixed_eu = client
+            .purchase_quote_for(Some(SupplierRegion::Eu))
+            .await
+            .unwrap();
+        assert_eq!(fixed_eu.stock, 120);
+        assert_eq!(fixed_eu.zone.as_deref(), Some("eu"));
+
+        // ③ 指定美区：如实报 0，不替运维改打欧区——配死的区就是意图。
+        let fixed_us = client
+            .purchase_quote_for(Some(SupplierRegion::Us))
+            .await
+            .unwrap();
+        assert_eq!(fixed_us.stock, 0);
+        assert_eq!(fixed_us.zone.as_deref(), Some("us"));
+    }
+
+    /// 默认区有货时不带 `zone`：下单不指定 region，保留 409→欧区回退作为
+    /// 「查到有货、下单前被抢空」的兜底；也避免多一次没必要的欧区查询。
+    #[tokio::test]
+    async fn kiro_drop_keeps_the_default_region_implicit_when_it_has_stock() {
+        let hits = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = hits.clone();
+        let app = Router::new().route(
+            "/api/me/stock",
+            get(move |uri: axum::http::Uri| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock()
+                        .unwrap()
+                        .push(uri.query().unwrap_or("").to_owned());
+                    axum::Json(serde_json::json!({
+                        "region": "us-east-1",
+                        "stock": 25,
+                        "price": "30.00",
+                        "balance": "2060.00"
+                    }))
+                }
+            }),
+        );
+        let client =
+            SupplierClient::with_kind(server(app).await, "usr-secret", SupplierKind::KiroDrop)
+                .unwrap();
+
+        let quote = client.purchase_quote_for(None).await.unwrap();
+        assert_eq!(quote.stock, 25);
+        assert_eq!(
+            quote.zone, None,
+            "默认区有货就不要钉死区域，留着 409 回退救被抢空的情况"
+        );
+        assert_eq!(
+            hits.lock().unwrap().as_slice(),
+            &[String::new()],
+            "默认区有货时不该多问一次欧区"
+        );
+    }
+
     #[tokio::test]
     async fn kiro_drop_falls_back_to_eu_when_the_default_region_is_out_of_stock() {
         // 线上表现：webhook 到了却一直买不到——默认只打美区，美区空了就 409，
@@ -2042,6 +2140,23 @@ impl SupplierClient {
         self.purchase_quote_for(None).await
     }
 
+    /// `GET /api/me/stock[?region=…]`（Kiro Drop）。
+    ///
+    /// 不传 `region` 时对方按美区算（文档：「region 可选……不传默认 US」），
+    /// 所以「查库存」和「按哪个区查库存」必须是同一件事，不能分开。
+    async fn kiro_drop_stock_in(
+        &self,
+        region: Option<SupplierRegion>,
+    ) -> Result<KiroDropStock, SupplierError> {
+        let path = match region {
+            // 对方只接受 us / eu / us-east-1 / eu-central-1，未知值直接 400。
+            Some(region) => format!("/api/me/stock?region={}", region.as_wire()),
+            None => "/api/me/stock".to_owned(),
+        };
+        self.request(Method::GET, &path, None, RetryPolicy::Retryable)
+            .await
+    }
+
     pub async fn purchase_quote_for(
         &self,
         requested_region: Option<SupplierRegion>,
@@ -2089,16 +2204,53 @@ impl SupplierClient {
             // 曾经读 `/api/status` 的 `keys_stock`，四次自动采购四次拿到 500：那个数
             // 跟着 `keys_active` 走，不代表能买到货。按对方文档没货该返 404，返 500
             // 是他们的 bug，但我们据一个错的字段去下单等于主动往里踩。
+            // Drop 的库存必须**按区**查：`/api/me/stock` 不带 `region` 时对方按美区算。
+            //
+            // 原先这里固定不带 region，造成两个需求同时失效：
+            // ① 「美区缺货自动换欧区」——美区库存 0 会让上层 `select_purchase_count`
+            //    直接判 0 而跳过，购买请求根本发不出去，`purchase_kiro_drop` 里那条
+            //    409→欧区回退成了死代码（它只能救「查到有货、下单时被抢空」的窄缝）；
+            // ② 「指定只买欧区」——requested_region 是欧区，库存却查的美区，
+            //    美区一空就跳过，欧区有货也不买。
             SupplierKind::KiroDrop => {
-                let stock: KiroDropStock = self
-                    .request(Method::GET, "/api/me/stock", None, RetryPolicy::Retryable)
-                    .await?;
+                // 指定了区就只看那个区：这是运维配死的意图，不替他探别的区。
+                if let Some(region) = requested_region {
+                    let stock = self.kiro_drop_stock_in(Some(region)).await?;
+                    return Ok(PurchaseQuote {
+                        zone: Some(region.as_wire().to_owned()),
+                        stock: stock.stock,
+                        unit_price: parse_decimal_string(&stock.price),
+                    });
+                }
+
+                // 未指定（bestAvailable / omit）：先问对方默认区（美区）。
+                let default_stock = self.kiro_drop_stock_in(None).await?;
+                if default_stock.stock > 0 {
+                    return Ok(PurchaseQuote {
+                        // 刻意留 None：下单时不带 region，保留 `purchase_kiro_drop` 里的
+                        // 409→欧区回退作为「查到有货、下单前被抢空」的兜底。
+                        // 落库区域由购买响应回显决定，不靠这里。
+                        zone: None,
+                        stock: default_stock.stock,
+                        // 按对方文档这个 price 是 USD，而余额是 CNY。只和本家配置的上限比，
+                        // 不参与任何跨家或跨币种的算术。
+                        unit_price: parse_decimal_string(&default_stock.price),
+                    });
+                }
+
+                // 默认区空了，问欧区。有货就把区带出去——上层会据 `zone` 把
+                // requested_region 切成欧区，下单就直接打欧区，不必先撞一个 409。
+                let eu = self.kiro_drop_stock_in(Some(SupplierRegion::Eu)).await?;
+                tracing::info!(
+                    supplier = %self.kind,
+                    eu_stock = eu.stock,
+                    "默认区库存为 0，改看欧区"
+                );
                 Ok(PurchaseQuote {
-                    zone: None,
-                    stock: stock.stock,
-                    // 按对方文档这个 price 是 USD，而余额是 CNY。只和本家配置的上限比，
-                    // 不参与任何跨家或跨币种的算术。
-                    unit_price: parse_decimal_string(&stock.price),
+                    // 欧区也空就报 None + 0，让上层按「都没货」跳过，而不是拿 0 去下单。
+                    zone: (eu.stock > 0).then(|| SupplierRegion::Eu.as_wire().to_owned()),
+                    stock: eu.stock,
+                    unit_price: parse_decimal_string(&eu.price),
                 })
             }
             SupplierKind::KiroApp => {
@@ -3186,6 +3338,10 @@ struct KiroDropStock {
     stock: u64,
     #[serde(default)]
     price: String,
+    /// 对方回显的标准区域（`us-east-1` / `eu-central-1`）。用它而不是我们自己传的值，
+    /// 免得「不传 region 默认美区」这条默认行为哪天变了我们还按美区记账。
+    #[serde(default)]
+    region: Option<String>,
 }
 
 /// `POST /api/my/purchase`（Drop）→ `{client_order_id, purchased, remaining(字符串), keys}`。
