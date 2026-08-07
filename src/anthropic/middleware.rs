@@ -33,6 +33,8 @@ pub struct KeyContext {
     pub response_mode: crate::admin::client_keys::ClientResponseMode,
     /// Per-key cache hit-rate override captured during authentication.
     pub cache_hit_rate: Option<CacheHitRateBounds>,
+    /// 鉴权时捕获的 per-key 缓存策略（计费口径 / TTL）；在途请求不随后台编辑变化。
+    pub cache_policy: crate::admin::client_keys::ClientCachePolicy,
 }
 
 /// 应用共享状态
@@ -165,6 +167,7 @@ pub async fn auth_middleware(
                 key_source: TraceKeySource::ClientKey,
                 response_mode: authorized.response_mode,
                 cache_hit_rate: authorized.cache_hit_rate,
+                cache_policy: authorized.cache_policy,
             });
             return next.run(request).await;
         }

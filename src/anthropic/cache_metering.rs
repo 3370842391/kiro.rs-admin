@@ -117,12 +117,21 @@ pub struct CacheUsage {
     pub hit_rate_min_pct: u32,
     /// 命中率整形上界（百分比 0..=100）。见 [`Self::hit_rate_min_pct`]。
     pub hit_rate_max_pct: u32,
+    /// 对外上报的计费口径（per-key）。与 `hit_rate_*` 同处：都是随 Key 走的上报配置。
+    /// 默认 `Exclusive`（优化口径），未配置的 Key 行为与升级前一致。
+    pub billing_mode: crate::admin::client_keys::CacheBillingMode,
 }
 
 impl CacheUsage {
     /// 注入命中率整形区间（百分比 0..=100），返回带 bounds 的副本。
     /// 由 handler 在 `compute_cache_usage` 产出后、随 cache_usage 流入流/非流路径前调用；
     /// `(0, 0)` = 不整形。bounds 随 [`CacheUsage`] 一路带到 [`Self::split_against_total`]。
+    /// 注入 per-key 计费口径。链式调用，与 [`Self::with_hit_rate_bounds`] 并列。
+    pub fn with_billing_mode(mut self, mode: crate::admin::client_keys::CacheBillingMode) -> Self {
+        self.billing_mode = mode;
+        self
+    }
+
     pub fn with_hit_rate_bounds(mut self, min_pct: u32, max_pct: u32) -> Self {
         self.hit_rate_min_pct = min_pct.min(100);
         self.hit_rate_max_pct = max_pct.min(100);
@@ -139,6 +148,33 @@ impl CacheUsage {
     pub fn split_against_total(&self, total_real: i32) -> (i32, i32, i32) {
         let (input, creation, read) = self.split_raw(total_real);
         // 整形：固定 creation 与 total 不变，只在 input↔read 之间挪，把命中率钳进 [min,max]。
+        shape_hit_rate(
+            input,
+            creation,
+            read,
+            self.hit_rate_min_pct,
+            self.hit_rate_max_pct,
+        )
+    }
+
+    /// 非互斥（legacy）分摊：被缓存覆盖的前缀**同时**计进 `input` 与 `cache_creation`。
+    ///
+    /// 这是行业普遍口径，也是本项目「互斥口径分摊」修复之前的行为。**它不是 bug**：
+    /// 命中率整形照常生效，写创建照常产生，两者并存就是这个模式的定义。
+    /// 保留它是为了让普通客户按同行口径计费，优质客户走互斥优化口径。
+    ///
+    /// 与互斥口径的唯一差别：`input` 不扣掉被缓存覆盖的部分，因此
+    /// `input + creation + read > total_real`。**这个不等式是该模式的特征，不是缺陷** ——
+    /// 断言三者之和等于 total 的地方只适用于 [`Self::split_against_total`]。
+    ///
+    /// 全 miss（无缓存覆盖）时退化为 `(total, 0, 0)`，与互斥口径一致：没有覆盖前缀
+    /// 就没有可重复计的部分，凭空把 prompt 塞进 creation 会让总量凭空翻倍。
+    pub fn split_legacy_overlapping(&self, total_real: i32) -> (i32, i32, i32) {
+        let (_, creation, read) = self.split_raw(total_real);
+        // input 取全量：覆盖前缀既算进 input 也算进 creation，这就是"重复计入"。
+        let (input, creation, read) = (total_real.max(0), creation, read);
+        // 整形仍然作用于命中率区间（例如 0..=90）。这一步只在 input↔read 之间挪，
+        // 不改 creation，所以写创建不会被整形抹掉。
         shape_hit_rate(
             input,
             creation,
@@ -627,7 +663,28 @@ fn select_cache_candidates(
 /// 请求 metadata 里的 session，否则退回 key_id），使不同会话 / 不同客户端 Key 的
 /// 缓存互不命中——同一前缀只在同一会话内复用。
 pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u64) -> CacheUsage {
-    let policy = cache.policy();
+    compute_cache_usage_with_ttl(cache, req, key_id, None)
+}
+
+/// 同 [`compute_cache_usage`]，但允许用 per-key TTL 覆盖全局默认值。
+///
+/// 覆盖只作用在**本次请求写入的段**上（`Segment::ttl_secs`），缓存条目自带
+/// `expires_at`，所以不同 Key 的条目可以有不同存活期，不需要拆缓存实例。
+///
+/// 非法值（不在 `ALLOWED_TTL_SECS` 内）一律忽略、退回全局：宁可跟全局也不要
+/// 因为一个笔误把某个 Key 的缓存变成 60 秒。
+pub fn compute_cache_usage_with_ttl(
+    cache: &CacheMeter,
+    req: &MessagesRequest,
+    key_id: u64,
+    ttl_override_secs: Option<u64>,
+) -> CacheUsage {
+    let mut policy = cache.policy();
+    if let Some(ttl) = ttl_override_secs
+        && ALLOWED_TTL_SECS.contains(&ttl)
+    {
+        policy.default_ttl_secs = ttl;
+    }
     if !policy.enabled || (!policy.auto_without_cache_control && !request_has_cache_control(req)) {
         return CacheUsage::default();
     }

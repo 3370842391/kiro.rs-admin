@@ -1030,6 +1030,7 @@ mod tests {
             key_source: crate::admin::trace_db::TraceKeySource::ClientKey,
             response_mode: crate::admin::client_keys::ClientResponseMode::Detection,
             cache_hit_rate: None,
+            cache_policy: Default::default(),
         };
         let request: crate::anthropic::types::MessagesRequest =
             serde_json::from_value(serde_json::json!({
@@ -1168,6 +1169,7 @@ mod tests {
             key_source: crate::admin::trace_db::TraceKeySource::ClientKey,
             response_mode: crate::admin::client_keys::ClientResponseMode::Detection,
             cache_hit_rate: None,
+            cache_policy: Default::default(),
         };
         let content = format!("{HEAD_MARKER}{}{TAIL_MARKER}", "x".repeat(18 * 1024 * 1024));
         let request: crate::anthropic::types::MessagesRequest =
@@ -1275,6 +1277,7 @@ mod tests {
             key_source: crate::admin::trace_db::TraceKeySource::ClientKey,
             response_mode: crate::admin::client_keys::ClientResponseMode::KiroNative,
             cache_hit_rate: None,
+            cache_policy: Default::default(),
         };
         let request: crate::anthropic::types::MessagesRequest =
             serde_json::from_value(serde_json::json!({
@@ -1423,6 +1426,7 @@ mod tests {
             key_source: crate::admin::trace_db::TraceKeySource::ClientKey,
             response_mode: crate::admin::client_keys::ClientResponseMode::Detection,
             cache_hit_rate: None,
+            cache_policy: Default::default(),
         };
         let request: crate::anthropic::types::MessagesRequest =
             serde_json::from_value(serde_json::json!({

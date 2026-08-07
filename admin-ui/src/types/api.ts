@@ -536,6 +536,22 @@ export type CacheHitRatePatch =
   | { mode: 'inherit' }
   | { mode: 'custom'; minPct: number; maxPct: number }
 
+/**
+ * 对外上报 cache_creation / cache_read 的计费口径。
+ *
+ * - `exclusive`：互斥分摊，三桶之和 == input 总量（本项目的优化口径，给优质客户）
+ * - `legacy`：被缓存覆盖的前缀同时计进 input 与 creation，三桶之和 > 总量（同行口径，给普通客户）
+ *
+ * 两者 total 相同，差别只在覆盖前缀算几次。命中率整形在两种口径下都照常生效。
+ */
+export type CacheBillingMode = 'exclusive' | 'legacy'
+
+/** per-key 缓存策略。字段缺省 = 继承全局。 */
+export interface ClientCachePolicy {
+  billingMode?: CacheBillingMode
+  defaultTtlSecs?: number
+}
+
 export interface ClientKeyItem {
   id: number
   /** 脱敏后的 Key（仅展示） */
@@ -554,6 +570,8 @@ export interface ClientKeyItem {
   group?: string
   responseMode: ClientResponseMode
   cacheHitRate?: CacheHitRateBounds
+  /** per-key 缓存策略；后端在整体为空时不下发该字段 */
+  cachePolicy?: ClientCachePolicy
   /** 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换） */
   isSystem: boolean
 }
@@ -587,6 +605,11 @@ export interface UpdateClientKeyRequest {
   group?: string
   responseMode?: ClientResponseMode
   cacheHitRate?: CacheHitRatePatch
+  /**
+   * **整体替换**语义：缺省 = 不动；`{}` = 两项都恢复继承全局；
+   * 给了字段 = 覆盖该字段。与 cacheHitRate 的判别式补丁不同。
+   */
+  cachePolicy?: ClientCachePolicy
 }
 
 export interface UpdateClientKeyResponse {
@@ -595,6 +618,7 @@ export interface UpdateClientKeyResponse {
   id: number
   responseMode: ClientResponseMode
   cacheHitRate?: CacheHitRateBounds
+  cachePolicy?: ClientCachePolicy
 }
 
 // ============ 用量统计 ============

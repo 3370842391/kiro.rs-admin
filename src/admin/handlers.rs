@@ -1290,6 +1290,7 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         total_cache_read_tokens: k.total_cache_read_tokens,
         response_mode: k.response_mode,
         cache_hit_rate: k.cache_hit_rate,
+        cache_policy: k.cache_policy,
         group: k.group.clone(),
         is_system: k.is_system,
     }
@@ -1466,6 +1467,7 @@ pub async fn update_client_key(
         group,
         response_mode,
         cache_hit_rate,
+        payload.cache_policy,
     ) {
         Ok(Some(entry)) => Json(UpdateClientKeyResponse {
             success: true,
@@ -1473,6 +1475,7 @@ pub async fn update_client_key(
             id,
             response_mode: entry.response_mode,
             cache_hit_rate: entry.cache_hit_rate,
+            cache_policy: entry.cache_policy,
         })
         .into_response(),
         Ok(None) => (

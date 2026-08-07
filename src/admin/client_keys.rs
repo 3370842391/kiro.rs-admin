@@ -78,6 +78,87 @@ impl std::str::FromStr for ClientResponseMode {
     }
 }
 
+/// 对外上报 `cache_creation` / `cache_read` 的计费口径。
+///
+/// 差别只在被缓存覆盖的前缀算几次：
+///
+/// | | `Exclusive`（优化，默认） | `Legacy`（未修复口径） |
+/// |---|---|---|
+/// | 覆盖前缀 | 只计一次，按比例分摊 | **同时计进 input 与 creation/read** |
+/// | 三桶之和 | `== total` | `> total`（约 2 倍） |
+///
+/// **计价倍数不是个小数字。** 命中率越高，`Legacy` 相对 `Exclusive` 越贵，因为被
+/// 重复计入的前缀正是命中的那部分。按 input 1.0 / cache_write 1.25 / cache_read 0.1
+/// 的权重实算（见 `legacy_billing_multiple_grows_with_hit_rate` 测试的实测数字）：
+///
+/// | 场景 | `Exclusive` | `Legacy` | 倍数 |
+/// |---|---|---|---|
+/// | 首轮全写入 10k | 12500 | 22500 | 1.8× |
+/// | 第 2 轮 10k / 命中 9k | 2430 | 11525 | 4.7× |
+/// | 长会话 60k / 命中 57k | 12460 | 66950 | 5.4× |
+///
+/// 定价前务必按自己的实际单价重算，别拿这三行当结论。
+///
+/// `Legacy` **不是 bug**：命中率整形（例如 0..=90）照常生效，写创建照常产生，
+/// 两者并存就是这个口径的定义，也是本项目互斥修复**之前**的真实行为
+/// （修复前 `final_input_tokens` 就是完整 prompt total，不扣缓存前缀）。
+///
+/// 与修复前唯一的实现差异：这里的 `creation` / `read` 会被 `split_raw` 按
+/// `total_real` 等比缩放，而修复前直接用分段累计 token 的原始估算值。当
+/// `contextUsage` 真值大于本地估算时，`Legacy` 的缓存两桶会比修复前略高。
+/// 保留缩放是为了让三桶处在同一量纲，与 `Exclusive` 一致。
+///
+/// 无论选哪种，`traces.db` 与利润报表始终记 `Exclusive` 口径
+/// （见 `InputTokenUsage::split_internal`）——对外可以按同行收，内部账必须准。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CacheBillingMode {
+    /// 互斥分摊（本项目的优化口径）。给优质客户。
+    #[default]
+    Exclusive,
+    /// 非互斥、覆盖前缀重复计入。给普通客户。
+    Legacy,
+}
+
+/// 单个客户端 Key 的缓存策略覆盖。字段为 `None` 时继承全局。
+///
+/// 与 [`CacheHitRateBounds`] 同一继承模式：稚值跟全局，改全局会影响所有未单独配置的
+/// Key，升级零行为变化。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientCachePolicy {
+    /// 对外计费口径。`None` = 跟全局（即 `Exclusive` 优化口径）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing_mode: Option<CacheBillingMode>,
+    /// 该 Key 的缓存 TTL 秒数。`None` = 跟全局（默认 1800）。
+    ///
+    /// 缓存条目自带 `expires_at`、`record()` 接受 per-call TTL，所以不需要改缓存结构。
+    /// 注意：调小 TTL 会让间隔超过 TTL 的请求变成 miss 而重新全量写一次 creation ——
+    /// 在 `Legacy` 口径下这是加价，在 `Exclusive` 下是中性偏加价。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_ttl_secs: Option<u64>,
+}
+
+impl ClientCachePolicy {
+    /// 是否整体为空（全部继承全局）。空策略不必落盘。
+    pub fn is_empty(&self) -> bool {
+        self.billing_mode.is_none() && self.default_ttl_secs.is_none()
+    }
+
+    /// 校验 TTL 取值。允许集合与全局策略一致，避免出现一个全局拒绝、per-key 接受的口子。
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(ttl) = self.default_ttl_secs
+            && !crate::anthropic::cache_metering::ALLOWED_TTL_SECS.contains(&ttl)
+        {
+            anyhow::bail!(
+                "缓存 TTL 仅允许 {:?} 之一，收到 {ttl}",
+                crate::anthropic::cache_metering::ALLOWED_TTL_SECS
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Optional per-client-key cache hit-rate shaping bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -113,6 +194,8 @@ pub struct AuthorizedClientKey {
     pub group: Option<String>,
     pub response_mode: ClientResponseMode,
     pub cache_hit_rate: Option<CacheHitRateBounds>,
+    /// 该 Key 的缓存策略覆盖（计费口径 / TTL）。空表示全部继承全局。
+    pub cache_policy: ClientCachePolicy,
 }
 
 /// 单条客户端 Key
@@ -155,6 +238,11 @@ pub struct ClientKey {
     /// Per-key cache hit-rate shaping override; `None` inherits global config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_hit_rate: Option<CacheHitRateBounds>,
+    /// Per-key 缓存策略覆盖（对外计费口径 / TTL）。空字段继承全局。
+    ///
+    /// 老数据无此字段 → `Default`（全 `None`）→ 行为与升级前完全一致。
+    #[serde(default, skip_serializing_if = "ClientCachePolicy::is_empty")]
+    pub cache_policy: ClientCachePolicy,
     /// 系统 Key（由 config.json apiKey bootstrap 生成，不可删除 / 不可轮换）。
     /// 老数据无此字段，默认 false。
     #[serde(default, skip_serializing_if = "is_false")]
@@ -437,6 +525,7 @@ impl ClientKeyManager {
             group: group.filter(|g| !g.trim().is_empty()),
             response_mode,
             cache_hit_rate,
+            cache_policy: ClientCachePolicy::default(),
             is_system: false,
         };
         inner.by_key.insert(plaintext, id);
@@ -511,6 +600,7 @@ impl ClientKeyManager {
                     group: None,
                     response_mode: ClientResponseMode::Detection,
                     cache_hit_rate: None,
+                    cache_policy: ClientCachePolicy::default(),
                     is_system: true,
                 };
                 inner.by_key.insert(plaintext, id);
@@ -562,7 +652,7 @@ impl ClientKeyManager {
         group: Option<Option<String>>,
         response_mode: Option<ClientResponseMode>,
     ) -> anyhow::Result<Option<ClientKey>> {
-        self.update_meta_with_cache(id, name, description, group, response_mode, None)
+        self.update_meta_with_cache(id, name, description, group, response_mode, None, None)
     }
 
     /// Update metadata and optionally patch the per-key cache policy.
@@ -576,6 +666,7 @@ impl ClientKeyManager {
         group: Option<Option<String>>,
         response_mode: Option<ClientResponseMode>,
         cache_hit_rate: Option<Option<CacheHitRateBounds>>,
+        cache_policy: Option<ClientCachePolicy>,
     ) -> anyhow::Result<Option<ClientKey>> {
         let mut inner = self.inner.write();
         let Some(previous) = inner.entries.get(&id).cloned() else {
@@ -583,6 +674,10 @@ impl ClientKeyManager {
         };
         if let Some(Some(bounds)) = cache_hit_rate {
             CacheHitRateBounds::new(bounds.min_pct, bounds.max_pct)?;
+        }
+        // 先校验再落任何字段：TTL 非法时整次更新原样退回，不留半改状态。
+        if let Some(policy) = cache_policy.as_ref() {
+            policy.validate()?;
         }
         let updated = {
             let entry = inner.entries.get_mut(&id).expect("entry existed above");
@@ -600,6 +695,9 @@ impl ClientKeyManager {
             }
             if let Some(value) = cache_hit_rate {
                 entry.cache_hit_rate = value;
+            }
+            if let Some(value) = cache_policy {
+                entry.cache_policy = value;
             }
             entry.clone()
         };
@@ -765,6 +863,7 @@ impl ClientKeyManager {
             group: entry.group.clone(),
             response_mode: entry.response_mode,
             cache_hit_rate: entry.cache_hit_rate,
+            cache_policy: entry.cache_policy,
         })
     }
 
@@ -1016,6 +1115,7 @@ mod tests {
             is_system: false,
             response_mode: ClientResponseMode::KiroNative,
             cache_hit_rate: None,
+            cache_policy: ClientCachePolicy::default(),
         };
         let json = serde_json::to_value(&key).unwrap();
         assert_eq!(json["responseMode"], "kiro_native");
@@ -1244,15 +1344,105 @@ mod tests {
         let bounds = CacheHitRateBounds::new(50, 95).unwrap();
 
         let updated = manager
-            .update_meta_with_cache(entry.id, None, None, None, None, Some(Some(bounds)))
+            .update_meta_with_cache(entry.id, None, None, None, None, Some(Some(bounds)), None)
             .unwrap()
             .unwrap();
         assert_eq!(updated.cache_hit_rate, Some(bounds));
 
         let inherited = manager
-            .update_meta_with_cache(entry.id, None, None, None, None, Some(None))
+            .update_meta_with_cache(entry.id, None, None, None, None, Some(None), None)
             .unwrap()
             .unwrap();
         assert_eq!(inherited.cache_hit_rate, None);
+    }
+
+    /// per-key 缓存策略必须能一路走到鉴权快照，否则请求路径读不到它。
+    #[test]
+    fn cache_policy_reaches_the_authorized_snapshot() {
+        let manager = ClientKeyManager::new();
+        let entry = manager.create("普通客户".into(), None, None);
+        assert!(entry.cache_policy.is_empty(), "新建 Key 必须全部继承全局");
+
+        let policy = ClientCachePolicy {
+            billing_mode: Some(CacheBillingMode::Legacy),
+            default_ttl_secs: Some(300),
+        };
+        let updated = manager
+            .update_meta_with_cache(entry.id, None, None, None, None, None, Some(policy))
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.cache_policy, policy);
+
+        let authorized = manager.verify_and_touch_context(&entry.key).unwrap();
+        assert_eq!(
+            authorized.cache_policy, policy,
+            "鉴权快照是请求路径唯一的 per-key 配置来源"
+        );
+    }
+
+    /// 空策略即"恢复继承全局"，用于把误配的 Key 改回默认。
+    #[test]
+    fn empty_cache_policy_restores_global_inheritance() {
+        let manager = ClientKeyManager::new();
+        let entry = manager.create("回退".into(), None, None);
+        manager
+            .update_meta_with_cache(
+                entry.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(ClientCachePolicy {
+                    billing_mode: Some(CacheBillingMode::Legacy),
+                    default_ttl_secs: None,
+                }),
+            )
+            .unwrap();
+
+        let cleared = manager
+            .update_meta_with_cache(
+                entry.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(ClientCachePolicy::default()),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(cleared.cache_policy.is_empty());
+    }
+
+    /// 非法 TTL 必须整次拒绝，不能留下"名字改了、策略没改"的半改状态。
+    #[test]
+    fn invalid_cache_policy_ttl_rejects_the_whole_update() {
+        let manager = ClientKeyManager::new();
+        let entry = manager.create("原名".into(), None, None);
+
+        let error = manager
+            .update_meta_with_cache(
+                entry.id,
+                Some("新名".into()),
+                None,
+                None,
+                None,
+                None,
+                Some(ClientCachePolicy {
+                    billing_mode: None,
+                    default_ttl_secs: Some(77),
+                }),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("77"), "报错须带上被拒的取值");
+
+        let untouched = manager
+            .list()
+            .into_iter()
+            .find(|item| item.id == entry.id)
+            .unwrap();
+        assert_eq!(untouched.name, "原名", "校验失败时同批次的改名也不得生效");
+        assert!(untouched.cache_policy.is_empty());
     }
 }

@@ -6,6 +6,35 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### ✨ 新增 — 每把客户端 Key 可单独配置缓存计费口径与 TTL
+
+- **可以按 Key 选计费口径了**：新增 `Exclusive`（互斥分摊，三桶之和 == input 总量）与
+  `Legacy`（覆盖前缀同时计进 input 与 cache_creation，三桶之和 > 总量）两档。
+  `Legacy` 就是本项目互斥修复**之前**的行为——修复前 `final_input_tokens` 取完整
+  prompt total，不扣缓存前缀，已对着修复前的代码逐行核对过。给普通客户用 `Legacy`、
+  优质客户用 `Exclusive`。**这不是 bug 开关**：命中率整形（如 0..=90）与写创建在两种
+  口径下都照常生效，两者并存正是 `Legacy` 的定义。
+- **计价倍数写进测试而不只写注释**：按 input 1.0 / cache_write 1.25 / cache_read 0.1
+  的权重实算，`Legacy` 约为 `Exclusive` 的 **1.8×**（首轮全写入）到 **5.4×**
+  （长会话高命中）——命中率越高差得越多，因为被重复计入的前缀正是命中的那部分。
+  `legacy_billing_multiple_grows_with_hit_rate` 钉住量级并断言其随命中率单调上升。
+  （早前口头给过「约 15%」的估计，那是另一个口径下的数，按本表为准。）
+- **内部账不受影响**：`traces.db` 与利润报表始终走互斥口径
+  （新增 `InputTokenUsage::split_internal`）。对外可以按同行收，内部账必须看得准——
+  真实成本走上游 `metering.usage` 的 `credits`，与这三桶没有对应关系。
+- **per-key 缓存 TTL**：可选 5 分钟 / 30 分钟 / 1 小时。缓存条目本来就自带
+  `expires_at`、`record()` 也接受 per-call TTL，所以不同 Key 的条目可以有不同存活期，
+  不需要拆缓存实例。非法值一律忽略退回全局，不因一个笔误把某把 Key 的缓存变成 60 秒。
+- **界面**：客户端 Key 编辑对话框新增「计费口径」与「缓存 TTL」两个选择器，列表新增
+  「缓存策略」列。两个下拉的选项直接由常量渲染，并有契约测试解析 Rust 源码逐项比对
+  `ALLOWED_TTL_SECS` 与 `CacheBillingMode`——`kiro-drop` 那种「后端加了、前端硬编码表
+  没跟上，功能等于没上」不会重演。
+- **升级零行为变化**：两个字段都是 `Option`，老数据缺字段即全部继承全局，默认口径仍是
+  `Exclusive`。空策略 `{}` 表示恢复继承全局；TTL 非法时整次更新原样退回，不留半改状态。
+- **顺手收掉一处重复**：`handlers.rs` 里「算 cache_usage + 注入命中率区间」这段模板原本
+  在 7 个分支各抄一遍，加一项 per-key 配置就要改 7 处、漏一处就是"配了不生效"。
+  现收敛成单一 `resolve_cache_usage`。
+
 ### 🔧 修复 — Kiro Drop 缺货时自动改打欧区
 
 - **缺货能被识别了**：Drop 把「余额不足 / 库存不足 / 订单号冲突 / 价格超上限」四种原因

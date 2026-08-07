@@ -1253,6 +1253,12 @@ pub struct ClientKeyItem {
     pub response_mode: ClientResponseMode,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_hit_rate: Option<CacheHitRateBounds>,
+    /// per-key 缓存策略（计费口径 + TTL）。空对象不序列化 = 全部继承全局。
+    #[serde(
+        default,
+        skip_serializing_if = "crate::admin::client_keys::ClientCachePolicy::is_empty"
+    )]
+    pub cache_policy: crate::admin::client_keys::ClientCachePolicy,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     /// 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换）
@@ -1320,6 +1326,13 @@ pub struct UpdateClientKeyRequest {
     pub response_mode: Option<String>,
     #[serde(default)]
     pub cache_hit_rate: Option<CacheHitRatePatch>,
+    /// per-key 缓存策略。**整体替换**语义：
+    /// 缺省 = 不动；`{}` = 两项都恢复继承全局；给了字段 = 覆盖该字段。
+    ///
+    /// 这里不用 `cache_hit_rate` 那种 `Inherit`/`Custom` 判别式：编辑对话框本来就
+    /// 持有完整当前状态，整体替换比两个字段各自的三态（缺省/null/有值）好实现也好推理。
+    #[serde(default)]
+    pub cache_policy: Option<crate::admin::client_keys::ClientCachePolicy>,
 }
 
 /// 更新客户端 Key 响应；保留原成功响应字段，并返回实际持久化的模式。
@@ -1332,6 +1345,12 @@ pub struct UpdateClientKeyResponse {
     pub response_mode: ClientResponseMode,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_hit_rate: Option<CacheHitRateBounds>,
+    /// 回显实际持久化的缓存策略，前端据此刷新而不必再拉一次列表。
+    #[serde(
+        default,
+        skip_serializing_if = "crate::admin::client_keys::ClientCachePolicy::is_empty"
+    )]
+    pub cache_policy: crate::admin::client_keys::ClientCachePolicy,
 }
 
 // ============ IdC 设备授权登录 ============
@@ -2210,6 +2229,7 @@ mod tests {
             id: 7,
             response_mode: ClientResponseMode::KiroNative,
             cache_hit_rate: None,
+            cache_policy: Default::default(),
         };
         let value = serde_json::to_value(response).unwrap();
 

@@ -33,6 +33,19 @@ import {
   type ClientKeyCacheHitRateMode,
 } from '@/lib/client-key-cache-hit-rate'
 import {
+  ALLOWED_TTL_SECS,
+  BILLING_MODES,
+  INHERIT,
+  billingModeDescription,
+  billingModeLabel,
+  buildClientCachePolicy,
+  cachePolicyLabel,
+  cachePolicyToForm,
+  ttlLabel,
+  type BillingModeChoice,
+  type TtlChoice,
+} from '@/lib/client-key-cache-policy'
+import {
   DEFAULT_CLIENT_RESPONSE_MODE,
   responseModeDescription,
   responseModeLabel,
@@ -93,6 +106,8 @@ export function ClientKeysPage() {
   const [editCacheHitRateMode, setEditCacheHitRateMode] = useState<ClientKeyCacheHitRateMode>('inherit')
   const [editCacheHitRateMin, setEditCacheHitRateMin] = useState('')
   const [editCacheHitRateMax, setEditCacheHitRateMax] = useState('')
+  const [editBillingMode, setEditBillingMode] = useState<BillingModeChoice>(INHERIT)
+  const [editCacheTtl, setEditCacheTtl] = useState<TtlChoice>(INHERIT)
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -212,6 +227,9 @@ export function ClientKeysPage() {
     setEditCacheHitRateMode(item.cacheHitRate ? 'custom' : 'inherit')
     setEditCacheHitRateMin(item.cacheHitRate ? String(item.cacheHitRate.minPct) : '')
     setEditCacheHitRateMax(item.cacheHitRate ? String(item.cacheHitRate.maxPct) : '')
+    const policyForm = cachePolicyToForm(item.cachePolicy)
+    setEditBillingMode(policyForm.billingMode)
+    setEditCacheTtl(policyForm.ttl)
     setEditOpen(true)
   }
 
@@ -242,6 +260,10 @@ export function ClientKeysPage() {
           group: editGroup.trim(),
           responseMode: editResponseMode,
           cacheHitRate,
+          cachePolicy: buildClientCachePolicy({
+            billingMode: editBillingMode,
+            ttl: editCacheTtl,
+          }),
         },
       })
       if (warning) {
@@ -305,6 +327,7 @@ export function ClientKeysPage() {
                   <th className="text-left font-medium px-4 py-3">分组</th>
                   <th className="text-left font-medium px-4 py-3">回复模式</th>
                   <th className="text-left font-medium px-4 py-3">缓存命中率</th>
+                  <th className="text-left font-medium px-4 py-3">缓存策略</th>
                   <th className="text-left font-medium px-4 py-3">状态</th>
                   <th className="text-right font-medium px-4 py-3">总调用</th>
                   <th className="text-right font-medium px-4 py-3">输入</th>
@@ -367,6 +390,13 @@ export function ClientKeysPage() {
                     </td>
                     <td className="px-4 py-3 text-[12px] text-muted-foreground">
                       {cacheHitRateLabel(k.cacheHitRate)}
+                    </td>
+                    <td className="px-4 py-3 text-[12px] text-muted-foreground">
+                      {k.cachePolicy?.billingMode === 'legacy' ? (
+                        <Badge variant="secondary">{cachePolicyLabel(k.cachePolicy)}</Badge>
+                      ) : (
+                        cachePolicyLabel(k.cachePolicy)
+                      )}
                     </td>
                     <td className="px-4 py-3">
                       {k.disabled ? (
@@ -701,6 +731,51 @@ export function ClientKeysPage() {
                 </div>
               )}
               <p className="text-[11px] text-muted-foreground">继承全局不会修改全局设置；0/0 表示关闭该 Key 的命中率整形。</p>
+            </div>
+            <div className="space-y-2 rounded-lg border border-border/60 p-3">
+              <label className="text-[12px] text-muted-foreground">计费口径</label>
+              <Select
+                value={editBillingMode}
+                onValueChange={(value) => setEditBillingMode(value as BillingModeChoice)}
+                disabled={updateKey.isPending}
+              >
+                <SelectTrigger aria-label="计费口径">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={INHERIT}>继承全局配置</SelectItem>
+                  {BILLING_MODES.map((mode) => (
+                    <SelectItem key={mode} value={mode}>
+                      {billingModeLabel(mode)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-[11px] text-muted-foreground">
+                {billingModeDescription(editBillingMode)}
+              </p>
+              <label className="block pt-1 text-[12px] text-muted-foreground">缓存 TTL</label>
+              <Select
+                value={editCacheTtl}
+                onValueChange={(value) => setEditCacheTtl(value as TtlChoice)}
+                disabled={updateKey.isPending}
+              >
+                <SelectTrigger aria-label="缓存 TTL">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={INHERIT}>继承全局配置</SelectItem>
+                  {ALLOWED_TTL_SECS.map((secs) => (
+                    <SelectItem key={secs} value={String(secs)}>
+                      {ttlLabel(secs)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-[11px] text-muted-foreground">
+                调小 TTL 会让间隔超过 TTL 的请求变成 miss、重新全量写一次 cache_creation；
+                在同行口径下这是加价。内部利润报表始终按互斥口径记账，不受此处影响。
+              </p>
             </div>
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setEditOpen(false)}>取消</Button>

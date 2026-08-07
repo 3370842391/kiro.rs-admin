@@ -2094,6 +2094,14 @@ impl StreamContext {
         self.input_usage.split_api(&self.cache_usage)
     }
 
+    /// **内部（真实互斥）口径**，不受 per-key 计费模式影响。供 traces.db / 利润报表用。
+    ///
+    /// 与 [`Self::resolved_usage`] 分开是刻意的：对外可以按同行口径（legacy）收费，
+    /// 但我们自己的账必须按互斥口径记——否则被缓存覆盖的前缀会重复计一次，报表虚高。
+    pub fn internal_usage(&self) -> (i32, i32, i32) {
+        self.input_usage.split_internal(&self.cache_usage)
+    }
+
     /// Kiro 上报的整体上下文占用，只用于日志和上下文护栏。
     pub fn upstream_context_tokens(&self) -> Option<i32> {
         self.input_usage.upstream_context_tokens()

@@ -56,6 +56,33 @@ fn effective_identity_normalization(globally_enabled: bool, mode: ClientResponse
     globally_enabled && mode.allows_identity_normalization()
 }
 
+/// 组装随客户端 Key 走的缓存**上报**配置：TTL、命中率整形区间、对外计费口径。
+///
+/// 三项必须一起注入——漏掉任一项，那个 Key 的配置就静默失效，而"配了不生效"
+/// 比"配不了"难查得多。之前这段模板在 7 个 handler 分支里各抄了一遍，加一项配置
+/// 就要改 7 处；收成单一入口后漏改无从发生。
+fn resolve_cache_usage(
+    state: &AppState,
+    payload: &MessagesRequest,
+    key_id: u64,
+    cache_hit_rate: Option<CacheHitRateBounds>,
+    cache_policy: &crate::admin::client_keys::ClientCachePolicy,
+    provider: &crate::kiro::provider::KiroProvider,
+) -> super::cache_metering::CacheUsage {
+    let Some(cache) = state.cache_meter.as_ref() else {
+        return Default::default();
+    };
+    let (hr_min, hr_max) = effective_cache_hit_rate_bounds(provider, cache_hit_rate);
+    super::cache_metering::compute_cache_usage_with_ttl(
+        cache,
+        payload,
+        key_id,
+        cache_policy.default_ttl_secs,
+    )
+    .with_hit_rate_bounds(hr_min, hr_max)
+    .with_billing_mode(cache_policy.billing_mode.unwrap_or_default())
+}
+
 fn effective_cache_hit_rate_bounds(
     provider: &crate::kiro::provider::KiroProvider,
     override_bounds: Option<CacheHitRateBounds>,
@@ -87,6 +114,8 @@ pub(crate) struct UsageRecordHook {
     pub trace_id: Option<String>,
     pub key_id: u64,
     pub cache_hit_rate: Option<CacheHitRateBounds>,
+    /// 鉴权时捕获的 per-key 缓存策略（对外计费口径 / TTL）。
+    pub cache_policy: crate::admin::client_keys::ClientCachePolicy,
     pub model: String,
     pub started_at: Instant,
 }
@@ -105,6 +134,7 @@ impl UsageRecordHook {
             trace_id,
             key_id: key_ctx.key_id,
             cache_hit_rate: key_ctx.cache_hit_rate,
+            cache_policy: key_ctx.cache_policy,
             model,
             started_at: Instant::now(),
         }
@@ -1455,15 +1485,14 @@ fn try_local_exact_system_response(
         payload.messages.clone(),
         payload.tools.clone(),
     ) as i32;
-    let cache_usage = state
-        .cache_meter
-        .as_ref()
-        .map(|cache| {
-            let usage = super::cache_metering::compute_cache_usage(cache, payload, hook.key_id);
-            let (hr_min, hr_max) = effective_cache_hit_rate_bounds(provider, hook.cache_hit_rate);
-            usage.with_hit_rate_bounds(hr_min, hr_max)
-        })
-        .unwrap_or_default();
+    let cache_usage = resolve_cache_usage(
+        state,
+        payload,
+        hook.key_id,
+        hook.cache_hit_rate,
+        &hook.cache_policy,
+        provider,
+    );
     let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
         split_non_stream_usage(input_tokens, None, &cache_usage);
     let output_kind = match &output {
@@ -1539,15 +1568,14 @@ fn try_local_exact_user_response(
         payload.messages.clone(),
         payload.tools.clone(),
     ) as i32;
-    let cache_usage = state
-        .cache_meter
-        .as_ref()
-        .map(|cache| {
-            let usage = super::cache_metering::compute_cache_usage(cache, payload, hook.key_id);
-            let (hr_min, hr_max) = effective_cache_hit_rate_bounds(provider, hook.cache_hit_rate);
-            usage.with_hit_rate_bounds(hr_min, hr_max)
-        })
-        .unwrap_or_default();
+    let cache_usage = resolve_cache_usage(
+        state,
+        payload,
+        hook.key_id,
+        hook.cache_hit_rate,
+        &hook.cache_policy,
+        provider,
+    );
     let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
         split_non_stream_usage(input_tokens, None, &cache_usage);
 
@@ -1605,15 +1633,14 @@ fn try_local_ping_response(
         payload.messages.clone(),
         payload.tools.clone(),
     ) as i32;
-    let cache_usage = state
-        .cache_meter
-        .as_ref()
-        .map(|cache| {
-            let usage = super::cache_metering::compute_cache_usage(cache, payload, hook.key_id);
-            let (hr_min, hr_max) = effective_cache_hit_rate_bounds(provider, hook.cache_hit_rate);
-            usage.with_hit_rate_bounds(hr_min, hr_max)
-        })
-        .unwrap_or_default();
+    let cache_usage = resolve_cache_usage(
+        state,
+        payload,
+        hook.key_id,
+        hook.cache_hit_rate,
+        &hook.cache_policy,
+        provider,
+    );
     let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
         split_non_stream_usage(input_tokens, None, &cache_usage);
 
@@ -1684,15 +1711,14 @@ fn try_local_model_profile_response(
         payload.messages.clone(),
         payload.tools.clone(),
     ) as i32;
-    let cache_usage = state
-        .cache_meter
-        .as_ref()
-        .map(|cache| {
-            let usage = super::cache_metering::compute_cache_usage(cache, payload, hook.key_id);
-            let (hr_min, hr_max) = effective_cache_hit_rate_bounds(provider, hook.cache_hit_rate);
-            usage.with_hit_rate_bounds(hr_min, hr_max)
-        })
-        .unwrap_or_default();
+    let cache_usage = resolve_cache_usage(
+        state,
+        payload,
+        hook.key_id,
+        hook.cache_hit_rate,
+        &hook.cache_policy,
+        provider,
+    );
     let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
         split_non_stream_usage(input_tokens, None, &cache_usage);
     hook.record(
@@ -1794,15 +1820,14 @@ fn try_local_document_identifier_response(
         payload.messages.clone(),
         payload.tools.clone(),
     ) as i32;
-    let cache_usage = state
-        .cache_meter
-        .as_ref()
-        .map(|cache| {
-            let usage = super::cache_metering::compute_cache_usage(cache, payload, hook.key_id);
-            let (hr_min, hr_max) = effective_cache_hit_rate_bounds(provider, hook.cache_hit_rate);
-            usage.with_hit_rate_bounds(hr_min, hr_max)
-        })
-        .unwrap_or_default();
+    let cache_usage = resolve_cache_usage(
+        state,
+        payload,
+        hook.key_id,
+        hook.cache_hit_rate,
+        &hook.cache_policy,
+        provider,
+    );
     let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
         split_non_stream_usage(input_tokens, None, &cache_usage);
 
@@ -2489,17 +2514,14 @@ pub async fn post_messages(
 
     // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存。
     // 返回 estimate 口径的覆盖量；真实 input/cache 互斥分摊在拿到 total 真值时进行。
-    let cache_usage = state
-        .cache_meter
-        .as_ref()
-        .map(|cache| {
-            let usage = super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id);
-            // 注入运行时命中率整形区间（0,0 = 不整形）；随 cache_usage 带到分摊末尾。
-            let (hr_min, hr_max) =
-                effective_cache_hit_rate_bounds(&provider, key_ctx.cache_hit_rate);
-            usage.with_hit_rate_bounds(hr_min, hr_max)
-        })
-        .unwrap_or_default();
+    let cache_usage = resolve_cache_usage(
+        &state,
+        &payload,
+        key_ctx.key_id,
+        key_ctx.cache_hit_rate,
+        &key_ctx.cache_policy,
+        &provider,
+    );
 
     if strict_json_candidate {
         tracer.set_reasoning_effort(effort_from_fields(
@@ -4153,7 +4175,15 @@ fn record_stream_usage(
     credential_id: u64,
     status: &str,
 ) {
-    // 互斥分摊后的 (input, cache_creation, cache_read)，与 trace 上报口径一致。
+    // 用**对外**口径（per-key 可为 legacy），刻意与 `stream_trace_usage` 的内部口径不同。
+    //
+    // 这条路径喂的是「我们向客户收了多少」三个面：per-key 累计计数（客户端 Key 列表的
+    // 输入/输出列）、用量日志、统计聚合。它们必须与下游 NewAPI 实际计费的数字对得上，
+    // 否则客户来对账时我们拿不出一致的凭据。
+    //
+    // 真实（互斥）用量在 `traces.db` 里，见 [`stream_trace_usage`]。两者对同一 trace_id
+    // 给出不同 input_tokens 是设计如此，不是 bug——一个是收入面，一个是事实面；
+    // `credits`（上游真实成本）两边都记，所以利润仍可算。
     let (input, cache_creation, cache_read) = ctx.resolved_usage();
     hook.record(
         credential_id,
@@ -4166,9 +4196,13 @@ fn record_stream_usage(
     );
 }
 
-/// 从 StreamContext 提取用量，转成 trace 行用量（与 record_stream_usage 同源）
+/// 从 StreamContext 提取用量，转成 trace 行用量。
+///
+/// 与 [`record_stream_usage`] **同源但不同口径**：这里记事实，那里记收入。详见两处注释。
 fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
-    let (input, cache_creation, cache_read) = ctx.resolved_usage();
+    // 用内部（互斥）口径而不是对外口径：per-key 可以把对外账单切成 legacy 重复计数，
+    // 但 traces.db 与利润报表必须记真实值，否则我们自己的账会虚高。
+    let (input, cache_creation, cache_read) = ctx.internal_usage();
     TraceUsage {
         input_tokens: input.max(0) as u64,
         output_tokens: ctx.output_tokens.max(0) as u64,
@@ -5598,17 +5632,14 @@ pub async fn post_messages_cc(
     let tool_choice_policy = conversion_result.tool_choice_policy;
 
     // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存（estimate 口径）。
-    let cache_usage = state
-        .cache_meter
-        .as_ref()
-        .map(|cache| {
-            let usage = super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id);
-            // 注入运行时命中率整形区间（0,0 = 不整形）；随 cache_usage 带到分摊末尾。
-            let (hr_min, hr_max) =
-                effective_cache_hit_rate_bounds(&provider, key_ctx.cache_hit_rate);
-            usage.with_hit_rate_bounds(hr_min, hr_max)
-        })
-        .unwrap_or_default();
+    let cache_usage = resolve_cache_usage(
+        &state,
+        &payload,
+        key_ctx.key_id,
+        key_ctx.cache_hit_rate,
+        &key_ctx.cache_policy,
+        &provider,
+    );
 
     if strict_json_candidate {
         tracer.set_reasoning_effort(effort_from_fields(
@@ -6240,6 +6271,7 @@ mod tests {
             key_source: TraceKeySource::ClientKey,
             response_mode: ClientResponseMode::KiroNative,
             cache_hit_rate: None,
+            cache_policy: Default::default(),
         };
         let trace_id = "trace-hook-test-123".to_string();
         let hook = UsageRecordHook::from_state(
@@ -6555,6 +6587,7 @@ mod tests {
             key_source: TraceKeySource::ClientKey,
             response_mode: crate::admin::client_keys::ClientResponseMode::Detection,
             cache_hit_rate: None,
+            cache_policy: Default::default(),
         };
         let request: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model": "claude-opus-4-8",
