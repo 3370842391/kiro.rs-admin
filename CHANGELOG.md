@@ -6,6 +6,31 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 🔧 修复 — 换区买到的号不再按错误区域落库
+
+接着上一版的「Drop 缺货自动改打欧区」，补上落库这最后一环。上一版把换区做通了，
+但买回来的号仍可能被标成美区——功能看着好了，号其实用不了。
+
+- **过期的 webhook 区域不再压过实际购买区域**：`resolve_credential_region` 原先只接受
+  `region_source == PurchaseResponse` 的 `actual_region`。换区那次若对方响应没回显顶层
+  `region`（字段是 `#[serde(default)]`，缺了就是 `None`），来源会退成 `Request` 而被整个
+  丢掉，于是掉回 webhook 通知的**美区**——欧区号全标成美区，之后用美区端点去调，
+  表现是刚买的号立刻「不可用」而钱已经扣了。现在 `actual_region` 两种来源都收：
+  `Request` 意味着「这个区是我们自己发出去且下单成功的」，仍比 webhook 的原始通知可信。
+  来源如实保留，事件快照里看得出是对方回显的还是我们推断的。
+- **key 级区域不再被丢弃**：Drop 文档说 `keys` 每一项都带完整区域，而 `KeyWire` 压根没解析
+  这个字段。现在顶层读不到就退到 key 级；两者都是 `#[serde(default)]`，对方改名或漏字段
+  只会得到 `None` 而不报错，所以两路都要收。同一单跨区出货时取第一个并告警——
+  这批号只能整体落到一个区，猜错的那部分会表现为「刚买就不可用」，必须留下痕迹。
+- **界面不再对旧配置说谎**：Drop 的能力从「仅 omit」改成 fixed/webhook/bestAvailable 后，
+  配置里持久化的 `omit` 落在了选项列表之外。原生 `<select>` 的 `value` 无对应 `<option>`
+  时浏览器显示第一项而 state 仍是原值——界面显示「固定区域」、实际是 `omit`，
+  且「采购区域」子选择器（只在 `fixed` 时出现）也不显示，用户根本没法把它改成只买欧区。
+  现在旧值会作为「（旧配置）」选项保留并置顶，而不是在加载时静默改写用户的配置。
+  线上 `drop` 供应商正处于这个状态。
+- 行为上 `Omit` 与 `BestAvailable` 在 Drop 上等价（都不传 `region`，走美区默认再缺货换欧区），
+  所以线上那份 `omit` 旧配置**本来就能拿到换区回退**，不必先改配置。
+
 ### ✨ 新增 — 每把客户端 Key 可单独配置缓存计费口径与 TTL
 
 - **可以按 Key 选计费口径了**：新增 `Exclusive`（互斥分摊，三桶之和 == input 总量）与

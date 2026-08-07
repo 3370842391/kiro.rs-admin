@@ -980,6 +980,53 @@ mod tests {
         );
     }
 
+    /// 顶层 `region` 缺失时退到 key 级 `region`（文档：每项都带完整区域）。
+    ///
+    /// 两个字段都是 `#[serde(default)]`，对方改名或漏字段只会得到 `None` 而不报错。
+    /// 若两路都读不出来，源会退成 `Request`，上层再往下就可能掉回 webhook 的美区
+    /// ——欧区号标成美区，用美区端点调，刚买就"不可用"而钱已经扣了。所以两路都要收。
+    #[tokio::test]
+    async fn kiro_drop_reads_the_region_from_the_key_items_when_the_top_level_field_is_absent() {
+        let app = Router::new().route(
+            "/api/my/purchase",
+            post(|| async {
+                axum::http::Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "client_order_id": "",
+                            "purchased": 2,
+                            "remaining": "884.400000",
+                            // 顶层 region 刻意不给
+                            "keys": [
+                                {"key": "ksk_eu_one", "region": "eu-central-1"},
+                                {"key": "ksk_eu_two", "region": "eu-central-1"}
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap()
+            }),
+        );
+        let client =
+            SupplierClient::with_kind(server(app).await, "usr-secret", SupplierKind::KiroDrop)
+                .unwrap();
+
+        let purchase = client
+            .purchase(2, "0123456789abcdef0123456789abcdef")
+            .await
+            .unwrap();
+
+        assert_eq!(purchase.purchased, 2);
+        assert_eq!(purchase.actual_region, Some(SupplierRegion::Eu));
+        assert_eq!(
+            purchase.region_source,
+            Some(RegionSource::PurchaseResponse),
+            "key 级区域同样来自对方响应，不该降级成 Request"
+        );
+    }
+
     #[tokio::test]
     async fn kiro_drop_does_not_fall_back_when_the_shortage_reason_is_unreadable() {
         // 409 是多义的。读不出缺货就不该换区——否则余额不足也会白打一次欧区。
@@ -2328,14 +2375,38 @@ impl SupplierClient {
             return Err(SupplierError::OutOfStock);
         }
         // 实际出货区域以对方响应为准（文档：「本单实际出货区域，始终为完整区域值」）。
-        // 解析不出来时不猜——留 None 让上层退到自己的兜底链，而不是硬写成美区。
-        let actual_region = response
+        //
+        // 先看顶层 `region`，读不到再看 key 级 `region`——文档说每个 key 都带完整区域，
+        // 所以两处任一能读出来就不必靠"我们请求的是哪个区"去推断。两个字段都是
+        // `#[serde(default)]`，对方改名或漏字段只会得到 None 而不是报错，所以两路都要收。
+        //
+        // key 级区域不一致时（同一单跨区出货，文档没说会发生）取第一个并告警：
+        // 这批号只能整体落到一个区，猜错的那部分会表现为"刚买就不可用"，必须留下痕迹。
+        let key_regions: Vec<SupplierRegion> = response
+            .keys
+            .iter()
+            .filter_map(|item| item.region.as_deref())
+            .filter_map(|value| value.trim().parse::<SupplierRegion>().ok())
+            .collect();
+        if let Some(first) = key_regions.first()
+            && key_regions.iter().any(|item| item != first)
+        {
+            tracing::warn!(
+                supplier = %self.kind,
+                "同一单的 key 跨区出货，只能整体落到 {}；请人工核对",
+                first.as_api_region()
+            );
+        }
+        let response_region = response
             .region
             .as_deref()
             .and_then(|value| value.trim().parse::<SupplierRegion>().ok())
-            .or(region);
+            .or_else(|| key_regions.first().copied());
+        // 都读不到才退回"我们请求的区"。请求的区在换区成功后就是欧区，
+        // 依然比上层的 webhook 原始通知可信（见 `resolve_credential_region`）。
+        let actual_region = response_region.or(region);
         let region_source = actual_region.map(|_| {
-            if response.region.is_some() {
+            if response_region.is_some() {
                 RegionSource::PurchaseResponse
             } else {
                 RegionSource::Request
@@ -3045,6 +3116,10 @@ struct KeyWire {
     /// 这一个 key 实际扣了多少。只有 kiroapp-io 按 key 给价。
     #[serde(default)]
     price: Option<f64>,
+    /// 这一个 key 的完整区域。Kiro Drop 文档：「keys 购买到的 Key 列表，**每项都带
+    /// 完整区域**」。顶层 `region` 是单据级的，这里是 key 级的，后者才是落库依据。
+    #[serde(default)]
+    region: Option<String>,
 }
 
 /// `GET /openapi/stock` → `{availableKeys, keyPrice}`。

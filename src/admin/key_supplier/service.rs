@@ -2166,12 +2166,9 @@ impl KeySupplierService {
         };
         summary.decision_actual_region = purchase.actual_region;
         summary.decision_actual_region_source = purchase.region_source;
-        let purchase_response_region = (purchase.region_source
-            == Some(RegionSource::PurchaseResponse))
-        .then_some(purchase.actual_region)
-        .flatten();
         let credential_region = resolve_credential_region(
-            purchase_response_region,
+            purchase.actual_region,
+            purchase.region_source,
             event.event_region,
             requested_region,
             runtime,
@@ -2426,16 +2423,33 @@ struct ResolvedCredentialRegion {
     source: RegionSource,
 }
 
+/// 决定买回来的 key 按哪个区落库。优先级从"最能证明这批号在哪个区"往下排。
+///
+/// `actual_region` 是**下单成功那一次**用的区，它必须排在 `webhook_region` 之前——
+/// 这正是缺货换区场景：webhook 说美区到货，我们打美区 409 缺货、改打欧区成功，
+/// 此时 webhook 的"美区"已经过期，而 `actual_region` 是欧区。按 webhook 落库会把
+/// 欧区号全标成美区，之后用美区端点去调欧区号，表现是刚买的号立刻"不可用"。
+///
+/// 之前这里只接受 `region_source == PurchaseResponse` 的 `actual_region`，
+/// 换区那次若对方响应没回显顶层 `region`（字段是 `#[serde(default)]`，缺了就是 `None`），
+/// 源会退成 `Request` 而被整个丢掉，于是掉回 webhook 的美区——正是上面那个故障。
+/// 现在两种源都收：`Request` 意味着"这个区是我们自己发出去且下单成功的"，
+/// 依然比 webhook 的原始通知可信。
+///
+/// `requested_region` 排在 webhook 之后是刻意的：它是**换区之前**算出的意图，
+/// 而 `actual_region` 已经覆盖了换区之后的事实，所以它只在完全没有其他证据时兜底。
 fn resolve_credential_region(
-    purchase_response_region: Option<SupplierRegion>,
+    actual_region: Option<SupplierRegion>,
+    actual_region_source: Option<RegionSource>,
     webhook_region: Option<SupplierRegion>,
     requested_region: Option<SupplierRegion>,
     runtime: &SupplierRuntimeConfig,
 ) -> ResolvedCredentialRegion {
-    if let Some(region) = purchase_response_region {
+    if let Some(region) = actual_region {
         return ResolvedCredentialRegion {
             api_region: region.as_api_region().to_owned(),
-            source: RegionSource::PurchaseResponse,
+            // 保留原始来源，事件快照里才看得出这个区是对方回显的还是我们自己发的。
+            source: actual_region_source.unwrap_or(RegionSource::PurchaseResponse),
         };
     }
     if let Some(region) = webhook_region {
@@ -3291,8 +3305,10 @@ mod tests {
         let mut runtime = runtime(TOKEN);
         runtime.credential_api_region_fallback = "us-east-1".to_owned();
 
+        // 对方回显的出货区最权威，压过 webhook 与请求意图。
         let resolved = resolve_credential_region(
             Some(SupplierRegion::Eu),
+            Some(RegionSource::PurchaseResponse),
             Some(SupplierRegion::Us),
             Some(SupplierRegion::Us),
             &runtime,
@@ -3302,6 +3318,7 @@ mod tests {
 
         let webhook = resolve_credential_region(
             None,
+            None,
             Some(SupplierRegion::Eu),
             Some(SupplierRegion::Us),
             &runtime,
@@ -3309,9 +3326,49 @@ mod tests {
         assert_eq!(webhook.api_region, "eu-central-1");
         assert_eq!(webhook.source, RegionSource::Webhook);
 
-        let fallback = resolve_credential_region(None, None, None, &runtime);
+        let fallback = resolve_credential_region(None, None, None, None, &runtime);
         assert_eq!(fallback.api_region, "us-east-1");
         assert_eq!(fallback.source, RegionSource::ConfigFallback);
+    }
+
+    /// 缺货换区落库：webhook 说美区，我们实际买到欧区，凭证必须记欧区。
+    ///
+    /// 这是回归测试。原实现只接受 `PurchaseResponse` 源的 `actual_region`，
+    /// 换区那次若对方没回显顶层 `region`，源退成 `Request` 就被整个丢掉，
+    /// 于是掉回 webhook 的美区——欧区号全标成美区，用美区端点去调，
+    /// 表现是刚买的号立刻"不可用"，而账已经扣了。
+    #[test]
+    fn region_fallback_wins_over_a_stale_webhook_region() {
+        let mut runtime = runtime(TOKEN);
+        runtime.credential_api_region_fallback = "us-east-1".to_owned();
+
+        // 对方回显了欧区：最权威。
+        let echoed = resolve_credential_region(
+            Some(SupplierRegion::Eu),
+            Some(RegionSource::PurchaseResponse),
+            Some(SupplierRegion::Us), // webhook 通知的是美区，已经过期
+            None,
+            &runtime,
+        );
+        assert_eq!(echoed.api_region, "eu-central-1");
+
+        // 对方没回显，只知道"我们发出去并成功的是欧区"：仍然必须落欧区。
+        let inferred = resolve_credential_region(
+            Some(SupplierRegion::Eu),
+            Some(RegionSource::Request),
+            Some(SupplierRegion::Us),
+            None,
+            &runtime,
+        );
+        assert_eq!(
+            inferred.api_region, "eu-central-1",
+            "换区成功后的实际请求区必须压过已过期的 webhook 区"
+        );
+        assert_eq!(
+            inferred.source,
+            RegionSource::Request,
+            "来源要如实保留，事件快照才看得出这个区是推断来的"
+        );
     }
 
     #[test]

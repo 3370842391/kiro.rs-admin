@@ -21,7 +21,7 @@ import { GroupMultiSelect } from '@/components/group-select'
 import { useGroupOptions } from '@/hooks/use-groups'
 import { extractErrorMessage } from '@/lib/utils'
 import {
-  buildSupplierNicknamePreview, emptySupplierEntry, emptySupplierPool, getSupplierCapabilities,
+  buildSupplierNicknamePreview, emptySupplierEntry, emptySupplierPool, getSupplierCapabilities, regionModeOptions,
   getSupplierEventStatusLabel, getSupplierKindLabel, hasUnreadSupplierEvents, isValidSupplierId,
   parseSupplierDecimalDraft, parseSupplierNumberDraft, suggestSupplierId,
   toSupplierEntryUpdate, validateSupplierPool,
@@ -1020,8 +1020,11 @@ export function KeySupplierPage() {
                         }}
                         disabled={saveConfig.isPending}
                       >
-                        {capabilities.regionModes.map((mode) => (
-                          <option key={mode} value={mode}>{REGION_MODE_LABELS[mode]}</option>
+                        {regionModeOptions(capabilities.regionModes, config.purchaseRegionMode).map((mode) => (
+                          <option key={mode} value={mode}>
+                            {REGION_MODE_LABELS[mode]}
+                            {capabilities.regionModes.includes(mode) ? '' : '（旧配置）'}
+                          </option>
                         ))}
                       </select>
                     </Field>

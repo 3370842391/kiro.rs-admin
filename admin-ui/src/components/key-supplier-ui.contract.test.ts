@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { readFile } from 'node:fs/promises'
+import { regionModeOptions } from '@/lib/key-supplier'
+import type { PurchaseRegionMode } from '@/types/api'
 
 async function readSource(path: string): Promise<string> {
   return readFile(new URL(`../${path}`, import.meta.url), 'utf8').catch(() => '')
@@ -361,5 +363,43 @@ describe('key supplier management UI contract', () => {
     expect(page).not.toContain(
       'supportsWebhookRegistration = capabilities',
     )
+  })
+})
+
+describe('区域模式下拉不能丢掉已持久化的旧值', () => {
+  test('旧值不在支持列表时保留它并置顶', () => {
+    // 线上 kiro-drop 的实际状态：能力表已改成 fixed/webhook/bestAvailable，
+    // 而配置里持久化的还是 omit。原生 select 的 value 无对应 option 时浏览器显示
+    // 第一项，state 却仍是 omit——界面显示「固定区域」、实际是 omit，
+    // 「采购区域」子选择器也不出现，用户没法把它改成只买欧区。
+    expect(regionModeOptions(['fixed', 'webhook', 'bestAvailable'], 'omit')).toEqual([
+      'omit',
+      'fixed',
+      'webhook',
+      'bestAvailable',
+    ])
+  })
+
+  test('旧值本来就受支持时不重复插入', () => {
+    expect(regionModeOptions(['fixed', 'webhook', 'bestAvailable'], 'fixed')).toEqual([
+      'fixed',
+      'webhook',
+      'bestAvailable',
+    ])
+  })
+
+  test('不改动传入的能力数组（它是共享常量）', () => {
+    const supported: PurchaseRegionMode[] = ['fixed', 'webhook']
+    regionModeOptions(supported, 'omit')
+    expect(supported).toEqual(['fixed', 'webhook'])
+  })
+
+  test('界面用 regionModeOptions 而不是直接 map 能力表', async () => {
+    const page = await readFile(
+      new URL('./key-supplier-page.tsx', import.meta.url),
+      'utf8',
+    )
+    expect(page).toContain('regionModeOptions(capabilities.regionModes, config.purchaseRegionMode)')
+    expect(page).not.toContain('capabilities.regionModes.map')
   })
 })

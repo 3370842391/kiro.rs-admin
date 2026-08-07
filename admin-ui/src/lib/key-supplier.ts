@@ -1,4 +1,5 @@
 import type {
+  PurchaseRegionMode,
   SupplierConfigPayload,
   SupplierConfigUpdate,
   SupplierCapabilities,
@@ -150,6 +151,24 @@ const defaultSupplierCommon: SupplierCommonConfig = {
 
 export function getSupplierKindLabel(kind: SupplierKind): string {
   return supplierKindLabels[kind] ?? kind
+}
+
+/**
+ * 区域模式下拉要显示的选项：本家支持的模式 + 当前已持久化的模式（若已不在支持列表里）。
+ *
+ * 原生 `<select>` 的 `value` 找不到对应 `<option>` 时，浏览器会显示第一项，
+ * 而 React state 仍是原值——界面显示「固定区域」，实际配置却是 `omit`，
+ * 于是「采购区域」子选择器（只在 mode==='fixed' 时出现）也不显示，用户直接卡住。
+ * 线上 kiro-drop 就正处于这个状态：Drop 的能力从「仅 omit」改成
+ * fixed/webhook/bestAvailable 后，旧配置里持久化的 `omit` 落在了列表之外。
+ *
+ * 保留旧值而不是在加载时静默改写配置：改写等于替用户做了一次他没点过的变更。
+ */
+export function regionModeOptions(
+  supported: readonly PurchaseRegionMode[],
+  current: PurchaseRegionMode,
+): PurchaseRegionMode[] {
+  return supported.includes(current) ? [...supported] : [current, ...supported]
 }
 
 export function getSupplierCapabilities(kind: SupplierKind): SupplierCapabilities {
