@@ -6,6 +6,33 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 🔧 修复 — 错误快照库不再只涨不缩（线上 9.65 GB → 约 4 GB）
+
+线上 `error_snapshots.db` 长到 **9.65 GB**。查下来不是保留期失效——12 天前的老数据
+只有 74 条，全是 `critical` + `retention_exempt`，按设计就该保。真正的原因是两条：
+
+- **3.6 GB 是已删除但没回收的空闲页**（`freelist_count` 877,882 × 4 KiB）。
+  建库时开了 `PRAGMA auto_vacuum=INCREMENTAL`，但那只是**允许**回收，必须显式执行
+  `PRAGMA incremental_vacuum` 才真的还给文件系统——而这条从没被调用过。
+  现每轮维护回收一批（32 MiB，让单轮锁持有落在几十毫秒），靠 `needs_follow_up`
+  推进，线上那 3.6 GB 约半分钟能啃完。
+- **7 天窗口内的请求体本身就有 5.5 GB**：`client_request` 3.5 GB + `kiro_request`
+  1.9 GB，其余五类加起来不到 90 MB。容量清理的触发线是 `maxStorageGb` 的 70%
+  （20 GB × 70% = 14 GB），9.65 GB 根本没到线，所以从没跑过。
+
+新增请求体分级保留：`client_request` / `kiro_request` / `upstream_response` 只留
+**72 小时**，超期只删 payload，快照元数据（时间、模型、凭据、attempt 链、错误类型）
+与 `tool_diagnostics` 诊断分片全部保留，按 `retentionDays` 走。Admin UI 上这条错误
+仍然看得到、仍然知道是什么错，只是点不开原始正文；趋势统计不受影响。
+
+取 72 h 而非 48 h（`stream_tail` 的窗口）是给跨周末排障留一天余量。需要长期留证的个案
+用 `pinned` / `retention_exempt` 显式保下来——**本清理会跳过它们**，这是与
+`prune_expired_stream_tails` 的刻意差异：那边删的是模型输出明文，缩短窗口本身就是目的；
+这边删的是排障素材，运维显式钉住就该留住。
+
+清理按快照分批（每轮 256 条），不在单次事务里啃 2 GB；可反复执行，清完自然停下。
+
+
 ### 🔧 修复 — 上游发完 metering 就收尾，不再干等 120 秒把完整响应记成断流
 
 拉了线上 error_snapshots.db 解开 220 条断流现场，**161 条（73%）根本不是断流**：字节

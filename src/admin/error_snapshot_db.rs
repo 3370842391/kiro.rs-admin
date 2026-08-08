@@ -22,6 +22,32 @@ const MAINTENANCE_BATCH_SIZE: usize = 512;
 /// 短于快照库自身的 `retention_days`，因为尾部里是模型输出明文，而断流排障
 /// 基本在 1–2 天内完成。见 [`ErrorSnapshotStore::prune_expired_stream_tails`]。
 const STREAM_TAIL_RETENTION_SECS: i64 = 48 * 3600;
+
+/// 完整请求体（`client_request` / `kiro_request` / `upstream_response`）的保留期。
+///
+/// 这三类占了全库体积的**绝大部分**——线上实测 `client_request` 3.5 GB、
+/// `kiro_request` 1.9 GB，其余五类加起来不到 90 MB。它们是排障时最有用的东西，
+/// 但和 `stream_tail` 一样：排障基本在 1–2 天内完成，没有理由跟着快照库的
+/// `retention_days`（默认 7 天）一起躺着。实测 ≥3 天的这两类合计 2 GB，
+/// 全是"存着不会再看"的正文。
+///
+/// 取 72h 而不是 48h：给跨周末的排障留一天余量。需要长期留证的个案用
+/// `pinned` / `retention_exempt` 显式保下来——本清理会跳过它们，这正是那两个
+/// 标记存在的意义。快照元数据（时间、模型、凭据、attempt 链、错误类型）不受影响，
+/// 按 `retention_days` 走，所以趋势统计不会因此断档。
+const REQUEST_BODY_RETENTION_SECS: i64 = 72 * 3600;
+
+/// 每轮维护回收的空闲页上限（页大小 4 KiB → 约 32 MiB）。
+///
+/// `PRAGMA auto_vacuum=INCREMENTAL` 只是**允许**回收，不会自己回收：必须显式执行
+/// `PRAGMA incremental_vacuum`。之前从没执行过，于是线上 877,882 个空闲页
+/// （**3.6 GB**）一直占着文件不放——删了数据文件也不缩。
+///
+/// 分批而不是一次回收干净：`incremental_vacuum` 整个过程持有连接锁，一次啃 3.6 GB
+/// 会把请求热路径上的快照写入卡住好几秒。取 32 MiB 让单轮锁持有时间落在几十毫秒，
+/// 而维护循环在 `needs_follow_up` 时是 250 ms 一轮，线上那 3.6 GB 约半分钟能啃完。
+/// 追平之后每小时只需回收当轮删掉的那点，批量大小就更不构成问题。
+const INCREMENTAL_VACUUM_PAGES: u32 = 8_192;
 const SNAPSHOT_ROW_OVERHEAD_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -922,6 +948,16 @@ impl ErrorSnapshotStore {
             tx.commit()?;
         }
         self.prune_expired_stream_tails(now_epoch)?;
+        // 超期请求体：全库体积的大头（实测 client_request 3.5 GB + kiro_request 1.9 GB），
+        // 排障价值集中在头两三天。每轮有上界，靠 needs_follow_up 推进。
+        let expired_bodies_stripped = self.prune_expired_request_bodies(now_epoch)?;
+        if expired_bodies_stripped > 0 {
+            tracing::info!(
+                stripped_payloads = expired_bodies_stripped,
+                retention_hours = REQUEST_BODY_RETENTION_SECS / 3600,
+                "清理超期请求体（保留快照元数据与诊断分片）"
+            );
+        }
         // 历史 client_disconnected 请求体的回填清理。每轮有上界，靠 needs_follow_up
         // 驱动维护循环继续推进；清完后不再匹配候选条件，自然停下。
         let legacy_bodies_stripped = self.prune_legacy_client_disconnected_bodies()?;
@@ -930,6 +966,11 @@ impl ErrorSnapshotStore {
                 stripped_payloads = legacy_bodies_stripped,
                 "清理历史 client_disconnected 请求体（保留元数据与 1% 采样）"
             );
+        }
+        // 放在所有删除之后：先产生空闲页，再回收。否则这一轮删掉的还得等下一轮。
+        let reclaimed_pages = self.reclaim_free_pages()?;
+        if reclaimed_pages > 0 {
+            tracing::info!(reclaimed_pages, "回收快照库空闲页");
         }
         let status = self.storage_status()?;
         let (has_more_expired, has_capacity_candidates): (bool, bool) =
@@ -952,6 +993,9 @@ impl ErrorSnapshotStore {
             || has_more_expired
             // 本轮确实清掉了历史请求体，说明可能还有——再来一轮。
             || legacy_bodies_stripped > 0
+            || expired_bodies_stripped > 0
+            // 还回收出了空闲页，说明 freelist 可能没啃完——再来一轮。
+            || reclaimed_pages > 0
             || (status.live_bytes > target_bytes && has_capacity_candidates);
         let disk_pressure = status.available_bytes < policy.min_free_disk_bytes;
         self.capture_mode
@@ -1056,6 +1100,97 @@ impl ErrorSnapshotStore {
         }
         tx.commit()?;
         Ok(deleted)
+    }
+
+    /// 清理超期的完整请求体，保留快照元数据与诊断分片。
+    ///
+    /// 见 [`REQUEST_BODY_RETENTION_SECS`]：这三类占全库体积的绝大部分，而它们的
+    /// 排障价值集中在头两三天。删掉后快照本身还在——时间、模型、凭据、attempt 链、
+    /// 错误类型、`tool_diagnostics` 全部保留，Admin UI 上仍能看到这条错误发生过、
+    /// 长什么样，只是点不开原始请求体。
+    ///
+    /// 与 [`Self::prune_expired_stream_tails`] 的一处**刻意差异**：这里跳过
+    /// `pinned` / `retention_exempt`。运维把一条快照钉住，要留的正是请求体；
+    /// 连它一起删等于让那两个标记失去意义。
+    ///
+    /// 每轮按快照分批，不在单次事务里啃 2 GB——那会长时间持锁，把请求热路径上的
+    /// 快照写入一起卡住。靠维护循环多跑几轮推进；清完后不再匹配候选条件，自然停下。
+    fn prune_expired_request_bodies(&self, now_epoch: i64) -> anyhow::Result<usize> {
+        /// 每轮处理的快照条数上界，与 `prune_legacy_client_disconnected_bodies` 同量级。
+        const BATCH: usize = 256;
+
+        let cutoff = now_epoch.saturating_sub(REQUEST_BODY_RETENTION_SECS);
+        let candidates: Vec<String> = {
+            let conn = self.conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT s.snapshot_id
+                   FROM error_snapshots s
+                   JOIN error_snapshot_payloads p ON p.snapshot_id = s.snapshot_id
+                  WHERE s.ts_epoch < ?1
+                    AND s.pinned = 0 AND s.retention_exempt = 0
+                    AND p.kind IN ('client_request', 'kiro_request', 'upstream_response')
+                  LIMIT ?2",
+            )?;
+            stmt.query_map(params![cutoff, BATCH as i64], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let mut deleted = 0usize;
+        for snapshot_id in &candidates {
+            deleted += tx.execute(
+                "DELETE FROM error_snapshot_payloads
+                   WHERE snapshot_id = ?1
+                     AND kind IN ('client_request', 'kiro_request', 'upstream_response')",
+                params![snapshot_id],
+            )?;
+            // 聚合字段按剩余分片重算：Admin UI 直接展示这几个值，不重算会出现
+            // 「分片数 2 但字节数还含已删请求体」这种自相矛盾的行。
+            tx.execute(
+                "UPDATE error_snapshots SET
+                     payload_count = (
+                         SELECT COUNT(*) FROM error_snapshot_payloads p
+                         WHERE p.snapshot_id = ?1
+                     ),
+                     original_bytes = COALESCE((
+                         SELECT SUM(p.original_bytes) FROM error_snapshot_payloads p
+                         WHERE p.snapshot_id = ?1
+                     ), 0),
+                     compressed_bytes = COALESCE((
+                         SELECT SUM(p.compressed_bytes) FROM error_snapshot_payloads p
+                         WHERE p.snapshot_id = ?1
+                     ), 0)
+                   WHERE snapshot_id = ?1",
+                params![snapshot_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(deleted)
+    }
+
+    /// 把已删数据留下的空闲页还给文件系统。
+    ///
+    /// 见 [`INCREMENTAL_VACUUM_PAGES`]：`auto_vacuum=INCREMENTAL` 只是允许回收，
+    /// 不显式执行 `incremental_vacuum` 就永远不回收。返回本轮实际回收的页数，
+    /// 供维护循环判断要不要再来一轮。
+    ///
+    /// 若建库时没开 incremental auto_vacuum（`PRAGMA auto_vacuum` 返回 0/1），
+    /// 这条 pragma 是无害的空操作——不会报错，也不会阻塞，只是回收不了。
+    fn reclaim_free_pages(&self) -> anyhow::Result<u64> {
+        let conn = self.conn.lock();
+        let before: u64 = conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+        if before == 0 {
+            return Ok(0);
+        }
+        conn.execute_batch(&format!(
+            "PRAGMA incremental_vacuum({INCREMENTAL_VACUUM_PAGES});"
+        ))?;
+        let after: u64 = conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+        Ok(before.saturating_sub(after))
     }
 
     /// 单独清理超期的 `stream_tail` payload，保留其余分片与快照元数据。
@@ -1795,6 +1930,128 @@ mod tests {
 
     /// `stream_tail` 里是模型输出明文，必须比快照库自身的保留期更早清掉，
     /// 且只清尾部——断流的元数据仍要能查。
+    fn payload_count_of_kind(store: &ErrorSnapshotStore, snapshot_id: &str, kind: &str) -> i64 {
+        store
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM error_snapshot_payloads
+                   WHERE snapshot_id = ?1 AND kind = ?2",
+                params![snapshot_id, kind],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// 超期请求体被删、元数据与诊断分片留下；未超期的一动不动。
+    ///
+    /// 请求体是全库体积的大头（线上 client_request 3.5 GB + kiro_request 1.9 GB），
+    /// 但排障价值集中在头两三天。删了之后这条错误在 Admin UI 上仍然看得到、
+    /// 仍然知道它是什么错，只是点不开原始正文。
+    #[test]
+    fn expired_request_bodies_are_dropped_but_metadata_and_diagnostics_stay() {
+        let store = ErrorSnapshotStore::open_in_memory(test_policy()).unwrap();
+        let now = 1_800_000_000i64;
+        let stale_ts = now - 73 * 3600;
+        let fresh_ts = now - 3600;
+
+        let mut stale = sample_write("snap-stale", "t-stale");
+        stale.ts_epoch = stale_ts;
+        store.insert_with_fallback(&stale).unwrap();
+        let mut fresh = sample_write("snap-fresh", "t-fresh");
+        fresh.ts_epoch = fresh_ts;
+        store.insert_with_fallback(&fresh).unwrap();
+
+        assert_eq!(
+            payload_count_of_kind(&store, "snap-stale", "client_request"),
+            1
+        );
+        let deleted = store.prune_expired_request_bodies(now).unwrap();
+
+        assert_eq!(deleted, 1, "只应删掉超过 72 小时的那一条请求体");
+        assert_eq!(
+            payload_count_of_kind(&store, "snap-stale", "client_request"),
+            0
+        );
+        assert_eq!(
+            payload_count_of_kind(&store, "snap-fresh", "client_request"),
+            1,
+            "72 小时内的请求体必须保留，那是排障主要素材"
+        );
+        assert_eq!(
+            payload_count_of_kind(&store, "snap-stale", "internal_error"),
+            1,
+            "诊断分片体积很小，不跟着请求体一起删"
+        );
+
+        let (payload_count, error_type, compressed): (i64, String, i64) = store
+            .conn
+            .lock()
+            .query_row(
+                "SELECT payload_count, error_type, compressed_bytes
+                   FROM error_snapshots WHERE snapshot_id = ?1",
+                params!["snap-stale"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(error_type, "upstream_error", "元数据必须留下");
+        assert_eq!(payload_count, 1, "聚合字段应按剩余分片重算（2 - 1 = 1）");
+        assert!(
+            compressed > 0,
+            "重算后仍应反映剩余分片的体积，而不是清零或保留旧值"
+        );
+    }
+
+    /// 钉住的快照连请求体一起保留——这正是 pinned 存在的意义。
+    ///
+    /// 与 `prune_expired_stream_tails` 的刻意差异：那边删的是模型输出明文，
+    /// 缩短窗口本身就是目的；这边删的是排障素材，运维显式钉住就该留住。
+    #[test]
+    fn pinned_and_exempt_snapshots_keep_their_request_bodies() {
+        let store = ErrorSnapshotStore::open_in_memory(test_policy()).unwrap();
+        let now = 1_800_000_000i64;
+        let stale_ts = now - 100 * 3600;
+
+        let mut pinned = sample_write("snap-pinned", "t-pinned");
+        pinned.ts_epoch = stale_ts;
+        pinned.pinned = true;
+        store.insert_with_fallback(&pinned).unwrap();
+
+        let mut exempt = sample_write("snap-exempt", "t-exempt");
+        exempt.ts_epoch = stale_ts;
+        exempt.retention_exempt = true;
+        store.insert_with_fallback(&exempt).unwrap();
+
+        let deleted = store.prune_expired_request_bodies(now).unwrap();
+
+        assert_eq!(deleted, 0, "pinned / retention_exempt 的请求体一个都不能删");
+        assert_eq!(
+            payload_count_of_kind(&store, "snap-pinned", "client_request"),
+            1
+        );
+        assert_eq!(
+            payload_count_of_kind(&store, "snap-exempt", "client_request"),
+            1
+        );
+    }
+
+    /// 清理可反复执行：第二轮没有候选，返回 0 而不是再删一遍或报错。
+    #[test]
+    fn pruning_request_bodies_is_idempotent() {
+        let store = ErrorSnapshotStore::open_in_memory(test_policy()).unwrap();
+        let now = 1_800_000_000i64;
+        let mut stale = sample_write("snap-stale", "t-stale");
+        stale.ts_epoch = now - 73 * 3600;
+        store.insert_with_fallback(&stale).unwrap();
+
+        assert_eq!(store.prune_expired_request_bodies(now).unwrap(), 1);
+        assert_eq!(
+            store.prune_expired_request_bodies(now).unwrap(),
+            0,
+            "清完后不该再有候选，否则维护循环会被 needs_follow_up 卡住空转"
+        );
+    }
+
     #[test]
     fn stream_tail_expires_before_snapshot_and_keeps_metadata() {
         let store = ErrorSnapshotStore::open_in_memory(test_policy()).unwrap();
