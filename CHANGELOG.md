@@ -6,6 +6,43 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 🔧 修复 — 上游发完 metering 就收尾，不再干等 120 秒把完整响应记成断流
+
+拉了线上 error_snapshots.db 解开 220 条断流现场，**161 条（73%）根本不是断流**：字节
+尾部正是 `{"unit":"credit",…}`（meteringEvent，上游一轮响应的终止事件），之后上游再不
+发任何东西、也不主动关连接。我们干等满 `stream_idle_timeout_secs`（默认 **120 秒**），
+然后把一次**已经完整**的响应记成 `stream_idle_timeout`——链路落成 `interrupted`、
+用量按 `error` 上报、还写一条错误现场。
+
+- 收到 meteringEvent 且所有 content block 均已闭合时，空闲容忍度从 120 秒收到 2 秒；
+  超时即按**正常结束**收尾，不再记错误。
+- 判定要求 metering 与「无未闭合块」**两个**条件同时成立。只看 metering 不够：若上游哪天
+  把它挪到流中间，仅凭它就缩短等待会**截断输出还报成功**——比多等两分钟糟得多。
+- 2 秒而非 0：万一 metering 之后还有尾随帧，2 秒足够到达；且任何新字节都会重置窗口。
+- 空响应会提前走 error 分支返回、块保持未闭合，因此不会被误判收尾——保守方向正确。
+
+顺带：真断流（27%）的字节尾部**每条都停在完整帧边界**（JSON 后紧跟 4 字节 CRC），
+不是帧被截断。断点位置干净，对后续做续写是有利条件。
+
+### ✨ 新增 — `upstream_empty_response` 开始采集断点现场
+
+线上 931 条/天、恢复率仅 1.4%，却**一条现场都没有**——它不在 `stream_tail_worth_storing`
+的名单里。原先排除的理由是「上游什么都没发，尾部必然为空」，线上否定了这个假设：
+"空"到底是真的零字节、还是发了 contextUsage/metering 却没有内容块，光看计数分不出来，
+而这个区别正决定该续写还是该换号重试。现纳入采集，同样受 32 KB 上限约束。
+
+### 🧹 整理 — 公开仓库不再包含真实主机地址与内部草案
+
+- `deploy/test-proxy/` 里的真实测试机地址（IP 与 sslip.io 域名，含两个 nginx 配置的
+  **文件名**）替换为 `TEST-HOST-IP-DASHED` / `TEST_HOST_IP` 占位符，并在文档开头写明
+  照抄前要整体替换。顶层 README 里的同一地址一并换成 `<测试机地址>`。
+- `ACCOUNT_MARKETPLACE_PLATFORM_PLAN.md`（v0.2「等待评审」的内部商业规划草案，含定价 /
+  成本 / 利润口径讨论）取消跟踪并加入 `.gitignore`，与之前处理 `docs/` 同一理由。
+  本地文件保留。
+- `scripts/batch_login/TASK_APIKEY_登录后自动建key.md` 重命名为全 ASCII 文件名——
+  非 ASCII 路径在部分工具链与文件系统上会出问题。
+
+
 ### 🔧 修复 — Drop 库存按区查询，「缺货换欧区」这才真正生效
 
 前两版把换区下单和区域落库都做了，但都在**发出购买请求之后**才起作用。而 Drop 的库存

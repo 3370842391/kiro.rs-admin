@@ -3182,6 +3182,26 @@ async fn prepared_sse_response(prepared: PreparedSseStream) -> Response {
     }
 }
 
+/// 上游发出终止事件（meteringEvent）后，还愿意为收尾多等多久。
+///
+/// 实测上游发完 metering 就不再发任何字节、也不主动关连接，我们只能干等满
+/// `stream_idle_timeout_secs`（默认 **120 秒**）。线上 220 条断流现场里 161 条（73%）
+/// 就是这种：响应其实完整，却白等两分钟、还记一条 `stream_idle_timeout` 错误。
+///
+/// 不设 0 是留一点余量：万一 metering 之后还有尾随帧，2 秒足够到达，
+/// 而且任何新字节都会重置这个窗口，不会截断。
+const UPSTREAM_SETTLED_GRACE_SECS: u64 = 2;
+
+/// 下一次空闲截止时刻。上游已收尾就只给 [`UPSTREAM_SETTLED_GRACE_SECS`]。
+fn next_idle_deadline(settled: bool, idle_timeout_secs: u64) -> TokioInstant {
+    let secs = if settled {
+        UPSTREAM_SETTLED_GRACE_SECS
+    } else {
+        idle_timeout_secs.max(1)
+    };
+    TokioInstant::now() + Duration::from_secs(secs)
+}
+
 fn classify_stream_completion(
     termination: &AttemptTermination,
     has_semantic_output: bool,
@@ -3644,7 +3664,7 @@ async fn read_continuation_round(
                 Some(Ok(chunk)) => {
                     tracer.record_stream_chunk(&chunk);
                     received_bytes += chunk.len() as u64;
-                    idle_deadline = TokioInstant::now() + Duration::from_secs(idle_timeout_secs.max(1));
+                    idle_deadline = next_idle_deadline(ctx.upstream_settled(), idle_timeout_secs);
                     if let Err(error) = decoder.feed(&chunk) {
                         tracing::warn!(%error, continuation_round, "续写流解码缓冲区溢出");
                         tracer.record_protocol_error("sse_state_error", &error.to_string());
@@ -3698,6 +3718,12 @@ async fn read_continuation_round(
                 }
             }
             _ = idle_fut => {
+                // 上游已发出终止事件且所有块都闭合：这是一次**完整**的响应，
+                // 只是对方不关连接。按正常结束收尾——记成 idle timeout 会让一次成功的
+                // 请求变成 `interrupted` + 用量按 error 上报，线上 73% 的断流错误都是它。
+                if ctx.upstream_settled() {
+                    break AttemptTermination::Eof;
+                }
                 tracer.record_protocol_error(
                     "stream_idle_timeout",
                     &format!(
@@ -3833,7 +3859,7 @@ async fn run_realtime_sse_attempts(
                         }
                         tracer.record_stream_chunk(&chunk);
                         received_bytes += chunk.len() as u64;
-                        idle_deadline = TokioInstant::now() + Duration::from_secs(idle_timeout_secs.max(1));
+                        idle_deadline = next_idle_deadline(ctx.upstream_settled(), idle_timeout_secs);
                         if let Err(error) = decoder.feed(&chunk) {
                             tracing::warn!(%error, attempt = attempt_index + 1, "流式解码缓冲区溢出");
                             tracer.record_protocol_error("sse_state_error", &error.to_string());
@@ -3914,6 +3940,12 @@ async fn run_realtime_sse_attempts(
                     }
                 }
                 _ = idle_fut => {
+                    // 上游已发出终止事件且所有块都闭合：这是一次**完整**的响应，
+                    // 只是对方不关连接。按正常结束收尾——记成 idle timeout 会让一次成功的
+                    // 请求变成 `interrupted` + 用量按 error 上报，线上 73% 的断流错误都是它。
+                    if ctx.upstream_settled() {
+                        break AttemptTermination::Eof;
+                    }
                     tracing::warn!(attempt = attempt_index + 1, received_bytes, idle_timeout_secs, "流式空闲超时，主动收尾");
                     tracer.record_protocol_error(
                         "stream_idle_timeout",
@@ -5922,6 +5954,12 @@ async fn run_buffered_sse_attempts(
                     }
                 }
                 _ = idle_fut => {
+                    // 上游已发出终止事件且所有块都闭合：这是一次**完整**的响应，
+                    // 只是对方不关连接。按正常结束收尾——记成 idle timeout 会让一次成功的
+                    // 请求变成 `interrupted` + 用量按 error 上报，线上 73% 的断流错误都是它。
+                    if ctx.upstream_settled() {
+                        break AttemptTermination::Eof;
+                    }
                     tracing::warn!(attempt = attempt_index + 1, received_bytes, idle_timeout_secs, "缓冲流空闲超时，主动收尾");
                     tracer.record_protocol_error(
                         "stream_idle_timeout",
@@ -5938,7 +5976,7 @@ async fn run_buffered_sse_attempts(
                         }
                         tracer.record_stream_chunk(&chunk);
                         received_bytes += chunk.len() as u64;
-                        idle_deadline = TokioInstant::now() + Duration::from_secs(idle_timeout_secs.max(1));
+                        idle_deadline = next_idle_deadline(ctx.upstream_settled(), idle_timeout_secs);
                         if let Err(error) = decoder.feed(&chunk) {
                             tracing::warn!(%error, attempt = attempt_index + 1, "缓冲流解码缓冲区溢出");
                             tracer.record_protocol_error("sse_state_error", &error.to_string());

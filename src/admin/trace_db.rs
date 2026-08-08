@@ -187,6 +187,8 @@ pub mod outcome {
     pub const STREAM_IDLE_TIMEOUT: &str = "stream_idle_timeout";
     /// 客户端主动断开连接
     pub const CLIENT_DISCONNECTED: &str = "client_disconnected";
+    /// 上游 200 但一个助手内容都没给（重试后仍然如此）
+    pub const UPSTREAM_EMPTY_RESPONSE: &str = "upstream_empty_response";
 }
 
 /// 把上游错误体截断到安全长度（按字符边界，避免切碎 UTF-8）

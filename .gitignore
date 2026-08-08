@@ -60,6 +60,11 @@ demo/
 # 这条规则的原意；本地文件未删。
 /docs/
 
+# 内部商业规划草案（v0.2「等待评审」），含定价 / 成本 / 利润口径的讨论。
+# 与 docs/ 同一理由：这是给自己看的草稿，不该躺在公开仓库里。
+# 已用 `git rm --cached` 落实——gitignore 管不到已跟踪文件。
+/ACCOUNT_MARKETPLACE_PLATFORM_PLAN.md
+
 # 批量登录工具的账号清单（账号 + 密码明文）。README 里用 `--input .\accounts.txt`
 # 举例，所以这个文件名很容易被人放在仓库根目录再顺手提交进来——已经发生过一次。
 # 同时忽略 README 提到的另外两种命名。

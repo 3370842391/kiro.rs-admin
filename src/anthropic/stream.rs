@@ -1979,6 +1979,13 @@ pub struct StreamContext {
     pub cache_usage: super::cache_metering::CacheUsage,
     /// meteringEvent 上报的 credit 计费量（上游真实下发）
     pub credits: f64,
+    /// 是否已收到上游的 `meteringEvent`。
+    ///
+    /// 实测它是上游一轮响应的**终止事件**：解开 220 条断流现场，161 条（73%）的字节尾部
+    /// 正是 `{"unit":"credit",…}`，之后上游再不发任何东西、也不关连接，于是我们干等满
+    /// 120 秒空闲超时，把一次**已经完整**的响应记成 `stream_idle_timeout` 错误。
+    /// 见 [`Self::upstream_settled`]。
+    metering_observed: bool,
     /// 复读熔断：最近一次候选来自 text 还是 thinking；通道切换时重置连续计数。
     repeat_guard_last_channel: &'static str,
     /// 复读熔断：最近一次候选。只去掉行尾空白，保留行首缩进参与比较。
@@ -2171,6 +2178,15 @@ impl StreamContext {
         self.state_manager.open_block_type()
     }
 
+    /// 上游这一轮是否已经把话说完：收到了终止事件，且没有未闭合的内容块。
+    ///
+    /// 只看 `metering_observed` 不够。若上游哪天把 metering 挪到流中间，仅凭它就缩短
+    /// 空闲容忍度会**截断输出还报成功**——比多等 120 秒糟糕得多。所以再要求所有 content
+    /// block 都已闭合：那才是助手消息真正的干净边界。两个条件都满足才认为可以收尾。
+    pub fn upstream_settled(&self) -> bool {
+        self.metering_observed && self.open_block_type().is_none()
+    }
+
     /// 供断流路径打点用的稳定标签，不返回 `Option` 以便直接进日志与 trace。
     pub(crate) fn break_block_label(&self) -> &str {
         self.open_block_type().unwrap_or("block_boundary")
@@ -2320,6 +2336,7 @@ impl StreamContext {
             text_block_index: None,
             strip_thinking_leading_newline: false,
             cache_usage: super::cache_metering::CacheUsage::default(),
+            metering_observed: false,
             credits: 0.0,
             repeat_guard_last_channel: "",
             repeat_guard_last_line: String::new(),
@@ -2456,6 +2473,7 @@ impl StreamContext {
             }
             Event::Metering(metering) => {
                 // 上游 meteringEvent 只下发 credit；token / cache 字段不存在。
+                self.metering_observed = true;
                 self.credits += metering.usage;
                 tracing::debug!("metering credits +{:.6}", metering.usage);
                 Vec::new()
@@ -4222,6 +4240,10 @@ impl BufferedStreamContext {
 
     pub fn repetition_guard_tripped(&self) -> bool {
         self.inner.repetition_guard_tripped()
+    }
+
+    pub fn upstream_settled(&self) -> bool {
+        self.inner.upstream_settled()
     }
 
     #[cfg(test)]
@@ -9201,6 +9223,70 @@ mod tests {
             manager.open_block_type(),
             Some("tool_use"),
             "断在 tool_use 中必须能被识别出来——这是不可续写的情形"
+        );
+    }
+
+    /// `upstream_settled` 必须同时满足「收到终止事件」与「没有未闭合的块」。
+    ///
+    /// 它决定要不要把空闲容忍度从 120 秒收到 2 秒并按正常结束收尾。判早了会**截断输出
+    /// 还报成功**——比多等两分钟糟得多，所以两个条件缺一不可，这条测试就是钉住这点。
+    #[test]
+    fn upstream_settled_requires_both_metering_and_a_closed_block() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-5",
+            10,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        assert!(!ctx.upstream_settled(), "什么都没发生时不能认为已收尾");
+
+        // 正文还在写：即使 metering 先到（假想的上游变更），也绝不能提前收尾。
+        let mut chunk = crate::kiro::model::events::AssistantResponseEvent::default();
+        chunk.content = "hello".into();
+        let _ = ctx.process_kiro_event(&Event::AssistantResponse(chunk));
+        let _ = ctx.process_kiro_event(&Event::Metering(
+            crate::kiro::model::events::MeteringEvent { usage: 0.25 },
+        ));
+        assert_eq!(ctx.open_block_type(), Some("text"));
+        assert!(
+            !ctx.upstream_settled(),
+            "块还开着就收尾会截断正文——metering 单独一项不足以判定"
+        );
+
+        // 块闭合后才算真的说完了。
+        let _ = ctx.generate_final_events();
+        assert_eq!(ctx.open_block_type(), None);
+        assert!(ctx.upstream_settled());
+    }
+
+    /// 没收到 metering 就永远不缩短等待：那说明上游还没走到终止事件。
+    #[test]
+    fn upstream_settled_stays_false_without_metering() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-5",
+            10,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        // 要有正文，才能走到正常收尾路径把块关掉；空响应会提前走 error 分支返回。
+        let mut chunk = crate::kiro::model::events::AssistantResponseEvent::default();
+        chunk.content = "hello".into();
+        let _ = ctx.process_kiro_event(&Event::AssistantResponse(chunk));
+        let _ = ctx.process_kiro_event(&Event::ContextUsage(
+            crate::kiro::model::events::ContextUsageEvent {
+                context_usage_percentage: 12.5,
+            },
+        ));
+        let _ = ctx.generate_final_events();
+
+        assert_eq!(ctx.open_block_type(), None, "正常收尾后块必须全部闭合");
+        assert!(
+            !ctx.upstream_settled(),
+            "块闭合但没收到终止事件，仍要按完整空闲超时等——这才是真断流"
         );
     }
 

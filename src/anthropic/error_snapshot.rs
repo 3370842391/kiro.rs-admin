@@ -430,10 +430,18 @@ impl StreamTail {
 ///
 /// 其余类型——尤其占了 3.2 GB 的 `client_disconnected`——存原始尾部只是把对话正文
 /// 落盘，没有对应收益。
+///
+/// `upstream_empty_response` 是后加的：线上 931 条/天、恢复率仅 1.4%，却**一条现场都
+/// 没有**，因为它不在这张表里。没有字节尾部就只能猜「上游到底发了什么才算空」——
+/// 上一次排查断流就是卡在这里（非 UTF-8 时只存摘要，AWS 二进制帧永远存不下来），
+/// 补上采集后一次就定位了。它的尾部同样受 32 KB 上限约束，量级可控。
 fn stream_tail_worth_storing(error_type: &str) -> bool {
     matches!(
         error_type,
-        outcome::STREAM_IDLE_TIMEOUT | outcome::STREAM_READ_ERROR | outcome::STREAM_INTERRUPTED
+        outcome::STREAM_IDLE_TIMEOUT
+            | outcome::STREAM_READ_ERROR
+            | outcome::STREAM_INTERRUPTED
+            | outcome::UPSTREAM_EMPTY_RESPONSE
     )
 }
 
@@ -1503,13 +1511,18 @@ mod tests {
     }
 
     #[test]
-    fn stream_tail_only_stored_for_stream_break_errors() {
+    fn stream_tail_only_stored_for_errors_whose_bytes_explain_something() {
         assert!(stream_tail_worth_storing(outcome::STREAM_IDLE_TIMEOUT));
         assert!(stream_tail_worth_storing(outcome::STREAM_READ_ERROR));
         assert!(stream_tail_worth_storing(outcome::STREAM_INTERRUPTED));
-        // 客户端主动断开不存尾部：那只是把对话正文落盘，没有对应收益。
+        // 原先刻意排除 upstream_empty_response，理由是「上游什么都没发，尾部必然为空」。
+        // 线上否定了这个假设：931 条/天、恢复率仅 1.4%，而"空"到底是真的零字节、
+        // 还是发了 contextUsage/metering 却没有内容块，光看计数分不出来——正是这个区别
+        // 决定该续写还是该换号重试。所以改为采集，同样受 32 KB 上限约束。
+        assert!(stream_tail_worth_storing(outcome::UPSTREAM_EMPTY_RESPONSE));
+        // 客户端主动断开仍不存尾部：那只是把对话正文落盘，没有对应收益（曾占 3.2 GB）。
         assert!(!stream_tail_worth_storing(outcome::CLIENT_DISCONNECTED));
-        assert!(!stream_tail_worth_storing("upstream_empty_response"));
+        assert!(!stream_tail_worth_storing(outcome::BAD_REQUEST));
     }
 
     #[test]

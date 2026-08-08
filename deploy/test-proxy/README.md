@@ -1,9 +1,13 @@
 # 8991 HTTPS 测试入口
 
+> **占位符说明**：文中的 `TEST-HOST-IP-DASHED` / `TEST_HOST_IP` 是测试机地址的占位符
+> （sslip.io 的域名把 IP 的点写成短横线）。照抄前先整体替换成你自己的地址——
+> 本仓库是公开的，不把真实主机地址写进来。
+
 公开测试实例通过以下入口访问：
 
-- API Base URL：`https://rs-test.43-225-196-10.sslip.io`
-- 管理端：`https://rs-test.43-225-196-10.sslip.io/admin`
+- API Base URL：`https://rs-test.TEST-HOST-IP-DASHED.sslip.io`
+- 管理端：`https://rs-test.TEST-HOST-IP-DASHED.sslip.io/admin`
 - 后端：`http://127.0.0.1:8991`
 
 该入口只代理隔离的 `kiro-rs-test` 容器，不修改生产 `kiro-rs-admin`（8990）。
@@ -25,7 +29,7 @@
 1. 确认域名解析：
 
 ```bash
-getent ahostsv4 rs-test.43-225-196-10.sslip.io
+getent ahostsv4 rs-test.TEST-HOST-IP-DASHED.sslip.io
 ```
 
 2. 创建 ACME webroot，并先部署仅包含 80 端口和 challenge location 的临时 vhost。bootstrap 配置对普通 HTTP 请求返回 404，不允许在证书签发窗口通过明文入口调用 API。
@@ -34,15 +38,15 @@ getent ahostsv4 rs-test.43-225-196-10.sslip.io
 
 ```bash
 certbot certonly --webroot \
-  --webroot-path /www/wwwroot/rs-test.43-225-196-10.sslip.io \
-  --domain rs-test.43-225-196-10.sslip.io \
+  --webroot-path /www/wwwroot/rs-test.TEST-HOST-IP-DASHED.sslip.io \
+  --domain rs-test.TEST-HOST-IP-DASHED.sslip.io \
   --non-interactive --agree-tos --register-unsafely-without-email
 ```
 
-4. 把 `rs-test.43-225-196-10.sslip.io.conf` 复制到：
+4. 把 `rs-test.TEST-HOST-IP-DASHED.sslip.io.conf` 复制到：
 
 ```text
-/www/server/panel/vhost/nginx/rs-test.43-225-196-10.sslip.io.conf
+/www/server/panel/vhost/nginx/rs-test.TEST-HOST-IP-DASHED.sslip.io.conf
 ```
 
 5. 校验并热加载：
@@ -69,9 +73,9 @@ certbot renew --dry-run
 ## 验证
 
 ```bash
-curl -fsS https://rs-test.43-225-196-10.sslip.io/admin >/dev/null
+curl -fsS https://rs-test.TEST-HOST-IP-DASHED.sslip.io/admin >/dev/null
 curl -sS -o /dev/null -w '%{http_code}\n' \
-  https://rs-test.43-225-196-10.sslip.io/v1/models
+  https://rs-test.TEST-HOST-IP-DASHED.sslip.io/v1/models
 ```
 
 预期管理端为 200，未认证模型列表为 401。认证测试使用服务器测试配置中的系统 Key，但不得在命令输出或日志中打印该 Key。
@@ -84,7 +88,7 @@ curl -fsS -N \
   -H 'anthropic-version: 2023-06-01' \
   -H 'content-type: application/json' \
   --data '{"model":"auto","max_tokens":32,"stream":true,"messages":[{"role":"user","content":"Reply with exactly STREAM_OK"}]}' \
-  https://rs-test.43-225-196-10.sslip.io/v1/messages
+  https://rs-test.TEST-HOST-IP-DASHED.sslip.io/v1/messages
 unset TEST_API_KEY
 ```
 
@@ -97,7 +101,7 @@ unset TEST_API_KEY
 部署前必须为原 vhost（如果存在）创建不会被 `*.conf` include 加载、且带 UTC 时间戳的备份：
 
 ```bash
-vhost=/www/server/panel/vhost/nginx/rs-test.43-225-196-10.sslip.io.conf
+vhost=/www/server/panel/vhost/nginx/rs-test.TEST-HOST-IP-DASHED.sslip.io.conf
 cp -a "${vhost}" "${vhost}.bak.$(date -u +%Y%m%dT%H%M%SZ)"
 ```
 
