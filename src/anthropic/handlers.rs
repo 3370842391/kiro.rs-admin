@@ -3188,9 +3188,11 @@ async fn prepared_sse_response(prepared: PreparedSseStream) -> Response {
 /// `stream_idle_timeout_secs`（默认 **120 秒**）。线上 220 条断流现场里 161 条（73%）
 /// 就是这种：响应其实完整，却白等两分钟、还记一条 `stream_idle_timeout` 错误。
 ///
-/// 不设 0 是留一点余量：万一 metering 之后还有尾随帧，2 秒足够到达，
-/// 而且任何新字节都会重置这个窗口，不会截断。
-const UPSTREAM_SETTLED_GRACE_SECS: u64 = 2;
+/// 取 5 秒而非更短：`upstream_settled` 只看 metering 是否到达（它不能再要求"块已闭合"，
+/// 原因见该函数文档），少了一层结构性护栏，这里用时间窗口补回来一点——万一 metering
+/// 之后还有尾随帧，5 秒足够到达，且任何新字节都会重置窗口，不会截断。
+/// 相对 120 秒仍然省掉 96%。
+const UPSTREAM_SETTLED_GRACE_SECS: u64 = 5;
 
 /// 下一次空闲截止时刻。上游已收尾就只给 [`UPSTREAM_SETTLED_GRACE_SECS`]。
 fn next_idle_deadline(settled: bool, idle_timeout_secs: u64) -> TokioInstant {
@@ -3718,9 +3720,12 @@ async fn read_continuation_round(
                 }
             }
             _ = idle_fut => {
-                // 上游已发出终止事件且所有块都闭合：这是一次**完整**的响应，
-                // 只是对方不关连接。按正常结束收尾——记成 idle timeout 会让一次成功的
-                // 请求变成 `interrupted` + 用量按 error 上报，线上 73% 的断流错误都是它。
+                // 上游已发出终止事件（meteringEvent）：这是一次**完整**的响应，只是对方不关连接。
+                // 按正常结束收尾——记成 idle timeout 会让一次成功的请求变成 `interrupted`
+                // + 用量按 error 上报，线上 73% 的断流错误都是它。
+                //
+                // 刻意**不**再要求「所有块已闭合」：Kiro 的文本块只在我们自己收尾时才关，
+                // 上游从不发对应事件，加上那个条件这条分支一次都走不到（见 `upstream_settled`）。
                 if ctx.upstream_settled() {
                     break AttemptTermination::Eof;
                 }
@@ -3940,9 +3945,12 @@ async fn run_realtime_sse_attempts(
                     }
                 }
                 _ = idle_fut => {
-                    // 上游已发出终止事件且所有块都闭合：这是一次**完整**的响应，
-                    // 只是对方不关连接。按正常结束收尾——记成 idle timeout 会让一次成功的
-                    // 请求变成 `interrupted` + 用量按 error 上报，线上 73% 的断流错误都是它。
+                    // 上游已发出终止事件（meteringEvent）：这是一次**完整**的响应，只是对方不关连接。
+                    // 按正常结束收尾——记成 idle timeout 会让一次成功的请求变成 `interrupted`
+                    // + 用量按 error 上报，线上 73% 的断流错误都是它。
+                    //
+                    // 刻意**不**再要求「所有块已闭合」：Kiro 的文本块只在我们自己收尾时才关，
+                    // 上游从不发对应事件，加上那个条件这条分支一次都走不到（见 `upstream_settled`）。
                     if ctx.upstream_settled() {
                         break AttemptTermination::Eof;
                     }
@@ -5954,9 +5962,12 @@ async fn run_buffered_sse_attempts(
                     }
                 }
                 _ = idle_fut => {
-                    // 上游已发出终止事件且所有块都闭合：这是一次**完整**的响应，
-                    // 只是对方不关连接。按正常结束收尾——记成 idle timeout 会让一次成功的
-                    // 请求变成 `interrupted` + 用量按 error 上报，线上 73% 的断流错误都是它。
+                    // 上游已发出终止事件（meteringEvent）：这是一次**完整**的响应，只是对方不关连接。
+                    // 按正常结束收尾——记成 idle timeout 会让一次成功的请求变成 `interrupted`
+                    // + 用量按 error 上报，线上 73% 的断流错误都是它。
+                    //
+                    // 刻意**不**再要求「所有块已闭合」：Kiro 的文本块只在我们自己收尾时才关，
+                    // 上游从不发对应事件，加上那个条件这条分支一次都走不到（见 `upstream_settled`）。
                     if ctx.upstream_settled() {
                         break AttemptTermination::Eof;
                     }

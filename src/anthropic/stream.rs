@@ -2178,13 +2178,19 @@ impl StreamContext {
         self.state_manager.open_block_type()
     }
 
-    /// 上游这一轮是否已经把话说完：收到了终止事件，且没有未闭合的内容块。
+    /// 上游这一轮是否已经把话说完（收到了终止事件 `meteringEvent`）。
     ///
-    /// 只看 `metering_observed` 不够。若上游哪天把 metering 挪到流中间，仅凭它就缩短
-    /// 空闲容忍度会**截断输出还报成功**——比多等 120 秒糟糕得多。所以再要求所有 content
-    /// block 都已闭合：那才是助手消息真正的干净边界。两个条件都满足才认为可以收尾。
+    /// **不能再加「所有 content block 已闭合」这个条件**——那是本函数第一版的写法，
+    /// 结果是整个修复静默失效。Kiro 的文本块只在我们自己 `generate_final_events` 时才
+    /// 闭合，上游从不发对应的结束事件；所以在流循环里、idle 触发的那一刻，text 块**必然**
+    /// 还开着，条件永远不成立，那条分支一次都走不到。
+    ///
+    /// 换来的是失去一层结构性护栏：万一上游哪天把 metering 挪到流中间且随后停顿超过
+    /// [`UPSTREAM_SETTLED_GRACE_SECS`]，我们会把截断的输出当成完整响应交付。
+    /// 依据是 metering 确为终止事件——线上 220 条断流现场里，161 条的字节尾部正是它，
+    /// 且每条链路的 `meteringEventCount` 都是 1。宽限期也相应放宽，见该常量。
     pub fn upstream_settled(&self) -> bool {
-        self.metering_observed && self.open_block_type().is_none()
+        self.metering_observed
     }
 
     /// 供断流路径打点用的稳定标签，不返回 `Option` 以便直接进日志与 trace。
@@ -2269,6 +2275,11 @@ impl StreamContext {
         self.terminal_protocol_error_type = None;
         self.terminal_attempt_failure = None;
         self.attempt_observation = super::tool_attempt::AttemptObservation::default();
+        // 终止事件是**每轮**的：续写会另发一次上游请求，新的一轮要重新等它自己的
+        // meteringEvent。不清掉的话第 2 轮开局就带着上一轮的标记，
+        // 于是整轮都只有 5 秒空闲容忍度，一次真实停顿就会被当成正常收尾而静默截断。
+        // `credits` 反过来要跨轮累加（那是整条链路的计费量），所以只重置这一个。
+        self.metering_observed = false;
     }
 
     /// 返回工具 JSON 的 typed 终态，供 handler 精确区分可重试的 EOF 半截与其他错误。
@@ -9226,12 +9237,14 @@ mod tests {
         );
     }
 
-    /// `upstream_settled` 必须同时满足「收到终止事件」与「没有未闭合的块」。
+    /// **正文块还开着时也必须判定为已收尾。**
     ///
-    /// 它决定要不要把空闲容忍度从 120 秒收到 2 秒并按正常结束收尾。判早了会**截断输出
-    /// 还报成功**——比多等两分钟糟得多，所以两个条件缺一不可，这条测试就是钉住这点。
+    /// 这条测试的存在是因为第一版把条件写成「metering 且无未闭合块」，导致整个修复静默
+    /// 失效：Kiro 的文本块只在我们自己收尾时才闭合，上游从不发对应结束事件，所以流循环里
+    /// idle 触发的那一刻 text 块**必然**还开着，那条分支一次都走不到。
+    /// 线上真实形态就是「正文块开着 + metering 已到 + 上游静默」，这里照原样复现。
     #[test]
-    fn upstream_settled_requires_both_metering_and_a_closed_block() {
+    fn upstream_settled_holds_while_the_text_block_is_still_open() {
         let mut ctx = StreamContext::new_with_thinking(
             "claude-opus-5",
             10,
@@ -9249,16 +9262,52 @@ mod tests {
         let _ = ctx.process_kiro_event(&Event::Metering(
             crate::kiro::model::events::MeteringEvent { usage: 0.25 },
         ));
-        assert_eq!(ctx.open_block_type(), Some("text"));
+        assert_eq!(
+            ctx.open_block_type(),
+            Some("text"),
+            "上游不发结束事件，正文块此刻必然还开着——这正是线上的形态"
+        );
         assert!(
-            !ctx.upstream_settled(),
-            "块还开着就收尾会截断正文——metering 单独一项不足以判定"
+            ctx.upstream_settled(),
+            "块开着也要判定已收尾，否则这条分支在真实流里一次都走不到"
         );
 
-        // 块闭合后才算真的说完了。
+        // 收尾之后依然成立，不会因为块闭合而翻转。
         let _ = ctx.generate_final_events();
         assert_eq!(ctx.open_block_type(), None);
         assert!(ctx.upstream_settled());
+    }
+
+    /// 终止事件是**每轮**的：续写另发一次上游请求，新一轮要重新等它自己的 metering。
+    ///
+    /// 不重置的话，第 2 轮开局就带着上一轮的标记，整轮只有 5 秒空闲容忍度，
+    /// 一次真实停顿就会被当成正常收尾——静默截断，还报成功。
+    #[test]
+    fn continuation_rounds_wait_for_their_own_metering_event() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-5",
+            10,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_kiro_event(&Event::Metering(
+            crate::kiro::model::events::MeteringEvent { usage: 0.25 },
+        ));
+        assert!(ctx.upstream_settled());
+
+        ctx.prepare_for_continuation();
+        assert!(
+            !ctx.upstream_settled(),
+            "续写新一轮必须重新等自己的终止事件，不能继承上一轮的"
+        );
+
+        // credits 反过来要跨轮累加——那是整条链路的计费量，不能被一起清掉。
+        assert!(
+            ctx.credits > 0.0,
+            "重置的只有终止标记，累计 credit 必须跨续写保留"
+        );
     }
 
     /// 没收到 metering 就永远不缩短等待：那说明上游还没走到终止事件。
@@ -9283,10 +9332,9 @@ mod tests {
         ));
         let _ = ctx.generate_final_events();
 
-        assert_eq!(ctx.open_block_type(), None, "正常收尾后块必须全部闭合");
         assert!(
             !ctx.upstream_settled(),
-            "块闭合但没收到终止事件，仍要按完整空闲超时等——这才是真断流"
+            "没收到终止事件就要按完整空闲超时等——那才是真断流"
         );
     }
 
