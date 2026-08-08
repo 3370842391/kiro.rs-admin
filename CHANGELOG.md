@@ -15,7 +15,16 @@ project adheres to [Semantic Versioning](https://semver.org/).
   建库时开了 `PRAGMA auto_vacuum=INCREMENTAL`，但那只是**允许**回收，必须显式执行
   `PRAGMA incremental_vacuum` 才真的还给文件系统——而这条从没被调用过。
   现每轮维护回收一批（32 MiB，让单轮锁持有落在几十毫秒），靠 `needs_follow_up`
-  推进，线上那 3.6 GB 约半分钟能啃完。
+  推进，线上那 3.6 GB 约半分钟能啃完。回收后补一次 `wal_checkpoint(PASSIVE)`——
+  库跑在 WAL 下，`incremental_vacuum` 先把收缩写进 WAL，不 checkpoint 主文件不会动。
+  用 PASSIVE 而非 TRUNCATE：遇到活跃读者直接放弃、绝不阻塞维护线程。
+
+  实现上有个坑值得记下：`PRAGMA incremental_vacuum(N)` 的 N 是**上限**，
+  该语句每 step 只释放一页，必须 step 到底。用 `execute_batch` 只 step 一次——
+  实测每轮就回收 1 页（4 KiB），线上那 3.6 GB 要跑 87 万轮、约 61 小时，
+  其间 `needs_follow_up` 恒为真把维护循环钉在 250 ms 空转，而日志一直显示"回收成功"。
+  新增的 `reclaiming_free_pages_actually_shrinks_the_file` 用真实文件断言**字节数**
+  下降且回收收敛，正是这条测试逮到的。
 - **7 天窗口内的请求体本身就有 5.5 GB**：`client_request` 3.5 GB + `kiro_request`
   1.9 GB，其余五类加起来不到 90 MB。容量清理的触发线是 `maxStorageGb` 的 70%
   （20 GB × 70% = 14 GB），9.65 GB 根本没到线，所以从没跑过。

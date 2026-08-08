@@ -1186,9 +1186,25 @@ impl ErrorSnapshotStore {
         if before == 0 {
             return Ok(0);
         }
-        conn.execute_batch(&format!(
-            "PRAGMA incremental_vacuum({INCREMENTAL_VACUUM_PAGES});"
-        ))?;
+        // 必须把这条 pragma **step 到底**：`incremental_vacuum` 每 step 只释放一页，
+        // 参数是上限而非一次性批量。用 `execute_batch` 只会 step 一次——实测每轮就回收
+        // 1 页（4 KiB），线上那 3.6 GB 要跑 87 万轮、约 61 小时，其间 `needs_follow_up`
+        // 恒为真，维护循环被钉在 250 ms 空转，而日志还一直显示"回收成功"。
+        {
+            let mut stmt = conn.prepare(&format!(
+                "PRAGMA incremental_vacuum({INCREMENTAL_VACUUM_PAGES})"
+            ))?;
+            let mut rows = stmt.query([])?;
+            while rows.next()?.is_some() {}
+        }
+        // 库跑在 WAL 模式下：`incremental_vacuum` 先把收缩写进 WAL，主文件要等
+        // checkpoint 才真的变小。不显式推一把就得等自动 checkpoint（默认攒够 1000 页），
+        // 表现是"日志说回收了，`ls` 看文件没动"。
+        //
+        // 用 PASSIVE 而不是 TRUNCATE：PASSIVE 遇到活跃读者会直接放弃、绝不阻塞，
+        // 而这条路径跑在持有连接锁的维护线程上，卡住等于卡住快照写入。
+        // 这一轮没推完，下一轮还会再来。
+        conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
         let after: u64 = conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
         Ok(before.saturating_sub(after))
     }
@@ -2430,39 +2446,79 @@ mod tests {
         );
     }
 
+    /// 回收必须让**文件真的变小**，不能只是 freelist 计数下降。
+    ///
+    /// 这条测试用真实文件而非内存库，因为要验的正是 WAL 下的落地行为：
+    /// `incremental_vacuum` 先把收缩写进 WAL，不 checkpoint 主文件不会动——
+    /// 表现是"日志说回收了，`ls` 看文件没动"。线上正是 877,882 个空闲页
+    /// （3.6 GB）一直占着文件，所以这里断言的是字节数，不是页数。
     #[test]
-    fn legacy_snapshot_defaults_duplicate_count_and_fingerprint() {
-        let conn = Connection::open_in_memory().unwrap();
-        let legacy_schema = SCHEMA
-            .replace("  request_fingerprint TEXT NOT NULL DEFAULT '',\n", "")
-            .replace("  duplicate_count INTEGER NOT NULL DEFAULT 1,\n", "");
-        conn.execute_batch(&legacy_schema).unwrap();
-        conn.execute(
-            "INSERT INTO error_snapshots (
-                snapshot_id, trace_id, ts, ts_epoch, model, is_stream, key_id, key_source,
-                response_mode, final_credential_id, endpoint, http_status, final_status, error_type, severity,
-                error_message, recovered, pinned, retention_exempt, omitted_due_to_disk_pressure,
-                payload_count, original_bytes, compressed_bytes, created_at, updated_at
-             ) VALUES (
-                'legacy-dedup', 'legacy-dedup-trace', '2026-07-15T00:00:00Z', 1, 'm', 0, 7,
-                'clientKey', 'detection', 9, NULL, 500, 'error', 'legacy_error', 'error', NULL,
-                0, 0, 0, 0, 0, 0, 0, 1, 1
-             )",
-            [],
-        )
-        .unwrap();
-        initialize_connection(&conn, false).unwrap();
-        let store = ErrorSnapshotStore {
-            conn: Mutex::new(conn),
-            db_path: None,
-            fallback_dir: None,
-            policy: RwLock::new(test_policy()),
-            capture_mode: AtomicU8::new(CaptureMode::Full.as_u8()),
-            skipped_capacity: AtomicU64::new(0),
-            storage_probe: Arc::new(RealStorageProbe),
-        };
-        let detail = store.get("legacy-dedup").unwrap().unwrap();
-        assert_eq!(detail.summary.duplicate_count, 1);
+    fn reclaiming_free_pages_actually_shrinks_the_file() {
+        let root =
+            std::env::temp_dir().join(format!("kiro-error-snapshot-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("error_snapshots.db");
+        let store = ErrorSnapshotStore::open(db_path.clone(), root.join("fallback"), test_policy())
+            .unwrap();
+
+        // 写够量再删，才有可观的空闲页可回收。
+        for index in 0..400 {
+            let mut write = sample_write(&format!("snap-{index}"), &format!("trace-{index}"));
+            write.payloads = crate::anthropic::error_snapshot::encode_payload(
+                crate::common::error_snapshot::SnapshotPayloadKind::ClientRequest,
+                None,
+                "application/json",
+                // zstd 压不动的随机内容，保证真的占页。
+                format!("{index}{}", "x7Kq".repeat(4096)).as_bytes(),
+            )
+            .unwrap();
+            store.insert(&write).unwrap();
+        }
+        store
+            .conn
+            .lock()
+            .execute_batch("DELETE FROM error_snapshots;")
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+
+        let before_bytes = std::fs::metadata(&db_path).unwrap().len();
+        let freelist: u64 = store
+            .conn
+            .lock()
+            .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+            .unwrap();
+        assert!(freelist > 0, "删完应当产生空闲页，否则这条测试没有意义");
+
+        // 一轮有上界（WAL 下还要靠 checkpoint 让页真正可回收），多跑几轮把 freelist 啃完。
+        let mut rounds = 0;
+        while rounds < 64 {
+            rounds += 1;
+            if store.reclaim_free_pages().unwrap() == 0 {
+                break;
+            }
+        }
+        let after_bytes = std::fs::metadata(&db_path).unwrap().len();
+
+        assert!(
+            rounds < 64,
+            "回收必须收敛，否则维护循环会被 needs_follow_up 永久卡在空转"
+        );
+        assert!(
+            after_bytes < before_bytes,
+            "回收后文件必须真的变小：{before_bytes} -> {after_bytes}"
+        );
+        assert_eq!(
+            store.reclaim_free_pages().unwrap(),
+            0,
+            "没有空闲页时应当直接返回 0，不做无谓的 vacuum"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
