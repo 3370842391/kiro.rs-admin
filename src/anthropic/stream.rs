@@ -1929,6 +1929,11 @@ pub struct StreamContext {
     context_window_size: i32,
     /// 见 [`Self::set_context_window_signal_threshold_pct`]。默认 85%。
     context_window_signal_threshold_pct: f64,
+    /// 本轮是否已下发过 `model_context_window_exceeded`。
+    ///
+    /// 语境越过阈值后便不再回落，若不做去重每轮都会重复下发压缩信号——
+    /// 客户端频繁 compact 却没东西可压，等于空转。标记在续写时重置。
+    context_window_exceeded_signaled: bool,
     /// 消息 ID
     pub message_id: String,
     /// 客户端可见输入与 Kiro 整体上下文占用的双轨计量。
@@ -2275,6 +2280,9 @@ impl StreamContext {
         self.terminal_protocol_error_type = None;
         self.terminal_attempt_failure = None;
         self.attempt_observation = super::tool_attempt::AttemptObservation::default();
+        // 压缩信号同样每轮独立判定：续写另发一次上游请求，context 可能已回落，
+        // 下一轮可能不再越线，不能带着上一轮的标记。
+        self.context_window_exceeded_signaled = false;
         // 终止事件是**每轮**的：续写会另发一次上游请求，新的一轮要重新等它自己的
         // meteringEvent。不清掉的话第 2 轮开局就带着上一轮的标记，
         // 于是整轮都只有 5 秒空闲容忍度，一次真实停顿就会被当成正常收尾而静默截断。
@@ -2326,6 +2334,7 @@ impl StreamContext {
             model,
             context_window_size,
             context_window_signal_threshold_pct: 85.0,
+            context_window_exceeded_signaled: false,
             message_id: format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
             input_usage: super::usage::InputTokenUsage::new(input_tokens),
             output_tokens: 0,
@@ -2467,7 +2476,9 @@ impl StreamContext {
                 // 扣费）零计费影响。
                 if context_usage.context_usage_percentage
                     >= self.context_window_signal_threshold_pct
+                    && !self.context_window_exceeded_signaled
                 {
+                    self.context_window_exceeded_signaled = true;
                     self.state_manager
                         .set_stop_reason("model_context_window_exceeded");
                 }
