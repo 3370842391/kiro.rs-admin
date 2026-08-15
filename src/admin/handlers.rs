@@ -342,6 +342,7 @@ pub async fn batch_import_credentials(
         .filter(|v| !v.is_empty())
         .map(ToOwned::to_owned);
     let rpm_override = req.rpm_limit;
+    let max_concurrency_override = req.max_concurrency;
     let credentials = req.credentials;
     let total = credentials.len();
 
@@ -360,6 +361,9 @@ pub async fn batch_import_credentials(
                     }
                     if let Some(rpm_limit) = rpm_override {
                         cred_req.rpm_limit = rpm_limit;
+                    }
+                    if let Some(max_concurrency) = max_concurrency_override {
+                        cred_req.max_concurrency = Some(max_concurrency);
                     }
                     let result = service.import_one_credential(cred_req, verify).await;
                     (index, result)

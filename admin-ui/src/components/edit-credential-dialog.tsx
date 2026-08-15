@@ -47,6 +47,7 @@ export function EditCredentialDialog({
   const [groups, setGroups] = useState<string[]>(credential.groups ?? [])
   const [sourceChannel, setSourceChannel] = useState(credential.sourceChannel ?? '')
   const [rpmLimit, setRpmLimit] = useState(String(credential.rpmLimit ?? 10))
+  const [maxConcurrency, setMaxConcurrency] = useState(String(credential.maxConcurrency ?? 0))
   const [manualMode, setManualMode] = useState(false)
 
   const groupOptions = useGroupOptions()
@@ -69,6 +70,7 @@ export function EditCredentialDialog({
       setGroups(credential.groups ?? [])
       setSourceChannel(credential.sourceChannel ?? '')
       setRpmLimit(String(credential.rpmLimit ?? 10))
+      setMaxConcurrency(String(credential.maxConcurrency ?? 0))
       setManualMode(false)
     }
   }, [open, credential])
@@ -97,6 +99,7 @@ export function EditCredentialDialog({
           groups: groups,
           sourceChannel: sourceChannel,
           rpmLimit: rpmLimit.trim() === '' ? undefined : Number(rpmLimit),
+          maxConcurrency: maxConcurrency.trim() === '' ? undefined : Number(maxConcurrency),
         },
       },
       {
@@ -253,6 +256,25 @@ export function EditCredentialDialog({
               />
               <p className="text-xs text-muted-foreground">
                 滑动窗口每分钟最多请求数。默认 10；填 0 表示不限速。
+              </p>
+            </div>
+
+            {/* 并发上限 */}
+            <div className="space-y-2">
+              <label htmlFor="maxConcurrency" className="text-sm font-medium">
+                并发上限
+              </label>
+              <Input
+                id="maxConcurrency"
+                type="number"
+                min={0}
+                placeholder="0"
+                value={maxConcurrency}
+                onChange={(e) => setMaxConcurrency(e.target.value)}
+                disabled={isPending}
+              />
+              <p className="text-xs text-muted-foreground">
+                该账号最多同时 in-flight 的请求数。0 表示不限并发；与 RPM 限速互补，防止瞬时并发打爆账号触发风控。
               </p>
             </div>
 

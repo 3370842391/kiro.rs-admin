@@ -118,6 +118,14 @@ pub struct KiroCredentials {
     #[serde(default = "default_rpm_limit")]
     pub rpm_limit: u32,
 
+    /// 每账号最大并发（in-flight 上限）。默认 0 = 不限并发。
+    ///
+    /// 大于 0 时，该账号同时 in-flight 的请求数达到该值即不再被调度选中，作为 RPM
+    /// 限速之外的补充防风控闸（只限瞬时并发、不限请求速率）。0 序列化时跳过（与
+    /// `priority` 同范式），反序列化缺省回 0。
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub max_concurrency: u32,
+
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -308,6 +316,7 @@ impl std::fmt::Debug for KiroCredentials {
             .field("scopes", &self.scopes)
             .field("priority", &self.priority)
             .field("rpm_limit", &self.rpm_limit)
+            .field("max_concurrency", &self.max_concurrency)
             .field("region", &self.region)
             .field("auth_region", &self.auth_region)
             .field("api_region", &self.api_region)
@@ -1047,7 +1056,6 @@ mod tests {
 
     #[test]
     fn test_rpm_limit_serde_roundtrip() {
-        // 1. 缺 rpmLimit 键的旧数据 → 回退到默认 10
         let legacy = r#"{ "accessToken": "t", "authMethod": "social" }"#;
         let c = KiroCredentials::from_json(legacy).unwrap();
         assert_eq!(c.rpm_limit, 10, "缺字段应回退默认 10");
@@ -1067,6 +1075,32 @@ mod tests {
         // 3. 自定义值往返
         let five = r#"{ "accessToken": "t", "rpmLimit": 5 }"#;
         assert_eq!(KiroCredentials::from_json(five).unwrap().rpm_limit, 5);
+    }
+
+    #[test]
+    fn test_max_concurrency_serde_roundtrip() {
+        // 缺字段回退默认 0（不限并发）
+        let legacy = r#"{ "accessToken": "t", "authMethod": "social" }"#;
+        assert_eq!(
+            KiroCredentials::from_json(legacy).unwrap().max_concurrency,
+            0
+        );
+
+        // 显式 0 必须原样保留
+        let zero = r#"{ "accessToken": "t", "maxConcurrency": 0 }"#;
+        let c0 = KiroCredentials::from_json(zero).unwrap();
+        assert_eq!(c0.max_concurrency, 0);
+
+        // 自定义值往返
+        let three = r#"{ "accessToken": "t", "maxConcurrency": 3 }"#;
+        let c3 = KiroCredentials::from_json(three).unwrap();
+        assert_eq!(c3.max_concurrency, 3);
+        let json = c3.to_pretty_json().unwrap();
+        assert!(json.contains("maxConcurrency"));
+        assert_eq!(
+            KiroCredentials::from_json(&json).unwrap().max_concurrency,
+            3
+        );
     }
 
     #[test]
@@ -1098,6 +1132,7 @@ mod tests {
             scopes: None,
             priority: 0,
             rpm_limit: 10,
+            max_concurrency: 0,
             region: None,
             auth_region: None,
             api_region: None,
@@ -1347,6 +1382,7 @@ mod tests {
             scopes: None,
             priority: 0,
             rpm_limit: 10,
+            max_concurrency: 0,
             region: Some("eu-west-1".to_string()),
             auth_region: None,
             api_region: None,
@@ -1395,6 +1431,7 @@ mod tests {
             scopes: None,
             priority: 0,
             rpm_limit: 10,
+            max_concurrency: 0,
             region: None,
             auth_region: None,
             api_region: None,
@@ -1526,6 +1563,7 @@ mod tests {
             scopes: None,
             priority: 3,
             rpm_limit: 10,
+            max_concurrency: 0,
             region: Some("us-west-2".to_string()),
             auth_region: None,
             api_region: None,

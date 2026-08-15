@@ -410,12 +410,14 @@ fn normalize_batch_update_request(
 
     let patch = CredentialBatchPatch {
         rpm_limit: request.rpm_limit,
+        max_concurrency: request.max_concurrency,
         groups,
         source_channel,
         priority: request.priority,
         promote_priority: request.promote_priority,
     };
     if patch.rpm_limit.is_none()
+        && patch.max_concurrency.is_none()
         && patch.groups.is_none()
         && patch.source_channel.is_none()
         && request.priority.is_none()
@@ -1296,6 +1298,7 @@ impl AdminService {
                     id: entry.id,
                     priority: entry.priority,
                     rpm_limit: entry.rpm_limit,
+                    max_concurrency: entry.max_concurrency,
                     rpm_current: entry.rpm_current,
                     in_flight: entry.in_flight,
                     first_byte_ewma_ms: entry.first_byte_ewma_ms,
@@ -1951,6 +1954,7 @@ impl AdminService {
             scopes: req.scopes,
             priority: req.priority,
             rpm_limit: req.rpm_limit,
+            max_concurrency: req.max_concurrency.unwrap_or(0),
             region: req.region,
             auth_region: req.auth_region,
             api_region: req.api_region,
@@ -2110,6 +2114,7 @@ impl AdminService {
                 req.source_channel
                     .map(|v| if v.is_empty() { None } else { Some(v) }),
                 req.rpm_limit,
+                req.max_concurrency,
                 req.api_region,
             )
             .map_err(|e| self.classify_error(e, id))
@@ -3888,6 +3893,7 @@ impl AdminService {
                 None,            // groups 不修改
                 None,            // source_channel 不修改
                 None,            // rpm_limit 不修改
+                None,            // max_concurrency 不修改
                 None,            // api_region 不修改
             )
             .map_err(|e| {
@@ -3983,6 +3989,7 @@ impl AdminService {
                     None,
                     None,
                     Some(Some(url)),
+                    None,
                     None,
                     None,
                     None,
@@ -5270,6 +5277,7 @@ mod tests {
             id,
             priority: id as u32,
             rpm_limit,
+            max_concurrency: 0,
             rpm_current,
             in_flight: 0,
             first_byte_ewma_ms: None,
@@ -5368,6 +5376,7 @@ mod tests {
         let request = |ids, rpm_limit, groups, source_channel| BatchUpdateCredentialsRequest {
             ids,
             rpm_limit,
+            max_concurrency: None,
             groups,
             source_channel,
             priority: None,
@@ -5417,6 +5426,7 @@ mod tests {
         let conflict = normalize_batch_update_request(BatchUpdateCredentialsRequest {
             ids: vec![1, 2],
             rpm_limit: None,
+            max_concurrency: None,
             groups: None,
             source_channel: None,
             priority: Some(10),
@@ -5431,6 +5441,7 @@ mod tests {
         let promoted = normalize_batch_update_request(BatchUpdateCredentialsRequest {
             ids: vec![1, 2],
             rpm_limit: None,
+            max_concurrency: None,
             groups: None,
             source_channel: None,
             priority: None,
@@ -5451,6 +5462,7 @@ mod tests {
         let request = |values| BatchUpdateCredentialsRequest {
             ids: vec![1],
             rpm_limit: None,
+            max_concurrency: None,
             groups: Some(BatchGroupsPatchRequest {
                 mode: BatchGroupMode::Replace,
                 values,
@@ -5498,6 +5510,7 @@ mod tests {
         let clear = normalize_batch_update_request(BatchUpdateCredentialsRequest {
             ids: vec![1],
             rpm_limit: Some(0),
+            max_concurrency: None,
             groups: Some(BatchGroupsPatchRequest {
                 mode: BatchGroupMode::Replace,
                 values: vec!["  ".to_string(), String::new()],
@@ -5518,6 +5531,7 @@ mod tests {
         let normalized = normalize_batch_update_request(BatchUpdateCredentialsRequest {
             ids: vec![2],
             rpm_limit: None,
+            max_concurrency: None,
             groups: Some(BatchGroupsPatchRequest {
                 mode: BatchGroupMode::Replace,
                 values: vec![
@@ -5597,6 +5611,7 @@ mod tests {
             .batch_update_credentials(BatchUpdateCredentialsRequest {
                 ids: vec![1],
                 rpm_limit: Some(4),
+                max_concurrency: None,
                 groups: None,
                 source_channel: None,
                 priority: None,

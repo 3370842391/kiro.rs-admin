@@ -52,6 +52,8 @@ pub struct CredentialStatusItem {
     pub priority: u32,
     /// 每分钟请求数上限（0 = 不限速）
     pub rpm_limit: u32,
+    /// 每账号最大并发（in-flight 上限，0 = 不限并发）
+    pub max_concurrency: u32,
     /// 当前滑动窗口内已用请求条数
     pub rpm_current: u32,
     /// 当前正在使用该凭据的请求数
@@ -234,6 +236,10 @@ pub struct AddCredentialRequest {
     #[serde(default = "default_rpm_limit")]
     pub rpm_limit: u32,
 
+    /// 每账号最大并发（in-flight 上限，可选，默认 0 = 不限并发）
+    #[serde(default)]
+    pub max_concurrency: Option<u32>,
+
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region
     pub region: Option<String>,
@@ -338,6 +344,9 @@ pub struct UpdateCredentialRequest {
     /// 每分钟请求数上限（None 表示不修改，0 表示不限速）
     #[serde(default)]
     pub rpm_limit: Option<u32>,
+    /// 每账号最大并发（None 表示不修改，0 表示不限并发）
+    #[serde(default)]
+    pub max_concurrency: Option<u32>,
 }
 
 /// 批量分组修改模式
@@ -364,6 +373,8 @@ pub struct BatchUpdateCredentialsRequest {
     pub ids: Vec<u64>,
     #[serde(default)]
     pub rpm_limit: Option<u32>,
+    #[serde(default)]
+    pub max_concurrency: Option<u32>,
     #[serde(default)]
     pub groups: Option<BatchGroupsPatchRequest>,
     #[serde(default)]
@@ -413,6 +424,9 @@ pub struct BatchImportRequest {
     /// 顶层统一 RPM 覆盖；缺省时尊重单条凭据字段
     #[serde(default)]
     pub rpm_limit: Option<u32>,
+    /// 顶层统一并发覆盖；缺省时尊重单条凭据字段
+    #[serde(default)]
+    pub max_concurrency: Option<u32>,
     /// 并发度，缺省 8，服务端 clamp 到 [1, 16]
     #[serde(default)]
     pub concurrency: Option<u8>,

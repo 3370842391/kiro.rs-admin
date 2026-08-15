@@ -32,6 +32,8 @@ export interface CredentialStatusItem {
   firstByteEwmaMs?: number
   /** 每分钟请求数上限（0 = 不限速） */
   rpmLimit: number
+  /** 每账号最大并发（in-flight 上限，0 = 不限并发） */
+  maxConcurrency: number
   /** 当前滑动窗口内已用请求条数 */
   rpmCurrent: number
   disabled: boolean
@@ -247,6 +249,8 @@ export interface AddCredentialRequest {
   priority?: number
   /** 每分钟请求数上限（默认 10；0 表示不限速） */
   rpmLimit?: number
+  /** 每账号最大并发（in-flight 上限，0 表示不限并发） */
+  maxConcurrency?: number
   authRegion?: string
   apiRegion?: string
   machineId?: string
@@ -283,6 +287,8 @@ export interface UpdateCredentialRequest {
   sourceChannel?: string
   /** 每分钟请求数上限（undefined 表示不修改，0 表示不限速） */
   rpmLimit?: number
+  /** 每账号最大并发（undefined 表示不修改，0 表示不限并发） */
+  maxConcurrency?: number
 }
 
 export interface BatchCredentialGroupPatch {
@@ -293,6 +299,7 @@ export interface BatchCredentialGroupPatch {
 export interface BatchUpdateCredentialsRequest {
   ids: number[]
   rpmLimit?: number
+  maxConcurrency?: number
   groups?: BatchCredentialGroupPatch
   sourceChannel?: string
   priority?: number
@@ -1170,6 +1177,7 @@ export interface SupplierImportOverrides {
   sourceChannel?: string
   nicknameLabel?: string
   rpmLimit?: number
+  maxConcurrency?: number
   priority?: number
   groups?: string[]
   autoDeleteForbidden?: boolean
@@ -1179,6 +1187,7 @@ export interface SupplierCommonConfig {
   sourceChannel: string
   nicknameLabel: string
   rpmLimit: number
+  maxConcurrency: number
   priority: number
   groups: string[]
   autoDeleteForbidden: boolean
@@ -1196,6 +1205,7 @@ export interface SupplierConfigView {
   purchaseRegion: SupplierRegion | null
   credentialApiRegionFallback: string
   rpmLimit: number
+  maxConcurrency: number
   priority: number
   groups: string[]
   sourceChannel: string
@@ -1248,6 +1258,7 @@ export interface SupplierConfigUpdate {
   purchaseRegion: SupplierRegion | null
   credentialApiRegionFallback: string
   rpmLimit: number
+  maxConcurrency: number
   priority: number
   groups: string[]
   sourceChannel: string

@@ -15,6 +15,7 @@ import { GroupMultiSelect } from '@/components/group-select'
 import { useBatchUpdateCredentials } from '@/hooks/use-credentials'
 import {
   buildBatchUpdateRequest,
+  parseMaxConcurrency,
   parsePriority,
   parseRpmLimit,
 } from '@/lib/rpm-operations'
@@ -49,6 +50,10 @@ export function BatchEditCredentialDialog({
   const [rpmLimitDraft, setRpmLimitDraft] = useState('10')
   const [rpmError, setRpmError] = useState('')
   const rpmInputRef = useRef<HTMLInputElement>(null)
+  const [editMaxConcurrency, setEditMaxConcurrency] = useState(false)
+  const [maxConcurrencyDraft, setMaxConcurrencyDraft] = useState('0')
+  const [maxConcurrencyError, setMaxConcurrencyError] = useState('')
+  const maxConcurrencyInputRef = useRef<HTMLInputElement>(null)
   const [editGroups, setEditGroups] = useState(false)
   const [mode, setMode] = useState<GroupMode>('replace')
   const [groups, setGroups] = useState<string[]>([])
@@ -66,6 +71,9 @@ export function BatchEditCredentialDialog({
     setEditRpm(false)
     setRpmLimitDraft('10')
     setRpmError('')
+    setEditMaxConcurrency(false)
+    setMaxConcurrencyDraft('0')
+    setMaxConcurrencyError('')
     setEditGroups(false)
     setMode('replace')
     setGroups([])
@@ -92,6 +100,16 @@ export function BatchEditCredentialDialog({
     }
     setRpmError('')
 
+    if (editMaxConcurrency) {
+      const parsedConcurrency = parseMaxConcurrency(maxConcurrencyDraft)
+      if (!parsedConcurrency.ok) {
+        setMaxConcurrencyError(parsedConcurrency.message)
+        maxConcurrencyInputRef.current?.focus()
+        return
+      }
+    }
+    setMaxConcurrencyError('')
+
     if (editPriority && priorityMode === 'fixed') {
       const parsedPriority = parsePriority(priorityDraft)
       if (!parsedPriority.ok) {
@@ -106,6 +124,8 @@ export function BatchEditCredentialDialog({
       ids: credentials.map((credential) => credential.id),
       editRpm,
       rpmDraft: rpmLimitDraft,
+      editMaxConcurrency,
+      maxConcurrencyDraft,
       editGroups,
       groupMode: mode,
       groups,
@@ -202,6 +222,59 @@ export function BatchEditCredentialDialog({
                 ) : null}
                 <p id="batch-rpm-limit-hint" className="text-xs text-muted-foreground">
                   {rpmHint}
+                </p>
+              </div>
+            ) : null}
+          </section>
+
+          <section className="space-y-3 rounded-md border border-border/60 p-3">
+            <label htmlFor="batch-edit-max-concurrency" className="flex min-h-11 items-center justify-between gap-3">
+              <span className="text-sm font-medium">修改并发上限</span>
+              <Switch
+                id="batch-edit-max-concurrency"
+                checked={editMaxConcurrency}
+                onCheckedChange={setEditMaxConcurrency}
+                disabled={running}
+              />
+            </label>
+            {editMaxConcurrency ? (
+              <div className="space-y-2">
+                <label htmlFor="batch-max-concurrency" className="block text-xs font-medium text-muted-foreground">
+                  每账号最多同时 in-flight 的请求数（0 = 不限）
+                </label>
+                <Input
+                  ref={maxConcurrencyInputRef}
+                  id="batch-max-concurrency"
+                  name="maxConcurrency"
+                  autoComplete="off"
+                  type="number"
+                  inputMode="numeric"
+                  min={0}
+                  max={100000}
+                  step={1}
+                  value={maxConcurrencyDraft}
+                  onChange={(event) => {
+                    setMaxConcurrencyDraft(event.target.value)
+                    setMaxConcurrencyError('')
+                  }}
+                  aria-invalid={Boolean(maxConcurrencyError)}
+                  aria-describedby={
+                    maxConcurrencyError
+                      ? 'batch-max-concurrency-hint batch-max-concurrency-error'
+                      : 'batch-max-concurrency-hint'
+                  }
+                  disabled={running}
+                  className="h-11 sm:h-9 tabular-nums"
+                />
+                {maxConcurrencyError ? (
+                  <p id="batch-max-concurrency-error" className="text-xs text-destructive" role="alert">
+                    {maxConcurrencyError}
+                  </p>
+                ) : null}
+                <p id="batch-max-concurrency-hint" className="text-xs text-muted-foreground">
+                  {maxConcurrencyDraft.trim() === '0'
+                    ? '不限并发'
+                    : `瞬时并发上限：${maxConcurrencyDraft.trim() || '—'} 个`}
                 </p>
               </div>
             ) : null}

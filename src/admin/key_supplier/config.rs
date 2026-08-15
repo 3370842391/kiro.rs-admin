@@ -27,6 +27,8 @@ const MAX_TARGET_USABLE: u64 = 10_000;
 /// 配得比满额还大等于「所有号都算不可用」，也就是每次到货都买。
 const MAX_LOW_QUOTA_THRESHOLD: u64 = 100_000;
 const MAX_RPM_LIMIT: u64 = 100_000;
+/// 每账号最大并发上限。与 RPM 同量级：RPM 限速率，这个限瞬时并发。
+const MAX_CONCURRENCY: u64 = 100_000;
 const MAX_PRIORITY: u64 = u32::MAX as u64;
 const MAX_SUPPLIER_ID_CHARS: usize = 64;
 const MAX_SUPPLIER_NAME_CHARS: usize = 128;
@@ -39,6 +41,7 @@ pub struct ResolvedSupplierImportPreset {
     pub source_channel: String,
     pub nickname_label: String,
     pub rpm_limit: u32,
+    pub max_concurrency: u32,
     pub priority: u32,
     pub groups: Vec<String>,
     pub auto_delete_forbidden: bool,
@@ -50,6 +53,7 @@ impl Default for ResolvedSupplierImportPreset {
             source_channel: "Webhook 自动采购".to_owned(),
             nickname_label: String::new(),
             rpm_limit: 10,
+            max_concurrency: 0,
             priority: 0,
             groups: Vec::new(),
             auto_delete_forbidden: false,
@@ -60,6 +64,12 @@ impl Default for ResolvedSupplierImportPreset {
 impl ResolvedSupplierImportPreset {
     pub fn from_persisted(value: &KeySupplierCommonConfig) -> anyhow::Result<Self> {
         validate_number_range(u64::from(value.rpm_limit), "rpmLimit", 0, MAX_RPM_LIMIT)?;
+        validate_number_range(
+            u64::from(value.max_concurrency),
+            "maxConcurrency",
+            0,
+            MAX_CONCURRENCY,
+        )?;
         validate_number_range(u64::from(value.priority), "priority", 0, MAX_PRIORITY)?;
         Ok(Self {
             source_channel: normalize_text(
@@ -73,6 +83,7 @@ impl ResolvedSupplierImportPreset {
                 MAX_NICKNAME_PREFIX_CHARS,
             )?,
             rpm_limit: value.rpm_limit,
+            max_concurrency: value.max_concurrency,
             priority: value.priority,
             groups: normalize_groups(value.groups.clone())?,
             auto_delete_forbidden: value.auto_delete_forbidden,
@@ -81,8 +92,10 @@ impl ResolvedSupplierImportPreset {
 
     pub fn resolve(&self, overrides: &SupplierImportOverrides) -> anyhow::Result<Self> {
         let rpm_limit = overrides.rpm_limit.unwrap_or(self.rpm_limit);
+        let max_concurrency = overrides.max_concurrency.unwrap_or(self.max_concurrency);
         let priority = overrides.priority.unwrap_or(self.priority);
         validate_number_range(u64::from(rpm_limit), "rpmLimit", 0, MAX_RPM_LIMIT)?;
+        validate_number_range(u64::from(max_concurrency), "maxConcurrency", 0, MAX_CONCURRENCY)?;
         validate_number_range(u64::from(priority), "priority", 0, MAX_PRIORITY)?;
         Ok(Self {
             source_channel: normalize_text(
@@ -102,6 +115,7 @@ impl ResolvedSupplierImportPreset {
                 MAX_NICKNAME_PREFIX_CHARS,
             )?,
             rpm_limit,
+            max_concurrency,
             priority,
             groups: normalize_groups(
                 overrides
@@ -119,6 +133,7 @@ impl ResolvedSupplierImportPreset {
         settings.source_channel = self.source_channel.clone();
         settings.nickname_prefix = self.nickname_label.clone();
         settings.rpm_limit = self.rpm_limit;
+        settings.max_concurrency = self.max_concurrency;
         settings.priority = self.priority;
         settings.groups = self.groups.clone();
         settings.auto_delete_forbidden = self.auto_delete_forbidden;
@@ -128,6 +143,7 @@ impl ResolvedSupplierImportPreset {
         settings.source_channel = self.source_channel.clone();
         settings.nickname_prefix = self.nickname_label.clone();
         settings.rpm_limit = u64::from(self.rpm_limit);
+        settings.max_concurrency = u64::from(self.max_concurrency);
         settings.priority = u64::from(self.priority);
         settings.groups = self.groups.clone();
         settings.auto_delete_forbidden = self.auto_delete_forbidden;
@@ -137,6 +153,7 @@ impl ResolvedSupplierImportPreset {
         settings.source_channel = self.source_channel.clone();
         settings.nickname_prefix = self.nickname_label.clone();
         settings.rpm_limit = self.rpm_limit;
+        settings.max_concurrency = self.max_concurrency;
         settings.priority = self.priority;
         settings.groups = self.groups.clone();
         settings.auto_delete_forbidden = self.auto_delete_forbidden;
@@ -149,6 +166,7 @@ impl From<&ResolvedSupplierImportPreset> for KeySupplierCommonConfig {
             source_channel: value.source_channel.clone(),
             nickname_label: value.nickname_label.clone(),
             rpm_limit: value.rpm_limit,
+            max_concurrency: value.max_concurrency,
             priority: value.priority,
             groups: value.groups.clone(),
             auto_delete_forbidden: value.auto_delete_forbidden,
@@ -162,6 +180,7 @@ impl SupplierImportOverrides {
             source_channel: Some(settings.source_channel.clone()),
             nickname_label: Some(settings.nickname_prefix.clone()),
             rpm_limit: Some(settings.rpm_limit),
+            max_concurrency: Some(settings.max_concurrency),
             priority: Some(settings.priority),
             groups: Some(settings.groups.clone()),
             auto_delete_forbidden: Some(settings.auto_delete_forbidden),
@@ -178,6 +197,8 @@ impl SupplierImportOverrides {
             nickname_label: (settings.nickname_prefix != common.nickname_label)
                 .then(|| settings.nickname_prefix.clone()),
             rpm_limit: (settings.rpm_limit != common.rpm_limit).then_some(settings.rpm_limit),
+            max_concurrency: (settings.max_concurrency != common.max_concurrency)
+                .then_some(settings.max_concurrency),
             priority: (settings.priority != common.priority).then_some(settings.priority),
             groups: (settings.groups != common.groups).then(|| settings.groups.clone()),
             auto_delete_forbidden: (settings.auto_delete_forbidden != common.auto_delete_forbidden)
@@ -187,11 +208,13 @@ impl SupplierImportOverrides {
 
     fn from_legacy_update(settings: &SupplierConfigUpdate) -> anyhow::Result<Self> {
         validate_number_range(settings.rpm_limit, "rpmLimit", 0, MAX_RPM_LIMIT)?;
+        validate_number_range(settings.max_concurrency, "maxConcurrency", 0, MAX_CONCURRENCY)?;
         validate_number_range(settings.priority, "priority", 0, MAX_PRIORITY)?;
         Ok(Self {
             source_channel: Some(settings.source_channel.clone()),
             nickname_label: Some(settings.nickname_prefix.clone()),
             rpm_limit: Some(settings.rpm_limit as u32),
+            max_concurrency: Some(settings.max_concurrency as u32),
             priority: Some(settings.priority as u32),
             groups: Some(settings.groups.clone()),
             auto_delete_forbidden: Some(settings.auto_delete_forbidden),
@@ -205,6 +228,7 @@ pub struct SupplierCommonConfigView {
     pub source_channel: String,
     pub nickname_label: String,
     pub rpm_limit: u32,
+    pub max_concurrency: u32,
     pub priority: u32,
     pub groups: Vec<String>,
     pub auto_delete_forbidden: bool,
@@ -216,6 +240,7 @@ impl From<&ResolvedSupplierImportPreset> for SupplierCommonConfigView {
             source_channel: value.source_channel.clone(),
             nickname_label: value.nickname_label.clone(),
             rpm_limit: value.rpm_limit,
+            max_concurrency: value.max_concurrency,
             priority: value.priority,
             groups: value.groups.clone(),
             auto_delete_forbidden: value.auto_delete_forbidden,
@@ -233,6 +258,8 @@ pub struct SupplierCommonConfigUpdate {
     #[serde(default)]
     pub rpm_limit: u64,
     #[serde(default)]
+    pub max_concurrency: u64,
+    #[serde(default)]
     pub priority: u64,
     #[serde(default)]
     pub groups: Vec<String>,
@@ -243,11 +270,13 @@ pub struct SupplierCommonConfigUpdate {
 impl ResolvedSupplierImportPreset {
     pub fn normalize_update(update: SupplierCommonConfigUpdate) -> anyhow::Result<Self> {
         validate_number_range(update.rpm_limit, "rpmLimit", 0, MAX_RPM_LIMIT)?;
+        validate_number_range(update.max_concurrency, "maxConcurrency", 0, MAX_CONCURRENCY)?;
         validate_number_range(update.priority, "priority", 0, MAX_PRIORITY)?;
         Self::from_persisted(&KeySupplierCommonConfig {
             source_channel: update.source_channel,
             nickname_label: update.nickname_label,
             rpm_limit: update.rpm_limit as u32,
+            max_concurrency: update.max_concurrency as u32,
             priority: update.priority as u32,
             groups: update.groups,
             auto_delete_forbidden: update.auto_delete_forbidden,
@@ -409,6 +438,7 @@ pub struct SupplierRuntimeConfig {
     pub purchase_region: Option<SupplierRegion>,
     pub credential_api_region_fallback: String,
     pub rpm_limit: u32,
+    pub max_concurrency: u32,
     pub priority: u32,
     pub groups: Vec<String>,
     pub source_channel: String,
@@ -441,6 +471,7 @@ pub struct SupplierConfigView {
     pub purchase_region: Option<SupplierRegion>,
     pub credential_api_region_fallback: String,
     pub rpm_limit: u32,
+    pub max_concurrency: u32,
     pub priority: u32,
     pub groups: Vec<String>,
     pub source_channel: String,
@@ -475,6 +506,8 @@ pub struct SupplierConfigUpdate {
     #[serde(default)]
     pub credential_api_region_fallback: Option<String>,
     pub rpm_limit: u64,
+    #[serde(default)]
+    pub max_concurrency: u64,
     pub priority: u64,
     #[serde(default)]
     pub groups: Vec<String>,
@@ -520,6 +553,7 @@ impl std::fmt::Debug for SupplierRuntimeConfig {
                 &self.credential_api_region_fallback,
             )
             .field("rpm_limit", &self.rpm_limit)
+            .field("max_concurrency", &self.max_concurrency)
             .field("priority", &self.priority)
             .field("groups", &self.groups)
             .field("source_channel", &self.source_channel)
@@ -563,6 +597,7 @@ impl std::fmt::Debug for SupplierConfigUpdate {
                 &self.credential_api_region_fallback,
             )
             .field("rpm_limit", &self.rpm_limit)
+            .field("max_concurrency", &self.max_concurrency)
             .field("priority", &self.priority)
             .field("groups", &self.groups)
             .field("source_channel", &self.source_channel)
@@ -601,6 +636,7 @@ impl SupplierRuntimeConfig {
             anyhow::bail!("minPurchase 不能大于 maxPurchase");
         }
         validate_number_range(update.rpm_limit, "rpmLimit", 0, MAX_RPM_LIMIT)?;
+        validate_number_range(update.max_concurrency, "maxConcurrency", 0, MAX_CONCURRENCY)?;
         validate_number_range(update.priority, "priority", 0, MAX_PRIORITY)?;
         validate_number_range(update.target_usable, "targetUsable", 0, MAX_TARGET_USABLE)?;
         // 单价上限必须是有限的非负数。NaN 参与任何比较都是 false，会让这道闸静默失效；
@@ -685,6 +721,7 @@ impl SupplierRuntimeConfig {
             purchase_region,
             credential_api_region_fallback,
             rpm_limit: update.rpm_limit as u32,
+            max_concurrency: update.max_concurrency as u32,
             priority: update.priority as u32,
             groups: normalize_groups(update.groups)?,
             source_channel: normalize_text(
@@ -724,6 +761,7 @@ impl From<&SupplierRuntimeConfig> for KeySupplierConfig {
             purchase_region: value.purchase_region,
             credential_api_region_fallback: value.credential_api_region_fallback.clone(),
             rpm_limit: value.rpm_limit,
+            max_concurrency: value.max_concurrency,
             priority: value.priority,
             groups: value.groups.clone(),
             source_channel: value.source_channel.clone(),
@@ -753,6 +791,7 @@ impl From<&SupplierRuntimeConfig> for SupplierConfigView {
             purchase_region: value.purchase_region,
             credential_api_region_fallback: value.credential_api_region_fallback.clone(),
             rpm_limit: value.rpm_limit,
+            max_concurrency: value.max_concurrency,
             priority: value.priority,
             groups: value.groups.clone(),
             source_channel: value.source_channel.clone(),
@@ -912,6 +951,7 @@ pub fn load_suppliers_with_common(
                 source_channel: config.key_supplier.source_channel.clone(),
                 nickname_label: config.key_supplier.nickname_prefix.clone(),
                 rpm_limit: config.key_supplier.rpm_limit,
+                max_concurrency: config.key_supplier.max_concurrency,
                 priority: config.key_supplier.priority,
                 groups: config.key_supplier.groups.clone(),
                 auto_delete_forbidden: config.key_supplier.auto_delete_forbidden,
@@ -997,6 +1037,11 @@ fn shared_legacy_common(
         rpm_limit: all(&|settings| settings.rpm_limit == first.settings.rpm_limit)
             .then_some(first.settings.rpm_limit)
             .unwrap_or(fallback.rpm_limit),
+        max_concurrency: all(&|settings| {
+            settings.max_concurrency == first.settings.max_concurrency
+        })
+        .then_some(first.settings.max_concurrency)
+        .unwrap_or(fallback.max_concurrency),
         priority: all(&|settings| settings.priority == first.settings.priority)
             .then_some(first.settings.priority)
             .unwrap_or(fallback.priority),
@@ -1138,6 +1183,7 @@ fn normalize_persisted(
             Some(value.credential_api_region_fallback.clone())
         },
         rpm_limit: u64::from(value.rpm_limit),
+        max_concurrency: u64::from(value.max_concurrency),
         priority: u64::from(value.priority),
         groups: value.groups.clone(),
         source_channel: value.source_channel.clone(),
@@ -1239,6 +1285,7 @@ mod tests {
             purchase_region: None,
             credential_api_region_fallback: None,
             rpm_limit: 100,
+            max_concurrency: 4,
             priority: 10,
             groups: vec![
                 " production ".to_string(),

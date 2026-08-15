@@ -1161,6 +1161,8 @@ pub struct CredentialEntrySnapshot {
     pub priority: u32,
     /// 每分钟请求数上限（0 = 不限速）
     pub rpm_limit: u32,
+    /// 每账号最大并发（in-flight 上限，0 = 不限并发）
+    pub max_concurrency: u32,
     /// 当前滑动窗口内已用请求条数（前端展示 "rpm_current / rpm_limit"）
     pub rpm_current: u32,
     /// 当前正在使用该凭据的请求数
@@ -1416,6 +1418,8 @@ pub(crate) enum CredentialGroupPatch {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct CredentialBatchPatch {
     pub rpm_limit: Option<u32>,
+    /// 每账号最大并发（None 表示不修改，0 表示不限）。
+    pub max_concurrency: Option<u32>,
     pub groups: Option<CredentialGroupPatch>,
     /// 外层 `None` 表示不修改，`Some(None)` 表示清除来源渠道。
     pub source_channel: Option<Option<String>>,
@@ -1613,6 +1617,13 @@ fn is_rpm_exceeded(entry: &CredentialEntry, now: Instant) -> bool {
         return false; // 不限速
     }
     rpm_window_count(entry, now) >= limit
+}
+
+/// 该账号是否已达并发上限。`max_concurrency == 0` 视为不限并发，永远返回 false。
+/// in_flight >= max_concurrency 即达限。RPM 限「速率」，这个限「瞬时并发」，二者互补防风控。
+fn is_concurrency_exceeded(entry: &CredentialEntry) -> bool {
+    let limit = entry.credentials.max_concurrency;
+    limit > 0 && entry.in_flight >= limit
 }
 
 fn cooldown_remaining_ms(until: Option<Instant>, now: Instant) -> Option<u64> {
@@ -1971,6 +1982,7 @@ impl MultiTokenManager {
                 && !entry.rate_limited_until.map(|t| t > now).unwrap_or(false)
                 && !is_rpm_exceeded(entry, now)
                 && entry.in_flight < SESSION_AFFINITY_MAX_IN_FLIGHT
+                && !is_concurrency_exceeded(entry)
                 && credential_matches_request(&entry.credentials, model, group)
         });
         if let Some(entry) = entry {
@@ -2077,6 +2089,10 @@ impl MultiTokenManager {
                 if is_rpm_exceeded(e, now) {
                     return false;
                 }
+                // 并发上限：本账号 in-flight 已达上限，跳过（0 = 不限）
+                if is_concurrency_exceeded(e) {
+                    return false;
+                }
                 true
             })
             .collect();
@@ -2166,6 +2182,7 @@ impl MultiTokenManager {
                 && !e.rate_limited_until.map(|t| t > now).unwrap_or(false)
                 && credential_matches_request(&e.credentials, model, group)
                 && !is_rpm_exceeded(e, now)
+                && !is_concurrency_exceeded(e)
         })
     }
 
@@ -2247,6 +2264,7 @@ impl MultiTokenManager {
                                 && !e.throttled_until.map(|t| t > now).unwrap_or(false)
                                 && !e.rate_limited_until.map(|t| t > now).unwrap_or(false)
                                 && !is_rpm_exceeded(e, now)
+                                && !is_concurrency_exceeded(e)
                                 && credential_matches_request(&e.credentials, model, group)
                         })
                         .map(|e| (e.id, e.credentials.clone()))
@@ -3297,6 +3315,7 @@ impl MultiTokenManager {
                     id: e.id,
                     priority: e.credentials.priority,
                     rpm_limit: e.credentials.rpm_limit,
+                    max_concurrency: e.credentials.max_concurrency,
                     rpm_current: rpm_window_count(e, now),
                     in_flight: e.in_flight,
                     first_byte_ewma_ms: e.first_byte_ewma_ms,
@@ -4304,6 +4323,7 @@ impl MultiTokenManager {
         validated_cred.died_at = None;
         validated_cred.priority = new_cred.priority;
         validated_cred.rpm_limit = new_cred.rpm_limit;
+        validated_cred.max_concurrency = new_cred.max_concurrency;
         validated_cred.auth_method = new_cred.auth_method.as_deref().map(|m| {
             crate::kiro::model::credentials::canonicalize_auth_method_value(m).to_string()
         });
@@ -4417,6 +4437,7 @@ impl MultiTokenManager {
         groups: Option<Vec<String>>,
         source_channel: Option<Option<String>>,
         rpm_limit: Option<u32>,
+        max_concurrency: Option<u32>,
         api_region: Option<String>,
     ) -> anyhow::Result<()> {
         let nickname = nickname.map(normalize_nickname).transpose()?;
@@ -4462,6 +4483,9 @@ impl MultiTokenManager {
             }
             if let Some(v) = rpm_limit {
                 entry.credentials.rpm_limit = v; // 0 = 不限速
+            }
+            if let Some(v) = max_concurrency {
+                entry.credentials.max_concurrency = v; // 0 = 不限并发
             }
             if let Some(api_region) = api_region {
                 entry.credentials.api_region = Some(api_region);
@@ -4584,6 +4608,13 @@ impl MultiTokenManager {
                 && entry.credentials.rpm_limit != rpm_limit
             {
                 entry.credentials.rpm_limit = rpm_limit;
+                changed = true;
+            }
+
+            if let Some(max_concurrency) = patch.max_concurrency
+                && entry.credentials.max_concurrency != max_concurrency
+            {
+                entry.credentials.max_concurrency = max_concurrency;
                 changed = true;
             }
 
@@ -6315,6 +6346,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some("ap-southeast-1".to_string()),
             )
             .unwrap_err();
@@ -6324,6 +6356,7 @@ mod tests {
         manager
             .update_credential(
                 1,
+                None,
                 None,
                 None,
                 None,
@@ -6634,6 +6667,50 @@ mod tests {
         }
         let pick = manager.select_next_credential(None, None);
         assert_eq!(pick.map(|(id, _)| id), Some(1), "平局应按优先级稳定选 A");
+    }
+
+    #[test]
+    fn select_skips_credential_at_max_concurrency() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "least_conn".to_string();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![grouped_cred("a", &[]), grouped_cred("b", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // A(id1) 并发上限 1 且已在途 1，必须跳过，选 B(id2)。
+        // B(id2) 并发上限 0（不限）。
+        {
+            let mut entries = manager.entries.lock();
+            entries
+                .iter_mut()
+                .find(|e| e.id == 1)
+                .unwrap()
+                .credentials
+                .max_concurrency = 1;
+            entries.iter_mut().find(|e| e.id == 1).unwrap().in_flight = 1;
+        }
+        let pick = manager.select_next_credential(None, None);
+        assert_eq!(pick.map(|(id, _)| id), Some(2), "A 已达并发上限，应改选 B");
+
+        // 并发上限 0 = 不限：A 即使在途 1 也应可被选中（least_conn 下 B 在途 0 仍优先，
+        // 这里验证 A 不再被硬跳过——通过把 B 也压满来逼出 A 可选）。
+        {
+            let mut entries = manager.entries.lock();
+            entries
+                .iter_mut()
+                .find(|e| e.id == 1)
+                .unwrap()
+                .credentials
+                .max_concurrency = 0;
+            entries.iter_mut().find(|e| e.id == 2).unwrap().in_flight = 1;
+        }
+        let pick = manager.select_next_credential(None, None);
+        assert!(pick.is_some(), "并发上限 0 时账号不应被并发闸跳过");
     }
 
     #[test]
@@ -7048,6 +7125,7 @@ mod tests {
                 &[3],
                 CredentialBatchPatch {
                     rpm_limit: None,
+                    max_concurrency: None,
                     groups: None,
                     source_channel: None,
                     priority: Some(7),
@@ -7066,6 +7144,7 @@ mod tests {
                 &[3, 4],
                 CredentialBatchPatch {
                     rpm_limit: None,
+                    max_concurrency: None,
                     groups: None,
                     source_channel: None,
                     priority: None,
@@ -7084,6 +7163,7 @@ mod tests {
                 &[3, 4],
                 CredentialBatchPatch {
                     rpm_limit: None,
+                    max_concurrency: None,
                     groups: None,
                     source_channel: None,
                     priority: None,
@@ -7103,6 +7183,7 @@ mod tests {
                 &[1, 2, 3],
                 CredentialBatchPatch {
                     rpm_limit: None,
+                    max_concurrency: None,
                     groups: None,
                     source_channel: None,
                     priority: None,
@@ -7145,6 +7226,7 @@ mod tests {
                 &[3],
                 CredentialBatchPatch {
                     rpm_limit: None,
+                    max_concurrency: None,
                     groups: None,
                     source_channel: None,
                     priority: None,
@@ -7246,6 +7328,7 @@ mod tests {
                 &[2],
                 CredentialBatchPatch {
                     rpm_limit: None,
+                    max_concurrency: None,
                     groups: None,
                     source_channel: Some(None),
                     ..CredentialBatchPatch::default()
@@ -7725,6 +7808,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         manager
@@ -7732,6 +7816,7 @@ mod tests {
                 1,
                 None,
                 Some(Some("real@example.test".to_string())),
+                None,
                 None,
                 None,
                 None,
@@ -7754,6 +7839,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap_err();
         assert!(overlong.to_string().contains("nickname"));
@@ -7768,6 +7854,7 @@ mod tests {
                 None,
                 None,
                 Some(Some("渠".repeat(129))),
+                None,
                 None,
                 None,
             )

@@ -5,9 +5,11 @@ import type {
 
 const MAX_RPM_LIMIT = 100_000
 const MAX_PRIORITY = 4_294_967_295
+const MAX_CONCURRENCY = 100_000
 const MAX_SOURCE_CHANNEL_CHARS = 128
 const INVALID_RPM_MESSAGE = `RPM 上限必须是 0 到 ${MAX_RPM_LIMIT} 的整数`
 const INVALID_PRIORITY_MESSAGE = `优先级必须是 0 到 ${MAX_PRIORITY} 的十进制整数`
+const INVALID_CONCURRENCY_MESSAGE = `并发上限必须是 0 到 ${MAX_CONCURRENCY} 的整数`
 
 export type RpmLimitParseResult =
   | { ok: true; value: number }
@@ -23,6 +25,8 @@ export interface BatchUpdateInput {
   ids: number[]
   editRpm: boolean
   rpmDraft: string
+  editMaxConcurrency?: boolean
+  maxConcurrencyDraft?: string
   editGroups: boolean
   groupMode: BatchCredentialGroupPatch['mode']
   groups: string[]
@@ -69,6 +73,24 @@ export function parsePriority(draft: string): PriorityParseResult {
   return { ok: true, value }
 }
 
+export function parseMaxConcurrency(draft: string): RpmLimitParseResult {
+  const trimmed = draft.trim()
+  if (trimmed === '') {
+    return { ok: false, message: '请输入并发上限' }
+  }
+
+  if (!/^\d+$/.test(trimmed)) {
+    return { ok: false, message: INVALID_CONCURRENCY_MESSAGE }
+  }
+
+  const value = Number(trimmed)
+  if (!Number.isSafeInteger(value) || value > MAX_CONCURRENCY) {
+    return { ok: false, message: INVALID_CONCURRENCY_MESSAGE }
+  }
+
+  return { ok: true, value }
+}
+
 export function rpmLoadState(current: number, limit: number): RpmLoadState {
   if (!Number.isFinite(limit) || limit <= 0) {
     return 'unlimited'
@@ -107,7 +129,7 @@ export function buildBatchUpdateRequest(
     return { ok: false, message: '凭据 ID 不能重复' }
   }
 
-  if (!input.editRpm && !input.editGroups && !input.editSource && !input.editPriority) {
+  if (!input.editRpm && !input.editMaxConcurrency && !input.editGroups && !input.editSource && !input.editPriority) {
     return { ok: false, message: '请至少选择一项要修改的内容' }
   }
 
@@ -119,6 +141,14 @@ export function buildBatchUpdateRequest(
       return rpmLimit
     }
     request.rpmLimit = rpmLimit.value
+  }
+
+  if (input.editMaxConcurrency) {
+    const maxConcurrency = parseMaxConcurrency(input.maxConcurrencyDraft ?? '')
+    if (!maxConcurrency.ok) {
+      return maxConcurrency
+    }
+    request.maxConcurrency = maxConcurrency.value
   }
 
   if (input.editGroups) {

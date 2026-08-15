@@ -264,10 +264,14 @@ const CONCURRENCY_TONE: Record<
  * 「当前并发」计量表 —— 账号列表里最需要一眼看到的实时量：
  * 此刻有多少个请求正压在这个号上。数字 + 呼吸点 + 相对量条。
  */
-function ConcurrencyGauge({ inFlight }: { inFlight: number }) {
+function ConcurrencyGauge({ inFlight, max }: { inFlight: number; max?: number }) {
   const value = Number.isFinite(inFlight) && inFlight > 0 ? Math.floor(inFlight) : 0;
   const tone = CONCURRENCY_TONE[concurrencyTone(value)];
-  const hint = concurrencyHint(value);
+  const limit = Number.isFinite(max) && max! > 0 ? Math.floor(max!) : 0;
+  const hint =
+    limit > 0
+      ? `当前有 ${value} 个请求（并发上限 ${limit}）`
+      : concurrencyHint(value) + "（不限并发）";
   const ratio = concurrencyFillRatio(value);
 
   return (
@@ -288,6 +292,11 @@ function ConcurrencyGauge({ inFlight }: { inFlight: number }) {
         >
           {value}
         </span>
+        {limit > 0 ? (
+          <span className="text-[11px] leading-none tabular-nums text-muted-foreground">
+            / {limit}
+          </span>
+        ) : null}
       </div>
       <div className="mt-1.5 h-1 w-full overflow-hidden rounded-full bg-border/60">
         <div
@@ -875,7 +884,7 @@ export function CredentialCard({
 
       {/* 当前并发 —— 小屏起就常驻，是列表里最该一眼看到的实时量 */}
       <div className="hidden w-16 shrink-0 sm:block">
-        <ConcurrencyGauge inFlight={credential.inFlight ?? 0} />
+        <ConcurrencyGauge inFlight={credential.inFlight ?? 0} max={credential.maxConcurrency} />
       </div>
 
       {/* 关键指标（中大屏） */}
@@ -1178,7 +1187,7 @@ export function CredentialCard({
         <CardContent className="flex flex-1 flex-col space-y-3 px-4 pb-4 sm:space-y-4 sm:px-5 sm:pb-5">
           {/* 实时负载：当前并发 + 滚动窗口 RPM */}
           <div className="grid grid-cols-[4.5rem_1fr] items-start gap-4 rounded-xl border border-border/60 bg-secondary/40 px-3 py-2.5">
-            <ConcurrencyGauge inFlight={credential.inFlight ?? 0} />
+            <ConcurrencyGauge inFlight={credential.inFlight ?? 0} max={credential.maxConcurrency} />
             <div className="min-w-0">
               <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
                 RPM

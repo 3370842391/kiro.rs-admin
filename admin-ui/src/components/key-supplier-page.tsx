@@ -57,6 +57,7 @@ type SupplierNumericField =
   | 'minPurchase'
   | 'maxPurchase'
   | 'rpmLimit'
+  | 'maxConcurrency'
   | 'priority'
   | 'targetUsable'
   | 'lowQuotaThreshold'
@@ -70,6 +71,7 @@ function toNumericDrafts(config: Pick<SupplierEntryUpdate, SupplierNumericField>
     minPurchase: String(config.minPurchase),
     maxPurchase: String(config.maxPurchase),
     rpmLimit: String(config.rpmLimit),
+    maxConcurrency: String(config.maxConcurrency),
     priority: String(config.priority),
     targetUsable: String(config.targetUsable),
     lowQuotaThreshold: String(config.lowQuotaThreshold),
@@ -127,6 +129,7 @@ function importValueFromConfig(
     case 'sourceChannel': return config.sourceChannel
     case 'nicknameLabel': return config.nicknamePrefix
     case 'rpmLimit': return config.rpmLimit
+    case 'maxConcurrency': return config.maxConcurrency
     case 'priority': return config.priority
     case 'groups': return [...config.groups]
     case 'autoDeleteForbidden': return config.autoDeleteForbidden
@@ -148,6 +151,7 @@ function importConfigPatch(
     case 'sourceChannel': return { sourceChannel: value as string }
     case 'nicknameLabel': return { nicknamePrefix: value as string }
     case 'rpmLimit': return { rpmLimit: value as number }
+    case 'maxConcurrency': return { maxConcurrency: value as number }
     case 'priority': return { priority: value as number }
     case 'groups': return { groups: [...value as string[]] }
     case 'autoDeleteForbidden': return { autoDeleteForbidden: value as boolean }
@@ -261,13 +265,14 @@ export function KeySupplierPage() {
   const [config, setConfig] = useState<SupplierEntryUpdate | null>(null)
   const [commonDraft, setCommonDraft] = useState<SupplierCommonConfig | null>(null)
   const [commonRpmDraft, setCommonRpmDraft] = useState('')
+  const [commonMaxConcurrencyDraft, setCommonMaxConcurrencyDraft] = useState('')
   const [commonPriorityDraft, setCommonPriorityDraft] = useState('')
   const [apiKey, setApiKey] = useState('')
   const [webhookToken, setWebhookToken] = useState('')
   const [webhookSecret, setWebhookSecret] = useState('')
   const groupOptions = useGroupOptions()
   const [numericDrafts, setNumericDrafts] = useState<NumericDrafts>({
-    minPurchase: '', maxPurchase: '', rpmLimit: '', priority: '',
+    minPurchase: '', maxPurchase: '', rpmLimit: '', maxConcurrency: '', priority: '',
     targetUsable: '', lowQuotaThreshold: '', maxUnitPrice: '',
   })
   const [purchaseCountDraft, setPurchaseCountDraft] = useState('1')
@@ -308,24 +313,27 @@ export function KeySupplierPage() {
   })
 
   const commonRpm = parseSupplierNumberDraft(commonRpmDraft, 0)
+  const commonMaxConcurrency = parseSupplierNumberDraft(commonMaxConcurrencyDraft, 0)
   const commonPriority = parseSupplierNumberDraft(commonPriorityDraft, 0)
-  const commonNumbersValid = commonRpm !== null && commonPriority !== null
+  const commonNumbersValid = commonRpm !== null && commonMaxConcurrency !== null && commonPriority !== null
 
   useEffect(() => {
     if (!commonQuery.data) return
     setCommonDraft({ ...commonQuery.data, groups: [...commonQuery.data.groups] })
     setCommonRpmDraft(String(commonQuery.data.rpmLimit))
+    setCommonMaxConcurrencyDraft(String(commonQuery.data.maxConcurrency))
     setCommonPriorityDraft(String(commonQuery.data.priority))
   }, [commonQuery.data])
 
   const saveCommon = useMutation({
     mutationFn: () => {
-      if (!commonDraft || commonRpm === null || commonPriority === null) {
+      if (!commonDraft || commonRpm === null || commonMaxConcurrency === null || commonPriority === null) {
         throw new Error('公共导入设置包含无效数字')
       }
       return updateSupplierCommon({
         ...commonDraft,
         rpmLimit: commonRpm,
+        maxConcurrency: commonMaxConcurrency,
         priority: commonPriority,
         groups: [...commonDraft.groups],
       })
@@ -534,9 +542,10 @@ export function KeySupplierPage() {
       }
     })
     if (inherited && commonValue !== null && field === 'rpmLimit') setNumericDrafts((values) => ({ ...values, rpmLimit: String(commonValue) }))
+    if (inherited && commonValue !== null && field === 'maxConcurrency') setNumericDrafts((values) => ({ ...values, maxConcurrency: String(commonValue) }))
     if (inherited && commonValue !== null && field === 'priority') setNumericDrafts((values) => ({ ...values, priority: String(commonValue) }))
   }
-  const updateImportNumberDraft = (field: 'rpmLimit' | 'priority', value: string) => {
+  const updateImportNumberDraft = (field: 'rpmLimit' | 'maxConcurrency' | 'priority', value: string) => {
     updateNumericDraft(field, value)
     const parsed = parseSupplierNumberDraft(value, 0)
     if (parsed !== null) updateImportOverride(field, parsed)
@@ -559,6 +568,7 @@ export function KeySupplierPage() {
   const parsedMinPurchase = parseSupplierNumberDraft(numericDrafts.minPurchase, 1)
   const parsedMaxPurchase = parseSupplierNumberDraft(numericDrafts.maxPurchase, 1)
   const parsedRpmLimit = parseSupplierNumberDraft(numericDrafts.rpmLimit, 0)
+  const parsedMaxConcurrency = parseSupplierNumberDraft(numericDrafts.maxConcurrency, 0)
   const parsedPriority = parseSupplierNumberDraft(numericDrafts.priority, 0)
   const parsedTargetUsable = parseSupplierNumberDraft(
     numericDrafts.targetUsable,
@@ -569,7 +579,7 @@ export function KeySupplierPage() {
   const parsedMaxUnitPrice = parseSupplierDecimalDraft(numericDrafts.maxUnitPrice, 0)
   const idValid = !creating || isValidSupplierId(config?.id ?? '')
   const configNumbersValid = parsedMinPurchase !== null && parsedMaxPurchase !== null &&
-    parsedRpmLimit !== null && parsedPriority !== null && parsedMinPurchase <= parsedMaxPurchase &&
+    parsedRpmLimit !== null && parsedMaxConcurrency !== null && parsedPriority !== null && parsedMinPurchase <= parsedMaxPurchase &&
     parsedTargetUsable !== null && parsedLowQuotaThreshold !== null &&
     parsedMaxUnitPrice !== null &&
     idValid
@@ -598,7 +608,7 @@ export function KeySupplierPage() {
     if (!config) return
     if (
       parsedMinPurchase === null || parsedMaxPurchase === null ||
-      parsedRpmLimit === null || parsedPriority === null ||
+      parsedRpmLimit === null || parsedMaxConcurrency === null || parsedPriority === null ||
       parsedTargetUsable === null || parsedLowQuotaThreshold === null ||
       parsedMaxUnitPrice === null
     ) {
@@ -614,6 +624,7 @@ export function KeySupplierPage() {
       minPurchase: parsedMinPurchase,
       maxPurchase: parsedMaxPurchase,
       rpmLimit: parsedRpmLimit,
+      maxConcurrency: parsedMaxConcurrency,
       priority: parsedPriority,
       targetUsable: parsedTargetUsable,
       lowQuotaThreshold: parsedLowQuotaThreshold,
@@ -734,6 +745,15 @@ export function KeySupplierPage() {
                     disabled={saveCommon.isPending}
                   />
                 </Field>
+                <Field label="并发上限预设">
+                  <Input
+                    type="number"
+                    min={0}
+                    value={commonMaxConcurrencyDraft}
+                    onChange={(event) => setCommonMaxConcurrencyDraft(event.target.value)}
+                    disabled={saveCommon.isPending}
+                  />
+                </Field>
                 <Field label="Priority">
                   <Input
                     type="number"
@@ -771,7 +791,7 @@ export function KeySupplierPage() {
                   </code>
                 </div>
                 {!commonNumbersValid && (
-                  <span className="text-xs text-destructive" role="alert">RPM 和 Priority 必须是非负整数。</span>
+                  <span className="text-xs text-destructive" role="alert">RPM、并发和 Priority 必须是非负整数。</span>
                 )}
                 <Button
                   className="ml-auto"
@@ -1103,6 +1123,19 @@ export function KeySupplierPage() {
                       />
                     </ImportOverrideSetting>
                     <ImportOverrideSetting
+                      label="并发上限"
+                      inherited={config.importOverrides.maxConcurrency === undefined}
+                      onInheritedChange={(inherited) => setImportFieldInherited('maxConcurrency', inherited)}
+                    >
+                      <Input
+                        type="number"
+                        min={0}
+                        value={numericDrafts.maxConcurrency}
+                        onChange={(event) => updateImportNumberDraft('maxConcurrency', event.target.value)}
+                        disabled={saveConfig.isPending || config.importOverrides.maxConcurrency === undefined}
+                      />
+                    </ImportOverrideSetting>
+                    <ImportOverrideSetting
                       label="Priority"
                       inherited={config.importOverrides.priority === undefined}
                       onInheritedChange={(inherited) => setImportFieldInherited('priority', inherited)}
@@ -1148,7 +1181,7 @@ export function KeySupplierPage() {
                   </div>
                 </div>
                 {!idValid && <p className="text-xs text-destructive">供货商 ID 必填，且只能包含字母、数字、- 和 _。</p>}
-                {!configNumbersValid && idValid && <p className="text-xs text-destructive">购买量需为正整数，且最小值不能大于最大值；RPM 和 Priority 需为非负整数。</p>}
+                {!configNumbersValid && idValid && <p className="text-xs text-destructive">购买量需为正整数，且最小值不能大于最大值；RPM、并发和 Priority 需为非负整数。</p>}
                 <div className="flex flex-wrap gap-2">
                   <Button onClick={handleSave} disabled={saveConfig.isPending || !configNumbersValid}>
                     {saveConfig.isPending && <Loader2 className="h-3.5 w-3.5 animate-spin" />}

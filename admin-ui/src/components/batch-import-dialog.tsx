@@ -60,6 +60,8 @@ interface CredentialInput {
   priority?: number
   rpmLimit?: number
   rpm_limit?: number
+  maxConcurrency?: number
+  max_concurrency?: number
   machineId?: string
   machine_id?: string
   kiroApiKey?: string
@@ -202,6 +204,7 @@ function normalizeImportEntry(raw: unknown): CredentialInput {
     apiRegion: preferString(merged, 'apiRegion', 'api_region'),
     priority: preferNumber(merged, 'priority'),
     rpmLimit: preferNumber(merged, 'rpmLimit', 'rpm_limit'),
+    maxConcurrency: preferNumber(merged, 'maxConcurrency', 'max_concurrency'),
     machineId: preferString(merged, 'machineId', 'machine_id'),
     kiroApiKey: preferString(merged, 'kiroApiKey', 'kiro_api_key'),
     authMethod: preferString(merged, 'authMethod', 'auth_method'),
@@ -267,6 +270,16 @@ function parseUniformRpmLimit(raw: string): number | undefined {
   return parsed
 }
 
+function parseUniformMaxConcurrency(raw: string): number | undefined {
+  const value = raw.trim()
+  if (!value) return undefined
+  const parsed = Number(value)
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error('统一并发必须是大于等于 0 的整数')
+  }
+  return parsed
+}
+
 function maskProxyCandidate(candidate: string): string {
   return candidate.toLowerCase() === 'direct' ? 'direct' : maskProxyUrl(candidate)
 }
@@ -304,6 +317,7 @@ export function BatchImportDialog({
   // 统一覆盖导入账号的代理与 RPM；留空表示保留 JSON/现有自动分配逻辑。
   const [uniformProxyUrl, setUniformProxyUrl] = useState('')
   const [uniformRpmLimit, setUniformRpmLimit] = useState('')
+  const [uniformMaxConcurrency, setUniformMaxConcurrency] = useState('')
   const groupOptions = useGroupOptions()
   const fileInputRef = useRef<HTMLInputElement>(null)
   // 进行中的 AbortController，用于"停止导入"：abort 会让 fetch 流中断，
@@ -334,6 +348,7 @@ export function BatchImportDialog({
     setGroups([])
     setUniformProxyUrl('')
     setUniformRpmLimit('')
+    setUniformMaxConcurrency('')
     if (fileInputRef.current) fileInputRef.current.value = ''
   }
 
@@ -420,6 +435,13 @@ export function BatchImportDialog({
       toast.error(extractErrorMessage(error))
       return
     }
+    let maxConcurrencyOverride: number | undefined
+    try {
+      maxConcurrencyOverride = parseUniformMaxConcurrency(uniformMaxConcurrency)
+    } catch (error) {
+      toast.error(extractErrorMessage(error))
+      return
+    }
 
     try {
       setImporting(true)
@@ -471,6 +493,7 @@ export function BatchImportDialog({
           cred.proxyUrl = picked.url
         }
         const rpmLimit = rpmOverride ?? cred.rpmLimit ?? 0
+        const maxConcurrency = maxConcurrencyOverride ?? cred.maxConcurrency ?? 0
         const isApiKeyCred = !!(cred.kiroApiKey?.trim()) || cred.authMethod === 'api_key'
 
         updateResult(i, { status: 'checking' })
@@ -500,6 +523,7 @@ export function BatchImportDialog({
               nickname: cred.nickname?.trim() || undefined,
               priority: cred.priority || 0,
               rpmLimit,
+              maxConcurrency,
               authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
               apiRegion: cred.apiRegion?.trim() || undefined,
               machineId: cred.machineId?.trim() || undefined,
@@ -579,6 +603,7 @@ export function BatchImportDialog({
               scopes: isExternalIdp ? scopes : undefined,
               priority: cred.priority || 0,
               rpmLimit,
+              maxConcurrency,
               machineId: cred.machineId?.trim() || undefined,
               endpoint: cred.endpoint?.trim() || undefined,
               nickname: cred.nickname?.trim() || undefined,
@@ -612,6 +637,7 @@ export function BatchImportDialog({
             credentials: toImport.map(t => t.req),
             proxyUrl: proxyOverride,
             rpmLimit: rpmOverride,
+            maxConcurrency: maxConcurrencyOverride,
             concurrency: 8,
             verify,
           },
@@ -1059,6 +1085,22 @@ export function BatchImportDialog({
                 />
                 <p className="text-xs text-muted-foreground">
                   填写后会覆盖所有导入账号的 rpmLimit；留空时 JSON 内有值就使用该值，否则默认 0。
+                </p>
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm text-muted-foreground">统一并发</label>
+                <input
+                  type="number"
+                  min="0"
+                  step="1"
+                  value={uniformMaxConcurrency}
+                  onChange={(e) => setUniformMaxConcurrency(e.target.value)}
+                  disabled={importing}
+                  placeholder="不填则尊重 JSON；0 表示不限并发"
+                  className="h-9 w-full rounded-lg border border-input bg-background px-3 text-sm font-mono placeholder:text-muted-foreground/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-50"
+                />
+                <p className="text-xs text-muted-foreground">
+                  填写后会覆盖所有导入账号的 maxConcurrency；留空时 JSON 内有值就使用该值，否则默认 0（不限）。
                 </p>
               </div>
             </div>

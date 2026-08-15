@@ -56,6 +56,7 @@ export function AddCredentialDialog({
   const [groups, setGroups] = useState<string[]>([])
   const [sourceChannel, setSourceChannel] = useState('')
   const [rpmLimit, setRpmLimit] = useState('10')
+  const [maxConcurrency, setMaxConcurrency] = useState('')
 
   const groupOptions = useGroupOptions()
 
@@ -81,6 +82,7 @@ export function AddCredentialDialog({
     setGroups([])
     setSourceChannel('')
     setRpmLimit('10')
+    setMaxConcurrency('')
   }
 
   const isApiKey = authMethod === 'api_key'
@@ -142,6 +144,7 @@ export function AddCredentialDialog({
         groups: groups,
         sourceChannel: sourceChannel.trim() || undefined,
         rpmLimit: rpmLimit.trim() === '' ? undefined : Number(rpmLimit),
+        maxConcurrency: maxConcurrency.trim() === '' ? undefined : Number(maxConcurrency),
       },
       {
         onSuccess: (data) => {
@@ -341,6 +344,25 @@ export function AddCredentialDialog({
               />
               <p className="text-xs text-muted-foreground">
                 滑动窗口每分钟最多请求数。默认 10；填 0 表示不限速。
+              </p>
+            </div>
+
+            {/* 并发上限 */}
+            <div className="space-y-2">
+              <label htmlFor="maxConcurrency" className="text-sm font-medium">
+                并发上限
+              </label>
+              <Input
+                id="maxConcurrency"
+                type="number"
+                min={0}
+                placeholder="0"
+                value={maxConcurrency}
+                onChange={(e) => setMaxConcurrency(e.target.value)}
+                disabled={isPending}
+              />
+              <p className="text-xs text-muted-foreground">
+                该账号最多同时 in-flight 的请求数。默认 0 表示不限并发；与 RPM 限速互补，防止瞬时并发打爆账号触发风控。
               </p>
             </div>
 

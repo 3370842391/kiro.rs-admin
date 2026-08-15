@@ -10,7 +10,10 @@ import {
 } from './client-key-cache-policy'
 
 async function readRustSource(path: string): Promise<string> {
-  return readFile(new URL(`../../../src/${path}`, import.meta.url), 'utf8')
+  // Windows 下 `readFile` 保留 CRLF，而下方断言按 `\n` 写。归一化行尾，
+  // 否则换行断言的 `\n` 永远匹配不上 `\r\n`，与 Rust 源码内容无关。
+  const source = await readFile(new URL(`../../../src/${path}`, import.meta.url), 'utf8')
+  return source.replace(/\r\n/g, '\n')
 }
 
 /**

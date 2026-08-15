@@ -131,6 +131,10 @@ pub struct KeySupplierConfig {
     pub credential_api_region_fallback: String,
     #[serde(default = "default_supplier_rpm_limit")]
     pub rpm_limit: u32,
+    /// 每账号最大并发（in-flight 上限）。默认 0 = 不限并发。历史单供货商字段，
+    /// 仅作为多供货商迁移来源。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub max_concurrency: u32,
     #[serde(default)]
     pub priority: u32,
     #[serde(default)]
@@ -206,6 +210,7 @@ impl std::fmt::Debug for KeySupplierConfig {
                 &self.credential_api_region_fallback,
             )
             .field("rpm_limit", &self.rpm_limit)
+            .field("max_concurrency", &self.max_concurrency)
             .field("priority", &self.priority)
             .field("groups", &self.groups)
             .field("source_channel", &self.source_channel)
@@ -237,6 +242,7 @@ impl Default for KeySupplierConfig {
             purchase_region: None,
             credential_api_region_fallback: String::new(),
             rpm_limit: default_supplier_rpm_limit(),
+            max_concurrency: 0,
             priority: 0,
             groups: Vec::new(),
             source_channel: default_supplier_source_channel(),
@@ -368,6 +374,9 @@ pub struct KeySupplierCommonConfig {
     pub nickname_label: String,
     #[serde(default = "default_supplier_rpm_limit")]
     pub rpm_limit: u32,
+    /// 每账号最大并发（in-flight 上限）。默认 0 = 不限并发，与凭据级 `maxConcurrency` 同语义。
+    #[serde(default)]
+    pub max_concurrency: u32,
     #[serde(default)]
     pub priority: u32,
     #[serde(default)]
@@ -382,6 +391,7 @@ impl Default for KeySupplierCommonConfig {
             source_channel: default_supplier_source_channel(),
             nickname_label: String::new(),
             rpm_limit: default_supplier_rpm_limit(),
+            max_concurrency: 0,
             priority: 0,
             groups: Vec::new(),
             auto_delete_forbidden: false,
@@ -399,6 +409,8 @@ pub struct SupplierImportOverrides {
     pub nickname_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rpm_limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1107,6 +1119,10 @@ fn default_supplier_purchase() -> u32 {
 
 fn default_supplier_rpm_limit() -> u32 {
     10
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }
 
 fn default_supplier_source_channel() -> String {
