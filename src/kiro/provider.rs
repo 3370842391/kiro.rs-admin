@@ -351,13 +351,25 @@ impl KiroProvider {
     /// 记录了这个缺陷，只是当时只在批发探活路径上修了。
     ///
     /// 这里复用那个已测过的分类器，不另写一套判定：封号文案会变，规则只应有一处。
-    fn handle_auth_failure(&self, credential_id: u64, status: u16, body: &str) -> bool {
+    fn handle_auth_failure(
+        &self,
+        credential_id: u64,
+        status: u16,
+        body: &str,
+        proxy: Option<&ProxyConfig>,
+    ) -> bool {
         if status == 403 {
             match crate::wholesale::health::classify_account_health(status, body) {
-                AccountHealth::Dead => match self.token_manager.mark_credential_dead(credential_id)
-                {
+                AccountHealth::Dead => match self.token_manager.mark_credential_dead(
+                    credential_id,
+                    proxy.map(|p| p.url.as_str()),
+                    Some(body),
+                ) {
                     Ok(Some(has_available)) => {
                         tracing::warn!(
+                            proxy = proxy
+                                .map(|p| crate::admin::proxy_ban_stats::redact_proxy_url(&p.url))
+                                .unwrap_or_else(|| "direct".to_string()),
                             "凭据 #{} 收到封号 403，已判死并禁用（保留期后自动清理）",
                             credential_id
                         );
@@ -921,7 +933,7 @@ impl KiroProvider {
         machine_id: &str,
         config: &crate::model::config::Config,
         request_body: &str,
-    ) -> anyhow::Result<reqwest::Response> {
+    ) -> anyhow::Result<ProxyAttemptResult> {
         let rctx = RequestContext {
             credentials: &ctx.credentials,
             token: &ctx.token,
@@ -976,7 +988,7 @@ impl KiroProvider {
                     if !should_try_next_proxy(status) {
                         self.report_proxy_success(ctx.id, proxy.as_ref());
                     }
-                    return Ok(response);
+                    return Ok(ProxyAttemptResult { response, proxy });
                 }
                 Err(err) => {
                     self.report_proxy_failure(ctx.id, proxy.as_ref());
@@ -1271,7 +1283,7 @@ impl KiroProvider {
                 }
             };
 
-            let response = match self
+            let attempt_result = match self
                 .execute_mcp_request_with_proxy_failover(
                     &endpoint,
                     &ctx,
@@ -1281,7 +1293,7 @@ impl KiroProvider {
                 )
                 .await
             {
-                Ok(resp) => resp,
+                Ok(result) => result,
                 Err(e) => {
                     tracing::warn!(
                         "MCP 请求发送失败（尝试 {}/{}）: {}",
@@ -1296,6 +1308,9 @@ impl KiroProvider {
                     continue;
                 }
             };
+
+            let selected_proxy = attempt_result.proxy.clone();
+            let response = attempt_result.response;
 
             let status = response.status();
             let retry_after = Self::retry_after_delay(response.headers(), &retry_policy);
@@ -1342,7 +1357,12 @@ impl KiroProvider {
                     tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
                 }
 
-                let has_available = self.handle_auth_failure(ctx.id, status.as_u16(), &body);
+                let has_available = self.handle_auth_failure(
+                    ctx.id,
+                    status.as_u16(),
+                    &body,
+                    selected_proxy.as_ref(),
+                );
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
                 }
@@ -1728,7 +1748,12 @@ impl KiroProvider {
                     tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
                 }
 
-                let has_available = self.handle_auth_failure(ctx.id, status.as_u16(), &body);
+                let has_available = self.handle_auth_failure(
+                    ctx.id,
+                    status.as_u16(),
+                    &body,
+                    selected_proxy.as_ref(),
+                );
                 if !has_available {
                     anyhow::bail!(
                         "{} API 请求失败（所有凭据已用尽）: {} {}",

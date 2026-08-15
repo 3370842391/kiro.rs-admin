@@ -28,6 +28,7 @@ mod middleware;
 pub mod model_mapping;
 pub mod model_profile_sync;
 pub mod profit;
+pub mod proxy_ban_stats;
 pub mod proxy_pool;
 mod router;
 mod service;

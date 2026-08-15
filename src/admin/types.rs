@@ -1,5 +1,6 @@
 //! Admin API 类型定义
 
+use crate::admin::proxy_ban_stats::{ProxyBanEvent, ProxyBanSummary, ProxyRiskAssessment};
 use crate::admin::proxy_pool::ProxyHealth;
 use crate::model::config::RetryPolicy;
 use serde::{Deserialize, Serialize};
@@ -1012,6 +1013,10 @@ pub struct ProxyPoolEntry {
     pub consecutive_failures: u32,
     /// 是否由健康检查自动禁用
     pub auto_disabled: bool,
+    /// 历史封号统计（来自 proxy_ban_stats.json，不随死号被清理而丢失）
+    pub ban_stats: ProxyBanSummary,
+    /// 风险研判结论。建议模式：只给结论和理由，不会自动改启用状态。
+    pub risk: ProxyRiskAssessment,
 }
 
 /// 代理池列表响应
@@ -1020,6 +1025,46 @@ pub struct ProxyPoolEntry {
 pub struct ProxyPoolResponse {
     pub total: usize,
     pub proxies: Vec<ProxyPoolEntry>,
+    /// 全池历史累计封号数（含已从代理池删除的代理）
+    pub total_bans: u64,
+}
+
+/// 单个代理的封号档案（含明细）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyBanDetailEntry {
+    /// 归一化代理身份：host:port（或 `(direct)`）
+    pub proxy_key: String,
+    /// 代理池中对应条目的 ID；代理已被删除时为 None
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_id: Option<u64>,
+    /// 该代理当前是否仍在代理池中
+    pub in_pool: bool,
+    #[serde(flatten)]
+    pub summary: ProxyBanSummary,
+    pub risk: ProxyRiskAssessment,
+    pub events: Vec<ProxyBanEvent>,
+}
+
+/// 封号统计总览响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyBanStatsResponse {
+    /// 按历史封号数降序排列
+    pub proxies: Vec<ProxyBanDetailEntry>,
+    /// 全局累计封号数
+    pub total_bans: u64,
+    /// 最近的封号事件（跨代理时间线，新的在前）
+    pub recent_events: Vec<ProxyBanTimelineItem>,
+}
+
+/// 时间线条目：封号事件 + 它发生在哪个代理上
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyBanTimelineItem {
+    pub proxy_key: String,
+    #[serde(flatten)]
+    pub event: ProxyBanEvent,
 }
 
 /// 单个代理健康检查响应

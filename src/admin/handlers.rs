@@ -637,6 +637,47 @@ pub async fn check_all_proxies(State(state): State<AdminState>) -> impl IntoResp
     Json(state.service.check_all_proxies().await)
 }
 
+/// GET /api/admin/proxy-pool/ban-stats
+/// 代理历史封号统计：每个代理烧掉过几个号 + 跨代理封号时间线。
+/// 含已从池中删除的代理，删代理不会「洗白」它的历史。
+pub async fn get_proxy_ban_stats(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(200)
+        .clamp(1, 2000);
+    Json(state.service.get_proxy_ban_stats(limit))
+}
+
+/// POST /api/admin/proxy-pool/ban-stats/reset
+/// 清空指定代理的封号台账（机场换了出口 IP 之后重新计数）
+pub async fn reset_proxy_ban_stats(
+    State(state): State<AdminState>,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let Some(key) = payload
+        .get("proxyKey")
+        .or_else(|| payload.get("url"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "缺少 proxyKey" })),
+        )
+            .into_response();
+    };
+    let removed = state.service.reset_proxy_ban_stats(key);
+    Json(serde_json::json!({
+        "success": removed,
+        "message": if removed { format!("已清空 {} 的封号台账", key) } else { format!("{} 没有封号记录", key) },
+    }))
+    .into_response()
+}
+
 /// POST /api/admin/proxy-pool/assign-round-robin
 /// 将可用代理轮询批量分配给凭据
 pub async fn assign_proxies_round_robin(

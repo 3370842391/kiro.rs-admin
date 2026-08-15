@@ -38,6 +38,7 @@ use super::model_profile_sync::{
     ModelProfileSyncService, PreviewCacheError, SyncCollection, SyncError,
 };
 use super::profit::ProfitConfig;
+use super::proxy_ban_stats;
 use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
     AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse,
@@ -56,7 +57,8 @@ use super::types::{
     ModelProfileSyncResponse, ModelProfileSyncSummaryResponse, ModelProfileViewResponse,
     ModelProfilesResponse, PatchModelProfileRequest, PollIdcLoginResponse,
     PreviewModelProfilesRequest, ProfitConfigResponse, ProxyBalancingModeResponse,
-    ProxyCheckAllResponse, ProxyCheckResponse, ProxyCheckUrlRequest, ProxyPoolEntry,
+    ProxyBanDetailEntry, ProxyBanStatsResponse, ProxyBanTimelineItem, ProxyCheckAllResponse,
+    ProxyCheckResponse, ProxyCheckUrlRequest, ProxyPoolEntry,
     ProxyPoolResponse, QuotaExceededResult, ResolvedModelProfileResponse, RetryPolicyResponse,
     RevisionRequest, RpmSummary, SetAccountThrottleConfigRequest, SetCacheHitRateRequest,
     SetCachePolicyRequest, SetCompatibilityConfigRequest, SetDeadCredentialConfigRequest,
@@ -3754,7 +3756,22 @@ impl AdminService {
 
     // ============ 代理池管理 ============
 
-    /// 获取代理池列表（含凭据引用计数）
+    /// 全池风险研判，键为归一化的 `host:port`。
+    ///
+    /// 「显著高于中位数」是相对判断，必须有全池视角，所以一次算全部再按需取用。
+    fn proxy_risk_map(
+        &self,
+    ) -> std::collections::BTreeMap<String, proxy_ban_stats::ProxyRiskAssessment> {
+        let Some(ledger) = self.token_manager.ban_ledger() else {
+            return Default::default();
+        };
+        proxy_ban_stats::assess_pool_risk(
+            &ledger.all_summaries(),
+            self.proxy_pool.assignable_urls().len(),
+        )
+    }
+
+    /// 获取代理池列表（含凭据引用计数与历史封号统计）
     pub fn get_proxy_pool(&self) -> ProxyPoolResponse {
         let proxies = self.proxy_pool.list();
         let credentials = {
@@ -3762,6 +3779,17 @@ impl AdminService {
             snapshot.entries
         };
 
+        // 顺手把当前绑定关系登记进台账，为封号率提供分母。号被删后集合不回退，
+        // 所以「这个代理一共用过多少号」是累积的真实值。
+        if let Some(ledger) = self.token_manager.ban_ledger() {
+            ledger.observe_bindings(
+                credentials
+                    .iter()
+                    .map(|c| (c.proxy_url.clone(), c.id)),
+            );
+        }
+
+        let risk_map = self.proxy_risk_map();
         let pool: Vec<ProxyPoolEntry> = proxies
             .into_iter()
             .map(|p| {
@@ -3769,6 +3797,15 @@ impl AdminService {
                     .iter()
                     .filter(|c| c.proxy_url.as_deref().map(|u| u == p.url).unwrap_or(false))
                     .count() as u32;
+                let ban_stats = self
+                    .token_manager
+                    .ban_ledger()
+                    .map(|l| l.summary_for(Some(&p.url)))
+                    .unwrap_or_default();
+                let risk = risk_map
+                    .get(&proxy_ban_stats::normalize_proxy_key(Some(&p.url)))
+                    .cloned()
+                    .unwrap_or_default();
                 ProxyPoolEntry {
                     id: p.id,
                     url: p.url,
@@ -3780,14 +3817,92 @@ impl AdminService {
                     last_checked_at: p.last_checked_at,
                     consecutive_failures: p.consecutive_failures,
                     auto_disabled: p.auto_disabled,
+                    ban_stats,
+                    risk,
                 }
             })
             .collect();
 
+        // 统计所有代理（含已从池中删除的）的累计封号，避免删掉代理就「洗白」历史
+        let total_bans = self
+            .token_manager
+            .ban_ledger()
+            .map(|l| l.all_summaries().values().map(|s| s.total_bans).sum())
+            .unwrap_or(0);
+
         ProxyPoolResponse {
             total: pool.len(),
             proxies: pool,
+            total_bans,
         }
+    }
+
+    /// 代理封号统计总览：每个代理的历史封号档案 + 跨代理封号时间线。
+    ///
+    /// 包含已经从代理池里删掉的代理——历史封号数据的价值就在于「这个 IP 以前烧过号」，
+    /// 把代理从池里删掉不该让这段记录消失，否则重新添加同一个 IP 时又是一张白纸。
+    pub fn get_proxy_ban_stats(&self, event_limit: usize) -> ProxyBanStatsResponse {
+        let Some(ledger) = self.token_manager.ban_ledger() else {
+            return ProxyBanStatsResponse {
+                proxies: Vec::new(),
+                total_bans: 0,
+                recent_events: Vec::new(),
+            };
+        };
+
+        // 归一化键 → 代理池条目，用于标注「这个代理还在不在池子里」
+        let pool_by_key: std::collections::HashMap<String, u64> = self
+            .proxy_pool
+            .list()
+            .into_iter()
+            .map(|p| (proxy_ban_stats::normalize_proxy_key(Some(&p.url)), p.id))
+            .collect();
+
+        let risk_map = self.proxy_risk_map();
+        let mut proxies: Vec<ProxyBanDetailEntry> = ledger
+            .all_summaries()
+            .into_iter()
+            .map(|(proxy_key, summary)| {
+                let proxy_id = pool_by_key.get(&proxy_key).copied();
+                let events = ledger.events_for(Some(&proxy_key), 100);
+                let risk = risk_map.get(&proxy_key).cloned().unwrap_or_default();
+                ProxyBanDetailEntry {
+                    in_pool: proxy_id.is_some(),
+                    proxy_id,
+                    proxy_key,
+                    summary,
+                    risk,
+                    events,
+                }
+            })
+            .collect();
+        proxies.sort_by(|a, b| {
+            b.summary
+                .total_bans
+                .cmp(&a.summary.total_bans)
+                .then_with(|| a.proxy_key.cmp(&b.proxy_key))
+        });
+
+        let total_bans = proxies.iter().map(|p| p.summary.total_bans).sum();
+        let recent_events = ledger
+            .recent_events(event_limit)
+            .into_iter()
+            .map(|(proxy_key, event)| ProxyBanTimelineItem { proxy_key, event })
+            .collect();
+
+        ProxyBanStatsResponse {
+            proxies,
+            total_bans,
+            recent_events,
+        }
+    }
+
+    /// 清空某个代理的封号台账（机场换了出口 IP 之后重新计数）
+    pub fn reset_proxy_ban_stats(&self, proxy_key: &str) -> bool {
+        self.token_manager
+            .ban_ledger()
+            .map(|l| l.reset(Some(proxy_key)))
+            .unwrap_or(false)
     }
 
     /// 添加代理到池中
@@ -3800,6 +3915,13 @@ impl AdminService {
             .proxy_pool
             .add(url, label)
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+        // 重新添加此前用过的 IP 时，历史封号记录要跟着回来——这正是台账按
+        // host:port 而非池内 ID 归档的原因。
+        let ban_stats = self
+            .token_manager
+            .ban_ledger()
+            .map(|l| l.summary_for(Some(&entry.url)))
+            .unwrap_or_default();
         Ok(ProxyPoolEntry {
             id: entry.id,
             url: entry.url,
@@ -3811,6 +3933,8 @@ impl AdminService {
             last_checked_at: entry.last_checked_at,
             consecutive_failures: entry.consecutive_failures,
             auto_disabled: entry.auto_disabled,
+            ban_stats,
+            risk: Default::default(),
         })
     }
 
@@ -3820,19 +3944,25 @@ impl AdminService {
         req: BatchAddProxyRequest,
     ) -> (Vec<ProxyPoolEntry>, Vec<String>) {
         let (added, errors) = self.proxy_pool.batch_add(req.urls);
+        let ledger = self.token_manager.ban_ledger();
         let result = added
             .into_iter()
-            .map(|e| ProxyPoolEntry {
-                id: e.id,
-                url: e.url,
-                label: e.label,
-                enabled: e.enabled,
-                credential_count: 0,
-                health: e.health,
-                latency_ms: e.latency_ms,
-                last_checked_at: e.last_checked_at,
-                consecutive_failures: e.consecutive_failures,
-                auto_disabled: e.auto_disabled,
+            .map(|e| {
+                let ban_stats = ledger.map(|l| l.summary_for(Some(&e.url))).unwrap_or_default();
+                ProxyPoolEntry {
+                    id: e.id,
+                    url: e.url,
+                    label: e.label,
+                    enabled: e.enabled,
+                    credential_count: 0,
+                    health: e.health,
+                    latency_ms: e.latency_ms,
+                    last_checked_at: e.last_checked_at,
+                    consecutive_failures: e.consecutive_failures,
+                    auto_disabled: e.auto_disabled,
+                    ban_stats,
+                    risk: Default::default(),
+                }
             })
             .collect();
         (result, errors)

@@ -12,6 +12,7 @@ import {
   CheckCircle2,
   XCircle,
   HelpCircle,
+  Skull,
 } from 'lucide-react'
 import {
   Dialog,
@@ -40,6 +41,12 @@ import {
   type ProxyBalancingMode,
 } from '@/api/credentials'
 import { extractErrorMessage, maskProxyUrl } from '@/lib/utils'
+import {
+  ProxyBanBadge,
+  ProxyBanStatsPanel,
+  ProxyWeightBadge,
+  formatSurvival,
+} from '@/components/proxy-ban-stats-panel'
 import type { ProxyPoolEntry } from '@/types/api'
 
 interface ProxyPoolDialogProps {
@@ -72,8 +79,10 @@ function normalizeProxyCandidates(candidates: string[]): string[] {
 
 const PROXY_MODE_OPTIONS: ProxyBalancingMode[] = ['sticky', 'round_robin', 'least_load']
 type BatchAction = 'check' | 'enable' | 'disable' | 'global' | 'unglobal' | null
+type PoolTab = 'pool' | 'bans'
 
 export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPoolDialogProps) {
+  const [tab, setTab] = useState<PoolTab>('pool')
   const [newUrl, setNewUrl] = useState('')
   const [newLabel, setNewLabel] = useState('')
   const [batchText, setBatchText] = useState('')
@@ -136,6 +145,12 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
     allProxyCheckboxState = 'indeterminate'
   }
   const globalPoolCount = proxies.filter((proxy) => globalProxyCandidateSet.has(proxy.url)).length
+  // 全池累计封号，含已从池中删除的代理，所以用后端汇总而不是当前列表求和
+  const poolTotalBans = data?.totalBans ?? 0
+  // 已被自动降权的出口。降权是实际生效的行为，比「建议隔离」更值得顶端提示
+  const demotedProxies = proxies.filter(
+    (proxy) => proxy.risk && proxy.risk.selectionTier !== 'normal'
+  )
   const orphanGlobalCandidates = globalProxyCandidates.filter(
     (candidate) =>
       candidate.toLowerCase() !== 'direct' && !proxies.some((proxy) => proxy.url === candidate)
@@ -396,6 +411,44 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
           <DialogTitle>代理 IP 池管理</DialogTitle>
         </DialogHeader>
 
+        <div className="flex items-center gap-1 border-b -mt-1">
+          <button
+            type="button"
+            onClick={() => setTab('pool')}
+            className={`px-3 py-2 text-sm border-b-2 -mb-px transition-colors ${
+              tab === 'pool'
+                ? 'border-primary font-medium'
+                : 'border-transparent text-muted-foreground hover:text-foreground'
+            }`}
+          >
+            代理池
+          </button>
+          <button
+            type="button"
+            onClick={() => setTab('bans')}
+            className={`px-3 py-2 text-sm border-b-2 -mb-px inline-flex items-center gap-1 transition-colors ${
+              tab === 'bans'
+                ? 'border-primary font-medium'
+                : 'border-transparent text-muted-foreground hover:text-foreground'
+            }`}
+          >
+            <Skull className="h-3.5 w-3.5" />
+            封号统计
+            {poolTotalBans > 0 && (
+              <Badge variant="outline" className="h-4 px-1 text-[10px] border-destructive/60 text-destructive">
+                {poolTotalBans}
+              </Badge>
+            )}
+          </button>
+        </div>
+
+        {tab === 'bans' && (
+          <div className="flex-1 overflow-y-auto py-2">
+            <ProxyBanStatsPanel />
+          </div>
+        )}
+
+        {tab === 'pool' && (
         <div className="flex-1 overflow-y-auto space-y-4 py-2">
           <div className="rounded-md border p-3 space-y-2">
             <div className="flex items-center justify-between gap-3">
@@ -597,6 +650,27 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                   </div>
                 )}
               </div>
+              {demotedProxies.length > 0 && (
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                  <span>
+                    有 {demotedProxies.length} 个出口因烧号率明显高于池内中位数已被自动降权（
+                    {demotedProxies
+                      .slice(0, 3)
+                      .map((proxy) => maskProxyUrl(proxy.url))
+                      .join('、')}
+                    {demotedProxies.length > 3 ? ' 等' : ''}
+                    ），干净出口用尽前不会轮到它们。代理本身仍处于启用状态。
+                  </span>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 text-xs"
+                    onClick={() => setTab('bans')}
+                  >
+                    查看依据
+                  </Button>
+                </div>
+              )}
               {orphanGlobalCandidates.length > 0 && (
                 <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-yellow-500/40 bg-yellow-500/10 px-3 py-2 text-xs text-yellow-700 dark:text-yellow-300">
                   <span>有 {orphanGlobalCandidates.length} 个旧全局代理还不在代理池里。</span>
@@ -666,16 +740,36 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                           </Badge>
                         )}
                         {renderHealthBadge(proxy)}
+                        <ProxyBanBadge stats={proxy.banStats} risk={proxy.risk} />
+                        <ProxyWeightBadge risk={proxy.risk} />
                         {!proxy.enabled && (
                           <Badge variant="outline" className="text-xs text-muted-foreground">
                             {proxy.autoDisabled ? '自动禁用' : '已禁用'}
                           </Badge>
                         )}
                       </div>
-                      <div className="flex items-center gap-3 mt-0.5">
+                      <div className="flex items-center gap-3 mt-0.5 flex-wrap">
                         {proxy.credentialCount > 0 && (
                           <span className="text-xs text-muted-foreground">
                             {proxy.credentialCount} 个凭据使用中
+                          </span>
+                        )}
+                        {proxy.banStats?.bans24h > 0 && (
+                          <span className="text-xs text-destructive">
+                            24h 内烧 {proxy.banStats.bans24h} 个
+                          </span>
+                        )}
+                        {proxy.banStats?.medianSurvivalSecs != null && (
+                          <span className="text-xs text-muted-foreground">
+                            存活中位 {formatSurvival(proxy.banStats.medianSurvivalSecs)}
+                          </span>
+                        )}
+                        {proxy.risk?.blockers?.[0] && proxy.banStats?.totalBans > 0 && (
+                          <span
+                            className="text-xs text-muted-foreground truncate max-w-[280px]"
+                            title={proxy.risk.blockers.join('\n')}
+                          >
+                            {proxy.risk.blockers[0]}
                           </span>
                         )}
                         {proxy.lastCheckedAt && (
@@ -749,6 +843,7 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
             </div>
           </div>
         </div>
+        )}
       </DialogContent>
     </Dialog>
   )

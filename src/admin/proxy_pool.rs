@@ -5,6 +5,9 @@
 //! 除增删改查外，还提供主动健康检查：周期性（或按需）通过每个代理请求一个
 //! 轻量公网探测端点，记录连通性与延迟；连续探测失败达阈值的代理会被自动禁用。
 
+use crate::admin::proxy_ban_stats::{
+    ProxyBanLedger, SelectionTier, assess_pool_risk, normalize_proxy_key,
+};
 use crate::http_client::{ProxyConfig, build_client};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
@@ -12,7 +15,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 /// 健康检查探测端点：返回 204 No Content 的轻量公网地址，不依赖上游 Kiro。
 const PROXY_HEALTH_CHECK_URL: &str = "https://www.gstatic.com/generate_204";
@@ -20,6 +24,13 @@ const PROXY_HEALTH_CHECK_URL: &str = "https://www.gstatic.com/generate_204";
 const PROXY_PROBE_TIMEOUT_SECS: u64 = 8;
 /// 连续探测失败阈值：达到后自动禁用（与凭据的 MAX_FAILURES_PER_CREDENTIAL 对齐）
 const MAX_PROXY_PROBE_FAILURES: u32 = 3;
+/// 风险档位缓存有效期。封号是低频事件，没必要每个请求都重算 Wilson 下界。
+const RISK_TIER_TTL: Duration = Duration::from_secs(60);
+/// 被降权出口保留的探测流量比例。
+///
+/// 完全断流会让它的统计永远停在被降权那一刻——机场把出口换成干净 IP 之后
+/// 也翻不了身。放一点流量进去，它能靠新数据自己爬回正常档。
+const RISK_PROBE_RATE: f64 = 0.05;
 
 /// 代理健康状态
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,6 +111,16 @@ pub struct ProxyPoolManager {
     path: Option<PathBuf>,
     /// TLS 后端，构建探测用 HTTP client 时需要
     tls_backend: TlsBackend,
+    /// 封号台账（启动时注入）。用于按封号率对出口降权。
+    ban_ledger: OnceLock<Arc<ProxyBanLedger>>,
+    /// 风险档位缓存，带 TTL
+    risk_tiers: Mutex<RiskTierCache>,
+}
+
+#[derive(Default)]
+struct RiskTierCache {
+    tiers: HashMap<String, SelectionTier>,
+    refreshed_at: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -159,7 +180,60 @@ impl ProxyPoolManager {
             next_id: AtomicU64::new(next_id),
             path,
             tls_backend,
+            ban_ledger: OnceLock::new(),
+            risk_tiers: Mutex::new(RiskTierCache::default()),
         }
+    }
+
+    /// 注入封号台账，开启按封号率降权。不注入时所有出口一律按正常档处理。
+    pub fn set_ban_ledger(&self, ledger: Arc<ProxyBanLedger>) {
+        let _ = self.ban_ledger.set(ledger);
+        self.risk_tiers.lock().refreshed_at = None;
+    }
+
+    /// 取当前风险档位表，过期则重算。
+    ///
+    /// 必须在拿 `entries` / `runtime` 之前调用：它内部会短暂持有 `entries`
+    /// 来数可分配代理，嵌套加锁会死锁。
+    fn risk_tiers(&self) -> HashMap<String, SelectionTier> {
+        let Some(ledger) = self.ban_ledger.get() else {
+            return HashMap::new();
+        };
+        {
+            let cache = self.risk_tiers.lock();
+            if cache
+                .refreshed_at
+                .is_some_and(|at| at.elapsed() < RISK_TIER_TTL)
+            {
+                return cache.tiers.clone();
+            }
+        }
+
+        let assignable = self.assignable_urls().len();
+        let tiers: HashMap<String, SelectionTier> =
+            assess_pool_risk(&ledger.all_summaries(), assignable)
+                .into_iter()
+                .map(|(key, assessment)| (key, assessment.selection_tier))
+                .collect();
+
+        let mut cache = self.risk_tiers.lock();
+        cache.tiers = tiers.clone();
+        cache.refreshed_at = Some(Instant::now());
+        tiers
+    }
+
+    /// 该 URL 在本次排序中的档位。
+    ///
+    /// 被降权的出口有 [`RISK_PROBE_RATE`] 的概率按正常档参与，作为翻身通道。
+    fn effective_tier(tiers: &HashMap<String, SelectionTier>, url: &str) -> u8 {
+        let tier = tiers
+            .get(&normalize_proxy_key(Some(url)))
+            .copied()
+            .unwrap_or(SelectionTier::Normal);
+        if tier != SelectionTier::Normal && fastrand::f64() < RISK_PROBE_RATE {
+            return SelectionTier::Normal.rank();
+        }
+        tier.rank()
     }
 
     pub fn list(&self) -> Vec<ProxyEntry> {
@@ -336,12 +410,19 @@ impl ProxyPoolManager {
     /// - `least_load`：当前 in-flight 最少优先，延迟作为次序。
     /// - `sticky`：若该凭据已有成功代理且仍可用，优先使用；否则先按 least_load 选，
     ///   成功后由 `report_proxy_success` 绑定。
+    ///
+    /// 最后统一按封号风险档位做一次**稳定**排序，档位是主键、均衡策略是次键：
+    /// 烧号多的出口沉到队尾，只在干净出口用尽时才兜底。全池封号率一致时所有出口
+    /// 同档，排序完全等价于原策略。粘性也让位于档位——粘在一个正在烧号的出口上
+    /// 正是要避免的情况。
     pub fn order_candidates(
         &self,
         credential_id: u64,
         candidates: Vec<ProxyConfig>,
         mode: &str,
     ) -> Vec<ProxyConfig> {
+        // 必须在拿 entries 之前取，risk_tiers 内部会加 entries 锁
+        let risk_tiers = self.risk_tiers();
         let entries = self.entries.lock();
         let mut available = Vec::new();
         for candidate in candidates {
@@ -360,6 +441,19 @@ impl ProxyPoolManager {
             return available;
         }
 
+        let mut ordered = self.order_by_mode(credential_id, available, mode, &entries);
+        // 稳定排序：同档内保持上面均衡策略排好的顺序
+        ordered.sort_by_key(|proxy| Self::effective_tier(&risk_tiers, &proxy.url));
+        ordered
+    }
+
+    fn order_by_mode(
+        &self,
+        credential_id: u64,
+        mut available: Vec<ProxyConfig>,
+        mode: &str,
+        entries: &[ProxyEntry],
+    ) -> Vec<ProxyConfig> {
         let mut runtime = self.runtime.lock();
         let load = |url: &str, state: &ProxyRuntimeState| {
             (
@@ -771,6 +865,114 @@ mod tests {
         mgr.report_proxy_failure(7, &proxy_b);
         let ordered = mgr.order_candidates(7, vec![proxy_a.clone(), proxy_b], "sticky");
         assert_eq!(ordered, vec![proxy_a]);
+    }
+
+    /// 造一个台账：`bans` 里每项是 (代理 URL, 封号数, 曾绑定账号数)
+    fn ledger_with(bans: &[(&str, u64, u64)]) -> Arc<ProxyBanLedger> {
+        use crate::admin::proxy_ban_stats::BanObservation;
+        let ledger = Arc::new(ProxyBanLedger::new(None));
+        let mut next_id = 1u64;
+        for (url, banned, seen) in bans {
+            let ids: Vec<u64> = (0..*seen).map(|_| { let i = next_id; next_id += 1; i }).collect();
+            ledger.observe_bindings(ids.iter().map(|id| (Some(url.to_string()), *id)));
+            for (n, id) in ids.iter().take(*banned as usize).enumerate() {
+                ledger.record_ban(BanObservation {
+                    credential_id: *id,
+                    email: None,
+                    // 跨多个批次，避免被「同一批号」检验挡掉
+                    banned_at: format!("2026-08-{:02}T12:00:00+00:00", 10 + (n % 5)),
+                    added_at: Some(format!("2026-08-{:02}T10:00:00+00:00", 10 + (n % 5))),
+                    reason: None,
+                    proxy_url: Some(url.to_string()),
+                    successes_before_ban: None,
+                    requests_before_ban: None,
+                });
+            }
+        }
+        ledger
+    }
+
+    fn mgr_with_proxies(urls: &[&str], ledger: Arc<ProxyBanLedger>) -> ProxyPoolManager {
+        let mgr = ProxyPoolManager::new(None, TlsBackend::Rustls);
+        for url in urls {
+            mgr.add(url.to_string(), None).unwrap();
+        }
+        mgr.set_ban_ledger(ledger);
+        mgr
+    }
+
+    #[test]
+    fn burning_proxy_sinks_to_the_back_of_the_candidate_list() {
+        let urls = [
+            "http://bad:8080",
+            "http://ok1:8080",
+            "http://ok2:8080",
+            "http://ok3:8080",
+        ];
+        let mgr = mgr_with_proxies(
+            &urls,
+            ledger_with(&[
+                ("http://bad:8080", 10, 12),
+                ("http://ok1:8080", 0, 12),
+                ("http://ok2:8080", 0, 12),
+                ("http://ok3:8080", 1, 20),
+            ]),
+        );
+        let candidates: Vec<ProxyConfig> = urls.iter().map(|u| ProxyConfig::new(*u)).collect();
+
+        // 降权档保留少量探测流量，所以单次结果有随机性；统计多次看趋势
+        let mut bad_first = 0;
+        for _ in 0..200 {
+            let ordered = mgr.order_candidates(1, candidates.clone(), "least_load");
+            if ordered.first().map(|p| p.url.as_str()) == Some("http://bad:8080") {
+                bad_first += 1;
+            }
+        }
+        assert!(
+            bad_first < 30,
+            "烧号出口不该经常排在首位，200 次里出现了 {} 次",
+            bad_first
+        );
+        assert!(bad_first > 0, "应保留探测流量供其翻身，实际完全断流");
+    }
+
+    #[test]
+    fn uniform_risk_leaves_ordering_to_the_balancing_mode() {
+        // 全池一样烂：不该有人被降权，排序必须完全等价于原策略
+        let urls = ["http://a:8080", "http://b:8080", "http://c:8080"];
+        let mgr = mgr_with_proxies(
+            &urls,
+            ledger_with(&[
+                ("http://a:8080", 5, 10),
+                ("http://b:8080", 5, 10),
+                ("http://c:8080", 5, 10),
+            ]),
+        );
+        let candidates: Vec<ProxyConfig> = urls.iter().map(|u| ProxyConfig::new(*u)).collect();
+
+        let proxy_a = ProxyConfig::new("http://a:8080");
+        let _guard = mgr.in_flight_guard(&proxy_a);
+        // least_load 应照常把在途最少的排前面，A 因为在途 1 被排后
+        for _ in 0..20 {
+            let ordered = mgr.order_candidates(1, candidates.clone(), "least_load");
+            assert_ne!(
+                ordered.first().map(|p| p.url.as_str()),
+                Some("http://a:8080"),
+                "同档时应完全由 least_load 决定顺序"
+            );
+        }
+    }
+
+    #[test]
+    fn without_ledger_ordering_is_unchanged() {
+        let mgr = ProxyPoolManager::new(None, TlsBackend::Rustls);
+        mgr.add("http://proxy-a:8080".to_string(), None).unwrap();
+        mgr.add("http://proxy-b:8080".to_string(), None).unwrap();
+        let proxy_a = ProxyConfig::new("http://proxy-a:8080");
+        let proxy_b = ProxyConfig::new("http://proxy-b:8080");
+        let _guard = mgr.in_flight_guard(&proxy_a);
+        let ordered = mgr.order_candidates(1, vec![proxy_a, proxy_b.clone()], "least_load");
+        assert_eq!(ordered.first().map(|p| p.url.as_str()), Some(proxy_b.url.as_str()));
     }
 
     #[test]

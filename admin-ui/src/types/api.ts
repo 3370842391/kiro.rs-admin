@@ -324,6 +324,86 @@ export interface UpdateRefreshTokenRequest {
 // 代理健康状态
 export type ProxyHealth = 'unknown' | 'healthy' | 'unhealthy'
 
+// 代理历史封号统计。来自 proxy_ban_stats.json，死号被保留期清理后依然存在
+export interface ProxyBanSummary {
+  /** 历史累计封号数，永不回退 */
+  totalBans: number
+  bans24h: number
+  bans7d: number
+  /** 曾经绑定过这个代理的账号总数（封号率分母） */
+  accountsSeen: number
+  /** totalBans / accountsSeen，0~1 */
+  banRate?: number
+  /** 被封账号存活时长中位数（秒），越短说明这个出口 IP 越脏 */
+  medianSurvivalSecs?: number
+  /** 被封账号死前成功请求数的中位数。接近 0 = 出口被标记；很大 = 号是被打死的 */
+  medianSuccessesBeforeBan?: number
+  /** 被封的号分布在多少个不同加入日。1 = 全是同一批，不足以归咎于这个出口 */
+  distinctBatchDays: number
+  firstBanAt?: string
+  lastBanAt?: string
+}
+
+export type ProxyRiskLevel = 'ok' | 'watch' | 'suspect' | 'quarantineRecommended'
+
+/** 候选排序档位：正常参与 / 只在正常档用尽后轮到 / 基本不会被选中 */
+export type ProxySelectionTier = 'normal' | 'degraded' | 'penalized'
+
+// 风险研判结论。建议模式：只给结论和理由，不会自动改代理的启用状态
+export interface ProxyRiskAssessment {
+  level: ProxyRiskLevel
+  /** 封号率的 Wilson 95% 置信下界 */
+  banRateLowerBound: number
+  /** 参照用的池内封号率中位数 */
+  poolMedianBanRate: number
+  recommendQuarantine: boolean
+  /** 候选排序权重 0~1。相对池内中位数算，全池一样烂时所有人都是 1 */
+  selectionWeight: number
+  /** 由权重换算的档位，排序主键 */
+  selectionTier: ProxySelectionTier
+  /** 支持「这个出口有问题」的证据 */
+  reasons: string[]
+  /** 阻止下结论的原因：原始封号率高但未建议隔离时，这里说明为什么 */
+  blockers: string[]
+}
+
+// 单次封号事件
+export interface ProxyBanEvent {
+  credentialId: number
+  email?: string
+  bannedAt: string
+  addedAt?: string
+  survivalSecs?: number
+  /** 该号死前打过的成功请求数 */
+  successesBeforeBan?: number
+  requestsBeforeBan?: number
+  reason?: string
+  proxyUrl?: string
+}
+
+// 单个代理的封号档案（含明细）
+export interface ProxyBanDetailEntry extends ProxyBanSummary {
+  /** 归一化代理身份：host:port（或 "(direct)"） */
+  proxyKey: string
+  proxyId?: number
+  /** 该代理当前是否仍在代理池中 */
+  inPool: boolean
+  risk: ProxyRiskAssessment
+  events: ProxyBanEvent[]
+}
+
+// 封号时间线条目
+export interface ProxyBanTimelineItem extends ProxyBanEvent {
+  proxyKey: string
+}
+
+// 封号统计总览响应
+export interface ProxyBanStatsResponse {
+  proxies: ProxyBanDetailEntry[]
+  totalBans: number
+  recentEvents: ProxyBanTimelineItem[]
+}
+
 // 代理池条目
 export interface ProxyPoolEntry {
   id: number
@@ -336,12 +416,16 @@ export interface ProxyPoolEntry {
   lastCheckedAt?: string
   consecutiveFailures: number
   autoDisabled: boolean
+  banStats: ProxyBanSummary
+  risk: ProxyRiskAssessment
 }
 
 // 代理池列表响应
 export interface ProxyPoolResponse {
   total: number
   proxies: ProxyPoolEntry[]
+  /** 全池历史累计封号数，含已从池中删除的代理 */
+  totalBans: number
 }
 
 // 添加代理请求

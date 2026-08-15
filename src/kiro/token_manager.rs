@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -1520,6 +1521,11 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// 代理封号台账（启动时注入，测试里可缺省）。
+    ///
+    /// 判死时必须就地记下「是哪个代理烧掉了这个号」：`cleanup_dead_credentials`
+    /// 会在保留期后把整条凭据删掉，那之后就再也无法回答这个问题了。
+    ban_ledger: OnceLock<Arc<crate::admin::proxy_ban_stats::ProxyBanLedger>>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -1839,6 +1845,7 @@ impl MultiTokenManager {
             cache_hit_rate_max_pct: AtomicU32::new(cache_hit_rate_max_pct),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            ban_ledger: OnceLock::new(),
         };
 
         // 单凭据格式自动迁移：升级为数组格式，确保 token rotation 能写盘
@@ -4839,6 +4846,15 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 注入代理封号台账。启动时调用一次，之后不可变更。
+    pub fn set_ban_ledger(&self, ledger: Arc<crate::admin::proxy_ban_stats::ProxyBanLedger>) {
+        let _ = self.ban_ledger.set(ledger);
+    }
+
+    pub fn ban_ledger(&self) -> Option<&Arc<crate::admin::proxy_ban_stats::ProxyBanLedger>> {
+        self.ban_ledger.get()
+    }
+
     /// 上游返回 403 时删除显式启用该策略的凭证。
     ///
     /// `Ok(None)` 表示凭证不存在或未启用自动删除，调用方应继续原有失败处理；
@@ -4851,8 +4867,20 @@ impl MultiTokenManager {
     ///
     /// 返回值沿用被取代函数的形状（`Ok(None)` = 未做处理，`Ok(Some(has_available))`
     /// = 已判死且告知池中是否还有可用号），这样 provider 的重试仲裁逻辑不用改。
-    pub fn mark_credential_dead(&self, id: u64) -> anyhow::Result<Option<bool>> {
+    ///
+    /// 判死的同时把「烧号的那个代理」记进台账：`observed_proxy` 是本次请求实际走的
+    /// 代理（代理故障转移后可能不是凭据上配置的那个），缺省时回落到凭据自身的
+    /// `proxyUrl`；`reason` 是上游封号文案，截断后存档，方便回溯是哪一类风控。
+    pub fn mark_credential_dead(
+        &self,
+        id: u64,
+        observed_proxy: Option<&str>,
+        reason: Option<&str>,
+    ) -> anyhow::Result<Option<bool>> {
         let died_at = Utc::now().to_rfc3339();
+        // 台账要用的字段必须在这里就地取走：号进入保留期后会被 cleanup 删掉，
+        // 事后再查 credentials.json 是查不到的。
+        let ban_facts;
         {
             let mut entries = self.entries.lock();
             let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) else {
@@ -4866,7 +4894,26 @@ impl MultiTokenManager {
             entry.disabled = true;
             entry.credentials.disabled = true;
             entry.credentials.disable_reason = Some(DisabledReason::Forbidden);
-            entry.credentials.died_at = Some(died_at);
+            entry.credentials.died_at = Some(died_at.clone());
+
+            ban_facts = crate::admin::proxy_ban_stats::BanObservation {
+                credential_id: id,
+                email: entry.credentials.email.clone(),
+                banned_at: died_at,
+                added_at: entry.credentials.added_at.clone(),
+                reason: reason.map(str::to_string),
+                proxy_url: observed_proxy
+                    .map(str::to_string)
+                    .or_else(|| entry.credentials.proxy_url.clone()),
+                successes_before_ban: Some(entry.success_count),
+                requests_before_ban: Some(
+                    entry.success_count.saturating_add(entry.total_failure_count),
+                ),
+            };
+        }
+
+        if let Some(ledger) = self.ban_ledger.get() {
+            ledger.record_ban(ban_facts);
         }
 
         if let Err(error) = self.persist_credentials() {
@@ -8639,7 +8686,7 @@ mod tests {
                 .unwrap();
 
         // #1 封号，#2 额度耗尽，#3 手动禁用（仍算可用），#4 干净。
-        manager.mark_credential_dead(1).unwrap();
+        manager.mark_credential_dead(1, None, None).unwrap();
         manager.disable_quota_exceeded(2).unwrap();
         manager.set_disabled(3, true).unwrap();
 
@@ -8849,8 +8896,8 @@ mod tests {
                 .unwrap();
 
         // #1 #2 判死（仍在保留期内，没被清理），#3 额度耗尽，#4 手动禁用，#5 干净。
-        manager.mark_credential_dead(1).unwrap();
-        manager.mark_credential_dead(2).unwrap();
+        manager.mark_credential_dead(1, None, None).unwrap();
+        manager.mark_credential_dead(2, None, None).unwrap();
         manager.disable_quota_exceeded(3).unwrap();
         manager.set_disabled(4, true).unwrap();
 
@@ -9098,7 +9145,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(manager.mark_credential_dead(1).unwrap(), Some(true));
+        assert_eq!(manager.mark_credential_dead(1, None, None).unwrap(), Some(true));
 
         // 号还在池子里，只是被禁用了
         let ids: Vec<u64> = manager
@@ -9124,7 +9171,7 @@ mod tests {
 
         // 重复判死不应把 died_at 往后推（并发请求会重复触发）
         let first_death = persisted_dead.died_at.clone();
-        assert_eq!(manager.mark_credential_dead(1).unwrap(), None);
+        assert_eq!(manager.mark_credential_dead(1, None, None).unwrap(), None);
         let after = manager.snapshot();
         assert_eq!(
             after.entries.iter().find(|e| e.id == 1).unwrap().died_at,

@@ -23,12 +23,14 @@ use super::{
         get_credential_models, get_dead_credential_config, get_endpoint_chains, get_endpoint_mode,
         get_error_snapshot, get_error_snapshot_payload, get_global_proxy, get_image_budget,
         get_load_balancing_mode, get_log_governance_config, get_model_profiles, get_profit_config,
-        get_proxy_balancing_mode, get_proxy_pool, get_retry_policy, get_update_config,
+        get_proxy_balancing_mode, get_proxy_ban_stats, get_proxy_pool, get_retry_policy,
+        get_update_config,
         list_client_keys, list_error_snapshots, list_groups, list_model_mappings, list_traces,
         patch_model_profile, pin_error_snapshot, poll_idc_login, poll_idc_relogin,
         poll_social_login, poll_social_relogin, preview_model_profiles, profit_report,
         pull_update_image, replace_model_mappings, reset_all_success_count, reset_client_key_stats,
-        reset_failure_count, reset_success_count, rollback_image_update, rotate_client_key,
+        reset_failure_count, reset_proxy_ban_stats, reset_success_count, rollback_image_update,
+        rotate_client_key,
         set_account_throttle_config, set_cache_hit_rate, set_cache_policy, set_client_key_disabled,
         set_compatibility_config, set_credential_disabled, set_credential_overage,
         set_credential_priority, set_dead_credential_config, set_endpoint_chains,
@@ -130,6 +132,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/proxy-pool/batch", post(batch_add_proxies))
         .route("/proxy-pool/check-url", post(check_proxy_url))
         .route("/proxy-pool/check-all", post(check_all_proxies))
+        .route("/proxy-pool/ban-stats", get(get_proxy_ban_stats))
+        .route("/proxy-pool/ban-stats/reset", post(reset_proxy_ban_stats))
         .route(
             "/proxy-pool/assign-round-robin",
             post(assign_proxies_round_robin),

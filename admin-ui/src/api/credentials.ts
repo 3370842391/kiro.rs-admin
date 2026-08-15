@@ -17,6 +17,7 @@ import type {
   UpdateRefreshTokenRequest,
   ProxyPoolEntry,
   ProxyPoolResponse,
+  ProxyBanStatsResponse,
   AddProxyRequest,
   ProxyCheckUrlRequest,
   BatchAddProxyRequest,
@@ -439,6 +440,20 @@ export async function checkProxyUrl(req: ProxyCheckUrlRequest): Promise<ProxyChe
 // 触发全部代理健康检查
 export async function checkAllProxies(): Promise<ProxyCheckAllResponse> {
   const { data } = await api.post<ProxyCheckAllResponse>('/proxy-pool/check-all')
+  return data
+}
+
+// 代理历史封号统计（含已从池中删除的代理）
+export async function getProxyBanStats(limit = 200): Promise<ProxyBanStatsResponse> {
+  const { data } = await api.get<ProxyBanStatsResponse>('/proxy-pool/ban-stats', {
+    params: { limit },
+  })
+  return data
+}
+
+// 清空指定代理的封号台账（机场换了出口 IP 之后重新计数）
+export async function resetProxyBanStats(proxyKey: string): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>('/proxy-pool/ban-stats/reset', { proxyKey })
   return data
 }
 

@@ -283,6 +283,46 @@ async fn main() {
         proxy_pool_path,
         config.tls_backend,
     ));
+
+    // 代理封号台账：与凭据生命周期解耦，死号被保留期清理后统计依然在。
+    let ban_ledger = Arc::new(admin::proxy_ban_stats::ProxyBanLedger::new(
+        token_manager
+            .cache_dir()
+            .map(|d| d.join("proxy_ban_stats.json")),
+    ));
+    token_manager.set_ban_ledger(ban_ledger.clone());
+    // 代理池据此对烧号多的出口降权（相对池内中位数，全池一样烂时不降）
+    proxy_pool.set_ban_ledger(ban_ledger.clone());
+    {
+        // 升级首日的历史回填：credentials.json 里尚未被清理的死号先进台账，
+        // 否则统计要从零重新积累。幂等，重复启动不会重复计数。
+        let snapshot = token_manager.snapshot();
+        let backfilled = ban_ledger.backfill_from_credentials(snapshot.entries.iter().filter_map(
+            |entry| {
+                Some(admin::proxy_ban_stats::BanObservation {
+                    credential_id: entry.id,
+                    email: entry.email.clone(),
+                    banned_at: entry.died_at.clone()?,
+                    added_at: entry.added_at.clone(),
+                    reason: Some("backfilled from credentials.json".to_string()),
+                    proxy_url: entry.proxy_url.clone(),
+                    successes_before_ban: Some(entry.success_count),
+                    requests_before_ban: Some(
+                        entry.success_count.saturating_add(entry.total_failure_count),
+                    ),
+                })
+            },
+        ));
+        if backfilled > 0 {
+            tracing::info!("代理封号台账：回填 {} 条历史封号记录", backfilled);
+        }
+        ban_ledger.observe_bindings(
+            snapshot
+                .entries
+                .iter()
+                .map(|entry| (entry.proxy_url.clone(), entry.id)),
+        );
+    }
     let kiro_provider = Arc::new(KiroProvider::with_proxy(
         token_manager.clone(),
         proxy_config.clone(),
