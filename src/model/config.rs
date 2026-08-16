@@ -399,6 +399,60 @@ impl Default for KeySupplierCommonConfig {
     }
 }
 
+/// 手动导入凭据的默认值（批量导入 / 单个添加共用）。
+///
+/// 与 [`KeySupplierCommonConfig`] 分开是刻意的：那份预设服务于 webhook 自动采购，
+/// 它的 `sourceChannel` 默认就是「Webhook 自动采购」。若两者共用一份，运营调一下
+/// 手动导入的 RPM 就会顺带改掉自动采购的行为，手动导进来的号还会被打上采购来源
+/// 的标签。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialImportDefaults {
+    /// 每分钟请求数上限。0 = 不限速。
+    #[serde(default = "default_import_rpm_limit")]
+    pub rpm_limit: u32,
+    /// 每账号最大并发（in-flight 上限）。0 = 不限并发。
+    #[serde(default)]
+    pub max_concurrency: u32,
+    #[serde(default)]
+    pub priority: u32,
+    #[serde(default)]
+    pub groups: Vec<String>,
+    /// 来源渠道备注，留空则不写。
+    #[serde(default)]
+    pub source_channel: String,
+    /// 未显式指定代理时，是否自动从代理池挑一个分配给新号。
+    #[serde(default = "default_true")]
+    pub auto_assign_proxy: bool,
+    /// 自动分配时是否跳过因烧号被降权的出口。
+    ///
+    /// 新号最经不起脏出口——刚导入就被判死连观察窗口都没有。默认开启。
+    #[serde(default = "default_true")]
+    pub avoid_risky_proxies: bool,
+}
+
+/// 手动导入的默认 RPM。
+///
+/// 取 10 而不是 0：0 在凭据侧的语义是「不限速」，让新号裸奔正是要避免的
+/// ——账号级风控对高频请求敏感，一批不限速的号会很快把自己打死。
+fn default_import_rpm_limit() -> u32 {
+    10
+}
+
+impl Default for CredentialImportDefaults {
+    fn default() -> Self {
+        Self {
+            rpm_limit: default_import_rpm_limit(),
+            max_concurrency: 0,
+            priority: 0,
+            groups: Vec::new(),
+            source_channel: String::new(),
+            auto_assign_proxy: true,
+            avoid_risky_proxies: true,
+        }
+    }
+}
+
 /// 单家供货商对公共导入预设的显式覆盖。`None` 表示继承公共值。
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -902,6 +956,10 @@ pub struct Config {
     #[serde(default)]
     pub key_supplier_common: KeySupplierCommonConfig,
 
+    /// 手动导入（批量导入 / 单个添加）的默认值。与供货商预设互不影响。
+    #[serde(default)]
+    pub credential_import_defaults: CredentialImportDefaults,
+
     /// 全局号池采购配置。控制「所有采购来的号合计养几个」，跨供货商共享一个缺口。
     ///
     /// 缺失时整块取默认值（`enabled = false`），使老 `config.json` 升级后行为不变。
@@ -1359,6 +1417,7 @@ impl Default for Config {
             key_supplier: KeySupplierConfig::default(),
             key_suppliers: Vec::new(),
             key_supplier_common: KeySupplierCommonConfig::default(),
+            credential_import_defaults: CredentialImportDefaults::default(),
             key_supplier_pool: KeySupplierPoolConfig::default(),
             error_snapshot_enabled: true,
             dead_credential_auto_delete: true,

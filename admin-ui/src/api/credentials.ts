@@ -18,6 +18,8 @@ import type {
   ProxyPoolEntry,
   ProxyPoolResponse,
   ProxyBanStatsResponse,
+  CredentialImportDefaults,
+  SetImportDefaultsRequest,
   AddProxyRequest,
   ProxyCheckUrlRequest,
   BatchAddProxyRequest,
@@ -381,6 +383,21 @@ export async function updateCredential(
   req: UpdateCredentialRequest
 ): Promise<SuccessResponse> {
   const { data } = await api.put<SuccessResponse>(`/credentials/${id}`, req)
+  return data
+}
+
+// ============ 导入默认值 ============
+
+// 手动导入默认值：批量导入 / 单个添加打开时预填这些值
+export async function getImportDefaults(): Promise<CredentialImportDefaults> {
+  const { data } = await api.get<CredentialImportDefaults>('/config/import-defaults')
+  return data
+}
+
+export async function setImportDefaults(
+  req: SetImportDefaultsRequest
+): Promise<CredentialImportDefaults> {
+  const { data } = await api.put<CredentialImportDefaults>('/config/import-defaults', req)
   return data
 }
 

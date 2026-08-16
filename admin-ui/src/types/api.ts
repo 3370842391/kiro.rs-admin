@@ -321,6 +321,25 @@ export interface UpdateRefreshTokenRequest {
   expiresAt?: string
 }
 
+// 手动导入默认值（批量导入 / 单个添加共用）。与供货商「公共导入设置」互不影响
+export interface CredentialImportDefaults {
+  /** 每分钟请求数上限。0 = 不限速 */
+  rpmLimit: number
+  /** 每账号最大并发。0 = 不限并发 */
+  maxConcurrency: number
+  priority: number
+  groups: string[]
+  /** 来源渠道备注，留空则不写 */
+  sourceChannel: string
+  /** 未显式指定代理时是否自动从代理池分配 */
+  autoAssignProxy: boolean
+  /** 自动分配时跳过因烧号被降权的出口 */
+  avoidRiskyProxies: boolean
+}
+
+// 更新导入默认值。字段缺省表示不修改
+export type SetImportDefaultsRequest = Partial<CredentialImportDefaults>
+
 // 代理健康状态
 export type ProxyHealth = 'unknown' | 'healthy' | 'unhealthy'
 

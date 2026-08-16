@@ -984,6 +984,26 @@ pub struct SetLogGovernanceConfigRequest {
     pub error_snapshot_min_free_disk_gb: Option<u64>,
 }
 
+/// 更新手动导入默认值。字段缺省表示不修改。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetImportDefaultsRequest {
+    #[serde(default)]
+    pub rpm_limit: Option<u32>,
+    #[serde(default)]
+    pub max_concurrency: Option<u32>,
+    #[serde(default)]
+    pub priority: Option<u32>,
+    #[serde(default)]
+    pub groups: Option<Vec<String>>,
+    #[serde(default)]
+    pub source_channel: Option<String>,
+    #[serde(default)]
+    pub auto_assign_proxy: Option<bool>,
+    #[serde(default)]
+    pub avoid_risky_proxies: Option<bool>,
+}
+
 // ============ 代理池 ============
 
 /// 代理池条目

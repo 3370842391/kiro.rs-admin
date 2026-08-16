@@ -22,6 +22,7 @@ use super::{
         get_cache_hit_rate, get_cache_policy, get_compatibility_config, get_credential_balance,
         get_credential_models, get_dead_credential_config, get_endpoint_chains, get_endpoint_mode,
         get_error_snapshot, get_error_snapshot_payload, get_global_proxy, get_image_budget,
+        get_import_defaults,
         get_load_balancing_mode, get_log_governance_config, get_model_profiles, get_profit_config,
         get_proxy_balancing_mode, get_proxy_ban_stats, get_proxy_pool, get_retry_policy,
         get_update_config,
@@ -34,7 +35,8 @@ use super::{
         set_account_throttle_config, set_cache_hit_rate, set_cache_policy, set_client_key_disabled,
         set_compatibility_config, set_credential_disabled, set_credential_overage,
         set_credential_priority, set_dead_credential_config, set_endpoint_chains,
-        set_endpoint_mode, set_global_proxy, set_image_budget, set_load_balancing_mode,
+        set_endpoint_mode, set_global_proxy, set_image_budget, set_import_defaults,
+        set_load_balancing_mode,
         set_log_governance_config, set_model_profile_settings, set_profit_config,
         set_proxy_balancing_mode, set_proxy_enabled, set_retry_policy, set_update_config,
         start_idc_login, start_idc_relogin, start_social_login, start_social_relogin,
@@ -181,6 +183,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/dead-credentials",
             get(get_dead_credential_config).put(set_dead_credential_config),
+        )
+        .route(
+            "/config/import-defaults",
+            get(get_import_defaults).put(set_import_defaults),
         )
         .route(
             "/config/image-budget",

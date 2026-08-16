@@ -9,6 +9,7 @@ import {
   RotateCcw,
   CheckCircle2,
   Globe,
+  SlidersHorizontal,
   LogIn,
   Key,
   Building2,
@@ -62,6 +63,7 @@ import {
 import { CredentialResponseTestDialog } from "@/components/credential-response-test-dialog";
 import { type Tier } from "@/components/subscription-badge";
 import { ProxyPoolDialog } from "@/components/proxy-pool-dialog";
+import { ImportDefaultsDialog } from "@/components/import-defaults-dialog";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import {
   useCredentials,
@@ -1498,6 +1500,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     IP 代理池管理
                   </DropdownMenuItem>
                   <DropdownMenuItem
+                    onSelect={() => dialogs.setImportDefaultsOpen(true)}
+                  >
+                    <SlidersHorizontal />
+                    导入默认值
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
                     disabled={
                       resetAllSuccess.isPending || !data?.credentials?.length
                     }
@@ -1759,6 +1767,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
       <ProxyPoolDialog
         open={dialogs.proxyPoolOpen}
         onOpenChange={dialogs.setProxyPoolOpen}
+      />
+      <ImportDefaultsDialog
+        open={dialogs.importDefaultsOpen}
+        onOpenChange={dialogs.setImportDefaultsOpen}
       />
       {/* 镜像在线更新与「修改登录API密钥」两个弹窗已移除：
           它们的唯一入口是本文件此前那段独立模式顶栏，而该顶栏是死代码

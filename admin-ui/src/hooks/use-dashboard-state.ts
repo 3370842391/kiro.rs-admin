@@ -28,6 +28,8 @@ export interface DashboardDialogs {
   /** 带模式打开批量导入——两个 state 必须一起改，单独暴露 setter 容易只改一半。 */
   openBatchImport: (mode: BatchImportMode) => void
   proxyPoolOpen: boolean
+  importDefaultsOpen: boolean
+  setImportDefaultsOpen: (open: boolean) => void
   setAddOpen: (open: boolean) => void
   setBatchEditOpen: (open: boolean) => void
   setBatchImportOpen: (open: boolean) => void
@@ -47,6 +49,7 @@ export function useDashboardDialogs(): DashboardDialogs {
   const [enterpriseLoginOpen, setEnterpriseLoginOpen] = useState(false)
   const [socialLoginOpen, setSocialLoginOpen] = useState(false)
   const [proxyPoolOpen, setProxyPoolOpen] = useState(false)
+  const [importDefaultsOpen, setImportDefaultsOpen] = useState(false)
 
   const openBatchImport = useCallback((mode: BatchImportMode) => {
     setBatchImportMode(mode)
@@ -62,6 +65,8 @@ export function useDashboardDialogs(): DashboardDialogs {
     idcLoginOpen,
     openBatchImport,
     proxyPoolOpen,
+    importDefaultsOpen,
+    setImportDefaultsOpen,
     setAddOpen,
     setBatchEditOpen,
     setBatchImportOpen,

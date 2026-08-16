@@ -31,7 +31,7 @@ use crate::kiro::token_manager::{
     CredentialBatchPatch, CredentialBatchUpdateError, CredentialEntrySnapshot,
     CredentialGroupPatch, MultiTokenManager, RPM_WINDOW_SECONDS,
 };
-use crate::model::config::{Config, EndpointMode, RetryMode};
+use crate::model::config::{Config, CredentialImportDefaults, EndpointMode, RetryMode};
 
 use super::error::AdminServiceError;
 use super::model_profile_sync::{
@@ -64,7 +64,8 @@ use super::types::{
     SetCachePolicyRequest, SetCompatibilityConfigRequest, SetDeadCredentialConfigRequest,
     SetEndpointChainsRequest, SetEndpointModeRequest, SetImageBudgetRequest,
     SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetModelProfileSettingsRequest,
-    SetProfitConfigRequest, SetProxyBalancingModeRequest, SetRetryPolicyRequest,
+    SetImportDefaultsRequest, SetProfitConfigRequest, SetProxyBalancingModeRequest,
+    SetRetryPolicyRequest,
     SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
     StartSocialLoginResponse, SyncModelProfilesRequest, UpdateCheckInfo, UpdateConfigResponse,
     UpdateCredentialRequest, UpdateRefreshTokenRequest,
@@ -588,6 +589,8 @@ pub struct AdminService {
     model_profile_sync: Option<Arc<ModelProfileSyncService>>,
     /// 最近一次同步摘要（进程内）。
     last_model_profile_sync: Mutex<Option<ModelProfileSyncSummaryResponse>>,
+    /// 手动导入默认值（运行时可改）。`Config` 是启动快照，改配置必须另存运行时副本。
+    import_defaults: Mutex<CredentialImportDefaults>,
 }
 
 /// Social 登录会话状态
@@ -970,6 +973,7 @@ impl AdminService {
 
         let balance_cache = Self::load_balance_cache_from(&cache_path);
         let update_config = RuntimeUpdateConfig::from_config(token_manager.config());
+        let import_defaults = token_manager.config().credential_import_defaults.clone();
 
         let svc = Self {
             token_manager,
@@ -991,6 +995,7 @@ impl AdminService {
             model_profiles: None,
             model_profile_sync: None,
             last_model_profile_sync: Mutex::new(None),
+            import_defaults: Mutex::new(import_defaults),
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -3317,6 +3322,88 @@ impl AdminService {
             error_snapshot_capture_bodies: snapshot_policy.capture_bodies,
             error_snapshot_min_free_disk_gb: snapshot_policy.min_free_disk_bytes / GIB,
         }
+    }
+
+    /// 手动导入默认值。批量导入与单个添加打开时预填，运营仍可当次覆盖。
+    pub fn get_import_defaults(&self) -> CredentialImportDefaults {
+        self.import_defaults.lock().clone()
+    }
+
+    /// 更新手动导入默认值：改运行时副本 + 持久化到 config.json。字段缺省表示不修改。
+    pub fn set_import_defaults(
+        &self,
+        req: SetImportDefaultsRequest,
+    ) -> Result<CredentialImportDefaults, AdminServiceError> {
+        // RPM 与并发上限跟供货商预设取同一量级，避免两处口径打架
+        const MAX_RPM: u32 = 100_000;
+        const MAX_CONCURRENCY: u32 = 100_000;
+        if let Some(v) = req.rpm_limit
+            && v > MAX_RPM
+        {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "rpmLimit 超出上限 {}: {}",
+                MAX_RPM, v
+            )));
+        }
+        if let Some(v) = req.max_concurrency
+            && v > MAX_CONCURRENCY
+        {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "maxConcurrency 超出上限 {}: {}",
+                MAX_CONCURRENCY, v
+            )));
+        }
+
+        let updated = {
+            let mut current = self.import_defaults.lock();
+            if let Some(v) = req.rpm_limit {
+                current.rpm_limit = v;
+            }
+            if let Some(v) = req.max_concurrency {
+                current.max_concurrency = v;
+            }
+            if let Some(v) = req.priority {
+                current.priority = v;
+            }
+            if let Some(v) = req.groups {
+                current.groups = v;
+            }
+            if let Some(v) = req.source_channel {
+                current.source_channel = v.trim().to_string();
+            }
+            if let Some(v) = req.auto_assign_proxy {
+                current.auto_assign_proxy = v;
+            }
+            if let Some(v) = req.avoid_risky_proxies {
+                current.avoid_risky_proxies = v;
+            }
+            current.clone()
+        };
+
+        if let Err(error) = self.persist_import_defaults(&updated) {
+            tracing::warn!(%error, "持久化导入默认值失败（运行时已生效）");
+        }
+        Ok(updated)
+    }
+
+    fn persist_import_defaults(&self, value: &CredentialImportDefaults) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let Some(config_path) = self
+            .token_manager
+            .config()
+            .config_path()
+            .map(|p| p.to_path_buf())
+        else {
+            tracing::warn!("配置文件路径未知，导入默认值仅在当前进程生效");
+            return Ok(());
+        };
+        let mut config = crate::model::config::Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.credential_import_defaults = value.clone();
+        config
+            .save()
+            .with_context(|| format!("持久化导入默认值失败: {}", config_path.display()))?;
+        Ok(())
     }
 
     /// 死号治理配置：判死后的保留策略，以及当前死号统计。

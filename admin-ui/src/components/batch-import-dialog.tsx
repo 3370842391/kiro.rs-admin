@@ -15,6 +15,7 @@ import { useGroupOptions } from '@/hooks/use-groups'
 import { GroupMultiSelect } from '@/components/group-select'
 import {
   batchImportCredentials,
+  getImportDefaults,
   getProxyPool,
   type BatchImportItemEvent,
   type BatchImportSummary,
@@ -335,6 +336,26 @@ export function BatchImportDialog({
     queryFn: getProxyPool,
     enabled: open,
   })
+  const { data: importDefaults } = useQuery({
+    queryKey: ['import-defaults'],
+    queryFn: getImportDefaults,
+    enabled: open,
+  })
+
+  // 打开时用全局导入默认值预填，运营仍可当次改。只在字段还没被动过时填，
+  // 避免默认值到货（异步）时把用户已经输入的内容冲掉。
+  const prefilledRef = useRef(false)
+  useEffect(() => {
+    if (!open) {
+      prefilledRef.current = false
+      return
+    }
+    if (!importDefaults || prefilledRef.current) return
+    prefilledRef.current = true
+    setUniformRpmLimit(String(importDefaults.rpmLimit))
+    setUniformMaxConcurrency(String(importDefaults.maxConcurrency))
+    if (importDefaults.groups.length > 0) setGroups(importDefaults.groups)
+  }, [open, importDefaults])
 
   const resetForm = () => {
     setImportMode(initialMode)
@@ -345,10 +366,10 @@ export function BatchImportDialog({
     setProgress({ current: 0, total: 0 })
     setCurrentProcessing('')
     setResults([])
-    setGroups([])
+    setGroups(importDefaults?.groups ?? [])
     setUniformProxyUrl('')
-    setUniformRpmLimit('')
-    setUniformMaxConcurrency('')
+    setUniformRpmLimit(importDefaults ? String(importDefaults.rpmLimit) : '')
+    setUniformMaxConcurrency(importDefaults ? String(importDefaults.maxConcurrency) : '')
     if (fileInputRef.current) fileInputRef.current.value = ''
   }
 
@@ -470,8 +491,23 @@ export function BatchImportDialog({
           .filter((hash): hash is string => Boolean(hash)) || []
       )
 
-      // 可用的代理池条目（用于无代理凭据的随机分配）
-      const enabledProxies = proxyPool?.proxies.filter(p => p.enabled) ?? []
+      // 可用的代理池条目（用于无代理凭据的随机分配）。
+      // 默认跳过因烧号被降权的出口——新号最经不起脏 IP，刚导入就被判死连观察
+      // 窗口都没有。全池都被降权时不做过滤，否则会一个代理都分不出去。
+      const allEnabledProxies = proxyPool?.proxies.filter(p => p.enabled) ?? []
+      const cleanProxies =
+        importDefaults?.avoidRiskyProxies === false
+          ? allEnabledProxies
+          : allEnabledProxies.filter(p => (p.risk?.selectionTier ?? 'normal') === 'normal')
+      const assignableProxies = cleanProxies.length > 0 ? cleanProxies : allEnabledProxies
+      const enabledProxies = importDefaults?.autoAssignProxy === false ? [] : assignableProxies
+      const skippedRiskyCount = allEnabledProxies.length - assignableProxies.length
+      if (skippedRiskyCount > 0 && enabledProxies.length > 0) {
+        toast.info(`自动分配代理时跳过了 ${skippedRiskyCount} 个已降权的出口`)
+      }
+
+      const defaultPriority = importDefaults?.priority ?? 0
+      const defaultSourceChannel = importDefaults?.sourceChannel?.trim() || undefined
 
       // 本地预处理：代理分配 + 去重 + 校验 + 构造请求。
       // 不通过的行直接标终态；通过的收集进 toImport，记录其原始下标，
@@ -492,8 +528,11 @@ export function BatchImportDialog({
           const picked = enabledProxies[Math.floor(Math.random() * enabledProxies.length)]
           cred.proxyUrl = picked.url
         }
-        const rpmLimit = rpmOverride ?? cred.rpmLimit ?? 0
-        const maxConcurrency = maxConcurrencyOverride ?? cred.maxConcurrency ?? 0
+        // 兜底取全局导入默认值而不是 0：0 在凭据侧的语义是「不限速 / 不限并发」，
+        // 让新号裸奔正是账号级风控最容易抓的行为。
+        const rpmLimit = rpmOverride ?? cred.rpmLimit ?? importDefaults?.rpmLimit ?? 10
+        const maxConcurrency =
+          maxConcurrencyOverride ?? cred.maxConcurrency ?? importDefaults?.maxConcurrency ?? 0
         const isApiKeyCred = !!(cred.kiroApiKey?.trim()) || cred.authMethod === 'api_key'
 
         updateResult(i, { status: 'checking' })
@@ -521,9 +560,10 @@ export function BatchImportDialog({
               authMethod: 'api_key',
               kiroApiKey: apiKey,
               nickname: cred.nickname?.trim() || undefined,
-              priority: cred.priority || 0,
+              priority: cred.priority ?? defaultPriority,
               rpmLimit,
               maxConcurrency,
+              sourceChannel: defaultSourceChannel,
               authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
               apiRegion: cred.apiRegion?.trim() || undefined,
               machineId: cred.machineId?.trim() || undefined,
@@ -601,9 +641,10 @@ export function BatchImportDialog({
               tokenEndpoint: isExternalIdp ? tokenEndpoint : undefined,
               issuerUrl: isExternalIdp ? issuerUrl : undefined,
               scopes: isExternalIdp ? scopes : undefined,
-              priority: cred.priority || 0,
+              priority: cred.priority ?? defaultPriority,
               rpmLimit,
               maxConcurrency,
+              sourceChannel: defaultSourceChannel,
               machineId: cred.machineId?.trim() || undefined,
               endpoint: cred.endpoint?.trim() || undefined,
               nickname: cred.nickname?.trim() || undefined,
