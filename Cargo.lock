@@ -1206,7 +1206,7 @@ dependencies = [
 
 [[package]]
 name = "kiro-rs"
-version = "0.9.55"
+version = "0.9.56"
 dependencies = [
  "anyhow",
  "atomicwrites",
