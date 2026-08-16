@@ -875,6 +875,11 @@ fn is_routine_trace_only_error(error_type: &str) -> bool {
             | outcome::TRANSIENT
             | outcome::NETWORK_ERROR
             | outcome::BAD_REQUEST
+            // 下面两类的请求根本没发到上游：一个是号池空了，一个是没账号提供该模型。
+            // 结论与请求内容无关，存现场只是把对话正文落盘。线上这两类曾占快照库
+            // 3.1 GB / 95%，全部是纯浪费；trace 里仍有完整记录可查。
+            | outcome::NO_AVAILABLE_CREDENTIALS
+            | outcome::MODEL_NOT_AVAILABLE
     )
 }
 
@@ -1238,6 +1243,36 @@ mod tests {
         assert_eq!(envelope["sha256"].as_str().unwrap().len(), 64);
         assert!(envelope["head"].as_str().unwrap().contains(HEAD_MARKER));
         assert!(envelope["tail"].as_str().unwrap().contains(TAIL_MARKER));
+    }
+
+    /// 号池耗尽与「没账号提供该模型」都不该进快照库。
+    ///
+    /// 这两类请求根本没发到上游，请求体对结论毫无帮助；此前它们落成 `unknown`
+    /// 绕过白名单，线上因此攒了 3.1 GB（占快照库 95%）纯浪费的现场。
+    #[test]
+    fn pool_exhausted_and_model_unavailable_stay_trace_only() {
+        for error_type in [
+            outcome::NO_AVAILABLE_CREDENTIALS,
+            outcome::MODEL_NOT_AVAILABLE,
+        ] {
+            let store = test_store();
+            let ctx = sample_context(store.clone(), true, true);
+            let id = ctx
+                .finalize(SnapshotFinalState::error(error_type, Some(503)))
+                .unwrap();
+            assert!(id.is_none(), "{error_type} 不该生成快照");
+            assert_eq!(
+                store
+                    .query_paged(&crate::admin::error_snapshot_db::SnapshotQuery {
+                        limit: 10,
+                        ..Default::default()
+                    })
+                    .unwrap()
+                    .total,
+                0,
+                "{error_type} 不该落库"
+            );
+        }
     }
 
     #[test]

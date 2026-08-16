@@ -609,6 +609,35 @@ fn record_strict_json_recovery(tracer: &RequestTracer, attempts: usize) {
     }
 }
 
+/// 从 provider 错误文本识别「请求根本没出站」的确定性终态。
+///
+/// 这两类失败没有 attempt 可归类，此前一路落成 `unknown`，于是绕过了
+/// [`is_routine_trace_only_error`](super::error_snapshot) 的快照白名单：线上因此
+/// 攒下 3.1 GB 全是这两类的请求体快照，而它们的请求体对结论毫无帮助——一个是
+/// 号池空了，一个是没账号提供该模型，都跟请求内容无关。
+fn terminal_provider_outcome(err: &Error) -> Option<&'static str> {
+    let text = err.to_string();
+    if text.contains("所有凭据均已禁用") {
+        return Some(outcome::NO_AVAILABLE_CREDENTIALS);
+    }
+    if text.contains("MODEL_NOT_AVAILABLE") {
+        return Some(outcome::MODEL_NOT_AVAILABLE);
+    }
+    None
+}
+
+/// provider 整体失败时的 error_type：优先用最后一跳的具体分类，
+/// 它缺失或为 `unknown` 时再退回按错误文本识别的终态。
+fn provider_failure_outcome(tracer: &RequestTracer, err: &Error) -> Option<&'static str> {
+    let attempt = last_attempt_outcome(tracer);
+    if matches!(attempt, None | Some(outcome::UNKNOWN))
+        && let Some(terminal) = terminal_provider_outcome(err)
+    {
+        return Some(terminal);
+    }
+    attempt
+}
+
 /// 取追踪器里最后一跳的 outcome（用于把 provider 的失败分类提升到 record.error_type）。
 /// 返回 'static str（outcome 常量），无 attempt 时返回 None。
 fn last_attempt_outcome(tracer: &RequestTracer) -> Option<&'static str> {
@@ -681,8 +710,49 @@ struct ClassifiedProviderError {
     public_message: &'static str,
 }
 
+/// 号池耗尽时回给客户端的文案。也用作日志节流的判定键——它是这条链路上唯一
+/// 稳定可比的标识，`StreamStartFailure` 传到日志点时原始错误已经丢了。
+const POOL_EXHAUSTED_MESSAGE: &str =
+    "No upstream account is currently available. All credentials are disabled, throttled, or out of quota.";
+
+/// 号池耗尽是运营状态不是缺陷，按请求刷 ERROR 会把真正的问题淹掉
+/// （线上 720 小时里它自己就刷了 6.2 万条）。首条与之后每 60 秒各记一条，
+/// 带上期间被压掉的条数；其余降到 DEBUG。
+fn log_pool_exhausted(err: &dyn std::fmt::Display) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_LOGGED_SECS: AtomicU64 = AtomicU64::new(0);
+    static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+    const INTERVAL_SECS: u64 = 60;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_LOGGED_SECS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < INTERVAL_SECS
+        || LAST_LOGGED_SECS
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(error = %err, "号池耗尽（已节流）");
+        return;
+    }
+    let suppressed = SUPPRESSED.swap(0, Ordering::Relaxed);
+    tracing::error!(error = %err, suppressed, "号池耗尽：没有可用凭据");
+}
+
 fn classify_provider_error(err: &Error) -> ClassifiedProviderError {
     let text = err.to_string();
+    if text.contains("所有凭据均已禁用") {
+        // 503 而不是笼统的 502：区别在于「上游挂了」还是「我们这边没号了」，
+        // 客户端据此决定是重试还是告警，此前一律 502 分不出来。
+        return ClassifiedProviderError {
+            http_status: StatusCode::SERVICE_UNAVAILABLE,
+            error_type: "api_error",
+            public_message: POOL_EXHAUSTED_MESSAGE,
+        };
+    }
     if text.contains("MODEL_NOT_AVAILABLE") {
         return ClassifiedProviderError {
             http_status: StatusCode::BAD_REQUEST,
@@ -723,6 +793,8 @@ pub(super) fn map_provider_error(err: Error) -> Response {
     let classified = classify_provider_error(&err);
     if classified.http_status.is_client_error() {
         tracing::warn!(error = %err, "上游拒绝了客户端请求");
+    } else if classified.public_message == POOL_EXHAUSTED_MESSAGE {
+        log_pool_exhausted(&err);
     } else {
         tracing::error!(error = %err, "Kiro API 调用失败");
     }
@@ -2834,7 +2906,7 @@ async fn handle_stream_request(
             // 重试链路全部失败、未开始返回内容：error_type 取最后一跳分类
             tracer.finalize(
                 "error",
-                last_attempt_outcome(&tracer),
+                provider_failure_outcome(&tracer, &e),
                 Some(&e.to_string()),
                 None,
                 TraceUsage::zero(),
@@ -2962,7 +3034,7 @@ fn create_early_sse_stream(
                 setup
                     .hook
                     .record(0, setup.attempt.input_tokens, 0, 0, 0, 0.0, "error");
-                let error_type = last_attempt_outcome(&setup.tracer);
+                let error_type = provider_failure_outcome(&setup.tracer, &err);
                 let error_text = err.to_string();
                 setup.tracer.finalize(
                     "error",
@@ -3249,6 +3321,8 @@ fn classify_stream_completion(
 fn stream_start_failure_response(failure: StreamStartFailure) -> Response {
     if failure.status.is_client_error() {
         tracing::warn!(error_type = %failure.error_type, message = %failure.message, "流式请求在发送响应前失败");
+    } else if failure.message == POOL_EXHAUSTED_MESSAGE {
+        log_pool_exhausted(&failure.message);
     } else {
         tracing::error!(error_type = %failure.error_type, message = %failure.message, "上游未产生可交付的助手内容");
     }
@@ -3805,7 +3879,7 @@ async fn run_realtime_sse_attempts(
                 Err(error) => {
                     hook.record(0, setup.input_tokens, 0, 0, 0, 0.0, "error");
                     let upstream_status = tracer.last_http_status();
-                    let error_type = last_attempt_outcome(&tracer);
+                    let error_type = provider_failure_outcome(&tracer, &error);
                     let message = error.to_string();
                     tracer.finalize(
                         "error",
@@ -3816,10 +3890,15 @@ async fn run_realtime_sse_attempts(
                     );
                     signal_stream_start_failure(
                         &mut start_tx,
-                        StreamStartFailure {
-                            status: StatusCode::BAD_GATEWAY,
-                            error_type: "api_error".to_string(),
-                            message: "Upstream API request failed.".to_string(),
+                        // 走分类器而不是写死 502：号池耗尽和上游故障对客户端
+                        // 是两回事，写死会让所有失败都长成一个样子。
+                        {
+                            let classified = classify_provider_error(&error);
+                            StreamStartFailure {
+                                status: classified.http_status,
+                                error_type: classified.error_type.to_string(),
+                                message: classified.public_message.to_string(),
+                            }
                         },
                     );
                     let _ = sender
@@ -4860,7 +4939,7 @@ async fn handle_non_stream_request(
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
             tracer.finalize(
                 "error",
-                last_attempt_outcome(&tracer),
+                provider_failure_outcome(&tracer, &error),
                 Some(&error.to_string()),
                 None,
                 TraceUsage::zero(),
@@ -5791,7 +5870,7 @@ async fn handle_stream_request_buffered(
             hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
             tracer.finalize(
                 "error",
-                last_attempt_outcome(&tracer),
+                provider_failure_outcome(&tracer, &e),
                 Some(&e.to_string()),
                 None,
                 TraceUsage::zero(),
@@ -5903,7 +5982,7 @@ async fn run_buffered_sse_attempts(
                 Err(error) => {
                     hook.record(0, setup.input_tokens, 0, 0, 0, 0.0, "error");
                     let upstream_status = tracer.last_http_status();
-                    let error_type = last_attempt_outcome(&tracer);
+                    let error_type = provider_failure_outcome(&tracer, &error);
                     let message = error.to_string();
                     tracer.finalize(
                         "error",
@@ -5914,10 +5993,15 @@ async fn run_buffered_sse_attempts(
                     );
                     signal_stream_start_failure(
                         &mut start_tx,
-                        StreamStartFailure {
-                            status: StatusCode::BAD_GATEWAY,
-                            error_type: "api_error".to_string(),
-                            message: "Upstream API request failed.".to_string(),
+                        // 走分类器而不是写死 502：号池耗尽和上游故障对客户端
+                        // 是两回事，写死会让所有失败都长成一个样子。
+                        {
+                            let classified = classify_provider_error(&error);
+                            StreamStartFailure {
+                                status: classified.http_status,
+                                error_type: classified.error_type.to_string(),
+                                message: classified.public_message.to_string(),
+                            }
                         },
                     );
                     let _ = sender
@@ -7491,6 +7575,36 @@ mod tests {
     fn strict_thinking_rejects_plain_text_without_reasoning_block() {
         let content = vec![serde_json::json!({"type": "text", "text": "plain"})];
         assert!(validate_required_thinking(true, true, &content).is_err());
+    }
+
+    /// 号池耗尽要能和「上游挂了」区分开：503 而不是笼统的 502，
+    /// 并且要被分类成能命中快照白名单的 error_type。
+    #[test]
+    fn pool_exhausted_maps_to_503_and_a_classified_outcome() {
+        let err = anyhow::anyhow!("Kiro API 请求失败: 所有凭据均已禁用（0/42）");
+        let classified = classify_provider_error(&err);
+        assert_eq!(classified.http_status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(classified.public_message, POOL_EXHAUSTED_MESSAGE);
+        assert_eq!(
+            terminal_provider_outcome(&err),
+            Some(outcome::NO_AVAILABLE_CREDENTIALS)
+        );
+    }
+
+    #[test]
+    fn unavailable_model_is_classified_for_snapshot_suppression() {
+        let err = anyhow::anyhow!(
+            "MODEL_NOT_AVAILABLE: requested model is unavailable for configured credentials"
+        );
+        assert_eq!(
+            terminal_provider_outcome(&err),
+            Some(outcome::MODEL_NOT_AVAILABLE)
+        );
+        // 上游真故障不该被误判成这两类终态
+        assert_eq!(
+            terminal_provider_outcome(&anyhow::anyhow!("upstream 500 Internal Server Error")),
+            None
+        );
     }
 
     #[test]

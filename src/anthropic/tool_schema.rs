@@ -815,6 +815,7 @@ fn validate_object(
 
     if let Some(properties) = properties {
         repair_required_property_aliases(properties, &required, object, path, repairs);
+        repair_case_insensitive_required_properties(properties, &required, object, path, repairs);
     }
 
     if let Some(properties) = properties {
@@ -923,6 +924,71 @@ fn repair_required_property_aliases(
         let value = object
             .remove(source)
             .expect("source alias was checked before removal");
+        object.insert(target.to_string(), value);
+        repairs.push(property_path(path, target));
+    }
+}
+
+/// 规范化属性名：小写并去掉 `_` / `-`，让 `filePath` / `file_path` / `FilePath` 等价。
+fn normalize_property_key(name: &str) -> String {
+    name.chars()
+        .filter(|c| *c != '_' && *c != '-')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// 大小写 / 分隔符不敏感的必填字段兜底改名。
+///
+/// [`SAFE_REQUIRED_PROPERTY_ALIASES`] 是逐对硬编码的，追不上线上的实际形态：上游按
+/// 自己那套命名回参数，客户端 schema 用另一种写法，于是 `filePath` vs `file_path`、
+/// `SearchPath` vs `search_path`、`isRegexp` vs `is_regexp`、`Query` vs `query` 全部
+/// 撞 missing required 整轮失败（线上 7 天 400+ 条，重试也救不回来，因为上游会再发
+/// 一遍同样的命名）。这里改成规范化后比对，一条规则覆盖全部大小写变体。
+///
+/// 只在下列条件**同时**成立时改名，宁可不修也不猜错：
+/// 1. 目标字段 required 且当前缺失；
+/// 2. 现有键里规范化后恰好只有一个能对上——有歧义就不动；
+/// 3. 该源键本身不是 schema 声明的属性，否则搬走会弄坏它自己的校验；
+/// 4. 源值类型与目标声明的类型相符。
+fn repair_case_insensitive_required_properties(
+    properties: &serde_json::Map<String, serde_json::Value>,
+    required: &std::collections::HashSet<&str>,
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    path: &str,
+    repairs: &mut Vec<String>,
+) {
+    let missing: Vec<&str> = required
+        .iter()
+        .copied()
+        .filter(|target| !object.contains_key(*target) && properties.contains_key(*target))
+        .collect();
+
+    for target in missing {
+        let normalized_target = normalize_property_key(target);
+        let mut matches = object
+            .keys()
+            .filter(|key| {
+                !properties.contains_key(*key)
+                    && normalize_property_key(key) == normalized_target
+            })
+            .cloned();
+        let (Some(source), None) = (matches.next(), matches.next()) else {
+            continue;
+        };
+
+        let Some(declared_type) = properties.get(target).and_then(|s| s.get("type")) else {
+            continue;
+        };
+        let Some(source_value) = object.get(&source) else {
+            continue;
+        };
+        if !matches_declared_type(declared_type, source_value) {
+            continue;
+        }
+
+        let value = object
+            .remove(&source)
+            .expect("source key was resolved from the same object");
         object.insert(target.to_string(), value);
         repairs.push(property_path(path, target));
     }
@@ -1108,6 +1174,90 @@ mod tests {
                 )]))
             );
         }
+    }
+
+    /// 线上实测的高频形态：上游按自己的命名回参数，客户端 schema 用另一种写法。
+    #[test]
+    fn repairs_case_and_separator_variants_of_required_properties() {
+        for (source, target) in [
+            ("filepath", "filePath"),
+            ("file_path", "filePath"),
+            ("FilePath", "filePath"),
+            ("search_path", "SearchPath"),
+            ("searchPath", "SearchPath"),
+            ("query", "Query"),
+            ("is_regexp", "isRegexp"),
+            ("file_key", "fileKey"),
+            ("start_line", "startLine"),
+        ] {
+            let mut schema = serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": [target],
+                "additionalProperties": true
+            });
+            schema["properties"][target] = serde_json::json!({"type": "string"});
+            let mut input = serde_json::json!({});
+            input[source] = serde_json::json!("v");
+
+            assert_eq!(
+                validate_and_repair(&schema, &mut input),
+                ToolInputOutcome::Repaired {
+                    paths: vec![format!("$.{target}")]
+                },
+                "{source} 应被改名为 {target}"
+            );
+            assert_eq!(input, serde_json::json!({ target: "v" }));
+        }
+    }
+
+    #[test]
+    fn case_insensitive_repair_skips_ambiguous_and_type_mismatched_sources() {
+        // 用 SearchPath：它不在 SAFE_REQUIRED_PROPERTY_ALIASES 里，
+        // 否则会先被那条硬编码规则修掉，测不到这里的兜底逻辑。
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"SearchPath": {"type": "string"}},
+            "required": ["SearchPath"],
+            "additionalProperties": true
+        });
+
+        // 两个键规范化后都对得上目标：有歧义，不动
+        let mut ambiguous = serde_json::json!({"search_path": "a", "SEARCHPATH": "b"});
+        assert!(matches!(
+            validate_and_repair(&schema, &mut ambiguous),
+            ToolInputOutcome::Invalid { .. }
+        ));
+
+        // 类型对不上：不改名，照常报缺失
+        let mut wrong_type = serde_json::json!({"search_path": 42});
+        assert!(matches!(
+            validate_and_repair(&schema, &mut wrong_type),
+            ToolInputOutcome::Invalid { .. }
+        ));
+    }
+
+    /// 源键本身也是 schema 声明的属性时不能搬走，否则会弄坏它自己的校验。
+    #[test]
+    fn case_insensitive_repair_never_steals_a_declared_property() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "Path": {"type": "string"}
+            },
+            "required": ["Path"],
+            "additionalProperties": true
+        });
+        let mut input = serde_json::json!({"path": "/tmp/a"});
+        assert!(
+            matches!(
+                validate_and_repair(&schema, &mut input),
+                ToolInputOutcome::Invalid { .. }
+            ),
+            "path 是已声明属性，不该被搬去填 Path"
+        );
+        assert_eq!(input, serde_json::json!({"path": "/tmp/a"}));
     }
 
     #[test]

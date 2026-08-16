@@ -189,6 +189,14 @@ pub mod outcome {
     pub const CLIENT_DISCONNECTED: &str = "client_disconnected";
     /// 上游 200 但一个助手内容都没给（重试后仍然如此）
     pub const UPSTREAM_EMPTY_RESPONSE: &str = "upstream_empty_response";
+    /// 号池耗尽：一个可用凭据都没有，请求根本没发到上游。
+    ///
+    /// 单列一类是为了让它命中快照白名单。此前它一路落成 `unknown`，于是每个请求
+    /// 都被完整存档——线上 27.8 万条、2.7 GB，占了整个快照库的 83%，而请求体对
+    /// 「没号可用」这个结论没有任何诊断价值。
+    pub const NO_AVAILABLE_CREDENTIALS: &str = "no_available_credentials";
+    /// 配置的账号里没有一个提供客户端请求的模型。同样是请求未出站的确定性终态。
+    pub const MODEL_NOT_AVAILABLE: &str = "model_not_available";
 }
 
 /// 把上游错误体截断到安全长度（按字符边界，避免切碎 UTF-8）
