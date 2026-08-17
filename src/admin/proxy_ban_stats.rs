@@ -22,6 +22,13 @@ use tokio::sync::Notify;
 /// 每个代理最多保留多少条封号明细（聚合计数不受此限制，只截断明细列表）
 const MAX_EVENTS_PER_PROXY: usize = 500;
 
+/// 批量清扫检测：观察窗口（分钟）
+const SWEEP_WINDOW_MINS: i64 = 20;
+/// 窗口内至少这么多次封号才算异常
+const SWEEP_MIN_BANS: usize = 3;
+/// 且必须横跨这么多个不同出口——同一个出口连掉几个号是另一回事
+const SWEEP_MIN_EXITS: usize = 2;
+
 /// 单次封号事件
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -103,6 +110,18 @@ pub struct ProxyBanSummary {
     pub first_ban_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_ban_at: Option<String>,
+}
+
+/// 批量清扫的观测摘要
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SweepSummary {
+    pub bans: usize,
+    pub distinct_exits: usize,
+    pub window_mins: i64,
+    pub credentials: Vec<u64>,
+    /// 窗口内最短 / 最长存活时长。两者差距越大，越不可能是「每个号各自到寿命」。
+    pub survival_min_secs: Option<i64>,
+    pub survival_max_secs: Option<i64>,
 }
 
 /// 一次封号观测，由调用方填好后交给台账
@@ -306,6 +325,69 @@ impl ProxyBanLedger {
         self.persist();
         self.ban_signal.notify_waiters();
         true
+    }
+
+    /// 检测「上游正在批量清扫」：短窗口内多次封号且横跨多个出口。
+    ///
+    /// 逐条封号日志看不出这个形态——必须把时间线拉出来横向对比才能发现「刚导入
+    /// 6 分钟的号和活了 3 小时的号一起死」。而这恰恰是「上游按墙钟批量扫号」与
+    /// 「每个号各自到寿命」的分水岭：前者说明封号与出口、用量都无关，折腾代理池
+    /// 是白费力气。2026-08-17 那次排查靠人工重建时间线才看出来，所以让程序直接讲。
+    ///
+    /// 要求横跨 `SWEEP_MIN_EXITS` 个出口：同一个出口连掉几个号是「出口可能脏」，
+    /// 与「无差别清扫」是两个结论，不能混。
+    pub fn detect_sweep(&self) -> Option<SweepSummary> {
+        let cutoff = chrono::Utc::now() - chrono::Duration::minutes(SWEEP_WINDOW_MINS);
+        let mut exits = std::collections::BTreeSet::new();
+        let mut credentials = Vec::new();
+        let mut survivals = Vec::new();
+        {
+            let data = self.data.lock();
+            for (key, record) in data.proxies.iter() {
+                for event in &record.events {
+                    let recent = chrono::DateTime::parse_from_rfc3339(&event.banned_at)
+                        .ok()
+                        .is_some_and(|ts| ts.with_timezone(&chrono::Utc) >= cutoff);
+                    if recent {
+                        exits.insert(key.clone());
+                        credentials.push(event.credential_id);
+                        if let Some(secs) = event.survival_secs {
+                            survivals.push(secs);
+                        }
+                    }
+                }
+            }
+        }
+
+        if credentials.len() < SWEEP_MIN_BANS || exits.len() < SWEEP_MIN_EXITS {
+            return None;
+        }
+        survivals.sort_unstable();
+        credentials.sort_unstable();
+        Some(SweepSummary {
+            bans: credentials.len(),
+            distinct_exits: exits.len(),
+            window_mins: SWEEP_WINDOW_MINS,
+            credentials,
+            survival_min_secs: survivals.first().copied(),
+            survival_max_secs: survivals.last().copied(),
+        })
+    }
+
+    /// 刚记下一次封号后调用：命中清扫特征就打一条汇总。
+    pub fn warn_if_sweep(&self) {
+        let Some(sweep) = self.detect_sweep() else {
+            return;
+        };
+        tracing::error!(
+            bans = sweep.bans,
+            distinct_exits = sweep.distinct_exits,
+            window_mins = sweep.window_mins,
+            credentials = ?sweep.credentials,
+            survival_min_secs = sweep.survival_min_secs.unwrap_or(-1),
+            survival_max_secs = sweep.survival_max_secs.unwrap_or(-1),
+            "疑似上游批量清扫：多个出口同时掉号。存活时长跨度越大，越说明封号与出口和用量无关"
+        );
     }
 
     /// 登记「这些凭据当前绑在这些代理上」，为封号率提供分母。
@@ -1002,6 +1084,61 @@ mod tests {
         let summary = ledger.summary_for(proxy);
         assert_eq!(summary.accounts_seen, 1);
         assert_eq!(summary.ban_rate, Some(1.0));
+    }
+
+    #[test]
+    fn sweep_needs_multiple_exits_not_just_multiple_bans() {
+        let ledger = ProxyBanLedger::new(None);
+        let now = chrono::Utc::now();
+        let recent = |mins: i64| (now - chrono::Duration::minutes(mins)).to_rfc3339();
+
+        // 同一个出口连掉 3 个号：那是「出口可能脏」，不是无差别清扫
+        for id in 1..=3 {
+            ledger.record_ban(obs(id, Some("socks5://1.1.1.1:1080"), &recent(5), None));
+        }
+        assert_eq!(ledger.detect_sweep(), None);
+
+        // 换个出口再掉一个 -> 跨出口，命中清扫特征
+        ledger.record_ban(obs(4, Some("socks5://2.2.2.2:1080"), &recent(3), None));
+        let sweep = ledger.detect_sweep().expect("应识别为批量清扫");
+        assert_eq!(sweep.bans, 4);
+        assert_eq!(sweep.distinct_exits, 2);
+        assert_eq!(sweep.credentials, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn sweep_ignores_bans_outside_the_window() {
+        let ledger = ProxyBanLedger::new(None);
+        let now = chrono::Utc::now();
+        // 三个号分散在几小时里，各自到寿命，不该报清扫
+        ledger.record_ban(obs(1, Some("socks5://1.1.1.1:1080"),
+            &(now - chrono::Duration::hours(3)).to_rfc3339(), None));
+        ledger.record_ban(obs(2, Some("socks5://2.2.2.2:1080"),
+            &(now - chrono::Duration::hours(2)).to_rfc3339(), None));
+        ledger.record_ban(obs(3, Some("socks5://3.3.3.3:1080"),
+            &(now - chrono::Duration::minutes(1)).to_rfc3339(), None));
+        assert_eq!(ledger.detect_sweep(), None);
+    }
+
+    #[test]
+    fn sweep_reports_survival_spread() {
+        // 存活跨度是关键证据：6 分钟的新号和 3 小时的老号一起死，
+        // 说明不是每个号各自到寿命，而是被同时端掉
+        let ledger = ProxyBanLedger::new(None);
+        let now = chrono::Utc::now();
+        let banned = (now - chrono::Duration::minutes(2)).to_rfc3339();
+        for (id, age_mins, exit) in [
+            (1u64, 6i64, "socks5://1.1.1.1:1080"),
+            (2, 191, "socks5://2.2.2.2:1080"),
+            (3, 66, "socks5://3.3.3.3:1080"),
+        ] {
+            let added = (now - chrono::Duration::minutes(2 + age_mins)).to_rfc3339();
+            ledger.record_ban(obs(id, Some(exit), &banned, Some(&added)));
+        }
+        let sweep = ledger.detect_sweep().expect("应识别为批量清扫");
+        assert_eq!(sweep.distinct_exits, 3);
+        assert_eq!(sweep.survival_min_secs, Some(6 * 60));
+        assert_eq!(sweep.survival_max_secs, Some(191 * 60));
     }
 
     #[test]

@@ -491,7 +491,7 @@ export function BatchImportDialog({
           .filter((hash): hash is string => Boolean(hash)) || []
       )
 
-      // 可用的代理池条目（用于无代理凭据的随机分配）。
+      // 可用的代理池条目（用于无代理凭据的自动分配）。
       // 默认跳过因烧号被降权的出口——新号最经不起脏 IP，刚导入就被判死连观察
       // 窗口都没有。全池都被降权时不做过滤，否则会一个代理都分不出去。
       const allEnabledProxies = proxyPool?.proxies.filter(p => p.enabled) ?? []
@@ -504,6 +504,23 @@ export function BatchImportDialog({
       const skippedRiskyCount = allEnabledProxies.length - assignableProxies.length
       if (skippedRiskyCount > 0 && enabledProxies.length > 0) {
         toast.info(`自动分配代理时跳过了 ${skippedRiskyCount} 个已降权的出口`)
+      }
+
+      // 按当前负载最低挑出口，而不是随机。
+      //
+      // 随机挑会撞：28 个出口里导 10 个号，约 80% 概率至少两个号落在同一出口。
+      // 同出口并发是我们这边唯一能控的变量，没有理由白白让它发生。
+      // 起始负载取代理池上报的 credentialCount（已有的活号），再叠加本次导入
+      // 已分配的数量，这样跨多次导入也不会往同一个出口上堆。
+      const proxyLoad = new Map(enabledProxies.map(p => [p.url, p.credentialCount]))
+      const pickLeastLoadedProxy = (): string | undefined => {
+        if (enabledProxies.length === 0) return undefined
+        const minLoad = Math.min(...enabledProxies.map(p => proxyLoad.get(p.url) ?? 0))
+        // 同负载的出口之间随机，避免每次导入都从同一个出口开始堆
+        const tied = enabledProxies.filter(p => (proxyLoad.get(p.url) ?? 0) === minLoad)
+        const picked = tied[Math.floor(Math.random() * tied.length)]
+        proxyLoad.set(picked.url, minLoad + 1)
+        return picked.url
       }
 
       const defaultPriority = importDefaults?.priority ?? 0
@@ -521,12 +538,11 @@ export function BatchImportDialog({
           continue
         }
 
-        // 统一代理优先级最高；否则沿用 JSON 内单条代理；都没有时保持现有随机分配代理池逻辑。
+        // 统一代理优先级最高；否则沿用 JSON 内单条代理；都没有时从代理池按负载最低分配。
         if (proxyOverride) {
           cred.proxyUrl = proxyOverride
-        } else if (!cred.proxyUrl?.trim() && enabledProxies.length > 0) {
-          const picked = enabledProxies[Math.floor(Math.random() * enabledProxies.length)]
-          cred.proxyUrl = picked.url
+        } else if (!cred.proxyUrl?.trim()) {
+          cred.proxyUrl = pickLeastLoadedProxy() ?? cred.proxyUrl
         }
         // 兜底取全局导入默认值而不是 0：0 在凭据侧的语义是「不限速 / 不限并发」，
         // 让新号裸奔正是账号级风控最容易抓的行为。

@@ -1526,6 +1526,12 @@ pub struct MultiTokenManager {
     /// 判死时必须就地记下「是哪个代理烧掉了这个号」：`cleanup_dead_credentials`
     /// 会在保留期后把整条凭据删掉，那之后就再也无法回答这个问题了。
     ban_ledger: OnceLock<Arc<crate::admin::proxy_ban_stats::ProxyBanLedger>>,
+    /// 曾经不经代理直连过上游的凭据 id。
+    ///
+    /// 死号取证用：判断「这个号是不是被我们自己的出口 IP 拖死的」。2026-08-17 那次
+    /// 排查为了回答这个问题，只能去 grep 日志再正则抽 credential_id，样本一多就不
+    /// 可靠。进程内即可，重启清零——它服务的是「当前这批号」的归因。
+    direct_upstream_seen: Mutex<std::collections::HashSet<u64>>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -1846,6 +1852,7 @@ impl MultiTokenManager {
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
             ban_ledger: OnceLock::new(),
+            direct_upstream_seen: Mutex::new(std::collections::HashSet::new()),
         };
 
         // 单凭据格式自动迁移：升级为数组格式，确保 token rotation 能写盘
@@ -4871,6 +4878,16 @@ impl MultiTokenManager {
     /// 判死的同时把「烧号的那个代理」记进台账：`observed_proxy` 是本次请求实际走的
     /// 代理（代理故障转移后可能不是凭据上配置的那个），缺省时回落到凭据自身的
     /// `proxyUrl`；`reason` 是上游封号文案，截断后存档，方便回溯是哪一类风控。
+    /// 记下「这个凭据刚刚不经代理直连了上游」，供死号取证使用。
+    pub fn note_direct_upstream(&self, id: u64) {
+        self.direct_upstream_seen.lock().insert(id);
+    }
+
+    /// 这个凭据是否曾经直连过上游（本进程内）
+    pub fn used_direct_upstream(&self, id: u64) -> bool {
+        self.direct_upstream_seen.lock().contains(&id)
+    }
+
     pub fn mark_credential_dead(
         &self,
         id: u64,
@@ -4913,7 +4930,11 @@ impl MultiTokenManager {
         }
 
         if let Some(ledger) = self.ban_ledger.get() {
-            ledger.record_ban(ban_facts);
+            let newly_recorded = ledger.record_ban(ban_facts.clone());
+            if newly_recorded {
+                self.log_ban_forensics(ledger, &ban_facts, reason);
+                ledger.warn_if_sweep();
+            }
         }
 
         if let Err(error) = self.persist_credentials() {
@@ -4924,6 +4945,52 @@ impl MultiTokenManager {
 
         let has_available = self.entries.lock().iter().any(|entry| !entry.disabled);
         Ok(Some(has_available))
+    }
+
+    /// 判死时把一次性可得的全部归因材料打成**一条**结构化日志。
+    ///
+    /// 为什么要单独一条而不是靠已有日志拼：号进入保留期后 `cleanup_dead_credentials`
+    /// 会删掉凭据，`trace_db` 也会连带清掉它的请求记录，事后想复盘就只剩零散的 WARN。
+    /// 2026-08-17 排查那批死号时，「存活多久 / 打了多少请求 / 出口累计烧了几个号 /
+    /// 有没有直连过 / 上游用的哪种封号措辞」这五个字段散在四处，靠 grep + 正则拼了
+    /// 好几轮才凑齐。一条日志一次给全，`grep 死号取证` 就能直接喂给分析脚本。
+    fn log_ban_forensics(
+        &self,
+        ledger: &crate::admin::proxy_ban_stats::ProxyBanLedger,
+        facts: &crate::admin::proxy_ban_stats::BanObservation,
+        raw_body: Option<&str>,
+    ) {
+        let exit_summary = ledger.summary_for(facts.proxy_url.as_deref());
+        let survival_secs = facts
+            .added_at
+            .as_deref()
+            .and_then(|added| DateTime::parse_from_rfc3339(added).ok())
+            .zip(DateTime::parse_from_rfc3339(&facts.banned_at).ok())
+            .map(|(added, banned)| (banned - added).num_seconds())
+            .filter(|secs| *secs >= 0);
+
+        tracing::error!(
+            credential_id = facts.credential_id,
+            email = facts.email.as_deref().unwrap_or("-"),
+            added_at = facts.added_at.as_deref().unwrap_or("-"),
+            survival_secs = survival_secs.unwrap_or(-1),
+            successes = facts.successes_before_ban.unwrap_or(0),
+            requests = facts.requests_before_ban.unwrap_or(0),
+            exit = %facts
+                .proxy_url
+                .as_deref()
+                .map(crate::admin::proxy_ban_stats::redact_proxy_url)
+                .unwrap_or_else(|| "direct".to_string()),
+            exit_total_bans = exit_summary.total_bans,
+            exit_bans_24h = exit_summary.bans_24h,
+            exit_accounts_seen = exit_summary.accounts_seen,
+            // 唯一能区分「被我们自己的出口 IP 拖死」和「账号自身被风控」的字段
+            ever_direct = self.used_direct_upstream(facts.credential_id),
+            ban_kind = raw_body
+                .map(crate::wholesale::health::ban_message_kind)
+                .unwrap_or("unknown"),
+            "死号取证"
+        );
     }
 
     /// 判死凭据的保留时长（小时）。

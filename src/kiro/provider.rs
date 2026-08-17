@@ -579,12 +579,30 @@ impl KiroProvider {
                 }
             }
             Err(error) => {
-                tracing::warn!(
-                    credential_id,
-                    model,
-                    error = %error,
-                    "模型列表查询失败，按未知能力继续当前请求"
-                );
+                let text = error.to_string();
+                // 这条查询的 403 一直被当成「查不到能力」咽掉，但上游在这里会明说
+                // 「你的账号已被停用」。判死只认主 API 的 TEMPORARILY_SUSPENDED，
+                // 于是这类号会以「活号」身份滞留在池子里被反复选中——线上见过单个
+                // 号被拒 598 次仍未判死，号池水位因此虚高。
+                //
+                // 这里只提级告警、不改判死行为：改判死是另一个决定，需要先确认
+                // 这条通路不会误伤跨区兼容 403。
+                if crate::wholesale::health::classify_from_error_text(&text).is_dead() {
+                    tracing::warn!(
+                        credential_id,
+                        model,
+                        ban_kind = crate::wholesale::health::ban_message_kind(&text),
+                        error = %text,
+                        "上游在模型列表查询中报告该账号已被停用，但当前判死逻辑不认这条通路，该号仍留在池中"
+                    );
+                } else {
+                    tracing::warn!(
+                        credential_id,
+                        model,
+                        error = %text,
+                        "模型列表查询失败，按未知能力继续当前请求"
+                    );
+                }
                 ModelAvailability::Unknown
             }
         }
@@ -935,6 +953,7 @@ impl KiroProvider {
             }
             if proxy.is_none() {
                 warn_direct_upstream(ctx.id);
+                self.token_manager.note_direct_upstream(ctx.id);
             }
 
             match self
@@ -1030,6 +1049,7 @@ impl KiroProvider {
             }
             if proxy.is_none() {
                 warn_direct_upstream(ctx.id);
+                self.token_manager.note_direct_upstream(ctx.id);
             }
             let base = self
                 .client_for_proxy(proxy.clone())?

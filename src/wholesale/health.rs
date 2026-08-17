@@ -67,6 +67,33 @@ fn body_indicates_ban(body: &str) -> bool {
     BAN_MARKERS.iter().any(|m| b.contains(m))
 }
 
+/// 给封号文案分型，落进死号取证日志。
+///
+/// 上游同一天用过至少三种措辞，且只有第一种带 `reason` 字段，另两种 `reason: null`。
+/// 不分型的话事后只能靠 grep 猜：2026-08-17 那次排查里，1900 条「已被停用」的 403
+/// 被淹没在噪声里，直到把文案逐类计数才发现有号在被上游拒了几百次之后仍留在池子里。
+///
+/// 返回稳定的短标识，便于直接按字段聚合。
+pub fn ban_message_kind(body: &str) -> &'static str {
+    let b = body.to_ascii_lowercase();
+    if b.contains("temporarily_suspended") {
+        // 主 API 的封号响应，带 reason 字段，是当前唯一会触发判死的通路
+        "suspended_unusual_activity"
+    } else if b.contains("temporarily is suspended") || b.contains("is temporarily suspended") {
+        // 「已锁定，请联系客服」，多见于 ListAvailableModels，reason: null
+        "suspended_security_lock"
+    } else if b.contains("not authorized to make this call") {
+        // 号已被停用时主 API 的另一种措辞，本身不含封禁字样
+        "not_authorized"
+    } else if b.contains("banned") {
+        "banned"
+    } else if body_indicates_ban(body) {
+        "suspended_other"
+    } else {
+        "unknown"
+    }
+}
+
 /// 核心分类：由 HTTP 状态码 + 响应体判定健康度。
 ///
 /// - `status == 200` → `Active`（额度维度由 `classify_with_quota` 叠加）
@@ -155,6 +182,39 @@ mod tests {
     fn production_locked_account_403_is_dead() {
         let body = r#"{"message":"Your User ID (842882713699) temporarily is suspended. We've locked your account as a security precaution. To restore access, please contact our support team to verify your identity: https://aws.amazon.com/contact-us/","reason":null}"#;
         assert_eq!(classify_account_health(403, body), AccountHealth::Dead);
+    }
+
+    /// 线上真实抓到的三种封号措辞必须分成三型。
+    ///
+    /// 只有第一种会触发判死；把另两种和它混在一起，就看不出「有号被上游拒了几百次
+    /// 却仍留在池子里」——2026-08-17 排查时正是这个盲区导致号池水位虚高。
+    #[test]
+    fn ban_message_kinds_separate_the_three_real_variants() {
+        assert_eq!(
+            ban_message_kind(
+                r#"{"message":"Your User ID is temporarily suspended. We detected unusual user activity...","reason":"TEMPORARILY_SUSPENDED"}"#
+            ),
+            "suspended_unusual_activity"
+        );
+        assert_eq!(
+            ban_message_kind(
+                r#"{"message":"Your User ID (842882713699) temporarily is suspended. We've locked your account as a security precaution...","reason":null}"#
+            ),
+            "suspended_security_lock"
+        );
+        assert_eq!(
+            ban_message_kind(r#"{"message":"User is not authorized to make this call.","reason":null}"#),
+            "not_authorized"
+        );
+        assert_eq!(
+            ban_message_kind(r#"{"message":"This account has been banned for abuse"}"#),
+            "banned"
+        );
+        // 跨区兼容 403 不含封禁字样，必须落到 unknown，不能被算成封号
+        assert_eq!(
+            ban_message_kind(r#"{"message":"Invalid token for this region"}"#),
+            "unknown"
+        );
     }
 
     #[test]
