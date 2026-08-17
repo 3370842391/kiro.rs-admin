@@ -1011,6 +1011,17 @@ pub async fn run_proxy_guard(State(state): State<AdminState>) -> impl IntoRespon
     Json(state.service.enforce_proxy_guard())
 }
 
+/// POST /api/admin/proxy-pool/reputation/check
+/// 检测出口 IP 信誉：ASN、是否机房、是否已被公开标记为代理。
+/// body 里给 `proxyIds` 则只查这些，留空查全部。
+pub async fn check_proxy_reputation(
+    State(state): State<AdminState>,
+    body: Option<Json<super::types::ProxyReputationCheckRequest>>,
+) -> impl IntoResponse {
+    let ids = body.and_then(|Json(req)| req.proxy_ids);
+    Json(state.service.check_proxy_reputation(ids).await)
+}
+
 /// GET /api/admin/config/dead-credentials
 /// 死号治理配置：判死后保留多久、是否自动删除，以及当前死号统计。
 pub async fn get_dead_credential_config(State(state): State<AdminState>) -> impl IntoResponse {

@@ -2,6 +2,7 @@
 
 use crate::admin::proxy_ban_stats::{ProxyBanEvent, ProxyBanSummary, ProxyRiskAssessment};
 use crate::admin::proxy_pool::ProxyHealth;
+use crate::admin::proxy_reputation::{ProxyReputation, ReputationGrade};
 use crate::model::config::RetryPolicy;
 use serde::{Deserialize, Serialize};
 
@@ -1043,6 +1044,35 @@ pub struct ProxyPoolEntry {
     pub ban_stats: ProxyBanSummary,
     /// 风险研判结论。建议模式：只给结论和理由，不会自动改启用状态。
     pub risk: ProxyRiskAssessment,
+    /// 出口 IP 信誉（ASN / 是否机房 / 是否已被标记为代理）。未检测时为 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reputation: Option<ProxyReputation>,
+    /// 由信誉换算的等级，便于前端直接分档上色
+    pub reputation_grade: ReputationGrade,
+}
+
+/// 信誉批量检测请求。`proxyIds` 留空表示全量检测。
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyReputationCheckRequest {
+    #[serde(default)]
+    pub proxy_ids: Option<Vec<u64>>,
+}
+
+/// 信誉批量检测响应
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyReputationCheckResponse {
+    pub checked: usize,
+    /// 已被公开情报库标记为代理 / VPN
+    pub flagged_proxy: usize,
+    /// 机房 / 托管但未被标记为代理
+    pub hosting: usize,
+    /// 既非机房也未被标记
+    pub clean: usize,
+    pub unreachable: usize,
+    /// 实测出口与配置 host 不一致（轮换池特征）
+    pub mismatched: usize,
 }
 
 /// 一次隔离动作的说明

@@ -12,7 +12,8 @@ use super::{
         add_credential, add_proxy, apply_image_update, apply_model_profile_preview,
         assign_proxies_round_robin, assign_proxy_to_credential, batch_add_proxies,
         batch_import_credentials, batch_update_credentials, cancel_idc_login, cancel_social_login,
-        check_all_proxies, check_proxy, check_proxy_url, check_rate_limit, check_update,
+        check_all_proxies, check_proxy, check_proxy_reputation, check_proxy_url, check_rate_limit,
+        check_update,
         cleanup_error_snapshots, clear_cache_policy_entries, clear_throttle, clear_traces,
         complete_social_login, complete_social_relogin, create_client_key, create_group,
         delete_client_key, delete_credential, delete_error_snapshot, delete_group,
@@ -138,6 +139,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/proxy-pool/ban-stats", get(get_proxy_ban_stats))
         .route("/proxy-pool/ban-stats/reset", post(reset_proxy_ban_stats))
         .route("/proxy-pool/guard/run", post(run_proxy_guard))
+        .route("/proxy-pool/reputation/check", post(check_proxy_reputation))
         .route(
             "/proxy-pool/assign-round-robin",
             post(assign_proxies_round_robin),

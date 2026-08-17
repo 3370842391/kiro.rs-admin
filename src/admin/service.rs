@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::http::StatusCode;
 use chrono::{DateTime, Duration, Timelike, Utc};
@@ -42,6 +42,7 @@ use super::model_profile_sync::{
 use super::profit::ProfitConfig;
 use super::proxy_ban_stats;
 use super::proxy_pool::{GetUrlResult, ProxyEntry, ProxyHealth, ProxyPoolManager};
+use super::proxy_reputation::{ProxyReputationStore, ReputationGrade};
 use super::types::{
     AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse,
     ApplyModelProfilesRequest, AssignProxyRequest, AssignRoundRobinResponse, AvailableModelItem,
@@ -61,7 +62,7 @@ use super::types::{
     PreviewModelProfilesRequest, ProfitConfigResponse, ProxyBalancingModeResponse,
     ProxyBanDetailEntry, ProxyBanStatsResponse, ProxyBanTimelineItem, ProxyCheckAllResponse,
     ProxyCheckResponse, ProxyCheckUrlRequest, ProxyGuardQuarantineItem, ProxyGuardRunResponse,
-    ProxyPoolEntry,
+    ProxyPoolEntry, ProxyReputationCheckResponse,
     ProxyPoolResponse, QuotaExceededResult, ResolvedModelProfileResponse, RetryPolicyResponse,
     RevisionRequest, RpmSummary, SetAccountThrottleConfigRequest, SetCacheHitRateRequest,
     SetCachePolicyRequest, SetCompatibilityConfigRequest, SetDeadCredentialConfigRequest,
@@ -596,6 +597,8 @@ pub struct AdminService {
     import_defaults: Mutex<CredentialImportDefaults>,
     /// 烧号出口隔离策略（运行时可改），同理不能直接读 `Config`。
     proxy_guard: Mutex<ProxyGuardConfig>,
+    /// 出口 IP 信誉档案。缺省表示未启用检测（测试里可不注入）。
+    proxy_reputation: OnceLock<Arc<ProxyReputationStore>>,
 }
 
 /// Social 登录会话状态
@@ -1003,6 +1006,7 @@ impl AdminService {
             last_model_profile_sync: Mutex::new(None),
             import_defaults: Mutex::new(import_defaults),
             proxy_guard: Mutex::new(proxy_guard),
+            proxy_reputation: OnceLock::new(),
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -1026,6 +1030,52 @@ impl AdminService {
     /// 暴露 TokenManager 给 handlers（分组管理需要 count / rename / remove 凭据 groups 字段）
     pub fn token_manager(&self) -> &Arc<MultiTokenManager> {
         &self.token_manager
+    }
+
+    /// 注入出口 IP 信誉档案，开启信誉展示与检测
+    pub fn set_proxy_reputation(&self, store: Arc<ProxyReputationStore>) {
+        let _ = self.proxy_reputation.set(store);
+    }
+
+    /// 检测代理池出口的 IP 信誉。
+    ///
+    /// `ids` 为空则全量检测。走代理自身发起查询，所以顺带能查出「配置写着 A 实际从 B
+    /// 出去」的轮换池——那种情况下按配置 host 查到的信誉是错的。
+    pub async fn check_proxy_reputation(
+        &self,
+        ids: Option<Vec<u64>>,
+    ) -> ProxyReputationCheckResponse {
+        let Some(store) = self.proxy_reputation.get() else {
+            return ProxyReputationCheckResponse::default();
+        };
+        let wanted: Option<std::collections::HashSet<u64>> =
+            ids.filter(|v| !v.is_empty()).map(|v| v.into_iter().collect());
+        let urls: Vec<String> = self
+            .proxy_pool
+            .list()
+            .into_iter()
+            .filter(|p| wanted.as_ref().is_none_or(|set| set.contains(&p.id)))
+            .map(|p| p.url)
+            .collect();
+
+        let summary = store.check_many(urls).await;
+        tracing::info!(
+            checked = summary.checked,
+            flagged_proxy = summary.flagged_proxy,
+            hosting = summary.hosting,
+            clean = summary.clean,
+            unreachable = summary.unreachable,
+            mismatched = summary.mismatched,
+            "代理出口信誉检测完成"
+        );
+        ProxyReputationCheckResponse {
+            checked: summary.checked,
+            flagged_proxy: summary.flagged_proxy,
+            hosting: summary.hosting,
+            clean: summary.clean,
+            unreachable: summary.unreachable,
+            mismatched: summary.mismatched,
+        }
     }
 
     /// 注入日志治理句柄（trace 存储 + 用量记录器），用于运行时改保留期/开关。
@@ -4218,6 +4268,14 @@ impl AdminService {
                     .get(&proxy_ban_stats::normalize_proxy_key(Some(&p.url)))
                     .cloned()
                     .unwrap_or_default();
+                let reputation = self
+                    .proxy_reputation
+                    .get()
+                    .and_then(|store| store.get(&p.url));
+                let reputation_grade = reputation
+                    .as_ref()
+                    .map(|r| r.grade())
+                    .unwrap_or(ReputationGrade::Unknown);
                 ProxyPoolEntry {
                     id: p.id,
                     url: p.url,
@@ -4233,6 +4291,8 @@ impl AdminService {
                     quarantine_reason: p.quarantine_reason,
                     ban_stats,
                     risk,
+                    reputation,
+                    reputation_grade,
                 }
             })
             .collect();
@@ -4351,6 +4411,10 @@ impl AdminService {
             quarantine_reason: entry.quarantine_reason,
             ban_stats,
             risk: Default::default(),
+            // 新加的代理还没查过信誉。刻意不留空当成"干净"——Unknown 与 Clean 必须可区分，
+            // 否则刚加进来的脏 IP 会被自动分配逻辑当成已验证的好出口。
+            reputation: None,
+            reputation_grade: ReputationGrade::Unknown,
         })
     }
 
@@ -4380,6 +4444,8 @@ impl AdminService {
                     quarantine_reason: e.quarantine_reason,
                     ban_stats,
                     risk: Default::default(),
+                    reputation: None,
+                    reputation_grade: ReputationGrade::Unknown,
                 }
             })
             .collect();

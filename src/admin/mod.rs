@@ -30,6 +30,7 @@ pub mod model_profile_sync;
 pub mod profit;
 pub mod proxy_ban_stats;
 pub mod proxy_pool;
+pub mod proxy_reputation;
 mod router;
 mod service;
 pub mod trace_db;

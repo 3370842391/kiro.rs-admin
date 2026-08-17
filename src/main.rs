@@ -291,6 +291,16 @@ async fn main() {
             .map(|d| d.join("proxy_ban_stats.json")),
     ));
     token_manager.set_ban_ledger(ban_ledger.clone());
+
+    // 出口 IP 信誉档案：判断出口是否已被公开情报库标记为代理。
+    // 线上实测过剂量-反应关系（本机 VPS IP 中位存活 8 分钟 vs 租用机房 IP 63 分钟），
+    // 出口的「已被标记程度」直接决定账号能活多久，所以这件事必须能查、能看。
+    let proxy_reputation = Arc::new(admin::proxy_reputation::ProxyReputationStore::new(
+        token_manager
+            .cache_dir()
+            .map(|d| d.join("proxy_reputation.json")),
+        config.tls_backend,
+    ));
     // 代理池据此对烧号多的出口降权（相对池内中位数，全池一样烂时不降）
     proxy_pool.set_ban_ledger(ban_ledger.clone());
     {
@@ -684,6 +694,10 @@ async fn main() {
 
             // 启动烧号出口隔离守卫：封号事件即触发，隔离脏出口并把幸存号迁走
             admin_state.service.start_proxy_guard();
+
+            admin_state
+                .service
+                .set_proxy_reputation(proxy_reputation.clone());
 
             // 启动自动更新调度器：每分钟检查一次本地时间，到达 update_auto_apply_time
             // 且开启 update_auto_apply 时执行一次更新；否则静默等待。

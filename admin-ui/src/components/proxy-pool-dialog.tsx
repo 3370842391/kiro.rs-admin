@@ -14,6 +14,7 @@ import {
   HelpCircle,
   Skull,
   ShieldAlert,
+  Fingerprint,
 } from 'lucide-react'
 import {
   Dialog,
@@ -38,6 +39,7 @@ import {
   setProxyBalancingMode,
   PROXY_BALANCING_LABEL,
   checkProxy,
+  checkProxyReputation,
   assignProxiesRoundRobin,
   type ProxyBalancingMode,
 } from '@/api/credentials'
@@ -45,6 +47,7 @@ import { extractErrorMessage, maskProxyUrl } from '@/lib/utils'
 import {
   ProxyBanBadge,
   ProxyBanStatsPanel,
+  ProxyReputationBadge,
   ProxyWeightBadge,
   formatSurvival,
 } from '@/components/proxy-ban-stats-panel'
@@ -123,6 +126,26 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
     onError: (err) => toast.error(`切换失败: ${extractErrorMessage(err)}`),
   })
 
+  const reputationMutation = useMutation({
+    mutationFn: (ids?: number[]) => checkProxyReputation(ids),
+    onSuccess: (res) => {
+      if (res.checked === 0) {
+        toast.info('没有可检测的出口')
+        return
+      }
+      const parts = [
+        res.flaggedProxy > 0 ? `已标记代理 ${res.flaggedProxy}` : null,
+        res.hosting > 0 ? `机房 ${res.hosting}` : null,
+        res.clean > 0 ? `未标记 ${res.clean}` : null,
+        res.unreachable > 0 ? `检测失败 ${res.unreachable}` : null,
+        res.mismatched > 0 ? `出口不符 ${res.mismatched}` : null,
+      ].filter(Boolean)
+      toast.success(`检测 ${res.checked} 个出口：${parts.join('、')}`)
+      queryClient.invalidateQueries({ queryKey: ['proxy-pool'] })
+    },
+    onError: (err) => toast.error(`检测失败: ${extractErrorMessage(err)}`),
+  })
+
   const setGlobalProxyMutation = useMutation({
     mutationFn: (url: string | null) => setGlobalProxy({ proxyUrl: url }),
     onSuccess: (_, url) => {
@@ -159,6 +182,9 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
   )
   // 已被隔离守卫停用的出口。比降权更硬：这些出口已经完全不参与分配
   const quarantinedProxies = proxies.filter((proxy) => proxy.quarantinedAt)
+  // 被公开情报库标记为代理的出口。这是目前唯一被实测证明会显著缩短账号寿命的属性
+  const flaggedProxies = proxies.filter((proxy) => proxy.reputationGrade === 'flaggedProxy')
+  const uncheckedCount = proxies.filter((proxy) => proxy.reputationGrade === 'unknown').length
   const orphanGlobalCandidates = globalProxyCandidates.filter(
     (candidate) =>
       candidate.toLowerCase() !== 'direct' && !proxies.some((proxy) => proxy.url === candidate)
@@ -681,6 +707,19 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                       size="sm"
                       variant="outline"
                       className="h-7 text-xs"
+                      onClick={() => reputationMutation.mutate(
+                        selectedCount > 0 ? selectedProxies.map((p) => p.id) : undefined
+                      )}
+                      disabled={reputationMutation.isPending || proxies.length === 0}
+                      title="查出口的 ASN / 是否机房 / 是否已被公开标记为代理。判据是有没有被标记，不是机房还是家宽"
+                    >
+                      <Fingerprint className="h-3 w-3 mr-1" />
+                      {reputationMutation.isPending ? '检测中...' : '检测信誉'}
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-7 text-xs"
                       onClick={() => setGuardOpen(true)}
                       title="窗口内封够几个号就停用该出口，并把幸存号迁走"
                     >
@@ -690,6 +729,37 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                   </div>
                 )}
               </div>
+              {flaggedProxies.length > 0 && (
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                  <span>
+                    有 {flaggedProxies.length} 个出口已被公开情报库标记为代理/VPN（
+                    {flaggedProxies
+                      .slice(0, 3)
+                      .map((proxy) => maskProxyUrl(proxy.url))
+                      .join('、')}
+                    {flaggedProxies.length > 3 ? ' 等' : ''}
+                    ）。线上实测出口的「已被标记程度」直接决定账号寿命，
+                    这些出口优先淘汰；干净的机房 IP 是可用的，不必非要家宽。
+                  </span>
+                </div>
+              )}
+              {uncheckedCount > 0 && proxies.length > 0 && (
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border px-3 py-2 text-xs text-muted-foreground">
+                  <span>
+                    有 {uncheckedCount} 个出口还没查过 IP 信誉。未检测不等于干净 ——
+                    点上面的「检测信誉」看它们的 ASN 与标记状态。
+                  </span>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 text-xs"
+                    onClick={() => reputationMutation.mutate(undefined)}
+                    disabled={reputationMutation.isPending}
+                  >
+                    立即检测
+                  </Button>
+                </div>
+              )}
               {directGlobalEnabled && (
                 <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-destructive/60 bg-destructive/15 px-3 py-2 text-xs text-destructive">
                   <span>
@@ -821,6 +891,10 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                           </Badge>
                         )}
                         {renderHealthBadge(proxy)}
+                        <ProxyReputationBadge
+                          grade={proxy.reputationGrade}
+                          reputation={proxy.reputation}
+                        />
                         <ProxyBanBadge stats={proxy.banStats} risk={proxy.risk} />
                         <ProxyWeightBadge risk={proxy.risk} />
                         {!proxy.enabled && (

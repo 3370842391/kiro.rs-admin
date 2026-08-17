@@ -4,6 +4,7 @@ import {
   AlertTriangle,
   ChevronDown,
   ChevronRight,
+  Fingerprint,
   Flame,
   Info,
   RotateCcw,
@@ -20,9 +21,11 @@ import { maskEmailAddress } from '@/lib/utils'
 import type {
   ProxyBanDetailEntry,
   ProxyBanSummary,
+  ProxyReputation,
   ProxyRiskAssessment,
   ProxyRiskLevel,
   ProxySelectionTier,
+  ReputationGrade,
 } from '@/types/api'
 
 /** 存活时长：被封账号从加入到判死之间的秒数，短到分钟级就说明这个出口 IP 已经被上游盯上了 */
@@ -87,6 +90,75 @@ export function ProxyWeightBadge({ risk }: { risk: ProxyRiskAssessment | undefin
     >
       <TrendingDown className="h-3 w-3" />
       {TIER_LABEL[tier]} {Math.round(risk.selectionWeight * 100)}%
+    </Badge>
+  )
+}
+
+const GRADE_LABEL: Record<ReputationGrade, string> = {
+  unknown: '未检测',
+  unreachable: '检测失败',
+  flaggedProxy: '已标记代理',
+  hosting: '机房 IP',
+  clean: '未标记',
+}
+
+const GRADE_CLASS: Record<ReputationGrade, string> = {
+  unknown: 'text-muted-foreground border-dashed',
+  unreachable: 'text-muted-foreground border-dashed',
+  flaggedProxy: 'border-destructive/60 text-destructive',
+  hosting: 'border-yellow-500/50 text-yellow-600 dark:text-yellow-400',
+  clean: 'border-green-500/50 text-green-600 dark:text-green-400',
+}
+
+/** 出口 IP 信誉徽章。
+ *
+ * 判据是「有没有被标记」，不是「机房还是家宽」。线上实测的剂量-反应关系：
+ * 服务器本机 VPS IP 中位存活 8 分钟，租来的机房 IP 63 分钟——两者都是机房，
+ * 差 8 倍，区别只在被标记的程度。所以干净的机房 IP 是可用的，
+ * 被公开标记为代理的才是要淘汰的。
+ */
+export function ProxyReputationBadge({
+  grade,
+  reputation,
+}: {
+  grade: ReputationGrade | undefined
+  reputation?: ProxyReputation
+}) {
+  const g = grade ?? 'unknown'
+  return (
+    <Badge
+      variant="outline"
+      className={cn('text-xs gap-1', GRADE_CLASS[g])}
+      title={[
+        reputation?.exitIp ? `实测出口 ${reputation.exitIp}` : '尚未探测出口 IP',
+        reputation?.exitIpMismatch
+          ? '注意：实测出口与配置 host 不一致，这是轮换代理池的特征'
+          : null,
+        reputation?.asn ? `ASN ${reputation.asn}` : null,
+        reputation?.isp ? `ISP ${reputation.isp}` : null,
+        reputation?.country
+          ? `位置 ${reputation.country}${reputation.region ? ` / ${reputation.region}` : ''}`
+          : null,
+        '',
+        g === 'flaggedProxy'
+          ? '已被公开情报库标记为代理/VPN。连免费库都认得出来，上游的数据源只会更全 —— 优先淘汰。'
+          : null,
+        g === 'hosting'
+          ? '机房/托管 IP，但未被标记为代理。按线上数据这一档可用，只是不如未标记的。'
+          : null,
+        g === 'clean' ? '既非机房也未被标记，是目前最干净的一档。' : null,
+        g === 'unknown' ? '还没查过。点「检测信誉」后才有结论，不要当成干净。' : null,
+        reputation?.error ? `检测失败：${reputation.error}` : null,
+        reputation?.checkedAt
+          ? `检测时间 ${new Date(reputation.checkedAt).toLocaleString()}`
+          : null,
+      ]
+        .filter((line) => line !== null)
+        .join('\n')}
+    >
+      <Fingerprint className="h-3 w-3" />
+      {GRADE_LABEL[g]}
+      {reputation?.exitIpMismatch ? ' · 出口不符' : ''}
     </Badge>
   )
 }

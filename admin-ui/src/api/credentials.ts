@@ -21,6 +21,7 @@ import type {
   ProxyGuardConfig,
   SetProxyGuardRequest,
   ProxyGuardRunResponse,
+  ProxyReputationCheckResponse,
   CredentialImportDefaults,
   SetImportDefaultsRequest,
   AddProxyRequest,
@@ -493,6 +494,17 @@ export async function setProxyGuardConfig(
 // 立即执行一轮隔离与迁移，不等下一次封号事件
 export async function runProxyGuard(): Promise<ProxyGuardRunResponse> {
   const { data } = await api.post<ProxyGuardRunResponse>('/proxy-pool/guard/run')
+  return data
+}
+
+// 检测出口 IP 信誉（ASN / 是否机房 / 是否已被标记为代理）。proxyIds 留空查全部
+export async function checkProxyReputation(
+  proxyIds?: number[]
+): Promise<ProxyReputationCheckResponse> {
+  const { data } = await api.post<ProxyReputationCheckResponse>(
+    '/proxy-pool/reputation/check',
+    { proxyIds: proxyIds ?? null }
+  )
   return data
 }
 

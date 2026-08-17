@@ -427,6 +427,46 @@ export interface ProxyBanStatsResponse {
   recentEvents: ProxyBanTimelineItem[]
 }
 
+// 出口 IP 信誉等级。
+// unknown = 没查过；unreachable = 查失败；flaggedProxy = 已被公开标记为代理/VPN；
+// hosting = 机房但未被标记（可用）；clean = 既非机房也未被标记
+export type ReputationGrade =
+  | 'unknown'
+  | 'unreachable'
+  | 'flaggedProxy'
+  | 'hosting'
+  | 'clean'
+
+// 出口 IP 信誉档案
+export interface ProxyReputation {
+  /** 实测出口 IP。与配置里的 host 不一致说明是轮换出口 */
+  exitIp?: string
+  exitIpMismatch: boolean
+  country?: string
+  region?: string
+  /** 形如 "AS62240 Clouvider" */
+  asn?: string
+  isp?: string
+  /** 情报库判定为机房/托管 */
+  hosting: boolean
+  /** 情报库已知为代理/VPN —— 最致命的一项 */
+  proxy: boolean
+  mobile: boolean
+  checkedAt?: string
+  /** 探测失败原因；非空时其余字段不可信 */
+  error?: string
+}
+
+export interface ProxyReputationCheckResponse {
+  checked: number
+  flaggedProxy: number
+  hosting: number
+  clean: number
+  unreachable: number
+  /** 实测出口与配置 host 不一致的数量 */
+  mismatched: number
+}
+
 // 代理池条目
 export interface ProxyPoolEntry {
   id: number
@@ -445,6 +485,9 @@ export interface ProxyPoolEntry {
   quarantineReason?: string
   banStats: ProxyBanSummary
   risk: ProxyRiskAssessment
+  /** 出口 IP 信誉档案；未检测时缺省 */
+  reputation?: ProxyReputation
+  reputationGrade: ReputationGrade
 }
 
 // 烧号出口隔离策略

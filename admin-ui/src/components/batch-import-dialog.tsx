@@ -498,7 +498,12 @@ export function BatchImportDialog({
       const cleanProxies =
         importDefaults?.avoidRiskyProxies === false
           ? allEnabledProxies
-          : allEnabledProxies.filter(p => (p.risk?.selectionTier ?? 'normal') === 'normal')
+          : allEnabledProxies
+              .filter(p => (p.risk?.selectionTier ?? 'normal') === 'normal')
+              // 同时避开已被公开情报库标记为代理的出口。线上实测出口的「已被标记
+              // 程度」直接决定账号寿命（本机 VPS IP 中位存活 8 分钟 vs 租用机房
+              // 63 分钟），新号最经不起这个。
+              .filter(p => p.reputationGrade !== 'flaggedProxy')
       const assignableProxies = cleanProxies.length > 0 ? cleanProxies : allEnabledProxies
       const enabledProxies = importDefaults?.autoAssignProxy === false ? [] : assignableProxies
       const skippedRiskyCount = allEnabledProxies.length - assignableProxies.length
