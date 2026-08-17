@@ -91,7 +91,12 @@ export function ProxyWeightBadge({ risk }: { risk: ProxyRiskAssessment | undefin
   )
 }
 
-/** 挂在代理池每一行上的紧凑封号徽章 */
+/** 挂在代理池每一行上的紧凑封号徽章。
+ *
+ * 只有**统计上高于全池基线**的出口才用醒目配色。没超基线的一律灰显并在提示里说明
+ * 「这些封号只是服役期间赶上过全池清扫」——否则一排红色的「烧号 4 个 · 44%」会让
+ * 运营分不清哪个出口是真有问题，把精力耗在无辜的出口上。
+ */
 export function ProxyBanBadge({
   stats,
   risk,
@@ -100,16 +105,22 @@ export function ProxyBanBadge({
   risk?: ProxyRiskAssessment
 }) {
   if (!stats || stats.totalBans === 0) return null
-  const level = riskLevelOf(risk)
+  const noisy = risk != null && !risk.abovePoolBaseline
+  const level = noisy ? 'ok' : riskLevelOf(risk)
   const rate = stats.banRate != null ? `${Math.round(stats.banRate * 100)}%` : null
+  const baseline = risk != null ? `${Math.round(risk.pooledBanRate * 100)}%` : null
   return (
     <Badge
       variant="outline"
-      className={cn('text-xs gap-1', LEVEL_CLASS[level])}
+      className={cn('text-xs gap-1', LEVEL_CLASS[level], noisy && 'opacity-70')}
       title={[
         `历史封号 ${stats.totalBans} 个 / 曾绑定 ${stats.accountsSeen} 个`,
         rate ? `原始封号率 ${rate}` : null,
         risk ? `置信下界 ${Math.round(risk.banRateLowerBound * 100)}%` : null,
+        baseline ? `全池基线 ${baseline}` : null,
+        noisy
+          ? '结论：未超全池基线，属清扫噪声，不能归咎于这个出口'
+          : '结论：统计上高于全池基线，这个出口确实更容易烧号',
         stats.medianSurvivalSecs != null
           ? `存活中位数 ${formatSurvival(stats.medianSurvivalSecs)}`
           : null,
@@ -126,6 +137,7 @@ export function ProxyBanBadge({
       <Skull className="h-3 w-3" />
       烧号 {stats.totalBans}
       {rate ? ` · ${rate}` : ''}
+      {noisy && baseline ? `（基线 ${baseline}）` : ''}
       {level === 'quarantineRecommended' ? ' · 建议隔离' : ''}
     </Badge>
   )
@@ -166,7 +178,10 @@ function BanRow({ entry }: { entry: ProxyBanDetailEntry }) {
     onError: (err) => toast.error(`清空失败: ${extractErrorMessage(err)}`),
   })
 
-  const level = riskLevelOf(entry.risk)
+  // 未超全池基线的出口一律按正常显示：它的封号是全池清扫摊到的，不是它的问题。
+  // 之前统一用 riskLevelOf 上色，结果一屏红色徽章里分不出哪个才该动手。
+  const noisy = !entry.risk.abovePoolBaseline
+  const level = noisy ? 'ok' : riskLevelOf(entry.risk)
 
   return (
     <div className="text-sm">
@@ -192,14 +207,15 @@ function BanRow({ entry }: { entry: ProxyBanDetailEntry }) {
               {entry.totalBans} 个号
             </Badge>
             <Badge variant="outline" className={cn('text-xs', LEVEL_CLASS[level])}>
-              {LEVEL_LABEL[level]}
+              {noisy ? '清扫噪声' : LEVEL_LABEL[level]}
             </Badge>
             <ProxyWeightBadge risk={entry.risk} />
             {entry.banRate != null && (
               <span className="text-xs text-muted-foreground">
                 {entry.totalBans}/{entry.accountsSeen} = {Math.round(entry.banRate * 100)}%
                 <span className="ml-1">
-                  （下界 {Math.round(entry.risk.banRateLowerBound * 100)}%）
+                  （下界 {Math.round(entry.risk.banRateLowerBound * 100)}% vs 基线{' '}
+                  {Math.round(entry.risk.pooledBanRate * 100)}%）
                 </span>
               </span>
             )}

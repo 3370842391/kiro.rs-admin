@@ -150,6 +150,9 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
   const globalPoolCount = proxies.filter((proxy) => globalProxyCandidateSet.has(proxy.url)).length
   // 全池累计封号，含已从池中删除的代理，所以用后端汇总而不是当前列表求和
   const poolTotalBans = data?.totalBans ?? 0
+  // 全池合计封号率基线。后端对每个出口都算了同一个值，取任意一个即可。
+  // 摆到顶端是因为单看某个出口的「44%」毫无意义——必须和基线比才知道它是否异常。
+  const poolBaselineRate = proxies.find((proxy) => proxy.risk != null)?.risk?.pooledBanRate ?? null
   // 已被自动降权的出口。降权是实际生效的行为，比「建议隔离」更值得顶端提示
   const demotedProxies = proxies.filter(
     (proxy) => proxy.risk && proxy.risk.selectionTier !== 'normal'
@@ -575,6 +578,19 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                   <Badge variant="secondary" className="text-xs">
                     全局 {globalPoolCount}{directGlobalEnabled ? ' + 直连' : ''}
                   </Badge>
+                  {poolBaselineRate != null && (
+                    <Badge
+                      variant="outline"
+                      className="text-xs text-muted-foreground"
+                      title={
+                        '全池合计封号率 = 总封号 / 总绑定过的账号。\n' +
+                        '判断某个出口是否真的更脏，要看它的封号率置信下界有没有超过这条基线；\n' +
+                        '没超过就只是它服役期间赶上过全池清扫，不是它自己的问题。'
+                      }
+                    >
+                      全池基线 {Math.round(poolBaselineRate * 100)}%
+                    </Badge>
+                  )}
                   {selectedCount > 0 && (
                     <Badge variant="outline" className="text-xs">
                       已选 {selectedCount}
@@ -716,7 +732,9 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
               {demotedProxies.length > 0 && (
                 <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
                   <span>
-                    有 {demotedProxies.length} 个出口因烧号率明显高于池内中位数已被自动降权（
+                    有 {demotedProxies.length} 个出口的封号率置信下界高于全池基线
+                    {poolBaselineRate != null ? ` ${Math.round(poolBaselineRate * 100)}%` : ''}
+                    ，已自动降权（
                     {demotedProxies
                       .slice(0, 3)
                       .map((proxy) => maskProxyUrl(proxy.url))

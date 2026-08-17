@@ -665,6 +665,14 @@ pub struct ProxyRiskAssessment {
     pub ban_rate_lower_bound: f64,
     /// 参照用的池内封号率中位数
     pub pool_median_ban_rate: f64,
+    /// 全池合计封号率（总封号 / 总绑定过的号）。降权与「是否显著」都以它为基线。
+    ///
+    /// 暴露给前端是为了让运营能自己判断：出口的封号数只要没超过这个基线，就只是
+    /// 「服役期间赶上过几次全池清扫」，不是它自己的问题。少了这个参照，界面上
+    /// 那句「烧号 4 个 · 44%」会一直把人往错误结论上带。
+    pub pooled_ban_rate: f64,
+    /// 该出口是否**统计上**显著高于全池基线（置信下界高过基线才算）
+    pub above_pool_baseline: bool,
     /// 是否建议隔离。仅作展示，不会自动改代理的启用状态。
     pub recommend_quarantine: bool,
     /// 候选排序权重（0~1）。相对池内中位数计算，全池一样烂时所有人都是 1。
@@ -684,6 +692,8 @@ impl ProxyRiskAssessment {
             level: RiskLevel::Ok,
             ban_rate_lower_bound: 0.0,
             pool_median_ban_rate: 0.0,
+            pooled_ban_rate: 0.0,
+            above_pool_baseline: false,
             recommend_quarantine: false,
             selection_weight: 1.0,
             selection_tier: SelectionTier::Normal,
@@ -755,15 +765,27 @@ pub fn assess_pool_risk(
     );
     let capacity_ok = assignable_count.saturating_sub(1) >= MIN_ASSIGNABLE_AFTER;
 
-    // 降权基准同样取置信下界的中位数，而不是原始封号率：否则一个 1/1 的出口
-    // 会把中位数顶上去，把真正干净的出口误判成「低于中位数」。
-    let pool_median_lb = median_f64(
-        summaries
+    // 降权基准取**全池合计封号率**（总封号 / 总绑定过的号），而不是各出口下界的中位数。
+    //
+    // 中位数在这里是错的参照。封号是全池性事件——上游按墙钟无差别清扫当时在跑的号，
+    // 随机落在各个出口上。曝光量小的出口很容易一次都没摊上，于是一堆 0 把中位数拉到
+    // 接近 0，任何摊到封号的出口都成了「离群点」。2026-08-17 线上就是这样把两个统计
+    // 上完全正常的出口降到 0.42 / 0.47 权重：全池基线 27%，它们的封号率置信下界只有
+    // 19% 和 22%，本来连基线都没够上。
+    //
+    // 合计率回答的才是正确的问题：这个出口是否**比全池平均更容易烧号**。
+    let pooled_ban_rate = {
+        let bans: u64 = summaries.values().map(|s| s.total_bans).sum();
+        let seen: u64 = summaries
             .values()
-            .filter(|s| s.accounts_seen > 0)
-            .map(|s| wilson_lower_bound(s.total_bans, s.accounts_seen.max(s.total_bans)))
-            .collect(),
-    );
+            .map(|s| s.accounts_seen.max(s.total_bans))
+            .sum();
+        if seen == 0 {
+            0.0
+        } else {
+            bans as f64 / seen as f64
+        }
+    };
 
     summaries
         .iter()
@@ -773,9 +795,9 @@ pub fn assess_pool_risk(
             let mut reasons = Vec::new();
             let mut blockers = Vec::new();
 
-            // 超出池内中位数多少才降权。全池一样烂时 excess 恒为 0，
+            // 超出全池合计封号率多少才降权。全池一样烂时 excess 恒为 0，
             // 所有出口权重都是 1，排序退回原策略。
-            let excess = (lb - pool_median_lb).max(0.0);
+            let excess = (lb - pooled_ban_rate).max(0.0);
             // 再按样本量打折：号越少，越不敢下手
             let observed = s.accounts_seen.max(s.total_bans) as f64;
             let confidence = observed / (observed + PENALTY_SAMPLE_SMOOTHING);
@@ -783,6 +805,7 @@ pub fn assess_pool_risk(
                 .exp()
                 .clamp(MIN_SELECTION_WEIGHT, 1.0);
             let selection_tier = SelectionTier::from_weight(selection_weight);
+            let above_pool_baseline = excess > 0.0;
 
             if s.total_bans == 0 {
                 return (
@@ -791,6 +814,8 @@ pub fn assess_pool_risk(
                         level: RiskLevel::Ok,
                         ban_rate_lower_bound: 0.0,
                         pool_median_ban_rate,
+                        pooled_ban_rate,
+                        above_pool_baseline: false,
                         recommend_quarantine: false,
                         selection_weight: 1.0,
                         selection_tier: SelectionTier::Normal,
@@ -798,6 +823,27 @@ pub fn assess_pool_risk(
                         blockers,
                     },
                 );
+            }
+
+            // 这条要放在最前面：它决定运营看到「烧号 4 个 · 44%」时该不该当回事。
+            if above_pool_baseline {
+                reasons.push(format!(
+                    "封号率置信下界 {:.0}% 高于全池基线 {:.0}%，确实比平均更容易烧号",
+                    lb * 100.0,
+                    pooled_ban_rate * 100.0
+                ));
+            } else {
+                blockers.push(format!(
+                    "未超全池基线：本出口封号率置信下界 {:.0}%，全池合计 {:.0}%（{} 个号封了 {} 个）。\
+                     这些封号只说明它服役期间赶上过全池清扫，不是它自己的问题",
+                    lb * 100.0,
+                    pooled_ban_rate * 100.0,
+                    summaries
+                        .values()
+                        .map(|x| x.accounts_seen.max(x.total_bans))
+                        .sum::<u64>(),
+                    summaries.values().map(|x| x.total_bans).sum::<u64>(),
+                ));
             }
 
             if selection_tier != SelectionTier::Normal {
@@ -895,8 +941,12 @@ pub fn assess_pool_risk(
             let recommend_quarantine =
                 capacity_ok && (fast_burn || (sample_ok && absolute_ok && relative_ok && batch_ok));
 
+            // 没超全池基线的一律算 Ok：它的封号只是清扫噪声，标成「存疑」会让运营
+            // 把注意力花在无辜的出口上，真正的问题（账号来源）反而被掩盖。
             let level = if recommend_quarantine {
                 RiskLevel::QuarantineRecommended
+            } else if !above_pool_baseline {
+                RiskLevel::Ok
             } else if absolute_ok || rate >= BAN_RATE_LB_THRESHOLD {
                 RiskLevel::Suspect
             } else {
@@ -909,6 +959,8 @@ pub fn assess_pool_risk(
                     level,
                     ban_rate_lower_bound: lb,
                     pool_median_ban_rate,
+                    pooled_ban_rate,
+                    above_pool_baseline,
                     recommend_quarantine,
                     selection_weight,
                     selection_tier,
@@ -1084,6 +1136,75 @@ mod tests {
         let summary = ledger.summary_for(proxy);
         assert_eq!(summary.accounts_seen, 1);
         assert_eq!(summary.ban_rate, Some(1.0));
+    }
+
+    /// 2026-08-17 线上快照回归：清扫式封号不得降权任何出口。
+    ///
+    /// 当天全池 34/137 ≈ 25%，是上游按墙钟无差别清扫造成的（8 个号在 32 分钟内死在
+    /// 8 个不同出口，存活时长从 36 分钟到 191 分钟）。但降权基准当时取的是「各出口
+    /// 置信下界的中位数」，而池子里一堆曝光量小、一次都没摊上封号的出口把中位数压到
+    /// 接近 0，于是 4/9 和 4/8 这两个统计上完全正常的出口被降到 0.47 / 0.42 权重，
+    /// 界面上还标成「存疑」——运营因此完全无法分辨哪些是误判。
+    ///
+    /// 改成以全池合计率为基准后，4/9 的置信下界只有 19%，够不上 25% 的基线，不降权。
+    #[test]
+    fn sweep_noise_does_not_demote_any_exit() {
+        let observed: &[(u64, u64)] = &[
+            (4, 9),
+            (4, 8),
+            (3, 12),
+            (2, 9),
+            (2, 7),
+            (2, 4),
+            (2, 6),
+            (2, 9),
+            (2, 5),
+            (2, 10),
+            (1, 4),
+            (1, 4),
+            (1, 7),
+            (1, 11),
+            (1, 1),
+            (1, 1),
+            (1, 1),
+            (1, 3),
+            (1, 5),
+            (0, 4),
+            (0, 3),
+            (0, 3),
+            (0, 4),
+            (0, 4),
+            (0, 3),
+        ];
+        let entries: Vec<(String, ProxyBanSummary)> = observed
+            .iter()
+            .enumerate()
+            .map(|(i, &(bans, seen))| {
+                (format!("10.0.0.{}:1080", i + 1), summary(bans, seen, 1, None, None))
+            })
+            .collect();
+        let pool: BTreeMap<String, ProxyBanSummary> = entries.into_iter().collect();
+
+        let assessed = assess_pool_risk(&pool, 25);
+        let pooled = assessed.values().next().unwrap().pooled_ban_rate;
+        assert!(
+            (0.20..0.30).contains(&pooled),
+            "全池合计率应落在 25% 附近，实际 {:.3}",
+            pooled
+        );
+
+        for (key, risk) in &assessed {
+            assert_eq!(
+                risk.selection_tier,
+                SelectionTier::Normal,
+                "{key} 不该被降权（权重 {:.2}）：它的封号只是全池清扫噪声",
+                risk.selection_weight
+            );
+            assert_eq!(risk.selection_weight, 1.0, "{key} 权重应为满值");
+            assert!(!risk.above_pool_baseline, "{key} 不该被判为高于基线");
+            assert_eq!(risk.level, RiskLevel::Ok, "{key} 不该被标成存疑");
+            assert!(!risk.recommend_quarantine, "{key} 不该被建议隔离");
+        }
     }
 
     #[test]

@@ -375,6 +375,10 @@ export interface ProxyRiskAssessment {
   banRateLowerBound: number
   /** 参照用的池内封号率中位数 */
   poolMedianBanRate: number
+  /** 全池合计封号率（总封号 / 总绑定过的号）。判断某出口是否真的偏高就看它 */
+  pooledBanRate: number
+  /** 该出口封号率是否统计上显著高于全池基线；false = 封号数属全池清扫噪声 */
+  abovePoolBaseline: boolean
   recommendQuarantine: boolean
   /** 候选排序权重 0~1。相对池内中位数算，全池一样烂时所有人都是 1 */
   selectionWeight: number
