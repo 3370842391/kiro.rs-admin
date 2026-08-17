@@ -435,8 +435,39 @@ export interface ProxyPoolEntry {
   lastCheckedAt?: string
   consecutiveFailures: number
   autoDisabled: boolean
+  /** 因烧号被隔离守卫停用的时间；非空即表示这次停用是烧号导致的 */
+  quarantinedAt?: string
+  /** 隔离原因摘要 */
+  quarantineReason?: string
   banStats: ProxyBanSummary
   risk: ProxyRiskAssessment
+}
+
+// 烧号出口隔离策略
+export interface ProxyGuardConfig {
+  enabled: boolean
+  /** 窗口内封号数达到此值即停用该出口 */
+  banThreshold: number
+  /** 观察窗口（小时） */
+  windowHours: number
+  /** 隔离后池中必须仍有这么多可分配出口，否则跳过隔离 */
+  minAssignable: number
+  /** 隔离时把该出口上还活着的号迁到干净出口 */
+  migrateSurvivors: boolean
+  /** 隔离多少小时后自动解除。0 = 永不自动解除 */
+  autoReleaseHours: number
+}
+
+export type SetProxyGuardRequest = Partial<ProxyGuardConfig>
+
+// 一轮隔离守卫的执行结果
+export interface ProxyGuardRunResponse {
+  quarantined: Array<{ proxy: string; bans: number; reason: string }>
+  /** 改绑到干净出口的账号数 */
+  migrated: number
+  released: string[]
+  /** 超阈值但因可分配出口不足而跳过的出口 */
+  skippedForCapacity: string[]
 }
 
 // 代理池列表响应

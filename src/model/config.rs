@@ -453,6 +453,76 @@ impl Default for CredentialImportDefaults {
     }
 }
 
+/// 烧号出口的自动隔离策略。
+///
+/// 与 `proxy_ban_stats` 里那套统计研判是两件事。研判要求样本量、跨批次、显著高于
+/// 池内中位数，为的是不冤枉任何一个出口；但线上实测下来它一次都没触发过——最脏的
+/// 出口 4/8 封号率，Wilson 下界仍只有 21%，够不上 30% 阈值，被封的号又全来自同一天
+/// 导入的批次。等它凑齐证据的代价是继续烧号。
+///
+/// 这份配置是运营要的钝器：**窗口内封够 N 个就直接停用这个出口**，不问置信区间。
+/// 代价是可能误伤一个恰好接了脏料的干净出口——用 `min_assignable` 保证不会把池子
+/// 抽干，用手动重新启用兜住误判。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyGuardConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 观察窗口内封号数达到此值即隔离该出口。
+    ///
+    /// 默认 2 而不是 1：单个号被封可能是这个号本身有问题（注册资料、付款方式），
+    /// 同一出口连着死两个才说明问题在出口这一侧。
+    #[serde(default = "default_proxy_guard_ban_threshold")]
+    pub ban_threshold: u32,
+    /// 观察窗口（小时）。只看近期封号——机场的出口 IP 会轮换，
+    /// 上周脏过的线路今天可能已经换了干净 IP。
+    #[serde(default = "default_proxy_guard_window_hours")]
+    pub window_hours: u32,
+    /// 隔离后池中必须仍有这么多可分配出口，否则跳过本次隔离只告警。
+    ///
+    /// 没有这道闸，一次全池普遍封号会把所有出口连锁停用，号全部退化成直连。
+    #[serde(default = "default_proxy_guard_min_assignable")]
+    pub min_assignable: usize,
+    /// 隔离时是否把该出口上还活着的号迁到干净出口。
+    ///
+    /// **必须开启**，除非你清楚自己在做什么：凭据的 `proxyUrl` 是钉死的，出口一旦
+    /// 停用，`proxy_candidates_for` 会把唯一候选过滤掉、最后兜底压入直连，这些号
+    /// 就会拿服务器真实 IP 去打上游。隔离与迁移是同一个动作的两半。
+    #[serde(default = "default_true")]
+    pub migrate_survivors: bool,
+    /// 隔离多少小时后自动解除。0 = 永不自动解除，只能手动重新启用。
+    ///
+    /// 默认 0：既然判定这个 IP 在烧号，自动放它回来正是要避免的事。确认机场换过
+    /// 出口 IP 的场景下再按需打开。
+    #[serde(default)]
+    pub auto_release_hours: u32,
+}
+
+fn default_proxy_guard_ban_threshold() -> u32 {
+    2
+}
+
+fn default_proxy_guard_window_hours() -> u32 {
+    24
+}
+
+fn default_proxy_guard_min_assignable() -> usize {
+    3
+}
+
+impl Default for ProxyGuardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ban_threshold: default_proxy_guard_ban_threshold(),
+            window_hours: default_proxy_guard_window_hours(),
+            min_assignable: default_proxy_guard_min_assignable(),
+            migrate_survivors: true,
+            auto_release_hours: 0,
+        }
+    }
+}
+
 /// 单家供货商对公共导入预设的显式覆盖。`None` 表示继承公共值。
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -960,6 +1030,10 @@ pub struct Config {
     #[serde(default)]
     pub credential_import_defaults: CredentialImportDefaults,
 
+    /// 烧号出口的自动隔离策略。缺失时取默认值（开启，窗口 24h 内封 2 个即隔离）。
+    #[serde(default)]
+    pub proxy_guard: ProxyGuardConfig,
+
     /// 全局号池采购配置。控制「所有采购来的号合计养几个」，跨供货商共享一个缺口。
     ///
     /// 缺失时整块取默认值（`enabled = false`），使老 `config.json` 升级后行为不变。
@@ -1418,6 +1492,7 @@ impl Default for Config {
             key_suppliers: Vec::new(),
             key_supplier_common: KeySupplierCommonConfig::default(),
             credential_import_defaults: CredentialImportDefaults::default(),
+            proxy_guard: ProxyGuardConfig::default(),
             key_supplier_pool: KeySupplierPoolConfig::default(),
             error_snapshot_enabled: true,
             dead_credential_auto_delete: true,

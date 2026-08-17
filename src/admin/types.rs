@@ -1033,10 +1033,53 @@ pub struct ProxyPoolEntry {
     pub consecutive_failures: u32,
     /// 是否由健康检查自动禁用
     pub auto_disabled: bool,
+    /// 因烧号被隔离的时间（RFC3339）；非空即表示当前禁用来自隔离守卫
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quarantined_at: Option<String>,
+    /// 隔离原因摘要
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quarantine_reason: Option<String>,
     /// 历史封号统计（来自 proxy_ban_stats.json，不随死号被清理而丢失）
     pub ban_stats: ProxyBanSummary,
     /// 风险研判结论。建议模式：只给结论和理由，不会自动改启用状态。
     pub risk: ProxyRiskAssessment,
+}
+
+/// 一次隔离动作的说明
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyGuardQuarantineItem {
+    /// 已抹掉账号密码的代理 URL
+    pub proxy: String,
+    /// 触发隔离时窗口内的封号数
+    pub bans: u64,
+    pub reason: String,
+}
+
+/// 一轮隔离守卫的执行结果
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyGuardRunResponse {
+    /// 本轮新隔离的出口
+    pub quarantined: Vec<ProxyGuardQuarantineItem>,
+    /// 本轮改绑到干净出口的账号数
+    pub migrated: usize,
+    /// 隔离到期被放回来的出口
+    pub released: Vec<String>,
+    /// 超阈值但因可分配出口不足而跳过的出口
+    pub skipped_for_capacity: Vec<String>,
+}
+
+/// 隔离守卫配置的读写载荷。字段留空表示不修改。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetProxyGuardRequest {
+    pub enabled: Option<bool>,
+    pub ban_threshold: Option<u32>,
+    pub window_hours: Option<u32>,
+    pub min_assignable: Option<usize>,
+    pub migrate_survivors: Option<bool>,
+    pub auto_release_hours: Option<u32>,
 }
 
 /// 代理池列表响应

@@ -70,6 +70,46 @@ pub struct ProxyEntry {
     /// 是否由健康检查自动禁用（区别于用户手动禁用）
     #[serde(default)]
     pub auto_disabled: bool,
+    /// 因烧号被隔离的时间（RFC3339）。为 None 说明当前禁用与封号无关。
+    ///
+    /// 与 `auto_disabled` 并存：那个标记只说明「不是人禁的」，这个说明「为什么」。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarantined_at: Option<String>,
+    /// 隔离原因摘要，直接给运营看
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarantine_reason: Option<String>,
+    /// 隔离守卫的计数起点（RFC3339）。手动重新启用或自动解除时刷成当前时间。
+    ///
+    /// 没有它，被解除隔离的出口会因为窗口内还留着旧封号记录而立刻再次被隔离，
+    /// 运营点「启用」看起来毫无效果。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_reset_at: Option<String>,
+}
+
+impl ProxyEntry {
+    fn new(id: u64, url: String, label: Option<String>) -> Self {
+        Self {
+            id,
+            url,
+            label,
+            enabled: true,
+            health: ProxyHealth::Unknown,
+            latency_ms: None,
+            last_checked_at: None,
+            consecutive_failures: 0,
+            auto_disabled: false,
+            quarantined_at: None,
+            quarantine_reason: None,
+            guard_reset_at: None,
+        }
+    }
+
+    /// 隔离守卫应从哪个时刻起统计封号
+    pub fn guard_window_start(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        chrono::DateTime::parse_from_rfc3339(self.guard_reset_at.as_deref()?)
+            .ok()
+            .map(|ts| ts.with_timezone(&chrono::Utc))
+    }
 }
 
 fn default_true() -> bool {
@@ -254,17 +294,7 @@ impl ProxyPoolManager {
         }
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let entry = ProxyEntry {
-            id,
-            url,
-            label,
-            enabled: true,
-            health: ProxyHealth::Unknown,
-            latency_ms: None,
-            last_checked_at: None,
-            consecutive_failures: 0,
-            auto_disabled: false,
-        };
+        let entry = ProxyEntry::new(id, url, label);
         entries.push(entry.clone());
         drop(entries);
 
@@ -292,17 +322,7 @@ impl ProxyPoolManager {
                 continue;
             }
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-            let entry = ProxyEntry {
-                id,
-                url,
-                label: None,
-                enabled: true,
-                health: ProxyHealth::Unknown,
-                latency_ms: None,
-                last_checked_at: None,
-                consecutive_failures: 0,
-                auto_disabled: false,
-            };
+            let entry = ProxyEntry::new(id, url, None);
             entries.push(entry.clone());
             added.push(entry);
         }
@@ -338,7 +358,8 @@ impl ProxyPoolManager {
     /// 设置代理启用/禁用状态
     ///
     /// 用户手动启用时清除「健康检查自动禁用」标记与连续失败计数，
-    /// 让该代理重新参与健康检查与分配。
+    /// 让该代理重新参与健康检查与分配。手动启用同时解除烧号隔离并把守卫的
+    /// 计数窗口推到当前时刻，否则窗口里的旧封号会让它下一秒又被隔离回去。
     pub fn set_enabled(&self, id: u64, enabled: bool) -> anyhow::Result<()> {
         let mut entries = self.entries.lock();
         let entry = entries
@@ -349,12 +370,64 @@ impl ProxyPoolManager {
         if enabled {
             entry.auto_disabled = false;
             entry.consecutive_failures = 0;
+            entry.quarantined_at = None;
+            entry.quarantine_reason = None;
+            entry.guard_reset_at = Some(chrono::Utc::now().to_rfc3339());
         } else {
             self.clear_runtime_for_urls(&[entry.url.clone()]);
         }
         drop(entries);
         self.persist()?;
         Ok(())
+    }
+
+    /// 因烧号隔离一个出口：停用 + 打隔离标记 + 清掉粘性绑定。
+    ///
+    /// 返回 false 表示该 URL 不在池子里或已处于停用状态。
+    pub fn quarantine(&self, url: &str, reason: String) -> bool {
+        let mut applied = false;
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.url == url)
+                && entry.enabled
+            {
+                entry.enabled = false;
+                entry.auto_disabled = true;
+                entry.quarantined_at = Some(chrono::Utc::now().to_rfc3339());
+                entry.quarantine_reason = Some(reason);
+                applied = true;
+            }
+        }
+        if applied {
+            self.clear_runtime_for_urls(&[url.to_string()]);
+            if let Err(error) = self.persist() {
+                tracing::warn!(%error, "隔离烧号出口后持久化失败");
+            }
+        }
+        applied
+    }
+
+    /// 解除隔离（自动解除通道）。计数窗口起点推到当前，避免旧封号立刻再次触发。
+    pub fn release_quarantine(&self, url: &str) -> bool {
+        let mut applied = false;
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.url == url)
+                && entry.quarantined_at.is_some()
+            {
+                entry.enabled = true;
+                entry.auto_disabled = false;
+                entry.consecutive_failures = 0;
+                entry.quarantined_at = None;
+                entry.quarantine_reason = None;
+                entry.guard_reset_at = Some(chrono::Utc::now().to_rfc3339());
+                applied = true;
+            }
+        }
+        if applied && let Err(error) = self.persist() {
+            tracing::warn!(%error, "解除烧号隔离后持久化失败");
+        }
+        applied
     }
 
     /// 获取代理 URL，区分"不存在"和"已禁用"两种情况
@@ -741,17 +814,7 @@ impl ProxyPoolManager {
         validate_proxy_url(url)?;
 
         let result = self.probe_one(url).await;
-        let mut entry = ProxyEntry {
-            id: 0,
-            url: url.to_string(),
-            label: None,
-            enabled: true,
-            health: ProxyHealth::Unknown,
-            latency_ms: None,
-            last_checked_at: None,
-            consecutive_failures: 0,
-            auto_disabled: false,
-        };
+        let mut entry = ProxyEntry::new(0, url.to_string(), None);
         Self::apply_probe_result(&mut entry, &result);
         Ok(entry)
     }
@@ -762,17 +825,7 @@ mod tests {
     use super::*;
 
     fn make_entry(url: &str) -> ProxyEntry {
-        ProxyEntry {
-            id: 1,
-            url: url.to_string(),
-            label: None,
-            enabled: true,
-            health: ProxyHealth::Unknown,
-            latency_ms: None,
-            last_checked_at: None,
-            consecutive_failures: 0,
-            auto_disabled: false,
-        }
+        ProxyEntry::new(1, url.to_string(), None)
     }
 
     #[test]
@@ -786,6 +839,73 @@ mod tests {
         assert_eq!(e.latency_ms, None);
         assert_eq!(e.consecutive_failures, 0);
         assert!(!e.auto_disabled);
+        assert_eq!(e.quarantined_at, None);
+        assert_eq!(e.guard_reset_at, None);
+    }
+
+    #[test]
+    fn quarantine_disables_and_records_reason() {
+        let mgr = ProxyPoolManager::new(None, TlsBackend::Rustls);
+        let url = "socks5://127.0.0.1:1080".to_string();
+        mgr.add(url.clone(), None).unwrap();
+
+        assert!(mgr.quarantine(&url, "烧了 2 个号".to_string()));
+        let e = mgr.list().into_iter().next().unwrap();
+        assert!(!e.enabled);
+        assert!(e.auto_disabled);
+        assert!(e.quarantined_at.is_some());
+        assert_eq!(e.quarantine_reason.as_deref(), Some("烧了 2 个号"));
+        assert!(mgr.assignable_urls().is_empty());
+
+        // 已停用的出口不会被重复隔离
+        assert!(!mgr.quarantine(&url, "再来一次".to_string()));
+    }
+
+    #[test]
+    fn releasing_quarantine_pushes_guard_window_forward() {
+        // 没有这一步，运营点「启用」之后窗口里的旧封号会立刻把出口再隔离回去，
+        // 看起来就像按钮没生效
+        let mgr = ProxyPoolManager::new(None, TlsBackend::Rustls);
+        let url = "socks5://127.0.0.1:1080".to_string();
+        let entry = mgr.add(url.clone(), None).unwrap();
+
+        mgr.quarantine(&url, "烧号".to_string());
+        assert!(mgr.release_quarantine(&url));
+        let e = mgr.list().into_iter().next().unwrap();
+        assert!(e.enabled);
+        assert!(!e.auto_disabled);
+        assert_eq!(e.quarantine_reason, None);
+        assert!(e.guard_window_start().is_some());
+
+        // 未处于隔离的出口不需要解除
+        assert!(!mgr.release_quarantine(&url));
+
+        // 手动启用同样刷新窗口起点
+        mgr.quarantine(&url, "又烧号".to_string());
+        mgr.set_enabled(entry.id, true).unwrap();
+        let e = mgr.list().into_iter().next().unwrap();
+        assert!(e.enabled);
+        assert_eq!(e.quarantined_at, None);
+        assert!(e.guard_window_start().is_some());
+    }
+
+    #[test]
+    fn quarantined_proxy_drops_out_of_candidates() {
+        let mgr = ProxyPoolManager::new(None, TlsBackend::Rustls);
+        mgr.add("http://proxy-a:8080".to_string(), None).unwrap();
+        mgr.add("http://proxy-b:8080".to_string(), None).unwrap();
+
+        mgr.quarantine("http://proxy-a:8080", "烧号".to_string());
+        let ordered = mgr.order_candidates(
+            1,
+            vec![
+                ProxyConfig::new("http://proxy-a:8080"),
+                ProxyConfig::new("http://proxy-b:8080"),
+            ],
+            "least_load",
+        );
+        assert_eq!(ordered.len(), 1);
+        assert_eq!(ordered[0].url, "http://proxy-b:8080");
     }
 
     #[test]

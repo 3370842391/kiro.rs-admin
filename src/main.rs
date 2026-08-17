@@ -682,6 +682,9 @@ async fn main() {
                 .service
                 .start_proxy_health_checker(std::time::Duration::from_secs(300));
 
+            // 启动烧号出口隔离守卫：封号事件即触发，隔离脏出口并把幸存号迁走
+            admin_state.service.start_proxy_guard();
+
             // 启动自动更新调度器：每分钟检查一次本地时间，到达 update_auto_apply_time
             // 且开启 update_auto_apply 时执行一次更新；否则静默等待。
             admin_state.service.start_auto_update_scheduler();

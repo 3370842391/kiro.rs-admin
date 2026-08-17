@@ -13,6 +13,7 @@ import {
   XCircle,
   HelpCircle,
   Skull,
+  ShieldAlert,
 } from 'lucide-react'
 import {
   Dialog,
@@ -47,6 +48,7 @@ import {
   ProxyWeightBadge,
   formatSurvival,
 } from '@/components/proxy-ban-stats-panel'
+import { ProxyGuardDialog } from '@/components/proxy-guard-dialog'
 import type { ProxyPoolEntry } from '@/types/api'
 
 interface ProxyPoolDialogProps {
@@ -91,6 +93,7 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
   const [selectedIds, setSelectedIds] = useState<Set<number>>(() => new Set())
   const [checkingIds, setCheckingIds] = useState<Set<number>>(() => new Set())
   const [batchAction, setBatchAction] = useState<BatchAction>(null)
+  const [guardOpen, setGuardOpen] = useState(false)
   const queryClient = useQueryClient()
 
   const { data, isLoading } = useQuery({
@@ -151,6 +154,8 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
   const demotedProxies = proxies.filter(
     (proxy) => proxy.risk && proxy.risk.selectionTier !== 'normal'
   )
+  // 已被隔离守卫停用的出口。比降权更硬：这些出口已经完全不参与分配
+  const quarantinedProxies = proxies.filter((proxy) => proxy.quarantinedAt)
   const orphanGlobalCandidates = globalProxyCandidates.filter(
     (candidate) =>
       candidate.toLowerCase() !== 'direct' && !proxies.some((proxy) => proxy.url === candidate)
@@ -405,6 +410,7 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
   }
 
   return (
+    <>
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-2xl max-h-[85vh] flex flex-col">
         <DialogHeader>
@@ -647,9 +653,40 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                       <Shuffle className="h-3 w-3 mr-1" />
                       轮询分配
                     </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-7 text-xs"
+                      onClick={() => setGuardOpen(true)}
+                      title="窗口内封够几个号就停用该出口，并把幸存号迁走"
+                    >
+                      <ShieldAlert className="h-3 w-3 mr-1" />
+                      烧号隔离
+                    </Button>
                   </div>
                 )}
               </div>
+              {quarantinedProxies.length > 0 && (
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-destructive/60 bg-destructive/15 px-3 py-2 text-xs text-destructive">
+                  <span>
+                    有 {quarantinedProxies.length} 个出口因烧号已被隔离停用（
+                    {quarantinedProxies
+                      .slice(0, 3)
+                      .map((proxy) => maskProxyUrl(proxy.url))
+                      .join('、')}
+                    {quarantinedProxies.length > 3 ? ' 等' : ''}
+                    ）。上面的号已改绑到干净出口；确认机场换过出口 IP 后可手动重新启用。
+                  </span>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 text-xs"
+                    onClick={() => setGuardOpen(true)}
+                  >
+                    隔离设置
+                  </Button>
+                </div>
+              )}
               {demotedProxies.length > 0 && (
                 <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
                   <span>
@@ -743,8 +780,21 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                         <ProxyBanBadge stats={proxy.banStats} risk={proxy.risk} />
                         <ProxyWeightBadge risk={proxy.risk} />
                         {!proxy.enabled && (
-                          <Badge variant="outline" className="text-xs text-muted-foreground">
-                            {proxy.autoDisabled ? '自动禁用' : '已禁用'}
+                          <Badge
+                            variant="outline"
+                            className={
+                              proxy.quarantinedAt
+                                ? 'text-xs text-destructive border-destructive/50 gap-1'
+                                : 'text-xs text-muted-foreground'
+                            }
+                            title={proxy.quarantineReason ?? undefined}
+                          >
+                            {proxy.quarantinedAt && <ShieldAlert className="h-3 w-3" />}
+                            {proxy.quarantinedAt
+                              ? '烧号隔离'
+                              : proxy.autoDisabled
+                                ? '自动禁用'
+                                : '已禁用'}
                           </Badge>
                         )}
                       </div>
@@ -846,5 +896,7 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
         )}
       </DialogContent>
     </Dialog>
+    <ProxyGuardDialog open={guardOpen} onOpenChange={setGuardOpen} />
+    </>
   )
 }

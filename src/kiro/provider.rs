@@ -670,11 +670,16 @@ impl KiroProvider {
         credentials: &KiroCredentials,
     ) -> Vec<Option<ProxyConfig>> {
         let global = self.global_proxy_candidates();
+        let pinned = credentials
+            .proxy_url
+            .as_deref()
+            .is_some_and(|url| !url.trim().is_empty());
         let mut candidates = credentials.effective_proxy_candidates(&global);
 
         let has_direct = candidates.iter().any(|candidate| candidate.is_none());
         candidates.retain(|candidate| candidate.is_some());
 
+        let requested = candidates.len();
         let proxy_candidates: Vec<ProxyConfig> = candidates.into_iter().flatten().collect();
         let ordered = if let Some(pool) = &self.proxy_pool {
             let mode = self.token_manager.get_proxy_balancing_mode();
@@ -682,6 +687,18 @@ impl KiroProvider {
         } else {
             proxy_candidates
         };
+
+        // 凭据钉死了出口，而这些出口全被禁用或隔离时，绝不能兜底直连：那是拿服务器
+        // 真实 IP 去打上游，比继续用脏代理更糟——一次就能把出口暴露给上游风控。
+        // 返回空候选让上层换凭据重试；绑定关系由烧号隔离守卫迁移修好。
+        // 出口列表里显式写了 `direct` 的属于运营主动允许，不在此列。
+        if pinned && !has_direct && requested > 0 && ordered.is_empty() {
+            tracing::warn!(
+                credential_id,
+                "凭据指定的代理全部不可用（已禁用或隔离），跳过该凭据而不退化为直连"
+            );
+            return Vec::new();
+        }
 
         let mut candidates: Vec<Option<ProxyConfig>> = ordered.into_iter().map(Some).collect();
 

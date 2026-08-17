@@ -988,6 +988,29 @@ pub async fn set_import_defaults(
     }
 }
 
+/// GET /api/admin/config/proxy-guard
+/// 烧号出口隔离策略：窗口内封几个号就停用该出口，以及是否把幸存号迁走。
+pub async fn get_proxy_guard_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_proxy_guard_config())
+}
+
+/// PUT /api/admin/config/proxy-guard
+pub async fn set_proxy_guard_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<super::types::SetProxyGuardRequest>,
+) -> impl IntoResponse {
+    match state.service.set_proxy_guard_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/proxy-pool/guard/run
+/// 立即按当前策略执行一轮隔离与迁移，不等下一次封号事件。
+pub async fn run_proxy_guard(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.enforce_proxy_guard())
+}
+
 /// GET /api/admin/config/dead-credentials
 /// 死号治理配置：判死后保留多久、是否自动删除，以及当前死号统计。
 pub async fn get_dead_credential_config(State(state): State<AdminState>) -> impl IntoResponse {

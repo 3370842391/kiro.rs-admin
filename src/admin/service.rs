@@ -31,7 +31,9 @@ use crate::kiro::token_manager::{
     CredentialBatchPatch, CredentialBatchUpdateError, CredentialEntrySnapshot,
     CredentialGroupPatch, MultiTokenManager, RPM_WINDOW_SECONDS,
 };
-use crate::model::config::{Config, CredentialImportDefaults, EndpointMode, RetryMode};
+use crate::model::config::{
+    Config, CredentialImportDefaults, EndpointMode, ProxyGuardConfig, RetryMode,
+};
 
 use super::error::AdminServiceError;
 use super::model_profile_sync::{
@@ -39,7 +41,7 @@ use super::model_profile_sync::{
 };
 use super::profit::ProfitConfig;
 use super::proxy_ban_stats;
-use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
+use super::proxy_pool::{GetUrlResult, ProxyEntry, ProxyHealth, ProxyPoolManager};
 use super::types::{
     AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse,
     ApplyModelProfilesRequest, AssignProxyRequest, AssignRoundRobinResponse, AvailableModelItem,
@@ -58,14 +60,15 @@ use super::types::{
     ModelProfilesResponse, PatchModelProfileRequest, PollIdcLoginResponse,
     PreviewModelProfilesRequest, ProfitConfigResponse, ProxyBalancingModeResponse,
     ProxyBanDetailEntry, ProxyBanStatsResponse, ProxyBanTimelineItem, ProxyCheckAllResponse,
-    ProxyCheckResponse, ProxyCheckUrlRequest, ProxyPoolEntry,
+    ProxyCheckResponse, ProxyCheckUrlRequest, ProxyGuardQuarantineItem, ProxyGuardRunResponse,
+    ProxyPoolEntry,
     ProxyPoolResponse, QuotaExceededResult, ResolvedModelProfileResponse, RetryPolicyResponse,
     RevisionRequest, RpmSummary, SetAccountThrottleConfigRequest, SetCacheHitRateRequest,
     SetCachePolicyRequest, SetCompatibilityConfigRequest, SetDeadCredentialConfigRequest,
     SetEndpointChainsRequest, SetEndpointModeRequest, SetImageBudgetRequest,
     SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetModelProfileSettingsRequest,
     SetImportDefaultsRequest, SetProfitConfigRequest, SetProxyBalancingModeRequest,
-    SetRetryPolicyRequest,
+    SetProxyGuardRequest, SetRetryPolicyRequest,
     SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
     StartSocialLoginResponse, SyncModelProfilesRequest, UpdateCheckInfo, UpdateConfigResponse,
     UpdateCredentialRequest, UpdateRefreshTokenRequest,
@@ -591,6 +594,8 @@ pub struct AdminService {
     last_model_profile_sync: Mutex<Option<ModelProfileSyncSummaryResponse>>,
     /// 手动导入默认值（运行时可改）。`Config` 是启动快照，改配置必须另存运行时副本。
     import_defaults: Mutex<CredentialImportDefaults>,
+    /// 烧号出口隔离策略（运行时可改），同理不能直接读 `Config`。
+    proxy_guard: Mutex<ProxyGuardConfig>,
 }
 
 /// Social 登录会话状态
@@ -974,6 +979,7 @@ impl AdminService {
         let balance_cache = Self::load_balance_cache_from(&cache_path);
         let update_config = RuntimeUpdateConfig::from_config(token_manager.config());
         let import_defaults = token_manager.config().credential_import_defaults.clone();
+        let proxy_guard = token_manager.config().proxy_guard.clone();
 
         let svc = Self {
             token_manager,
@@ -996,6 +1002,7 @@ impl AdminService {
             model_profile_sync: None,
             last_model_profile_sync: Mutex::new(None),
             import_defaults: Mutex::new(import_defaults),
+            proxy_guard: Mutex::new(proxy_guard),
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -1745,6 +1752,97 @@ impl AdminService {
                 tokio::time::sleep(interval).await;
             }
         });
+    }
+
+    /// 启动烧号出口隔离守卫。
+    ///
+    /// 事件驱动为主：台账每记下一次封号就唤醒一次。线上观测到的封号是聚集出现的
+    /// ——同一出口上两个号只隔了 84 秒——纯轮询的间隔就是白送给脏出口的额度。
+    /// 定时唤醒只为兜住两件事：到期自动解除隔离，以及重启后立刻按现有台账做一次判定。
+    pub fn start_proxy_guard(self: &Arc<Self>) {
+        let Some(ledger) = self.token_manager.ban_ledger() else {
+            return;
+        };
+        let signal = ledger.ban_signal();
+        let svc = Arc::clone(self);
+        tokio::spawn(async move {
+            // 启动时先让代理池健康检查跑一轮，避免拿「尚未探测」的状态做容量判断
+            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            loop {
+                let outcome = svc.enforce_proxy_guard();
+                if !outcome.quarantined.is_empty()
+                    || outcome.migrated > 0
+                    || !outcome.released.is_empty()
+                {
+                    tracing::info!(
+                        quarantined = outcome.quarantined.len(),
+                        migrated = outcome.migrated,
+                        released = outcome.released.len(),
+                        skipped = outcome.skipped_for_capacity.len(),
+                        "烧号隔离守卫完成一轮处置"
+                    );
+                }
+                // notified() 必须在本轮处置之后再等，才不会漏掉处置期间发生的封号
+                tokio::select! {
+                    _ = signal.notified() => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {}
+                }
+            }
+        });
+    }
+
+    /// 读取隔离守卫配置
+    pub fn get_proxy_guard_config(&self) -> ProxyGuardConfig {
+        self.proxy_guard.lock().clone()
+    }
+
+    /// 更新隔离守卫配置：先改运行时副本立即生效，再落盘
+    pub fn set_proxy_guard_config(
+        &self,
+        req: SetProxyGuardRequest,
+    ) -> Result<ProxyGuardConfig, AdminServiceError> {
+        if let Some(v) = req.ban_threshold
+            && v == 0
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "banThreshold 至少为 1".to_string(),
+            ));
+        }
+        if let Some(v) = req.window_hours
+            && !(1..=8760).contains(&v)
+        {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "windowHours 必须在 1..=8760 内: {}",
+                v
+            )));
+        }
+
+        let updated = {
+            let mut current = self.proxy_guard.lock();
+            if let Some(v) = req.enabled {
+                current.enabled = v;
+            }
+            if let Some(v) = req.ban_threshold {
+                current.ban_threshold = v;
+            }
+            if let Some(v) = req.window_hours {
+                current.window_hours = v;
+            }
+            if let Some(v) = req.min_assignable {
+                current.min_assignable = v;
+            }
+            if let Some(v) = req.migrate_survivors {
+                current.migrate_survivors = v;
+            }
+            if let Some(v) = req.auto_release_hours {
+                current.auto_release_hours = v;
+            }
+            current.clone()
+        };
+
+        let value = updated.clone();
+        self.update_config_file(move |c| c.proxy_guard = value);
+        Ok(updated)
     }
 
     /// 启动无人值守自动更新调度器。
@@ -3858,6 +3956,233 @@ impl AdminService {
         )
     }
 
+    /// 执行一轮烧号出口隔离。
+    ///
+    /// 与 [`Self::proxy_risk_map`] 那套统计研判互不干扰：研判负责「有没有证据」，
+    /// 这里负责「够不够狠」。两个动作必须同时发生：
+    ///
+    /// 1. **隔离**：窗口内封号数达阈值的出口直接停用。
+    /// 2. **迁移**：把该出口上还活着的号改绑到干净出口。
+    ///
+    /// 只做第 1 步是有害的。凭据的 `proxyUrl` 是钉死的单候选，出口停用后
+    /// `proxy_candidates_for` 会把它过滤成空列表，然后兜底压入直连——这些号会拿
+    /// 服务器真实 IP 去打上游，比继续用脏代理更糟。
+    pub fn enforce_proxy_guard(&self) -> ProxyGuardRunResponse {
+        let cfg = self.get_proxy_guard_config();
+        let mut outcome = ProxyGuardRunResponse::default();
+        if !cfg.enabled {
+            return outcome;
+        }
+        let Some(ledger) = self.token_manager.ban_ledger() else {
+            return outcome;
+        };
+
+        // 先解除到期隔离，腾出的容量能让本轮多隔离一个真正在烧号的出口。
+        // 必须在统计封号数之前做：解除会把守卫窗口起点推到当前，之后重新计数才能
+        // 得到 0，否则刚放回来的出口会被窗口里的旧封号立刻再次隔离。
+        if cfg.auto_release_hours > 0 {
+            let deadline =
+                chrono::Utc::now() - chrono::Duration::hours(cfg.auto_release_hours as i64);
+            for entry in self.proxy_pool.list() {
+                let expired = entry
+                    .quarantined_at
+                    .as_deref()
+                    .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+                    .is_some_and(|at| at.with_timezone(&chrono::Utc) <= deadline);
+                if expired && self.proxy_pool.release_quarantine(&entry.url) {
+                    tracing::info!(
+                        proxy = %proxy_ban_stats::redact_proxy_url(&entry.url),
+                        hours = cfg.auto_release_hours,
+                        "烧号隔离到期，已重新启用该出口"
+                    );
+                    outcome
+                        .released
+                        .push(proxy_ban_stats::redact_proxy_url(&entry.url));
+                }
+            }
+        }
+
+        let entries = self.proxy_pool.list();
+        // 归一化键 → 守卫计数起点。手动启用/自动解除会把起点推到当时，
+        // 窗口里的旧封号不该让刚放回来的出口立刻再被隔离。
+        let reset_at: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>> = entries
+            .iter()
+            .filter_map(|e| {
+                e.guard_window_start()
+                    .map(|at| (proxy_ban_stats::normalize_proxy_key(Some(&e.url)), at))
+            })
+            .collect();
+        let bans = ledger.bans_in_window(cfg.window_hours, &|key| reset_at.get(key).copied());
+        let ban_count = |url: &str| -> u64 {
+            bans.get(&proxy_ban_stats::normalize_proxy_key(Some(url)))
+                .copied()
+                .unwrap_or(0)
+        };
+
+        let mut assignable = entries
+            .iter()
+            .filter(|e| e.enabled && e.health != ProxyHealth::Unhealthy)
+            .count();
+
+        // 触发隔离的出口，烧得最狠的排前面——容量不够时优先处理最坏的那个
+        let mut offenders: Vec<&ProxyEntry> = entries
+            .iter()
+            .filter(|e| e.enabled && ban_count(&e.url) >= cfg.ban_threshold as u64)
+            .collect();
+        offenders.sort_by(|a, b| ban_count(&b.url).cmp(&ban_count(&a.url)));
+
+        for offender in offenders {
+            let bans_now = ban_count(&offender.url);
+            let redacted = proxy_ban_stats::redact_proxy_url(&offender.url);
+            let reason = format!(
+                "最近 {} 小时内烧掉 {} 个号（阈值 {}）",
+                cfg.window_hours, bans_now, cfg.ban_threshold
+            );
+
+            // 容量闸门：宁可让一个脏出口继续跑，也不能把池子抽干让号退化成直连
+            if assignable.saturating_sub(1) < cfg.min_assignable {
+                tracing::warn!(
+                    proxy = %redacted,
+                    bans = bans_now,
+                    assignable,
+                    min_assignable = cfg.min_assignable,
+                    "出口烧号超阈值但可分配出口不足，跳过隔离"
+                );
+                outcome.skipped_for_capacity.push(redacted);
+                continue;
+            }
+
+            if !self.proxy_pool.quarantine(&offender.url, reason.clone()) {
+                continue;
+            }
+            assignable -= 1;
+            tracing::error!(proxy = %redacted, bans = bans_now, "{}，已隔离该出口", reason);
+            outcome.quarantined.push(ProxyGuardQuarantineItem {
+                proxy: redacted,
+                bans: bans_now,
+                reason,
+            });
+
+            if cfg.migrate_survivors {
+                outcome.migrated += self.migrate_off_proxy(&offender.url, &bans, cfg.ban_threshold);
+            }
+        }
+
+        outcome
+    }
+
+    /// 把某个出口上还活着的号改绑到干净出口。返回迁移成功的账号数。
+    ///
+    /// 只迁未判死的号：死号改绑只会污染新出口的 `accountsSeen` 分母，把它的封号率
+    /// 摊薄成假的好看数字。
+    fn migrate_off_proxy(
+        &self,
+        from_url: &str,
+        bans: &std::collections::BTreeMap<String, u64>,
+        ban_threshold: u32,
+    ) -> usize {
+        let from_key = proxy_ban_stats::normalize_proxy_key(Some(from_url));
+        let survivors: Vec<(u64, Option<String>)> = self
+            .token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .filter(|c| c.died_at.is_none())
+            .filter(|c| {
+                c.proxy_url
+                    .as_deref()
+                    .is_some_and(|u| proxy_ban_stats::normalize_proxy_key(Some(u)) == from_key)
+            })
+            .map(|c| (c.id, c.email))
+            .collect();
+        if survivors.is_empty() {
+            return 0;
+        }
+
+        // 目标只从「窗口内封号数低于阈值」的出口里挑，否则只是把号从一个正在烧号的
+        // 出口搬到另一个，下一轮又得搬一次
+        let mut targets: Vec<(String, usize)> = {
+            let counts = self.credential_count_by_proxy();
+            self.proxy_pool
+                .assignable_urls()
+                .into_iter()
+                .filter(|url| {
+                    let key = proxy_ban_stats::normalize_proxy_key(Some(url));
+                    key != from_key
+                        && bans.get(&key).copied().unwrap_or(0) < ban_threshold as u64
+                })
+                .map(|url| {
+                    let key = proxy_ban_stats::normalize_proxy_key(Some(&url));
+                    let load = counts.get(&key).copied().unwrap_or(0);
+                    (url, load)
+                })
+                .collect()
+        };
+        if targets.is_empty() {
+            tracing::error!(
+                proxy = %proxy_ban_stats::redact_proxy_url(from_url),
+                stranded = survivors.len(),
+                "没有干净出口可迁移，这些号仍绑在被隔离的出口上（不会直连，但也打不通）"
+            );
+            return 0;
+        }
+
+        let mut migrated = 0usize;
+        for (credential_id, email) in survivors {
+            // 每次都挑当前负载最低的，避免把一批号全塞给同一个出口——同出口并发
+            // 正是这轮封号里最可疑的特征
+            targets.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            let (target_url, load) = &mut targets[0];
+            let target_url = target_url.clone();
+            *load += 1;
+
+            match self.token_manager.update_credential(
+                credential_id,
+                None,
+                None,
+                Some(Some(target_url.clone())),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ) {
+                Ok(()) => {
+                    migrated += 1;
+                    tracing::warn!(
+                        credential_id,
+                        email = email.as_deref().unwrap_or("-"),
+                        from = %proxy_ban_stats::redact_proxy_url(from_url),
+                        to = %proxy_ban_stats::redact_proxy_url(&target_url),
+                        "出口被隔离，账号已改绑到干净出口"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(credential_id, %error, "账号改绑代理失败");
+                }
+            }
+        }
+        migrated
+    }
+
+    /// 每个出口当前绑了多少个活号，键为归一化 `host:port`
+    fn credential_count_by_proxy(&self) -> std::collections::HashMap<String, usize> {
+        let mut counts: std::collections::HashMap<String, usize> = Default::default();
+        for c in self.token_manager.snapshot().entries {
+            if c.died_at.is_some() {
+                continue;
+            }
+            if let Some(url) = c.proxy_url.as_deref() {
+                *counts
+                    .entry(proxy_ban_stats::normalize_proxy_key(Some(url)))
+                    .or_default() += 1;
+            }
+        }
+        counts
+    }
+
     /// 获取代理池列表（含凭据引用计数与历史封号统计）
     pub fn get_proxy_pool(&self) -> ProxyPoolResponse {
         let proxies = self.proxy_pool.list();
@@ -3904,6 +4229,8 @@ impl AdminService {
                     last_checked_at: p.last_checked_at,
                     consecutive_failures: p.consecutive_failures,
                     auto_disabled: p.auto_disabled,
+                    quarantined_at: p.quarantined_at,
+                    quarantine_reason: p.quarantine_reason,
                     ban_stats,
                     risk,
                 }
@@ -4020,6 +4347,8 @@ impl AdminService {
             last_checked_at: entry.last_checked_at,
             consecutive_failures: entry.consecutive_failures,
             auto_disabled: entry.auto_disabled,
+            quarantined_at: entry.quarantined_at,
+            quarantine_reason: entry.quarantine_reason,
             ban_stats,
             risk: Default::default(),
         })
@@ -4047,6 +4376,8 @@ impl AdminService {
                     last_checked_at: e.last_checked_at,
                     consecutive_failures: e.consecutive_failures,
                     auto_disabled: e.auto_disabled,
+                    quarantined_at: e.quarantined_at,
+                    quarantine_reason: e.quarantine_reason,
                     ban_stats,
                     risk: Default::default(),
                 }

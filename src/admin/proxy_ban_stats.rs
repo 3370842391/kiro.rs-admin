@@ -16,6 +16,8 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Notify;
 
 /// 每个代理最多保留多少条封号明细（聚合计数不受此限制，只截断明细列表）
 const MAX_EVENTS_PER_PROXY: usize = 500;
@@ -193,6 +195,9 @@ fn truncate_reason(reason: &str) -> String {
 pub struct ProxyBanLedger {
     data: Mutex<LedgerData>,
     path: Option<PathBuf>,
+    /// 新增封号时被唤醒。让隔离守卫在封号发生的那一刻就动手，而不是等下一个
+    /// 轮询周期——一次封号聚集里两个号只隔了 84 秒，轮询间隔就是纯损失。
+    ban_signal: Arc<Notify>,
 }
 
 impl ProxyBanLedger {
@@ -208,7 +213,39 @@ impl ProxyBanLedger {
         Self {
             data: Mutex::new(data),
             path,
+            ban_signal: Arc::new(Notify::new()),
         }
+    }
+
+    /// 订阅封号事件。等待者在下一次 [`Self::record_ban`] 真正新增记录时被唤醒。
+    pub fn ban_signal(&self) -> Arc<Notify> {
+        Arc::clone(&self.ban_signal)
+    }
+
+    /// 每个代理在最近 `window_hours` 小时内的封号数。
+    ///
+    /// 与 [`ProxyBanSummary::bans_24h`] 分开是因为隔离窗口可配置；另外这里支持
+    /// `since` 下限——出口被手动重新启用后，之前的封号不该立刻把它再送回隔离。
+    pub fn bans_in_window(
+        &self,
+        window_hours: u32,
+        since: &dyn Fn(&str) -> Option<chrono::DateTime<chrono::Utc>>,
+    ) -> BTreeMap<String, u64> {
+        let cutoff = chrono::Utc::now() - chrono::Duration::hours(window_hours.max(1) as i64);
+        let data = self.data.lock();
+        data.proxies
+            .iter()
+            .map(|(key, record)| {
+                let floor = since(key).map(|at| at.max(cutoff)).unwrap_or(cutoff);
+                let count = record
+                    .events
+                    .iter()
+                    .filter_map(|e| chrono::DateTime::parse_from_rfc3339(&e.banned_at).ok())
+                    .filter(|ts| ts.with_timezone(&chrono::Utc) >= floor)
+                    .count() as u64;
+                (key.clone(), count)
+            })
+            .collect()
     }
 
     /// 记一次封号。同一 (代理, 凭据) 只计一次，重放与回填都不会重复累加。
@@ -267,6 +304,7 @@ impl ProxyBanLedger {
 
         drop(data);
         self.persist();
+        self.ban_signal.notify_waiters();
         true
     }
 
@@ -964,6 +1002,60 @@ mod tests {
         let summary = ledger.summary_for(proxy);
         assert_eq!(summary.accounts_seen, 1);
         assert_eq!(summary.ban_rate, Some(1.0));
+    }
+
+    #[test]
+    fn window_counts_only_recent_bans() {
+        let ledger = ProxyBanLedger::new(None);
+        let proxy = Some("socks5://1.2.3.4:7139");
+        let now = chrono::Utc::now();
+        // 一次在窗口内，一次远在窗口之外
+        ledger.record_ban(obs(
+            1,
+            proxy,
+            &(now - chrono::Duration::hours(2)).to_rfc3339(),
+            None,
+        ));
+        ledger.record_ban(obs(
+            2,
+            proxy,
+            &(now - chrono::Duration::hours(80)).to_rfc3339(),
+            None,
+        ));
+
+        let no_floor = |_: &str| None;
+        let bans = ledger.bans_in_window(24, &no_floor);
+        assert_eq!(bans.get("1.2.3.4:7139").copied(), Some(1));
+        // 拉长窗口两次都算上，历史累计从不因窗口而丢失
+        let bans = ledger.bans_in_window(168, &no_floor);
+        assert_eq!(bans.get("1.2.3.4:7139").copied(), Some(2));
+        assert_eq!(ledger.summary_for(proxy).total_bans, 2);
+    }
+
+    #[test]
+    fn window_floor_ignores_bans_before_manual_reenable() {
+        // 出口被放回来之后，之前那些封号不该立刻把它再送回隔离
+        let ledger = ProxyBanLedger::new(None);
+        let proxy = Some("socks5://1.2.3.4:7139");
+        let now = chrono::Utc::now();
+        ledger.record_ban(obs(
+            1,
+            proxy,
+            &(now - chrono::Duration::hours(3)).to_rfc3339(),
+            None,
+        ));
+        ledger.record_ban(obs(
+            2,
+            proxy,
+            &(now - chrono::Duration::minutes(30)).to_rfc3339(),
+            None,
+        ));
+
+        let reset_at = now - chrono::Duration::hours(1);
+        let bans = ledger.bans_in_window(24, &|key| {
+            (key == "1.2.3.4:7139").then_some(reset_at)
+        });
+        assert_eq!(bans.get("1.2.3.4:7139").copied(), Some(1));
     }
 
     #[test]

@@ -18,6 +18,9 @@ import type {
   ProxyPoolEntry,
   ProxyPoolResponse,
   ProxyBanStatsResponse,
+  ProxyGuardConfig,
+  SetProxyGuardRequest,
+  ProxyGuardRunResponse,
   CredentialImportDefaults,
   SetImportDefaultsRequest,
   AddProxyRequest,
@@ -471,6 +474,25 @@ export async function getProxyBanStats(limit = 200): Promise<ProxyBanStatsRespon
 // 清空指定代理的封号台账（机场换了出口 IP 之后重新计数）
 export async function resetProxyBanStats(proxyKey: string): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>('/proxy-pool/ban-stats/reset', { proxyKey })
+  return data
+}
+
+// 烧号出口隔离策略
+export async function getProxyGuardConfig(): Promise<ProxyGuardConfig> {
+  const { data } = await api.get<ProxyGuardConfig>('/config/proxy-guard')
+  return data
+}
+
+export async function setProxyGuardConfig(
+  req: SetProxyGuardRequest
+): Promise<ProxyGuardConfig> {
+  const { data } = await api.put<ProxyGuardConfig>('/config/proxy-guard', req)
+  return data
+}
+
+// 立即执行一轮隔离与迁移，不等下一次封号事件
+export async function runProxyGuard(): Promise<ProxyGuardRunResponse> {
+  const { data } = await api.post<ProxyGuardRunResponse>('/proxy-pool/guard/run')
   return data
 }
 
