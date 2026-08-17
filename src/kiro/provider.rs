@@ -310,6 +310,29 @@ fn should_try_next_proxy(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 407 | 502 | 503 | 504)
 }
 
+/// 把排好序的代理候选组装成最终尝试列表，并决定要不要给直连留个兜底位。
+///
+/// 直连兜底只在两种情况下允许：候选里显式写了 `direct`（运营主动要求），
+/// 或者压根没配任何代理（`configured_proxies == 0`，本来就是直连）。
+///
+/// 配了代理却连不上时**绝不能**偷偷走直连。线上为此付出过代价：代理一次超时就
+/// 退化直连，账号拿服务器真实 IP 打了几分钟上游，6~12 分钟后被判死；更糟的是这个
+/// 真实 IP 会被上游记住，之后凡是从它出去过的号接连被封，而封号台账把锅记在各自的
+/// 代理头上，看起来像是「一堆脏 IP」，根因被完全掩盖。
+///
+/// 返回空列表是合法结果：宁可这次请求失败、让上层换个凭据重试，也不暴露出口。
+fn assemble_proxy_candidates(
+    ordered: Vec<ProxyConfig>,
+    has_direct: bool,
+    configured_proxies: usize,
+) -> Vec<Option<ProxyConfig>> {
+    let mut candidates: Vec<Option<ProxyConfig>> = ordered.into_iter().map(Some).collect();
+    if has_direct || configured_proxies == 0 {
+        candidates.push(None);
+    }
+    candidates
+}
+
 /// Kiro API Provider
 ///
 /// 核心组件，负责与 Kiro API 通信
@@ -670,16 +693,13 @@ impl KiroProvider {
         credentials: &KiroCredentials,
     ) -> Vec<Option<ProxyConfig>> {
         let global = self.global_proxy_candidates();
-        let pinned = credentials
-            .proxy_url
-            .as_deref()
-            .is_some_and(|url| !url.trim().is_empty());
         let mut candidates = credentials.effective_proxy_candidates(&global);
 
         let has_direct = candidates.iter().any(|candidate| candidate.is_none());
         candidates.retain(|candidate| candidate.is_some());
 
-        let requested = candidates.len();
+        // 配置层面要求走代理的候选数（与「此刻还有几个可用」无关）
+        let configured_proxies = candidates.len();
         let proxy_candidates: Vec<ProxyConfig> = candidates.into_iter().flatten().collect();
         let ordered = if let Some(pool) = &self.proxy_pool {
             let mode = self.token_manager.get_proxy_balancing_mode();
@@ -688,31 +708,19 @@ impl KiroProvider {
             proxy_candidates
         };
 
-        // 凭据钉死了出口，而这些出口全被禁用或隔离时，绝不能兜底直连：那是拿服务器
-        // 真实 IP 去打上游，比继续用脏代理更糟——一次就能把出口暴露给上游风控。
-        // 返回空候选让上层换凭据重试；绑定关系由烧号隔离守卫迁移修好。
-        // 出口列表里显式写了 `direct` 的属于运营主动允许，不在此列。
-        if pinned && !has_direct && requested > 0 && ordered.is_empty() {
+        let mut ordered = ordered;
+        if self.proxy_pool.is_none() && ordered.len() > 1 {
+            let offset = fastrand::usize(..ordered.len());
+            ordered.rotate_left(offset);
+        }
+
+        let candidates = assemble_proxy_candidates(ordered, has_direct, configured_proxies);
+        if candidates.is_empty() {
             tracing::warn!(
                 credential_id,
-                "凭据指定的代理全部不可用（已禁用或隔离），跳过该凭据而不退化为直连"
+                configured_proxies,
+                "凭据配置的代理当前全部不可用，跳过该凭据而不退化为直连"
             );
-            return Vec::new();
-        }
-
-        let mut candidates: Vec<Option<ProxyConfig>> = ordered.into_iter().map(Some).collect();
-
-        if self.proxy_pool.is_none() && candidates.len() > 1 {
-            let offset = fastrand::usize(..candidates.len());
-            candidates.rotate_left(offset);
-        }
-
-        // 代理候选随机轮询；直连只作为最后兜底，避免有代理可用时主动绕过代理。
-        if has_direct || !candidates.is_empty() {
-            candidates.push(None);
-        }
-        if candidates.is_empty() {
-            candidates.push(None);
         }
         candidates
     }
@@ -2363,6 +2371,33 @@ mod tests {
             "application/json"
         );
         assert_eq!(debug_header_value("x-binary", &[0xff]), "<binary>");
+    }
+
+    #[test]
+    fn configured_proxy_never_silently_falls_back_to_direct() {
+        let proxy = ProxyConfig::new("socks5://1.2.3.4:1080");
+
+        // 代理可用：直连不在候选里，否则代理一失败就会被顺位选中
+        let candidates = assemble_proxy_candidates(vec![proxy.clone()], false, 1);
+        assert_eq!(candidates, vec![Some(proxy)]);
+
+        // 代理配了但此刻一个都不可用：返回空而不是退化成直连。
+        // 线上就是这里把账号推到服务器真实 IP 上，6~12 分钟后被判死。
+        assert!(assemble_proxy_candidates(vec![], false, 1).is_empty());
+    }
+
+    #[test]
+    fn direct_is_offered_only_when_asked_for_or_no_proxy_configured() {
+        let proxy = ProxyConfig::new("socks5://1.2.3.4:1080");
+
+        // 运营在候选里显式写了 direct，属于主动允许
+        assert_eq!(
+            assemble_proxy_candidates(vec![proxy.clone()], true, 1),
+            vec![Some(proxy), None]
+        );
+
+        // 压根没配代理，本来就是直连
+        assert_eq!(assemble_proxy_candidates(vec![], true, 0), vec![None]);
     }
 
     #[test]
