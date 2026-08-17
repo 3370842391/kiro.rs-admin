@@ -40,6 +40,15 @@ impl ProxyConfig {
         value.trim().eq_ignore_ascii_case("direct")
     }
 
+    /// 这份配置是否是「运营主动要求直连」——有内容，且每一项都是 `direct`。
+    ///
+    /// 用来把它和「配置写错/写空」区分开：两者都取不出代理 URL，但前者可以放行，
+    /// 后者必须报错。混为一谈就会在配置出错时静默走本机 IP。
+    pub fn is_explicit_direct(&self) -> bool {
+        let candidates = Self::split_candidates(&self.url);
+        !candidates.is_empty() && candidates.iter().all(|c| Self::is_direct(c))
+    }
+
     /// 将逗号/空白/换行分隔的代理字符串拆成候选项，保留 `direct`。
     pub fn split_candidates(raw: &str) -> Vec<String> {
         raw.split(|c: char| c == ',' || c == ';' || c.is_whitespace())
@@ -188,7 +197,18 @@ fn build_client_with_redirect_policy(
 
     if let Some(proxy_config) = proxy {
         let Some(proxy_url) = proxy_config.first_proxy_url() else {
-            return Ok(builder.build()?);
+            // 取不出代理 URL 有两种可能，必须分开处理：
+            //   - 配置就是 `direct`：运营主动要求直连，放行
+            //   - 配置是空串或全是垃圾值：写错了。此时构建一个无代理 client 等于
+            //     拿服务器真实 IP 去打上游，而调用方拿到的是 Ok，毫无察觉。
+            //     线上因为类似的静默降级烧掉过一批号，这里宁可失败也不放行。
+            if proxy_config.is_explicit_direct() {
+                return Ok(builder.build()?);
+            }
+            anyhow::bail!(
+                "代理配置无效，拒绝退化为直连（会暴露本机 IP）: {:?}",
+                proxy_config.url
+            );
         };
         let mut proxy = Proxy::all(&proxy_url)?;
 
@@ -277,6 +297,31 @@ mod tests {
         let config = ProxyConfig::new("http://127.0.0.1:7890, direct");
         let client = build_client(Some(&config), 30, TlsBackend::Rustls);
         assert!(client.is_ok());
+    }
+
+    /// 写坏的代理配置必须让 client 构建失败，而不是悄悄构建一个直连 client。
+    ///
+    /// 静默降级的代价是拿服务器真实 IP 打上游：调用方拿到 Ok，账号照常发请求，
+    /// 直到被上游风控标记才会发现。
+    #[test]
+    fn broken_proxy_config_fails_instead_of_going_direct() {
+        for broken in ["", "   ", ",,", ";"] {
+            let config = ProxyConfig::new(broken);
+            let err = build_client(Some(&config), 30, TlsBackend::Rustls)
+                .expect_err(&format!("代理配置 {:?} 不应构建出直连 client", broken));
+            assert!(err.to_string().contains("拒绝退化为直连"), "{}", err);
+        }
+    }
+
+    #[test]
+    fn explicit_direct_is_still_allowed() {
+        // 运营主动写 direct 是合法诉求，不能被上面的保护误伤
+        let config = ProxyConfig::new("direct");
+        assert!(config.is_explicit_direct());
+        assert!(build_client(Some(&config), 30, TlsBackend::Rustls).is_ok());
+
+        assert!(!ProxyConfig::new("").is_explicit_direct());
+        assert!(!ProxyConfig::new("http://127.0.0.1:7890, direct").is_explicit_direct());
     }
 
     #[test]

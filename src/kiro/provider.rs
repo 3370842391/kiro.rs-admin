@@ -310,6 +310,49 @@ fn should_try_next_proxy(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 407 | 502 | 503 | 504)
 }
 
+/// 上游请求即将不经代理发出时的显式告警。
+///
+/// 经过 [`configured_proxy_intent`] 过滤后，能走到直连只剩两种情况：运营在候选里
+/// 写了 `direct`，或者压根没配代理。两者都是主动选择，所以这里不拦截。但本机 IP
+/// 一旦被上游风控标记，代价是成批封号且短期无法回滚——每次都留一条可检索、可告警
+/// 的记录，别再让它只出现在 INFO 级的「使用下一个代理候选重试」里。
+fn warn_direct_upstream(credential_id: u64) {
+    tracing::warn!(
+        credential_id,
+        "本次上游请求不经代理，将暴露本机 IP；若非本意请检查该凭据 proxyUrl 与全局代理里的 direct 兜底"
+    );
+}
+
+/// 从**原始配置字符串**判断运营的意图：要走几个代理，以及是否显式允许直连。
+///
+/// 必须看原始字符串而不是解析结果。`proxyUrl` 写错时（少了 scheme、把 socks5
+/// 拼成 sock5）解析结果为空，若据此判定「这个号没配代理」，就会给它安排直连，
+/// 拿服务器真实 IP 去打上游。配置写错应当让请求失败并在日志里喊出来，而不是
+/// 偷偷换条出路——后者要等到号被封才会被发现。
+///
+/// 返回 `(要走代理的候选数, 是否显式允许直连)`。两者都为 0/false 时表示配置里
+/// 有代理但一个都解析不出来，调用方应当放弃这个凭据。
+fn configured_proxy_intent(own: Option<&str>, global: Option<&str>) -> (usize, bool) {
+    let own_entries = own.map(ProxyConfig::split_candidates).unwrap_or_default();
+    // 凭据自己配了就不再看全局，与 `effective_proxy_candidates` 的取舍保持一致
+    let entries = if own_entries.is_empty() {
+        global.map(ProxyConfig::split_candidates).unwrap_or_default()
+    } else {
+        own_entries
+    };
+
+    if entries.is_empty() {
+        // 两级都没配代理，本来就是直连
+        return (0, true);
+    }
+    let proxies = entries
+        .iter()
+        .filter(|entry| !ProxyConfig::is_direct(entry))
+        .count();
+    let has_direct = entries.iter().any(|entry| ProxyConfig::is_direct(entry));
+    (proxies, has_direct)
+}
+
 /// 把排好序的代理候选组装成最终尝试列表，并决定要不要给直连留个兜底位。
 ///
 /// 直连兜底只在两种情况下允许：候选里显式写了 `direct`（运营主动要求），
@@ -692,14 +735,15 @@ impl KiroProvider {
         credential_id: u64,
         credentials: &KiroCredentials,
     ) -> Vec<Option<ProxyConfig>> {
+        let global_proxy = self.token_manager.proxy();
+        let (configured_proxies, has_direct) = configured_proxy_intent(
+            credentials.proxy_url.as_deref(),
+            global_proxy.as_ref().map(|p| p.url.as_str()),
+        );
+
         let global = self.global_proxy_candidates();
         let mut candidates = credentials.effective_proxy_candidates(&global);
-
-        let has_direct = candidates.iter().any(|candidate| candidate.is_none());
         candidates.retain(|candidate| candidate.is_some());
-
-        // 配置层面要求走代理的候选数（与「此刻还有几个可用」无关）
-        let configured_proxies = candidates.len();
         let proxy_candidates: Vec<ProxyConfig> = candidates.into_iter().flatten().collect();
         let ordered = if let Some(pool) = &self.proxy_pool {
             let mode = self.token_manager.get_proxy_balancing_mode();
@@ -889,6 +933,9 @@ impl KiroProvider {
                     proxy.as_ref().map(|p| p.url.as_str()).unwrap_or("direct")
                 );
             }
+            if proxy.is_none() {
+                warn_direct_upstream(ctx.id);
+            }
 
             match self
                 .execute_api_request(
@@ -980,6 +1027,9 @@ impl KiroProvider {
                     ctx.id,
                     proxy.as_ref().map(|p| p.url.as_str()).unwrap_or("direct")
                 );
+            }
+            if proxy.is_none() {
+                warn_direct_upstream(ctx.id);
             }
             let base = self
                 .client_for_proxy(proxy.clone())?
@@ -2384,6 +2434,40 @@ mod tests {
         // 代理配了但此刻一个都不可用：返回空而不是退化成直连。
         // 线上就是这里把账号推到服务器真实 IP 上，6~12 分钟后被判死。
         assert!(assemble_proxy_candidates(vec![], false, 1).is_empty());
+    }
+
+    #[test]
+    fn misconfigured_proxy_url_is_not_mistaken_for_no_proxy() {
+        // 写错 scheme：解析不出任何代理，但运营的意图明明是走代理。
+        // 若把它当成「没配代理」，这个号就会被安排直连。
+        let (proxies, has_direct) = configured_proxy_intent(Some("sock5://1.2.3.4:1080"), None);
+        assert_eq!(proxies, 1);
+        assert!(!has_direct);
+        assert!(assemble_proxy_candidates(vec![], has_direct, proxies).is_empty());
+
+        // 全局代理写错，凭据没配自己的代理，同样不能退化直连
+        let (proxies, has_direct) = configured_proxy_intent(None, Some("1.2.3.4:1080"));
+        assert_eq!(proxies, 1);
+        assert!(!has_direct);
+    }
+
+    #[test]
+    fn proxy_intent_reads_credential_first_then_global() {
+        // 凭据配了就不再看全局
+        assert_eq!(
+            configured_proxy_intent(Some("socks5://a:1080"), Some("socks5://b:1080, direct")),
+            (1, false)
+        );
+        // 凭据没配才继承全局，包括全局里的 direct
+        assert_eq!(
+            configured_proxy_intent(None, Some("socks5://b:1080, direct")),
+            (1, true)
+        );
+        // 凭据显式只写 direct：主动要求直连
+        assert_eq!(configured_proxy_intent(Some("direct"), None), (0, true));
+        // 两级都没配：本来就是直连
+        assert_eq!(configured_proxy_intent(None, None), (0, true));
+        assert_eq!(configured_proxy_intent(Some("  "), None), (0, true));
     }
 
     #[test]

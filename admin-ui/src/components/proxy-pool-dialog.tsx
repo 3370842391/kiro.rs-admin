@@ -583,7 +583,15 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                 </div>
                 {(data?.total ?? 0) > 0 && (
                   <div className="flex flex-wrap items-center gap-1">
-                    <label className="inline-flex h-7 items-center gap-1 rounded-md border px-2 text-xs">
+                    <label
+                      className={
+                        'inline-flex h-7 items-center gap-1 rounded-md border px-2 text-xs' +
+                        (directGlobalEnabled
+                          ? ' border-destructive/60 bg-destructive/10 text-destructive'
+                          : '')
+                      }
+                      title="开启后，代理连不上时会改用本机 IP 直连上游，账号会因此暴露服务器真实 IP"
+                    >
                       <Checkbox
                         checked={directGlobalEnabled}
                         onCheckedChange={(checked) => toggleDirectFallback(checked === true)}
@@ -666,6 +674,24 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                   </div>
                 )}
               </div>
+              {directGlobalEnabled && (
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-destructive/60 bg-destructive/15 px-3 py-2 text-xs text-destructive">
+                  <span>
+                    已开启「直连兜底」：代理连不上时账号会改用<b>本机 IP</b> 直连上游。
+                    线上因此烧掉过一批号——真实 IP 被上游记住后，从它出去过的号会接连被判死，
+                    而封号会记在各自的代理头上，很难查。除非你确实需要，否则关掉。
+                  </span>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 text-xs"
+                    onClick={() => toggleDirectFallback(false)}
+                    disabled={setGlobalProxyMutation.isPending}
+                  >
+                    立即关闭
+                  </Button>
+                </div>
+              )}
               {quarantinedProxies.length > 0 && (
                 <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-destructive/60 bg-destructive/15 px-3 py-2 text-xs text-destructive">
                   <span>
