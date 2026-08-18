@@ -22,6 +22,7 @@ import type {
   SetProxyGuardRequest,
   ProxyGuardRunResponse,
   ProxyReputationCheckResponse,
+  EarningsSummary,
   CredentialImportDefaults,
   SetImportDefaultsRequest,
   AddProxyRequest,
@@ -387,6 +388,14 @@ export async function updateCredential(
   req: UpdateCredentialRequest
 ): Promise<SuccessResponse> {
   const { data } = await api.put<SuccessResponse>(`/credentials/${id}`, req)
+  return data
+}
+
+// ============ 收益核算 ============
+
+// 号池收益汇总：总投入、总产出、剩余存货价值、回本周期
+export async function getEarningsSummary(): Promise<EarningsSummary> {
+  const { data } = await api.get<EarningsSummary>('/credentials/earnings-summary')
   return data
 }
 

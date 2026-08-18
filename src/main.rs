@@ -699,6 +699,16 @@ async fn main() {
                 .service
                 .set_proxy_reputation(proxy_reputation.clone());
 
+            // 实测卖价（¥/credit）：跑一次利润报表就更新一次，之后每号收益核算都用它。
+            // 落盘是因为凭据列表接口不能每次都去打 NewAPI。
+            admin_state
+                .service
+                .set_sell_rate_store(Arc::new(admin::credential_earnings::SellRateStore::new(
+                    token_manager
+                        .cache_dir()
+                        .map(|d| d.join("profit_sell_rate.json")),
+                )));
+
             // 启动自动更新调度器：每分钟检查一次本地时间，到达 update_auto_apply_time
             // 且开启 update_auto_apply 时执行一次更新；否则静默等待。
             admin_state.service.start_auto_update_scheduler();

@@ -93,6 +93,64 @@ export interface CredentialStatusItem {
   balance?: BalanceResponse
   /** 余额缓存的更新时间（Unix 秒） */
   balanceUpdatedAt?: number
+  /** 收益核算：这个号已产生 / 还能产生多少人民币 */
+  earnings?: CredentialEarnings
+}
+
+// 额度这个数是哪来的
+export type QuotaSource = 'unknown' | 'manual' | 'upstream'
+
+// 单号收益核算。
+// 金额字段全是可选：缺卖价或买入价时保持 undefined，不能当 0 —— 用 0 会让汇总利润凭空变好看
+export interface CredentialEarnings {
+  /** 额度积分（手填优先，其次上游 usageLimit） */
+  quotaCredits?: number
+  quotaSource: QuotaSource
+  /** 我们通过这个号实际消耗掉的 credits */
+  creditsUsed: number
+  creditsRemaining?: number
+  /** 已产生收入（¥） */
+  revenueRmb?: number
+  /** 剩余额度还能产生（¥） */
+  remainingRmb?: number
+  /** 买入成本（¥，手填） */
+  costRmb?: number
+  /** 净利润 = 已产生 − 成本 */
+  profitRmb?: number
+  /** 回本进度。1.0 = 刚好回本 */
+  paybackRatio?: number
+  aliveHours?: number
+  /** 每存活小时产出（¥/小时） */
+  revenuePerHour?: number
+}
+
+// 实测卖价：1 个上游 credit 能换来多少人民币收入
+export interface SellRate {
+  rmbPerCredit: number
+  revenueRmb: number
+  credits: number
+  /** 参与实测的流水条数。太小则这个卖价不可信 */
+  samples: number
+  measuredAt: string
+  windowMinutes: number
+}
+
+// 号池收益汇总
+export interface EarningsSummary {
+  accounts: number
+  /** 其中填了买入价的号数。没填的不进成本与利润 */
+  accountsWithCost: number
+  totalCostRmb: number
+  totalRevenueRmb: number
+  /** 剩余额度还能产生（¥）——号池存货价值 */
+  totalRemainingRmb: number
+  profitRmb: number
+  marginPct: number
+  paidBackAccounts: number
+  revenuePerHour?: number
+  /** 回本需要活多久（小时） */
+  paybackHours?: number
+  sellRate?: SellRate
 }
 
 // 余额响应
@@ -251,6 +309,10 @@ export interface AddCredentialRequest {
   rpmLimit?: number
   /** 每账号最大并发（in-flight 上限，0 表示不限并发） */
   maxConcurrency?: number
+  /** 买入成本（¥），用于收益核算。导入时带上最省事 */
+  costRmb?: number
+  /** 额度积分，手填值优先于上游查到的额度 */
+  quotaCredits?: number
   authRegion?: string
   apiRegion?: string
   machineId?: string
@@ -289,6 +351,10 @@ export interface UpdateCredentialRequest {
   rpmLimit?: number
   /** 每账号最大并发（undefined 表示不修改，0 表示不限并发） */
   maxConcurrency?: number
+  /** 买入成本（¥）。undefined 不修改，0 表示清除 */
+  costRmb?: number
+  /** 额度积分。undefined 不修改，0 表示清除（改回用上游额度） */
+  quotaCredits?: number
 }
 
 export interface BatchCredentialGroupPatch {

@@ -1236,6 +1236,12 @@ pub struct CredentialEntrySnapshot {
     /// 账号来源渠道（纯备注）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
+    /// 手填的买入成本（人民币），收益核算用
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_rmb: Option<f64>,
+    /// 手填的额度积分，优先于上游查到的额度
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_credits: Option<f64>,
 }
 
 /// 凭据是否算在全局号池水位里，以及是靠什么认出来的。
@@ -3400,6 +3406,8 @@ impl MultiTokenManager {
                     endpoint: e.credentials.endpoint.clone(),
                     groups: e.credentials.groups.clone(),
                     source_channel: e.credentials.source_channel.clone(),
+                    cost_rmb: e.credentials.cost_rmb,
+                    quota_credits: e.credentials.quota_credits,
                 })
                 .collect(),
             current_id,
@@ -4434,6 +4442,35 @@ impl MultiTokenManager {
 
         tracing::info!("成功添加凭据 #{}", new_id);
         Ok(new_id)
+    }
+
+    /// 更新收益核算字段：买入成本（¥）与额度积分。
+    ///
+    /// 单独一个方法而不是塞进 [`Self::update_credential`]：那个已经有 11 个位置参数，
+    /// 再加两个所有调用点都得数着占位符改，很容易串位。
+    ///
+    /// `Some(0.0)` 语义是**清除**（改回用上游查到的额度 / 视为未填进价），
+    /// `None` 是不修改。
+    pub fn update_credential_costing(
+        &self,
+        id: u64,
+        cost_rmb: Option<f64>,
+        quota_credits: Option<f64>,
+    ) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            if let Some(v) = cost_rmb {
+                entry.credentials.cost_rmb = (v > 0.0).then_some(v);
+            }
+            if let Some(v) = quota_credits {
+                entry.credentials.quota_credits = (v > 0.0).then_some(v);
+            }
+        }
+        self.persist_credentials().map(|_| ())
     }
 
     /// 更新凭据的可编辑字段（Admin API）

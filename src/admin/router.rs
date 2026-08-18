@@ -22,8 +22,8 @@ use super::{
         fetch_model_profile, force_refresh_token, get_account_throttle_config, get_all_credentials,
         get_cache_hit_rate, get_cache_policy, get_compatibility_config, get_credential_balance,
         get_credential_models, get_dead_credential_config, get_endpoint_chains, get_endpoint_mode,
-        get_error_snapshot, get_error_snapshot_payload, get_global_proxy, get_image_budget,
-        get_import_defaults,
+        get_earnings_summary, get_error_snapshot, get_error_snapshot_payload, get_global_proxy,
+        get_image_budget, get_import_defaults,
         get_load_balancing_mode, get_log_governance_config, get_model_profiles, get_profit_config,
         get_proxy_balancing_mode, get_proxy_ban_stats, get_proxy_guard_config, get_proxy_pool,
         get_retry_policy, get_update_config,
@@ -108,6 +108,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_all_credentials).post(add_credential),
         )
         .route("/credentials/export", get(export_credentials))
+        .route("/credentials/earnings-summary", get(get_earnings_summary))
         .route("/credentials/batch", put(batch_update_credentials))
         .route(
             "/credentials/{id}",

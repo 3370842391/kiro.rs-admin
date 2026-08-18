@@ -48,6 +48,13 @@ export function EditCredentialDialog({
   const [sourceChannel, setSourceChannel] = useState(credential.sourceChannel ?? '')
   const [rpmLimit, setRpmLimit] = useState(String(credential.rpmLimit ?? 10))
   const [maxConcurrency, setMaxConcurrency] = useState(String(credential.maxConcurrency ?? 0))
+  const [costRmb, setCostRmb] = useState(String(credential.earnings?.costRmb ?? ''))
+  // 只在「手填」时预填，避免把上游查到的额度写成手填值——那样上游额度变了也不会跟着更新
+  const [quotaCredits, setQuotaCredits] = useState(
+    credential.earnings?.quotaSource === 'manual'
+      ? String(credential.earnings.quotaCredits ?? '')
+      : ''
+  )
   const [manualMode, setManualMode] = useState(false)
 
   const groupOptions = useGroupOptions()
@@ -71,6 +78,12 @@ export function EditCredentialDialog({
       setSourceChannel(credential.sourceChannel ?? '')
       setRpmLimit(String(credential.rpmLimit ?? 10))
       setMaxConcurrency(String(credential.maxConcurrency ?? 0))
+      setCostRmb(String(credential.earnings?.costRmb ?? ''))
+      setQuotaCredits(
+        credential.earnings?.quotaSource === 'manual'
+          ? String(credential.earnings.quotaCredits ?? '')
+          : ''
+      )
       setManualMode(false)
     }
   }, [open, credential])
@@ -100,6 +113,9 @@ export function EditCredentialDialog({
           sourceChannel: sourceChannel,
           rpmLimit: rpmLimit.trim() === '' ? undefined : Number(rpmLimit),
           maxConcurrency: maxConcurrency.trim() === '' ? undefined : Number(maxConcurrency),
+          // 留空表示清除（后端把 0 当清除），不是"不修改"——否则填错了就再也改不回来
+          costRmb: costRmb.trim() === '' ? 0 : Number(costRmb),
+          quotaCredits: quotaCredits.trim() === '' ? 0 : Number(quotaCredits),
         },
       },
       {
@@ -276,6 +292,49 @@ export function EditCredentialDialog({
               <p className="text-xs text-muted-foreground">
                 该账号最多同时 in-flight 的请求数。0 表示不限并发；与 RPM 限速互补，防止瞬时并发打爆账号触发风控。
               </p>
+            </div>
+
+            {/* 收益核算：买入价与额度都手填，因为不同渠道、不同批次差别很大 */}
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-2">
+                <label htmlFor="costRmb" className="text-sm font-medium">
+                  买入价（¥）
+                </label>
+                <Input
+                  id="costRmb"
+                  type="number"
+                  min={0}
+                  step="0.01"
+                  placeholder="留空表示未填"
+                  value={costRmb}
+                  onChange={(e) => setCostRmb(e.target.value)}
+                  disabled={isPending}
+                />
+                <p className="text-xs text-muted-foreground">
+                  这个号实际花了多少钱。不填就只统计收入、不算利润。
+                </p>
+              </div>
+              <div className="space-y-2">
+                <label htmlFor="quotaCredits" className="text-sm font-medium">
+                  额度积分
+                </label>
+                <Input
+                  id="quotaCredits"
+                  type="number"
+                  min={0}
+                  placeholder={
+                    credential.earnings?.quotaSource === 'upstream'
+                      ? `上游查到 ${credential.earnings.quotaCredits}`
+                      : '留空则用上游额度'
+                  }
+                  value={quotaCredits}
+                  onChange={(e) => setQuotaCredits(e.target.value)}
+                  disabled={isPending}
+                />
+                <p className="text-xs text-muted-foreground">
+                  填了以它为准。上游查不到额度、或卖家标称与上游不一致时用。
+                </p>
+              </div>
             </div>
 
             {/* 代理配置 */}

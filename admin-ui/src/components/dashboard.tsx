@@ -29,7 +29,9 @@ import {
   X,
 } from "lucide-react";
 
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { getEarningsSummary } from "@/api/credentials";
+import { EarningsSummaryCard } from "@/components/earnings-badge";
 import { toast } from "sonner";
 import { storage } from "@/lib/storage";
 import { Card, CardContent } from "@/components/ui/card";
@@ -205,6 +207,13 @@ export function Dashboard({ onLogout }: DashboardProps) {
     data?.credentials ?? [],
     balanceMap,
   );
+
+  // 号池收益汇总。60 秒刷一次就够——卖价只在跑利润报表时才更新。
+  const { data: earningsSummary } = useQuery({
+    queryKey: ["earnings-summary"],
+    queryFn: getEarningsSummary,
+    refetchInterval: 60_000,
+  });
 
   // 分组 / 订阅分级 / 模糊搜索：状态与过滤逻辑一起放在 hook 里
   const filters = useCredentialFilters();
@@ -1597,6 +1606,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
           availableCreditSummary={availableCreditSummary}
           creditsPerMinute={data?.creditsPerMinute}
         />
+
+        <EarningsSummaryCard summary={earningsSummary} />
 
         {/* 列表 */}
         {data?.credentials.length === 0 ? (

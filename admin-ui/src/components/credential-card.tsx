@@ -34,6 +34,7 @@ import {
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import { SubscriptionBadge } from "@/components/subscription-badge";
+import { EarningsBadge } from "@/components/earnings-badge";
 import {
   Dialog,
   DialogContent,
@@ -673,6 +674,7 @@ export function CredentialCard({
           className="max-w-full"
         />
       )}
+      <EarningsBadge earnings={credential.earnings} />
       {credential.isCurrent && <Badge variant="success">活跃</Badge>}
       {/* 禁用状态：合并 "已禁用" + 中文化的原因，单个 Badge 更醒目 */}
       {credential.disabled && reasonStyle && (

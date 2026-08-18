@@ -1,5 +1,6 @@
 //! Admin API 类型定义
 
+use crate::admin::credential_earnings::CredentialEarnings;
 use crate::admin::proxy_ban_stats::{ProxyBanEvent, ProxyBanSummary, ProxyRiskAssessment};
 use crate::admin::proxy_pool::ProxyHealth;
 use crate::admin::proxy_reputation::{ProxyReputation, ReputationGrade};
@@ -141,6 +142,9 @@ pub struct CredentialStatusItem {
     /// 余额缓存的更新时间（Unix 秒，仅在 balance 有值时返回）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance_updated_at: Option<f64>,
+    /// 收益核算：这个号已产生 / 还能产生多少人民币
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub earnings: Option<CredentialEarnings>,
 }
 
 // ============ 操作请求 ============
@@ -165,6 +169,14 @@ pub struct SetPriorityRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddCredentialRequest {
+    /// 这个号的买入成本（人民币）。用于收益核算，导入时带上最省事。
+    #[serde(default, alias = "cost_rmb")]
+    pub cost_rmb: Option<f64>,
+
+    /// 这个号的额度积分。手填值优先于上游 `getUsageLimits` 查到的额度。
+    #[serde(default, alias = "quota_credits")]
+    pub quota_credits: Option<f64>,
+
     /// 刷新令牌（OAuth 凭据必填，API Key 凭据不需要）
     #[serde(alias = "refresh_token")]
     pub refresh_token: Option<String>,
@@ -349,6 +361,12 @@ pub struct UpdateCredentialRequest {
     /// 每账号最大并发（None 表示不修改，0 表示不限并发）
     #[serde(default)]
     pub max_concurrency: Option<u32>,
+    /// 买入成本（人民币）。None 不修改，0 表示清除。
+    #[serde(default)]
+    pub cost_rmb: Option<f64>,
+    /// 额度积分。None 不修改，0 表示清除（改回用上游查到的额度）。
+    #[serde(default)]
+    pub quota_credits: Option<f64>,
 }
 
 /// 批量分组修改模式

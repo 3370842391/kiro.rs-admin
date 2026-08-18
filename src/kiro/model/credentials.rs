@@ -276,6 +276,23 @@ pub struct KiroCredentials {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub died_at: Option<String>,
+
+    /// 这个号的买入成本（人民币，手填）。
+    ///
+    /// 与 [`Self::purchase_price`] 分开：那个是供货商积分，各家单位不同、也没有汇率，
+    /// 换算不出人民币。收益核算要的是真金白银，而且不同渠道、不同批次的进价差别很大，
+    /// 所以直接让运营填实际付了多少。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_rmb: Option<f64>,
+
+    /// 这个号的额度积分（手填，覆盖上游查到的 `usageLimit`）。
+    ///
+    /// 上游额度要调 `getUsageLimits` 才知道，号一死就查不到了；而且卖家标称的额度
+    /// 与上游实际返回的并不总是一致。手填值优先，查不到时也还能算收益。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_credits: Option<f64>,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -1156,6 +1173,8 @@ mod tests {
             added_at: None,
             added_at_backfilled: false,
             died_at: None,
+            cost_rmb: None,
+            quota_credits: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -1406,6 +1425,8 @@ mod tests {
             added_at: None,
             added_at_backfilled: false,
             died_at: None,
+            cost_rmb: None,
+            quota_credits: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -1455,6 +1476,8 @@ mod tests {
             added_at: None,
             added_at_backfilled: false,
             died_at: None,
+            cost_rmb: None,
+            quota_credits: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -1587,6 +1610,8 @@ mod tests {
             added_at: None,
             added_at_backfilled: false,
             died_at: None,
+            cost_rmb: None,
+            quota_credits: None,
         };
 
         let json = original.to_pretty_json().unwrap();

@@ -427,6 +427,9 @@ pub struct CredentialDistribution {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub errors: u64,
+    /// 上游 credits 消耗。收益核算按它折人民币，所以必须按凭据暴露出来
+    /// ——token 数与 credits 不是同一个计费口径，换算不过去。
+    pub credits: f64,
 }
 
 /// 概览：今日 + 累计
@@ -669,6 +672,7 @@ impl UsageAggregator {
                 entry.output_tokens += stats.output_tokens;
                 entry.calls += stats.calls;
                 entry.errors += stats.errors;
+                entry.credits += stats.credits;
             }
         }
         let mut out: Vec<CredentialDistribution> = acc
@@ -679,10 +683,27 @@ impl UsageAggregator {
                 input_tokens: stats.input_tokens,
                 output_tokens: stats.output_tokens,
                 errors: stats.errors,
+                credits: stats.credits,
             })
             .collect();
         out.sort_by(|a, b| b.calls.cmp(&a.calls));
         out
+    }
+
+    /// 每个凭据的累计 credits 消耗，覆盖全部保留期内的天桶。
+    ///
+    /// 收益核算要的是「这个号从加入到现在一共替我们消耗了多少 credits」，不是某个查询
+    /// 窗口内的量，所以不走 [`Self::query_by_credential`] 那套窗口过滤。
+    /// 上限就是聚合器的保留期（31 天）——号活不过几小时，这个范围绰绰有余。
+    pub fn credits_by_credential(&self) -> HashMap<u64, f64> {
+        let inner = self.inner.read();
+        let mut acc: HashMap<u64, f64> = HashMap::new();
+        for bucket in inner.day_buckets.iter() {
+            for (id, stats) in bucket.by_credential.iter() {
+                *acc.entry(*id).or_insert(0.0) += stats.credits;
+            }
+        }
+        acc
     }
 
     /// 概览（今日 + 最近 7 天）

@@ -876,6 +876,16 @@ pub async fn profit_report(
         })
         .collect();
     let report = aggregate_ledger_report(logs, usage_read.records, traces, keys, config.clone());
+    // 顺手把「1 个 credit 卖了多少钱」实测下来，供每号收益核算使用。
+    // 这是唯一能同时看到收入（NewAPI quota）与成本口径（credits）的地方，
+    // 所以卖价只在这里更新，不用运营手配。
+    state.service.record_sell_rate_from_report(
+        report.revenue,
+        report.credits,
+        report.rows,
+        u64::from(payload.minutes),
+        report.ledger_scope_confirmed,
+    );
     Json(ProfitReportResponse {
         start_timestamp,
         end_timestamp,
@@ -885,6 +895,12 @@ pub async fn profit_report(
         report,
     })
     .into_response()
+}
+
+/// GET /api/admin/credentials/earnings-summary
+/// 号池收益汇总：总投入、总产出、剩余存货价值、回本周期。
+pub async fn get_earnings_summary(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_earnings_summary())
 }
 
 /// GET /api/admin/config/retry-policy

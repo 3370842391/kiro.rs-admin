@@ -42,6 +42,7 @@ use super::model_profile_sync::{
 use super::profit::ProfitConfig;
 use super::proxy_ban_stats;
 use super::proxy_pool::{GetUrlResult, ProxyEntry, ProxyHealth, ProxyPoolManager};
+use super::credential_earnings::{self, SellRateStore};
 use super::proxy_reputation::{ProxyReputationStore, ReputationGrade};
 use super::types::{
     AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse,
@@ -599,6 +600,22 @@ pub struct AdminService {
     proxy_guard: Mutex<ProxyGuardConfig>,
     /// 出口 IP 信誉档案。缺省表示未启用检测（测试里可不注入）。
     proxy_reputation: OnceLock<Arc<ProxyReputationStore>>,
+    /// 实测卖价（¥/credit）缓存。跑一次利润报表就更新一次。
+    sell_rate: OnceLock<Arc<SellRateStore>>,
+}
+
+/// 从加入时间与判死时间算存活小时数。死号算到判死那一刻，活号算到现在。
+///
+/// 这是「每存活小时产出」的分母，也是跨渠道比价的关键：单价便宜但活得短的号，
+/// 折成时薪可能反而更贵。
+fn alive_hours_of(added_at: Option<&str>, died_at: Option<&str>) -> Option<f64> {
+    let added = DateTime::parse_from_rfc3339(added_at?).ok()?.to_utc();
+    let end = died_at
+        .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+        .map(|t| t.to_utc())
+        .unwrap_or_else(Utc::now);
+    let hours = (end - added).num_seconds() as f64 / 3600.0;
+    (hours > 0.0).then_some(hours)
 }
 
 /// Social 登录会话状态
@@ -1007,6 +1024,7 @@ impl AdminService {
             import_defaults: Mutex::new(import_defaults),
             proxy_guard: Mutex::new(proxy_guard),
             proxy_reputation: OnceLock::new(),
+            sell_rate: OnceLock::new(),
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -1035,6 +1053,71 @@ impl AdminService {
     /// 注入出口 IP 信誉档案，开启信誉展示与检测
     pub fn set_proxy_reputation(&self, store: Arc<ProxyReputationStore>) {
         let _ = self.proxy_reputation.set(store);
+    }
+
+    /// 注入实测卖价缓存，开启收益核算
+    pub fn set_sell_rate_store(&self, store: Arc<SellRateStore>) {
+        let _ = self.sell_rate.set(store);
+    }
+
+    /// 从一次利润报表里实测卖价（¥/credit）。口径未确认或没有 credits 时不写。
+    pub fn record_sell_rate_from_report(
+        &self,
+        revenue_rmb: f64,
+        credits: f64,
+        samples: u64,
+        window_minutes: u64,
+        scope_confirmed: bool,
+    ) {
+        if let Some(store) = self.sell_rate.get() {
+            store.record_from_report(
+                revenue_rmb,
+                credits,
+                samples,
+                window_minutes,
+                scope_confirmed,
+            );
+        }
+    }
+
+    /// 号池收益汇总：总投入、总产出、存货价值、回本周期。
+    ///
+    /// 回本周期是这里最有价值的一项：把它和实测存活时长放在一起，就能直接回答
+    /// 「按现在的封号速度，这批号到底赚不赚钱」。
+    pub fn get_earnings_summary(&self) -> credential_earnings::EarningsSummary {
+        let sell_rate = self.sell_rate.get().and_then(|store| store.get());
+        let metered = self
+            .usage_aggregator
+            .as_ref()
+            .map(|agg| agg.credits_by_credential())
+            .unwrap_or_default();
+        let balance_snapshot: HashMap<u64, CachedBalance> = self.balance_cache.lock().clone();
+
+        let items: Vec<credential_earnings::CredentialEarnings> = self
+            .token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .map(|entry| {
+                let balance = balance_snapshot.get(&entry.id).map(|c| &c.data);
+                credential_earnings::compute(
+                    &credential_earnings::EarningsInput {
+                        manual_quota_credits: entry.quota_credits,
+                        upstream_usage_limit: balance.map(|b| b.usage_limit),
+                        upstream_current_usage: balance.map(|b| b.current_usage),
+                        metered_credits: metered.get(&entry.id).copied(),
+                        cost_rmb: entry.cost_rmb,
+                        alive_hours: alive_hours_of(
+                            entry.added_at.as_deref(),
+                            entry.died_at.as_deref(),
+                        ),
+                    },
+                    sell_rate.as_ref(),
+                )
+            })
+            .collect();
+
+        credential_earnings::summarize(&items, sell_rate)
     }
 
     /// 检测代理池出口的 IP 信誉。
@@ -1348,6 +1431,16 @@ impl AdminService {
         };
         let now_ts = Utc::now().timestamp() as f64;
 
+        // 收益核算的两个外部输入：实测卖价（¥/credit）与本地计量到的 credits 消耗。
+        // 两者都可能缺失——没跑过利润报表就没有卖价，聚合器没注入就没有计量数据——
+        // 缺了就只报积分维度，金额留空，不编数。
+        let sell_rate = self.sell_rate.get().and_then(|store| store.get());
+        let metered = self
+            .usage_aggregator
+            .as_ref()
+            .map(|agg| agg.credits_by_credential())
+            .unwrap_or_default();
+
         let mut credentials: Vec<CredentialStatusItem> = snapshot
             .entries
             .into_iter()
@@ -1357,6 +1450,21 @@ impl AdminService {
                     .filter(|c| (now_ts - c.cached_at) < BALANCE_CACHE_TTL_SECS as f64)
                     .map(|c| (Some(c.data.clone()), Some(c.cached_at)))
                     .unwrap_or((None, None));
+
+                let earnings = Some(credential_earnings::compute(
+                    &credential_earnings::EarningsInput {
+                        manual_quota_credits: entry.quota_credits,
+                        upstream_usage_limit: balance.as_ref().map(|b| b.usage_limit),
+                        upstream_current_usage: balance.as_ref().map(|b| b.current_usage),
+                        metered_credits: metered.get(&entry.id).copied(),
+                        cost_rmb: entry.cost_rmb,
+                        alive_hours: alive_hours_of(
+                            entry.added_at.as_deref(),
+                            entry.died_at.as_deref(),
+                        ),
+                    },
+                    sell_rate.as_ref(),
+                ));
 
                 CredentialStatusItem {
                     id: entry.id,
@@ -1398,6 +1506,7 @@ impl AdminService {
                     source_channel: entry.source_channel,
                     balance,
                     balance_updated_at,
+                    earnings,
                 }
             })
             .collect();
@@ -2138,6 +2247,9 @@ impl AdminService {
             added_at: None,
             added_at_backfilled: false,
             died_at: None,
+            // 收益核算用的进价与额度：导入时就能带上，之后也可在列表里改。
+            cost_rmb: req.cost_rmb.filter(|v| *v > 0.0),
+            quota_credits: req.quota_credits.filter(|v| *v > 0.0),
         };
 
         // 调用 token_manager 添加凭据
@@ -2253,6 +2365,22 @@ impl AdminService {
             Some(raw) => Some(normalize_proxy_list(&raw)?),
             None => None,
         };
+
+        if req.cost_rmb.is_some() || req.quota_credits.is_some() {
+            for (value, label) in [(req.cost_rmb, "costRmb"), (req.quota_credits, "quotaCredits")] {
+                if let Some(v) = value
+                    && (v < 0.0 || !v.is_finite())
+                {
+                    return Err(AdminServiceError::InvalidCredential(format!(
+                        "{} 必须是不小于 0 的有限数值: {}",
+                        label, v
+                    )));
+                }
+            }
+            self.token_manager
+                .update_credential_costing(id, req.cost_rmb, req.quota_credits)
+                .map_err(|e| self.classify_error(e, id))?;
+        }
 
         self.token_manager
             .update_credential(
@@ -5924,6 +6052,8 @@ mod tests {
             endpoint: None,
             groups: Vec::new(),
             source_channel: None,
+            cost_rmb: None,
+            quota_credits: None,
         }
     }
 
