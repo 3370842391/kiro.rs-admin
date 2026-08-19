@@ -43,6 +43,7 @@ use super::pricing_calc;
 use super::profit::ProfitConfig;
 use super::proxy_ban_stats;
 use super::proxy_pool::{GetUrlResult, ProxyEntry, ProxyHealth, ProxyPoolManager};
+use super::proxy_rebind;
 use super::credential_earnings::{self, SellRateStore};
 use super::proxy_reputation::{ProxyReputationStore, ReputationGrade};
 use super::types::{
@@ -1937,6 +1938,21 @@ impl AdminService {
             loop {
                 let started = std::time::Instant::now();
                 let summary = svc.proxy_pool.check_all().await;
+                if !summary.disabled_urls.is_empty() {
+                    let mut migrated = 0usize;
+                    for url in &summary.disabled_urls {
+                        migrated += proxy_rebind::migrate_live_off_proxy(
+                            &svc.token_manager,
+                            &svc.proxy_pool,
+                            url,
+                        );
+                    }
+                    tracing::warn!(
+                        disabled = summary.disabled_urls.len(),
+                        migrated,
+                        "健康检查自动禁用出口，已把还活着的号改绑到健康 IP"
+                    );
+                }
                 tracing::info!(
                     "代理池健康检查完成：健康 {}，异常 {}，本轮自动禁用 {}，耗时 {:.1}s",
                     summary.healthy,
@@ -4179,8 +4195,9 @@ impl AdminService {
     /// 2. **迁移**：把该出口上还活着的号改绑到干净出口。
     ///
     /// 只做第 1 步是有害的。凭据的 `proxyUrl` 是钉死的单候选，出口停用后
-    /// `proxy_candidates_for` 会把它过滤成空列表，然后兜底压入直连——这些号会拿
-    /// 服务器真实 IP 去打上游，比继续用脏代理更糟。
+    /// `proxy_candidates_for` 会把它过滤成空列表；直连已被禁止，这些号会
+    /// 0ms 报「没有可用代理候选」。自动禁用/健康检查失败时由
+    /// [`crate::admin::proxy_rebind`] 把活号迁到健康出口。
     pub fn enforce_proxy_guard(&self) -> ProxyGuardRunResponse {
         let cfg = self.get_proxy_guard_config();
         let mut outcome = ProxyGuardRunResponse::default();
@@ -4691,6 +4708,9 @@ impl AdminService {
             .check_one(id)
             .await
             .map_err(|_| AdminServiceError::NotFound { id })?;
+        if entry.auto_disabled && !entry.enabled {
+            proxy_rebind::migrate_live_off_proxy(&self.token_manager, &self.proxy_pool, &entry.url);
+        }
         Ok(ProxyCheckResponse {
             id: entry.id,
             health: entry.health,
@@ -4724,6 +4744,9 @@ impl AdminService {
     /// 触发全部代理的健康检查
     pub async fn check_all_proxies(&self) -> ProxyCheckAllResponse {
         let summary = self.proxy_pool.check_all().await;
+        for url in &summary.disabled_urls {
+            proxy_rebind::migrate_live_off_proxy(&self.token_manager, &self.proxy_pool, url);
+        }
         ProxyCheckAllResponse {
             healthy: summary.healthy,
             unhealthy: summary.unhealthy,

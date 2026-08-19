@@ -135,6 +135,8 @@ pub struct CheckSummary {
     pub unhealthy: usize,
     /// 本轮新增的自动禁用数
     pub auto_disabled: usize,
+    /// 本轮新自动禁用的 URL，供调用方把还活着的号迁走。
+    pub disabled_urls: Vec<String>,
 }
 
 /// 单个代理探测结果
@@ -449,6 +451,36 @@ impl ProxyPoolManager {
             .collect()
     }
 
+    /// 从可分配出口里挑一个替换目标：排除失效出口，优先负载低、延迟低的。
+    ///
+    /// 号钉死在已禁用/不健康出口上时，候选列表会空。这里给出下一个该绑的 IP，
+    /// 调用方负责写回凭据。没有可替换出口时返回 `None`——绝不能因此改成直连。
+    pub fn pick_replacement_url(
+        &self,
+        exclude: Option<&str>,
+        loads: &HashMap<String, usize>,
+    ) -> Option<String> {
+        let exclude_key = exclude.map(|url| normalize_proxy_key(Some(url)));
+        let entries = self.entries.lock();
+        let mut targets: Vec<(String, usize, u32)> = entries
+            .iter()
+            .filter(|entry| entry.enabled && entry.health != ProxyHealth::Unhealthy)
+            .filter(|entry| {
+                exclude_key
+                    .as_ref()
+                    .is_none_or(|key| normalize_proxy_key(Some(&entry.url)) != *key)
+            })
+            .map(|entry| {
+                let key = normalize_proxy_key(Some(&entry.url));
+                let load = loads.get(&key).copied().unwrap_or(0);
+                let latency = entry.latency_ms.unwrap_or(u32::MAX);
+                (entry.url.clone(), load, latency)
+            })
+            .collect();
+        targets.sort_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)).then(a.0.cmp(&b.0)));
+        targets.into_iter().next().map(|(url, _, _)| url)
+    }
+
     fn clear_runtime_for_urls(&self, urls: &[String]) {
         if urls.is_empty() {
             return;
@@ -599,7 +631,9 @@ impl ProxyPoolManager {
     }
 
     /// 记录运行时代理失败。若该 URL 存在于代理池，连续失败达到阈值会自动禁用并持久化。
-    pub fn report_proxy_failure(&self, credential_id: u64, proxy: &ProxyConfig) {
+    ///
+    /// 返回本次新自动禁用的 URL，调用方应立刻把还活着的号迁到健康出口。
+    pub fn report_proxy_failure(&self, credential_id: u64, proxy: &ProxyConfig) -> Option<String> {
         {
             let mut runtime = self.runtime.lock();
             if runtime
@@ -630,12 +664,13 @@ impl ProxyPoolManager {
             }
         }
 
-        if let Some(url) = disabled_url {
-            self.clear_runtime_for_urls(&[url]);
+        if let Some(url) = &disabled_url {
+            self.clear_runtime_for_urls(&[url.clone()]);
         }
         if changed && let Err(e) = self.persist() {
             tracing::warn!("记录运行时代理失败后持久化失败: {}", e);
         }
+        disabled_url
     }
 
     fn persist(&self) -> anyhow::Result<()> {
@@ -764,6 +799,7 @@ impl ProxyPoolManager {
                     if newly_disabled {
                         summary.auto_disabled += 1;
                         disabled_urls.push(entry.url.clone());
+                        summary.disabled_urls.push(entry.url.clone());
                     }
                 }
             }
@@ -1108,6 +1144,49 @@ mod tests {
         assert_eq!(
             ordered.first().map(|p| p.url.as_str()),
             Some(proxy_b.url.as_str())
+        );
+    }
+
+    #[test]
+    fn pick_replacement_skips_unusable_and_prefers_lower_load() {
+        let mgr = ProxyPoolManager::new(None, TlsBackend::Rustls);
+        let dead = mgr
+            .add("http://dead:8080".to_string(), None)
+            .unwrap();
+        mgr.add("http://busy:8080".to_string(), None).unwrap();
+        mgr.add("http://free:8080".to_string(), None).unwrap();
+        mgr.set_enabled(dead.id, false).unwrap();
+
+        let mut loads = HashMap::new();
+        loads.insert(normalize_proxy_key(Some("http://busy:8080")), 5);
+        loads.insert(normalize_proxy_key(Some("http://free:8080")), 1);
+
+        let picked = mgr
+            .pick_replacement_url(Some("http://dead:8080"), &loads)
+            .unwrap();
+        assert_eq!(picked, "http://free:8080");
+    }
+
+    #[test]
+    fn pick_replacement_returns_none_when_pool_has_nothing_else() {
+        let mgr = ProxyPoolManager::new(None, TlsBackend::Rustls);
+        let dead = mgr
+            .add("http://dead:8080".to_string(), None)
+            .unwrap();
+        mgr.set_enabled(dead.id, false).unwrap();
+        assert!(mgr.pick_replacement_url(Some("http://dead:8080"), &HashMap::new()).is_none());
+    }
+
+    #[test]
+    fn report_proxy_failure_returns_url_only_when_auto_disabled() {
+        let mgr = ProxyPoolManager::new(None, TlsBackend::Rustls);
+        mgr.add("http://flaky:8080".to_string(), None).unwrap();
+        let proxy = ProxyConfig::new("http://flaky:8080");
+        assert!(mgr.report_proxy_failure(1, &proxy).is_none());
+        assert!(mgr.report_proxy_failure(1, &proxy).is_none());
+        assert_eq!(
+            mgr.report_proxy_failure(1, &proxy).as_deref(),
+            Some("http://flaky:8080")
         );
     }
 }

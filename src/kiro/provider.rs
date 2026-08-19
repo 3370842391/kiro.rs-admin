@@ -748,7 +748,7 @@ impl KiroProvider {
         if out.is_empty() { vec![None] } else { out }
     }
 
-    fn proxy_candidates_for(
+    pub(crate) fn proxy_candidates_for(
         &self,
         credential_id: u64,
         credentials: &KiroCredentials,
@@ -778,6 +778,16 @@ impl KiroProvider {
 
         let candidates = assemble_proxy_candidates(ordered, has_direct, configured_proxies);
         if candidates.is_empty() {
+            if let Some(pool) = self.proxy_pool.as_ref() {
+                if let Some(url) = crate::admin::proxy_rebind::rebind_credential_to_healthy_proxy(
+                    &self.token_manager,
+                    pool,
+                    credential_id,
+                    credentials.proxy_url.as_deref(),
+                ) {
+                    return vec![Some(ProxyConfig::new(&url))];
+                }
+            }
             tracing::warn!(
                 credential_id,
                 configured_proxies,
@@ -802,7 +812,13 @@ impl KiroProvider {
 
     fn report_proxy_failure(&self, credential_id: u64, proxy: Option<&ProxyConfig>) {
         if let (Some(pool), Some(proxy)) = (&self.proxy_pool, proxy) {
-            pool.report_proxy_failure(credential_id, proxy);
+            if let Some(url) = pool.report_proxy_failure(credential_id, proxy) {
+                crate::admin::proxy_rebind::migrate_live_off_proxy(
+                    &self.token_manager,
+                    pool,
+                    &url,
+                );
+            }
         }
     }
 
@@ -2488,6 +2504,60 @@ mod tests {
         // 两级都没配：本来就是直连
         assert_eq!(configured_proxy_intent(None, None), (0, true));
         assert_eq!(configured_proxy_intent(Some("  "), None), (0, true));
+    }
+
+    #[test]
+    fn unusable_bound_proxy_is_rebound_instead_of_empty_or_direct() {
+        use crate::kiro::endpoint::{IdeEndpoint, KiroEndpoint};
+        use crate::kiro::model::credentials::KiroCredentials;
+        use crate::kiro::token_manager::MultiTokenManager;
+        use crate::model::config::{Config, TlsBackend};
+
+        let credentials = vec![KiroCredentials {
+            id: Some(1),
+            proxy_url: Some("http://dead:8080".into()),
+            rpm_limit: 10,
+            ..Default::default()
+        }];
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), credentials, None, None, true).unwrap(),
+        );
+        let pool = Arc::new(ProxyPoolManager::new(None, TlsBackend::Rustls));
+        let dead = pool.add("http://dead:8080".into(), None).unwrap();
+        pool.add("http://ok:8080".into(), None).unwrap();
+        pool.set_enabled(dead.id, false).unwrap();
+
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert("ide".into(), Arc::new(IdeEndpoint::new()));
+        let provider = KiroProvider::with_proxy(
+            Arc::clone(&manager),
+            None,
+            endpoints,
+            "ide".into(),
+            Some(pool),
+        );
+        let creds = manager
+            .clone_all_credentials()
+            .into_iter()
+            .find(|credential| credential.id == Some(1))
+            .unwrap();
+        let candidates = provider.proxy_candidates_for(1, &creds);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].as_ref().map(|proxy| proxy.url.as_str()),
+            Some("http://ok:8080")
+        );
+        assert!(candidates.iter().all(Option::is_some));
+        assert_eq!(
+            manager
+                .clone_all_credentials()
+                .into_iter()
+                .find(|credential| credential.id == Some(1))
+                .unwrap()
+                .proxy_url
+                .as_deref(),
+            Some("http://ok:8080")
+        );
     }
 
     #[test]
