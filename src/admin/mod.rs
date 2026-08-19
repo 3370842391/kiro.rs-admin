@@ -29,6 +29,7 @@ pub mod model_mapping;
 pub mod model_profile_sync;
 pub mod profit;
 pub mod credential_earnings;
+pub mod pricing_calc;
 pub mod proxy_ban_stats;
 pub mod proxy_pool;
 pub mod proxy_reputation;

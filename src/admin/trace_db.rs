@@ -803,6 +803,40 @@ impl TraceStore {
         Ok(records)
     }
 
+    /// 按模型汇总「token 吞吐 ↔ credits 消耗」，供进价测算器估算一个号能产出多少 token。
+    ///
+    /// token 口径取四类之和（含 cache_read）：那是上游真实处理掉的量，也是运营口中
+    /// 「这个号能干多少活」的意思。只算未缓存部分会把长会话的产出低估一个数量级。
+    ///
+    /// 只统计成功请求：失败请求既没产出也常常没计费，混进来会同时污染分子和分母。
+    pub fn query_token_credit_stats(
+        &self,
+        start_epoch: i64,
+        end_epoch: i64,
+    ) -> rusqlite::Result<Vec<(String, f64, f64)>> {
+        if start_epoch >= end_epoch {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT model, \
+                    SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0) \
+                        + COALESCE(cache_read_tokens,0) + COALESCE(cache_creation_tokens,0)), \
+                    SUM(COALESCE(credits,0)) \
+             FROM traces \
+             WHERE ts_epoch >= ? AND ts_epoch <= ? AND final_status = 'success' \
+             GROUP BY model",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![start_epoch, end_epoch], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, f64>(1).unwrap_or(0.0),
+                row.get::<_, f64>(2).unwrap_or(0.0),
+            ))
+        })?;
+        rows.collect()
+    }
+
     /// 测试辅助：仅取记录、忽略总数
     #[cfg(test)]
     fn query(&self, q: &TraceQuery) -> Vec<TraceRecord> {

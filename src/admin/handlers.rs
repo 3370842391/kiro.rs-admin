@@ -19,9 +19,10 @@ use super::{
     client_keys::{CacheHitRateBounds, ClientResponseMode, mask_client_key},
     error_snapshot_db::{SnapshotQuery, SnapshotSeverity},
     middleware::AdminState,
+    pricing_calc,
     profit::{
-        ProfitKeyMetadata, ProfitReportRequest, ProfitReportResponse, aggregate_ledger_report,
-        fetch_newapi_logs,
+        DEFAULT_PROFIT_QUOTA_PER_UNIT, ProfitKeyMetadata, ProfitReportRequest,
+        ProfitReportResponse, aggregate_ledger_report, fetch_newapi_logs,
     },
     trace_db::TraceQuery,
     types::{
@@ -834,14 +835,21 @@ pub async fn profit_report(
         .collect();
     let trace_store = state.trace_store.clone();
     let service = Arc::clone(&state.service);
-    let (traces, usage_read) = match tokio::task::spawn_blocking(move || {
+    let (traces, usage_read, token_stats) = match tokio::task::spawn_blocking(move || {
         let traces = trace_store
             .query_profit_traces(&trace_ids, start_timestamp, end_timestamp)
             .map_err(|error| format!("读取利润关联 trace 失败: {error}"))?;
         let usage = service
             .query_usage_records(start_timestamp, end_timestamp)
             .map_err(|error| error.to_string())?;
-        Ok::<_, String>((traces, usage))
+        // token 吞吐只用于进价测算，取不到不该连累利润报表本身。
+        let token_stats = trace_store
+            .query_token_credit_stats(start_timestamp, end_timestamp)
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "读取 token 吞吐统计失败，测算系数将缺少 token 维度");
+                Vec::new()
+            });
+        Ok::<_, String>((traces, usage, token_stats))
     })
     .await
     {
@@ -875,6 +883,50 @@ pub async fn profit_report(
             group: key.group,
         })
         .collect();
+    // 进价测算系数必须在 aggregate_ledger_report 消费掉 logs / traces 之前取样。
+    // 与卖价实测同源，但额外带上分组倍率做归一化——否则系数会把当期的倍率结构
+    // 固化进去，「反算该设多少倍率」就不成立了（见 pricing_calc::measure）。
+    let quota_per_unit = if config.quota_per_unit > 0.0 {
+        config.quota_per_unit
+    } else {
+        DEFAULT_PROFIT_QUOTA_PER_UNIT
+    };
+    let revenue_samples: Vec<pricing_calc::RevenueSample> = {
+        let by_trace: HashMap<&str, (&str, f64)> = traces
+            .iter()
+            .map(|trace| {
+                (
+                    trace.trace_id.as_str(),
+                    (trace.model.as_str(), trace.credits),
+                )
+            })
+            .collect();
+        logs.iter()
+            .filter_map(|log| {
+                let (model, credits) = by_trace.get(log.upstream_request_id.trim())?;
+                Some(pricing_calc::RevenueSample {
+                    model: (*model).to_string(),
+                    revenue_rmb: log.quota as f64 / quota_per_unit,
+                    credits: *credits,
+                    group_ratio: log.group_ratio()?,
+                })
+            })
+            .collect()
+    };
+    let token_samples: Vec<pricing_calc::TokenSample> = token_stats
+        .into_iter()
+        .map(|(model, tokens, credits)| pricing_calc::TokenSample {
+            model,
+            tokens,
+            credits,
+        })
+        .collect();
+    state.service.record_pricing_coefficients(pricing_calc::measure(
+        &revenue_samples,
+        &token_samples,
+        u64::from(payload.minutes),
+    ));
+
     let report = aggregate_ledger_report(logs, usage_read.records, traces, keys, config.clone());
     // 顺手把「1 个 credit 卖了多少钱」实测下来，供每号收益核算使用。
     // 这是唯一能同时看到收入（NewAPI quota）与成本口径（credits）的地方，
@@ -901,6 +953,28 @@ pub async fn profit_report(
 /// 号池收益汇总：总投入、总产出、剩余存货价值、回本周期。
 pub async fn get_earnings_summary(State(state): State<AdminState>) -> impl IntoResponse {
     Json(state.service.get_earnings_summary())
+}
+
+/// GET /api/admin/pricing/coefficients
+/// 当前实测定价系数（¥/credit·倍率、token/credit）。跑一次利润报表即刷新。
+pub async fn get_pricing_coefficients(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_pricing_coefficients())
+}
+
+/// POST /api/admin/pricing/simulate
+/// 进价测算：输入买入价与额度积分，得出该设多少分组倍率、单号能赚多少、能产出多少 token。
+pub async fn simulate_pricing(
+    State(state): State<AdminState>,
+    Json(payload): Json<pricing_calc::PricingInput>,
+) -> impl IntoResponse {
+    match state.service.simulate_pricing(&payload) {
+        Ok(result) => Json(result).into_response(),
+        // 输入非法属于调用方错误，必须 400 并带上人话原因，不能静默返回空结果。
+        Err(error) => {
+            let error = super::error::AdminServiceError::InvalidCredential(error.to_string());
+            (error.status_code(), Json(error.into_response())).into_response()
+        }
+    }
 }
 
 /// GET /api/admin/config/retry-policy

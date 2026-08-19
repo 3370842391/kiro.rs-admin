@@ -23,7 +23,7 @@ use super::{
         get_cache_hit_rate, get_cache_policy, get_compatibility_config, get_credential_balance,
         get_credential_models, get_dead_credential_config, get_endpoint_chains, get_endpoint_mode,
         get_earnings_summary, get_error_snapshot, get_error_snapshot_payload, get_global_proxy,
-        get_image_budget, get_import_defaults,
+        get_image_budget, get_import_defaults, get_pricing_coefficients,
         get_load_balancing_mode, get_log_governance_config, get_model_profiles, get_profit_config,
         get_proxy_balancing_mode, get_proxy_ban_stats, get_proxy_guard_config, get_proxy_pool,
         get_retry_policy, get_update_config,
@@ -31,6 +31,7 @@ use super::{
         patch_model_profile, pin_error_snapshot, poll_idc_login, poll_idc_relogin,
         poll_social_login, poll_social_relogin, preview_model_profiles, profit_report,
         pull_update_image, replace_model_mappings, reset_all_success_count, reset_client_key_stats,
+        simulate_pricing,
         reset_failure_count, reset_proxy_ban_stats, reset_success_count, rollback_image_update,
         rotate_client_key, run_proxy_guard,
         set_account_throttle_config, set_cache_hit_rate, set_cache_policy, set_client_key_disabled,
@@ -169,6 +170,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_profit_config).put(set_profit_config),
         )
         .route("/profit/report", post(profit_report))
+        .route("/pricing/coefficients", get(get_pricing_coefficients))
+        .route("/pricing/simulate", post(simulate_pricing))
         .route(
             "/config/retry-policy",
             get(get_retry_policy).put(set_retry_policy),
@@ -1213,6 +1216,60 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn pricing_routes_return_empty_coefficients_and_simulate_cost_without_store() {
+        let app = batch_update_test_router();
+        let coefficients = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/pricing/coefficients")
+                    .header("x-api-key", "test-admin-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(coefficients.status(), StatusCode::OK);
+        let body = to_bytes(coefficients.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"null");
+
+        let simulated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/pricing/simulate")
+                    .header("x-api-key", "test-admin-key")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"costRmb":800,"quotaCredits":10000,"groupRatio":0.3}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(simulated.status(), StatusCode::OK);
+        let body = to_bytes(simulated.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!((json["costPerCredit"].as_f64().unwrap() - 0.08).abs() < 1e-9);
+        assert_eq!(json["effectiveCredits"], 10_000.0);
+        assert!(json.get("revenueRmb").is_none(), "没有实测系数时金额必须留空");
+
+        let invalid = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/pricing/simulate")
+                    .header("x-api-key", "test-admin-key")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"costRmb":0,"quotaCredits":10000}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

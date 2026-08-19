@@ -35,8 +35,24 @@ describe('NewAPI 利润报表 UI 接线', () => {
     const source = await readSource('api/profit.ts')
     expect(source).toContain('/config/profit')
     expect(source).toContain('/profit/report')
+    expect(source).toContain('/pricing/coefficients')
+    expect(source).toContain('/pricing/simulate')
     expect(source).toContain('newapiToken.trim()')
     expect(source).toContain('undefined')
+  })
+
+  test('进价测算弹窗能正算倍率、反算毛利，并在系数缺失时给出提示', async () => {
+    const page = await readSource('components/profit-page.tsx')
+    const dialog = await readSource('components/pricing-calculator-dialog.tsx')
+    expect(page).toContain('PricingCalculatorDialog')
+    expect(page).toContain('pricing-coefficients')
+    expect(dialog).toContain('进价测算')
+    expect(dialog).toContain('目标毛利率')
+    expect(dialog).toContain('额度能跑到')
+    expect(dialog).toContain('回本倍率')
+    expect(dialog).toContain('可产出 token')
+    expect(dialog).toContain('还没有实测系数')
+    expect(await readSource('types/api.ts')).toContain('breakevenGroupRatio')
   })
 
   test('应用注册利润导航页', async () => {

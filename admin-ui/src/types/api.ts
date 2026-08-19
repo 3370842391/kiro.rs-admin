@@ -278,6 +278,47 @@ export interface ProfitReport {
   byUser: ProfitBreakdownStat[]
 }
 
+/** 单个模型的实测定价系数。缺失字段表示该维度还没对上样本。 */
+export interface PricingModelCoefficient {
+  model: string
+  rmbPerCreditRatio?: number
+  tokensPerCredit?: number
+  credits: number
+}
+
+/** 跑利润报表后固化的测算系数。从未跑过时接口返回 null。 */
+export interface PricingCoefficients {
+  rmbPerCreditRatio?: number
+  tokensPerCredit?: number
+  byModel: PricingModelCoefficient[]
+  samples: number
+  windowMinutes: number
+  measuredAt?: string
+}
+
+export interface PricingInput {
+  costRmb: number
+  quotaCredits: number
+  groupRatio?: number
+  targetMarginPct?: number
+  model?: string
+  consumedPct?: number
+}
+
+export interface PricingResult {
+  costPerCredit: number
+  effectiveCredits: number
+  modelExact: boolean
+  sellRatePerCredit?: number
+  revenueRmb?: number
+  profitRmb?: number
+  marginPct?: number
+  breakevenGroupRatio?: number
+  requiredGroupRatio?: number
+  producibleTokens?: number
+  warning?: string
+}
+
 // 请求类型
 export interface SetDisabledRequest {
   disabled: boolean

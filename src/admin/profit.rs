@@ -49,6 +49,30 @@ pub struct NewapiLogItem {
     pub channel_id: u64,
     #[serde(default)]
     pub upstream_request_id: String,
+    /// NewAPI 把计费明细（各类倍率、缓存 token 拆分）塞在这里。
+    /// 定价系数需要其中的 `group_ratio` 做归一化，见 [`Self::group_ratio`]。
+    #[serde(default)]
+    pub other: serde_json::Value,
+}
+
+impl NewapiLogItem {
+    /// 取本条流水计费时使用的分组倍率。
+    ///
+    /// `other` 在 NewAPI 里是 TEXT 列，接口有时原样返回 JSON **字符串**、有时已反序列化
+    /// 成对象，两种都得认——只认一种会让系数在对方形态下静默变成 `None`，
+    /// 而调用方看到的是「没测出来」而不是「解析错了」，很难查。
+    pub fn group_ratio(&self) -> Option<f64> {
+        fn pick(value: &serde_json::Value) -> Option<f64> {
+            value.get("group_ratio").and_then(serde_json::Value::as_f64)
+        }
+        match &self.other {
+            serde_json::Value::String(raw) => {
+                serde_json::from_str::<serde_json::Value>(raw).ok().as_ref().and_then(pick)
+            }
+            other => pick(other),
+        }
+        .filter(|ratio| ratio.is_finite() && *ratio > 0.0)
+    }
 }
 
 #[derive(Debug, Deserialize)]

@@ -8,6 +8,10 @@ import {
   runProfitReport,
   updateProfitConfig,
 } from '@/api/profit'
+import {
+  PricingCalculatorButton,
+  PricingCalculatorDialog,
+} from '@/components/pricing-calculator-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -45,6 +49,7 @@ export function ProfitPage() {
   const [minutes, setMinutes] = useState(120)
   const [report, setReport] = useState<ProfitReport | null>(null)
   const [breakdown, setBreakdown] = useState<Breakdown>('group')
+  const [calculatorOpen, setCalculatorOpen] = useState(false)
 
   useEffect(() => {
     const config = configQuery.data
@@ -66,7 +71,10 @@ export function ProfitPage() {
   })
   const reportMutation = useMutation({
     mutationFn: runProfitReport,
-    onSuccess: setReport,
+    onSuccess: (data) => {
+      setReport(data)
+      void queryClient.invalidateQueries({ queryKey: ['pricing-coefficients'] })
+    },
     onError: (error) => toast.error(extractErrorMessage(error)),
   })
 
@@ -96,10 +104,14 @@ export function ProfitPage() {
             收入按已识别的 RS 渠道统计；顶部总成本来自 RS 实际 metering 账本。
           </p>
         </div>
-        <Badge variant={configQuery.data?.tokenConfigured ? 'success' : 'warning'}>
-          {configQuery.data?.tokenConfigured ? 'Token 已配置' : 'Token 未配置'}
-        </Badge>
+        <div className="flex flex-wrap items-center gap-2">
+          <PricingCalculatorButton onClick={() => setCalculatorOpen(true)} />
+          <Badge variant={configQuery.data?.tokenConfigured ? 'success' : 'warning'}>
+            {configQuery.data?.tokenConfigured ? 'Token 已配置' : 'Token 未配置'}
+          </Badge>
+        </div>
       </div>
+      <PricingCalculatorDialog open={calculatorOpen} onOpenChange={setCalculatorOpen} />
 
       <ConfigCard
         newapiBase={newapiBase}

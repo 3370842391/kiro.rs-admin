@@ -709,6 +709,16 @@ async fn main() {
                         .map(|d| d.join("profit_sell_rate.json")),
                 )));
 
+            // 进价测算系数：与卖价同源（跑利润报表时更新），单独落盘是因为测算器
+            // 不能每次都去打 NewAPI，而且系数缺失时必须明确说「还没测到」而不是填 0。
+            admin_state.service.set_pricing_coefficient_store(Arc::new(
+                admin::pricing_calc::PricingCoefficientStore::new(
+                    token_manager
+                        .cache_dir()
+                        .map(|d| d.join("pricing_coefficients.json")),
+                ),
+            ));
+
             // 启动自动更新调度器：每分钟检查一次本地时间，到达 update_auto_apply_time
             // 且开启 update_auto_apply 时执行一次更新；否则静默等待。
             admin_state.service.start_auto_update_scheduler();

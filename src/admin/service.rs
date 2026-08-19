@@ -39,6 +39,7 @@ use super::error::AdminServiceError;
 use super::model_profile_sync::{
     ModelProfileSyncService, PreviewCacheError, SyncCollection, SyncError,
 };
+use super::pricing_calc;
 use super::profit::ProfitConfig;
 use super::proxy_ban_stats;
 use super::proxy_pool::{GetUrlResult, ProxyEntry, ProxyHealth, ProxyPoolManager};
@@ -602,6 +603,8 @@ pub struct AdminService {
     proxy_reputation: OnceLock<Arc<ProxyReputationStore>>,
     /// 实测卖价（¥/credit）缓存。跑一次利润报表就更新一次。
     sell_rate: OnceLock<Arc<SellRateStore>>,
+    /// 进价测算系数缓存，与卖价同源同步更新。
+    pricing_coefficients: OnceLock<Arc<pricing_calc::PricingCoefficientStore>>,
 }
 
 /// 从加入时间与判死时间算存活小时数。死号算到判死那一刻，活号算到现在。
@@ -1025,6 +1028,7 @@ impl AdminService {
             proxy_guard: Mutex::new(proxy_guard),
             proxy_reputation: OnceLock::new(),
             sell_rate: OnceLock::new(),
+            pricing_coefficients: OnceLock::new(),
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -1078,6 +1082,38 @@ impl AdminService {
                 scope_confirmed,
             );
         }
+    }
+
+    /// 注入进价测算系数缓存，开启测算器。
+    pub fn set_pricing_coefficient_store(
+        &self,
+        store: Arc<pricing_calc::PricingCoefficientStore>,
+    ) {
+        let _ = self.pricing_coefficients.set(store);
+    }
+
+    /// 记录一次实测出的定价系数（与卖价实测同一时机）。
+    pub fn record_pricing_coefficients(&self, measured: pricing_calc::PricingCoefficients) {
+        if let Some(store) = self.pricing_coefficients.get() {
+            store.record(measured);
+        }
+    }
+
+    /// 当前实测系数；从未跑过利润报表时为 `None`。
+    pub fn get_pricing_coefficients(&self) -> Option<pricing_calc::PricingCoefficients> {
+        self.pricing_coefficients.get().and_then(|store| store.get())
+    }
+
+    /// 进价测算：给定买入价与额度，算该设多少倍率、能赚多少、能产出多少 token。
+    ///
+    /// 系数缺失时不报错而是走 `PricingCoefficients::default()`——测算器仍能给出
+    /// 成本/credit 这类只依赖输入的结论，并在结果里说明为什么没有金额。
+    pub fn simulate_pricing(
+        &self,
+        input: &pricing_calc::PricingInput,
+    ) -> Result<pricing_calc::PricingResult, pricing_calc::PricingError> {
+        let coefficients = self.get_pricing_coefficients().unwrap_or_default();
+        pricing_calc::simulate(input, &coefficients)
     }
 
     /// 号池收益汇总：总投入、总产出、存货价值、回本周期。

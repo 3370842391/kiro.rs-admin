@@ -1,5 +1,8 @@
 import { api } from '@/api/credentials'
 import type {
+  PricingCoefficients,
+  PricingInput,
+  PricingResult,
   ProfitConfigUpdate,
   ProfitConfigView,
   ProfitReport,
@@ -28,5 +31,15 @@ export async function runProfitReport(minutes: number): Promise<ProfitReport> {
     { minutes },
     { timeout: 60_000 },
   )
+  return data
+}
+
+export async function getPricingCoefficients(): Promise<PricingCoefficients | null> {
+  const { data } = await api.get<PricingCoefficients | null>('/pricing/coefficients')
+  return data
+}
+
+export async function simulatePricing(input: PricingInput): Promise<PricingResult> {
+  const { data } = await api.post<PricingResult>('/pricing/simulate', input)
   return data
 }
