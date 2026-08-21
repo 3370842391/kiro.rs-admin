@@ -803,6 +803,53 @@ impl TraceStore {
         Ok(records)
     }
 
+    /// 按账号、按分钟汇总成功与 429，给 RPM 推算用。
+    ///
+    /// 只数 `outcome=success` 和 `http_status=429`。没状态的 unknown 跳过——那是
+    /// 还没落地的诊断行，算进去会把分母撑爆。当前这分钟不算，由调用方把
+    /// `end_epoch` 截到整分。
+    pub fn query_rpm_minute_buckets(
+        &self,
+        start_epoch: i64,
+        end_epoch: i64,
+    ) -> Vec<crate::admin::rpm_infer::RpmMinuteBucket> {
+        if start_epoch >= end_epoch {
+            return Vec::new();
+        }
+        let conn = self.conn.lock();
+        let mut stmt = match conn.prepare(
+            "SELECT a.credential_id,
+                    (t.ts_epoch / 60) * 60,
+                    SUM(CASE WHEN a.outcome = 'success' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN a.http_status = 429 THEN 1 ELSE 0 END)
+             FROM traces t
+             JOIN trace_attempts a ON a.trace_id = t.trace_id
+             WHERE t.ts_epoch >= ?1 AND t.ts_epoch < ?2 AND a.credential_id > 0
+             GROUP BY a.credential_id, (t.ts_epoch / 60) * 60",
+        ) {
+            Ok(stmt) => stmt,
+            Err(error) => {
+                tracing::warn!(%error, "RPM 分钟桶查询准备失败");
+                return Vec::new();
+            }
+        };
+        let rows = match stmt.query_map([start_epoch, end_epoch], |row| {
+            Ok(crate::admin::rpm_infer::RpmMinuteBucket {
+                credential_id: row.get::<_, i64>(0)? as u64,
+                minute_epoch: row.get(1)?,
+                successes: row.get::<_, i64>(2)? as u32,
+                rate_limited: row.get::<_, i64>(3)? as u32,
+            })
+        }) {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(%error, "RPM 分钟桶查询失败");
+                return Vec::new();
+            }
+        };
+        rows.filter_map(|row| row.ok()).collect()
+    }
+
     /// 按模型汇总「token 吞吐 ↔ credits 消耗」，供进价测算器估算一个号能产出多少 token。
     ///
     /// token 口径取四类之和（含 cache_read）：那是上游真实处理掉的量，也是运营口中
@@ -1990,6 +2037,37 @@ mod tests {
         );
         // 空库再清一次返回 0，不报错
         assert_eq!(store.clear_all(), 0);
+    }
+
+    #[test]
+    fn query_rpm_minute_buckets_counts_success_and_429() {
+        let store = mem_store();
+        store.insert(sample(TraceSample {
+            trace_id: "a",
+            status: "success",
+            credential_id: 5,
+            model: "m1",
+        }));
+        store.insert(sample(TraceSample {
+            trace_id: "b",
+            status: "success",
+            credential_id: 5,
+            model: "m1",
+        }));
+        let now = Utc::now().timestamp();
+        let buckets = store.query_rpm_minute_buckets(now - 120, now + 60);
+        let cred5 = buckets
+            .iter()
+            .find(|bucket| bucket.credential_id == 5)
+            .expect("success credential");
+        let cred9 = buckets
+            .iter()
+            .find(|bucket| bucket.credential_id == 9)
+            .expect("429 first hop");
+        assert_eq!(cred5.successes, 2);
+        assert_eq!(cred5.rate_limited, 0);
+        assert_eq!(cred9.successes, 0);
+        assert_eq!(cred9.rate_limited, 2);
     }
 
     #[test]

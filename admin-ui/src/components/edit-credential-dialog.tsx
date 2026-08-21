@@ -272,6 +272,11 @@ export function EditCredentialDialog({
               />
               <p className="text-xs text-muted-foreground">
                 滑动窗口每分钟最多请求数。默认 10；填 0 表示不限速。
+                {credential.inferredRpm
+                  ? credential.inferredRpm.kind === 'ceiling'
+                    ? ` 近 ${credential.inferredRpm.sampleMinutes} 分钟已见 429，推算可撑约 ${credential.inferredRpm.suggested}，建议不要高于此值。`
+                    : ` 近 ${credential.inferredRpm.sampleMinutes} 分钟没见 429，至少能到 ${credential.inferredRpm.suggested}，还可以试着往上加。`
+                  : ''}
               </p>
             </div>
 

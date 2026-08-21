@@ -611,10 +611,23 @@ export function CredentialCard({
   const rpmCurrent = credential.rpmCurrent ?? 0;
   const rpmLimit = credential.rpmLimit ?? 10;
   const rpmState = rpmLoadState(rpmCurrent, rpmLimit);
+  const inferredRpm = credential.inferredRpm;
+  const inferredRpmTitle = inferredRpm
+    ? inferredRpm.kind === "ceiling"
+      ? `近 ${inferredRpm.sampleMinutes} 分钟见过 429，推算可撑 ${inferredRpm.suggested} RPM（成功中位 ${inferredRpm.successRpm}，429 约 ${inferredRpm.rate429Rpm}/分）。只展示，不会自动改上限。`
+      : `近 ${inferredRpm.sampleMinutes} 分钟没见 429，至少能到 ${inferredRpm.suggested} RPM，还可以试着往上加。只展示，不会自动改上限。`
+    : undefined;
   const rpmTitle =
-    rpmState === "unlimited"
+    (rpmState === "unlimited"
       ? "最近60秒滚动窗口：不限速"
-      : `最近60秒滚动窗口：${rpmCurrent} / ${rpmLimit}`;
+      : `最近60秒滚动窗口：${rpmCurrent} / ${rpmLimit}`) +
+    (inferredRpmTitle ? `。${inferredRpmTitle}` : "");
+  const inferredRpmClass =
+    inferredRpm?.kind === "ceiling" &&
+    rpmLimit > 0 &&
+    inferredRpm.suggested < rpmLimit
+      ? "text-amber-600 dark:text-amber-400"
+      : "text-muted-foreground";
   const rpmValueClass =
     rpmState === "saturated"
       ? "text-destructive"
@@ -901,6 +914,15 @@ export function CredentialCard({
           >
             {rpmDisplay}
           </div>
+          {inferredRpm && (
+            <div
+              className={`mt-1 text-[11px] leading-none tabular-nums ${inferredRpmClass}`}
+              title={inferredRpmTitle}
+            >
+              推算 {inferredRpm.suggested}
+              {inferredRpm.kind === "ceiling" ? " · 见429" : " · 未见429"}
+            </div>
+          )}
           <div className="mt-1.5 h-1 w-full overflow-hidden rounded-full bg-border/60">
             <div
               className={`h-full rounded-full transition-[width] duration-500 ${rpmBarClass}`}
@@ -1200,6 +1222,15 @@ export function CredentialCard({
               >
                 {rpmDisplay}
               </div>
+              {inferredRpm && (
+                <div
+                  className={`mt-1.5 text-[11px] leading-none tabular-nums ${inferredRpmClass}`}
+                  title={inferredRpmTitle}
+                >
+                  推算 {inferredRpm.suggested}
+                  {inferredRpm.kind === "ceiling" ? " · 见429" : " · 未见429"}
+                </div>
+              )}
               <div className="mt-2 h-1 w-full overflow-hidden rounded-full bg-border/60">
                 <div
                   className={`h-full rounded-full transition-[width] duration-500 ${rpmBarClass}`}

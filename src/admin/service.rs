@@ -606,6 +606,8 @@ pub struct AdminService {
     sell_rate: OnceLock<Arc<SellRateStore>>,
     /// 进价测算系数缓存，与卖价同源同步更新。
     pricing_coefficients: OnceLock<Arc<pricing_calc::PricingCoefficientStore>>,
+    /// 每分钟推算的账号可支撑 RPM。只给面板看，不改 `rpmLimit`。
+    rpm_infer: OnceLock<Arc<crate::admin::rpm_infer::RpmInferenceStore>>,
 }
 
 /// 从加入时间与判死时间算存活小时数。死号算到判死那一刻，活号算到现在。
@@ -1030,6 +1032,7 @@ impl AdminService {
             proxy_reputation: OnceLock::new(),
             sell_rate: OnceLock::new(),
             pricing_coefficients: OnceLock::new(),
+            rpm_infer: OnceLock::new(),
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -1063,6 +1066,11 @@ impl AdminService {
     /// 注入实测卖价缓存，开启收益核算
     pub fn set_sell_rate_store(&self, store: Arc<SellRateStore>) {
         let _ = self.sell_rate.set(store);
+    }
+
+    /// 注入 RPM 推算缓存。没注入时凭据列表不带 `inferredRpm`。
+    pub fn set_rpm_infer_store(&self, store: Arc<crate::admin::rpm_infer::RpmInferenceStore>) {
+        let _ = self.rpm_infer.set(store);
     }
 
     /// 从一次利润报表里实测卖价（¥/credit）。口径未确认或没有 credits 时不写。
@@ -1544,6 +1552,10 @@ impl AdminService {
                     balance,
                     balance_updated_at,
                     earnings,
+                    inferred_rpm: self
+                        .rpm_infer
+                        .get()
+                        .and_then(|store| store.get(entry.id)),
                 }
             })
             .collect();
@@ -1899,6 +1911,38 @@ impl AdminService {
             self.save_balance_cache();
         }
         (success, failure)
+    }
+
+    /// 每分钟根据 traces 推算每个号能撑多少 RPM。只写缓存，不改 `rpmLimit`。
+    pub fn start_rpm_inferrer(self: &Arc<Self>, interval: std::time::Duration) {
+        let svc = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                svc.refresh_rpm_inference().await;
+                tokio::time::sleep(interval).await;
+            }
+        });
+    }
+
+    async fn refresh_rpm_inference(&self) {
+        let Some(trace_store) = self.trace_store.clone() else {
+            return;
+        };
+        let Some(infer_store) = self.rpm_infer.get().cloned() else {
+            return;
+        };
+        let now = Utc::now().timestamp();
+        let end = (now / 60) * 60;
+        let start = end - crate::admin::rpm_infer::WINDOW_MINUTES * 60;
+        let buckets = tokio::task::spawn_blocking(move || {
+            trace_store.query_rpm_minute_buckets(start, end)
+        })
+        .await
+        .unwrap_or_else(|_| Vec::new());
+        let inferred = crate::admin::rpm_infer::infer_all(&buckets, Utc::now());
+        let accounts = inferred.len();
+        infer_store.replace(inferred);
+        tracing::info!(accounts, "RPM 推算已更新（只展示，未改账号上限）");
     }
 
     /// 启动余额后台刷新调度器

@@ -36,6 +36,18 @@ export interface CredentialStatusItem {
   maxConcurrency: number
   /** 当前滑动窗口内已用请求条数 */
   rpmCurrent: number
+  /**
+   * 最近完整分钟推算出的可支撑 RPM。只展示，不改 rpmLimit。
+   * ceiling = 已见 429，别再往上加；floor = 没见 429，至少能到这个数。
+   */
+  inferredRpm?: {
+    suggested: number
+    kind: 'ceiling' | 'floor'
+    successRpm: number
+    rate429Rpm: number
+    sampleMinutes: number
+    measuredAt: string
+  }
   disabled: boolean
   failureCount: number
   /** 累计失败次数（所有失败类型，只增不减，仅手动重置归零） */

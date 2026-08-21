@@ -692,6 +692,14 @@ async fn main() {
                 .service
                 .start_proxy_health_checker(std::time::Duration::from_secs(300));
 
+            // 每分钟推算每个号能撑多少 RPM，给面板看。不自动改 rpmLimit。
+            admin_state.service.set_rpm_infer_store(Arc::new(
+                admin::rpm_infer::RpmInferenceStore::default(),
+            ));
+            admin_state
+                .service
+                .start_rpm_inferrer(std::time::Duration::from_secs(60));
+
             // 启动烧号出口隔离守卫：封号事件即触发，隔离脏出口并把幸存号迁走
             admin_state.service.start_proxy_guard();
 

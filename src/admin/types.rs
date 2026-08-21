@@ -8,6 +8,7 @@ use crate::model::config::RetryPolicy;
 use serde::{Deserialize, Serialize};
 
 use super::client_keys::{CacheHitRateBounds, ClientResponseMode};
+use super::rpm_infer::RpmInference;
 
 // ============ 凭据状态 ============
 
@@ -145,6 +146,9 @@ pub struct CredentialStatusItem {
     /// 收益核算：这个号已产生 / 还能产生多少人民币
     #[serde(skip_serializing_if = "Option::is_none")]
     pub earnings: Option<CredentialEarnings>,
+    /// 最近完整分钟推算出的可支撑 RPM。只展示，不改 `rpmLimit`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inferred_rpm: Option<RpmInference>,
 }
 
 // ============ 操作请求 ============

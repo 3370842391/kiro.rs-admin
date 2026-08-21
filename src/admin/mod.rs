@@ -34,6 +34,7 @@ pub mod proxy_ban_stats;
 pub mod proxy_pool;
 pub mod proxy_rebind;
 pub mod proxy_reputation;
+pub mod rpm_infer;
 mod router;
 mod service;
 pub mod trace_db;
