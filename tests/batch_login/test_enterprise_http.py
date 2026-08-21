@@ -172,7 +172,7 @@ class EnterpriseHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], transport.responses)
 
     async def test_eu_central_portal_uses_eu_endpoints(self):
-        portal_url = "https://d-99674db463.awsapps.com/start"
+        portal_url = "https://d-0123456789.awsapps.com/start"
         redirect = {
             "url": portal_url
             + "/?workflowResultHandle=auth&state=state"
@@ -184,7 +184,7 @@ class EnterpriseHttpTests(unittest.IsolatedAsyncioTestCase):
             {
                 "redirectUrl": (
                     "https://eu-central-1.signin.aws/platform/"
-                    "d-99674db463/login?workflowStateHandle=wh-1"
+                    "d-0123456789/login?workflowStateHandle=wh-1"
                 ),
                 "csrfToken": "csrf",
             }
@@ -197,7 +197,7 @@ class EnterpriseHttpTests(unittest.IsolatedAsyncioTestCase):
             EnterpriseHttpSettings(portal_url, "eu-central-1"),
         )
 
-        self.assertEqual("d-99674db463", result.directory_id)
+        self.assertEqual("d-0123456789", result.directory_id)
         self.assertEqual(
             "https://oidc.eu-central-1.amazonaws.com/client/register",
             transport.requests[0][1],
@@ -208,13 +208,13 @@ class EnterpriseHttpTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn(
             "https://eu-central-1.signin.aws/platform/"
-            "d-99674db463/api/execute",
+            "d-0123456789/api/execute",
             transport.requests[4][1],
         )
 
     async def test_new_sso_instance_portal_discovers_directory_and_signin_endpoint(self):
         portal_url = (
-            "https://ssoins-7223a15405d7b4ec.portal.us-east-1.app.aws/"
+            "https://ssoins-0123456789abcdef.portal.us-east-1.app.aws/"
         )
         responses = base_responses(
             {
@@ -228,7 +228,7 @@ class EnterpriseHttpTests(unittest.IsolatedAsyncioTestCase):
         responses[2] = response(
             {
                 "redirectUrl": (
-                    "https://us-east-1.sso.signin.aws/platform/d-9066772d19/login"
+                    "https://us-east-1.sso.signin.aws/platform/d-fedcba9876/login"
                     "?workflowStateHandle=wh-1"
                 ),
                 "csrfToken": "csrf",
@@ -242,7 +242,7 @@ class EnterpriseHttpTests(unittest.IsolatedAsyncioTestCase):
             EnterpriseHttpSettings(portal_url, "us-east-1"),
         )
 
-        self.assertEqual("d-9066772d19", result.directory_id)
+        self.assertEqual("d-fedcba9876", result.directory_id)
         self.assertEqual(
             "https://oidc.us-east-1.api.aws/client/register",
             transport.requests[0][1],
@@ -252,11 +252,11 @@ class EnterpriseHttpTests(unittest.IsolatedAsyncioTestCase):
             transport.requests[2][1],
         )
         self.assertIn(
-            "idc_instance_id=ssoins-7223a15405d7b4ec",
+            "idc_instance_id=ssoins-0123456789abcdef",
             transport.requests[2][1],
         )
         self.assertIn(
-            "us-east-1.sso.signin.aws/platform/d-9066772d19/api/execute",
+            "us-east-1.sso.signin.aws/platform/d-fedcba9876/api/execute",
             transport.requests[4][1],
         )
 

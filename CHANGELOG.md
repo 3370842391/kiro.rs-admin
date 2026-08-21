@@ -77,6 +77,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - `deploy/test-proxy/` 里的真实测试机地址（IP 与 sslip.io 域名，含两个 nginx 配置的
   **文件名**）替换为 `TEST-HOST-IP-DASHED` / `TEST_HOST_IP` 占位符，并在文档开头写明
   照抄前要整体替换。顶层 README 里的同一地址一并换成 `<测试机地址>`。
+- 顶层 README 去掉对外的中转域名。批量登录测试里的 Identity Center 门户 ID /
+  实例主机名，以及像真实账号口令的样例，改成明显的占位数据。
 - `ACCOUNT_MARKETPLACE_PLATFORM_PLAN.md`（v0.2「等待评审」的内部商业规划草案，含定价 /
   成本 / 利润口径讨论）取消跟踪并加入 `.gitignore`，与之前处理 `docs/` 同一理由。
   本地文件保留。

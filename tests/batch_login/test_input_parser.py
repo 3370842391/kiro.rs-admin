@@ -66,16 +66,16 @@ class ModelTests(unittest.TestCase):
 
 class InputParserTests(unittest.TestCase):
     def test_enterprise_pipe_format_parses_account_password_and_portal_url(self):
-        portal = "https://ssoins-7223a15405d7b4ec.portal.us-east-1.app.aws/"
+        portal = "https://ssoins-0123456789abcdef.portal.us-east-1.app.aws/"
         result = parse_accounts(
-            "mary.smith.bo4y|w77Vs>JO_SqL|" + portal,
+            "pipe-user|example-Passw0rd|" + portal,
             "{account}|{password}|{start_url}",
             LoginMode.ENTERPRISE,
         )
 
         self.assertEqual([], result.issues)
-        self.assertEqual("mary.smith.bo4y", result.entries[0].account)
-        self.assertEqual("w77Vs>JO_SqL", result.entries[0].password)
+        self.assertEqual("pipe-user", result.entries[0].account)
+        self.assertEqual("example-Passw0rd", result.entries[0].password)
         self.assertEqual(portal, result.entries[0].start_url)
 
     def test_pipe_format_keeps_separator_characters_inside_password(self):

@@ -75,7 +75,7 @@ class AccountManagerServiceTests(unittest.TestCase):
 
     def test_confirm_import_normalizes_and_saves_region(self):
         preview = self.service.preview_import(
-            "enterprise-user|secret|https://d-99674db463.awsapps.com/start",
+            "enterprise-user|secret|https://d-0123456789.awsapps.com/start",
             "{account}|{password}|{start_url}",
             LoginMode.ENTERPRISE,
         )
@@ -89,7 +89,7 @@ class AccountManagerServiceTests(unittest.TestCase):
 
     def test_confirm_import_rejects_invalid_region_before_saving(self):
         preview = self.service.preview_import(
-            "enterprise-user|secret|https://d-99674db463.awsapps.com/start",
+            "enterprise-user|secret|https://d-0123456789.awsapps.com/start",
             "{account}|{password}|{start_url}",
             LoginMode.ENTERPRISE,
         )
@@ -136,12 +136,12 @@ class AccountManagerServiceTests(unittest.TestCase):
         )
 
     def test_preview_auto_detects_dashed_per_line_start_urls(self):
-        portal = "https://d-9066760521.awsapps.com/start"
+        portal = "https://d-abcdef0123.awsapps.com/start"
         preview = self.service.preview_import(
             "\n".join(
                 (
-                    f"NobleFlame1----#5P%<g)g@d80D>o03$OHKz----{portal}",
-                    f"NobleFlame2----part----two----{portal}",
+                    f"acct-one----P@ssw0rd!#special----{portal}",
+                    f"acct-two----part----two----{portal}",
                 )
             ),
             "login = {account} / onetime password = {password}",
@@ -150,10 +150,10 @@ class AccountManagerServiceTests(unittest.TestCase):
 
         self.assertEqual([], preview.issues)
         self.assertEqual(
-            ["NobleFlame1", "NobleFlame2"],
+            ["acct-one", "acct-two"],
             [item.account for item in preview.entries],
         )
-        self.assertEqual("#5P%<g)g@d80D>o03$OHKz", preview.entries[0].password)
+        self.assertEqual("P@ssw0rd!#special", preview.entries[0].password)
         self.assertEqual("part----two", preview.entries[1].password)
         self.assertEqual(
             [portal, portal],

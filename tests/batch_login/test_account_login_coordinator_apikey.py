@@ -513,7 +513,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                     3,
                     "eu-account",
                     "pw3",
-                    "https://d-99674db463.awsapps.com/start",
+                    "https://d-0123456789.awsapps.com/start",
                 )
             ],
             login_mode=LoginMode.ENTERPRISE,
