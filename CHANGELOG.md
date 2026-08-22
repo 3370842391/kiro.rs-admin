@@ -6,6 +6,27 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 工具 JSON — 按客户 schema 修好上游吐参再转发
+
+线上 `read_file` 大量撞 `missing fileKey / files`：Kiro 吐 `path`，Cline/Roo/部分 IDE 要另一套字段。现在校验层会：
+
+- 路径族互转（`path` / `file_path` → `fileKey`）
+- 单路径包成 `files: ["..."]` 或 `files: [{path}]`
+- `timeout` 复制到 `timeout_ms`（两边都声明时不再放弃）
+- JSON 字符串解码成 object；单个 object/string 包成数组
+- 尊重 schema `default`；`multiSelect` 缺省补 `false`
+
+修完再交给客户，后续工具 JSON 跟客户声明的 inputSchema 对齐。半截 `write` JSON 仍然不编造、走重试。
+
+### 调度 — 会话粘滞只在号还能打时钉住
+
+Best 模式仍按会话粘同一只号（避免换号重写 cache、烧积分），但松手条件改了：
+
+- 粘滞改到**上游 200 之后**才写，不再抢到 token 就钉。
+- 本请求普通 429（含 failover、不冷却）立刻忘掉这条会话；近 1 分钟 429 够密时，其它会话也不再粘这个号。
+- RPM 只剩 1 个空位时松开，下一跳走 least_conn。
+- 并行 helper 不再因 `in_flight ≥ 2` 拆号，并发闸跟账号 `maxConcurrency`。
+
 ### 🔧 修复 — 错误快照库不再只涨不缩（线上 9.65 GB → 约 4 GB）
 
 线上 `error_snapshots.db` 长到 **9.65 GB**。查下来不是保留期失效——12 天前的老数据

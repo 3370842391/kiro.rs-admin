@@ -6,13 +6,13 @@
  */
 export type ConcurrencyTone = 'idle' | 'active' | 'busy' | 'hot'
 
-/** 会话亲和最多复用同一凭据 2 个在飞请求（后端 SESSION_AFFINITY_MAX_IN_FLIGHT），超过即为被压。 */
-const AFFINITY_SOFT_LIMIT = 2
+/** 展示用：1–2 算轻载。调度不再按 in_flight=2 拆会话，刹车是 RPM / 429。 */
+const LIGHT_LOAD = 2
 const BUSY_LIMIT = 5
 
 export function concurrencyTone(inFlight: number): ConcurrencyTone {
   if (!Number.isFinite(inFlight) || inFlight <= 0) return 'idle'
-  if (inFlight <= AFFINITY_SOFT_LIMIT) return 'active'
+  if (inFlight <= LIGHT_LOAD) return 'active'
   if (inFlight <= BUSY_LIMIT) return 'busy'
   return 'hot'
 }
@@ -24,8 +24,8 @@ export function concurrencyHint(inFlight: number): string {
   const suffix =
     value > BUSY_LIMIT
       ? '，明显被压，考虑加号或降低该号优先级'
-      : value > AFFINITY_SOFT_LIMIT
-        ? '，超过会话亲和软上限 2'
+      : value > LIGHT_LOAD
+        ? '，同一会话的 helper 仍会粘在这个号上'
         : ''
   return `当前有 ${value} 个请求正在这个账号上执行${suffix}`
 }

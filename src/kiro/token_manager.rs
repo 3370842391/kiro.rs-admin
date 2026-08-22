@@ -1126,6 +1126,9 @@ struct CredentialEntry {
     /// 最近 60 秒内「对该账号上游发起请求」的时间戳队列（RPM 滑动窗口计数）。
     /// record_request 时 push 队尾并剔除过期项；不持久化，进程重启清空。
     recent_requests: VecDeque<Instant>,
+    /// 最近 60 秒内普通/账号级 429 时间戳。粘滞用：号已经在打 429，就不要再钉它。
+    /// 不持久化，进程重启清空。
+    recent_429s: VecDeque<Instant>,
     /// 流式首字节延迟 EWMA，仅保存在进程内用于调度。
     first_byte_ewma_ms: Option<f64>,
 }
@@ -1502,6 +1505,7 @@ pub struct MultiTokenManager {
     /// 全局端点路由模式，运行时可由 Admin API 切换。
     endpoint_mode: Mutex<EndpointMode>,
     /// 会话到凭据的短期粘性，仅在默认最好模式使用，不写入凭据文件。
+    /// 只在上游 200 之后写入；429 / RPM 将满 / 账号不可用时松开。
     session_affinity: Mutex<HashMap<String, SessionAffinity>>,
     /// 单请求备用桶尝试总数硬上限（运行时可修改，0 = 不限）。
     max_bucket_attempts_per_request: AtomicUsize,
@@ -1545,7 +1549,8 @@ const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 const SESSION_AFFINITY_TTL: StdDuration = StdDuration::from_secs(5 * 60);
-const SESSION_AFFINITY_MAX_IN_FLIGHT: u32 = 2;
+/// 60s 内 429 达到该次数，其它会话也不再粘这个号。本会话在第一次 429 就会松手。
+const AFFINITY_429_RELEASE_THRESHOLD: u32 = 2;
 const FIRST_BYTE_EWMA_ALPHA: f64 = 0.3;
 
 /// API 调用上下文
@@ -1644,6 +1649,30 @@ fn is_concurrency_exceeded(entry: &CredentialEntry) -> bool {
     limit > 0 && entry.in_flight >= limit
 }
 
+fn rate429_window_count(entry: &CredentialEntry, now: Instant) -> u32 {
+    let cutoff = now.checked_sub(RPM_WINDOW);
+    entry
+        .recent_429s
+        .iter()
+        .filter(|&&t| cutoff.map(|c| t > c).unwrap_or(true))
+        .count() as u32
+}
+
+/// 粘滞视角的「RPM 快满」：上限至少 2 且只剩 1 个空位。
+/// 上限 1 时不提前松手，留给 `is_rpm_exceeded` 在打满后再换。
+fn is_rpm_nearly_full(entry: &CredentialEntry, now: Instant) -> bool {
+    let limit = entry.credentials.rpm_limit;
+    if limit < 2 {
+        return false;
+    }
+    rpm_window_count(entry, now) + 1 >= limit
+}
+
+/// 近 1 分钟 429 已经够密，粘滞不再钉这个号。
+fn is_affinity_429_hot(entry: &CredentialEntry, now: Instant) -> bool {
+    rate429_window_count(entry, now) >= AFFINITY_429_RELEASE_THRESHOLD
+}
+
 fn cooldown_remaining_ms(until: Option<Instant>, now: Instant) -> Option<u64> {
     until
         .and_then(|t| t.checked_duration_since(now))
@@ -1736,6 +1765,7 @@ impl MultiTokenManager {
                     rate_limited_until: None,
                     in_flight: 0,
                     recent_requests: VecDeque::new(),
+                    recent_429s: VecDeque::new(),
                     first_byte_ewma_ms: None,
                 }
             })
@@ -1976,6 +2006,43 @@ impl MultiTokenManager {
         }
     }
 
+    /// 上游 200 之后才钉会话。抢 token 时不写，避免失败的号被粘住。
+    pub(crate) fn confirm_session_affinity(&self, key: Option<&str>, credential_id: u64) {
+        let Some(key) = key.filter(|value| !value.is_empty()) else {
+            return;
+        };
+        if self.get_endpoint_mode() != EndpointMode::Best {
+            return;
+        }
+        self.remember_session_affinity(key, credential_id);
+    }
+
+    /// 本会话立刻松手。下一跳走 least_conn。
+    pub(crate) fn release_session_affinity(&self, key: Option<&str>, credential_id: u64) {
+        if let Some(key) = key.filter(|value| !value.is_empty()) {
+            self.forget_session_affinity(key, credential_id);
+        }
+    }
+
+    /// 记一次 429，给粘滞的「近 1 分钟够密」判断用。failover 普通 429 不冷却，也必须记。
+    pub(crate) fn record_rate_limit_hit(&self, id: u64) {
+        let now = Instant::now();
+        let cutoff = now.checked_sub(RPM_WINDOW);
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+            if let Some(c) = cutoff {
+                while let Some(&front) = entry.recent_429s.front() {
+                    if front <= c {
+                        entry.recent_429s.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            entry.recent_429s.push_back(now);
+        }
+    }
+
     fn affinity_credential(
         &self,
         key: &str,
@@ -2001,14 +2068,15 @@ impl MultiTokenManager {
                 && !entry.throttled_until.map(|t| t > now).unwrap_or(false)
                 && !entry.rate_limited_until.map(|t| t > now).unwrap_or(false)
                 && !is_rpm_exceeded(entry, now)
-                && entry.in_flight < SESSION_AFFINITY_MAX_IN_FLIGHT
+                && !is_rpm_nearly_full(entry, now)
+                && !is_affinity_429_hot(entry, now)
                 && !is_concurrency_exceeded(entry)
                 && credential_matches_request(&entry.credentials, model, group)
         });
         if let Some(entry) = entry {
             Some((entry.id, entry.credentials.clone()))
         } else {
-            // 凭据被禁用、限流或过载后立即释放粘性，下一次请求走实时调度。
+            // 凭据被禁用、429 过密、RPM 将满或达并发上限后立即释放粘性。
             self.session_affinity.lock().remove(key);
             None
         }
@@ -2028,6 +2096,14 @@ impl MultiTokenManager {
                 None => millis as f64,
             });
         }
+    }
+
+    #[cfg(test)]
+    fn session_affinity_id(&self, key: &str) -> Option<u64> {
+        self.session_affinity
+            .lock()
+            .get(key)
+            .map(|value| value.credential_id)
     }
 
     #[cfg(test)]
@@ -2120,6 +2196,18 @@ impl MultiTokenManager {
         if available.is_empty() {
             return None;
         }
+
+        // Best：有更凉快的号就别再打 429 过密 / RPM 将满的号。全池都热才回退，避免选不出号。
+        let cool: Vec<_> = available
+            .iter()
+            .copied()
+            .filter(|entry| !is_rpm_nearly_full(entry, now) && !is_affinity_429_hot(entry, now))
+            .collect();
+        let available = if self.get_endpoint_mode() == EndpointMode::Best && !cool.is_empty() {
+            cool
+        } else {
+            available
+        };
 
         let configured_mode = self.load_balancing_mode.lock().clone();
         let mode =
@@ -2357,11 +2445,6 @@ impl MultiTokenManager {
                     // 仅在最终把凭据交给调用方时 +1（least_conn 在途计数）。
                     // 上面 token 重载的 continue 不会到达这里，故不会误增。
                     self.inc_in_flight(ctx.id);
-                    if let Some(key) = affinity_key {
-                        if self.get_endpoint_mode() == EndpointMode::Best {
-                            self.remember_session_affinity(key, ctx.id);
-                        }
-                    }
                     return Ok(ctx);
                 }
                 Err(e) => {
@@ -2900,6 +2983,8 @@ impl MultiTokenManager {
                 // 成功 = 风控已解除，提前结束冷却
                 entry.throttled_until = None;
                 entry.rate_limited_until = None;
+                // 刚 200 过就不要再被「429 过密」赶走，否则 helper 会拆号重写 cache。
+                entry.recent_429s.clear();
                 tracing::debug!(
                     "凭据 #{} API 调用成功（累计 {} 次）",
                     id,
@@ -4432,6 +4517,7 @@ impl MultiTokenManager {
                 rate_limited_until: None,
                 in_flight: 0,
                 recent_requests: VecDeque::new(),
+                recent_429s: VecDeque::new(),
                 first_byte_ewma_ms: None,
             });
         }
@@ -6899,13 +6985,12 @@ mod tests {
         )
         .unwrap();
         manager.remember_session_affinity("group-a\0conversation-1", 1);
-        manager
-            .entries
-            .lock()
-            .iter_mut()
-            .find(|e| e.id == 1)
-            .unwrap()
-            .in_flight = 2;
+        {
+            let mut entries = manager.entries.lock();
+            let entry = entries.iter_mut().find(|e| e.id == 1).unwrap();
+            entry.credentials.max_concurrency = 2;
+            entry.in_flight = 2;
+        }
 
         let selected = manager
             .select_next_credential_with_affinity(
@@ -6917,6 +7002,227 @@ mod tests {
             .map(|(id, _)| id);
 
         assert_eq!(selected, Some(2));
+    }
+
+    #[test]
+    fn session_affinity_keeps_helpers_when_concurrency_unlimited() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("a", &[]), grouped_cred("b", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.remember_session_affinity("group-a\0conversation-1", 1);
+        manager
+            .entries
+            .lock()
+            .iter_mut()
+            .find(|e| e.id == 1)
+            .unwrap()
+            .in_flight = 3;
+
+        let selected = manager
+            .select_next_credential_with_affinity(
+                None,
+                None,
+                &HashSet::new(),
+                Some("group-a\0conversation-1"),
+            )
+            .map(|(id, _)| id);
+
+        assert_eq!(
+            selected,
+            Some(1),
+            "helper 并行不应因 in_flight≥2 拆号，否则会重写 cache"
+        );
+    }
+
+    #[test]
+    fn session_affinity_releases_when_rpm_nearly_full() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("a", &[]), grouped_cred("b", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.remember_session_affinity("group-a\0conversation-1", 1);
+        {
+            let mut entries = manager.entries.lock();
+            let entry = entries.iter_mut().find(|e| e.id == 1).unwrap();
+            entry.credentials.rpm_limit = 10;
+            let now = Instant::now();
+            for _ in 0..9 {
+                entry.recent_requests.push_back(now);
+            }
+        }
+
+        let selected = manager
+            .select_next_credential_with_affinity(
+                None,
+                None,
+                &HashSet::new(),
+                Some("group-a\0conversation-1"),
+            )
+            .map(|(id, _)| id);
+
+        assert_eq!(selected, Some(2), "RPM 只剩 1 个空位时应松开粘滞");
+    }
+
+    #[test]
+    fn session_affinity_releases_when_recent_429_hot() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("a", &[]), grouped_cred("b", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.remember_session_affinity("group-a\0conversation-1", 1);
+        manager.record_rate_limit_hit(1);
+
+        let still_sticky = manager
+            .select_next_credential_with_affinity(
+                None,
+                None,
+                &HashSet::new(),
+                Some("group-a\0conversation-1"),
+            )
+            .map(|(id, _)| id);
+        assert_eq!(
+            still_sticky,
+            Some(1),
+            "单次 429 不应拆掉其它还没炸的会话"
+        );
+
+        manager.record_rate_limit_hit(1);
+        let selected = manager
+            .select_next_credential_with_affinity(
+                None,
+                None,
+                &HashSet::new(),
+                Some("group-a\0conversation-1"),
+            )
+            .map(|(id, _)| id);
+        assert_eq!(selected, Some(2), "近 1 分钟 429 够密时应松开粘滞");
+    }
+
+    #[test]
+    fn session_affinity_holds_after_success_clears_429_heat() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("a", &[]), grouped_cred("b", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.remember_session_affinity("group-a\0conversation-1", 1);
+        manager.record_rate_limit_hit(1);
+        manager.record_rate_limit_hit(1);
+        manager.report_success(1);
+
+        let selected = manager
+            .select_next_credential_with_affinity(
+                None,
+                None,
+                &HashSet::new(),
+                Some("group-a\0conversation-1"),
+            )
+            .map(|(id, _)| id);
+        assert_eq!(
+            selected,
+            Some(1),
+            "刚 200 应清掉 429 热度，helper 继续粘这个号"
+        );
+    }
+
+    #[test]
+    fn least_conn_still_picks_when_every_account_is_429_hot() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("a", &[]), grouped_cred("b", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.record_rate_limit_hit(1);
+        manager.record_rate_limit_hit(1);
+        manager.record_rate_limit_hit(2);
+        manager.record_rate_limit_hit(2);
+
+        let selected = manager.select_next_credential(None, None).map(|(id, _)| id);
+        assert!(
+            selected == Some(1) || selected == Some(2),
+            "全池 429 过密时仍应能选出一只号"
+        );
+    }
+
+    #[test]
+    fn release_session_affinity_drops_only_that_conversation() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("a", &[]), grouped_cred("b", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.remember_session_affinity("group-a\0conversation-1", 1);
+        manager.remember_session_affinity("group-a\0conversation-2", 1);
+        manager.release_session_affinity(Some("group-a\0conversation-1"), 1);
+
+        assert_eq!(
+            manager
+                .select_next_credential_with_affinity(
+                    None,
+                    None,
+                    &HashSet::new(),
+                    Some("group-a\0conversation-1"),
+                )
+                .map(|(id, _)| id),
+            Some(1),
+            "松开后应走 least_conn；两号都空闲时仍可能选回 1，但粘滞表已清"
+        );
+        assert_eq!(
+            manager.session_affinity_id("group-a\0conversation-1"),
+            None
+        );
+        assert_eq!(
+            manager.session_affinity_id("group-a\0conversation-2"),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_context_does_not_pin_session_before_upstream_success() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("a", &[]), grouped_cred("b", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let key = "group-a\0conversation-1";
+        let ctx = manager
+            .acquire_context_excluding_with_affinity(None, None, &HashSet::new(), Some(key))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager.session_affinity_id(key),
+            None,
+            "抢到 token 不应写粘滞"
+        );
+
+        manager.confirm_session_affinity(Some(key), ctx.id);
+        assert_eq!(manager.session_affinity_id(key), Some(ctx.id));
     }
 
     #[test]

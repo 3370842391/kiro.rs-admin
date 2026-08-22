@@ -78,9 +78,35 @@ const SAFE_REQUIRED_PROPERTY_ALIASES: &[(&str, &str)] = &[
     ("newString", "newStr"),
     // Monitor：上游按 Bash 的习惯吐 `timeout`，客户端 schema 要 `timeout_ms`。
     // 两边同为毫秒且同为 number，`matches_declared_type` 会再校一次类型；
-    // 若客户端自己也声明了 `timeout`，上面的 `properties.contains_key(source)` 会拦下不改名。
+    // 若客户端自己也声明了 `timeout`，`copy_declared_alias_to_missing_required` 会复制一份。
     ("timeout", "timeout_ms"),
+    // 路径族：Kiro 吐 path / file_path，Cline/Roo 要 files，部分 IDE 要 fileKey。
+    ("path", "fileKey"),
+    ("file_path", "fileKey"),
+    ("filePath", "fileKey"),
+    ("file_key", "fileKey"),
+    ("path", "file_key"),
+    ("file_path", "file_key"),
+    ("fileKey", "path"),
+    ("fileKey", "file_path"),
+    ("files", "path"),
+    ("files", "file_path"),
+    ("files", "fileKey"),
 ];
+
+/// 路径类标量字段。规范化后互相等价，补上别名表没穷举到的大小写。
+const PATH_SCALAR_FAMILY: &[&str] = &[
+    "path",
+    "file_path",
+    "filePath",
+    "filepath",
+    "file_key",
+    "fileKey",
+    "target_file",
+    "targetFile",
+];
+
+const FILES_ARRAY_NAMES: &[&str] = &["files", "file_list", "fileList"];
 
 /// 上游未声明工具 → 客户端已声明工具的**语义等价族**。
 ///
@@ -509,6 +535,8 @@ fn validate_value(
     violations: &mut Vec<ToolInputViolation>,
 ) {
     repair_json_encoded_array(schema, value, path, repairs);
+    repair_json_encoded_object(schema, value, path, repairs);
+    repair_singleton_to_declared_array(schema, value, path, repairs);
     repair_or_validate_fixed_value(schema, value, path, required_property, repairs, violations);
 
     let Some(expected_type) = schema.get("type") else {
@@ -593,6 +621,99 @@ fn repair_json_encoded_array(
 
     *value = decoded;
     repairs.push(path.to_string());
+}
+
+fn declares_kind(schema: &serde_json::Value, kind: &str) -> bool {
+    match schema.get("type") {
+        Some(serde_json::Value::String(declared)) => declared == kind,
+        Some(serde_json::Value::Array(kinds)) => kinds
+            .iter()
+            .any(|declared| declared.as_str() == Some(kind)),
+        _ => false,
+    }
+}
+
+fn repair_json_encoded_object(
+    schema: &serde_json::Value,
+    value: &mut serde_json::Value,
+    path: &str,
+    repairs: &mut Vec<String>,
+) {
+    if !declares_kind(schema, "object") {
+        return;
+    }
+    let Some(encoded) = value
+        .as_str()
+        .filter(|encoded| encoded.len() <= MAX_JSON_ENCODED_ARRAY_BYTES)
+    else {
+        return;
+    };
+    let Ok(decoded) = serde_json::from_str::<serde_json::Value>(encoded) else {
+        return;
+    };
+    if !decoded.is_object() {
+        return;
+    }
+    *value = decoded;
+    repairs.push(path.to_string());
+}
+
+/// 客户端要数组、上游给了单个同类型元素时包一层。writeMemory 的 `memory` 常见这种。
+fn repair_singleton_to_declared_array(
+    schema: &serde_json::Value,
+    value: &mut serde_json::Value,
+    path: &str,
+    repairs: &mut Vec<String>,
+) {
+    if !declares_kind(schema, "array") || value.is_array() {
+        return;
+    }
+    let Some(items) = schema.get("items") else {
+        return;
+    };
+    let Some(item_type) = items.get("type") else {
+        if value.is_object() || value.is_string() {
+            *value = serde_json::json!([value.take()]);
+            repairs.push(path.to_string());
+        }
+        return;
+    };
+    if !matches_declared_type(item_type, value) {
+        return;
+    }
+    *value = serde_json::json!([value.take()]);
+    repairs.push(path.to_string());
+}
+
+fn schema_default_if_typed(schema: &serde_json::Value) -> Option<serde_json::Value> {
+    let default = schema.get("default")?.clone();
+    if let Some(declared) = schema.get("type")
+        && !matches_declared_type(declared, &default)
+    {
+        return None;
+    }
+    Some(default)
+}
+
+fn boolean_false_if_multiselect(
+    name: &str,
+    schema: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    if normalize_property_key(name) != "multiselect" {
+        return None;
+    }
+    if !declares_kind(schema, "boolean") {
+        return None;
+    }
+    if schema.get("const").is_some() {
+        return None;
+    }
+    if let Some(values) = schema.get("enum").and_then(serde_json::Value::as_array)
+        && !values.iter().any(|value| value == &serde_json::json!(false))
+    {
+        return None;
+    }
+    Some(serde_json::json!(false))
 }
 
 fn validate_all_of(
@@ -815,7 +936,10 @@ fn validate_object(
 
     if let Some(properties) = properties {
         repair_required_property_aliases(properties, &required, object, path, repairs);
+        copy_declared_alias_to_missing_required(properties, &required, object, path, repairs);
         repair_case_insensitive_required_properties(properties, &required, object, path, repairs);
+        repair_path_scalar_family(properties, &required, object, path, repairs);
+        repair_files_array_from_path(properties, &required, object, path, repairs);
     }
 
     if let Some(properties) = properties {
@@ -832,7 +956,10 @@ fn validate_object(
                     violations,
                 );
             } else if is_required {
-                if let Some(fixed) = deterministic_fixed_value(property_schema) {
+                if let Some(fixed) = deterministic_fixed_value(property_schema)
+                    .or_else(|| schema_default_if_typed(property_schema))
+                    .or_else(|| boolean_false_if_multiselect(name, property_schema))
+                {
                     object.insert(name.clone(), fixed);
                     repairs.push(child_path.clone());
                     let child = object.get_mut(name).expect("inserted required fixed value");
@@ -926,6 +1053,225 @@ fn repair_required_property_aliases(
             .expect("source alias was checked before removal");
         object.insert(target.to_string(), value);
         repairs.push(property_path(path, target));
+    }
+}
+
+/// 源字段也在客户端 schema 里时不能搬走，但 Monitor 的 `timeout` → `timeout_ms`
+/// 是同一毫秒值，可以复制一份给缺失的 required 目标。
+fn copy_declared_alias_to_missing_required(
+    properties: &serde_json::Map<String, serde_json::Value>,
+    required: &std::collections::HashSet<&str>,
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    path: &str,
+    repairs: &mut Vec<String>,
+) {
+    const COPYABLE: &[(&str, &str)] = &[("timeout", "timeout_ms")];
+    for &(source, target) in COPYABLE {
+        if !required.contains(target) || object.contains_key(target) {
+            continue;
+        }
+        if !properties.contains_key(source) || !object.contains_key(source) {
+            continue;
+        }
+        let Some(target_schema) = properties.get(target) else {
+            continue;
+        };
+        let Some(declared_type) = target_schema.get("type") else {
+            continue;
+        };
+        let Some(source_value) = object.get(source) else {
+            continue;
+        };
+        if !matches_declared_type(declared_type, source_value) {
+            continue;
+        }
+        object.insert(target.to_string(), source_value.clone());
+        repairs.push(property_path(path, target));
+    }
+}
+
+fn is_path_scalar_name(name: &str) -> bool {
+    let normalized = normalize_property_key(name);
+    PATH_SCALAR_FAMILY
+        .iter()
+        .any(|alias| normalize_property_key(alias) == normalized)
+}
+
+fn is_files_array_name(name: &str) -> bool {
+    let normalized = normalize_property_key(name);
+    FILES_ARRAY_NAMES
+        .iter()
+        .any(|alias| normalize_property_key(alias) == normalized)
+}
+
+fn take_path_scalar_source(
+    object: &serde_json::Map<String, serde_json::Value>,
+    properties: &serde_json::Map<String, serde_json::Value>,
+    skip: &str,
+) -> Option<(String, serde_json::Value)> {
+    let mut matches = object.iter().filter(|(key, value)| {
+        *key != skip && is_path_scalar_name(key) && value.is_string() && !properties.contains_key(*key)
+    });
+    let (key, value) = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some((key.clone(), value.clone()))
+}
+
+fn first_path_scalar_even_if_declared(
+    object: &serde_json::Map<String, serde_json::Value>,
+    skip: &str,
+) -> Option<(String, serde_json::Value)> {
+    object.iter().find_map(|(key, value)| {
+        (*key != skip && is_path_scalar_name(key) && value.is_string())
+            .then(|| (key.clone(), value.clone()))
+    })
+}
+
+/// 路径族标量互转：`path` / `file_path` → `fileKey`。源键未声明才搬走，已声明则复制。
+fn repair_path_scalar_family(
+    properties: &serde_json::Map<String, serde_json::Value>,
+    required: &std::collections::HashSet<&str>,
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    path: &str,
+    repairs: &mut Vec<String>,
+) {
+    let missing: Vec<String> = required
+        .iter()
+        .copied()
+        .filter(|target| {
+            is_path_scalar_name(target)
+                && !object.contains_key(*target)
+                && properties.contains_key(*target)
+        })
+        .map(ToOwned::to_owned)
+        .collect();
+
+    for target in missing {
+        let Some(declared_type) = properties.get(&target).and_then(|schema| schema.get("type"))
+        else {
+            continue;
+        };
+        if !declared_type
+            .as_str()
+            .is_some_and(|kind| kind == "string")
+            && !declared_type
+                .as_array()
+                .is_some_and(|kinds| kinds.iter().any(|kind| kind.as_str() == Some("string")))
+        {
+            continue;
+        }
+
+        let Some((source_key, source_value)) =
+            take_path_scalar_source(object, properties, &target)
+        else {
+            continue;
+        };
+        object.remove(&source_key);
+        object.insert(target.clone(), source_value);
+        repairs.push(property_path(path, &target));
+    }
+}
+
+fn wrap_path_as_files_item(
+    items_schema: &serde_json::Value,
+    path_value: &serde_json::Value,
+    extras: &serde_json::Map<String, serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let item_type = items_schema.get("type");
+    if item_type.is_some_and(|declared| matches_declared_type(declared, path_value))
+        || item_type.is_none() && path_value.is_string()
+    {
+        return Some(path_value.clone());
+    }
+    if !item_type.is_some_and(|declared| {
+        declared.as_str() == Some("object")
+            || declared
+                .as_array()
+                .is_some_and(|kinds| kinds.iter().any(|kind| kind.as_str() == Some("object")))
+    }) && items_schema.get("properties").is_none()
+    {
+        return None;
+    }
+
+    let item_properties = items_schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object);
+    let mut item = serde_json::Map::new();
+    let path_field = item_properties
+        .into_iter()
+        .flat_map(|properties| properties.keys())
+        .find(|name| is_path_scalar_name(name))
+        .map(String::as_str)
+        .unwrap_or("path");
+    item.insert(path_field.to_string(), path_value.clone());
+
+    if let Some(item_properties) = item_properties {
+        for (target, extra_keys) in item_properties.keys().map(|target| {
+            let extra_keys: &[&str] = match normalize_property_key(target).as_str() {
+                "startline" | "linestart" => &["start_line", "startLine", "lineStart", "offset"],
+                "endline" | "lineend" => &["end_line", "endLine", "lineEnd"],
+                "offset" => &["offset", "start_line", "startLine"],
+                "limit" => &["limit"],
+                _ => &[],
+            };
+            (target, extra_keys)
+        }) {
+            if extra_keys.is_empty() || item.contains_key(target) {
+                continue;
+            }
+            if let Some(value) = extra_keys.iter().find_map(|source| extras.get(*source)) {
+                item.insert(target.clone(), value.clone());
+            }
+        }
+    }
+    Some(serde_json::Value::Object(item))
+}
+
+/// Cline / Roo 的 `read_file` 要 `files: [{path}]` 或 `files: ["..."]`，上游只给了一条 path。
+fn repair_files_array_from_path(
+    properties: &serde_json::Map<String, serde_json::Value>,
+    required: &std::collections::HashSet<&str>,
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    path: &str,
+    repairs: &mut Vec<String>,
+) {
+    let missing: Vec<String> = required
+        .iter()
+        .copied()
+        .filter(|target| {
+            is_files_array_name(target)
+                && !object.contains_key(*target)
+                && properties.contains_key(*target)
+        })
+        .map(ToOwned::to_owned)
+        .collect();
+
+    for target in missing {
+        let Some(target_schema) = properties.get(&target) else {
+            continue;
+        };
+        if !declares_kind(target_schema, "array") {
+            continue;
+        }
+        let source = take_path_scalar_source(object, properties, &target)
+            .or_else(|| first_path_scalar_even_if_declared(object, &target));
+        let Some((source_key, source_value)) = source else {
+            continue;
+        };
+        let items = target_schema
+            .get("items")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+        let Some(item) = wrap_path_as_files_item(&items, &source_value, object) else {
+            continue;
+        };
+        if !properties.contains_key(&source_key) {
+            object.remove(&source_key);
+        }
+        object.insert(target.clone(), serde_json::json!([item]));
+        repairs.push(property_path(path, &target));
     }
 }
 
@@ -1882,6 +2228,160 @@ mod tests {
         assert_eq!(input["meta"]["nonce"], "fixed-42");
         assert_eq!(input["rows"][0]["kind"], "weather");
         assert_eq!(input["rows"][1]["kind"], "weather");
+    }
+
+    #[test]
+    fn repairs_path_to_file_key_for_ide_read_file() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"fileKey": {"type": "string"}},
+            "required": ["fileKey"],
+            "additionalProperties": false
+        });
+        let mut input = serde_json::json!({"path": "/tmp/a.rs"});
+        assert_eq!(
+            validate_and_repair(&schema, &mut input),
+            ToolInputOutcome::Repaired {
+                paths: vec!["$.fileKey".to_string()]
+            }
+        );
+        assert_eq!(input, serde_json::json!({"fileKey": "/tmp/a.rs"}));
+    }
+
+    #[test]
+    fn repairs_path_to_files_object_array_for_cline_read_file() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "files": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "lineStart": {"type": "integer"}
+                        },
+                        "required": ["path"]
+                    }
+                }
+            },
+            "required": ["files"],
+            "additionalProperties": false
+        });
+        let mut input = serde_json::json!({"file_path": "src/main.rs", "start_line": 10});
+        assert!(matches!(
+            validate_and_repair(&schema, &mut input),
+            ToolInputOutcome::Repaired { .. }
+        ));
+        assert_eq!(
+            input["files"],
+            serde_json::json!([{"path": "src/main.rs", "lineStart": 10}])
+        );
+    }
+
+    #[test]
+    fn repairs_path_to_files_string_array() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "files": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["files"]
+        });
+        let mut input = serde_json::json!({"path": "a.txt"});
+        assert!(matches!(
+            validate_and_repair(&schema, &mut input),
+            ToolInputOutcome::Repaired { .. }
+        ));
+        assert_eq!(input["files"], serde_json::json!(["a.txt"]));
+    }
+
+    #[test]
+    fn copies_timeout_to_timeout_ms_when_both_are_declared() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "timeout": {"type": "number"},
+                "timeout_ms": {"type": "number"}
+            },
+            "required": ["timeout_ms"]
+        });
+        let mut input = serde_json::json!({"timeout": 5000});
+        assert!(matches!(
+            validate_and_repair(&schema, &mut input),
+            ToolInputOutcome::Repaired { .. }
+        ));
+        assert_eq!(input["timeout_ms"], 5000);
+        assert_eq!(input["timeout"], 5000);
+    }
+
+    #[test]
+    fn fills_schema_default_and_multiselect_false() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question": {"type": "string"},
+                            "header": {"type": "string", "default": "Choose"},
+                            "multiSelect": {"type": "boolean"}
+                        },
+                        "required": ["question", "header", "multiSelect"]
+                    }
+                }
+            },
+            "required": ["questions"]
+        });
+        let mut input = serde_json::json!({
+            "questions": [{"question": "Pick one"}]
+        });
+        assert!(matches!(
+            validate_and_repair(&schema, &mut input),
+            ToolInputOutcome::Repaired { .. }
+        ));
+        assert_eq!(input["questions"][0]["header"], "Choose");
+        assert_eq!(input["questions"][0]["multiSelect"], false);
+    }
+
+    #[test]
+    fn decodes_json_encoded_object_and_wraps_singleton_memory() {
+        let object_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "params": {"type": "object"},
+                "tool_name": {"type": "string"}
+            },
+            "required": ["params", "tool_name"]
+        });
+        let mut encoded = serde_json::json!({
+            "params": "{\"a\":1}",
+            "tool_name": "read"
+        });
+        assert!(matches!(
+            validate_and_repair(&object_schema, &mut encoded),
+            ToolInputOutcome::Repaired { .. }
+        ));
+        assert_eq!(encoded["params"], serde_json::json!({"a": 1}));
+
+        let memory_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "memory": {
+                    "type": "array",
+                    "items": {"type": "object"}
+                }
+            },
+            "required": ["memory"]
+        });
+        let mut memory = serde_json::json!({"memory": {"k": "v"}});
+        assert!(matches!(
+            validate_and_repair(&memory_schema, &mut memory),
+            ToolInputOutcome::Repaired { .. }
+        ));
+        assert_eq!(memory["memory"], serde_json::json!([{"k": "v"}]));
     }
 
     #[test]

@@ -1484,6 +1484,7 @@ impl KiroProvider {
             // 瞬态错误
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
                 if status.as_u16() == 429 {
+                    self.token_manager.record_rate_limit_hit(ctx.id);
                     let switch_on_ordinary_429 =
                         retry_mode == RetryMode::Failover || retry_policy.credential_switch_on_429;
                     if switch_on_ordinary_429 {
@@ -1751,6 +1752,8 @@ impl KiroProvider {
                     attempt_start,
                 );
                 self.token_manager.report_success(ctx.id);
+                self.token_manager
+                    .confirm_session_affinity(affinity_key.as_deref(), ctx.id);
                 return Ok(KiroCallResult {
                     response,
                     credential_id: ctx.id,
@@ -2016,6 +2019,8 @@ impl KiroProvider {
                                 fb_start,
                             );
                             self.token_manager.report_success(ctx.id);
+                            self.token_manager
+                                .confirm_session_affinity(affinity_key.as_deref(), ctx.id);
                             tracing::info!(
                                 "凭据 #{} 在备用端点 [{}] 成功（主端点 [{}] 此前 429）",
                                 ctx.id,
@@ -2104,8 +2109,17 @@ impl KiroProvider {
                     }
                 }
                 // 整条降级链都失败，落回主端点 429 分类处理。
+                // failover 普通 429 不冷却，也必须记一笔；只有真的要换号
+                // （或账号级风控）才松粘滞。Polite 等「同号退避」策略松了会误跳号。
                 let switch_on_ordinary_429 =
                     retry_mode == RetryMode::Failover || retry_policy.credential_switch_on_429;
+                if status.as_u16() == 429 {
+                    self.token_manager.record_rate_limit_hit(ctx.id);
+                    if switch_on_ordinary_429 || account_throttled {
+                        self.token_manager
+                            .release_session_affinity(affinity_key.as_deref(), ctx.id);
+                    }
+                }
                 if status.as_u16() == 429 && !account_throttled && switch_on_ordinary_429 {
                     request_throttled_ids.insert(ctx.id);
                     if self.token_manager.has_available_excluding(
