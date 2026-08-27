@@ -937,6 +937,7 @@ fn validate_object(
     if let Some(properties) = properties {
         repair_required_property_aliases(properties, &required, object, path, repairs);
         copy_declared_alias_to_missing_required(properties, &required, object, path, repairs);
+        copy_nested_params_tool_name(properties, &required, object, path, repairs);
         repair_case_insensitive_required_properties(properties, &required, object, path, repairs);
         repair_path_scalar_family(properties, &required, object, path, repairs);
         repair_files_array_from_path(properties, &required, object, path, repairs);
@@ -1088,6 +1089,42 @@ fn copy_declared_alias_to_missing_required(
         object.insert(target.to_string(), source_value.clone());
         repairs.push(property_path(path, target));
     }
+}
+
+/// `package_proxy` 线上形态：`{params: {tool_name: "..."}}`。只提升明确的
+/// `params.tool_name` 字符串，禁止把整个 `params` 对象当成 `tool_name`。
+fn copy_nested_params_tool_name(
+    properties: &serde_json::Map<String, serde_json::Value>,
+    required: &std::collections::HashSet<&str>,
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    path: &str,
+    repairs: &mut Vec<String>,
+) {
+    if !required.contains("tool_name") || object.contains_key("tool_name") {
+        return;
+    }
+    let Some(target_schema) = properties.get("tool_name") else {
+        return;
+    };
+    let Some(declared_type) = target_schema.get("type") else {
+        return;
+    };
+    let Some(name) = object
+        .get("params")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|params| params.get("tool_name"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    else {
+        return;
+    };
+    let value = serde_json::Value::String(name.to_string());
+    if !matches_declared_type(declared_type, &value) {
+        return;
+    }
+    object.insert("tool_name".to_string(), value);
+    repairs.push(property_path(path, "tool_name"));
 }
 
 fn is_path_scalar_name(name: &str) -> bool {
@@ -2228,6 +2265,69 @@ mod tests {
         assert_eq!(input["meta"]["nonce"], "fixed-42");
         assert_eq!(input["rows"][0]["kind"], "weather");
         assert_eq!(input["rows"][1]["kind"], "weather");
+    }
+
+    #[test]
+    fn empty_read_file_input_does_not_invent_file_key() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"fileKey": {"type": "string"}},
+            "required": ["fileKey"],
+            "additionalProperties": false
+        });
+        let mut input = serde_json::json!({});
+        assert!(
+            matches!(validate_and_repair(&schema, &mut input), ToolInputOutcome::Invalid { .. }),
+            "空 input 只能 Invalid 或走 retry，禁止编造 fileKey"
+        );
+        assert_eq!(input, serde_json::json!({}));
+        assert!(input.get("fileKey").is_none());
+    }
+
+    #[test]
+    fn package_proxy_copies_params_tool_name_only() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "tool_name": {"type": "string"},
+                "params": {"type": "object"}
+            },
+            "required": ["tool_name"],
+            "additionalProperties": true
+        });
+        let mut input = serde_json::json!({
+            "params": {"tool_name": "read_file", "path": "src/main.rs"}
+        });
+        assert_eq!(
+            validate_and_repair(&schema, &mut input),
+            ToolInputOutcome::Repaired {
+                paths: vec!["$.tool_name".to_string()]
+            }
+        );
+        assert_eq!(input["tool_name"], "read_file");
+        assert_eq!(input["params"]["tool_name"], "read_file");
+    }
+
+    #[test]
+    fn package_proxy_does_not_treat_params_object_as_tool_name() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "tool_name": {"type": "string"},
+                "params": {"type": "object"}
+            },
+            "required": ["tool_name"],
+            "additionalProperties": true
+        });
+        let mut input = serde_json::json!({
+            "params": {"query": "hello"}
+        });
+        assert!(matches!(
+            validate_and_repair(&schema, &mut input),
+            ToolInputOutcome::Invalid { .. }
+        ));
+        assert!(input.get("tool_name").is_none());
+        assert!(input["params"].is_object());
     }
 
     #[test]

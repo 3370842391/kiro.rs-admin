@@ -35,6 +35,16 @@ function parseCount(raw: string, label: string): number {
   return n
 }
 
+function parseOptionalCost(raw: string, label: string): number {
+  const trimmed = raw.trim()
+  if (!trimmed) return 0
+  const n = Number(trimmed)
+  if (!Number.isFinite(n) || n < 0 || n > 1_000_000_000) {
+    throw new Error(`${label}必须是 0 到 1000000000 的数字，留空表示不预填`)
+  }
+  return n
+}
+
 export function ImportDefaultsDialog({ open, onOpenChange }: ImportDefaultsDialogProps) {
   const queryClient = useQueryClient()
   const groupOptions = useGroupOptions()
@@ -52,6 +62,8 @@ export function ImportDefaultsDialog({ open, onOpenChange }: ImportDefaultsDialo
   const [sourceChannel, setSourceChannel] = useState('')
   const [autoAssignProxy, setAutoAssignProxy] = useState(true)
   const [avoidRiskyProxies, setAvoidRiskyProxies] = useState(true)
+  const [costRmb, setCostRmb] = useState('')
+  const [quotaCredits, setQuotaCredits] = useState('')
 
   useEffect(() => {
     if (!open || !data) return
@@ -62,6 +74,8 @@ export function ImportDefaultsDialog({ open, onOpenChange }: ImportDefaultsDialo
     setSourceChannel(data.sourceChannel)
     setAutoAssignProxy(data.autoAssignProxy)
     setAvoidRiskyProxies(data.avoidRiskyProxies)
+    setCostRmb(data.costRmb != null && data.costRmb > 0 ? String(data.costRmb) : '')
+    setQuotaCredits(data.quotaCredits != null && data.quotaCredits > 0 ? String(data.quotaCredits) : '')
   }, [open, data])
 
   const saveMutation = useMutation({
@@ -84,6 +98,8 @@ export function ImportDefaultsDialog({ open, onOpenChange }: ImportDefaultsDialo
         sourceChannel: sourceChannel.trim(),
         autoAssignProxy,
         avoidRiskyProxies,
+        costRmb: parseOptionalCost(costRmb, '买入价'),
+        quotaCredits: parseOptionalCost(quotaCredits, '额度积分'),
       })
     } catch (error) {
       toast.error(extractErrorMessage(error))
@@ -150,6 +166,33 @@ export function ImportDefaultsDialog({ open, onOpenChange }: ImportDefaultsDialo
             <p className="text-xs text-muted-foreground">
               导入时与 JSON 内自带的 groups 取并集。
             </p>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-1">
+              <label className="text-sm font-medium">默认买入价（¥）</label>
+              <Input
+                value={costRmb}
+                onChange={(e) => setCostRmb(e.target.value)}
+                placeholder="留空则不预填"
+                inputMode="decimal"
+              />
+              <p className="text-xs text-muted-foreground">
+                导入时预填。不填则只计收入、不算利润。
+              </p>
+            </div>
+            <div className="space-y-1">
+              <label className="text-sm font-medium">默认额度积分</label>
+              <Input
+                value={quotaCredits}
+                onChange={(e) => setQuotaCredits(e.target.value)}
+                placeholder="留空则用上游额度"
+                inputMode="decimal"
+              />
+              <p className="text-xs text-muted-foreground">
+                填了以它为准；上游查不到或和卖家标称不一致时用。
+              </p>
+            </div>
           </div>
 
           <div className="grid grid-cols-2 gap-3">

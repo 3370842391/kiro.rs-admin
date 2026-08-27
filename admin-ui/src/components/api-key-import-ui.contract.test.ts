@@ -6,6 +6,23 @@ async function readSource(path: string): Promise<string> {
 }
 
 describe('API Key import UI wiring', () => {
+  test('batch import and defaults expose profit costing fields', async () => {
+    const dialog = await readSource('src/components/batch-import-dialog.tsx')
+    const defaults = await readSource('src/components/import-defaults-dialog.tsx')
+    const types = await readSource('src/types/api.ts')
+
+    expect(dialog).toContain('uniformCostRmb')
+    expect(dialog).toContain('uniformQuotaCredits')
+    expect(dialog).toContain('统一买入价（¥）')
+    expect(dialog).toContain('统一额度积分')
+    expect(dialog).toContain('costRmb: costRmb && costRmb > 0 ? costRmb : undefined')
+    expect(defaults).toContain('默认买入价（¥）')
+    expect(defaults).toContain('默认额度积分')
+    expect(defaults).toContain('costRmb: parseOptionalCost(costRmb, \'买入价\')')
+    expect(types).toContain('costRmb?: number')
+    expect(types).toContain('quotaCredits?: number')
+  })
+
   test('batch dialog provides JSON/KAM and API Key text modes', async () => {
     const dialog = await readSource('src/components/batch-import-dialog.tsx')
 

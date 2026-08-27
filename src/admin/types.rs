@@ -407,6 +407,12 @@ pub struct BatchUpdateCredentialsRequest {
     pub priority: Option<u32>,
     #[serde(default)]
     pub promote_priority: bool,
+    /// 买入成本（¥）。`Some(0)` 表示清除。
+    #[serde(default)]
+    pub cost_rmb: Option<f64>,
+    /// 手填额度积分。`Some(0)` 表示清除，改回用上游额度。
+    #[serde(default)]
+    pub quota_credits: Option<f64>,
 }
 
 /// 批量修改凭据响应
@@ -1025,6 +1031,12 @@ pub struct SetImportDefaultsRequest {
     pub auto_assign_proxy: Option<bool>,
     #[serde(default)]
     pub avoid_risky_proxies: Option<bool>,
+    /// 默认买入价（¥）。`Some(0)` 表示清除默认值。
+    #[serde(default)]
+    pub cost_rmb: Option<f64>,
+    /// 默认额度积分。`Some(0)` 表示清除默认值。
+    #[serde(default)]
+    pub quota_credits: Option<f64>,
 }
 
 // ============ 代理池 ============
@@ -2346,6 +2358,21 @@ mod tests {
         assert_eq!(groups.mode, BatchGroupMode::Add);
         assert_eq!(groups.values, vec!["team-a", "team-b"]);
         assert_eq!(request.source_channel.as_deref(), Some("migration"));
+        assert_eq!(request.cost_rmb, None);
+        assert_eq!(request.quota_credits, None);
+    }
+
+    #[test]
+    fn batch_update_request_deserializes_costing_fields() {
+        let request: BatchUpdateCredentialsRequest = serde_json::from_value(serde_json::json!({
+            "ids": [9],
+            "costRmb": 80.5,
+            "quotaCredits": 10000
+        }))
+        .unwrap();
+        assert_eq!(request.ids, vec![9]);
+        assert_eq!(request.cost_rmb, Some(80.5));
+        assert_eq!(request.quota_credits, Some(10_000.0));
     }
 
     #[test]

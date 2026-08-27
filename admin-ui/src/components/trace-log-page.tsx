@@ -48,36 +48,10 @@ import {
 import { extractErrorMessage } from '@/lib/utils'
 import type { TraceAttempt, TraceQuery, TraceRecord } from '@/types/api'
 import { ErrorSnapshotDialog } from '@/components/error-snapshot-dialog'
-
-/** 失败分类 → 中文标签 + Badge 颜色 */
-function outcomeStyle(outcome: string): {
-  label: string
-  variant: 'default' | 'secondary' | 'destructive' | 'outline' | 'success' | 'warning'
-} {
-  switch (outcome) {
-    case 'success':
-      return { label: '成功', variant: 'success' }
-    case 'quota_exhausted':
-      return { label: '额度耗尽', variant: 'warning' }
-    case 'account_throttled':
-      return { label: '账号风控', variant: 'warning' }
-    case 'auth_failed':
-      return { label: '鉴权失败', variant: 'destructive' }
-    case 'transient':
-      return { label: '瞬态错误', variant: 'outline' }
-    case 'network_error':
-      return { label: '网络错误', variant: 'destructive' }
-    case 'bad_request':
-      return { label: '请求错误', variant: 'destructive' }
-    case 'stream_interrupted':
-      return { label: '流中断', variant: 'warning' }
-    default:
-      return { label: outcome || '未知', variant: 'secondary' }
-  }
-}
+import { ERROR_TYPE_OPTIONS, interruptedStatusHint, outcomeStyle } from '@/lib/trace-outcome'
 
 /** 最终状态 → 徽章 */
-function StatusBadge({ status }: { status: string }) {
+function StatusBadge({ status, errorType }: { status: string; errorType?: string | null }) {
   if (status === 'success')
     return (
       <Badge variant="success">
@@ -87,9 +61,9 @@ function StatusBadge({ status }: { status: string }) {
     )
   if (status === 'interrupted')
     return (
-      <Badge variant="warning">
+      <Badge variant="warning" title={interruptedStatusHint(errorType)}>
         <Unplug className="mr-1 h-3 w-3" />
-        中断
+        {errorType ? outcomeStyle(errorType).label : '中断'}
       </Badge>
     )
   return (
@@ -145,17 +119,6 @@ const STATUS_OPTIONS = [
   { value: 'interrupted', label: '中断' },
 ]
 
-const ERROR_TYPE_OPTIONS = [
-  { value: '', label: '全部错误类型' },
-  { value: 'quota_exhausted', label: '额度耗尽' },
-  { value: 'account_throttled', label: '账号风控' },
-  { value: 'auth_failed', label: '鉴权失败' },
-  { value: 'transient', label: '瞬态错误' },
-  { value: 'network_error', label: '网络错误' },
-  { value: 'bad_request', label: '请求错误' },
-  { value: 'stream_interrupted', label: '流中断' },
-  { value: 'unknown', label: '未知' },
-]
 
 const COMPACTION_DIAGNOSIS_OPTIONS = [
   { value: '', label: '全部压缩诊断' },
@@ -166,6 +129,7 @@ const COMPACTION_DIAGNOSIS_OPTIONS = [
   { value: 'client_disconnected_before_signal', label: '信号前客户端断开' },
   { value: 'upstream_context_unknown', label: '上游上下文未知' },
   { value: 'payload_limit_preempted', label: '请求体限制抢先失败' },
+  { value: 'client_compaction_observed', label: '观测到客户端压缩' },
   { value: 'suspected_client_compaction_not_triggered', label: '疑似客户端未触发压缩' },
   { value: 'suspected_compaction_insufficient', label: '疑似压缩不足' },
 ]
@@ -189,6 +153,8 @@ function compactionDiagnosisStyle(diagnosis: string): {
       return { label: '上游上下文未知', variant: 'secondary' }
     case 'payload_limit_preempted':
       return { label: '请求体限制', variant: 'destructive' }
+    case 'client_compaction_observed':
+      return { label: '客户端已压缩', variant: 'success' }
     case 'suspected_client_compaction_not_triggered':
       return { label: '疑似未触发压缩', variant: 'warning' }
     case 'suspected_compaction_insufficient':
@@ -552,7 +518,7 @@ function TraceRow({
           <Badge variant="outline">{keyLabel(rec.keyId, rec.keyName)}</Badge>
         </td>
         <td className="py-2.5 pr-3">
-          <StatusBadge status={rec.finalStatus} />
+          <StatusBadge status={rec.finalStatus} errorType={rec.errorType} />
         </td>
         <td className="py-2.5 pr-3">
           <CompactionBadge diagnosis={rec.compaction?.diagnosis} />
@@ -1090,10 +1056,10 @@ export function TraceLogPage() {
             options={STATUS_OPTIONS}
           />
           <Select
-            label="按错误类型筛选"
+            label="按错误类型筛选（中断≠上游断流）"
             value={errorType}
             onChange={resetTo(setErrorType)}
-            options={ERROR_TYPE_OPTIONS}
+            options={[...ERROR_TYPE_OPTIONS]}
           />
           <Select
             label="按自动压缩诊断筛选"

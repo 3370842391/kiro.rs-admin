@@ -55,6 +55,19 @@ describe('admin RPM operations UI wiring', () => {
     expect(dialog).toContain('id="batch-group-mode-description"')
   })
 
+  test('batch dialog can edit purchase cost and quota credits', async () => {
+    const dialog = await readSource('src/components/batch-edit-credential-dialog.tsx')
+
+    expect(dialog).toContain('editCost')
+    expect(dialog).toContain('editQuota')
+    expect(dialog).toContain('修改买入价')
+    expect(dialog).toContain('修改额度积分')
+    expect(dialog).toContain('id="batch-cost-rmb"')
+    expect(dialog).toContain('id="batch-quota-credits"')
+    expect(dialog).toContain('costDraft')
+    expect(dialog).toContain('quotaDraft')
+  })
+
   test('batch dialog exposes fixed and promoted priority modes', async () => {
     const dialog = await readSource('src/components/batch-edit-credential-dialog.tsx')
 

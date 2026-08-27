@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Network, ArrowUp, ArrowDown, RotateCcw } from 'lucide-react'
+import { Network, ArrowUp, ArrowDown, RotateCcw, ChevronDown } from 'lucide-react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -11,7 +11,7 @@ import {
   useEndpointChains, useSetEndpointChains, useEndpointMode, useSetEndpointMode,
 } from '@/hooks/use-credentials'
 import type { EndpointBucketOption } from '@/api/credentials'
-import { extractErrorMessage } from '@/lib/utils'
+import { cn, extractErrorMessage } from '@/lib/utils'
 
 interface EndpointChainsDialogProps {
   open: boolean
@@ -62,6 +62,7 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
   const [autoContinueMax, setAutoContinueMax] = useState(3)
   const [partialRecovery, setPartialRecovery] = useState(false)
   const [partialWindowMs, setPartialWindowMs] = useState(750)
+  const [expanded, setExpanded] = useState<string | null>(null)
 
   // 载入服务端当前值到编辑态
   useEffect(() => {
@@ -129,8 +130,8 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-2xl">
-        <DialogHeader>
+      <DialogContent className="flex max-h-[min(88dvh,800px)] flex-col gap-3 overflow-hidden p-4 sm:max-w-2xl sm:p-6">
+        <DialogHeader className="shrink-0 space-y-1">
           <DialogTitle className="flex items-center gap-2">
             <Network className="h-4 w-4" />
             429 降级桶链
@@ -142,7 +143,7 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
           </DialogDescription>
         </DialogHeader>
 
-        <div className="rounded-lg border bg-muted/30 p-3">
+        <div className="shrink-0 rounded-lg border bg-muted/30 p-3">
           <div className="mb-2 text-sm font-medium">全局端点运行模式</div>
           <div className="flex flex-wrap gap-2">
             <Button
@@ -178,28 +179,49 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
         {isLoading ? (
           <div className="py-8 text-center text-sm text-muted-foreground">加载中…</div>
         ) : (
-          <div className="space-y-5 py-1">
+          <div className="min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
             {primaries.map((primary) => {
               const options: EndpointBucketOption[] = data?.availableBuckets[primary] ?? []
               const selected = draft[primary] ?? []
-              // 已选的按 draft 顺序在前，未选的按名字排在后
               const unselected = options
                 .filter((o) => !selected.includes(o.name))
                 .map((o) => o.name)
+              const isOpen = expanded === primary
               return (
-                <div key={primary} className="rounded-lg border p-3">
-                  <div className="mb-2 text-sm font-medium">
-                    {PRIMARY_LABEL[primary] ?? primary}
-                    <span className="ml-2 font-mono text-xs text-muted-foreground">{primary}</span>
-                  </div>
+                <div key={primary} className="rounded-lg border">
+                  <button
+                    type="button"
+                    className="flex w-full items-center gap-2 px-3 py-2 text-left"
+                    onClick={() => setExpanded(isOpen ? null : primary)}
+                    aria-expanded={isOpen}
+                  >
+                    <ChevronDown
+                      className={cn(
+                        'h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform',
+                        isOpen ? 'rotate-0' : '-rotate-90',
+                      )}
+                    />
+                    <div className="min-w-0 flex-1">
+                      <div className="text-sm font-medium">
+                        {PRIMARY_LABEL[primary] ?? primary}
+                        <span className="ml-2 font-mono text-xs text-muted-foreground">{primary}</span>
+                      </div>
+                      <p className="truncate font-mono text-[11px] text-muted-foreground">
+                        {selected.length > 0 ? selected.join(' → ') : '不降级'}
+                      </p>
+                    </div>
+                    <span className="shrink-0 text-xs text-muted-foreground">
+                      {isOpen ? '收起' : '展开'}
+                    </span>
+                  </button>
 
-                  {/* 已选（有序） */}
-                  {selected.length > 0 && (
-                    <div className="mb-2 space-y-1">
+                  {isOpen && (
+                    <div className="space-y-1 border-t px-3 py-2">
                       {selected.map((bucket, idx) => (
                         <div
                           key={bucket}
-                          className="flex items-center gap-2 rounded-md bg-muted/50 px-2 py-1.5"
+                          className="flex items-center gap-2 rounded-md bg-muted/50 px-2 py-1"
+                          title={BUCKET_HINT[bucket]}
                         >
                           <span className="w-5 text-center text-xs text-muted-foreground">
                             {idx + 1}
@@ -208,12 +230,7 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
                             checked
                             onCheckedChange={() => toggleBucket(primary, bucket)}
                           />
-                          <div className="flex-1">
-                            <span className="font-mono text-[13px]">{bucket}</span>
-                            <p className="text-[11px] leading-tight text-muted-foreground">
-                              {BUCKET_HINT[bucket] ?? ''}
-                            </p>
-                          </div>
+                          <span className="flex-1 font-mono text-[13px]">{bucket}</span>
                           <Button
                             type="button"
                             size="icon"
@@ -240,129 +257,124 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
                           </Button>
                         </div>
                       ))}
-                    </div>
-                  )}
-
-                  {/* 未选 */}
-                  {unselected.length > 0 && (
-                    <div className="space-y-1">
                       {unselected.map((bucket) => (
-                        <div key={bucket} className="flex items-center gap-2 px-2 py-1">
+                        <div
+                          key={bucket}
+                          className="flex items-center gap-2 px-2 py-1"
+                          title={BUCKET_HINT[bucket]}
+                        >
                           <span className="w-5" />
                           <Checkbox
                             checked={false}
                             onCheckedChange={() => toggleBucket(primary, bucket)}
                           />
-                          <div className="flex-1">
-                            <span className="font-mono text-[13px] text-muted-foreground">
-                              {bucket}
-                            </span>
-                            <p className="text-[11px] leading-tight text-muted-foreground/70">
-                              {BUCKET_HINT[bucket] ?? ''}
-                            </p>
-                          </div>
+                          <span className="flex-1 font-mono text-[13px] text-muted-foreground">
+                            {bucket}
+                          </span>
                         </div>
                       ))}
+                      {options.length === 0 && (
+                        <p className="text-xs text-muted-foreground">该协议无可选备用桶。</p>
+                      )}
                     </div>
-                  )}
-
-                  {options.length === 0 && (
-                    <p className="text-xs text-muted-foreground">该协议无可选备用桶。</p>
                   )}
                 </div>
               )
             })}
+          </div>
+        )}
 
-            <label className="flex items-center gap-3 text-sm">
-              <span className="text-muted-foreground">单请求桶尝试上限</span>
+        <div className="shrink-0 space-y-3 border-t pt-3">
+          <div className="grid gap-2 sm:grid-cols-2">
+            <label className="flex items-center gap-2 text-sm">
+              <span className="shrink-0 text-muted-foreground">单请求桶尝试上限</span>
               <Input
                 type="number"
                 min={0}
                 value={maxAttempts}
                 onChange={(e) => setMaxAttempts(Math.max(0, Number(e.target.value) || 0))}
-                className="h-8 w-24"
+                className="h-8 w-20"
               />
-              <span className="text-xs text-muted-foreground">0 = 不限；防止链长×重试放大成上百次上游调用</span>
+              <span className="text-xs text-muted-foreground">0 = 不限</span>
             </label>
-
-            <label className="flex items-center gap-3 text-sm">
-              <span className="text-muted-foreground">流式空闲超时（秒）</span>
+            <label className="flex items-center gap-2 text-sm">
+              <span className="shrink-0 text-muted-foreground">流式空闲超时（秒）</span>
               <Input
                 type="number"
                 min={0}
                 value={idleTimeout}
                 onChange={(e) => setIdleTimeout(Math.max(0, Number(e.target.value) || 0))}
-                className="h-8 w-24"
+                className="h-8 w-20"
               />
-              <span className="text-xs text-muted-foreground">上游 200 后连续无字节多久主动收尾；0 = 关闭（仅靠绝对超时兜底）</span>
+              <span className="text-xs text-muted-foreground">0 = 关闭</span>
             </label>
+          </div>
 
-            <div className="space-y-3 border-t pt-4">
-              <div>
-                <div className="text-sm font-medium">流式自动恢复</div>
-                <p className="mt-1 text-xs text-muted-foreground">
-                  默认关闭。开启后纯文本截断会自动请求续写，可能增加上游调用次数、总耗时和费用；
-                  不会续写工具调用、空流、复读熔断或显式错误。
-                </p>
-              </div>
-              <div className="flex flex-col gap-2 text-sm sm:flex-row sm:flex-wrap sm:items-center sm:gap-3">
-                <label className="flex min-h-8 items-center gap-2">
-                  <Checkbox
-                    checked={autoContinue}
-                    onCheckedChange={(checked) => setAutoContinue(checked === true)}
-                  />
-                  <span>启用纯文本自动续写</span>
-                </label>
-                <label className="flex items-center gap-2">
-                  <span className="text-xs text-muted-foreground">最大轮数</span>
-                  <Input
-                    type="number"
-                    min={0}
-                    max={10}
-                    value={autoContinueMax}
-                    onChange={(event) => setAutoContinueMax(
-                      Math.min(10, Math.max(0, Number(event.target.value) || 0)),
-                    )}
-                    className="h-8 w-20"
-                    disabled={!autoContinue}
-                  />
-                  <span className="text-xs text-muted-foreground">0–10</span>
-                </label>
-              </div>
-              <div className="flex flex-col gap-2 text-sm sm:flex-row sm:flex-wrap sm:items-center sm:gap-3">
-                <label className="flex min-h-8 items-center gap-2">
-                  <Checkbox
-                    checked={partialRecovery}
-                    onCheckedChange={(checked) => setPartialRecovery(checked === true)}
-                    disabled={!autoContinue}
-                  />
-                  <span>恢复可疑半截流</span>
-                </label>
-                <label className="flex items-center gap-2">
-                  <span className="text-xs text-muted-foreground">判定窗口</span>
-                  <Input
-                    type="number"
-                    min={100}
-                    max={10000}
-                    step={50}
-                    value={partialWindowMs}
-                    onChange={(event) => setPartialWindowMs(
-                      Math.min(10000, Math.max(100, Number(event.target.value) || 750)),
-                    )}
-                    className="h-8 w-24"
-                    disabled={!autoContinue || !partialRecovery}
-                  />
-                  <span className="text-xs text-muted-foreground">毫秒</span>
-                </label>
-                <span className="text-xs text-muted-foreground">
-                  可能误判正常短答，建议从 750 开始灰度
-                </span>
-              </div>
+          <div className="space-y-2">
+            <div>
+              <div className="text-sm font-medium">流式自动恢复</div>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                默认关闭。开启后纯文本截断会自动请求续写，可能增加上游调用次数、总耗时和费用；
+                不会续写工具调用、空流、复读熔断或显式错误。
+              </p>
+            </div>
+            <div className="flex flex-col gap-2 text-sm sm:flex-row sm:flex-wrap sm:items-center sm:gap-3">
+              <label className="flex min-h-8 items-center gap-2">
+                <Checkbox
+                  checked={autoContinue}
+                  onCheckedChange={(checked) => setAutoContinue(checked === true)}
+                />
+                <span>启用纯文本自动续写</span>
+              </label>
+              <label className="flex items-center gap-2">
+                <span className="text-xs text-muted-foreground">最大轮数</span>
+                <Input
+                  type="number"
+                  min={0}
+                  max={10}
+                  value={autoContinueMax}
+                  onChange={(event) => setAutoContinueMax(
+                    Math.min(10, Math.max(0, Number(event.target.value) || 0)),
+                  )}
+                  className="h-8 w-20"
+                  disabled={!autoContinue}
+                />
+                <span className="text-xs text-muted-foreground">0–10</span>
+              </label>
+            </div>
+            <div className="flex flex-col gap-2 text-sm sm:flex-row sm:flex-wrap sm:items-center sm:gap-3">
+              <label className="flex min-h-8 items-center gap-2">
+                <Checkbox
+                  checked={partialRecovery}
+                  onCheckedChange={(checked) => setPartialRecovery(checked === true)}
+                  disabled={!autoContinue}
+                />
+                <span>恢复可疑半截流</span>
+              </label>
+              <label className="flex items-center gap-2">
+                <span className="text-xs text-muted-foreground">判定窗口</span>
+                <Input
+                  type="number"
+                  min={100}
+                  max={10000}
+                  step={50}
+                  value={partialWindowMs}
+                  onChange={(event) => setPartialWindowMs(
+                    Math.min(10000, Math.max(100, Number(event.target.value) || 750)),
+                  )}
+                  className="h-8 w-24"
+                  disabled={!autoContinue || !partialRecovery}
+                />
+                <span className="text-xs text-muted-foreground">毫秒</span>
+              </label>
+              <span className="text-xs text-muted-foreground">
+                可能误判正常短答，建议从 750 开始灰度
+              </span>
             </div>
           </div>
-        )}
+        </div>
 
-        <DialogFooter className="gap-2 sm:justify-between">
+        <DialogFooter className="shrink-0 gap-2 sm:justify-between">
           <Button type="button" variant="outline" size="sm" onClick={resetToDefaults} disabled={saving}>
             <RotateCcw className="mr-1 h-3.5 w-3.5" />
             恢复默认

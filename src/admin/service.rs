@@ -327,6 +327,19 @@ struct NormalizedBatchUpdateRequest {
     patch: CredentialBatchPatch,
 }
 
+fn validate_costing_value(
+    value: Option<f64>,
+    label: &str,
+) -> Result<Option<f64>, AdminServiceError> {
+    match value {
+        None => Ok(None),
+        Some(v) if v.is_finite() && (0.0..=1_000_000_000.0).contains(&v) => Ok(Some(v)),
+        Some(v) => Err(AdminServiceError::InvalidCredential(format!(
+            "{label} 必须是 0 到 1000000000 的有限数值: {v}"
+        ))),
+    }
+}
+
 fn normalize_batch_update_request(
     request: BatchUpdateCredentialsRequest,
 ) -> Result<NormalizedBatchUpdateRequest, AdminServiceError> {
@@ -418,6 +431,9 @@ fn normalize_batch_update_request(
         })
         .transpose()?;
 
+    let cost_rmb = validate_costing_value(request.cost_rmb, "costRmb")?;
+    let quota_credits = validate_costing_value(request.quota_credits, "quotaCredits")?;
+
     let patch = CredentialBatchPatch {
         rpm_limit: request.rpm_limit,
         max_concurrency: request.max_concurrency,
@@ -425,6 +441,8 @@ fn normalize_batch_update_request(
         source_channel,
         priority: request.priority,
         promote_priority: request.promote_priority,
+        cost_rmb,
+        quota_credits,
     };
     if patch.rpm_limit.is_none()
         && patch.max_concurrency.is_none()
@@ -432,6 +450,8 @@ fn normalize_batch_update_request(
         && patch.source_channel.is_none()
         && request.priority.is_none()
         && !request.promote_priority
+        && patch.cost_rmb.is_none()
+        && patch.quota_credits.is_none()
     {
         return Err(AdminServiceError::InvalidCredential(
             "批量更新至少需要一个修改字段".to_string(),
@@ -3726,6 +3746,9 @@ impl AdminService {
             )));
         }
 
+        let next_cost = validate_costing_value(req.cost_rmb, "costRmb")?;
+        let next_quota = validate_costing_value(req.quota_credits, "quotaCredits")?;
+
         let updated = {
             let mut current = self.import_defaults.lock();
             if let Some(v) = req.rpm_limit {
@@ -3748,6 +3771,12 @@ impl AdminService {
             }
             if let Some(v) = req.avoid_risky_proxies {
                 current.avoid_risky_proxies = v;
+            }
+            if let Some(v) = next_cost {
+                current.cost_rmb = (v > 0.0).then_some(v);
+            }
+            if let Some(v) = next_quota {
+                current.quota_credits = (v > 0.0).then_some(v);
             }
             current.clone()
         };
@@ -5560,6 +5589,7 @@ impl AdminService {
             client_secret: Some(reg.client_secret.clone()),
             start_url: Some(start_url.to_string()),
             region: Some(req.region.clone()),
+            auth_region: Some(req.region.clone()),
             priority: req.priority,
             rpm_limit: 10, // 默认每分钟 10 次（与普通添加一致；用户可在面板调整）
             email: req.email,
@@ -6228,6 +6258,8 @@ mod tests {
             source_channel,
             priority: None,
             promote_priority: false,
+            cost_rmb: None,
+            quota_credits: None,
         };
 
         assert!(normalize_batch_update_request(request(vec![], Some(1), None, None)).is_err());
@@ -6278,6 +6310,8 @@ mod tests {
             source_channel: None,
             priority: Some(10),
             promote_priority: true,
+            cost_rmb: None,
+            quota_credits: None,
         });
         assert!(matches!(
             conflict,
@@ -6293,6 +6327,8 @@ mod tests {
             source_channel: None,
             priority: None,
             promote_priority: true,
+            cost_rmb: None,
+            quota_credits: None,
         })
         .unwrap();
         assert!(promoted.patch.promote_priority);
@@ -6317,6 +6353,8 @@ mod tests {
             source_channel: None,
             priority: None,
             promote_priority: false,
+            cost_rmb: None,
+            quota_credits: None,
         };
 
         let mut maximum_groups = (0..100)
@@ -6365,6 +6403,8 @@ mod tests {
             source_channel: Some("   ".to_string()),
             priority: None,
             promote_priority: false,
+            cost_rmb: None,
+            quota_credits: None,
         })
         .unwrap();
         assert_eq!(clear.ids, vec![1]);
@@ -6392,6 +6432,8 @@ mod tests {
             source_channel: Some(" migration ".to_string()),
             priority: None,
             promote_priority: false,
+            cost_rmb: None,
+            quota_credits: None,
         })
         .unwrap();
         assert_eq!(
@@ -6405,6 +6447,21 @@ mod tests {
             normalized.patch.source_channel,
             Some(Some("migration".to_string()))
         );
+
+        let costing = normalize_batch_update_request(BatchUpdateCredentialsRequest {
+            ids: vec![3],
+            rpm_limit: None,
+            max_concurrency: None,
+            groups: None,
+            source_channel: None,
+            priority: None,
+            promote_priority: false,
+            cost_rmb: Some(80.0),
+            quota_credits: Some(0.0),
+        })
+        .unwrap();
+        assert_eq!(costing.patch.cost_rmb, Some(80.0));
+        assert_eq!(costing.patch.quota_credits, Some(0.0));
     }
 
     #[test]
@@ -6463,6 +6520,8 @@ mod tests {
                 source_channel: None,
                 priority: None,
                 promote_priority: false,
+                cost_rmb: None,
+                quota_credits: None,
             })
             .unwrap();
 

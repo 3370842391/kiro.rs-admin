@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   buildBatchUpdateRequest,
+  parseCostingValue,
   parsePriority,
   parseRpmLimit,
   rpmLoadState,
@@ -82,6 +83,21 @@ describe('totalInFlight', () => {
 
   test('把正 Infinity 按 0 处理', () => {
     expect(totalInFlight([{ inFlight: 3 }, { inFlight: Number.POSITIVE_INFINITY }])).toBe(3)
+  })
+})
+
+describe('parseCostingValue', () => {
+  test('留空表示清除', () => {
+    expect(parseCostingValue('   ', '买入价')).toEqual({ ok: true, value: 0 })
+  })
+
+  test('接受小数买入价', () => {
+    expect(parseCostingValue(' 45.5 ', '买入价')).toEqual({ ok: true, value: 45.5 })
+  })
+
+  test('拒绝负数和无穷', () => {
+    expect(parseCostingValue('-1', '买入价').ok).toBe(false)
+    expect(parseCostingValue('Infinity', '额度积分').ok).toBe(false)
   })
 })
 
@@ -326,6 +342,28 @@ describe('buildBatchUpdateRequest', () => {
     expect(buildBatchUpdateRequest({ ...base, sourceChannel: '渠'.repeat(129) })).toEqual({
       ok: false,
       message: '来源渠道最多 128 个字符',
+    })
+  })
+
+  test('只改买入价或额度时生成对应字段', () => {
+    const base = {
+      ids: [8],
+      editRpm: false,
+      rpmDraft: '',
+      editGroups: false,
+      groupMode: 'replace' as const,
+      groups: [],
+      editSource: false,
+      sourceChannel: '',
+    }
+
+    expect(buildBatchUpdateRequest({ ...base, editCost: true, costDraft: '80' })).toEqual({
+      ok: true,
+      value: { ids: [8], costRmb: 80 },
+    })
+    expect(buildBatchUpdateRequest({ ...base, editQuota: true, quotaDraft: '' })).toEqual({
+      ok: true,
+      value: { ids: [8], quotaCredits: 0 },
     })
   })
 })

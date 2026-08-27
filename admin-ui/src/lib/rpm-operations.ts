@@ -35,6 +35,10 @@ export interface BatchUpdateInput {
   editPriority?: boolean
   priorityMode?: 'fixed' | 'promote'
   priorityDraft?: string
+  editCost?: boolean
+  costDraft?: string
+  editQuota?: boolean
+  quotaDraft?: string
 }
 
 export type BatchUpdateRequestResult =
@@ -68,6 +72,22 @@ export function parsePriority(draft: string): PriorityParseResult {
   const value = Number(trimmed)
   if (!Number.isSafeInteger(value) || value > MAX_PRIORITY) {
     return { ok: false, message: INVALID_PRIORITY_MESSAGE }
+  }
+
+  return { ok: true, value }
+}
+
+const MAX_COSTING_VALUE = 1_000_000_000
+
+export function parseCostingValue(draft: string, label: string): RpmLimitParseResult {
+  const trimmed = draft.trim()
+  if (trimmed === '') {
+    return { ok: true, value: 0 }
+  }
+
+  const value = Number(trimmed)
+  if (!Number.isFinite(value) || value < 0 || value > MAX_COSTING_VALUE) {
+    return { ok: false, message: `${label}必须是 0 到 ${MAX_COSTING_VALUE} 的数字，留空表示清除` }
   }
 
   return { ok: true, value }
@@ -129,7 +149,15 @@ export function buildBatchUpdateRequest(
     return { ok: false, message: '凭据 ID 不能重复' }
   }
 
-  if (!input.editRpm && !input.editMaxConcurrency && !input.editGroups && !input.editSource && !input.editPriority) {
+  if (
+    !input.editRpm &&
+    !input.editMaxConcurrency &&
+    !input.editGroups &&
+    !input.editSource &&
+    !input.editPriority &&
+    !input.editCost &&
+    !input.editQuota
+  ) {
     return { ok: false, message: '请至少选择一项要修改的内容' }
   }
 
@@ -176,6 +204,22 @@ export function buildBatchUpdateRequest(
       }
       request.priority = priority.value
     }
+  }
+
+  if (input.editCost) {
+    const costRmb = parseCostingValue(input.costDraft ?? '', '买入价')
+    if (!costRmb.ok) {
+      return costRmb
+    }
+    request.costRmb = costRmb.value
+  }
+
+  if (input.editQuota) {
+    const quotaCredits = parseCostingValue(input.quotaDraft ?? '', '额度积分')
+    if (!quotaCredits.ok) {
+      return quotaCredits
+    }
+    request.quotaCredits = quotaCredits.value
   }
 
   return { ok: true, value: request }

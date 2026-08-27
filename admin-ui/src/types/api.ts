@@ -423,6 +423,10 @@ export interface BatchUpdateCredentialsRequest {
   sourceChannel?: string
   priority?: number
   promotePriority?: boolean
+  /** 买入成本（¥）。0 表示清除 */
+  costRmb?: number
+  /** 手填额度积分。0 表示清除，改回用上游额度 */
+  quotaCredits?: number
 }
 
 export interface BatchUpdateCredentialsResponse {
@@ -454,6 +458,10 @@ export interface CredentialImportDefaults {
   autoAssignProxy: boolean
   /** 自动分配时跳过因烧号被降权的出口 */
   avoidRiskyProxies: boolean
+  /** 默认买入价（¥）。未填则导入后只计收入 */
+  costRmb?: number
+  /** 默认额度积分。未填则用上游额度 */
+  quotaCredits?: number
 }
 
 // 更新导入默认值。字段缺省表示不修改

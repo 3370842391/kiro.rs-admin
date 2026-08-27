@@ -17,6 +17,8 @@ pub struct ErrorDetail {
     #[serde(rename = "type")]
     pub error_type: String,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
 }
 
 impl ErrorResponse {
@@ -26,6 +28,21 @@ impl ErrorResponse {
             error: ErrorDetail {
                 error_type: error_type.into(),
                 message: message.into(),
+                stop_reason: None,
+            },
+        }
+    }
+
+    pub fn with_stop_reason(
+        error_type: impl Into<String>,
+        message: impl Into<String>,
+        stop_reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            error: ErrorDetail {
+                error_type: error_type.into(),
+                message: message.into(),
+                stop_reason: Some(stop_reason.into()),
             },
         }
     }

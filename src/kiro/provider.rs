@@ -165,6 +165,14 @@ fn is_content_length_threshold_error(error: &anyhow::Error) -> bool {
         .contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD")
 }
 
+fn request_error_outcome(body: &str) -> &'static str {
+    if body.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
+        outcome::PAYLOAD_LIMIT_EXCEEDED
+    } else {
+        outcome::BAD_REQUEST
+    }
+}
+
 fn is_terminal_fallback_response(
     endpoint: &dyn KiroEndpoint,
     status: reqwest::StatusCode,
@@ -1819,7 +1827,7 @@ impl KiroProvider {
                     ctx.id,
                     endpoint_name,
                     Some(400),
-                    outcome::BAD_REQUEST,
+                    request_error_outcome(&body),
                     Some(&body),
                     attempt_start,
                 );
@@ -2056,7 +2064,7 @@ impl KiroProvider {
                                     ctx.id,
                                     fb_name,
                                     Some(fb_status.as_u16()),
-                                    outcome::BAD_REQUEST,
+                                    request_error_outcome(&fb_body),
                                     Some(&fb_body),
                                     fb_start,
                                 );
@@ -2266,7 +2274,7 @@ impl KiroProvider {
                     ctx.id,
                     endpoint_name,
                     Some(status.as_u16()),
-                    outcome::BAD_REQUEST,
+                    request_error_outcome(&body),
                     Some(&body),
                     attempt_start,
                 );
@@ -2807,6 +2815,14 @@ mod tests {
     fn fallback_stops_on_request_wide_errors_but_keeps_transient_failover() {
         let endpoint = crate::kiro::endpoint::IdeEndpoint;
 
+        assert_eq!(
+            request_error_outcome(r#"{"reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#),
+            outcome::PAYLOAD_LIMIT_EXCEEDED
+        );
+        assert_eq!(
+            request_error_outcome(r#"{"reason":"REQUEST_BODY_INVALID"}"#),
+            outcome::BAD_REQUEST
+        );
         assert!(is_terminal_fallback_response(
             &endpoint,
             reqwest::StatusCode::BAD_REQUEST,

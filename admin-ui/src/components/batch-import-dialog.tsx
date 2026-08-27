@@ -96,6 +96,8 @@ interface CredentialInput {
   start_url?: string
   status?: string
   groups?: string[]
+  costRmb?: number
+  quotaCredits?: number
   lineNumber?: number
   maskedApiKey?: string
 }
@@ -223,6 +225,8 @@ function normalizeImportEntry(raw: unknown): CredentialInput {
     proxyUsername: preferString(merged, 'proxyUsername', 'proxy_username'),
     proxyPassword: preferString(merged, 'proxyPassword', 'proxy_password'),
     groups: preferStringArray(merged, 'groups'),
+    costRmb: preferNumber(merged, 'costRmb', 'cost_rmb'),
+    quotaCredits: preferNumber(merged, 'quotaCredits', 'quota_credits'),
     userId:
       typeof merged.userId === 'string' || merged.userId === null
         ? merged.userId
@@ -281,6 +285,16 @@ function parseUniformMaxConcurrency(raw: string): number | undefined {
   return parsed
 }
 
+function parseUniformCosting(raw: string, label: string): number | undefined {
+  const value = raw.trim()
+  if (!value) return undefined
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1_000_000_000) {
+    throw new Error(`${label}必须是 0 到 1000000000 的数字`)
+  }
+  return parsed > 0 ? parsed : undefined
+}
+
 function maskProxyCandidate(candidate: string): string {
   return candidate.toLowerCase() === 'direct' ? 'direct' : maskProxyUrl(candidate)
 }
@@ -319,6 +333,8 @@ export function BatchImportDialog({
   const [uniformProxyUrl, setUniformProxyUrl] = useState('')
   const [uniformRpmLimit, setUniformRpmLimit] = useState('')
   const [uniformMaxConcurrency, setUniformMaxConcurrency] = useState('')
+  const [uniformCostRmb, setUniformCostRmb] = useState('')
+  const [uniformQuotaCredits, setUniformQuotaCredits] = useState('')
   const groupOptions = useGroupOptions()
   const fileInputRef = useRef<HTMLInputElement>(null)
   // 进行中的 AbortController，用于"停止导入"：abort 会让 fetch 流中断，
@@ -354,6 +370,12 @@ export function BatchImportDialog({
     prefilledRef.current = true
     setUniformRpmLimit(String(importDefaults.rpmLimit))
     setUniformMaxConcurrency(String(importDefaults.maxConcurrency))
+    if (importDefaults.costRmb != null && importDefaults.costRmb > 0) {
+      setUniformCostRmb(String(importDefaults.costRmb))
+    }
+    if (importDefaults.quotaCredits != null && importDefaults.quotaCredits > 0) {
+      setUniformQuotaCredits(String(importDefaults.quotaCredits))
+    }
     if (importDefaults.groups.length > 0) setGroups(importDefaults.groups)
   }, [open, importDefaults])
 
@@ -370,6 +392,16 @@ export function BatchImportDialog({
     setUniformProxyUrl('')
     setUniformRpmLimit(importDefaults ? String(importDefaults.rpmLimit) : '')
     setUniformMaxConcurrency(importDefaults ? String(importDefaults.maxConcurrency) : '')
+    setUniformCostRmb(
+      importDefaults?.costRmb != null && importDefaults.costRmb > 0
+        ? String(importDefaults.costRmb)
+        : '',
+    )
+    setUniformQuotaCredits(
+      importDefaults?.quotaCredits != null && importDefaults.quotaCredits > 0
+        ? String(importDefaults.quotaCredits)
+        : '',
+    )
     if (fileInputRef.current) fileInputRef.current.value = ''
   }
 
@@ -459,6 +491,20 @@ export function BatchImportDialog({
     let maxConcurrencyOverride: number | undefined
     try {
       maxConcurrencyOverride = parseUniformMaxConcurrency(uniformMaxConcurrency)
+    } catch (error) {
+      toast.error(extractErrorMessage(error))
+      return
+    }
+    let costOverride: number | undefined
+    try {
+      costOverride = parseUniformCosting(uniformCostRmb, '买入价')
+    } catch (error) {
+      toast.error(extractErrorMessage(error))
+      return
+    }
+    let quotaOverride: number | undefined
+    try {
+      quotaOverride = parseUniformCosting(uniformQuotaCredits, '额度积分')
     } catch (error) {
       toast.error(extractErrorMessage(error))
       return
@@ -554,6 +600,10 @@ export function BatchImportDialog({
         const rpmLimit = rpmOverride ?? cred.rpmLimit ?? importDefaults?.rpmLimit ?? 10
         const maxConcurrency =
           maxConcurrencyOverride ?? cred.maxConcurrency ?? importDefaults?.maxConcurrency ?? 0
+        const costRmb =
+          costOverride ?? cred.costRmb ?? importDefaults?.costRmb
+        const quotaCredits =
+          quotaOverride ?? cred.quotaCredits ?? importDefaults?.quotaCredits
         const isApiKeyCred = !!(cred.kiroApiKey?.trim()) || cred.authMethod === 'api_key'
 
         updateResult(i, { status: 'checking' })
@@ -584,6 +634,8 @@ export function BatchImportDialog({
               priority: cred.priority ?? defaultPriority,
               rpmLimit,
               maxConcurrency,
+              costRmb: costRmb && costRmb > 0 ? costRmb : undefined,
+              quotaCredits: quotaCredits && quotaCredits > 0 ? quotaCredits : undefined,
               sourceChannel: defaultSourceChannel,
               authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
               apiRegion: cred.apiRegion?.trim() || undefined,
@@ -665,6 +717,8 @@ export function BatchImportDialog({
               priority: cred.priority ?? defaultPriority,
               rpmLimit,
               maxConcurrency,
+              costRmb: costRmb && costRmb > 0 ? costRmb : undefined,
+              quotaCredits: quotaCredits && quotaCredits > 0 ? quotaCredits : undefined,
               sourceChannel: defaultSourceChannel,
               machineId: cred.machineId?.trim() || undefined,
               endpoint: cred.endpoint?.trim() || undefined,
@@ -1147,6 +1201,38 @@ export function BatchImportDialog({
                 />
                 <p className="text-xs text-muted-foreground">
                   填写后会覆盖所有导入账号的 rpmLimit；留空时 JSON 内有值就使用该值，否则默认 0。
+                </p>
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm text-muted-foreground">统一买入价（¥）</label>
+                <input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  value={uniformCostRmb}
+                  onChange={(e) => setUniformCostRmb(e.target.value)}
+                  disabled={importing}
+                  placeholder="不填则尊重 JSON / 导入默认值"
+                  className="h-9 w-full rounded-lg border border-input bg-background px-3 text-sm font-mono placeholder:text-muted-foreground/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-50"
+                />
+                <p className="text-xs text-muted-foreground">
+                  这个号实际花了多少钱。不填就只统计收入、不算利润。
+                </p>
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm text-muted-foreground">统一额度积分</label>
+                <input
+                  type="number"
+                  min="0"
+                  step="1"
+                  value={uniformQuotaCredits}
+                  onChange={(e) => setUniformQuotaCredits(e.target.value)}
+                  disabled={importing}
+                  placeholder="不填则尊重 JSON / 上游额度"
+                  className="h-9 w-full rounded-lg border border-input bg-background px-3 text-sm font-mono placeholder:text-muted-foreground/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-50"
+                />
+                <p className="text-xs text-muted-foreground">
+                  填了以它为准。上游查不到额度、或卖家标称与上游不一致时用。
                 </p>
               </div>
               <div className="space-y-2">

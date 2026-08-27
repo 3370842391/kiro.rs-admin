@@ -143,15 +143,15 @@ export function EditCredentialDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-md">
-        <DialogHeader>
+      <DialogContent className="flex max-h-[min(88dvh,720px)] flex-col overflow-hidden p-4 sm:max-w-md sm:p-6">
+        <DialogHeader className="shrink-0">
           <DialogTitle>
             编辑凭据 #{credential.id}
           </DialogTitle>
         </DialogHeader>
 
-        <form onSubmit={handleSubmit}>
-          <div className="space-y-4 py-4">
+        <form onSubmit={handleSubmit} className="flex min-h-0 flex-1 flex-col">
+          <div className="min-h-0 flex-1 space-y-3 overflow-y-auto py-3 pr-1">
             <div className="space-y-2">
               <label htmlFor="nickname" className="text-sm font-medium">
                 Nickname（可选）
@@ -219,9 +219,7 @@ export function EditCredentialDialog({
                 onChange={(e) => setEmail(e.target.value)}
                 disabled={isPending}
               />
-              <p className="text-xs text-muted-foreground">
-                留空则显示凭据 ID，清除请提交空值
-              </p>
+              <p className="text-xs text-muted-foreground">留空显示凭据 ID</p>
             </div>
 
             {/* 账号分组 */}
@@ -234,7 +232,7 @@ export function EditCredentialDialog({
                 disabled={isPending}
               />
               <p className="text-xs text-muted-foreground">
-                绑定了某分组的客户端 Key 只会调度到含该分组的账号。不选表示不属于任何分组。
+                绑定了分组的客户端 Key 只调度到该组账号。
               </p>
             </div>
 
@@ -251,9 +249,7 @@ export function EditCredentialDialog({
                 maxLength={128}
                 disabled={isPending}
               />
-              <p className="text-xs text-muted-foreground">
-                纯备注，标记此账号的购买来源/渠道，便于追踪。留空表示清除。
-              </p>
+              <p className="text-xs text-muted-foreground">来源备注，留空清除</p>
             </div>
 
             {/* RPM 限速 */}
@@ -271,11 +267,11 @@ export function EditCredentialDialog({
                 disabled={isPending}
               />
               <p className="text-xs text-muted-foreground">
-                滑动窗口每分钟最多请求数。默认 10；填 0 表示不限速。
+                每分钟上限，默认 10；0 不限速。
                 {credential.inferredRpm
                   ? credential.inferredRpm.kind === 'ceiling'
-                    ? ` 近 ${credential.inferredRpm.sampleMinutes} 分钟已见 429，推算可撑约 ${credential.inferredRpm.suggested}，建议不要高于此值。`
-                    : ` 近 ${credential.inferredRpm.sampleMinutes} 分钟没见 429，至少能到 ${credential.inferredRpm.suggested}，还可以试着往上加。`
+                    ? ` 近 ${credential.inferredRpm.sampleMinutes} 分钟已见 429，建议不超过 ${credential.inferredRpm.suggested}。`
+                    : ` 近 ${credential.inferredRpm.sampleMinutes} 分钟未见 429，至少能到 ${credential.inferredRpm.suggested}。`
                   : ''}
               </p>
             </div>
@@ -294,14 +290,12 @@ export function EditCredentialDialog({
                 onChange={(e) => setMaxConcurrency(e.target.value)}
                 disabled={isPending}
               />
-              <p className="text-xs text-muted-foreground">
-                该账号最多同时 in-flight 的请求数。0 表示不限并发；与 RPM 限速互补，防止瞬时并发打爆账号触发风控。
-              </p>
+              <p className="text-xs text-muted-foreground">同时在途上限，0 不限</p>
             </div>
 
             {/* 收益核算：买入价与额度都手填，因为不同渠道、不同批次差别很大 */}
             <div className="grid grid-cols-2 gap-3">
-              <div className="space-y-2">
+              <div className="space-y-1.5">
                 <label htmlFor="costRmb" className="text-sm font-medium">
                   买入价（¥）
                 </label>
@@ -310,16 +304,14 @@ export function EditCredentialDialog({
                   type="number"
                   min={0}
                   step="0.01"
-                  placeholder="留空表示未填"
+                  placeholder="留空只计收入"
                   value={costRmb}
                   onChange={(e) => setCostRmb(e.target.value)}
                   disabled={isPending}
                 />
-                <p className="text-xs text-muted-foreground">
-                  这个号实际花了多少钱。不填就只统计收入、不算利润。
-                </p>
+                <p className="text-xs text-muted-foreground">实际花费，不填不算利润</p>
               </div>
-              <div className="space-y-2">
+              <div className="space-y-1.5">
                 <label htmlFor="quotaCredits" className="text-sm font-medium">
                   额度积分
                 </label>
@@ -329,16 +321,14 @@ export function EditCredentialDialog({
                   min={0}
                   placeholder={
                     credential.earnings?.quotaSource === 'upstream'
-                      ? `上游查到 ${credential.earnings.quotaCredits}`
-                      : '留空则用上游额度'
+                      ? `上游 ${credential.earnings.quotaCredits}`
+                      : '留空用上游额度'
                   }
                   value={quotaCredits}
                   onChange={(e) => setQuotaCredits(e.target.value)}
                   disabled={isPending}
                 />
-                <p className="text-xs text-muted-foreground">
-                  填了以它为准。上游查不到额度、或卖家标称与上游不一致时用。
-                </p>
+                <p className="text-xs text-muted-foreground">填了覆盖上游额度</p>
               </div>
             </div>
 
@@ -410,12 +400,12 @@ export function EditCredentialDialog({
                 />
               </div>
               <p className="text-xs text-muted-foreground">
-                用户名/密码留空表示不修改；多个代理会随机轮询，失败时自动换下一个
+                用户名/密码留空不改；多代理会轮询
               </p>
             </div>
           </div>
 
-          <DialogFooter>
+          <DialogFooter className="shrink-0 border-t pt-3">
             <Button
               type="button"
               variant="outline"

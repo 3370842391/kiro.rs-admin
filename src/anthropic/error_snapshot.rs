@@ -740,6 +740,7 @@ impl ErrorSnapshotContext {
         let include_bodies = policy.capture_bodies
             && !metadata_only
             && !tool_schema_safe_only
+            && !omits_request_bodies(&error_type)
             // client_disconnected 只留 1% 的请求体：客户端主动断开基本不是缺陷，
             // 但全量存 body 让它一类就占了快照库 3.2 GB。
             && (error_type != outcome::CLIENT_DISCONNECTED
@@ -866,6 +867,11 @@ impl ErrorSnapshotContext {
     }
 }
 
+/// 超限 400 的请求体动辄数 MB，诊断只需要 shape / sha256 / 上游 reason。
+fn omits_request_bodies(error_type: &str) -> bool {
+    error_type == outcome::PAYLOAD_LIMIT_EXCEEDED
+}
+
 fn is_routine_trace_only_error(error_type: &str) -> bool {
     matches!(
         error_type,
@@ -880,6 +886,7 @@ fn is_routine_trace_only_error(error_type: &str) -> bool {
             // 3.1 GB / 95%，全部是纯浪费；trace 里仍有完整记录可查。
             | outcome::NO_AVAILABLE_CREDENTIALS
             | outcome::MODEL_NOT_AVAILABLE
+            | outcome::PROXY_POOL_EMPTY
     )
 }
 
@@ -1558,6 +1565,55 @@ mod tests {
         // 客户端主动断开仍不存尾部：那只是把对话正文落盘，没有对应收益（曾占 3.2 GB）。
         assert!(!stream_tail_worth_storing(outcome::CLIENT_DISCONNECTED));
         assert!(!stream_tail_worth_storing(outcome::BAD_REQUEST));
+        assert!(!stream_tail_worth_storing(outcome::PAYLOAD_LIMIT_EXCEEDED));
+    }
+
+    /// 超限 400 必须有快照（shape / 字节数），但不能再把 3–16MB 请求体落盘。
+    ///
+    /// 线上 123 条/天 `CONTENT_LENGTH_EXCEEDS_THRESHOLD` 全被 `bad_request` 当成
+    /// routine 丢掉，7 天一过现场没了；若放开后又存 `client_request`，会把刚收
+    /// 缩的快照库再撑爆。
+    #[test]
+    fn payload_limit_snapshot_keeps_shape_and_drops_request_bodies() {
+        let store = test_store();
+        let ctx = sample_context(store.clone(), true, true);
+        ctx.record_kiro_request(0, 7, "ide", &"x".repeat(64 * 1024));
+        ctx.record_upstream_body(0, br#"{"reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#);
+
+        let id = ctx
+            .finalize(SnapshotFinalState::error(
+                outcome::PAYLOAD_LIMIT_EXCEEDED,
+                Some(400),
+            ))
+            .unwrap()
+            .expect("payload_limit 必须落快照，不能再当 routine bad_request");
+        let detail = store.get(&id).unwrap().unwrap();
+        assert_eq!(detail.summary.error_type, outcome::PAYLOAD_LIMIT_EXCEEDED);
+        let kinds: Vec<_> = detail.payloads.iter().map(|payload| payload.kind).collect();
+        assert!(kinds.contains(&SnapshotPayloadKind::ToolDiagnostics));
+        assert!(
+            kinds.contains(&SnapshotPayloadKind::UpstreamResponse),
+            "上游 400 JSON 很小，该留着对照 reason"
+        );
+        assert!(
+            !kinds.contains(&SnapshotPayloadKind::ClientRequest),
+            "禁止把超限请求体再写入快照"
+        );
+        assert!(
+            !kinds.contains(&SnapshotPayloadKind::KiroRequest),
+            "禁止把超限 kiro_request 再写入快照"
+        );
+        assert!(!kinds.contains(&SnapshotPayloadKind::StreamTail));
+    }
+
+    #[test]
+    fn ordinary_bad_request_stays_trace_only() {
+        let store = test_store();
+        let ctx = sample_context(store.clone(), true, true);
+        let id = ctx
+            .finalize(SnapshotFinalState::error(outcome::BAD_REQUEST, Some(400)))
+            .unwrap();
+        assert!(id.is_none(), "普通 bad_request 仍不该进快照库");
     }
 
     #[test]

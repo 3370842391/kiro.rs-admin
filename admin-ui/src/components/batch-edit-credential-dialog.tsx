@@ -15,6 +15,7 @@ import { GroupMultiSelect } from '@/components/group-select'
 import { useBatchUpdateCredentials } from '@/hooks/use-credentials'
 import {
   buildBatchUpdateRequest,
+  parseCostingValue,
   parseMaxConcurrency,
   parsePriority,
   parseRpmLimit,
@@ -64,6 +65,14 @@ export function BatchEditCredentialDialog({
   const [priorityDraft, setPriorityDraft] = useState('0')
   const [priorityError, setPriorityError] = useState('')
   const priorityInputRef = useRef<HTMLInputElement>(null)
+  const [editCost, setEditCost] = useState(false)
+  const [costDraft, setCostDraft] = useState('')
+  const [costError, setCostError] = useState('')
+  const costInputRef = useRef<HTMLInputElement>(null)
+  const [editQuota, setEditQuota] = useState(false)
+  const [quotaDraft, setQuotaDraft] = useState('')
+  const [quotaError, setQuotaError] = useState('')
+  const quotaInputRef = useRef<HTMLInputElement>(null)
   const [running, setRunning] = useState(false)
 
   useEffect(() => {
@@ -83,6 +92,12 @@ export function BatchEditCredentialDialog({
     setPriorityMode('fixed')
     setPriorityDraft('0')
     setPriorityError('')
+    setEditCost(false)
+    setCostDraft('')
+    setCostError('')
+    setEditQuota(false)
+    setQuotaDraft('')
+    setQuotaError('')
     setRunning(false)
   }, [open])
 
@@ -120,6 +135,26 @@ export function BatchEditCredentialDialog({
     }
     setPriorityError('')
 
+    if (editCost) {
+      const parsedCost = parseCostingValue(costDraft, '买入价')
+      if (!parsedCost.ok) {
+        setCostError(parsedCost.message)
+        costInputRef.current?.focus()
+        return
+      }
+    }
+    setCostError('')
+
+    if (editQuota) {
+      const parsedQuota = parseCostingValue(quotaDraft, '额度积分')
+      if (!parsedQuota.ok) {
+        setQuotaError(parsedQuota.message)
+        quotaInputRef.current?.focus()
+        return
+      }
+    }
+    setQuotaError('')
+
     const request = buildBatchUpdateRequest({
       ids: credentials.map((credential) => credential.id),
       editRpm,
@@ -134,6 +169,10 @@ export function BatchEditCredentialDialog({
       editPriority,
       priorityMode,
       priorityDraft,
+      editCost,
+      costDraft,
+      editQuota,
+      quotaDraft,
     })
     if (!request.ok) {
       toast.error(request.message)
@@ -457,6 +496,104 @@ export function BatchEditCredentialDialog({
                     选中账号会设为 0，其他账号保持相对层级并顺延。仅选择一个账号时，它可能承担全部新流量；不可用、RPM 满或冷却时会自动回退。
                   </p>
                 )}
+              </div>
+            ) : null}
+          </section>
+
+          <section className="space-y-3 rounded-md border border-border/60 p-3">
+            <label htmlFor="batch-edit-cost" className="flex min-h-11 items-center justify-between gap-3">
+              <span className="text-sm font-medium">修改买入价</span>
+              <Switch
+                id="batch-edit-cost"
+                checked={editCost}
+                onCheckedChange={setEditCost}
+                disabled={running}
+              />
+            </label>
+            {editCost ? (
+              <div className="space-y-2">
+                <label htmlFor="batch-cost-rmb" className="block text-xs font-medium text-muted-foreground">
+                  买入价（¥）
+                </label>
+                <Input
+                  ref={costInputRef}
+                  id="batch-cost-rmb"
+                  name="costRmb"
+                  autoComplete="off"
+                  type="number"
+                  inputMode="decimal"
+                  min={0}
+                  step="0.01"
+                  value={costDraft}
+                  onChange={(event) => {
+                    setCostDraft(event.target.value)
+                    setCostError('')
+                  }}
+                  aria-invalid={Boolean(costError)}
+                  aria-describedby={
+                    costError ? 'batch-cost-hint batch-cost-error' : 'batch-cost-hint'
+                  }
+                  disabled={running}
+                  className="h-11 sm:h-9 tabular-nums"
+                  placeholder="留空表示清除"
+                />
+                {costError ? (
+                  <p id="batch-cost-error" className="text-xs text-destructive" role="alert">
+                    {costError}
+                  </p>
+                ) : null}
+                <p id="batch-cost-hint" className="text-xs text-muted-foreground">
+                  这个号实际花了多少钱。留空会清除买入价，之后只计收入、不算利润。
+                </p>
+              </div>
+            ) : null}
+          </section>
+
+          <section className="space-y-3 rounded-md border border-border/60 p-3">
+            <label htmlFor="batch-edit-quota" className="flex min-h-11 items-center justify-between gap-3">
+              <span className="text-sm font-medium">修改额度积分</span>
+              <Switch
+                id="batch-edit-quota"
+                checked={editQuota}
+                onCheckedChange={setEditQuota}
+                disabled={running}
+              />
+            </label>
+            {editQuota ? (
+              <div className="space-y-2">
+                <label htmlFor="batch-quota-credits" className="block text-xs font-medium text-muted-foreground">
+                  额度积分
+                </label>
+                <Input
+                  ref={quotaInputRef}
+                  id="batch-quota-credits"
+                  name="quotaCredits"
+                  autoComplete="off"
+                  type="number"
+                  inputMode="decimal"
+                  min={0}
+                  step="1"
+                  value={quotaDraft}
+                  onChange={(event) => {
+                    setQuotaDraft(event.target.value)
+                    setQuotaError('')
+                  }}
+                  aria-invalid={Boolean(quotaError)}
+                  aria-describedby={
+                    quotaError ? 'batch-quota-hint batch-quota-error' : 'batch-quota-hint'
+                  }
+                  disabled={running}
+                  className="h-11 sm:h-9 tabular-nums"
+                  placeholder="留空表示清除，改回用上游额度"
+                />
+                {quotaError ? (
+                  <p id="batch-quota-error" className="text-xs text-destructive" role="alert">
+                    {quotaError}
+                  </p>
+                ) : null}
+                <p id="batch-quota-hint" className="text-xs text-muted-foreground">
+                  填了以它为准。留空会清掉手填额度，改回用上游查到的值。
+                </p>
               </div>
             ) : null}
           </section>

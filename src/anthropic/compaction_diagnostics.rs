@@ -9,6 +9,12 @@ use super::types::MessagesRequest;
 
 pub(crate) const HIGH_CONTEXT_PERCENTAGE: f64 = 80.0;
 pub(crate) const HIGH_PAYLOAD_BYTES: u64 = 2_500_000;
+
+/// 单条超大附件（一张图 / 一段 8MB 文本）不能改写成压缩信号，否则客户端会去压
+/// 历史、压完还是那条附件，进入压→400→再压。只有多轮会话撞上超限才改写。
+pub(crate) fn should_rewrite_payload_limit_as_compact_signal(conversation_turn_count: usize) -> bool {
+    conversation_turn_count >= 3
+}
 const PERCENTAGE_SCALE: f64 = 10_000.0;
 const UNKNOWN_U64: u64 = u64::MAX;
 
@@ -92,6 +98,7 @@ struct SafeDiagnosticSnapshot<'a> {
     probation_retry_started: bool,
     client_disconnected: bool,
     payload_limit_observed: bool,
+    last_upstream_event: Option<&'a str>,
     final_status: &'a str,
     final_error_type: Option<&'a str>,
 }
@@ -123,6 +130,7 @@ struct EnabledDiagnostics {
     probation_retry_considered: AtomicBool,
     probation_retry_started: AtomicBool,
     payload_limit_observed: AtomicBool,
+    last_upstream_event: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -179,8 +187,27 @@ impl CompactionDiagnostics {
                 probation_retry_considered: AtomicBool::new(false),
                 probation_retry_started: AtomicBool::new(false),
                 payload_limit_observed: AtomicBool::new(false),
+                last_upstream_event: AtomicU64::new(0),
             }),
         }
+    }
+
+    pub(crate) fn observe_last_upstream_event(&self, event: &crate::kiro::model::events::Event) {
+        let Some(state) = &self.enabled else {
+            return;
+        };
+        let code = match event {
+            crate::kiro::model::events::Event::AssistantResponse(_) => 1,
+            crate::kiro::model::events::Event::ToolUse(_) => 2,
+            crate::kiro::model::events::Event::Metering(_) => 3,
+            crate::kiro::model::events::Event::ContextUsage(_) => 4,
+            crate::kiro::model::events::Event::ReasoningContent(_) => 5,
+            crate::kiro::model::events::Event::Metadata(_) => 6,
+            crate::kiro::model::events::Event::Exception { .. } => 7,
+            crate::kiro::model::events::Event::Error { .. } => 8,
+            crate::kiro::model::events::Event::Unknown { .. } => 9,
+        };
+        state.last_upstream_event.store(code, Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -408,6 +435,9 @@ impl CompactionDiagnostics {
             probation_retry_started: state.probation_retry_started.load(Ordering::Relaxed),
             client_disconnected,
             payload_limit_observed,
+            last_upstream_event: last_upstream_event_name(
+                state.last_upstream_event.load(Ordering::Relaxed),
+            ),
             final_status: outcome.final_status,
             final_error_type: outcome.error_type,
         };
@@ -447,6 +477,21 @@ impl CompactionDiagnostics {
             client_reported_tokens,
             diagnostics_json,
         })
+    }
+}
+
+fn last_upstream_event_name(code: u64) -> Option<&'static str> {
+    match code {
+        1 => Some("assistantResponseEvent"),
+        2 => Some("toolUseEvent"),
+        3 => Some("meteringEvent"),
+        4 => Some("contextUsageEvent"),
+        5 => Some("reasoningContentEvent"),
+        6 => Some("metadataEvent"),
+        7 => Some("exception"),
+        8 => Some("error"),
+        9 => Some("unknown"),
+        _ => None,
     }
 }
 
@@ -647,6 +692,7 @@ mod tests {
     use super::{
         CompactionDiagnostics, CompactionFinalize, DiagnosisFacts, classify_diagnosis,
         known_third_party_autocompact_regression_possible,
+        should_rewrite_payload_limit_as_compact_signal,
     };
     use crate::anthropic::types::MessagesRequest;
     use axum::http::{HeaderMap, HeaderValue, header};
@@ -740,6 +786,24 @@ mod tests {
             .unwrap();
 
         assert_eq!(snapshot.client_reported_tokens, Some(1_000));
+    }
+
+    #[test]
+    fn snapshot_records_last_upstream_event_without_payload() {
+        let diagnostics = CompactionDiagnostics::new(true, &HeaderMap::new(), &request());
+        diagnostics.observe_last_upstream_event(&crate::kiro::model::events::Event::Metering(
+            crate::kiro::model::events::MeteringEvent { usage: 9.876 },
+        ));
+        let snapshot = diagnostics.finalize(finalize()).unwrap();
+        assert!(
+            snapshot
+                .diagnostics_json
+                .contains("\"lastUpstreamEvent\":\"meteringEvent\"")
+        );
+        assert!(
+            !snapshot.diagnostics_json.contains("9.876"),
+            "诊断 JSON 不得带上 metering 数值"
+        );
     }
 
     #[test]
@@ -847,5 +911,17 @@ mod tests {
             }),
             "normal"
         );
+    }
+
+    #[test]
+    fn single_huge_payload_does_not_rewrite_to_compact_signal() {
+        assert!(!should_rewrite_payload_limit_as_compact_signal(1));
+        assert!(!should_rewrite_payload_limit_as_compact_signal(2));
+    }
+
+    #[test]
+    fn multi_turn_payload_limit_rewrites_to_compact_signal() {
+        assert!(should_rewrite_payload_limit_as_compact_signal(3));
+        assert!(should_rewrite_payload_limit_as_compact_signal(1400));
     }
 }

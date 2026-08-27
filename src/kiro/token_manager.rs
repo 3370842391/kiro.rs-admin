@@ -1425,7 +1425,7 @@ pub(crate) enum CredentialGroupPatch {
 }
 
 /// 批量账号配置补丁。字段为 `None` 时保持原值不变。
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct CredentialBatchPatch {
     pub rpm_limit: Option<u32>,
     /// 每账号最大并发（None 表示不修改，0 表示不限）。
@@ -1437,6 +1437,10 @@ pub(crate) struct CredentialBatchPatch {
     pub priority: Option<u32>,
     /// 最高优先池模式：选中账号为 0，其他账号稳定压缩到 1..N。
     pub promote_priority: bool,
+    /// `Some(v)` 写入买入价；`Some(0.0)` 清除（只计收入、不算利润）。
+    pub cost_rmb: Option<f64>,
+    /// `Some(v)` 手填额度；`Some(0.0)` 清除（改回用上游额度）。
+    pub quota_credits: Option<f64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -3936,6 +3940,9 @@ impl MultiTokenManager {
                 .map(|e| e.credentials.clone())
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
+        let credentials = self
+            .credentials_with_resolved_profile(id, &token, credentials)
+            .await?;
 
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
@@ -4080,6 +4087,49 @@ impl MultiTokenManager {
         Ok((token, credentials))
     }
 
+    /// 企业 IdC 登录后默认只有 BuilderID 占位 ARN。用量 / 模型 REST 若带着占位符
+    /// 或不带真实 profile，上游会回 `403 User is not authorized to make this call`。
+    /// 聊天路径已经会先 `resolve_profile_arn_for`；这里与它对齐。
+    async fn credentials_with_resolved_profile(
+        &self,
+        id: u64,
+        token: &str,
+        credentials: KiroCredentials,
+    ) -> anyhow::Result<KiroCredentials> {
+        if credentials.is_api_key_credential() {
+            return Ok(credentials);
+        }
+
+        match self.resolve_profile_arn_for(id, token).await {
+            Ok(Some(_)) => {}
+            Ok(None)
+                if credentials
+                    .provider
+                    .as_deref()
+                    .is_some_and(|provider| provider.eq_ignore_ascii_case("Enterprise")) =>
+            {
+                anyhow::bail!(
+                    "该企业账号在 us-east-1/eu-central-1 没有可用的 Kiro profile。SSO 区域（如 ap-southeast-1）只用于登录，数据面仍要有已分配的 Amazon Q / Kiro 权限。"
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    credential_id = id,
+                    error = %error,
+                    "解析真实 profileArn 失败，仍尝试用量/模型接口"
+                );
+            }
+        }
+
+        self.entries
+            .lock()
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.credentials.clone())
+            .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))
+    }
+
     /// 获取指定凭据当前可用的模型列表（Admin API）
     ///
     /// 按需实时查询上游 `ListAvailableModels`，不做缓存。
@@ -4088,6 +4138,9 @@ impl MultiTokenManager {
         id: u64,
     ) -> anyhow::Result<ListAvailableModelsResponse> {
         let (token, credentials) = self.prepare_request_token(id).await?;
+        let credentials = self
+            .credentials_with_resolved_profile(id, &token, credentials)
+            .await?;
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
         get_available_models(&credentials, &self.config, &token, effective_proxy.as_ref()).await
@@ -4796,6 +4849,22 @@ impl MultiTokenManager {
             {
                 entry.credentials.source_channel = source_channel.clone();
                 changed = true;
+            }
+
+            if let Some(v) = patch.cost_rmb {
+                let next = (v > 0.0).then_some(v);
+                if entry.credentials.cost_rmb != next {
+                    entry.credentials.cost_rmb = next;
+                    changed = true;
+                }
+            }
+
+            if let Some(v) = patch.quota_credits {
+                let next = (v > 0.0).then_some(v);
+                if entry.credentials.quota_credits != next {
+                    entry.credentials.quota_credits = next;
+                    changed = true;
+                }
             }
 
             if changed {
@@ -7581,12 +7650,8 @@ mod tests {
             .batch_update_credentials(
                 &[3],
                 CredentialBatchPatch {
-                    rpm_limit: None,
-                    max_concurrency: None,
-                    groups: None,
-                    source_channel: None,
                     priority: Some(7),
-                    promote_priority: false,
+                    ..CredentialBatchPatch::default()
                 },
             )
             .unwrap();
@@ -7600,12 +7665,8 @@ mod tests {
             .batch_update_credentials(
                 &[3, 4],
                 CredentialBatchPatch {
-                    rpm_limit: None,
-                    max_concurrency: None,
-                    groups: None,
-                    source_channel: None,
-                    priority: None,
                     promote_priority: true,
+                    ..CredentialBatchPatch::default()
                 },
             )
             .unwrap();
@@ -7619,12 +7680,8 @@ mod tests {
             .batch_update_credentials(
                 &[3, 4],
                 CredentialBatchPatch {
-                    rpm_limit: None,
-                    max_concurrency: None,
-                    groups: None,
-                    source_channel: None,
-                    priority: None,
                     promote_priority: true,
+                    ..CredentialBatchPatch::default()
                 },
             )
             .unwrap();
@@ -7639,12 +7696,8 @@ mod tests {
             .batch_update_credentials(
                 &[1, 2, 3],
                 CredentialBatchPatch {
-                    rpm_limit: None,
-                    max_concurrency: None,
-                    groups: None,
-                    source_channel: None,
-                    priority: None,
                     promote_priority: true,
+                    ..CredentialBatchPatch::default()
                 },
             )
             .unwrap();
@@ -7682,12 +7735,8 @@ mod tests {
             .batch_update_credentials(
                 &[3],
                 CredentialBatchPatch {
-                    rpm_limit: None,
-                    max_concurrency: None,
-                    groups: None,
-                    source_channel: None,
-                    priority: None,
                     promote_priority: true,
+                    ..CredentialBatchPatch::default()
                 },
             )
             .unwrap_err();
@@ -7777,6 +7826,21 @@ mod tests {
             )
             .unwrap();
         assert_eq!(unchanged.selected, 2);
+
+        let costing = manager
+            .batch_update_credentials(
+                &[1, 2],
+                CredentialBatchPatch {
+                    cost_rmb: Some(80.0),
+                    quota_credits: Some(10_000.0),
+                    ..CredentialBatchPatch::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(costing.updated, 2);
+        let persisted = manager.clone_all_credentials();
+        assert!(persisted.iter().all(|c| c.cost_rmb == Some(80.0)));
+        assert!(persisted.iter().all(|c| c.quota_credits == Some(10_000.0)));
         assert_eq!(unchanged.updated, 0);
         assert_eq!(unchanged.unchanged, 2);
 

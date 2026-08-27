@@ -405,7 +405,7 @@ impl Default for KeySupplierCommonConfig {
 /// 它的 `sourceChannel` 默认就是「Webhook 自动采购」。若两者共用一份，运营调一下
 /// 手动导入的 RPM 就会顺带改掉自动采购的行为，手动导进来的号还会被打上采购来源
 /// 的标签。
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CredentialImportDefaults {
     /// 每分钟请求数上限。0 = 不限速。
@@ -429,6 +429,12 @@ pub struct CredentialImportDefaults {
     /// 新号最经不起脏出口——刚导入就被判死连观察窗口都没有。默认开启。
     #[serde(default = "default_true")]
     pub avoid_risky_proxies: bool,
+    /// 默认买入价（¥）。未填则导入后只计收入、不算利润。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_rmb: Option<f64>,
+    /// 默认额度积分。未填则用上游查到的额度。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_credits: Option<f64>,
 }
 
 /// 手动导入的默认 RPM。
@@ -449,6 +455,8 @@ impl Default for CredentialImportDefaults {
             source_channel: String::new(),
             auto_assign_proxy: true,
             avoid_risky_proxies: true,
+            cost_rmb: None,
+            quota_credits: None,
         }
     }
 }

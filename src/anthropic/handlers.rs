@@ -384,6 +384,7 @@ impl RequestTracer {
     }
 
     pub(crate) fn observe_upstream_event(&self, event: &Event, context_window_size: i32) {
+        self.compaction.observe_last_upstream_event(event);
         match event {
             Event::ContextUsage(context_usage) => self.compaction.observe_upstream_context(
                 context_usage.context_usage_percentage,
@@ -623,12 +624,27 @@ fn terminal_provider_outcome(err: &Error) -> Option<&'static str> {
     if text.contains("MODEL_NOT_AVAILABLE") {
         return Some(outcome::MODEL_NOT_AVAILABLE);
     }
+    if text.contains("没有可用代理候选") {
+        return Some(outcome::PROXY_POOL_EMPTY);
+    }
     None
+}
+
+/// 超限 400 必须压过 attempt 上的笼统 `bad_request`：否则 record / 快照仍进
+/// routine 白名单，现场继续丢。客户看到的 HTTP JSON 仍走 `classify_provider_error`。
+fn payload_limit_outcome(err_text: &str) -> Option<&'static str> {
+    err_text
+        .contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD")
+        .then_some(outcome::PAYLOAD_LIMIT_EXCEEDED)
 }
 
 /// provider 整体失败时的 error_type：优先用最后一跳的具体分类，
 /// 它缺失或为 `unknown` 时再退回按错误文本识别的终态。
 fn provider_failure_outcome(tracer: &RequestTracer, err: &Error) -> Option<&'static str> {
+    let text = err.to_string();
+    if let Some(limit) = payload_limit_outcome(&text) {
+        return Some(limit);
+    }
     let attempt = last_attempt_outcome(tracer);
     if matches!(attempt, None | Some(outcome::UNKNOWN))
         && let Some(terminal) = terminal_provider_outcome(err)
@@ -649,6 +665,9 @@ fn last_attempt_outcome(tracer: &RequestTracer) -> Option<&'static str> {
         outcome::TRANSIENT => outcome::TRANSIENT,
         outcome::NETWORK_ERROR => outcome::NETWORK_ERROR,
         outcome::BAD_REQUEST => outcome::BAD_REQUEST,
+        outcome::PAYLOAD_LIMIT_EXCEEDED => outcome::PAYLOAD_LIMIT_EXCEEDED,
+        outcome::PROXY_POOL_EMPTY => outcome::PROXY_POOL_EMPTY,
+        outcome::TOOL_SCHEMA_RETRY_EXHAUSTED => outcome::TOOL_SCHEMA_RETRY_EXHAUSTED,
         _ => outcome::UNKNOWN,
     })
 }
@@ -760,6 +779,13 @@ fn classify_provider_error(err: &Error) -> ClassifiedProviderError {
             public_message: "The requested model is not available for the configured upstream account.",
         };
     }
+    if text.contains("没有可用代理候选") {
+        return ClassifiedProviderError {
+            http_status: StatusCode::BAD_GATEWAY,
+            error_type: "api_error",
+            public_message: "No outbound proxy candidate is available.",
+        };
+    }
     if text.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
         return ClassifiedProviderError {
             http_status: StatusCode::BAD_REQUEST,
@@ -788,8 +814,61 @@ fn classify_provider_error(err: &Error) -> ClassifiedProviderError {
     }
 }
 
+const PAYLOAD_LIMIT_COMPACT_MESSAGE: &str =
+    "The conversation exceeds the model context window. Compact conversation history and retry.";
+
+fn kiro_conversation_turn_count(request_body: &str) -> usize {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(request_body) else {
+        return 1;
+    };
+    let history = value
+        .pointer("/conversationState/history")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    history.saturating_add(1)
+}
+
+fn promote_schema_retry_exhausted(public_type: &'static str, attempt_count: u8) -> &'static str {
+    if attempt_count >= 2 && public_type == "upstream_tool_schema_error" {
+        outcome::TOOL_SCHEMA_RETRY_EXHAUSTED
+    } else {
+        public_type
+    }
+}
+
+fn classify_stream_transport_error(duration_ms: u64, interrupted_after_bytes: u64) -> &'static str {
+    if duration_ms >= 710_000 && interrupted_after_bytes >= 100_000 {
+        outcome::STREAM_INTERRUPTED
+    } else {
+        outcome::STREAM_READ_ERROR
+    }
+}
+
 /// 将 KiroProvider 错误映射为 HTTP 响应。
 pub(super) fn map_provider_error(err: Error) -> Response {
+    map_provider_error_for_turns(err, 1)
+}
+
+fn payload_compact_client_copy(
+    public_message: &str,
+    conversation_turn_count: usize,
+) -> Option<(&'static str, &'static str)> {
+    if public_message.starts_with("The upstream request body is too large")
+        && super::compaction_diagnostics::should_rewrite_payload_limit_as_compact_signal(
+            conversation_turn_count,
+        )
+    {
+        Some((
+            PAYLOAD_LIMIT_COMPACT_MESSAGE,
+            "model_context_window_exceeded",
+        ))
+    } else {
+        None
+    }
+}
+
+fn map_provider_error_for_turns(err: Error, conversation_turn_count: usize) -> Response {
     let classified = classify_provider_error(&err);
     if classified.http_status.is_client_error() {
         tracing::warn!(error = %err, "上游拒绝了客户端请求");
@@ -798,14 +877,14 @@ pub(super) fn map_provider_error(err: Error) -> Response {
     } else {
         tracing::error!(error = %err, "Kiro API 调用失败");
     }
-    (
-        classified.http_status,
-        Json(ErrorResponse::new(
-            classified.error_type,
-            classified.public_message,
-        )),
-    )
-        .into_response()
+    let body = if let Some((message, stop_reason)) =
+        payload_compact_client_copy(classified.public_message, conversation_turn_count)
+    {
+        ErrorResponse::with_stop_reason(classified.error_type, message, stop_reason)
+    } else {
+        ErrorResponse::new(classified.error_type, classified.public_message)
+    };
+    (classified.http_status, Json(body)).into_response()
 }
 
 fn provider_error_sse(err: Error, upstream_status: Option<u16>) -> Bytes {
@@ -2911,7 +2990,7 @@ async fn handle_stream_request(
                 None,
                 TraceUsage::zero(),
             );
-            return map_provider_error(e);
+            return map_provider_error_for_turns(e, kiro_conversation_turn_count(request_body));
         }
     };
     let attempt_setup = StreamAttemptSetup {
@@ -3044,10 +3123,16 @@ fn create_early_sse_stream(
                     TraceUsage::zero(),
                 );
                 let classified = classify_provider_error(&err);
+                let message = payload_compact_client_copy(
+                    classified.public_message,
+                    kiro_conversation_turn_count(&setup.attempt.request_body),
+                )
+                .map(|(message, _)| message.to_string())
+                .unwrap_or_else(|| classified.public_message.to_string());
                 let _ = start_tx.send(StreamStart::Failed(StreamStartFailure {
                     status: classified.http_status,
                     error_type: classified.error_type.to_string(),
-                    message: classified.public_message.to_string(),
+                    message,
                 }));
             }
         }
@@ -3326,11 +3411,16 @@ fn stream_start_failure_response(failure: StreamStartFailure) -> Response {
     } else {
         tracing::error!(error_type = %failure.error_type, message = %failure.message, "上游未产生可交付的助手内容");
     }
-    (
-        failure.status,
-        Json(ErrorResponse::new(failure.error_type, failure.message)),
-    )
-        .into_response()
+    let body = if failure.message == PAYLOAD_LIMIT_COMPACT_MESSAGE {
+        ErrorResponse::with_stop_reason(
+            failure.error_type,
+            failure.message,
+            "model_context_window_exceeded",
+        )
+    } else {
+        ErrorResponse::new(failure.error_type, failure.message)
+    };
+    (failure.status, Json(body)).into_response()
 }
 
 fn stream_start_canceled_response() -> Response {
@@ -3418,6 +3508,102 @@ mod stream_gate_tests {
     #[test]
     fn continuation_request_rejects_empty_generated_text() {
         assert!(prepare_auto_continue_request_body(&continuation_fixture(), "").is_none());
+    }
+
+    #[test]
+    fn single_turn_kiro_body_is_not_compact_signal() {
+        let body = continuation_fixture();
+        assert_eq!(kiro_conversation_turn_count(&body), 1);
+        assert!(!super::super::compaction_diagnostics::should_rewrite_payload_limit_as_compact_signal(
+            kiro_conversation_turn_count(&body)
+        ));
+    }
+
+    #[test]
+    fn multi_turn_kiro_body_is_compact_signal() {
+        let mut value: serde_json::Value = serde_json::from_str(&continuation_fixture()).unwrap();
+        value["conversationState"]["history"] = serde_json::json!([
+            {"userInputMessage": {"content": "one"}},
+            {"assistantResponseMessage": {"content": "two"}}
+        ]);
+        let body = value.to_string();
+        assert_eq!(kiro_conversation_turn_count(&body), 3);
+        assert!(super::super::compaction_diagnostics::should_rewrite_payload_limit_as_compact_signal(
+            3
+        ));
+    }
+
+    #[test]
+    fn transport_error_near_720s_with_large_bytes_is_interrupted() {
+        assert_eq!(
+            classify_stream_transport_error(720_080, 1_265_392),
+            outcome::STREAM_INTERRUPTED
+        );
+        assert_eq!(
+            classify_stream_transport_error(37_000, 5_887),
+            outcome::STREAM_READ_ERROR
+        );
+        assert_eq!(
+            classify_stream_transport_error(720_000, 50_000),
+            outcome::STREAM_READ_ERROR
+        );
+    }
+
+    #[test]
+    fn empty_proxy_maps_to_api_error_without_internal_url() {
+        let resp = map_provider_error(anyhow::anyhow!("没有可用代理候选"));
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            terminal_provider_outcome(&anyhow::anyhow!("没有可用代理候选")),
+            Some(outcome::PROXY_POOL_EMPTY)
+        );
+    }
+
+    #[test]
+    fn schema_retry_exhausted_keeps_client_type() {
+        assert_eq!(
+            promote_schema_retry_exhausted("upstream_tool_schema_error", 2),
+            outcome::TOOL_SCHEMA_RETRY_EXHAUSTED
+        );
+        assert_eq!(
+            promote_schema_retry_exhausted("upstream_tool_schema_error", 1),
+            "upstream_tool_schema_error"
+        );
+    }
+
+    #[test]
+    fn stall_continue_allows_idle_text_but_rejects_short_decode_and_zero_bytes() {
+        let ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            std::collections::HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        assert!(!should_auto_continue_after_stall(
+            &ctx,
+            &super::super::tool_attempt::AttemptTermination::IdleTimeout,
+            0,
+            120_000
+        ));
+        assert!(should_auto_continue_after_stall(
+            &ctx,
+            &super::super::tool_attempt::AttemptTermination::IdleTimeout,
+            80_000,
+            145_000
+        ));
+        assert!(!should_auto_continue_after_stall(
+            &ctx,
+            &super::super::tool_attempt::AttemptTermination::ReadError("decode".into()),
+            5_887,
+            37_000
+        ));
+        assert!(should_auto_continue_after_stall(
+            &ctx,
+            &super::super::tool_attempt::AttemptTermination::ReadError("decode".into()),
+            1_265_392,
+            720_080
+        ));
     }
 
     #[test]
@@ -3663,15 +3849,24 @@ fn should_auto_continue_round(
     semantic_started_at: Option<TokioInstant>,
     round_credits: f64,
     round_output_tokens: i32,
+    received_bytes: u64,
+    duration_ms: u64,
 ) -> bool {
     if !setup.auto_continue_enabled
         || continuation_count >= setup.auto_continue_max
-        || !matches!(termination, AttemptTermination::Eof)
         || ctx.accumulated_text().trim().is_empty()
         || !auto_continue_is_plain_text_mode(setup.thinking_enabled, ctx)
         || ctx.repetition_guard_tripped()
         || ctx.has_terminal_error()
     {
+        return false;
+    }
+
+    if should_auto_continue_after_stall(ctx, termination, received_bytes, duration_ms) {
+        return true;
+    }
+
+    if !matches!(termination, AttemptTermination::Eof) {
         return false;
     }
 
@@ -3699,6 +3894,26 @@ fn should_auto_continue_round(
         && is_incomplete_text_ending(ctx.accumulated_text())
 }
 
+/// idle / 720s 硬顶续写：只接同一会话的纯文本，不换号，不碰半截 toolUse。
+fn should_auto_continue_after_stall(
+    ctx: &StreamContext,
+    termination: &AttemptTermination,
+    received_bytes: u64,
+    duration_ms: u64,
+) -> bool {
+    if ctx.saw_tool_use() || ctx.break_block_label() == "tool_use" || ctx.upstream_settled() {
+        return false;
+    }
+    match termination {
+        AttemptTermination::IdleTimeout => received_bytes > 0,
+        AttemptTermination::ReadError(_) => {
+            classify_stream_transport_error(duration_ms, received_bytes)
+                == outcome::STREAM_INTERRUPTED
+        }
+        _ => false,
+    }
+}
+
 struct ContinuationReadResult {
     termination: AttemptTermination,
     credential_id: u64,
@@ -3723,6 +3938,7 @@ async fn read_continuation_round(
     let mut ping_interval = interval(Duration::from_secs(PING_INTERVAL_SECS));
     let mut received_bytes = 0_u64;
     let mut semantic_started_at = None;
+    let stream_round_started = TokioInstant::now();
     let mut idle_deadline = TokioInstant::now() + Duration::from_secs(idle_timeout_secs.max(1));
 
     let termination = loop {
@@ -3781,7 +3997,10 @@ async fn read_continuation_round(
                 }
                 Some(Err(error)) => {
                     tracer.record_protocol_error(
-                        "stream_read_error",
+                        classify_stream_transport_error(
+                            stream_round_started.elapsed().as_millis() as u64,
+                            received_bytes,
+                        ),
                         &format!("{error} (break_block={})", ctx.break_block_label()),
                     );
                     break AttemptTermination::ReadError(error.to_string());
@@ -3894,10 +4113,16 @@ async fn run_realtime_sse_attempts(
                         // 是两回事，写死会让所有失败都长成一个样子。
                         {
                             let classified = classify_provider_error(&error);
+                            let message = payload_compact_client_copy(
+                                classified.public_message,
+                                kiro_conversation_turn_count(&setup.request_body),
+                            )
+                            .map(|(message, _)| message.to_string())
+                            .unwrap_or_else(|| classified.public_message.to_string());
                             StreamStartFailure {
                                 status: classified.http_status,
                                 error_type: classified.error_type.to_string(),
-                                message: classified.public_message.to_string(),
+                                message,
                             }
                         },
                     );
@@ -3921,6 +4146,7 @@ async fn run_realtime_sse_attempts(
         let mut ping_interval = interval(Duration::from_secs(PING_INTERVAL_SECS));
         let mut received_bytes = 0_u64;
         let mut semantic_started_at = None;
+        let stream_round_started = TokioInstant::now();
         let mut idle_deadline = TokioInstant::now() + Duration::from_secs(idle_timeout_secs.max(1));
 
         let mut termination = loop {
@@ -4001,8 +4227,9 @@ async fn run_realtime_sse_attempts(
                     }
                     Some(Err(error)) => {
                         tracing::error!(%error, attempt = attempt_index + 1, "读取响应流失败");
+                        let duration_ms = stream_round_started.elapsed().as_millis() as u64;
                         tracer.record_protocol_error(
-                        "stream_read_error",
+                        classify_stream_transport_error(duration_ms, received_bytes),
                         &format!("{error} (break_block={})", ctx.break_block_label()),
                     );
                         break AttemptTermination::ReadError(error.to_string());
@@ -4102,13 +4329,14 @@ async fn run_realtime_sse_attempts(
                     .as_deref()
                     .map(|message| (terminal_type, message)),
             ) {
-                let error_type = failure.error_type.clone();
                 let message = failure.message.clone();
+                let trace_type =
+                    promote_schema_retry_exhausted(terminal_type, attempt_index + 1);
                 signal_stream_start_failure(&mut start_tx, failure);
                 record_stream_usage(&hook, &ctx, credential_id, "error");
                 tracer.finalize(
                     "error",
-                    Some(&error_type),
+                    Some(trace_type),
                     Some(&message),
                     None,
                     stream_trace_usage(&ctx),
@@ -4126,6 +4354,8 @@ async fn run_realtime_sse_attempts(
             semantic_started_at,
             round_credits,
             round_output_tokens,
+            received_bytes,
+            stream_round_started.elapsed().as_millis() as u64,
         ) {
             let Some(continuation_body) =
                 prepare_auto_continue_request_body(&setup.request_body, ctx.accumulated_text())
@@ -4265,7 +4495,10 @@ async fn run_realtime_sse_attempts(
                 record_stream_usage(&hook, &ctx, credential_id, "error");
                 tracer.finalize(
                     "interrupted",
-                    Some("stream_read_error"),
+                    Some(classify_stream_transport_error(
+                        stream_round_started.elapsed().as_millis() as u64,
+                        received_bytes,
+                    )),
                     Some(&message),
                     Some(received_bytes),
                     stream_trace_usage(&ctx),
@@ -4944,7 +5177,7 @@ async fn handle_non_stream_request(
                 None,
                 TraceUsage::zero(),
             );
-            return map_provider_error(error);
+            return map_provider_error_for_turns(error, kiro_conversation_turn_count(&request_body));
         }
         Err(NonStreamCollectError::Body {
             credential_id,
@@ -5019,7 +5252,8 @@ async fn handle_non_stream_request(
     if let Some(failure) = state.failure {
         let (status, error_type, message) = non_stream_attempt_error(&failure, attempt_count);
         hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
-        tracer.record_protocol_error(error_type, &message);
+        let trace_type = promote_schema_retry_exhausted(error_type, attempt_count);
+        tracer.record_protocol_error(trace_type, &message);
         // 用真实失败类型，不再一律记 bad_request。
         //
         // 原实现这里写死 outcome::BAD_REQUEST，导致同一条失败在 API 侧是
@@ -5029,7 +5263,7 @@ async fn handle_non_stream_request(
         // 按 error_type 做的统计因此全部不可信。
         tracer.finalize(
             "error",
-            Some(error_type),
+            Some(trace_type),
             Some(&message),
             None,
             TraceUsage::zero(),
@@ -5875,7 +6109,7 @@ async fn handle_stream_request_buffered(
                 None,
                 TraceUsage::zero(),
             );
-            return map_provider_error(e);
+            return map_provider_error_for_turns(e, kiro_conversation_turn_count(request_body));
         }
     };
     let attempt_setup = StreamAttemptSetup {
@@ -5997,10 +6231,16 @@ async fn run_buffered_sse_attempts(
                         // 是两回事，写死会让所有失败都长成一个样子。
                         {
                             let classified = classify_provider_error(&error);
+                            let message = payload_compact_client_copy(
+                                classified.public_message,
+                                kiro_conversation_turn_count(&setup.request_body),
+                            )
+                            .map(|(message, _)| message.to_string())
+                            .unwrap_or_else(|| classified.public_message.to_string());
                             StreamStartFailure {
                                 status: classified.http_status,
                                 error_type: classified.error_type.to_string(),
-                                message: classified.public_message.to_string(),
+                                message,
                             }
                         },
                     );
@@ -6017,6 +6257,7 @@ async fn run_buffered_sse_attempts(
         let mut decoder = EventStreamDecoder::new();
         let mut ping_interval = interval(Duration::from_secs(PING_INTERVAL_SECS));
         let mut received_bytes = 0_u64;
+        let stream_round_started = TokioInstant::now();
         let mut idle_deadline = TokioInstant::now() + Duration::from_secs(idle_timeout_secs.max(1));
 
         let termination = loop {
@@ -6107,7 +6348,10 @@ async fn run_buffered_sse_attempts(
                     Some(Err(error)) => {
                         tracing::error!(%error, attempt = attempt_index + 1, "读取缓冲响应流失败");
                         tracer.record_protocol_error(
-                        "stream_read_error",
+                        classify_stream_transport_error(
+                            stream_round_started.elapsed().as_millis() as u64,
+                            received_bytes,
+                        ),
                         &format!("{error} (break_block={})", ctx.break_block_label()),
                     );
                         break AttemptTermination::ReadError(error.to_string());
@@ -6257,7 +6501,10 @@ async fn run_buffered_sse_attempts(
                 );
                 tracer.finalize(
                     "interrupted",
-                    Some("stream_read_error"),
+                    Some(classify_stream_transport_error(
+                        stream_round_started.elapsed().as_millis() as u64,
+                        received_bytes,
+                    )),
                     Some(&message),
                     Some(received_bytes),
                     trace_usage,
@@ -6335,6 +6582,26 @@ mod tests {
     use crate::admin::client_keys::ClientResponseMode;
 
     use super::*;
+
+    #[test]
+    fn content_length_error_promotes_to_payload_limit_even_if_attempt_says_bad_request() {
+        let classified = classify_provider_error(&anyhow::anyhow!(
+            "流式 API 请求失败: 400 Bad Request {{\"reason\":\"CONTENT_LENGTH_EXCEEDS_THRESHOLD\"}}"
+        ));
+        assert_eq!(classified.http_status, StatusCode::BAD_REQUEST);
+        assert_eq!(classified.error_type, "invalid_request_error");
+        assert!(classified.public_message.contains("too large"));
+        assert_eq!(
+            payload_limit_outcome(
+                "流式 API 请求失败: 400 Bad Request {\"reason\":\"CONTENT_LENGTH_EXCEEDS_THRESHOLD\"}"
+            ),
+            Some(outcome::PAYLOAD_LIMIT_EXCEEDED)
+        );
+        assert_eq!(
+            payload_limit_outcome("Improperly formed request."),
+            None
+        );
+    }
 
     #[test]
     fn response_mode_native_does_not_execute_detection_shortcut() {

@@ -178,6 +178,9 @@ pub mod outcome {
     pub const TRANSIENT: &str = "transient";
     pub const NETWORK_ERROR: &str = "network_error";
     pub const BAD_REQUEST: &str = "bad_request";
+    /// 上游 `CONTENT_LENGTH_EXCEEDS_THRESHOLD`。单独分类是为了能落「只有 shape、
+    /// 没有 7MB 正文」的快照；普通 `bad_request` 仍走 routine、不进快照库。
+    pub const PAYLOAD_LIMIT_EXCEEDED: &str = "payload_limit_exceeded";
     pub const UNKNOWN: &str = "unknown";
     /// 仅用作 record.error_type：流式响应已开始但上游中途断开
     pub const STREAM_INTERRUPTED: &str = "stream_interrupted";
@@ -197,6 +200,10 @@ pub mod outcome {
     pub const NO_AVAILABLE_CREDENTIALS: &str = "no_available_credentials";
     /// 配置的账号里没有一个提供客户端请求的模型。同样是请求未出站的确定性终态。
     pub const MODEL_NOT_AVAILABLE: &str = "model_not_available";
+    /// schema 重试一轮后仍缺字段。客户 JSON 仍用 `upstream_tool_schema_error`。
+    pub const TOOL_SCHEMA_RETRY_EXHAUSTED: &str = "tool_schema_retry_exhausted";
+    /// 出站代理候选耗尽。禁止为此回退直连。
+    pub const PROXY_POOL_EMPTY: &str = "proxy_pool_empty";
 }
 
 /// 把上游错误体截断到安全长度（按字符边界，避免切碎 UTF-8）
