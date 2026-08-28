@@ -427,6 +427,8 @@ export interface BatchUpdateCredentialsRequest {
   costRmb?: number
   /** 手填额度积分。0 表示清除，改回用上游额度 */
   quotaCredits?: number
+  /** 账号首跳端点。空串表示清除，改回跟全局默认 */
+  endpoint?: string
 }
 
 export interface BatchUpdateCredentialsResponse {

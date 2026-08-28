@@ -25,6 +25,7 @@ import {
 } from '@/hooks/use-credentials'
 import type { CredentialStatusItem, StartSocialLoginResponse, StartIdcLoginResponse } from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
+import { applyIdcStartUrlInput } from '@/lib/idc-start-url'
 import { useQueryClient } from '@tanstack/react-query'
 
 interface ReloginDialogProps {
@@ -140,7 +141,9 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
   const [socialSession, setSocialSession] = useState<StartSocialLoginResponse | null>(null)
   const [idcSession, setIdcSession] = useState<StartIdcLoginResponse | null>(null)
   // IdC 表单
-  const [idcRegion, setIdcRegion] = useState('us-east-1')
+  const [idcRegion, setIdcRegion] = useState(
+    () => credential.authRegion || 'us-east-1',
+  )
   const [idcStartUrl, setIdcStartUrl] = useState('')
 
   // Manual 字段
@@ -544,9 +547,9 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
         {step === 'form' && method === 'idc' && (
           <div className="space-y-3 py-2">
             <div className="space-y-1.5">
-              <label className="text-sm font-medium">AWS Region</label>
+              <label className="text-sm font-medium">AuthRegion（SSO 区域）</label>
               <Input
-                placeholder="us-east-1"
+                placeholder="ap-southeast-1"
                 value={idcRegion}
                 onChange={(e) => setIdcRegion(e.target.value)}
               />
@@ -554,12 +557,16 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
             <div className="space-y-1.5">
               <label className="text-sm font-medium">
                 SSO Start URL
-                <span className="ml-1 text-xs text-muted-foreground">（留空使用 AWS Builder ID）</span>
+                <span className="ml-1 text-xs text-muted-foreground">（企业号请填双栈门户，不要填 *.awsapps.com）</span>
               </label>
               <Input
-                placeholder="https://view.awsapps.com/start"
+                placeholder="https://xxxx.portal.ap-southeast-1.app.aws"
                 value={idcStartUrl}
-                onChange={(e) => setIdcStartUrl(e.target.value)}
+                onChange={(e) => {
+                  const next = applyIdcStartUrlInput(e.target.value)
+                  setIdcStartUrl(next.startUrl)
+                  if (next.region) setIdcRegion(next.region)
+                }}
               />
             </div>
           </div>

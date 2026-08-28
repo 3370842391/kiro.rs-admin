@@ -68,6 +68,17 @@ describe('admin RPM operations UI wiring', () => {
     expect(dialog).toContain('quotaDraft')
   })
 
+  test('batch dialog can pin selected accounts to runtime or ide', async () => {
+    const dialog = await readSource('src/components/batch-edit-credential-dialog.tsx')
+
+    expect(dialog).toContain('editEndpoint')
+    expect(dialog).toContain('修改端点')
+    expect(dialog).toContain('endpointDraft')
+    expect(dialog).toContain("value: 'runtime'")
+    expect(dialog).toContain("value: 'ide'")
+    expect(dialog).toContain('直接走 runtime')
+  })
+
   test('batch dialog exposes fixed and promoted priority modes', async () => {
     const dialog = await readSource('src/components/batch-edit-credential-dialog.tsx')
 

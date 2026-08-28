@@ -413,6 +413,9 @@ pub struct BatchUpdateCredentialsRequest {
     /// 手填额度积分。`Some(0)` 表示清除，改回用上游额度。
     #[serde(default)]
     pub quota_credits: Option<f64>,
+    /// 账号首跳端点。`Some("")` 表示清除，改回跟全局默认（通常是 ide）。
+    #[serde(default)]
+    pub endpoint: Option<String>,
 }
 
 /// 批量修改凭据响应
@@ -2360,6 +2363,24 @@ mod tests {
         assert_eq!(request.source_channel.as_deref(), Some("migration"));
         assert_eq!(request.cost_rmb, None);
         assert_eq!(request.quota_credits, None);
+        assert_eq!(request.endpoint, None);
+    }
+
+    #[test]
+    fn batch_update_request_deserializes_endpoint() {
+        let request: BatchUpdateCredentialsRequest = serde_json::from_value(serde_json::json!({
+            "ids": [4],
+            "endpoint": "runtime"
+        }))
+        .unwrap();
+        assert_eq!(request.endpoint.as_deref(), Some("runtime"));
+
+        let cleared: BatchUpdateCredentialsRequest = serde_json::from_value(serde_json::json!({
+            "ids": [4],
+            "endpoint": ""
+        }))
+        .unwrap();
+        assert_eq!(cleared.endpoint.as_deref(), Some(""));
     }
 
     #[test]

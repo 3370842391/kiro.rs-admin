@@ -366,4 +366,26 @@ describe('buildBatchUpdateRequest', () => {
       value: { ids: [8], quotaCredits: 0 },
     })
   })
+
+  test('只改端点时生成 endpoint 字段，空串表示跟随默认', () => {
+    const base = {
+      ids: [9],
+      editRpm: false,
+      rpmDraft: '',
+      editGroups: false,
+      groupMode: 'replace' as const,
+      groups: [],
+      editSource: false,
+      sourceChannel: '',
+    }
+
+    expect(buildBatchUpdateRequest({ ...base, editEndpoint: true, endpointDraft: 'runtime' })).toEqual({
+      ok: true,
+      value: { ids: [9], endpoint: 'runtime' },
+    })
+    expect(buildBatchUpdateRequest({ ...base, editEndpoint: true, endpointDraft: '  ' })).toEqual({
+      ok: true,
+      value: { ids: [9], endpoint: '' },
+    })
+  })
 })

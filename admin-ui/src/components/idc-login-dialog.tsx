@@ -23,6 +23,7 @@ import { Input } from '@/components/ui/input'
 import { startIdcLogin, pollIdcLogin } from '@/api/credentials'
 import type { StartIdcLoginResponse } from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
+import { applyIdcStartUrlInput, isIpv4AccessPortal } from '@/lib/idc-start-url'
 
 /** 预设 SSO 区域（分组 + 显示名），与 AWS 常用区域一致 */
 const SSO_REGION_GROUPS: { group: string; items: [string, string][] }[] = [
@@ -241,7 +242,7 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess, mode = 'builder-
           </DialogTitle>
           <DialogDescription>
             {isEnterprise
-              ? '填写组织的 SSO Start URL 与区域，通过设备授权流程添加企业凭据。'
+              ? '填写双栈门户 URL 与 AuthRegion。Kiro API 仍走 us-east-1；不要填仅 IPv4 的 *.awsapps.com/start，否则 token 会被上游判无效。'
               : '通过 AWS Identity Center 设备授权流程添加凭据，无需手动导出 refreshToken。'}
           </DialogDescription>
         </DialogHeader>
@@ -254,10 +255,22 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess, mode = 'builder-
               </label>
               <Input
                 id="idc-start-url"
-                placeholder="https://your-org.awsapps.com/start"
+                placeholder="https://xxxx.portal.ap-southeast-1.app.aws"
                 value={startUrl}
-                onChange={(e) => setStartUrl(e.target.value)}
+                onChange={(e) => {
+                  const next = applyIdcStartUrlInput(e.target.value)
+                  setStartUrl(next.startUrl)
+                  if (next.region) setRegion(next.region)
+                }}
               />
+              <p className="text-xs text-muted-foreground">
+                本组织双栈门户：https://ssoins-821071a5e59b0789.portal.ap-southeast-1.app.aws
+              </p>
+              {isIpv4AccessPortal(startUrl) && (
+                <p className="text-xs text-amber-600 dark:text-amber-400">
+                  这是仅 IPv4 的门户。已知别名会自动改成双栈；其它组织请改填 *.portal.&lt;region&gt;.app.aws。
+                </p>
+              )}
             </div>
             <div className="space-y-1.5">
               <label htmlFor="idc-region" className="text-sm font-medium">SSO 区域</label>

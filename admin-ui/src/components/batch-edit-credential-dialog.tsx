@@ -33,6 +33,12 @@ interface BatchEditCredentialDialogProps {
   onDone: () => void
 }
 
+const ENDPOINT_CHOICES: { value: string; label: string; desc: string }[] = [
+  { value: '', label: '跟随默认', desc: '清空账号端点，首跳跟全局 defaultEndpoint（一般是 ide）。' },
+  { value: 'ide', label: 'ide', desc: '先走 ide。429 时仍可按桶链降到 runtime。' },
+  { value: 'runtime', label: 'runtime', desc: '直接走 runtime，不再先打 ide。' },
+]
+
 const MODE_LABELS: { value: GroupMode; label: string; desc: string }[] = [
   { value: 'replace', label: '替换', desc: '用所选分组覆盖原分组；不选则清除分组。' },
   { value: 'add', label: '追加', desc: '将所选分组加入原分组。' },
@@ -73,6 +79,8 @@ export function BatchEditCredentialDialog({
   const [quotaDraft, setQuotaDraft] = useState('')
   const [quotaError, setQuotaError] = useState('')
   const quotaInputRef = useRef<HTMLInputElement>(null)
+  const [editEndpoint, setEditEndpoint] = useState(false)
+  const [endpointDraft, setEndpointDraft] = useState('runtime')
   const [running, setRunning] = useState(false)
 
   useEffect(() => {
@@ -98,6 +106,8 @@ export function BatchEditCredentialDialog({
     setEditQuota(false)
     setQuotaDraft('')
     setQuotaError('')
+    setEditEndpoint(false)
+    setEndpointDraft('runtime')
     setRunning(false)
   }, [open])
 
@@ -173,6 +183,8 @@ export function BatchEditCredentialDialog({
       costDraft,
       editQuota,
       quotaDraft,
+      editEndpoint,
+      endpointDraft,
     })
     if (!request.ok) {
       toast.error(request.message)
@@ -593,6 +605,49 @@ export function BatchEditCredentialDialog({
                 ) : null}
                 <p id="batch-quota-hint" className="text-xs text-muted-foreground">
                   填了以它为准。留空会清掉手填额度，改回用上游查到的值。
+                </p>
+              </div>
+            ) : null}
+          </section>
+
+          <section className="space-y-3 rounded-md border border-border/60 p-3">
+            <label htmlFor="batch-edit-endpoint" className="flex min-h-11 items-center justify-between gap-3">
+              <span className="text-sm font-medium">修改端点</span>
+              <Switch
+                id="batch-edit-endpoint"
+                checked={editEndpoint}
+                onCheckedChange={setEditEndpoint}
+                disabled={running}
+              />
+            </label>
+            {editEndpoint ? (
+              <div className="space-y-2">
+                <p id="batch-endpoint-label" className="text-xs font-medium text-muted-foreground">
+                  这些号的首跳端点
+                </p>
+                <div
+                  role="group"
+                  aria-labelledby="batch-endpoint-label"
+                  aria-describedby="batch-endpoint-description"
+                  className="grid grid-cols-3 gap-2"
+                >
+                  {ENDPOINT_CHOICES.map((item) => (
+                    <Button
+                      key={item.value || 'default'}
+                      type="button"
+                      size="sm"
+                      className="h-11 sm:h-8"
+                      aria-pressed={endpointDraft === item.value}
+                      variant={endpointDraft === item.value ? 'default' : 'outline'}
+                      onClick={() => setEndpointDraft(item.value)}
+                      disabled={running}
+                    >
+                      {item.label}
+                    </Button>
+                  ))}
+                </div>
+                <p id="batch-endpoint-description" className="text-xs text-muted-foreground">
+                  {ENDPOINT_CHOICES.find((item) => item.value === endpointDraft)?.desc}
                 </p>
               </div>
             ) : null}

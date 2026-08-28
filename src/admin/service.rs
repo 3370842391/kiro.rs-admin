@@ -433,6 +433,14 @@ fn normalize_batch_update_request(
 
     let cost_rmb = validate_costing_value(request.cost_rmb, "costRmb")?;
     let quota_credits = validate_costing_value(request.quota_credits, "quotaCredits")?;
+    let endpoint = request.endpoint.map(|raw| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
 
     let patch = CredentialBatchPatch {
         rpm_limit: request.rpm_limit,
@@ -443,6 +451,7 @@ fn normalize_batch_update_request(
         promote_priority: request.promote_priority,
         cost_rmb,
         quota_credits,
+        endpoint,
     };
     if patch.rpm_limit.is_none()
         && patch.max_concurrency.is_none()
@@ -452,6 +461,7 @@ fn normalize_batch_update_request(
         && !request.promote_priority
         && patch.cost_rmb.is_none()
         && patch.quota_credits.is_none()
+        && patch.endpoint.is_none()
     {
         return Err(AdminServiceError::InvalidCredential(
             "批量更新至少需要一个修改字段".to_string(),
@@ -1603,6 +1613,16 @@ impl AdminService {
         request: BatchUpdateCredentialsRequest,
     ) -> Result<BatchUpdateCredentialsResponse, AdminServiceError> {
         let normalized = normalize_batch_update_request(request)?;
+        if let Some(Some(name)) = &normalized.patch.endpoint
+            && !self.known_endpoints.contains(name)
+        {
+            let mut known: Vec<&str> = self.known_endpoints.iter().map(|s| s.as_str()).collect();
+            known.sort();
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "未知端点 \"{}\"，已注册端点: {:?}",
+                name, known
+            )));
+        }
         let result = self
             .token_manager
             .batch_update_credentials(&normalized.ids, normalized.patch)
@@ -5552,16 +5572,18 @@ impl AdminService {
             .map(ProxyConfig::new)
             .or(global_proxy);
 
-        let start_url = req.start_url.as_deref().unwrap_or(BUILDER_ID_START_URL);
+        let issuer = Self::resolve_idc_issuer(&req)?;
+        let start_url = issuer.start_url.as_str();
+        let auth_region = issuer.auth_region.as_str();
 
         // 1. 注册 OIDC 客户端
-        let reg = idc::register_client(&req.region, start_url, config, proxy.as_ref())
+        let reg = idc::register_client(auth_region, start_url, config, proxy.as_ref())
             .await
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
         // 2. 发起设备授权
         let device = idc::start_device_authorization(
-            &req.region,
+            auth_region,
             start_url,
             &reg.client_id,
             &reg.client_secret,
@@ -5588,8 +5610,8 @@ impl AdminService {
             client_id: Some(reg.client_id.clone()),
             client_secret: Some(reg.client_secret.clone()),
             start_url: Some(start_url.to_string()),
-            region: Some(req.region.clone()),
-            auth_region: Some(req.region.clone()),
+            region: Some(auth_region.to_string()),
+            auth_region: Some(auth_region.to_string()),
             priority: req.priority,
             rpm_limit: 10, // 默认每分钟 10 次（与普通添加一致；用户可在面板调整）
             email: req.email,
@@ -5598,7 +5620,7 @@ impl AdminService {
         };
 
         let session = IdcAuthSession {
-            region: req.region,
+            region: auth_region.to_string(),
             client_id: reg.client_id,
             client_secret: reg.client_secret,
             device_code: device.device_code,
@@ -5681,10 +5703,25 @@ impl AdminService {
 
                 // 重新登录模式：更新已有凭据而非创建新凭据
                 if let Some(target_id) = relogin_target_id {
-                    if let Some(refresh_token) = token.refresh_token {
-                        self.do_relogin_update(target_id, refresh_token)
-                            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
-                    }
+                    let refresh_token = token.refresh_token.ok_or_else(|| {
+                        AdminServiceError::InternalError(
+                            "IdC 登录未返回 refreshToken，无法更新凭据".to_string(),
+                        )
+                    })?;
+                    let expires_at = token
+                        .expires_in
+                        .map(|secs| (Utc::now() + Duration::seconds(secs)).to_rfc3339());
+                    self.do_idc_relogin_update(
+                        target_id,
+                        refresh_token,
+                        Some(token.access_token),
+                        expires_at,
+                        client_id,
+                        client_secret,
+                        cred_template.start_url.clone(),
+                        region,
+                    )
+                    .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
                     tracing::info!("IdC 重新登录成功，凭据 #{} Token 已更新", target_id);
                     return Ok(PollIdcLoginResponse::Success {
                         credential_id: target_id,
@@ -5713,6 +5750,53 @@ impl AdminService {
                 Ok(result.response())
             }
         }
+    }
+
+    fn resolve_idc_issuer(
+        req: &StartIdcLoginRequest,
+    ) -> Result<idc::NormalizedIdcIssuer, AdminServiceError> {
+        let issuer = idc::normalize_idc_issuer(
+            req.start_url.as_deref().unwrap_or(""),
+            &req.region,
+        )
+        .map_err(AdminServiceError::InvalidCredential)?;
+        if issuer.rewritten_from_ipv4 {
+            tracing::info!(
+                from = %req.start_url.as_deref().unwrap_or(""),
+                to = %issuer.start_url,
+                auth_region = %issuer.auth_region,
+                "企业 IdC 门户已从仅 IPv4 改写为双栈"
+            );
+        }
+        Ok(issuer)
+    }
+
+    /// IdC 重新登录：必须连同新的 clientId/clientSecret/startUrl/auth_region 一起写回。
+    /// 只换 refreshToken、留着旧 OIDC 客户端，下次刷新会继续签发 Kiro 不认的 token。
+    fn do_idc_relogin_update(
+        &self,
+        target_id: u64,
+        refresh_token: String,
+        access_token: Option<String>,
+        expires_at: Option<String>,
+        client_id: String,
+        client_secret: String,
+        start_url: Option<String>,
+        auth_region: String,
+    ) -> anyhow::Result<()> {
+        self.token_manager.set_disabled(target_id, true)?;
+        self.token_manager.update_idc_relogin(
+            target_id,
+            refresh_token,
+            access_token,
+            expires_at,
+            client_id,
+            client_secret,
+            start_url,
+            auth_region,
+        )?;
+        self.token_manager.reset_and_enable(target_id)?;
+        Ok(())
     }
 
     /// 内部：重新登录完成后更新已有凭据的 Token（禁用→更新→重置→启用）
@@ -5839,14 +5923,16 @@ impl AdminService {
             .map(ProxyConfig::new)
             .or(global_proxy);
 
-        let start_url = req.start_url.as_deref().unwrap_or(BUILDER_ID_START_URL);
+        let issuer = Self::resolve_idc_issuer(&req)?;
+        let start_url = issuer.start_url.as_str();
+        let auth_region = issuer.auth_region.as_str();
 
-        let reg = idc::register_client(&req.region, start_url, config, proxy.as_ref())
+        let reg = idc::register_client(auth_region, start_url, config, proxy.as_ref())
             .await
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
         let device = idc::start_device_authorization(
-            &req.region,
+            auth_region,
             start_url,
             &reg.client_id,
             &reg.client_secret,
@@ -5860,13 +5946,21 @@ impl AdminService {
         let session_id = Uuid::new_v4().to_string();
 
         let session = IdcAuthSession {
-            region: req.region,
-            client_id: reg.client_id,
-            client_secret: reg.client_secret,
+            region: auth_region.to_string(),
+            client_id: reg.client_id.clone(),
+            client_secret: reg.client_secret.clone(),
             device_code: device.device_code,
             expires_at,
             poll_interval: device.interval.max(5),
-            cred_template: KiroCredentials::default(),
+            cred_template: KiroCredentials {
+                auth_method: Some("idc".to_string()),
+                start_url: Some(start_url.to_string()),
+                region: Some(auth_region.to_string()),
+                auth_region: Some(auth_region.to_string()),
+                client_id: Some(reg.client_id),
+                client_secret: Some(reg.client_secret),
+                ..Default::default()
+            },
             proxy,
             relogin_target_id: Some(target_id),
         };
@@ -6260,6 +6354,7 @@ mod tests {
             promote_priority: false,
             cost_rmb: None,
             quota_credits: None,
+            endpoint: None,
         };
 
         assert!(normalize_batch_update_request(request(vec![], Some(1), None, None)).is_err());
@@ -6312,6 +6407,7 @@ mod tests {
             promote_priority: true,
             cost_rmb: None,
             quota_credits: None,
+            endpoint: None,
         });
         assert!(matches!(
             conflict,
@@ -6329,6 +6425,7 @@ mod tests {
             promote_priority: true,
             cost_rmb: None,
             quota_credits: None,
+            endpoint: None,
         })
         .unwrap();
         assert!(promoted.patch.promote_priority);
@@ -6355,6 +6452,7 @@ mod tests {
             promote_priority: false,
             cost_rmb: None,
             quota_credits: None,
+            endpoint: None,
         };
 
         let mut maximum_groups = (0..100)
@@ -6405,6 +6503,7 @@ mod tests {
             promote_priority: false,
             cost_rmb: None,
             quota_credits: None,
+            endpoint: None,
         })
         .unwrap();
         assert_eq!(clear.ids, vec![1]);
@@ -6434,6 +6533,7 @@ mod tests {
             promote_priority: false,
             cost_rmb: None,
             quota_credits: None,
+            endpoint: None,
         })
         .unwrap();
         assert_eq!(
@@ -6458,10 +6558,44 @@ mod tests {
             promote_priority: false,
             cost_rmb: Some(80.0),
             quota_credits: Some(0.0),
+            endpoint: None,
         })
         .unwrap();
         assert_eq!(costing.patch.cost_rmb, Some(80.0));
         assert_eq!(costing.patch.quota_credits, Some(0.0));
+
+        let pinned = normalize_batch_update_request(BatchUpdateCredentialsRequest {
+            ids: vec![4],
+            rpm_limit: None,
+            max_concurrency: None,
+            groups: None,
+            source_channel: None,
+            priority: None,
+            promote_priority: false,
+            cost_rmb: None,
+            quota_credits: None,
+            endpoint: Some(" runtime ".to_string()),
+        })
+        .unwrap();
+        assert_eq!(
+            pinned.patch.endpoint,
+            Some(Some("runtime".to_string()))
+        );
+
+        let cleared = normalize_batch_update_request(BatchUpdateCredentialsRequest {
+            ids: vec![4],
+            rpm_limit: None,
+            max_concurrency: None,
+            groups: None,
+            source_channel: None,
+            priority: None,
+            promote_priority: false,
+            cost_rmb: None,
+            quota_credits: None,
+            endpoint: Some("   ".to_string()),
+        })
+        .unwrap();
+        assert_eq!(cleared.patch.endpoint, Some(None));
     }
 
     #[test]
@@ -6522,6 +6656,7 @@ mod tests {
                 promote_priority: false,
                 cost_rmb: None,
                 quota_credits: None,
+                endpoint: None,
             })
             .unwrap();
 

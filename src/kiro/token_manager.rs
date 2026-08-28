@@ -1441,6 +1441,8 @@ pub(crate) struct CredentialBatchPatch {
     pub cost_rmb: Option<f64>,
     /// `Some(v)` 手填额度；`Some(0.0)` 清除（改回用上游额度）。
     pub quota_credits: Option<f64>,
+    /// `Some(None)` 清除账号端点（跟全局默认）；`Some(Some("runtime"))` 钉死首跳。
+    pub endpoint: Option<Option<String>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -4867,6 +4869,13 @@ impl MultiTokenManager {
                 }
             }
 
+            if let Some(next) = &patch.endpoint
+                && entry.credentials.endpoint != *next
+            {
+                entry.credentials.endpoint = next.clone();
+                changed = true;
+            }
+
             if changed {
                 updated += 1;
             }
@@ -5311,6 +5320,79 @@ impl MultiTokenManager {
         }
         self.persist_credentials()?;
         tracing::info!("凭据 #{} refreshToken 已更新", id);
+        Ok(())
+    }
+
+    /// 更新 IdC 重新登录拿到的 token 以及签发它的 OIDC 客户端 / 门户。
+    ///
+    /// # 前置条件
+    /// - 凭据必须已禁用（disabled = true），与 [`update_refresh_token`] 保持一致。
+    pub fn update_idc_relogin(
+        &self,
+        id: u64,
+        new_refresh_token: String,
+        new_access_token: Option<String>,
+        new_expires_at: Option<String>,
+        client_id: String,
+        client_secret: String,
+        start_url: Option<String>,
+        auth_region: String,
+    ) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let idx = entries
+                .iter()
+                .position(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+
+            if !entries[idx].disabled {
+                anyhow::bail!(
+                    "只能为已禁用的凭据更新 IdC Token（请先禁用凭据 #{}）",
+                    id
+                );
+            }
+
+            let tmp_creds = KiroCredentials {
+                refresh_token: Some(new_refresh_token.clone()),
+                auth_method: Some("idc".to_string()),
+                client_id: Some(client_id.clone()),
+                client_secret: Some(client_secret.clone()),
+                start_url: start_url.clone(),
+                region: Some(auth_region.clone()),
+                auth_region: Some(auth_region.clone()),
+                ..entries[idx].credentials.clone()
+            };
+            validate_refresh_token(&tmp_creds)?;
+
+            let new_hash = sha256_hex(&new_refresh_token);
+            let duplicate = entries.iter().enumerate().any(|(i, e)| {
+                i != idx
+                    && e.credentials
+                        .refresh_token
+                        .as_ref()
+                        .map(|t| sha256_hex(t) == new_hash)
+                        .unwrap_or(false)
+            });
+            if duplicate {
+                anyhow::bail!("refreshToken 与其他凭据重复");
+            }
+
+            let entry = &mut entries[idx];
+            entry.credentials.refresh_token = Some(new_refresh_token);
+            entry.credentials.access_token = new_access_token;
+            entry.credentials.expires_at = new_expires_at;
+            entry.credentials.auth_method = Some("idc".to_string());
+            entry.credentials.client_id = Some(client_id);
+            entry.credentials.client_secret = Some(client_secret);
+            if let Some(url) = start_url {
+                entry.credentials.start_url = Some(url);
+            }
+            entry.credentials.region = Some(auth_region.clone());
+            entry.credentials.auth_region = Some(auth_region);
+            entry.refresh_failure_count = 0;
+        }
+        self.persist_credentials()?;
+        tracing::info!("凭据 #{} IdC Token 与门户已更新", id);
         Ok(())
     }
 
@@ -6112,6 +6194,53 @@ impl Drop for MultiTokenManager {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn update_idc_relogin_writes_portal_and_oidc_client() {
+        let mut existing = KiroCredentials::default();
+        existing.id = Some(2705);
+        existing.auth_method = Some("idc".to_string());
+        existing.client_id = Some("old-client".to_string());
+        existing.client_secret = Some("old-secret".to_string());
+        existing.start_url = Some("https://jarvisclaw.awsapps.com/start".to_string());
+        existing.region = Some("us-east-1".to_string());
+        existing.refresh_token = Some("a".repeat(150));
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![existing], None, None, false).unwrap();
+        manager.set_disabled(2705, true).unwrap();
+        manager
+            .update_idc_relogin(
+                2705,
+                "b".repeat(150),
+                Some("new-access".to_string()),
+                Some("expires".to_string()),
+                "new-client".to_string(),
+                "new-secret".to_string(),
+                Some(
+                    "https://ssoins-821071a5e59b0789.portal.ap-southeast-1.app.aws".to_string(),
+                ),
+                "ap-southeast-1".to_string(),
+            )
+            .unwrap();
+
+        let cred = manager
+            .entries
+            .lock()
+            .iter()
+            .find(|e| e.id == 2705)
+            .unwrap()
+            .credentials
+            .clone();
+        assert_eq!(cred.client_id.as_deref(), Some("new-client"));
+        assert_eq!(cred.client_secret.as_deref(), Some("new-secret"));
+        assert_eq!(
+            cred.start_url.as_deref(),
+            Some("https://ssoins-821071a5e59b0789.portal.ap-southeast-1.app.aws")
+        );
+        assert_eq!(cred.auth_region.as_deref(), Some("ap-southeast-1"));
+        assert_eq!(cred.access_token.as_deref(), Some("new-access"));
+    }
 
     #[test]
     fn find_existing_login_credential_respects_tenant_scope() {
@@ -7841,6 +7970,32 @@ mod tests {
         let persisted = manager.clone_all_credentials();
         assert!(persisted.iter().all(|c| c.cost_rmb == Some(80.0)));
         assert!(persisted.iter().all(|c| c.quota_credits == Some(10_000.0)));
+
+        let endpoints = manager
+            .batch_update_credentials(
+                &[1],
+                CredentialBatchPatch {
+                    endpoint: Some(Some("runtime".to_string())),
+                    ..CredentialBatchPatch::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(endpoints.updated, 1);
+        let persisted = manager.clone_all_credentials();
+        assert_eq!(
+            persisted
+                .iter()
+                .find(|c| c.id == Some(1))
+                .and_then(|c| c.endpoint.as_deref()),
+            Some("runtime")
+        );
+        assert_eq!(
+            persisted
+                .iter()
+                .find(|c| c.id == Some(2))
+                .and_then(|c| c.endpoint.as_deref()),
+            None
+        );
         assert_eq!(unchanged.updated, 0);
         assert_eq!(unchanged.unchanged, 2);
 

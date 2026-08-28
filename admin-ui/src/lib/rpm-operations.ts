@@ -39,6 +39,8 @@ export interface BatchUpdateInput {
   costDraft?: string
   editQuota?: boolean
   quotaDraft?: string
+  editEndpoint?: boolean
+  endpointDraft?: string
 }
 
 export type BatchUpdateRequestResult =
@@ -156,7 +158,8 @@ export function buildBatchUpdateRequest(
     !input.editSource &&
     !input.editPriority &&
     !input.editCost &&
-    !input.editQuota
+    !input.editQuota &&
+    !input.editEndpoint
   ) {
     return { ok: false, message: '请至少选择一项要修改的内容' }
   }
@@ -220,6 +223,10 @@ export function buildBatchUpdateRequest(
       return quotaCredits
     }
     request.quotaCredits = quotaCredits.value
+  }
+
+  if (input.editEndpoint) {
+    request.endpoint = (input.endpointDraft ?? '').trim()
   }
 
   return { ok: true, value: request }
