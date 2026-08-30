@@ -56,6 +56,9 @@ export function EditCredentialDialog({
       : ''
   )
   const [manualMode, setManualMode] = useState(false)
+  const [endpoint, setEndpoint] = useState(
+    credential.endpointPinned ? (credential.endpoint ?? '') : '',
+  )
 
   const groupOptions = useGroupOptions()
 
@@ -85,6 +88,7 @@ export function EditCredentialDialog({
           : ''
       )
       setManualMode(false)
+      setEndpoint(credential.endpointPinned ? (credential.endpoint ?? '') : '')
     }
   }, [open, credential])
 
@@ -116,6 +120,7 @@ export function EditCredentialDialog({
           // 留空表示清除（后端把 0 当清除），不是"不修改"——否则填错了就再也改不回来
           costRmb: costRmb.trim() === '' ? 0 : Number(costRmb),
           quotaCredits: quotaCredits.trim() === '' ? 0 : Number(quotaCredits),
+          endpoint,
         },
       },
       {
@@ -220,6 +225,35 @@ export function EditCredentialDialog({
                 disabled={isPending}
               />
               <p className="text-xs text-muted-foreground">留空显示凭据 ID</p>
+            </div>
+
+            <div className="space-y-2">
+              <p className="text-sm font-medium">端点</p>
+              <div className="grid grid-cols-3 gap-2" role="group" aria-label="账号端点">
+                {(
+                  [
+                    { value: '', label: '跟随默认' },
+                    { value: 'ide', label: 'ide' },
+                    { value: 'runtime', label: 'runtime' },
+                  ] as const
+                ).map((item) => (
+                  <Button
+                    key={item.value || 'default'}
+                    type="button"
+                    size="sm"
+                    className="h-11 sm:h-8"
+                    variant={endpoint === item.value ? 'default' : 'outline'}
+                    aria-pressed={endpoint === item.value}
+                    onClick={() => setEndpoint(item.value)}
+                    disabled={isPending}
+                  >
+                    {item.label}
+                  </Button>
+                ))}
+              </div>
+              <p className="text-xs text-muted-foreground">
+                跟随默认走全局协议。429 策略是全局的，不能按号改。
+              </p>
             </div>
 
             {/* 账号分组 */}

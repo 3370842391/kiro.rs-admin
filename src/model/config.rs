@@ -59,6 +59,44 @@ pub enum EndpointMode {
     Manual,
 }
 
+/// 普通 429 时同一张号要不要换桶。
+///
+/// 与 [`RetryMode`]（换不换号）正交：本枚举只决定桶，换号仍由重试策略决定。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum RateLimitBucketMode {
+    /// 同端点最多试 N 次（默认 3），再换号；不沿 fallback 链换桶。
+    #[default]
+    SameEndpoint,
+    /// 现状：沿 429 降级桶链换桶不换号，链尽再换号。
+    Hop,
+    /// 同号不重试，立刻按换号策略处理。
+    None,
+}
+
+impl RateLimitBucketMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SameEndpoint => "same-endpoint",
+            Self::Hop => "hop",
+            Self::None => "none",
+        }
+    }
+}
+
+impl std::str::FromStr for RateLimitBucketMode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "same-endpoint" | "same_endpoint" => Ok(Self::SameEndpoint),
+            "hop" | "rescue" => Ok(Self::Hop),
+            "none" => Ok(Self::None),
+            _ => anyhow::bail!("无效的 429 桶策略: {}", value),
+        }
+    }
+}
+
 impl std::fmt::Display for RetryMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let value = match self {
@@ -976,6 +1014,14 @@ pub struct Config {
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
 
+    /// 普通 429 是否换桶。缺省同端点重试，不再默认跳 runtime/codewhisperer。
+    #[serde(default)]
+    pub rate_limit_bucket_mode: RateLimitBucketMode,
+
+    /// 同端点最多尝试次数（含首次）。仅 `same-endpoint` 生效，默认 3。
+    #[serde(default = "default_same_endpoint_attempts")]
+    pub same_endpoint_attempts: u32,
+
     /// 端点路由模式：best（默认最好模式）或 manual（手动端点链）。
     #[serde(default)]
     pub endpoint_mode: EndpointMode,
@@ -1334,6 +1380,10 @@ fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
 
+fn default_same_endpoint_attempts() -> u32 {
+    crate::kiro::endpoint::rate_limit::DEFAULT_SAME_ENDPOINT_ATTEMPTS
+}
+
 fn default_trace_enabled() -> bool {
     true
 }
@@ -1486,6 +1536,8 @@ impl Default for Config {
             model_profile_exact_answers_enabled: default_true(),
             tool_compatibility_mode: default_tool_compatibility_mode(),
             default_endpoint: default_endpoint(),
+            rate_limit_bucket_mode: RateLimitBucketMode::default(),
+            same_endpoint_attempts: default_same_endpoint_attempts(),
             endpoint_mode: EndpointMode::default(),
             trace_enabled: default_trace_enabled(),
             auto_compact_diagnostics_enabled: default_true(),
@@ -2005,6 +2057,9 @@ mod tests {
     fn endpoint_mode_defaults_to_best_and_round_trips() {
         let defaulted: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(defaulted.endpoint_mode, EndpointMode::Best);
+        assert_eq!(defaulted.rate_limit_bucket_mode, RateLimitBucketMode::SameEndpoint);
+        assert_eq!(defaulted.same_endpoint_attempts, 3);
+        assert_eq!(defaulted.default_endpoint, "ide");
 
         let manual: Config = serde_json::from_str(r#"{"endpointMode":"manual"}"#).unwrap();
         assert_eq!(manual.endpoint_mode, EndpointMode::Manual);

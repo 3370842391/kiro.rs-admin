@@ -32,7 +32,8 @@ use crate::kiro::token_manager::{
     CredentialGroupPatch, MultiTokenManager, RPM_WINDOW_SECONDS,
 };
 use crate::model::config::{
-    Config, CredentialImportDefaults, EndpointMode, ProxyGuardConfig, RetryMode,
+    Config, CredentialImportDefaults, EndpointMode, ProxyGuardConfig, RateLimitBucketMode,
+    RetryMode,
 };
 
 use super::error::AdminServiceError;
@@ -1493,11 +1494,7 @@ impl AdminService {
         // 此前这里无条件回退 `defaultEndpoint`，而 best 模式实际会忽略它、强制走内置首跳 ——
         // 面板于是给每张 endpoint 为空的凭据显示了一个请求根本没去过的端点
         // （配 defaultEndpoint="ide" 却实走 runtime），排查 429 时严重误导。
-        let default_endpoint = if self.token_manager.get_endpoint_mode() == EndpointMode::Best {
-            crate::kiro::provider::best_endpoint_name().to_string()
-        } else {
-            self.token_manager.config().default_endpoint.clone()
-        };
+        let default_endpoint = self.token_manager.get_default_endpoint();
 
         // 一次性快照余额缓存，避免 N 次加锁
         let balance_snapshot: HashMap<u64, CachedBalance> = {
@@ -1576,7 +1573,8 @@ impl AdminService {
                     disabled_reason: entry.disabled_reason,
                     throttled_remaining_secs: entry.throttled_remaining_secs,
                     rate_limited_remaining_ms: entry.rate_limited_remaining_ms,
-                    endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
+                    endpoint: entry.endpoint.clone().unwrap_or_else(|| default_endpoint.clone()),
+                    endpoint_pinned: entry.endpoint.is_some(),
                     groups: entry.groups,
                     source_channel: entry.source_channel,
                     balance,
@@ -2536,7 +2534,29 @@ impl AdminService {
                 req.max_concurrency,
                 req.api_region,
             )
-            .map_err(|e| self.classify_error(e, id))
+            .map_err(|e| self.classify_error(e, id))?;
+
+        if let Some(raw) = req.endpoint {
+            let trimmed = raw.trim();
+            let endpoint = if trimmed.is_empty() {
+                None
+            } else {
+                if !self.known_endpoints.contains(trimmed) {
+                    let mut known: Vec<&str> = self.known_endpoints.iter().map(|s| s.as_str()).collect();
+                    known.sort();
+                    return Err(AdminServiceError::InvalidCredential(format!(
+                        "未知端点 \"{}\"，已注册端点: {:?}",
+                        trimmed, known
+                    )));
+                }
+                Some(trimmed.to_string())
+            };
+            self.token_manager
+                .set_credential_endpoint(id, endpoint)
+                .map_err(|e| self.classify_error(e, id))?;
+        }
+
+        Ok(())
     }
 
     /// 删除凭据
@@ -3413,6 +3433,9 @@ impl AdminService {
             partial_stream_recovery_window_ms: self
                 .token_manager
                 .partial_stream_recovery_window_ms(),
+            default_endpoint: self.token_manager.get_default_endpoint(),
+            rate_limit_bucket_mode: self.token_manager.get_rate_limit_bucket_mode().as_str().to_string(),
+            same_endpoint_attempts: self.token_manager.same_endpoint_attempts(),
         })
     }
 
@@ -3510,6 +3533,34 @@ impl AdminService {
                     req.partial_stream_recovery_window_ms
                         .unwrap_or_else(|| self.token_manager.partial_stream_recovery_window_ms()),
                 )
+                .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+        }
+
+        if let Some(name) = req.default_endpoint {
+            let name = name.trim().to_string();
+            if !self.known_endpoints.contains(&name) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "未知默认端点: {}",
+                    name
+                )));
+            }
+            self.token_manager
+                .set_default_endpoint(name)
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        }
+
+        if let Some(raw) = req.rate_limit_bucket_mode {
+            let mode = raw
+                .parse::<RateLimitBucketMode>()
+                .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+            self.token_manager
+                .set_rate_limit_bucket_mode(mode)
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        }
+
+        if let Some(attempts) = req.same_endpoint_attempts {
+            self.token_manager
+                .set_same_endpoint_attempts(attempts)
                 .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
         }
 

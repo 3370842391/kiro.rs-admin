@@ -15,6 +15,7 @@ pub mod amazonq;
 pub mod cli;
 pub mod codewhisperer;
 pub mod ide;
+pub mod rate_limit;
 pub mod runtime;
 pub mod runtime_cli;
 
@@ -134,6 +135,10 @@ pub struct RequestContext<'a> {
     pub machine_id: &'a str,
     /// 全局配置
     pub config: &'a Config,
+    /// 同一张号、同一协议的第几次尝试（从 1 起）。缺省按首次。
+    pub request_attempt: u32,
+    /// 同端点尝试上限，写入 `x-kiro-attempt` 的 max。
+    pub request_attempt_max: u32,
 }
 
 /// 触发"额度耗尽 → 禁用并切换"的 reason 取值集合

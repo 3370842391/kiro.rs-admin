@@ -31,7 +31,7 @@ use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::kiro::region::{
     API_KEY_AUTH_REGION, KiroService, data_plane_host, rest_region_candidates, validate_api_region,
 };
-use crate::model::config::{Config, EndpointMode, RetryMode, RetryPolicy};
+use crate::model::config::{Config, EndpointMode, RateLimitBucketMode, RetryMode, RetryPolicy};
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -1510,6 +1510,12 @@ pub struct MultiTokenManager {
     endpoint_chains: Mutex<Option<HashMap<String, Vec<String>>>>,
     /// 全局端点路由模式，运行时可由 Admin API 切换。
     endpoint_mode: Mutex<EndpointMode>,
+    /// 凭据未钉端点时的首跳协议。
+    default_endpoint: Mutex<String>,
+    /// 普通 429 换不换桶。
+    rate_limit_bucket_mode: Mutex<RateLimitBucketMode>,
+    /// 同端点最多尝试次数（含首次）。
+    same_endpoint_attempts: AtomicU32,
     /// 会话到凭据的短期粘性，仅在默认最好模式使用，不写入凭据文件。
     /// 只在上游 200 之后写入；429 / RPM 将满 / 账号不可用时松开。
     session_affinity: Mutex<HashMap<String, SessionAffinity>>,
@@ -1838,6 +1844,9 @@ impl MultiTokenManager {
         let retry_policy = config.retry_policy.clone();
         let endpoint_chains = config.endpoint_chains.clone();
         let endpoint_mode = config.endpoint_mode;
+        let default_endpoint = config.default_endpoint.clone();
+        let rate_limit_bucket_mode = config.rate_limit_bucket_mode;
+        let same_endpoint_attempts = config.same_endpoint_attempts.max(1);
         let max_bucket_attempts = config.max_bucket_attempts_per_request;
         let stream_idle_timeout_secs = config.stream_idle_timeout_secs;
         let auto_continue_enabled = config.auto_continue_enabled;
@@ -1880,6 +1889,9 @@ impl MultiTokenManager {
             retry_policy: Mutex::new(retry_policy),
             endpoint_chains: Mutex::new(endpoint_chains),
             endpoint_mode: Mutex::new(endpoint_mode),
+            default_endpoint: Mutex::new(default_endpoint),
+            rate_limit_bucket_mode: Mutex::new(rate_limit_bucket_mode),
+            same_endpoint_attempts: AtomicU32::new(same_endpoint_attempts),
             session_affinity: Mutex::new(HashMap::new()),
             max_bucket_attempts_per_request: AtomicUsize::new(max_bucket_attempts),
             stream_idle_timeout_secs: AtomicU64::new(stream_idle_timeout_secs),
@@ -5671,6 +5683,120 @@ impl MultiTokenManager {
             .save()
             .with_context(|| format!("持久化端点模式失败: {}", path.display()))?;
         Ok(())
+    }
+
+    pub fn get_default_endpoint(&self) -> String {
+        self.default_endpoint.lock().clone()
+    }
+
+    pub fn set_default_endpoint(&self, name: String) -> anyhow::Result<()> {
+        let trimmed = name.trim().to_string();
+        if trimmed.is_empty() {
+            bail!("默认端点不能为空");
+        }
+        let previous = self.default_endpoint.lock().clone();
+        *self.default_endpoint.lock() = trimmed.clone();
+        if let Err(error) = self.persist_default_endpoint(&trimmed) {
+            *self.default_endpoint.lock() = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn persist_default_endpoint(&self, name: &str) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let Some(path) = self.config.config_path() else {
+            tracing::warn!("配置文件路径未知，默认端点仅在当前进程生效");
+            return Ok(());
+        };
+        let mut config =
+            Config::load(path).with_context(|| format!("重新加载配置失败: {}", path.display()))?;
+        config.default_endpoint = name.to_string();
+        config
+            .save()
+            .with_context(|| format!("持久化默认端点失败: {}", path.display()))?;
+        Ok(())
+    }
+
+    pub fn get_rate_limit_bucket_mode(&self) -> RateLimitBucketMode {
+        *self.rate_limit_bucket_mode.lock()
+    }
+
+    pub fn set_rate_limit_bucket_mode(&self, mode: RateLimitBucketMode) -> anyhow::Result<()> {
+        let previous = *self.rate_limit_bucket_mode.lock();
+        *self.rate_limit_bucket_mode.lock() = mode;
+        if let Err(error) = self.persist_rate_limit_bucket_mode(mode) {
+            *self.rate_limit_bucket_mode.lock() = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn persist_rate_limit_bucket_mode(&self, mode: RateLimitBucketMode) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let Some(path) = self.config.config_path() else {
+            tracing::warn!("配置文件路径未知，429 桶策略仅在当前进程生效");
+            return Ok(());
+        };
+        let mut config =
+            Config::load(path).with_context(|| format!("重新加载配置失败: {}", path.display()))?;
+        config.rate_limit_bucket_mode = mode;
+        config
+            .save()
+            .with_context(|| format!("持久化 429 桶策略失败: {}", path.display()))?;
+        Ok(())
+    }
+
+    pub fn same_endpoint_attempts(&self) -> u32 {
+        self.same_endpoint_attempts.load(Ordering::Relaxed).max(1)
+    }
+
+    pub fn set_same_endpoint_attempts(&self, value: u32) -> anyhow::Result<()> {
+        if !(1..=8).contains(&value) {
+            bail!("同端点尝试次数必须在 1..=8");
+        }
+        let previous = self.same_endpoint_attempts.swap(value, Ordering::Relaxed);
+        if let Err(error) = self.persist_same_endpoint_attempts(value) {
+            self.same_endpoint_attempts
+                .store(previous, Ordering::Relaxed);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn persist_same_endpoint_attempts(&self, value: u32) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let Some(path) = self.config.config_path() else {
+            tracing::warn!("配置文件路径未知，同端点尝试次数仅在当前进程生效");
+            return Ok(());
+        };
+        let mut config =
+            Config::load(path).with_context(|| format!("重新加载配置失败: {}", path.display()))?;
+        config.same_endpoint_attempts = value;
+        config
+            .save()
+            .with_context(|| format!("持久化同端点尝试次数失败: {}", path.display()))?;
+        Ok(())
+    }
+
+    /// 单号钉端点。`None` 表示跟随全局默认。
+    pub fn set_credential_endpoint(
+        &self,
+        id: u64,
+        endpoint: Option<String>,
+    ) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.endpoint = endpoint.filter(|name| !name.trim().is_empty());
+        }
+        self.persist_credentials().map(|_| ())
     }
 
     /// 单请求内备用桶尝试总数硬上限（跨 attempt 累计）。`0` = 不限。

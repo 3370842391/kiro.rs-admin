@@ -338,7 +338,13 @@ function CredentialMetaLine({ credential }: { credential: CredentialStatusItem }
     });
   }
   if (credential.endpoint) {
-    items.push({ text: credential.endpoint, hint: `端点：${credential.endpoint}` });
+    const pinned = credential.endpointPinned;
+    items.push({
+      text: pinned ? credential.endpoint : `默认·${credential.endpoint}`,
+      hint: pinned
+        ? `端点已钉死：${credential.endpoint}`
+        : `跟随全局默认协议（当前 ${credential.endpoint}）`,
+    });
   }
   if (credential.hasProfileArn) {
     items.push({ text: "ARN", hint: "已配置 Profile ARN" });

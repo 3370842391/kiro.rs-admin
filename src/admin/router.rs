@@ -35,6 +35,7 @@ use super::{
         reset_failure_count, reset_proxy_ban_stats, reset_success_count, rollback_image_update,
         rotate_client_key, run_proxy_guard,
         set_account_throttle_config, set_cache_hit_rate, set_cache_policy, set_client_key_disabled,
+        set_client_key_max_credits,
         set_compatibility_config, set_credential_disabled, set_credential_overage,
         set_credential_priority, set_dead_credential_config, set_endpoint_chains,
         set_endpoint_mode, set_global_proxy, set_image_budget, set_import_defaults,
@@ -331,6 +332,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
             post(reset_client_key_stats),
         )
         .route("/client-keys/{id}/rotate", post(rotate_client_key))
+        .route(
+            "/client-keys/{id}/max-credits",
+            post(set_client_key_max_credits),
+        )
         .route("/groups", get(list_groups).post(create_group))
         .route("/groups/{name}", delete(delete_group).patch(update_group))
         .route(

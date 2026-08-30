@@ -131,6 +131,9 @@ pub struct CredentialStatusItem {
     pub rate_limited_remaining_ms: Option<u64>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
+    /// 是否在凭据上钉死了端点。false = 跟随全局默认协议。
+    #[serde(default)]
+    pub endpoint_pinned: bool,
     /// 账号所属分组（可属于多个分组）
     #[serde(default)]
     pub groups: Vec<String>,
@@ -371,6 +374,9 @@ pub struct UpdateCredentialRequest {
     /// 额度积分。None 不修改，0 表示清除（改回用上游查到的额度）。
     #[serde(default)]
     pub quota_credits: Option<f64>,
+    /// 账号首跳端点。`Some("")` 表示清除，改回跟全局默认。
+    #[serde(default)]
+    pub endpoint: Option<String>,
 }
 
 /// 批量分组修改模式
@@ -792,6 +798,12 @@ pub struct EndpointChainsResponse {
     pub partial_stream_recovery_enabled: bool,
     /// 首个语义输出后的半截流判定窗口（毫秒）。
     pub partial_stream_recovery_window_ms: u64,
+    /// 凭据未钉端点时的首跳协议（`ide` / `runtime`）。
+    pub default_endpoint: String,
+    /// 普通 429 桶策略：`same-endpoint` / `hop` / `none`。
+    pub rate_limit_bucket_mode: String,
+    /// 同端点最多尝试次数（含首次）。
+    pub same_endpoint_attempts: u32,
 }
 
 /// 更新 429 降级桶链配置
@@ -816,6 +828,15 @@ pub struct SetEndpointChainsRequest {
     pub partial_stream_recovery_enabled: Option<bool>,
     #[serde(default)]
     pub partial_stream_recovery_window_ms: Option<u64>,
+    /// 全局默认协议。省略则不改。
+    #[serde(default)]
+    pub default_endpoint: Option<String>,
+    /// 普通 429 桶策略。省略则不改。
+    #[serde(default)]
+    pub rate_limit_bucket_mode: Option<String>,
+    /// 同端点尝试次数。省略则不改。
+    #[serde(default)]
+    pub same_endpoint_attempts: Option<u32>,
 }
 
 /// 全局端点运行模式。
@@ -1439,6 +1460,9 @@ pub struct ClientKeyItem {
     pub total_output_tokens: u64,
     pub total_cache_creation_tokens: u64,
     pub total_cache_read_tokens: u64,
+    pub total_credits: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_credits: Option<f64>,
     pub response_mode: ClientResponseMode,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_hit_rate: Option<CacheHitRateBounds>,
@@ -1476,6 +1500,9 @@ pub struct CreateClientKeyRequest {
     pub response_mode: Option<String>,
     #[serde(default)]
     pub cache_hit_rate: Option<CacheHitRateBounds>,
+    /// 创建时可选的积分上限；缺省或不传表示不限制。
+    #[serde(default)]
+    pub max_credits: Option<f64>,
 }
 
 /// 创建客户端 Key 响应（明文 Key 仅在此处返回一次）
@@ -1522,6 +1549,13 @@ pub struct UpdateClientKeyRequest {
     /// 持有完整当前状态，整体替换比两个字段各自的三态（缺省/null/有值）好实现也好推理。
     #[serde(default)]
     pub cache_policy: Option<crate::admin::client_keys::ClientCachePolicy>,
+}
+
+/// 设置或清除单个客户端 Key 的积分上限。`maxCredits: null` 表示取消限制。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetMaxCreditsRequest {
+    pub max_credits: Option<f64>,
 }
 
 /// 更新客户端 Key 响应；保留原成功响应字段，并返回实际持久化的模式。
@@ -2323,6 +2357,38 @@ mod tests {
 
         assert_eq!(request.nickname.as_deref(), Some("  repaired account  "));
         assert_eq!(request.api_region.as_deref(), Some("eu-central-1"));
+        assert_eq!(request.endpoint, None);
+    }
+
+    #[test]
+    fn update_credential_request_accepts_endpoint() {
+        let pinned: UpdateCredentialRequest = serde_json::from_value(serde_json::json!({
+            "endpoint": "runtime"
+        }))
+        .unwrap();
+        assert_eq!(pinned.endpoint.as_deref(), Some("runtime"));
+
+        let cleared: UpdateCredentialRequest = serde_json::from_value(serde_json::json!({
+            "endpoint": ""
+        }))
+        .unwrap();
+        assert_eq!(cleared.endpoint.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn set_endpoint_chains_request_accepts_protocol_policy() {
+        let request: SetEndpointChainsRequest = serde_json::from_value(serde_json::json!({
+            "defaultEndpoint": "runtime",
+            "rateLimitBucketMode": "same-endpoint",
+            "sameEndpointAttempts": 3
+        }))
+        .unwrap();
+        assert_eq!(request.default_endpoint.as_deref(), Some("runtime"));
+        assert_eq!(
+            request.rate_limit_bucket_mode.as_deref(),
+            Some("same-endpoint")
+        );
+        assert_eq!(request.same_endpoint_attempts, Some(3));
     }
 
     #[test]
@@ -2419,10 +2485,24 @@ mod tests {
     fn client_key_requests_use_camel_case_response_mode() {
         let create: CreateClientKeyRequest = serde_json::from_value(serde_json::json!({
             "name": "native",
-            "responseMode": "kiro_native"
+            "responseMode": "kiro_native",
+            "maxCredits": 12.5
         }))
         .unwrap();
         assert_eq!(create.response_mode.as_deref(), Some("kiro_native"));
+        assert_eq!(create.max_credits, Some(12.5));
+
+        let unlimited: CreateClientKeyRequest = serde_json::from_value(serde_json::json!({
+            "name": "plain"
+        }))
+        .unwrap();
+        assert_eq!(unlimited.max_credits, None);
+
+        let set_limit: SetMaxCreditsRequest = serde_json::from_value(serde_json::json!({
+            "maxCredits": null
+        }))
+        .unwrap();
+        assert_eq!(set_limit.max_credits, None);
 
         let update: UpdateClientKeyRequest = serde_json::from_value(serde_json::json!({
             "responseMode": "detection"

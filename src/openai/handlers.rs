@@ -21,8 +21,8 @@ use super::types::{
     AssistantParts, ChatCompletionRequest, OpenAIConversionError, OpenAIFunctionCall,
     OpenAIMessage, OpenAIToolCall, ResponsesRequest, assistant_message_for_history,
     assistant_parts_from_anthropic, chat_message_from_parts, chat_to_anthropic,
-    finish_reason_from_anthropic, openai_error, response_output_from_parts,
-    responses_to_chat_request, responses_usage_json, usage_json,
+    finish_reason_from_anthropic, openai_error, resolve_openai_conversation_id,
+    response_output_from_parts, responses_to_chat_request, responses_usage_json, usage_json,
 };
 
 const MAX_COLLECT_BYTES: usize = 32 * 1024 * 1024;
@@ -52,10 +52,16 @@ pub async fn post_chat_completions(
         .stream_options
         .as_ref()
         .is_some_and(|options| options.include_usage);
-    let converted = match chat_to_anthropic(&req) {
+    let mut converted = match chat_to_anthropic(&req) {
         Ok(converted) => converted,
         Err(e) => return conversion_error(e),
     };
+    apply_openai_conversation_hint(
+        &mut converted.anthropic,
+        &headers,
+        req.prompt_cache_key.as_deref(),
+        req.session_id.as_deref(),
+    );
     let stream = converted.anthropic.stream;
     let model = converted.anthropic.model.clone();
 
@@ -92,10 +98,16 @@ pub async fn post_responses(
         Ok(req) => req,
         Err(e) => return conversion_error(e),
     };
-    let converted = match chat_to_anthropic(&chat_req) {
+    let mut converted = match chat_to_anthropic(&chat_req) {
         Ok(converted) => converted,
         Err(e) => return conversion_error(e),
     };
+    apply_openai_conversation_hint(
+        &mut converted.anthropic,
+        &headers,
+        req.prompt_cache_key.as_deref(),
+        req.session_id.as_deref(),
+    );
 
     let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
     let created_at = unix_ts();
@@ -171,6 +183,32 @@ pub async fn delete_response(Path(id): Path<String>) -> Response {
 /// 在 `chat_to_anthropic` 的启发式映射（gpt-*/o1/o3/codex → 默认兼容模型）之前执行，
 /// 因此显式映射优先级更高；改写后的目标名（如 claude-opus-4.8）不匹配启发式前缀，
 /// 会被透传，不会被二次改写。
+fn header_text<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+fn apply_openai_conversation_hint(
+    req: &mut crate::anthropic::types::MessagesRequest,
+    headers: &HeaderMap,
+    prompt_cache_key: Option<&str>,
+    session_id: Option<&str>,
+) {
+    let Some(id) = resolve_openai_conversation_id(
+        prompt_cache_key,
+        header_text(headers, "x-session-affinity"),
+        header_text(headers, "x-client-request-id"),
+        session_id,
+    ) else {
+        return;
+    };
+    let mut metadata = req.metadata.take().unwrap_or(crate::anthropic::types::Metadata {
+        user_id: None,
+        conversation_id_hint: None,
+    });
+    metadata.conversation_id_hint = Some(id);
+    req.metadata = Some(metadata);
+}
+
 fn apply_model_mapping(state: &AppState, model: &mut String) {
     if let Some(mappings) = &state.model_mappings
         && let Some(target) = mappings.resolve(model)

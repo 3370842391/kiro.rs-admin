@@ -63,6 +63,9 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
   const [partialRecovery, setPartialRecovery] = useState(false)
   const [partialWindowMs, setPartialWindowMs] = useState(750)
   const [expanded, setExpanded] = useState<string | null>(null)
+  const [defaultEndpoint, setDefaultEndpoint] = useState('ide')
+  const [bucketMode, setBucketMode] = useState<'same-endpoint' | 'hop' | 'none'>('same-endpoint')
+  const [sameEndpointAttempts, setSameEndpointAttempts] = useState(3)
 
   // 载入服务端当前值到编辑态
   useEffect(() => {
@@ -74,6 +77,9 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
     setAutoContinueMax(data.autoContinueMax)
     setPartialRecovery(data.partialStreamRecoveryEnabled)
     setPartialWindowMs(data.partialStreamRecoveryWindowMs)
+    setDefaultEndpoint(data.defaultEndpoint || 'ide')
+    setBucketMode(data.rateLimitBucketMode || 'same-endpoint')
+    setSameEndpointAttempts(data.sameEndpointAttempts || 3)
   }, [data])
 
   const primaries = useMemo(
@@ -117,6 +123,9 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
         autoContinueMax,
         partialStreamRecoveryEnabled: partialRecovery,
         partialStreamRecoveryWindowMs: partialWindowMs,
+        defaultEndpoint,
+        rateLimitBucketMode: bucketMode,
+        sameEndpointAttempts,
       },
       {
         onSuccess: () => {
@@ -174,6 +183,57 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
               {modeData.adaptiveScheduling ? '；已启用会话粘性和实时调度。' : ''}
             </p>
           )}
+        </div>
+
+        <div className="shrink-0 space-y-3 rounded-lg border bg-muted/30 p-3">
+          <div>
+            <div className="mb-2 text-sm font-medium">默认协议</div>
+            <div className="flex flex-wrap gap-2">
+              {(['ide', 'runtime'] as const).map((name) => (
+                <Button
+                  key={name}
+                  type="button"
+                  size="sm"
+                  variant={defaultEndpoint === name ? 'default' : 'outline'}
+                  onClick={() => setDefaultEndpoint(name)}
+                >
+                  {name}
+                </Button>
+              ))}
+            </div>
+            <p className="mt-2 text-xs text-muted-foreground">
+              没钉端点的号走这个。单号仍可单独指定 ide / runtime。
+            </p>
+          </div>
+          <div>
+            <div className="mb-2 text-sm font-medium">429 策略</div>
+            <div className="flex flex-wrap gap-2">
+              {(
+                [
+                  { value: 'same-endpoint', label: '同端点3次后换号' },
+                  { value: 'hop', label: '换桶救援' },
+                  { value: 'none', label: '不重试' },
+                ] as const
+              ).map((item) => (
+                <Button
+                  key={item.value}
+                  type="button"
+                  size="sm"
+                  variant={bucketMode === item.value ? 'default' : 'outline'}
+                  onClick={() => setBucketMode(item.value)}
+                >
+                  {item.label}
+                </Button>
+              ))}
+            </div>
+            <p className="mt-2 text-xs text-muted-foreground">
+              {bucketMode === 'same-endpoint'
+                ? `同一张号、同一协议最多试 ${sameEndpointAttempts} 次，再换号，不切桶。`
+                : bucketMode === 'hop'
+                  ? '沿下面的桶链换桶不换号（旧行为）。'
+                  : '普通 429 后立刻换号或失败，同号不再打。'}
+            </p>
+          </div>
         </div>
 
         {isLoading ? (

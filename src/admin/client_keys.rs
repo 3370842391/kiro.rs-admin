@@ -187,6 +187,17 @@ impl CacheHitRateBounds {
     }
 }
 
+/// 鉴权结果：区分「命中」「超额」「未命中」，供中间件返回不同 HTTP 状态。
+#[derive(Debug, Clone, PartialEq)]
+pub enum KeyAuth {
+    /// 命中且未超额
+    Ok(AuthorizedClientKey),
+    /// 命中但已达积分上限；不累加调用次数
+    OverLimit { id: u64, used: f64, limit: f64 },
+    /// 未匹配到任何启用的 Key
+    NotFound,
+}
+
 /// 数据面鉴权成功时的一次性不可变快照。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizedClientKey {
@@ -226,6 +237,13 @@ pub struct ClientKey {
     /// 累计 credit 计费量（meteringEvent.usage 累加）
     #[serde(default)]
     pub total_credits: f64,
+    /// 累计积分上限。`None` 表示不限制。
+    ///
+    /// 达到上限后该 Key 的后续请求会被鉴权层拒绝（HTTP 429），且不累加调用次数。
+    /// 上限基于累计 `total_credits`，通过「重置统计」清零后可重新计费。
+    /// 老数据无此字段 → 不限制。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_credits: Option<f64>,
     /// 绑定的账号分组名（可选）
     ///
     /// 设置后，用该 Key 发起的请求只会调度到 groups 包含此分组名的上游账号（严格隔离）。
@@ -522,6 +540,7 @@ impl ClientKeyManager {
             total_cache_creation_tokens: 0,
             total_cache_read_tokens: 0,
             total_credits: 0.0,
+            max_credits: None,
             group: group.filter(|g| !g.trim().is_empty()),
             response_mode,
             cache_hit_rate,
@@ -597,6 +616,7 @@ impl ClientKeyManager {
                     total_cache_creation_tokens: 0,
                     total_cache_read_tokens: 0,
                     total_credits: 0.0,
+                    max_credits: None,
                     group: None,
                     response_mode: ClientResponseMode::Detection,
                     cache_hit_rate: None,
@@ -833,16 +853,23 @@ impl ClientKeyManager {
         updated
     }
 
-    /// 校验 Key，命中且未禁用则返回 id；同时更新 `last_used_at`/`total_calls`
+    /// 校验 Key，命中且未禁用、未超额则返回快照；同时更新 `last_used_at`/`total_calls`。
     ///
-    /// 用 `ConstantTimeEq` 对所有 active Key 做常量时间比对，防止时序攻击；
-    /// 之前的 HashMap 直接 lookup 仅作快速短路（命中后还会再做一次常量时间比较）。
+    /// 超额时返回 `None`（与禁用/未命中同形）。需要区分 429 时请用 [`Self::verify_and_touch_ex`]。
     pub fn verify_and_touch_context(&self, presented: &str) -> Option<AuthorizedClientKey> {
+        match self.verify_and_touch_ex(presented) {
+            KeyAuth::Ok(authorized) => Some(authorized),
+            KeyAuth::OverLimit { .. } | KeyAuth::NotFound => None,
+        }
+    }
+
+    /// 常量时间匹配所有启用 Key；命中后若已达积分上限则返回 [`KeyAuth::OverLimit`]，
+    /// 否则累加调用次数并返回 [`KeyAuth::Ok`]。
+    pub fn verify_and_touch_ex(&self, presented: &str) -> KeyAuth {
         if !presented.starts_with(CLIENT_KEY_PREFIX) {
-            return None;
+            return KeyAuth::NotFound;
         }
         let mut inner = self.inner.write();
-        // 第一遍：扫描所有 entry 做常量时间比较，避免 HashMap 短路泄露
         let mut hit_id: Option<u64> = None;
         for (id, ck) in inner.entries.iter() {
             if ck.disabled {
@@ -853,12 +880,25 @@ impl ClientKeyManager {
                 // 不 break，继续完整扫描以保持常量时间
             }
         }
-        let id = hit_id?;
-        let entry = inner.entries.get_mut(&id)?;
+        let Some(id) = hit_id else {
+            return KeyAuth::NotFound;
+        };
+        let Some(entry) = inner.entries.get_mut(&id) else {
+            return KeyAuth::NotFound;
+        };
+        if let Some(limit) = entry.max_credits
+            && entry.total_credits >= limit
+        {
+            return KeyAuth::OverLimit {
+                id,
+                used: entry.total_credits,
+                limit,
+            };
+        }
         entry.total_calls += 1;
         entry.last_used_at = Some(Utc::now().to_rfc3339());
         // 不在每次请求都落盘（高频写入），由 record_usage / 定期 flush 持久化
-        Some(AuthorizedClientKey {
+        KeyAuth::Ok(AuthorizedClientKey {
             id,
             group: entry.group.clone(),
             response_mode: entry.response_mode,
@@ -870,6 +910,30 @@ impl ClientKeyManager {
     pub fn verify_and_touch(&self, presented: &str) -> Option<u64> {
         self.verify_and_touch_context(presented)
             .map(|authorized| authorized.id)
+    }
+
+    /// 设置或清除单个 Key 的积分使用上限。`None` 表示取消限制。
+    ///
+    /// 传入 `Some(v)` 时必须是非负有限值；小于 0 或非有限值一律拒绝。
+    /// 返回 `false` 表示 Key 不存在或入参非法。
+    pub fn set_max_credits(&self, id: u64, max_credits: Option<f64>) -> bool {
+        if let Some(v) = max_credits
+            && (!v.is_finite() || v < 0.0)
+        {
+            return false;
+        }
+        let mut inner = self.inner.write();
+        let updated = match inner.entries.get_mut(&id) {
+            Some(e) => {
+                e.max_credits = max_credits;
+                true
+            }
+            None => false,
+        };
+        if updated {
+            self.save_locked(&inner);
+        }
+        updated
     }
 
     /// 在请求结束时累计 Token 用量并落盘
@@ -1008,6 +1072,71 @@ mod tests {
         assert_eq!(e.total_output_tokens, 80);
         assert_eq!(e.total_cache_creation_tokens, 5);
         assert_eq!(e.total_cache_read_tokens, 10);
+        assert!((e.total_credits - 1.5).abs() < 1e-9);
+        assert_eq!(e.max_credits, None);
+    }
+
+    #[test]
+    fn max_credits_blocks_when_exceeded() {
+        let mgr = ClientKeyManager::new();
+        let entry = mgr.create("test".to_string(), None, None);
+        assert!(mgr.set_max_credits(entry.id, Some(2.0)));
+
+        assert!(matches!(
+            mgr.verify_and_touch_ex(&entry.key),
+            KeyAuth::Ok(authorized) if authorized.id == entry.id
+        ));
+
+        mgr.record_usage(entry.id, 0, 0, 0, 0, 2.5);
+        match mgr.verify_and_touch_ex(&entry.key) {
+            KeyAuth::OverLimit { id, used, limit } => {
+                assert_eq!(id, entry.id);
+                assert!((used - 2.5).abs() < 1e-9);
+                assert!((limit - 2.0).abs() < 1e-9);
+            }
+            other => panic!("expected OverLimit, got {other:?}"),
+        }
+        // 旧接口兼容：超额返回 None，且不累加调用次数
+        let calls_before = mgr.list().iter().find(|k| k.id == entry.id).unwrap().total_calls;
+        assert_eq!(mgr.verify_and_touch(&entry.key), None);
+        let calls_after = mgr.list().iter().find(|k| k.id == entry.id).unwrap().total_calls;
+        assert_eq!(calls_after, calls_before);
+
+        assert!(mgr.reset_stats(entry.id));
+        assert!(matches!(
+            mgr.verify_and_touch_ex(&entry.key),
+            KeyAuth::Ok(authorized) if authorized.id == entry.id
+        ));
+
+        mgr.record_usage(entry.id, 0, 0, 0, 0, 999.0);
+        assert!(mgr.set_max_credits(entry.id, None));
+        assert!(matches!(
+            mgr.verify_and_touch_ex(&entry.key),
+            KeyAuth::Ok(authorized) if authorized.id == entry.id
+        ));
+    }
+
+    #[test]
+    fn set_max_credits_rejects_invalid() {
+        let mgr = ClientKeyManager::new();
+        let entry = mgr.create("test".to_string(), None, None);
+        assert!(!mgr.set_max_credits(entry.id, Some(-1.0)));
+        assert!(!mgr.set_max_credits(entry.id, Some(f64::NAN)));
+        assert!(!mgr.set_max_credits(999, Some(5.0)));
+        assert!(mgr.set_max_credits(entry.id, Some(0.0)));
+    }
+
+    #[test]
+    fn legacy_json_defaults_max_credits_to_unlimited() {
+        let raw = r#"{
+            "id": 7,
+            "key": "csk_legacy",
+            "name": "legacy",
+            "createdAt": "2026-07-15T00:00:00Z"
+        }"#;
+        let key: ClientKey = serde_json::from_str(raw).unwrap();
+        assert_eq!(key.max_credits, None);
+        assert_eq!(key.total_credits, 0.0);
     }
 
     #[test]
@@ -1111,6 +1240,7 @@ mod tests {
             total_cache_creation_tokens: 0,
             total_cache_read_tokens: 0,
             total_credits: 0.0,
+            max_credits: None,
             group: Some("team-a".into()),
             is_system: false,
             response_mode: ClientResponseMode::KiroNative,

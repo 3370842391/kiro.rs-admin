@@ -135,6 +135,10 @@ fn default_effort() -> String {
 pub struct Metadata {
     /// 用户 ID，格式如: user_xxx_account__session_0b4445e1-f5be-49e1-87ce-62bbc28ad705
     pub user_id: Option<String>,
+    /// OpenAI/Codex 会话亲和：合法 UUID 时复用为 Kiro `conversationId`。
+    /// 不参与客户端 JSON 反序列化，避免任意 `user_id` 抢同一上游会话。
+    #[serde(skip)]
+    pub conversation_id_hint: Option<String>,
 }
 
 /// Messages 请求体

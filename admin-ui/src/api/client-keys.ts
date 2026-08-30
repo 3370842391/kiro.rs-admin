@@ -63,3 +63,13 @@ export async function rotateClientKey(id: number): Promise<CreateClientKeyRespon
   const { data } = await api.post<CreateClientKeyResponse>(`/client-keys/${id}/rotate`)
   return data
 }
+
+export async function setClientKeyMaxCredits(
+  id: number,
+  maxCredits: number | null,
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/client-keys/${id}/max-credits`, {
+    maxCredits,
+  })
+  return data
+}

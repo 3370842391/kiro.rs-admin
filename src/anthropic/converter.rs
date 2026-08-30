@@ -867,9 +867,17 @@ pub fn convert_request_with_mode(
     };
 
     // 3. 生成会话 ID 和代理 ID
-    // Anthropic/OpenAI 兼容请求携带完整历史。复用 metadata.user_id 会让并发请求
-    // 在 Kiro 上游竞争同一会话状态，因此每次转换都使用独立会话 ID。
-    let conversation_id = Uuid::new_v4().to_string();
+    // Anthropic 兼容请求携带完整历史。复用 metadata.user_id 会让并发请求
+    // 在 Kiro 上游竞争同一会话状态，因此默认每次转换都使用独立会话 ID。
+    // OpenAI/Codex 若给出合法会话 UUID（prompt_cache_key / 亲和头 / session_id），
+    // 则复用为 conversationId，使同一会话能命中上游缓存。
+    let conversation_id = req
+        .metadata
+        .as_ref()
+        .and_then(|m| m.conversation_id_hint.as_deref())
+        .and_then(|hint| Uuid::parse_str(hint).ok())
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     let agent_continuation_id = Uuid::new_v4().to_string();
 
     // 4. 确定触发类型
@@ -4524,6 +4532,7 @@ mod tests {
                 user_id: Some(
                     "user_0dede55c6dcc4a11a30bbb5e7f22e6fdf86cdeba3820019cc27612af4e1243cd_account__session_a0662283-7fd3-4399-a7eb-52b9a717ae88".to_string(),
                 ),
+                conversation_id_hint: None,
             }),
         };
 
@@ -4536,6 +4545,66 @@ mod tests {
         assert_ne!(first_id, "a0662283-7fd3-4399-a7eb-52b9a717ae88");
         assert!(Uuid::parse_str(first_id).is_ok());
         assert!(Uuid::parse_str(second_id).is_ok());
+    }
+
+    #[test]
+    fn openai_conversation_hint_is_reused_as_kiro_conversation_id() {
+        use super::super::types::{Message as AnthropicMessage, Metadata};
+
+        let session = "a0662283-7fd3-4399-a7eb-52b9a717ae88";
+        let req = MessagesRequest {
+            force_web_search_loop: false,
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: Some(Metadata {
+                user_id: None,
+                conversation_id_hint: Some(session.to_string()),
+            }),
+        };
+
+        let first = convert_request(&req).unwrap();
+        let second = convert_request(&req).unwrap();
+        assert_eq!(first.conversation_state.conversation_id, session);
+        assert_eq!(second.conversation_state.conversation_id, session);
+    }
+
+    #[test]
+    fn invalid_conversation_hint_falls_back_to_random_id() {
+        use super::super::types::{Message as AnthropicMessage, Metadata};
+
+        let req = MessagesRequest {
+            force_web_search_loop: false,
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: Some(Metadata {
+                user_id: None,
+                conversation_id_hint: Some("not-a-uuid".into()),
+            }),
+        };
+
+        let result = convert_request(&req).unwrap();
+        assert!(Uuid::parse_str(&result.conversation_state.conversation_id).is_ok());
+        assert_ne!(result.conversation_state.conversation_id, "not-a-uuid");
     }
 
     #[test]

@@ -19,7 +19,7 @@ import {
 import {
   useClientKeys, useCreateClientKey, useDeleteClientKey,
   useSetClientKeyDisabled, useResetClientKeyStats, useUpdateClientKey,
-  useRotateClientKey,
+  useRotateClientKey, useSetClientKeyMaxCredits,
 } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
 import { GroupSingleSelect } from '@/components/group-select'
@@ -60,6 +60,23 @@ function formatTokens(n: number): string {
   return n.toString()
 }
 
+function formatCredits(n: number): string {
+  if (!Number.isFinite(n)) return '0'
+  return n.toLocaleString('zh-CN', { maximumFractionDigits: 2 })
+}
+
+function parseMaxCredits(raw: string):
+  | { ok: true; value: number | null }
+  | { ok: false; message: string } {
+  const trimmed = raw.trim()
+  if (!trimmed) return { ok: true, value: null }
+  const n = Number(trimmed)
+  if (!Number.isFinite(n) || n < 0) {
+    return { ok: false, message: '积分上限必须是非负数' }
+  }
+  return { ok: true, value: n }
+}
+
 function formatRelative(ts?: string): string {
   if (!ts) return '从未使用'
   const t = new Date(ts).getTime()
@@ -80,6 +97,7 @@ export function ClientKeysPage() {
   const resetStats = useResetClientKeyStats()
   const updateKey = useUpdateClientKey()
   const rotateKey = useRotateClientKey()
+  const setMaxCredits = useSetClientKeyMaxCredits()
   const confirm = useConfirm()
 
   const [createOpen, setCreateOpen] = useState(false)
@@ -92,6 +110,7 @@ export function ClientKeysPage() {
   const [createCacheHitRateMode, setCreateCacheHitRateMode] = useState<ClientKeyCacheHitRateMode>('inherit')
   const [createCacheHitRateMin, setCreateCacheHitRateMin] = useState('')
   const [createCacheHitRateMax, setCreateCacheHitRateMax] = useState('')
+  const [createMaxCredits, setCreateMaxCredits] = useState('')
   const [createdKey, setCreatedKey] = useState<CreateClientKeyResponse | null>(null)
   const [showCreatedPlain, setShowCreatedPlain] = useState(true)
 
@@ -108,6 +127,7 @@ export function ClientKeysPage() {
   const [editCacheHitRateMax, setEditCacheHitRateMax] = useState('')
   const [editBillingMode, setEditBillingMode] = useState<BillingModeChoice>(INHERIT)
   const [editCacheTtl, setEditCacheTtl] = useState<TtlChoice>(INHERIT)
+  const [editMaxCredits, setEditMaxCredits] = useState('')
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -125,6 +145,11 @@ export function ClientKeysPage() {
       }
       cacheHitRate = { minPct: parsed.minPct, maxPct: parsed.maxPct }
     }
+    const maxCreditsParsed = parseMaxCredits(createMaxCredits)
+    if (!maxCreditsParsed.ok) {
+      toast.error(maxCreditsParsed.message)
+      return
+    }
     try {
       const res = await createKey.mutateAsync({
         name,
@@ -132,6 +157,7 @@ export function ClientKeysPage() {
         group: createGroup.trim() || undefined,
         responseMode: createResponseMode,
         cacheHitRate,
+        maxCredits: maxCreditsParsed.value ?? undefined,
       })
       setCreatedKey(res)
       setCreateOpen(false)
@@ -142,6 +168,7 @@ export function ClientKeysPage() {
       setCreateCacheHitRateMode('inherit')
       setCreateCacheHitRateMin('')
       setCreateCacheHitRateMax('')
+      setCreateMaxCredits('')
       setShowCreatedPlain(true)
     } catch (err) {
       toast.error('创建失败：' + extractErrorMessage(err))
@@ -230,6 +257,7 @@ export function ClientKeysPage() {
     const policyForm = cachePolicyToForm(item.cachePolicy)
     setEditBillingMode(policyForm.billingMode)
     setEditCacheTtl(policyForm.ttl)
+    setEditMaxCredits(item.maxCredits == null ? '' : String(item.maxCredits))
     setEditOpen(true)
   }
 
@@ -251,6 +279,11 @@ export function ClientKeysPage() {
       toast.error(err instanceof Error ? err.message : '缓存命中率配置无效')
       return
     }
+    const maxCreditsParsed = parseMaxCredits(editMaxCredits)
+    if (!maxCreditsParsed.ok) {
+      toast.error(maxCreditsParsed.message)
+      return
+    }
     try {
       await updateKey.mutateAsync({
         id: editTarget.id,
@@ -266,6 +299,13 @@ export function ClientKeysPage() {
           }),
         },
       })
+      const currentLimit = editTarget.maxCredits ?? null
+      if (maxCreditsParsed.value !== currentLimit) {
+        await setMaxCredits.mutateAsync({
+          id: editTarget.id,
+          maxCredits: maxCreditsParsed.value,
+        })
+      }
       if (warning) {
         toast.warning(warning)
       } else {
@@ -318,7 +358,7 @@ export function ClientKeysPage() {
       ) : (
         <Card>
           <CardContent className="overflow-x-auto p-0">
-            <table className="w-full min-w-[1040px] text-sm">
+            <table className="w-full min-w-[1140px] text-sm">
               <thead className="text-[12px] text-muted-foreground border-b border-border/60">
                 <tr className="whitespace-nowrap">
                   <th className="text-left font-medium px-4 py-3">ID</th>
@@ -332,6 +372,7 @@ export function ClientKeysPage() {
                   <th className="text-right font-medium px-4 py-3">总调用</th>
                   <th className="text-right font-medium px-4 py-3">输入</th>
                   <th className="text-right font-medium px-4 py-3">输出</th>
+                  <th className="text-right font-medium px-4 py-3">积分</th>
                   <th className="text-left font-medium px-4 py-3">最后使用</th>
                   <th className="text-right font-medium px-4 py-3">操作</th>
                 </tr>
@@ -408,6 +449,23 @@ export function ClientKeysPage() {
                     <td className="px-4 py-3 text-right tabular-nums">{k.totalCalls}</td>
                     <td className="px-4 py-3 text-right tabular-nums">{formatTokens(k.totalInputTokens)}</td>
                     <td className="px-4 py-3 text-right tabular-nums">{formatTokens(k.totalOutputTokens)}</td>
+                    <td className="px-4 py-3 text-right tabular-nums">
+                      {(() => {
+                        const used = k.totalCredits ?? 0
+                        const over = k.maxCredits != null && used >= k.maxCredits
+                        return (
+                          <span className={over ? 'text-destructive' : undefined} title={
+                            k.maxCredits == null
+                              ? '未设置积分上限'
+                              : `已用 ${formatCredits(used)} / 上限 ${formatCredits(k.maxCredits)}`
+                          }>
+                            {k.maxCredits == null
+                              ? formatCredits(used)
+                              : `${formatCredits(used)} / ${formatCredits(k.maxCredits)}`}
+                          </span>
+                        )
+                      })()}
+                    </td>
                     <td className="px-4 py-3 text-[12px] text-muted-foreground">
                       {formatRelative(k.lastUsedAt)}
                     </td>
@@ -567,6 +625,20 @@ export function ClientKeysPage() {
               )}
               <p className="text-[11px] text-muted-foreground">不填写覆盖时沿用全局；0/0 表示关闭该 Key 的命中率整形。</p>
             </div>
+            <div>
+              <label htmlFor="create-max-credits" className="text-[12px] text-muted-foreground">积分上限（可选）</label>
+              <Input
+                id="create-max-credits"
+                inputMode="decimal"
+                placeholder="留空表示不限制"
+                value={createMaxCredits}
+                onChange={(e) => setCreateMaxCredits(e.target.value)}
+                disabled={createKey.isPending}
+              />
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                累计积分达到上限后该 Key 返回 429，不再放行。重置统计会清零已用积分。
+              </p>
+            </div>
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setCreateOpen(false)} disabled={createKey.isPending}>
                 取消
@@ -648,7 +720,7 @@ export function ClientKeysPage() {
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle>编辑 Key</DialogTitle>
-            <DialogDescription>修改名称、描述、分组与回复模式（不影响 Key 值与统计）</DialogDescription>
+            <DialogDescription>修改名称、描述、分组、回复模式与积分上限（不影响 Key 值）</DialogDescription>
           </DialogHeader>
           <form onSubmit={handleEditSave} className="space-y-3 py-2">
             <div>
@@ -777,10 +849,24 @@ export function ClientKeysPage() {
                 在同行口径下这是加价。内部利润报表始终按互斥口径记账，不受此处影响。
               </p>
             </div>
+            <div>
+              <label htmlFor="edit-max-credits" className="text-[12px] text-muted-foreground">积分上限</label>
+              <Input
+                id="edit-max-credits"
+                inputMode="decimal"
+                placeholder="留空表示不限制"
+                value={editMaxCredits}
+                onChange={(e) => setEditMaxCredits(e.target.value)}
+                disabled={updateKey.isPending || setMaxCredits.isPending}
+              />
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                达到上限后该 Key 返回 429，不累加调用次数。留空并保存即取消上限。
+              </p>
+            </div>
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setEditOpen(false)}>取消</Button>
-              <Button type="submit" disabled={updateKey.isPending}>
-                {updateKey.isPending ? '保存中…' : '保存'}
+              <Button type="submit" disabled={updateKey.isPending || setMaxCredits.isPending}>
+                {updateKey.isPending || setMaxCredits.isPending ? '保存中…' : '保存'}
               </Button>
             </DialogFooter>
           </form>

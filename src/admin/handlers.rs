@@ -35,6 +35,7 @@ use super::{
         ProxyCheckUrlRequest, RevisionRequest, SetAccountThrottleConfigRequest,
         SetCacheHitRateRequest, SetCachePolicyRequest, SetCompatibilityConfigRequest,
         SetDeadCredentialConfigRequest, SetDisabledRequest, SetEndpointChainsRequest,
+        SetMaxCreditsRequest,
         SetEndpointModeRequest, SetGlobalProxyRequest, SetImageBudgetRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetModelProfileSettingsRequest,
         SetPriorityRequest, SetProfitConfigRequest, SetProxyBalancingModeRequest,
@@ -1474,6 +1475,8 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         total_output_tokens: k.total_output_tokens,
         total_cache_creation_tokens: k.total_cache_creation_tokens,
         total_cache_read_tokens: k.total_cache_read_tokens,
+        total_credits: k.total_credits,
+        max_credits: k.max_credits,
         response_mode: k.response_mode,
         cache_hit_rate: k.cache_hit_rate,
         cache_policy: k.cache_policy,
@@ -1519,6 +1522,17 @@ pub async fn create_client_key(
                 .into_response();
         }
     };
+    if let Some(v) = payload.max_credits
+        && (!v.is_finite() || v < 0.0)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(super::types::AdminErrorResponse::invalid_request(
+                "maxCredits 必须是非负数",
+            )),
+        )
+            .into_response();
+    }
     let cache_hit_rate = match payload.cache_hit_rate {
         Some(bounds) => match CacheHitRateBounds::new(bounds.min_pct, bounds.max_pct) {
             Ok(bounds) => Some(bounds),
@@ -1559,6 +1573,9 @@ pub async fn create_client_key(
                 .into_response();
         }
     };
+    if let Some(v) = payload.max_credits {
+        state.client_keys.set_max_credits(entry.id, Some(v));
+    }
     Json(CreateClientKeyResponse {
         id: entry.id,
         key: entry.key,
@@ -1568,6 +1585,44 @@ pub async fn create_client_key(
         cache_hit_rate: entry.cache_hit_rate,
     })
     .into_response()
+}
+
+/// POST /api/admin/client-keys/:id/max-credits
+///
+/// 设置或清除单个 Key 的积分使用上限。body: `{ "maxCredits": <number|null> }`
+pub async fn set_client_key_max_credits(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetMaxCreditsRequest>,
+) -> impl IntoResponse {
+    use axum::http::StatusCode;
+    if let Some(v) = payload.max_credits
+        && (!v.is_finite() || v < 0.0)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(super::types::AdminErrorResponse::invalid_request(
+                "maxCredits 必须是非负数",
+            )),
+        )
+            .into_response();
+    }
+    if state.client_keys.set_max_credits(id, payload.max_credits) {
+        let msg = match payload.max_credits {
+            Some(v) => format!("Key #{} 积分上限已设为 {:.2}", id, v),
+            None => format!("Key #{} 已取消积分上限", id),
+        };
+        Json(SuccessResponse::new(msg)).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(super::types::AdminErrorResponse::not_found(format!(
+                "Key #{} 不存在",
+                id
+            ))),
+        )
+            .into_response()
+    }
 }
 
 /// DELETE /api/admin/client-keys/:id

@@ -34,9 +34,9 @@ interface BatchEditCredentialDialogProps {
 }
 
 const ENDPOINT_CHOICES: { value: string; label: string; desc: string }[] = [
-  { value: '', label: '跟随默认', desc: '清空账号端点，首跳跟全局 defaultEndpoint（一般是 ide）。' },
-  { value: 'ide', label: 'ide', desc: '先走 ide。429 时仍可按桶链降到 runtime。' },
-  { value: 'runtime', label: 'runtime', desc: '直接走 runtime，不再先打 ide。' },
+  { value: '', label: '跟随默认', desc: '清空账号端点，首跳跟全局默认协议（ide 或 runtime）。' },
+  { value: 'ide', label: 'ide', desc: '这张号永远走 ide，不受全局默认协议影响。' },
+  { value: 'runtime', label: 'runtime', desc: '这张号永远走官方 runtime。' },
 ]
 
 const MODE_LABELS: { value: GroupMode; label: string; desc: string }[] = [

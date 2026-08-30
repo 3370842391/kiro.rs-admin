@@ -620,6 +620,9 @@ export interface EndpointChainsConfig {
   autoContinueMax: number
   partialStreamRecoveryEnabled: boolean
   partialStreamRecoveryWindowMs: number
+  defaultEndpoint: string
+  rateLimitBucketMode: 'same-endpoint' | 'hop' | 'none'
+  sameEndpointAttempts: number
 }
 
 export interface SetEndpointChainsRequest {
@@ -630,6 +633,9 @@ export interface SetEndpointChainsRequest {
   autoContinueMax?: number
   partialStreamRecoveryEnabled?: boolean
   partialStreamRecoveryWindowMs?: number
+  defaultEndpoint?: string
+  rateLimitBucketMode?: 'same-endpoint' | 'hop' | 'none'
+  sameEndpointAttempts?: number
 }
 
 export async function getEndpointChains(): Promise<EndpointChainsConfig> {

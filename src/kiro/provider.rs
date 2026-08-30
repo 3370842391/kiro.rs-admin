@@ -18,6 +18,9 @@ use crate::admin::trace_db::{
 };
 use crate::anthropic::converter::normalize_model_id;
 use crate::http_client::{ProxyConfig, build_client_with_read_timeout};
+use crate::kiro::endpoint::rate_limit::{
+    apply_bucket_mode, resolve_primary_endpoint, stay_on_same_endpoint,
+};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::image_budget::ImageBudgetPolicy;
 use crate::kiro::machine_id;
@@ -845,12 +848,16 @@ impl KiroProvider {
         proxy: Option<ProxyConfig>,
         sink: Option<&dyn TraceSink>,
         attempt: u32,
+        request_attempt: u32,
+        request_attempt_max: u32,
     ) -> anyhow::Result<reqwest::Response> {
         let rctx = RequestContext {
             credentials: &ctx.credentials,
             token: &ctx.token,
             machine_id,
             config,
+            request_attempt,
+            request_attempt_max,
         };
 
         let url = endpoint.api_url(&rctx);
@@ -960,6 +967,8 @@ impl KiroProvider {
         request_body: &str,
         sink: Option<&dyn TraceSink>,
         attempt: u32,
+        request_attempt: u32,
+        request_attempt_max: u32,
     ) -> anyhow::Result<ProxyAttemptResult> {
         let candidates = self.proxy_candidates_for(ctx.id, &ctx.credentials);
         let candidate_count = candidates.len();
@@ -990,6 +999,8 @@ impl KiroProvider {
                     proxy.clone(),
                     sink,
                     attempt,
+                    request_attempt,
+                    request_attempt_max,
                 )
                 .await
             {
@@ -1054,6 +1065,8 @@ impl KiroProvider {
             token: &ctx.token,
             machine_id,
             config,
+            request_attempt: 1,
+            request_attempt_max: 1,
         };
         let url = endpoint.mcp_url(&rctx);
         let body = endpoint.transform_mcp_body(request_body, &rctx);
@@ -1136,13 +1149,8 @@ impl KiroProvider {
             crate::kiro::region::validate_api_region(api_region)?;
         }
         let configured_name = credentials.endpoint.as_deref();
-        let name = configured_name.unwrap_or_else(|| {
-            if self.token_manager.get_endpoint_mode() == EndpointMode::Best {
-                BEST_ENDPOINT_NAME
-            } else {
-                self.default_endpoint.as_str()
-            }
-        });
+        let default_endpoint = self.token_manager.get_default_endpoint();
+        let name = resolve_primary_endpoint(configured_name, default_endpoint.as_str());
         self.endpoints
             .get(name)
             .cloned()
@@ -1315,6 +1323,8 @@ impl KiroProvider {
                 &request_body,
                 None,
                 0,
+                1,
+                self.token_manager.same_endpoint_attempts(),
             )
             .await
         {
@@ -1704,6 +1714,8 @@ impl KiroProvider {
                     request_body,
                     sink,
                     attempt as u32,
+                    1,
+                    self.token_manager.same_endpoint_attempts(),
                 )
                 .await
             {
@@ -1972,11 +1984,14 @@ impl KiroProvider {
                 // 整条链都失败才落回下方的账号风控/瞬态重试逻辑。参考 demo 的多端点重试。
                 //
                 // 降级链来源见 resolve_fallback_chain：面板覆盖 > best 内置链 > 静态链。
-                let fallback_chain: Vec<String> = resolve_fallback_chain(
-                    endpoint.name(),
-                    endpoint.fallback_chain(),
-                    self.token_manager.endpoint_chain_for(endpoint.name()),
-                    self.token_manager.get_endpoint_mode(),
+                let fallback_chain: Vec<String> = apply_bucket_mode(
+                    self.token_manager.get_rate_limit_bucket_mode(),
+                    resolve_fallback_chain(
+                        endpoint.name(),
+                        endpoint.fallback_chain(),
+                        self.token_manager.endpoint_chain_for(endpoint.name()),
+                        self.token_manager.get_endpoint_mode(),
+                    ),
                 );
                 for fb_name in &fallback_chain {
                     // 单请求桶尝试总数硬上限（跨 attempt 累计）：防止「链长 × attempt 数」
@@ -2011,6 +2026,8 @@ impl KiroProvider {
                             selected_proxy.clone(),
                             sink,
                             attempt as u32,
+                            1,
+                            1,
                         )
                         .await
                     {
@@ -2113,6 +2130,78 @@ impl KiroProvider {
                                 fb_name,
                                 e
                             );
+                        }
+                    }
+                }
+                let bucket_mode = self.token_manager.get_rate_limit_bucket_mode();
+                let max_same = self.token_manager.same_endpoint_attempts();
+                if status.as_u16() == 429
+                    && !account_throttled
+                    && stay_on_same_endpoint(bucket_mode, 1, max_same, false)
+                {
+                    for same_try in 2..=max_same {
+                        let delay = Self::retry_delay_for_status(
+                            status,
+                            (same_try - 1) as usize,
+                            retry_mode,
+                            &retry_policy,
+                            retry_after,
+                        );
+                        tracing::info!(
+                            "凭据 #{} 端点 [{}] 普通 429，同端点重试 {}/{}",
+                            ctx.id,
+                            endpoint_name,
+                            same_try,
+                            max_same
+                        );
+                        sleep(delay).await;
+                        match self
+                            .execute_api_request_with_proxy_failover(
+                                &endpoint,
+                                &ctx,
+                                &machine_id,
+                                config,
+                                request_body,
+                                sink,
+                                attempt as u32,
+                                same_try,
+                                max_same,
+                            )
+                            .await
+                        {
+                            Ok(retry_result) if retry_result.response.status().is_success() => {
+                                Self::emit_attempt(
+                                    sink,
+                                    attempt,
+                                    ctx.id,
+                                    endpoint_name,
+                                    Some(retry_result.response.status().as_u16()),
+                                    outcome::SUCCESS,
+                                    None,
+                                    Instant::now(),
+                                );
+                                self.token_manager.report_success(ctx.id);
+                                self.token_manager
+                                    .confirm_session_affinity(affinity_key.as_deref(), ctx.id);
+                                return Ok(KiroCallResult {
+                                    response: retry_result.response,
+                                    credential_id: ctx.id,
+                                });
+                            }
+                            Ok(retry_result)
+                                if retry_result.response.status().as_u16() == 429 =>
+                            {
+                                self.token_manager.record_rate_limit_hit(ctx.id);
+                                if !stay_on_same_endpoint(
+                                    bucket_mode,
+                                    same_try,
+                                    max_same,
+                                    false,
+                                ) {
+                                    break;
+                                }
+                            }
+                            _ => break,
                         }
                     }
                 }

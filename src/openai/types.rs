@@ -25,6 +25,10 @@ pub struct ChatCompletionRequest {
     pub reasoning_effort: Option<String>,
     pub reasoning: Option<Value>,
     pub stream_options: Option<StreamOptions>,
+    #[serde(default)]
+    pub prompt_cache_key: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -96,6 +100,10 @@ pub struct ResponsesRequest {
     pub max_tokens: Option<i32>,
     pub reasoning: Option<Value>,
     pub metadata: Option<Value>,
+    #[serde(default)]
+    pub prompt_cache_key: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -230,7 +238,44 @@ pub fn responses_to_chat_request(
         reasoning_effort: None,
         reasoning: req.reasoning.clone(),
         stream_options: None,
+        prompt_cache_key: req.prompt_cache_key.clone(),
+        session_id: req.session_id.clone(),
     })
+}
+
+/// 从候选串中提取第一个合法 UUID，并归一成 hyphenated 小写形式。
+pub fn extract_session_uuid(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if let Ok(id) = uuid::Uuid::parse_str(trimmed) {
+        return Some(id.to_string());
+    }
+    let bytes = trimmed.as_bytes();
+    if bytes.len() < 36 {
+        return None;
+    }
+    for i in 0..=bytes.len() - 36 {
+        if let Ok(slice) = std::str::from_utf8(&bytes[i..i + 36])
+            && let Ok(id) = uuid::Uuid::parse_str(slice)
+        {
+            return Some(id.to_string());
+        }
+    }
+    None
+}
+
+/// OpenAI/Codex 会话亲和：按官方优先级提取 UUID。
+///
+/// `prompt_cache_key` → `x-session-affinity` → `x-client-request-id` → `session_id`
+pub fn resolve_openai_conversation_id(
+    prompt_cache_key: Option<&str>,
+    session_affinity: Option<&str>,
+    client_request_id: Option<&str>,
+    session_id: Option<&str>,
+) -> Option<String> {
+    [prompt_cache_key, session_affinity, client_request_id, session_id]
+        .into_iter()
+        .flatten()
+        .find_map(extract_session_uuid)
 }
 
 pub fn responses_input_to_messages(
@@ -1041,4 +1086,81 @@ pub fn response_output_from_parts(parts: &AssistantParts) -> (Vec<Value>, String
         }));
     }
     (output, parts.text.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_session_uuid_accepts_bare_and_embedded() {
+        assert_eq!(
+            extract_session_uuid("A0662283-7FD3-4399-A7EB-52B9A717AE88"),
+            Some("a0662283-7fd3-4399-a7eb-52b9a717ae88".to_string())
+        );
+        assert_eq!(
+            extract_session_uuid("org:a0662283-7fd3-4399-a7eb-52b9a717ae88:turn"),
+            Some("a0662283-7fd3-4399-a7eb-52b9a717ae88".to_string())
+        );
+        assert_eq!(extract_session_uuid("not-a-uuid"), None);
+        assert_eq!(extract_session_uuid(""), None);
+    }
+
+    #[test]
+    fn resolve_openai_conversation_id_follows_priority() {
+        let sid = "11111111-1111-1111-1111-111111111111";
+        let cache = "22222222-2222-2222-2222-222222222222";
+        let affinity = "33333333-3333-3333-3333-333333333333";
+        let request_id = "44444444-4444-4444-4444-444444444444";
+
+        assert_eq!(
+            resolve_openai_conversation_id(Some(cache), Some(affinity), Some(request_id), Some(sid)),
+            Some(cache.to_string())
+        );
+        assert_eq!(
+            resolve_openai_conversation_id(None, Some(affinity), Some(request_id), Some(sid)),
+            Some(affinity.to_string())
+        );
+        assert_eq!(
+            resolve_openai_conversation_id(None, None, Some(request_id), Some(sid)),
+            Some(request_id.to_string())
+        );
+        assert_eq!(
+            resolve_openai_conversation_id(None, None, None, Some(sid)),
+            Some(sid.to_string())
+        );
+        assert_eq!(
+            resolve_openai_conversation_id(Some("bad"), Some("also-bad"), None, None),
+            None
+        );
+    }
+
+    #[test]
+    fn responses_to_chat_request_forwards_session_fields() {
+        let req = ResponsesRequest {
+            model: Some("gpt-4o".into()),
+            input: Some(Value::String("hi".into())),
+            instructions: None,
+            stream: false,
+            tools: Vec::new(),
+            tool_choice: None,
+            previous_response_id: None,
+            store: None,
+            max_output_tokens: None,
+            max_tokens: None,
+            reasoning: None,
+            metadata: None,
+            prompt_cache_key: Some("a0662283-7fd3-4399-a7eb-52b9a717ae88".into()),
+            session_id: Some("11111111-1111-1111-1111-111111111111".into()),
+        };
+        let chat = responses_to_chat_request(&req, Vec::new()).unwrap();
+        assert_eq!(
+            chat.prompt_cache_key.as_deref(),
+            Some("a0662283-7fd3-4399-a7eb-52b9a717ae88")
+        );
+        assert_eq!(
+            chat.session_id.as_deref(),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
+    }
 }

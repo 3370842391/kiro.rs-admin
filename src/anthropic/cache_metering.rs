@@ -950,9 +950,25 @@ fn isolation_seed(req: &MessagesRequest, key_id: u64) -> Option<String> {
 
 /// 从 Claude Code 的 user_id 中提取 session 标识。
 ///
-/// 格式形如 `user_<hash>_account__session_<uuid>`，取 `_session_` 之后的部分。
-/// 不含该标记时返回 None（交由调用方退回 key_id）。
+/// 支持两种形态：
+/// 1. JSON 对象：`{"device_id":"...","account_uuid":"...","session_id":"..."}`
+///    —— 新版 Claude Code 实际发送的形态，取 `session_id` 字段。
+/// 2. 字符串：`user_<hash>_account__session_<uuid>` —— 取 `_session_` 之后的部分。
+///
+/// 两者都取不到时返回 None（交由调用方退回 key_id）。
+///
+/// 这里刻意不做 UUID 校验：只需要一个跨轮稳定、跨会话唯一的隔离标识。
 fn extract_session_id(user_id: &str) -> Option<String> {
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(user_id)
+        && let Some(sid) = json
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    {
+        return Some(sid.to_string());
+    }
+
     user_id
         .split_once("_session_")
         .map(|(_, sid)| sid.trim().to_string())
@@ -2195,6 +2211,7 @@ mod tests {
             output_config: None,
             metadata: Some(Metadata {
                 user_id: Some(format!("user_abc_account__session_{session}")),
+                conversation_id_hint: None,
             }),
         };
         let cache = CacheMeter::new(None);
@@ -2292,6 +2309,28 @@ mod tests {
         );
         assert_eq!(extract_session_id("no-session-here"), None);
         assert_eq!(extract_session_id("trailing_session_"), None);
+    }
+
+    #[test]
+    fn extract_session_id_parses_json_format() {
+        let user_id = r#"{"device_id":"2721550240e8e5303fa95053fab0666443ab2b2ea79c2fc67bb6ff336f1297a9","account_uuid":"","session_id":"c479866d-b846-4e87-807b-a5ed0d84948c"}"#;
+        assert_eq!(
+            extract_session_id(user_id),
+            Some("c479866d-b846-4e87-807b-a5ed0d84948c".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_session_id_json_without_session_falls_back() {
+        assert_eq!(extract_session_id(r#"{"device_id":"abc"}"#), None);
+        assert_eq!(
+            extract_session_id(r#"{"device_id":"abc","session_id":""}"#),
+            None
+        );
+        assert_eq!(
+            extract_session_id(r#"{"device_id":"abc","session_id":"  "}"#),
+            None
+        );
     }
 
     /// token 口径纯净性：cum_tokens 只算原文，不含 role / 签名前缀 / 分隔符噪声。

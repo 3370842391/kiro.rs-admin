@@ -97,6 +97,8 @@ export interface CredentialStatusItem {
   /** 普通 429 策略冷却剩余毫秒数（>0 表示冷却中） */
   rateLimitedRemainingMs?: number
   endpoint: string
+  /** false = 跟随全局默认协议 */
+  endpointPinned?: boolean
   /** 账号所属分组（可属于多个分组） */
   groups?: string[]
   /** 账号来源渠道（纯备注） */
@@ -408,6 +410,8 @@ export interface UpdateCredentialRequest {
   costRmb?: number
   /** 额度积分。undefined 不修改，0 表示清除（改回用上游额度） */
   quotaCredits?: number
+  /** 账号首跳端点。空串表示清除，改回跟全局默认 */
+  endpoint?: string
 }
 
 export interface BatchCredentialGroupPatch {
@@ -883,6 +887,10 @@ export interface ClientKeyItem {
   totalOutputTokens: number
   totalCacheCreationTokens: number
   totalCacheReadTokens: number
+  /** 累计积分（metering credits） */
+  totalCredits: number
+  /** 积分上限；未设置表示不限制 */
+  maxCredits?: number
   /** 绑定的账号分组（未绑定时为 undefined） */
   group?: string
   responseMode: ClientResponseMode
@@ -904,6 +912,8 @@ export interface CreateClientKeyRequest {
   group?: string
   responseMode?: ClientResponseMode
   cacheHitRate?: CacheHitRateBounds
+  /** 创建时可选的积分上限；不传表示不限制 */
+  maxCredits?: number
 }
 
 /** 创建响应：明文 Key 仅在此处返回一次 */

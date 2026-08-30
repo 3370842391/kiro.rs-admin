@@ -157,6 +157,8 @@ mod tests {
             token: "tok",
             machine_id: "machine",
             config: &config,
+            request_attempt: 1,
+            request_attempt_max: 3,
         };
         assert_eq!(
             endpoint.api_url(&ctx),
@@ -179,6 +181,8 @@ mod tests {
             token: "redacted",
             machine_id: "machine",
             config: &config,
+            request_attempt: 1,
+            request_attempt_max: 3,
         };
 
         assert_eq!(

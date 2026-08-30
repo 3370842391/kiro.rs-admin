@@ -9,6 +9,8 @@ test('endpoint mode UI exposes best-mode API and the four-endpoint chain', async
   expect(api).toContain('EndpointModeConfig')
   expect(hooks).toContain("queryKey: ['endpointMode']")
   expect(dialog).toContain('默认最好模式')
+  expect(dialog).toContain('默认协议')
+  expect(dialog).toContain('同端点3次后换号')
   expect(dialog).toContain('Kiro Runtime')
   expect(dialog).toContain('codewhisperer')
   expect(dialog).toContain('amazonq')

@@ -160,16 +160,26 @@ pub async fn auth_middleware(
 
     // 所有 Key 统一走客户端 Key 管理器校验
     if let Some(mgr) = &state.client_keys {
-        if let Some(authorized) = mgr.verify_and_touch_context(&presented) {
-            request.extensions_mut().insert(KeyContext {
-                key_id: authorized.id,
-                group: authorized.group,
-                key_source: TraceKeySource::ClientKey,
-                response_mode: authorized.response_mode,
-                cache_hit_rate: authorized.cache_hit_rate,
-                cache_policy: authorized.cache_policy,
-            });
-            return next.run(request).await;
+        match mgr.verify_and_touch_ex(&presented) {
+            crate::admin::client_keys::KeyAuth::Ok(authorized) => {
+                request.extensions_mut().insert(KeyContext {
+                    key_id: authorized.id,
+                    group: authorized.group,
+                    key_source: TraceKeySource::ClientKey,
+                    response_mode: authorized.response_mode,
+                    cache_hit_rate: authorized.cache_hit_rate,
+                    cache_policy: authorized.cache_policy,
+                });
+                return next.run(request).await;
+            }
+            crate::admin::client_keys::KeyAuth::OverLimit { used, limit, .. } => {
+                let error = ErrorResponse::new(
+                    "rate_limit_error",
+                    format!("Client key credit limit exceeded ({used:.4}/{limit:.4})"),
+                );
+                return (StatusCode::TOO_MANY_REQUESTS, Json(error)).into_response();
+            }
+            crate::admin::client_keys::KeyAuth::NotFound => {}
         }
     }
 
@@ -250,6 +260,55 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["responseMode"], "kiro_native");
+    }
+
+    #[tokio::test]
+    async fn over_limit_key_returns_rate_limit_error_without_entering_handler() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use axum::middleware;
+        use axum::routing::get;
+        use axum::{Extension, Router};
+        use std::sync::Arc;
+        use tower::ServiceExt;
+
+        async fn forbidden_handler(Extension(_context): Extension<KeyContext>) -> &'static str {
+            panic!("over-limit request must not reach the handler");
+        }
+
+        let keys = Arc::new(crate::admin::ClientKeyManager::new());
+        let key = keys.create("capped".into(), None, None);
+        assert!(keys.set_max_credits(key.id, Some(1.0)));
+        keys.record_usage(key.id, 0, 0, 0, 0, 1.5);
+        let state = AppState::new(
+            false,
+            crate::model::config::ToolCompatibilityMode::ClaudeCode,
+        )
+        .with_usage(Some(keys.clone()), None, None);
+        let app = Router::new()
+            .route("/", get(forbidden_handler))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ))
+            .with_state(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("x-api-key", key.key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["type"], "rate_limit_error");
+        assert_eq!(keys.list()[0].total_calls, 0);
     }
 
     #[tokio::test]
