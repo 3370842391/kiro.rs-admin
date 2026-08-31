@@ -4543,6 +4543,21 @@ impl MultiTokenManager {
         validated_cred.proxy_password = new_cred.proxy_password;
         validated_cred.kiro_api_key = new_cred.kiro_api_key;
 
+        // 环境标识（UA 的 os/ 与 node 段）必须在这里分配，不能只靠启动时回填。
+        //
+        // 回填在 `Self::new` 里，只对「进程启动时已存在」的凭据生效。运行中通过面板
+        // 或批量导入加进来的号会一直是 None，一路回落到全局 config——于是一批新号
+        // 共用同一套环境，正是按号分散要避免的。补一次的成本是常数，别指望下次重启。
+        //
+        // 顺序要求：种子取 machineId，所以必须先确保它有值。
+        if validated_cred.machine_id.is_none() {
+            validated_cred.machine_id = Some(machine_id::generate_from_credentials(
+                &validated_cred,
+                &self.config,
+            ));
+        }
+        client_identity::assign_missing(&mut validated_cred);
+
         {
             let mut entries = self.entries.lock();
             // 并发安全：token 刷新（网络）在锁外完成，期间可能有其它并发的
@@ -6612,6 +6627,60 @@ mod tests {
         assert!(id > 0);
         assert_eq!(manager.total_count(), 1);
         assert_eq!(manager.available_count(), 1);
+    }
+
+    /// 回归：运行中新加的号也要拿到自己的环境标识。
+    ///
+    /// 回填只发生在 `MultiTokenManager::new`，即进程启动时。面板/批量导入加进来的号
+    /// 走的是 `add_credential`，此前不分配，于是一批新号全部回落到全局 config、
+    /// 共用同一套 UA——按号分散就白做了。
+    #[tokio::test]
+    async fn newly_added_credentials_get_their_own_client_identity() {
+        let manager =
+            MultiTokenManager::new(Config::default(), Vec::new(), None, None, true).unwrap();
+
+        let mut ids = Vec::new();
+        for index in 0..6 {
+            let credential = KiroCredentials {
+                auth_method: Some("api_key".to_string()),
+                kiro_api_key: Some(format!("ksk_added_{index}")),
+                api_region: Some("us-east-1".to_string()),
+                ..Default::default()
+            };
+            ids.push(manager.add_credential(credential).await.unwrap());
+        }
+
+        // 快照类型不暴露这两个字段，直接看内部条目
+        let entries = manager.entries.lock();
+        let mut combos = std::collections::HashSet::new();
+        for id in &ids {
+            let cred = entries
+                .iter()
+                .find(|e| e.id == *id)
+                .map(|e| &e.credentials)
+                .expect("新增凭据应在池内");
+            let system = cred
+                .system_version
+                .as_deref()
+                .expect("新增凭据必须带 systemVersion，否则会回落到全局共用值");
+            let node = cred.node_version.as_deref().expect("必须带 nodeVersion");
+            assert!(
+                system.contains('#'),
+                "os/ 段应为 <平台>#<版本>，实际 {system}"
+            );
+            assert!(
+                crate::kiro::client_identity::PROFILES
+                    .iter()
+                    .any(|p| p.system_version == system && p.node_version == node),
+                "组合必须来自白名单，实际 {system} / {node}"
+            );
+            combos.insert((system.to_string(), node.to_string()));
+        }
+        assert!(
+            combos.len() >= 2,
+            "6 个新号不该全部落到同一套环境，实际只有 {} 种",
+            combos.len()
+        );
     }
 
     #[tokio::test]
