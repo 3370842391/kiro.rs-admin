@@ -47,9 +47,23 @@ pub fn stay_on_same_endpoint(
 
 /// 官方 `x-kiro-attempt`：`1;max=3`。
 pub fn kiro_attempt_header(attempt: u32, max_attempts: u32) -> String {
-    let max = max_attempts.max(1);
-    let attempt = attempt.clamp(1, max);
+    let (attempt, max) = clamp_attempt(attempt, max_attempts);
     format!("{attempt};max={max}")
+}
+
+/// AWS SDK 的 `amz-sdk-request`：`attempt=1; max=3`。
+///
+/// 必须与 [`kiro_attempt_header`] 取同一对 (attempt, max)。此前这个头被写死成
+/// `attempt=1`，而 `x-kiro-attempt` 是动态的——同一次重试里两个描述重试进度的头
+/// 互相矛盾（第 2 跳时一个说 2、一个说 1），真实 SDK 不会这样。
+pub fn amz_sdk_request_header(attempt: u32, max_attempts: u32) -> String {
+    let (attempt, max) = clamp_attempt(attempt, max_attempts);
+    format!("attempt={attempt}; max={max}")
+}
+
+fn clamp_attempt(attempt: u32, max_attempts: u32) -> (u32, u32) {
+    let max = max_attempts.max(1);
+    (attempt.clamp(1, max), max)
 }
 
 #[cfg(test)]
@@ -120,5 +134,16 @@ mod tests {
         assert_eq!(kiro_attempt_header(3, 3), "3;max=3");
         assert_eq!(kiro_attempt_header(0, 3), "1;max=3");
         assert_eq!(kiro_attempt_header(9, 3), "3;max=3");
+    }
+
+    #[test]
+    fn amz_sdk_request_tracks_the_same_attempt_as_kiro_header() {
+        for (attempt, max) in [(1, 3), (2, 3), (3, 3), (0, 3), (9, 3), (1, 1)] {
+            let kiro = kiro_attempt_header(attempt, max);
+            let amz = amz_sdk_request_header(attempt, max);
+            let (n, m) = kiro.split_once(";max=").expect("形如 2;max=3");
+            assert_eq!(amz, format!("attempt={n}; max={m}"), "两个头必须同源");
+        }
+        assert_eq!(amz_sdk_request_header(2, 3), "attempt=2; max=3");
     }
 }

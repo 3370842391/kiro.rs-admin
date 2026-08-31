@@ -671,8 +671,16 @@ export interface ProxyCheckUrlRequest {
 
 // 批量添加代理请求
 export interface BatchAddProxyRequest {
+  /**
+   * 每行一个。除完整 URL 外，也接受代理商导出的裸写法
+   * `host:port:用户名:密码` 与 `host:port`。
+   */
   urls: string[]
+  /** 裸写法要补的协议；省略则用 socks5。已带 scheme 的行不受影响 */
+  scheme?: ProxyScheme
 }
+
+export type ProxyScheme = 'socks5' | 'socks4' | 'http' | 'https'
 
 // 分配代理给凭据请求
 export interface AssignProxyRequest {
@@ -685,6 +693,32 @@ export interface BatchAddProxyResponse {
   errors: number
   proxies: ProxyPoolEntry[]
   errorMessages: string[]
+}
+
+// 批量删除代理请求
+export interface BatchDeleteProxyRequest {
+  ids: number[]
+  /**
+   * 是否允许删除仍被凭据绑定的出口。缺省 false，这类出口会被跳过并点名。
+   *
+   * 删掉池内条目不会解绑凭据：凭据自己存着 proxyUrl，删完照样从那个 IP 出去，
+   * 只是从此没有健康检查、没有封号统计、也不再参与自动改绑。
+   */
+  force?: boolean
+}
+
+// 被跳过的「使用中」出口
+export interface ProxyInUseSkip {
+  id: number
+  url: string
+  credentialCount: number
+}
+
+// 批量删除代理响应
+export interface BatchDeleteProxyResponse {
+  deleted: number
+  skippedInUse: ProxyInUseSkip[]
+  notFound: number[]
 }
 
 // 单个代理健康检查响应

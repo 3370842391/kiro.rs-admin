@@ -4,6 +4,7 @@ pub mod auth;
 pub mod endpoint;
 pub mod image_budget;
 pub mod kiro_version;
+pub mod client_identity;
 pub mod machine_id;
 pub mod model;
 pub mod model_capabilities;

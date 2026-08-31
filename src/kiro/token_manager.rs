@@ -19,6 +19,7 @@ use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::kiro_version::USAGE_API_KIRO_VERSION;
+use crate::kiro::client_identity;
 use crate::kiro::machine_id;
 use crate::kiro::model::available_models::ListAvailableModelsResponse;
 use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
@@ -284,8 +285,11 @@ async fn refresh_idc_token(
     // 优先级：凭据.auth_region > 凭据.region > config.auth_region > config.region
     let region = credentials.effective_auth_region(config);
     let refresh_url = format!("https://oidc.{}.amazonaws.com/token", region);
-    let os_name = &config.system_version;
-    let node_version = &config.node_version;
+    // 按号解析，不直接读全局配置：同一个号在刷新接口与聊天接口声明不同环境，
+    // 比全池共用一套更容易被识别。见 crate::kiro::client_identity。
+    let identity = client_identity::resolve(credentials, config);
+    let os_name = identity.system_version;
+    let node_version = identity.node_version;
 
     let x_amz_user_agent = "aws-sdk-js/3.980.0 KiroIDE";
     let user_agent = format!(
@@ -654,8 +658,9 @@ pub(crate) async fn get_usage_limits(
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     // API Key 使用当前有效版本；OAuth/SSO 保留 USAGE_API_KIRO_VERSION 兼容语义。
     let kiro_version = rest_kiro_version_for(credentials, config);
-    let os_name = &config.system_version;
-    let node_version = &config.node_version;
+    let identity = client_identity::resolve(credentials, config);
+    let os_name = identity.system_version;
+    let node_version = identity.node_version;
 
     // profileArn 查询串：仅发送真实 ARN，跳过 BuilderID 占位符
     let profile_arn_query = rest_profile_arn(credentials)
@@ -856,9 +861,10 @@ pub(crate) async fn get_available_models(
     let candidates = rest_api_region_candidates_for(credentials, config)?;
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     let kiro_version = rest_kiro_version_for(credentials, config);
+    let identity = client_identity::resolve(credentials, config);
     let user_agent = format!(
         "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
-        config.system_version, config.node_version, kiro_version, machine_id
+        identity.system_version, identity.node_version, kiro_version, machine_id
     );
     let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
     let client = build_client(proxy, 60, config.tls_backend)?;
@@ -917,8 +923,9 @@ pub(crate) async fn list_available_profiles(
     let candidates = rest_api_region_candidates_for(credentials, config)?;
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     let kiro_version = rest_kiro_version_for(credentials, config);
-    let os_name = &config.system_version;
-    let node_version = &config.node_version;
+    let identity = client_identity::resolve(credentials, config);
+    let os_name = identity.system_version;
+    let node_version = identity.node_version;
 
     let user_agent = format!(
         "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
@@ -1002,8 +1009,9 @@ pub(crate) async fn set_user_preference(
     let candidates = rest_api_region_candidates_for(credentials, config)?;
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     let kiro_version = rest_kiro_version_for(credentials, config);
-    let os_name = &config.system_version;
-    let node_version = &config.node_version;
+    let identity = client_identity::resolve(credentials, config);
+    let os_name = identity.system_version;
+    let node_version = identity.node_version;
 
     let user_agent = format!(
         "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
@@ -1508,6 +1516,9 @@ pub struct MultiTokenManager {
     retry_policy: Mutex<Option<RetryPolicy>>,
     /// 429 降级桶链运行时覆盖（运行时可修改）。None = 回退各 endpoint 静态 fallback_chain()。
     endpoint_chains: Mutex<Option<HashMap<String, Vec<String>>>>,
+    /// failover 模式下普通 429 的账号级冷却毫秒数。0 = 不冷却。
+    /// 见 [`crate::model::config::Config::failover_rate_limit_cooldown_ms`]。
+    failover_rate_limit_cooldown_ms: AtomicU64,
     /// 全局端点路由模式，运行时可由 Admin API 切换。
     endpoint_mode: Mutex<EndpointMode>,
     /// 凭据未钉端点时的首跳协议。
@@ -1734,6 +1745,12 @@ impl MultiTokenManager {
                         Some(machine_id::generate_from_credentials(&cred, config_ref));
                     has_new_machine_ids = true;
                 }
+                // 环境标识（UA 的 os/ 与 node 段）按号补一套并落盘，与 machineId 同一
+                // 套路：一次分配、之后不变。必须在 machineId 之后——分配用它做种子，
+                // 这样同一个号在 refreshToken 轮换后仍拿到同一套环境。
+                if client_identity::assign_missing(&mut cred) {
+                    has_new_machine_ids = true;
+                }
                 // 升级前的凭据文件没有 added_at，按「首次见到」回填并落盘。
                 // 回填值不是真实加入时间，展示层靠 `added_at_backfilled` 之类的推断
                 // 无从判断，因此这里只保证字段非空、由文案提示口径（见 credential-card）。
@@ -1846,6 +1863,9 @@ impl MultiTokenManager {
         let endpoint_mode = config.endpoint_mode;
         let default_endpoint = config.default_endpoint.clone();
         let rate_limit_bucket_mode = config.rate_limit_bucket_mode;
+        // 上限 120s 与 RetryPolicy::validate 的 rateLimitCooldownMs 保持同一量级：
+        // failover 的语义是短暂让位，配成分钟级会把号长时间移出轮转。
+        let failover_rate_limit_cooldown_ms = config.failover_rate_limit_cooldown_ms.min(120_000);
         let same_endpoint_attempts = config.same_endpoint_attempts.max(1);
         let max_bucket_attempts = config.max_bucket_attempts_per_request;
         let stream_idle_timeout_secs = config.stream_idle_timeout_secs;
@@ -1891,6 +1911,7 @@ impl MultiTokenManager {
             endpoint_mode: Mutex::new(endpoint_mode),
             default_endpoint: Mutex::new(default_endpoint),
             rate_limit_bucket_mode: Mutex::new(rate_limit_bucket_mode),
+            failover_rate_limit_cooldown_ms: AtomicU64::new(failover_rate_limit_cooldown_ms),
             same_endpoint_attempts: AtomicU32::new(same_endpoint_attempts),
             session_affinity: Mutex::new(HashMap::new()),
             max_bucket_attempts_per_request: AtomicUsize::new(max_bucket_attempts),
@@ -5941,6 +5962,11 @@ impl MultiTokenManager {
     /// 获取账号级风控冷却时长秒数（Admin API）
     pub fn get_account_throttle_cooldown_secs(&self) -> u64 {
         self.account_throttle_cooldown_secs.load(Ordering::Relaxed)
+    }
+
+    /// failover 模式下普通 429 的账号级冷却毫秒数。0 = 不冷却（历史行为）。
+    pub fn failover_rate_limit_cooldown_ms(&self) -> u64 {
+        self.failover_rate_limit_cooldown_ms.load(Ordering::Relaxed)
     }
 
     /// 设置账号级风控故障转移配置（Admin API）

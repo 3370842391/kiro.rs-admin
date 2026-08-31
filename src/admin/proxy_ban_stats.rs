@@ -804,8 +804,27 @@ pub fn assess_pool_risk(
             let selection_weight = (-PENALTY_K * excess * confidence)
                 .exp()
                 .clamp(MIN_SELECTION_WEIGHT, 1.0);
-            let selection_tier = SelectionTier::from_weight(selection_weight);
             let above_pool_baseline = excess > 0.0;
+            let sample_ok =
+                s.accounts_seen >= MIN_ACCOUNTS_FOR_VERDICT && s.total_bans >= MIN_BANS_FOR_VERDICT;
+
+            // 权重回答「差多少」，是个连续量；但「是不是确实更差」已经由
+            // `above_pool_baseline`（置信下界高过全池基线）加 `sample_ok`（样本够）
+            // 给出了明确的**二值**结论。两者必须结合，否则会出现这种情况：
+            //
+            // 2026-09-01 线上，`154.91.156.198` 是 33 个号烧了 9 个、置信下界 15%
+            // 对全池基线 10%，两项检验都通过，程序自己在理由里写着「确实比平均更容易
+            // 烧号」「样本足够」——但权重算下来 0.644，比 TIER_NORMAL_WEIGHT(0.6)
+            // 高一点点，于是判成 Normal，和零封号出口同档参与轮换。当晚新加的号
+            // 被轮询分到它上面，22 分钟即死。
+            //
+            // 所以：一旦有证据认定它比全池平均更容易烧号，就至少降一档——干净出口
+            // 还没用完之前不该轮到它。具体降到哪一档仍由权重决定。
+            let selection_tier = if above_pool_baseline && sample_ok {
+                SelectionTier::from_weight(selection_weight).max(SelectionTier::Degraded)
+            } else {
+                SelectionTier::from_weight(selection_weight)
+            };
 
             if s.total_bans == 0 {
                 return (
@@ -857,8 +876,6 @@ pub fn assess_pool_risk(
                 ));
             }
 
-            let sample_ok =
-                s.accounts_seen >= MIN_ACCOUNTS_FOR_VERDICT && s.total_bans >= MIN_BANS_FOR_VERDICT;
             if sample_ok {
                 reasons.push(format!(
                     "样本足够：{} 个号里封了 {} 个",
@@ -1570,6 +1587,68 @@ mod tests {
         let risk = assess_pool_risk(&summaries, 2);
         assert!(risk["bad:1"].selection_weight >= MIN_SELECTION_WEIGHT);
         assert!(risk["bad:1"].selection_weight > 0.0);
+    }
+
+    /// 回归：2026-09-01 线上形状——证据齐全但权重刚好压线，于是留在 Normal 档。
+    ///
+    /// `154.91.156.198` 33 个号烧 9 个、置信下界 15% 对全池基线 10%，
+    /// 两项检验都过，程序自己写着「确实比平均更容易烧号」「样本足够」，
+    /// 权重却是 0.644（TIER_NORMAL_WEIGHT = 0.6），判成 Normal，
+    /// 和零封号出口同档参与轮询。当晚新号被分到它上面，22 分钟即死。
+    #[test]
+    fn confirmed_dirty_exit_is_never_left_in_normal_tier() {
+        let summaries = pool(&[
+            ("dirty:1", summary(9, 33, 4, None, None)),
+            ("ok1:1", summary(2, 30, 2, None, None)),
+            ("ok2:1", summary(1, 25, 1, None, None)),
+            ("clean1:1", summary(0, 20, 0, None, None)),
+            ("clean2:1", summary(0, 18, 0, None, None)),
+        ]);
+        let risk = assess_pool_risk(&summaries, 5);
+        let dirty = &risk["dirty:1"];
+
+        assert!(
+            dirty.above_pool_baseline,
+            "前提：它应当被判为显著高于全池基线"
+        );
+        assert_ne!(
+            dirty.selection_tier,
+            SelectionTier::Normal,
+            "证据齐全（下界 {:.2} > 基线 {:.2}，33 个号烧 9 个）就不该与干净出口同档，\
+             权重 {:.3}",
+            dirty.ban_rate_lower_bound,
+            dirty.pooled_ban_rate,
+            dirty.selection_weight
+        );
+        for key in ["clean1:1", "clean2:1"] {
+            assert_eq!(
+                risk[key].selection_tier,
+                SelectionTier::Normal,
+                "{key} 零封号，不该受牵连"
+            );
+        }
+    }
+
+    /// 证据不足时，档位必须仍然只由权重决定——新增的「确认更脏就降档」规则
+    /// 不许介入，否则刚上线、只是恰好第一个号出事的出口会被误杀。
+    #[test]
+    fn insufficient_sample_leaves_tier_to_the_weight_alone() {
+        let summaries = pool(&[
+            // 超出基线，但只有 2 次封号（< MIN_BANS_FOR_VERDICT = 3）
+            ("thin:1", summary(2, 4, 2, None, None)),
+            ("ok1:1", summary(0, 30, 0, None, None)),
+            ("ok2:1", summary(0, 30, 0, None, None)),
+            ("ok3:1", summary(0, 30, 0, None, None)),
+        ]);
+        let risk = assess_pool_risk(&summaries, 4);
+        let thin = &risk["thin:1"];
+        assert_eq!(
+            thin.selection_tier,
+            SelectionTier::from_weight(thin.selection_weight),
+            "样本不足（{} 个号 / {} 次封号）时不该被额外降档",
+            4,
+            2
+        );
     }
 
     #[test]

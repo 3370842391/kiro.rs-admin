@@ -40,14 +40,14 @@ impl RuntimeCliEndpoint {
     fn user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
             "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.14474 os/{} lang/rust/1.92.0 md/appVersion-{} app/AmazonQ-For-CLI",
-            ctx.config.system_version, ctx.config.kiro_version,
+            ctx.system_version(), ctx.config.kiro_version,
         )
     }
 
     fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
             "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.14474 os/{} lang/rust/1.92.0 m/F app/AmazonQ-For-CLI",
-            ctx.config.system_version,
+            ctx.system_version(),
         )
     }
 }
@@ -127,8 +127,9 @@ impl KiroEndpoint for RuntimeCliEndpoint {
         req
     }
 
-    fn transform_api_body(&self, body: &str, _ctx: &RequestContext<'_>) -> String {
-        set_origin_kiro_cli(body)
+    fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {
+        let env = crate::kiro::client_identity::env_state_for(ctx.credentials, ctx.config);
+        set_origin_kiro_cli(body, Some(&env))
     }
 }
 

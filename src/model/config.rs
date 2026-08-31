@@ -1018,6 +1018,19 @@ pub struct Config {
     #[serde(default)]
     pub rate_limit_bucket_mode: RateLimitBucketMode,
 
+    /// `failover` 模式下普通 429 的账号级冷却（毫秒）。`0` = 不冷却（历史行为）。
+    ///
+    /// failover 原本刻意不冷却——它的语义就是「立刻换号」。但线上实测的后果是：
+    /// 号在 429 之后立刻还能被再次选中，于是我们始终按高于上游天花板的速率投递，
+    /// 429 流一分钟都没断过（181 个采样分钟全部有 429，单号约 90 次/小时，
+    /// 占比 8%–12%）。对上游而言这是「已知超限仍持续超限投递」，而不是「用得多」——
+    /// 合作方单号请求量数倍于我方却长期零封禁，与此一致。
+    ///
+    /// 配一段**短**冷却（建议 2000–5000）即可让刚被限流的号歇几秒，换号逻辑不变。
+    /// 缺省 0 保持历史行为，便于随时关掉回滚。
+    #[serde(default)]
+    pub failover_rate_limit_cooldown_ms: u64,
+
     /// 同端点最多尝试次数（含首次）。仅 `same-endpoint` 生效，默认 3。
     #[serde(default = "default_same_endpoint_attempts")]
     pub same_endpoint_attempts: u32,
@@ -1320,11 +1333,38 @@ fn default_supplier_nickname_prefix() -> String {
 }
 
 fn default_kiro_version() -> String {
-    "2.3.0".to_string()
+    // 仅作 `kiro_version::effective` 的回落值：正常情况下由后台任务从官方元数据
+    // 拉到真实版本。回落值必须也是一个真实存在过的版本号——写成 `2.3.0` 这种
+    // 官方从未发布的号段，等于在 autofetch 失效时把「这不是真 IDE」直接写在 UA 上。
+    "1.0.395".to_string()
+}
+
+#[cfg(test)]
+mod client_identity_defaults_tests {
+    use super::*;
+
+    #[test]
+    fn ua_defaults_are_plausible_client_values() {
+        let defaulted: Config = serde_json::from_str("{}").unwrap();
+        // 回归守卫：生产曾长期发送 `os/macos`（真实客户端不存在的裸平台名）与
+        // `kiroVersion 2.3.0`（官方从未发布的号段）。两者都是全池共用的静态标记。
+        assert!(
+            defaulted.system_version.contains('#'),
+            "`os/` 段必须是 <平台>#<版本>，实际: {}",
+            defaulted.system_version
+        );
+        assert_ne!(defaulted.system_version, "macos");
+        assert_ne!(defaulted.kiro_version, "2.3.0");
+        assert_eq!(defaulted.node_version.split('.').count(), 3);
+    }
 }
 
 fn default_system_version() -> String {
-    "macos".to_string()
+    // UA 的 `os/` 段必须是 `<平台>#<版本>`。生产曾长期发送 `os/macos`，
+    // 真实 Kiro IDE 不存在这种裸平台名，它在全网是唯一且非法的静态标记，
+    // 而且全池共用——一个号被标记就能顺着它枚举出整池。
+    // 正常情况下按号取 `client_identity::PROFILES`，这里只是回落值。
+    "win32#10.0.26200".to_string()
 }
 
 fn default_node_version() -> String {
@@ -1537,6 +1577,7 @@ impl Default for Config {
             tool_compatibility_mode: default_tool_compatibility_mode(),
             default_endpoint: default_endpoint(),
             rate_limit_bucket_mode: RateLimitBucketMode::default(),
+            failover_rate_limit_cooldown_ms: 0,
             same_endpoint_attempts: default_same_endpoint_attempts(),
             endpoint_mode: EndpointMode::default(),
             trace_enabled: default_trace_enabled(),
@@ -2059,6 +2100,8 @@ mod tests {
         assert_eq!(defaulted.endpoint_mode, EndpointMode::Best);
         assert_eq!(defaulted.rate_limit_bucket_mode, RateLimitBucketMode::SameEndpoint);
         assert_eq!(defaulted.same_endpoint_attempts, 3);
+        // 缺省关闭：failover 的历史行为是普通 429 不冷却，改动必须可回滚。
+        assert_eq!(defaulted.failover_rate_limit_cooldown_ms, 0);
         assert_eq!(defaulted.default_endpoint, "ide");
 
         let manual: Config = serde_json::from_str(r#"{"endpointMode":"manual"}"#).unwrap();

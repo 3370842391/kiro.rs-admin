@@ -29,6 +29,8 @@ import type {
   ProxyCheckUrlRequest,
   BatchAddProxyRequest,
   BatchAddProxyResponse,
+  BatchDeleteProxyRequest,
+  BatchDeleteProxyResponse,
   AssignProxyRequest,
   ProxyCheckResponse,
   ProxyCheckAllResponse,
@@ -437,6 +439,14 @@ export async function batchAddProxies(req: BatchAddProxyRequest): Promise<BatchA
 // 删除代理
 export async function deleteProxy(id: number): Promise<SuccessResponse> {
   const { data } = await api.delete<SuccessResponse>(`/proxy-pool/${id}`)
+  return data
+}
+
+// 批量删除代理。缺省跳过仍被凭据绑定的出口，force 才强删
+export async function batchDeleteProxies(
+  req: BatchDeleteProxyRequest,
+): Promise<BatchDeleteProxyResponse> {
+  const { data } = await api.post<BatchDeleteProxyResponse>('/proxy-pool/batch-delete', req)
   return data
 }
 

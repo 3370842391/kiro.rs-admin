@@ -1280,8 +1280,52 @@ pub struct ProxyCheckUrlRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchAddProxyRequest {
-    /// 代理 URL 列表（每行一个）
+    /// 代理列表（每行一个）。
+    ///
+    /// 除完整 URL 外，也接受代理商导出的裸写法 `host:port:用户名:密码` 与 `host:port`。
     pub urls: Vec<String>,
+    /// 裸写法要补的协议（`socks5` / `socks4` / `http` / `https`）。
+    /// 省略则用 `socks5`；已带 scheme 的行不受影响。
+    #[serde(default)]
+    pub scheme: Option<String>,
+}
+
+/// 批量删除代理请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchDeleteProxyRequest {
+    /// 要删除的代理池条目 ID
+    pub ids: Vec<u64>,
+    /// 是否允许删除「仍有凭据绑定」的出口。
+    ///
+    /// 缺省 `false`：这类出口会被跳过并在响应里点名。删掉池内条目并不会解绑凭据——
+    /// 凭据的 `proxyUrl` 是自己存的，删完它照样从那个 IP 出去，只是从此没有健康
+    /// 检查、没有封号统计、也不再参与改绑。想清掉坏 IP 的人通常不想要这个结果。
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// 批量删除代理响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchDeleteProxyResponse {
+    /// 实际删除的条目数
+    pub deleted: usize,
+    /// 因仍被凭据绑定而跳过的条目
+    pub skipped_in_use: Vec<ProxyInUseSkip>,
+    /// 请求里不存在的 ID（可能是列表过期）
+    pub not_found: Vec<u64>,
+}
+
+/// 被跳过的「使用中」出口
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyInUseSkip {
+    pub id: u64,
+    /// 已抹掉账号密码的代理 URL
+    pub url: String,
+    /// 仍绑定在它上面的凭据数
+    pub credential_count: u32,
 }
 
 /// 分配代理给凭据请求

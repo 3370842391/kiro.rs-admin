@@ -15,6 +15,7 @@ import {
   Skull,
   ShieldAlert,
   Fingerprint,
+  Search,
 } from 'lucide-react'
 import {
   Dialog,
@@ -31,6 +32,7 @@ import {
   getProxyPool,
   addProxy,
   batchAddProxies,
+  batchDeleteProxies,
   deleteProxy,
   setProxyEnabled,
   getGlobalProxy,
@@ -43,6 +45,7 @@ import {
   assignProxiesRoundRobin,
   type ProxyBalancingMode,
 } from '@/api/credentials'
+import type { ProxyScheme } from '@/types/api'
 import { extractErrorMessage, maskProxyUrl } from '@/lib/utils'
 import {
   ProxyBanBadge,
@@ -83,8 +86,78 @@ function normalizeProxyCandidates(candidates: string[]): string[] {
 }
 
 const PROXY_MODE_OPTIONS: ProxyBalancingMode[] = ['sticky', 'round_robin', 'least_load']
-type BatchAction = 'check' | 'enable' | 'disable' | 'global' | 'unglobal' | null
+type BatchAction = 'check' | 'enable' | 'disable' | 'global' | 'unglobal' | 'delete' | null
 type PoolTab = 'pool' | 'bans'
+
+/**
+ * 出口筛选条件。围绕「哪些是坏 IP」设计——挑出来批量删除是主要用途，
+ * 所以每一项都对应一个已知的淘汰理由，而不是把所有字段都做成筛选器。
+ */
+type ProxyFilterKey =
+  | 'burned'
+  | 'burned24h'
+  | 'demoted'
+  | 'flagged'
+  | 'unhealthy'
+  | 'disabled'
+  | 'idle'
+  | 'clean'
+
+const PROXY_FILTERS: {
+  key: ProxyFilterKey
+  label: string
+  hint: string
+  match: (proxy: ProxyPoolEntry) => boolean
+}[] = [
+  {
+    key: 'burned',
+    label: '烧过号',
+    hint: '历史上有账号在这个出口被判死',
+    match: (p) => (p.banStats?.totalBans ?? 0) > 0,
+  },
+  {
+    key: 'burned24h',
+    label: '24h 内烧号',
+    hint: '最近一天烧过号。出口是会换 IP 的，近期证据比累计更能说明现在的状态',
+    match: (p) => (p.banStats?.bans24h ?? 0) > 0,
+  },
+  {
+    key: 'demoted',
+    label: '已降权',
+    hint: '封号率置信下界高于全池基线，分配时排在干净出口之后',
+    match: (p) => p.risk != null && p.risk.selectionTier !== 'normal',
+  },
+  {
+    key: 'flagged',
+    label: '被标记为代理',
+    hint: '公开情报库把它标成代理/VPN。实测这一项直接影响账号寿命',
+    match: (p) => p.reputationGrade === 'flaggedProxy',
+  },
+  {
+    key: 'unhealthy',
+    label: '连通异常',
+    hint: '健康检查失败',
+    match: (p) => p.health === 'unhealthy',
+  },
+  {
+    key: 'disabled',
+    label: '已禁用',
+    hint: '手动禁用、自动禁用或烧号隔离',
+    match: (p) => !p.enabled,
+  },
+  {
+    key: 'idle',
+    label: '空闲',
+    hint: '当前没有凭据绑定，删掉不影响在跑的号',
+    match: (p) => p.credentialCount === 0,
+  },
+  {
+    key: 'clean',
+    label: '零封号',
+    hint: '台账里一次都没烧过号',
+    match: (p) => (p.banStats?.totalBans ?? 0) === 0,
+  },
+]
 
 export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPoolDialogProps) {
   const [tab, setTab] = useState<PoolTab>('pool')
@@ -97,6 +170,9 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
   const [checkingIds, setCheckingIds] = useState<Set<number>>(() => new Set())
   const [batchAction, setBatchAction] = useState<BatchAction>(null)
   const [guardOpen, setGuardOpen] = useState(false)
+  const [search, setSearch] = useState('')
+  const [activeFilters, setActiveFilters] = useState<Set<ProxyFilterKey>>(() => new Set())
+  const [batchScheme, setBatchScheme] = useState<ProxyScheme>('socks5')
   const queryClient = useQueryClient()
 
   const { data, isLoading } = useQuery({
@@ -161,15 +237,35 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
   const globalProxyCandidateSet = new Set(globalProxyCandidates.filter((c) => c.toLowerCase() !== 'direct'))
   const directGlobalEnabled = globalProxyCandidates.some((c) => c.toLowerCase() === 'direct')
   const proxies = data?.proxies ?? []
+
+  // 筛选：多个条件取交集（「烧过号」+「空闲」= 烧过号且当前没人用，正是最该删的那批）
+  const keyword = search.trim().toLowerCase()
+  const visibleProxies = proxies.filter((proxy) => {
+    if (keyword) {
+      const haystack = `${proxy.url} ${proxy.label ?? ''}`.toLowerCase()
+      if (!haystack.includes(keyword)) return false
+    }
+    for (const filter of PROXY_FILTERS) {
+      if (activeFilters.has(filter.key) && !filter.match(proxy)) return false
+    }
+    return true
+  })
+  const filterActive = keyword.length > 0 || activeFilters.size > 0
+
+  // 选中集合跨筛选保留：先按「烧过号」勾一批、再换条件勾另一批，是常见操作。
+  // 但全选框只对当前可见的这批负责，否则「全选」会悄悄带上看不见的条目。
   const selectedProxies = proxies.filter((proxy) => selectedIds.has(proxy.id))
   const selectedCount = selectedProxies.length
-  const allSelected = proxies.length > 0 && selectedCount === proxies.length
+  const visibleSelectedCount = visibleProxies.filter((proxy) => selectedIds.has(proxy.id)).length
+  const allVisibleSelected =
+    visibleProxies.length > 0 && visibleSelectedCount === visibleProxies.length
   let allProxyCheckboxState: boolean | 'indeterminate' = false
-  if (allSelected) {
+  if (allVisibleSelected) {
     allProxyCheckboxState = true
-  } else if (selectedCount > 0) {
+  } else if (visibleSelectedCount > 0) {
     allProxyCheckboxState = 'indeterminate'
   }
+  const selectedInUseCount = selectedProxies.filter((proxy) => proxy.credentialCount > 0).length
   const globalPoolCount = proxies.filter((proxy) => globalProxyCandidateSet.has(proxy.url)).length
   // 全池累计封号，含已从池中删除的代理，所以用后端汇总而不是当前列表求和
   const poolTotalBans = data?.totalBans ?? 0
@@ -205,6 +301,7 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
     mutationFn: () =>
       batchAddProxies({
         urls: batchText.split('\n').map((l) => l.trim()).filter(Boolean),
+        scheme: batchScheme,
       }),
     onSuccess: (res) => {
       if (res.errors === 0) {
@@ -249,8 +346,75 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
     })
   }
 
+  /** 只对当前筛选出来的这批生效；取消全选也只取消可见的那些 */
   const toggleAllSelected = (checked: boolean) => {
-    setSelectedIds(checked ? new Set(proxies.map((proxy) => proxy.id)) : new Set())
+    setSelectedIds((prev) => {
+      const next = new Set(prev)
+      for (const proxy of visibleProxies) {
+        if (checked) next.add(proxy.id)
+        else next.delete(proxy.id)
+      }
+      return next
+    })
+  }
+
+  const toggleFilter = (key: ProxyFilterKey) => {
+    setActiveFilters((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
+
+  const clearFilters = () => {
+    setActiveFilters(new Set())
+    setSearch('')
+  }
+
+  const handleBatchDelete = async (force: boolean) => {
+    if (selectedCount === 0) return
+    const ids = selectedProxies.map((proxy) => proxy.id)
+    const warning =
+      selectedInUseCount > 0 && force
+        ? `\n\n其中 ${selectedInUseCount} 个仍有凭据在用。删掉池内条目不会解绑凭据——` +
+          '号照样从那个 IP 出去，只是从此没有健康检查、没有封号统计，也不再自动改绑。'
+        : ''
+    if (!window.confirm(`确认删除选中的 ${ids.length} 个代理？${warning}`)) return
+
+    setBatchAction('delete')
+    try {
+      const res = await batchDeleteProxies({ ids, force })
+      if (res.deleted > 0) {
+        toast.success(`已删除 ${res.deleted} 个代理`)
+      }
+      if (res.skippedInUse.length > 0) {
+        toast.warning(
+          `${res.skippedInUse.length} 个出口仍有凭据绑定，已跳过：` +
+            res.skippedInUse
+              .slice(0, 3)
+              .map((item) => `${item.url}（${item.credentialCount} 个号）`)
+              .join('、') +
+            (res.skippedInUse.length > 3 ? ' 等' : '') +
+            '。先把号改绑到干净出口，或用「强制删除」。',
+          { duration: 8000 },
+        )
+      }
+      if (res.deleted === 0 && res.skippedInUse.length === 0) {
+        toast.info('没有可删除的条目')
+      }
+      setSelectedIds((prev) => {
+        const next = new Set(prev)
+        for (const id of ids) next.delete(id)
+        return next
+      })
+      queryClient.invalidateQueries({ queryKey: ['proxy-pool'] })
+      queryClient.invalidateQueries({ queryKey: ['global-proxy'] })
+    } catch (err) {
+      toast.error(`批量删除失败: ${extractErrorMessage(err)}`)
+    } finally {
+      setBatchAction(null)
+    }
   }
 
   const toggleProxyGlobal = async (proxy: ProxyPoolEntry, checked: boolean) => {
@@ -521,7 +685,8 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
           {!showBatch && (
             <form onSubmit={handleAdd} className="flex gap-2">
               <Input
-                placeholder="代理 URL（如 socks5://user:pass@host:port）"
+                placeholder="socks5://user:pass@host:port，或直接粘 host:端口:用户名:密码"
+                title="不带协议时按 socks5 处理；要用别的协议请写完整 URL，或用批量导入选协议"
                 value={newUrl}
                 onChange={(e) => setNewUrl(e.target.value)}
                 className="flex-1 font-mono text-sm"
@@ -552,14 +717,44 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
           {showBatch && (
             <div className="space-y-2">
               <label className="text-sm font-medium">
-                批量导入（每行一个代理 URL，# 开头为注释）
+                批量导入（每行一个，# 开头为注释）
               </label>
               <textarea
-                placeholder={'# 每行一个代理 URL\nsocks5://user:pass@host1:1080\nsocks5://user:pass@host2:1080\nhttp://user:pass@host3:8080'}
+                placeholder={
+                  '# 支持两种写法，可混用\n' +
+                  '# 1) 代理商导出格式 host:端口:用户名:密码\n' +
+                  '165.254.38.248:35435:tZy7bp8mE5Yj:G3ZDADS5SFNv\n' +
+                  '# 2) 完整 URL\n' +
+                  'socks5://user:pass@host:1080'
+                }
                 value={batchText}
                 onChange={(e) => setBatchText(e.target.value)}
                 className="flex min-h-[120px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-mono placeholder:text-muted-foreground focus-visible:outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/30"
               />
+              <div className="flex flex-wrap items-center gap-2 rounded-md border px-2 py-1.5">
+                <span className="text-xs text-muted-foreground">不带协议的行按</span>
+                {(['socks5', 'http', 'socks4', 'https'] as ProxyScheme[]).map((scheme) => (
+                  <button
+                    key={scheme}
+                    type="button"
+                    onClick={() => setBatchScheme(scheme)}
+                    className={
+                      'h-6 rounded-full border px-2 font-mono text-[11px] transition-colors ' +
+                      (batchScheme === scheme
+                        ? 'border-primary bg-primary/10 font-medium text-primary'
+                        : 'border-border text-muted-foreground hover:text-foreground')
+                    }
+                  >
+                    {scheme}
+                  </button>
+                ))}
+                <span
+                  className="text-xs text-muted-foreground"
+                  title="导出清单里不含协议，只能按这里选的补。选错会让出口在健康检查里一直失败，导入后记得点「批量测试」确认"
+                >
+                  导入。已写明协议的行不受影响
+                </span>
+              </div>
               <div className="flex gap-2">
                 <Button
                   size="sm"
@@ -597,10 +792,20 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                     <Checkbox
                       checked={allProxyCheckboxState}
                       onCheckedChange={(checked) => toggleAllSelected(checked === true)}
-                      title={allSelected ? '取消全选' : '全选代理'}
+                      title={
+                        allVisibleSelected
+                          ? '取消全选'
+                          : filterActive
+                            ? `全选筛出的 ${visibleProxies.length} 个`
+                            : '全选代理'
+                      }
                     />
                   )}
-                  <span>共 {data?.total ?? 0} 个代理</span>
+                  <span>
+                    {filterActive
+                      ? `筛出 ${visibleProxies.length} / ${data?.total ?? 0} 个代理`
+                      : `共 ${data?.total ?? 0} 个代理`}
+                  </span>
                   <Badge variant="secondary" className="text-xs">
                     全局 {globalPoolCount}{directGlobalEnabled ? ' + 直连' : ''}
                   </Badge>
@@ -690,6 +895,33 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                         >
                           取消全局
                         </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-7 text-xs border-destructive/50 text-destructive hover:text-destructive"
+                          onClick={() => handleBatchDelete(false)}
+                          disabled={batchAction !== null}
+                          title={
+                            selectedInUseCount > 0
+                              ? `其中 ${selectedInUseCount} 个仍有凭据绑定，会被跳过`
+                              : '删除选中的代理'
+                          }
+                        >
+                          <Trash2 className="h-3 w-3 mr-1" />
+                          {batchAction === 'delete' ? '删除中...' : `删除 ${selectedCount}`}
+                        </Button>
+                        {selectedInUseCount > 0 && (
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="h-7 text-xs text-destructive hover:text-destructive"
+                            onClick={() => handleBatchDelete(true)}
+                            disabled={batchAction !== null}
+                            title="连仍有凭据绑定的一起删。凭据不会被解绑，只是从此不再被监控与改绑"
+                          >
+                            强制删除
+                          </Button>
+                        )}
                       </>
                     )}
                     <Button
@@ -729,6 +961,59 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                   </div>
                 )}
               </div>
+              {/* 筛选：挑出坏 IP 批量处理 */}
+              {(data?.total ?? 0) > 0 && (
+                <div className="space-y-1.5 rounded-md border p-2">
+                  <div className="flex items-center gap-2">
+                    <Search className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                    <Input
+                      placeholder="按 IP / 端口 / 备注搜索"
+                      value={search}
+                      onChange={(e) => setSearch(e.target.value)}
+                      className="h-7 flex-1 font-mono text-xs"
+                    />
+                    {filterActive && (
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="h-7 shrink-0 text-xs"
+                        onClick={clearFilters}
+                      >
+                        清除筛选
+                      </Button>
+                    )}
+                  </div>
+                  <div className="flex flex-wrap gap-1">
+                    {PROXY_FILTERS.map((filter) => {
+                      const count = proxies.filter(filter.match).length
+                      const on = activeFilters.has(filter.key)
+                      return (
+                        <button
+                          key={filter.key}
+                          type="button"
+                          onClick={() => toggleFilter(filter.key)}
+                          title={filter.hint}
+                          className={
+                            'inline-flex h-6 items-center gap-1 rounded-full border px-2 text-[11px] transition-colors ' +
+                            (on
+                              ? 'border-primary bg-primary/10 font-medium text-primary'
+                              : 'border-border text-muted-foreground hover:text-foreground')
+                          }
+                        >
+                          {filter.label}
+                          <span className="tabular-nums opacity-70">{count}</span>
+                        </button>
+                      )
+                    })}
+                  </div>
+                  {activeFilters.size > 1 && (
+                    <p className="text-[11px] text-muted-foreground">
+                      多个条件取交集。例如「烧过号」+「空闲」= 烧过号且当前没有凭据在用，
+                      这批删掉不影响在跑的号。
+                    </p>
+                  )}
+                </div>
+              )}
               {flaggedProxies.length > 0 && (
                 <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-xs text-destructive">
                   <span>
@@ -859,14 +1144,23 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
               <div className="text-sm text-muted-foreground py-4 text-center">加载中...</div>
             )}
 
-            {data?.proxies.length === 0 && !isLoading && (
+            {proxies.length === 0 && !isLoading && (
               <div className="text-sm text-muted-foreground py-4 text-center">
                 暂无代理，请添加
               </div>
             )}
 
+            {proxies.length > 0 && visibleProxies.length === 0 && !isLoading && (
+              <div className="space-y-2 py-4 text-center text-sm text-muted-foreground">
+                <div>没有符合筛选条件的代理</div>
+                <Button size="sm" variant="outline" className="h-7 text-xs" onClick={clearFilters}>
+                  清除筛选
+                </Button>
+              </div>
+            )}
+
             <div className="border rounded-md divide-y max-h-[320px] overflow-y-auto">
-              {proxies.map((proxy: ProxyPoolEntry) => {
+              {visibleProxies.map((proxy: ProxyPoolEntry) => {
                 const isGlobal = globalProxyCandidateSet.has(proxy.url)
                 const isChecking = checkingIds.has(proxy.id)
                 return (

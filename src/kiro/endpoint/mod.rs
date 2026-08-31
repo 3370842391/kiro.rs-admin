@@ -141,6 +141,27 @@ pub struct RequestContext<'a> {
     pub request_attempt_max: u32,
 }
 
+impl RequestContext<'_> {
+    /// 本次请求要声明的客户端环境（UA 的 `os/` 与 `md/nodejs#` 段）。
+    ///
+    /// 一律走这里而不是直接读 `config`：环境标识是**按号**的，直接读全局配置会让
+    /// 同一个号在不同接口上声明不同环境，比全池共用一套更容易被识别。
+    /// 见 [`crate::kiro::client_identity`]。
+    pub fn client_identity(&self) -> crate::kiro::client_identity::ClientIdentity<'_> {
+        crate::kiro::client_identity::resolve(self.credentials, self.config)
+    }
+
+    /// UA 的 `os/` 段
+    pub fn system_version(&self) -> &str {
+        self.client_identity().system_version
+    }
+
+    /// UA 的 `md/nodejs#` 段
+    pub fn node_version(&self) -> &str {
+        self.client_identity().node_version
+    }
+}
+
 /// 触发"额度耗尽 → 禁用并切换"的 reason 取值集合
 ///
 /// - `MONTHLY_REQUEST_COUNT`: 月度请求额度用尽
@@ -241,6 +262,161 @@ pub fn default_is_client_validation_error(body: &str) -> bool {
     CLIENT_VALIDATION_MESSAGE_MARKERS
         .iter()
         .any(|m| body.contains(m))
+}
+
+#[cfg(test)]
+mod client_identity_consistency_tests {
+    use super::*;
+    use crate::kiro::client_identity;
+
+    /// 所有端点在同一个凭据上必须声明**同一套**环境。
+    ///
+    /// 曾经每个端点各自读全局 `config.system_version`：漏改一处，同一个号就会在
+    /// 聊天接口说 win32、在用量接口说 macos——同号自相矛盾比全池共用一套更容易
+    /// 被识别。本测试锁住「一处漏改就红」。
+    #[test]
+    fn every_endpoint_declares_the_same_environment() {
+        let mut creds = KiroCredentials {
+            id: Some(1),
+            machine_id: Some("f".repeat(64)),
+            profile_arn: Some("arn:aws:codewhisperer:us-east-1:1:profile/A".to_string()),
+            ..Default::default()
+        };
+        client_identity::assign_missing(&mut creds);
+
+        let mut config = Config::default();
+        config.api_region = Some("us-east-1".to_string());
+        // 全局值刻意与凭据级不同：读错来源的实现会拼出这里的值而不是凭据的值。
+        config.system_version = "linux#0.0.0".to_string();
+        config.node_version = "0.0.0".to_string();
+
+        let expected_os = creds.system_version.clone().unwrap();
+        let expected_node = creds.node_version.clone().unwrap();
+
+        let endpoints: Vec<Box<dyn KiroEndpoint>> = vec![
+            Box::new(crate::kiro::endpoint::IdeEndpoint::new()),
+            Box::new(crate::kiro::endpoint::RuntimeEndpoint::new()),
+            Box::new(crate::kiro::endpoint::CodeWhispererEndpoint::new()),
+            Box::new(crate::kiro::endpoint::AmazonQEndpoint::new()),
+            Box::new(crate::kiro::endpoint::CliEndpoint::new()),
+            Box::new(crate::kiro::endpoint::RuntimeCliEndpoint::new()),
+        ];
+
+        for endpoint in &endpoints {
+            let ctx = RequestContext {
+                credentials: &creds,
+                token: "tok",
+                machine_id: "f".repeat(64).leak(),
+                config: &config,
+                request_attempt: 1,
+                request_attempt_max: 3,
+            };
+            let request = endpoint
+                .decorate_api(reqwest::Client::new().post(endpoint.api_url(&ctx)), &ctx)
+                .build()
+                .expect("构建请求");
+            let ua = request
+                .headers()
+                .get("user-agent")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+
+            assert!(
+                ua.contains(&format!("os/{expected_os}")),
+                "端点 {} 的 UA 未使用凭据级 OS（期望 {}）: {}",
+                endpoint.name(),
+                expected_os,
+                ua
+            );
+            // CLI 协议的 UA 不带 node 段，只有 IDE 协议带。
+            if ua.contains("md/nodejs#") {
+                assert!(
+                    ua.contains(&format!("md/nodejs#{expected_node}")),
+                    "端点 {} 的 UA 未使用凭据级 Node 版本（期望 {}）: {}",
+                    endpoint.name(),
+                    expected_node,
+                    ua
+                );
+            }
+            assert!(
+                !ua.contains("linux#0.0.0") && !ua.contains("nodejs#0.0.0"),
+                "端点 {} 读了全局配置而不是凭据: {}",
+                endpoint.name(),
+                ua
+            );
+        }
+    }
+
+    /// 请求体 `envState` 必须与 UA 的 `os/` 段同源，且不再泄露容器工作目录。
+    #[test]
+    fn every_endpoint_rewrites_env_state_to_match_the_ua() {
+        let mut creds = KiroCredentials {
+            id: Some(2),
+            machine_id: Some("a1b2".repeat(16)),
+            profile_arn: Some("arn:aws:codewhisperer:us-east-1:1:profile/A".to_string()),
+            ..Default::default()
+        };
+        client_identity::assign_missing(&mut creds);
+
+        let mut config = Config::default();
+        config.api_region = Some("us-east-1".to_string());
+
+        let expected = client_identity::env_state_for(&creds, &config);
+        // 转换阶段产出的占位值：既有 currentMessage 也有 history，两处都要被改写。
+        let body = r#"{"conversationState":{"conversationId":"c1",
+            "currentMessage":{"userInputMessage":{"content":"hi","origin":"AI_EDITOR",
+                "userInputMessageContext":{"envState":{"operatingSystem":"macos","currentWorkingDirectory":"/app"}}}},
+            "history":[{"userInputMessage":{"content":"old","origin":"AI_EDITOR",
+                "userInputMessageContext":{"envState":{"operatingSystem":"macos","currentWorkingDirectory":"/app"}}}}]}}"#;
+
+        let endpoints: Vec<Box<dyn KiroEndpoint>> = vec![
+            Box::new(crate::kiro::endpoint::IdeEndpoint::new()),
+            Box::new(crate::kiro::endpoint::RuntimeEndpoint::new()),
+            Box::new(crate::kiro::endpoint::CodeWhispererEndpoint::new()),
+            Box::new(crate::kiro::endpoint::AmazonQEndpoint::new()),
+            Box::new(crate::kiro::endpoint::CliEndpoint::new()),
+            Box::new(crate::kiro::endpoint::RuntimeCliEndpoint::new()),
+        ];
+
+        for endpoint in &endpoints {
+            let ctx = RequestContext {
+                credentials: &creds,
+                token: "tok",
+                machine_id: "a1b2".repeat(16).leak(),
+                config: &config,
+                request_attempt: 1,
+                request_attempt_max: 3,
+            };
+            let out = endpoint.transform_api_body(body, &ctx);
+            let json: serde_json::Value = serde_json::from_str(&out)
+                .unwrap_or_else(|e| panic!("端点 {} 产出的请求体非法: {e}", endpoint.name()));
+
+            let mut checked = 0;
+            for pointer in [
+                "/conversationState/currentMessage/userInputMessage/userInputMessageContext/envState",
+                "/conversationState/history/0/userInputMessage/userInputMessageContext/envState",
+            ] {
+                let env = json.pointer(pointer).unwrap_or_else(|| {
+                    panic!("端点 {} 丢了 {pointer}", endpoint.name())
+                });
+                assert_eq!(
+                    env["operatingSystem"].as_str(),
+                    Some(expected.operating_system),
+                    "端点 {} 的 envState.operatingSystem 与 UA 不一致",
+                    endpoint.name()
+                );
+                assert_eq!(
+                    env["currentWorkingDirectory"].as_str(),
+                    Some(expected.working_directory.as_str()),
+                    "端点 {} 未改写 currentWorkingDirectory",
+                    endpoint.name()
+                );
+                checked += 1;
+            }
+            assert_eq!(checked, 2, "端点 {} 漏改了某一处 envState", endpoint.name());
+        }
+    }
 }
 
 #[cfg(test)]

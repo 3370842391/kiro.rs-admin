@@ -321,6 +321,27 @@ fn should_try_next_proxy(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 407 | 502 | 503 | 504)
 }
 
+/// failover 模式下普通 429 该冷却多久。`None` = 不冷却。
+///
+/// 上游给了 `Retry-After` 就照办——「按上游说的等」正是这项配置要改出来的行为。
+/// 但以配置值为下限（否则一个 `Retry-After: 0` 等于没冷却）、120s 为上限
+/// （避免上游一个大数把号长时间移出轮转）。
+fn failover_rate_limit_cooldown(
+    configured_ms: u64,
+    retry_after: Option<Duration>,
+) -> Option<Duration> {
+    if configured_ms == 0 {
+        return None;
+    }
+    let configured = Duration::from_millis(configured_ms);
+    Some(
+        retry_after
+            .unwrap_or(configured)
+            .max(configured)
+            .min(Duration::from_millis(120_000)),
+    )
+}
+
 /// 上游请求即将不经代理发出时的显式告警。
 ///
 /// 经过 [`configured_proxy_intent`] 过滤后，能走到直连只剩两种情况：运营在候选里
@@ -1512,12 +1533,12 @@ impl KiroProvider {
                             None,
                             &request_throttled_ids,
                         ) {
-                            if retry_mode != RetryMode::Failover {
-                                let cooldown = retry_after.unwrap_or_else(|| {
-                                    Duration::from_millis(retry_policy.rate_limit_cooldown_ms)
-                                });
-                                self.token_manager.report_rate_limited(ctx.id, cooldown);
-                            }
+                            self.apply_ordinary_429_cooldown(
+                                ctx.id,
+                                retry_mode,
+                                &retry_policy,
+                                retry_after,
+                            );
                             tracing::info!(
                                 "MCP 凭据 #{} 返回普通 429，按 {} 策略优先切换其它凭据",
                                 ctx.id,
@@ -2224,12 +2245,12 @@ impl KiroProvider {
                         group,
                         &request_throttled_ids,
                     ) {
-                        if retry_mode != RetryMode::Failover {
-                            let cooldown = retry_after.unwrap_or_else(|| {
-                                Duration::from_millis(retry_policy.rate_limit_cooldown_ms)
-                            });
-                            self.token_manager.report_rate_limited(ctx.id, cooldown);
-                        }
+                        self.apply_ordinary_429_cooldown(
+                            ctx.id,
+                            retry_mode,
+                            &retry_policy,
+                            retry_after,
+                        );
                         last_error = Some(anyhow::anyhow!(
                             "{} API 请求失败（凭据 #{} 429，备用端点也失败，已切换其它凭据重试）: {} {}",
                             api_type,
@@ -2537,6 +2558,42 @@ impl KiroProvider {
     /// 上游 429（SERVICE_REQUEST_RATE_EXCEEDED）是账号级速率配额耗尽，需要更长
     /// 时间恢复；用通用的 ≤2s 快速退避只会让请求在配额恢复前反复撞墙、持续触顶。
     /// 这里 base 1s、封顶 8s，给账号配额留出恢复窗口。
+    /// 普通 429 之后给该号加一段账号级冷却。
+    ///
+    /// 非 failover 策略沿用各自的 `rateLimitCooldownMs`。
+    ///
+    /// failover 原本刻意不冷却——它的语义就是「立刻换号，不让位」。但线上实测的
+    /// 后果是：号在 429 之后立刻还能被再次选中，于是始终按高于上游天花板的速率
+    /// 投递（天花板约 14/分钟，`rpmLimit` 却是 30），429 流一分钟都没断过
+    /// （181 个采样分钟全部有 429，单号约 90 次/小时）。对上游而言这是
+    /// 「已知超限仍持续超限投递」，而不是「用得多」——合作方单号请求量数倍于我方
+    /// 却长期零封禁，与此一致。
+    ///
+    /// 所以 failover 也允许配一段**短**冷却（`failoverRateLimitCooldownMs`）：
+    /// 换号逻辑完全不变，只是让刚被限流的号歇几秒，别在同一分钟里被反复选中。
+    /// 配 0（缺省）保持历史行为，便于随时关掉。
+    fn apply_ordinary_429_cooldown(
+        &self,
+        credential_id: u64,
+        retry_mode: RetryMode,
+        retry_policy: &RetryPolicy,
+        retry_after: Option<Duration>,
+    ) {
+        if retry_mode != RetryMode::Failover {
+            let cooldown = retry_after
+                .unwrap_or_else(|| Duration::from_millis(retry_policy.rate_limit_cooldown_ms));
+            self.token_manager
+                .report_rate_limited(credential_id, cooldown);
+            return;
+        }
+
+        let configured = self.token_manager.failover_rate_limit_cooldown_ms();
+        if let Some(cooldown) = failover_rate_limit_cooldown(configured, retry_after) {
+            self.token_manager
+                .report_rate_limited(credential_id, cooldown);
+        }
+    }
+
     fn retry_delay_throttle(attempt: usize) -> Duration {
         const BASE_MS: u64 = 1_000;
         const MAX_MS: u64 = 8_000;
@@ -2552,6 +2609,45 @@ impl KiroProvider {
 mod tests {
     use super::*;
     use crate::kiro::parser::crc::crc32;
+
+    #[test]
+    fn failover_429_cooldown_defaults_to_disabled() {
+        // 缺省 0 必须完全保持历史行为（failover 不冷却），否则这项改动无法安全回滚。
+        assert_eq!(failover_rate_limit_cooldown(0, None), None);
+        assert_eq!(
+            failover_rate_limit_cooldown(0, Some(Duration::from_secs(30))),
+            None
+        );
+    }
+
+    #[test]
+    fn failover_429_cooldown_honours_retry_after_within_bounds() {
+        let configured = 3_000;
+        // 没有 Retry-After：用配置值
+        assert_eq!(
+            failover_rate_limit_cooldown(configured, None),
+            Some(Duration::from_millis(3_000))
+        );
+        // Retry-After 更长：照上游说的等
+        assert_eq!(
+            failover_rate_limit_cooldown(configured, Some(Duration::from_secs(20))),
+            Some(Duration::from_secs(20))
+        );
+        // Retry-After 更短（含 0）：不得低于配置值，否则等于没冷却
+        assert_eq!(
+            failover_rate_limit_cooldown(configured, Some(Duration::from_millis(100))),
+            Some(Duration::from_millis(3_000))
+        );
+        assert_eq!(
+            failover_rate_limit_cooldown(configured, Some(Duration::ZERO)),
+            Some(Duration::from_millis(3_000))
+        );
+        // 上游给一个大数不能把号长时间移出轮转
+        assert_eq!(
+            failover_rate_limit_cooldown(configured, Some(Duration::from_secs(3_600))),
+            Some(Duration::from_millis(120_000))
+        );
+    }
 
     #[test]
     fn debug_header_value_redacts_credentials() {

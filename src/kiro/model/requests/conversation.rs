@@ -148,12 +148,16 @@ pub struct EnvState {
 
 impl Default for EnvState {
     fn default() -> Self {
-        let cwd = std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| "/".to_string());
+        // 占位值，真实内容由端点层按凭据改写（见
+        // `crate::kiro::client_identity::patch_env_state`）：转换阶段还没选号，
+        // 这里拿不到「该用哪台机器的身份」。
+        //
+        // 曾用 `std::env::current_dir()`，等于把**容器的工作目录**发给上游，而且
+        // 全池完全相同——既暴露部署形态，又白送一个跨号关联键。即使改写漏掉，
+        // 这里也不能再回到那个值。
         Self {
             operating_system: "macos".to_string(),
-            current_working_directory: cwd,
+            current_working_directory: "/workspace".to_string(),
         }
     }
 }

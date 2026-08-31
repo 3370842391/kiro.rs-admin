@@ -43,14 +43,15 @@ use super::model_profile_sync::{
 use super::pricing_calc;
 use super::profit::ProfitConfig;
 use super::proxy_ban_stats;
-use super::proxy_pool::{GetUrlResult, ProxyEntry, ProxyHealth, ProxyPoolManager};
+use super::proxy_pool::{self, GetUrlResult, ProxyEntry, ProxyHealth, ProxyPoolManager};
 use super::proxy_rebind;
 use super::credential_earnings::{self, SellRateStore};
 use super::proxy_reputation::{ProxyReputationStore, ReputationGrade};
 use super::types::{
     AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse,
     ApplyModelProfilesRequest, AssignProxyRequest, AssignRoundRobinResponse, AvailableModelItem,
-    AvailableModelsResponse, BalanceResponse, BatchAddProxyRequest, BatchGroupMode,
+    AvailableModelsResponse, BalanceResponse, BatchAddProxyRequest, BatchDeleteProxyRequest,
+    BatchDeleteProxyResponse, BatchGroupMode,
     BatchImportEvent, BatchUpdateCredentialsRequest, BatchUpdateCredentialsResponse,
     CacheHitRateResponse, CachePolicyResponse, CancelLoginResponse, CheckRateLimitRequest,
     ClearCacheResponse, CompatibilityConfigResponse, CompleteSocialLoginRequest,
@@ -66,7 +67,7 @@ use super::types::{
     PreviewModelProfilesRequest, ProfitConfigResponse, ProxyBalancingModeResponse,
     ProxyBanDetailEntry, ProxyBanStatsResponse, ProxyBanTimelineItem, ProxyCheckAllResponse,
     ProxyCheckResponse, ProxyCheckUrlRequest, ProxyGuardQuarantineItem, ProxyGuardRunResponse,
-    ProxyPoolEntry, ProxyReputationCheckResponse,
+    ProxyInUseSkip, ProxyPoolEntry, ProxyReputationCheckResponse,
     ProxyPoolResponse, QuotaExceededResult, ResolvedModelProfileResponse, RetryPolicyResponse,
     RevisionRequest, RpmSummary, SetAccountThrottleConfigRequest, SetCacheHitRateRequest,
     SetCachePolicyRequest, SetCompatibilityConfigRequest, SetDeadCredentialConfigRequest,
@@ -271,22 +272,31 @@ fn normalize_import_email(raw_email: Option<String>, access_token: Option<&str>)
         .or_else(|| access_token.and_then(social::extract_email_from_jwt))
 }
 
+/// 规范化一组代理配置。
+///
+/// 与代理池导入共用 [`proxy_pool::normalize_proxy_entry`]，所以这里也能直接粘
+/// 代理商导出的 `host:port:用户名:密码`——同一种写法在两个入口行为不一致很难解释。
 fn normalize_proxy_list(raw: &str) -> Result<Option<String>, AdminServiceError> {
     let candidates = ProxyConfig::split_candidates(raw);
     if candidates.is_empty() {
         return Ok(None);
     }
 
+    let mut normalized = Vec::with_capacity(candidates.len());
     for candidate in &candidates {
-        if !ProxyConfig::is_supported_entry(candidate) {
-            return Err(AdminServiceError::InvalidCredential(format!(
-                "代理 URL 格式无效: {}。支持 http://、https://、socks5://、socks4://，多个代理可用逗号/空格/换行分隔，direct 表示直连候选",
-                candidate
-            )));
+        match proxy_pool::normalize_proxy_entry(candidate, proxy_pool::DEFAULT_PROXY_SCHEME) {
+            Ok(url) => normalized.push(url),
+            Err(error) => {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "{error}。支持 http://、https://、socks5://、socks4:// 完整 URL，\
+                     也支持代理商导出的 host:port:用户名:密码；多个代理用逗号/空格/换行分隔，\
+                     direct 表示直连候选"
+                )));
+            }
         }
     }
 
-    Ok(Some(candidates.join("\n")))
+    Ok(Some(normalized.join("\n")))
 }
 
 fn calculate_rpm_summary(entries: &[CredentialEntrySnapshot]) -> RpmSummary {
@@ -2357,6 +2367,10 @@ impl AdminService {
             auth_region: req.auth_region,
             api_region: req.api_region,
             machine_id: req.machine_id,
+            // 环境标识不在导入接口暴露：由 client_identity::assign_missing 在首次
+            // 加载时按号分配并落盘，避免调用方随手填出白名单外的组合。
+            system_version: None,
+            node_version: None,
             email: email.clone(),
             nickname: req.nickname,
             subscription_title: None, // 将在首次获取使用额度时自动更新
@@ -4748,7 +4762,8 @@ impl AdminService {
         &self,
         req: BatchAddProxyRequest,
     ) -> (Vec<ProxyPoolEntry>, Vec<String>) {
-        let (added, errors) = self.proxy_pool.batch_add(req.urls);
+        let scheme = req.scheme.as_deref().unwrap_or(proxy_pool::DEFAULT_PROXY_SCHEME);
+        let (added, errors) = self.proxy_pool.batch_add(req.urls, scheme);
         let ledger = self.token_manager.ban_ledger();
         let result = added
             .into_iter()
@@ -4786,6 +4801,99 @@ impl AdminService {
             } else {
                 AdminServiceError::InternalError(msg)
             }
+        })
+    }
+
+    /// 批量删除代理，默认保护「仍有凭据绑定」的出口。
+    ///
+    /// 删池内条目**不会**解绑凭据：凭据的 `proxyUrl` 是自己存的一份字符串，
+    /// 条目删掉之后它照样从那个 IP 出去，只是从此没有健康检查、没有封号统计，
+    /// 出问题也不会被自动改绑——等于把一个坏出口从「可观测」变成「不可观测」。
+    /// 所以缺省跳过并点名，让调用方先改绑再删；确实要删就传 `force`。
+    pub fn batch_delete_proxies(
+        &self,
+        req: BatchDeleteProxyRequest,
+    ) -> Result<BatchDeleteProxyResponse, AdminServiceError> {
+        if req.ids.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "未选择要删除的代理".to_string(),
+            ));
+        }
+
+        let entries = self.proxy_pool.list();
+        let known: HashMap<u64, String> = entries
+            .iter()
+            .map(|entry| (entry.id, entry.url.clone()))
+            .collect();
+        let not_found: Vec<u64> = req
+            .ids
+            .iter()
+            .copied()
+            .filter(|id| !known.contains_key(id))
+            .collect();
+
+        let credentials = self.token_manager.snapshot().entries;
+        let mut usage: HashMap<&str, u32> = HashMap::new();
+        for cred in &credentials {
+            if let Some(url) = cred.proxy_url.as_deref() {
+                *usage.entry(url).or_default() += 1;
+            }
+        }
+
+        let mut deletable = Vec::new();
+        let mut skipped_in_use = Vec::new();
+        for id in req.ids.iter().copied() {
+            let Some(url) = known.get(&id) else { continue };
+            let count = usage.get(url.as_str()).copied().unwrap_or(0);
+            if count > 0 && !req.force {
+                skipped_in_use.push(ProxyInUseSkip {
+                    id,
+                    url: proxy_ban_stats::redact_proxy_url(url),
+                    credential_count: count,
+                });
+            } else {
+                deletable.push(id);
+            }
+        }
+
+        let removed = self
+            .proxy_pool
+            .delete_many(&deletable)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        // 删掉的出口如果还挂在全局候选里，一并摘掉，否则会留下一批「池里没有、
+        // 全局却还在用」的孤儿候选（界面上那条「旧全局代理还不在代理池里」提示）。
+        if !removed.is_empty() {
+            let removed_urls: std::collections::HashSet<&str> =
+                removed.iter().map(|(_, url)| url.as_str()).collect();
+            if let Some(global) = self.token_manager.proxy() {
+                let candidates = ProxyConfig::split_candidates(&global.url);
+                let kept: Vec<String> = candidates
+                    .iter()
+                    .filter(|candidate| !removed_urls.contains(candidate.as_str()))
+                    .cloned()
+                    .collect();
+                if kept.len() != candidates.len() {
+                    let next = (!kept.is_empty()).then(|| kept.join("\n"));
+                    if let Err(error) = self.set_global_proxy(next) {
+                        tracing::warn!(%error, "删除代理后清理全局候选失败");
+                    }
+                }
+            }
+        }
+
+        for (id, url) in &removed {
+            tracing::info!(
+                proxy_id = id,
+                proxy = %proxy_ban_stats::redact_proxy_url(url),
+                "代理已批量删除"
+            );
+        }
+
+        Ok(BatchDeleteProxyResponse {
+            deleted: removed.len(),
+            skipped_in_use,
+            not_found,
         })
     }
 
@@ -4898,15 +5006,21 @@ impl AdminService {
         }
     }
 
-    /// 将可用代理（已启用且非 Unhealthy）按轮询方式批量分配给凭据
+    /// 将可用代理按轮询方式批量分配给凭据，**干净的出口先分**。
     ///
     /// - `credential_ids` 为 None 时对全部凭据分配
     /// - 无可用代理时返回错误
+    ///
+    /// 候选顺序取自 [`ProxyPoolManager::assignable_urls_ranked`]（封号风险档位优先），
+    /// 不是 `assignable_urls()`。后者只过滤连通性，`urls[i % len]` 会把烧号最多的
+    /// 出口和零封号出口一视同仁——2026-09-01 线上一次导入 7 个号，其中一个被分到
+    /// 33 个号烧了 9 个的出口上，22 分钟即死。要分配 N 个号时，排序后拿到的是
+    /// 当前最干净的前 N 个。
     pub fn assign_proxies_round_robin(
         &self,
         credential_ids: Option<Vec<u64>>,
     ) -> Result<AssignRoundRobinResponse, AdminServiceError> {
-        let urls = self.proxy_pool.assignable_urls();
+        let urls = self.proxy_pool.assignable_urls_ranked();
         if urls.is_empty() {
             return Err(AdminServiceError::InvalidCredential(
                 "没有可用代理（需已启用且健康检查未失败）".to_string(),

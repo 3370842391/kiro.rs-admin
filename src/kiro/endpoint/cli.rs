@@ -33,14 +33,14 @@ impl CliEndpoint {
     fn user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
             "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.14474 os/{} lang/rust/1.92.0 md/appVersion-{} app/AmazonQ-For-CLI",
-            ctx.config.system_version, ctx.config.kiro_version,
+            ctx.system_version(), ctx.config.kiro_version,
         )
     }
 
     fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
             "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.14474 os/{} lang/rust/1.92.0 m/F app/AmazonQ-For-CLI",
-            ctx.config.system_version,
+            ctx.system_version(),
         )
     }
 }
@@ -118,8 +118,9 @@ impl KiroEndpoint for CliEndpoint {
         req
     }
 
-    fn transform_api_body(&self, body: &str, _ctx: &RequestContext<'_>) -> String {
-        set_origin_kiro_cli(body)
+    fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {
+        let env = crate::kiro::client_identity::env_state_for(ctx.credentials, ctx.config);
+        set_origin_kiro_cli(body, Some(&env))
     }
 }
 
@@ -127,14 +128,22 @@ impl KiroEndpoint for CliEndpoint {
 /// 1. 所有 "AI_EDITOR" origin 替换为 "KIRO_CLI"
 /// 2. 移除 conversationState.agentContinuationId（Kiro CLI 不发送此字段）
 /// 3. 移除 history 中用户消息的 modelId（Kiro CLI 不在历史消息里发送此字段）
+/// 4. `env` 为 `Some` 时校正 `envState`，使它与该凭据 UA 里声明的 OS 一致
 ///
 /// runtime_cli 端点（`runtime_cli.rs`）与 cli 端点的请求体加工完全一致，直接复用本函数。
-pub(crate) fn set_origin_kiro_cli(body: &str) -> String {
+pub(crate) fn set_origin_kiro_cli(
+    body: &str,
+    env: Option<&crate::kiro::client_identity::EnvState>,
+) -> String {
     let body = body.replace("\"origin\":\"AI_EDITOR\"", "\"origin\":\"KIRO_CLI\"");
 
     let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&body) else {
         return body;
     };
+
+    if let Some(env) = env {
+        crate::kiro::client_identity::patch_env_state(&mut json, env);
+    }
 
     if let Some(state) = json
         .get_mut("conversationState")
@@ -164,7 +173,7 @@ mod tests {
     #[test]
     fn test_set_origin_kiro_cli_current_message() {
         let body = r#"{"conversationState":{"currentMessage":{"userInputMessage":{"content":"hi","origin":"AI_EDITOR"}}}}"#;
-        let result = set_origin_kiro_cli(body);
+        let result = set_origin_kiro_cli(body, None);
         assert!(result.contains("\"origin\":\"KIRO_CLI\""));
         assert!(!result.contains("\"origin\":\"AI_EDITOR\""));
     }
@@ -172,7 +181,7 @@ mod tests {
     #[test]
     fn test_set_origin_kiro_cli_history() {
         let body = r#"{"conversationState":{"history":[{"userInputMessage":{"content":"hi","origin":"AI_EDITOR"}},{"userInputMessage":{"content":"hello","origin":"AI_EDITOR"}}],"currentMessage":{"userInputMessage":{"origin":"AI_EDITOR"}}}}"#;
-        let result = set_origin_kiro_cli(body);
+        let result = set_origin_kiro_cli(body, None);
         assert!(!result.contains("\"origin\":\"AI_EDITOR\""));
         assert_eq!(result.matches("\"origin\":\"KIRO_CLI\"").count(), 3);
     }
@@ -180,6 +189,6 @@ mod tests {
     #[test]
     fn test_set_origin_kiro_cli_no_origin() {
         let body = r#"{"conversationState":{}}"#;
-        assert_eq!(set_origin_kiro_cli(body), r#"{"conversationState":{}}"#);
+        assert_eq!(set_origin_kiro_cli(body, None), r#"{"conversationState":{}}"#);
     }
 }

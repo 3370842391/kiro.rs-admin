@@ -44,8 +44,8 @@ impl IdeEndpoint {
     fn user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
             "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
-            ctx.config.system_version,
-            ctx.config.node_version,
+            ctx.system_version(),
+            ctx.node_version(),
             kiro_version::effective(&ctx.config.kiro_version),
             ctx.machine_id
         )
@@ -126,13 +126,42 @@ impl KiroEndpoint for IdeEndpoint {
     }
 
     fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {
-        inject_profile_arn(body, ctx.credentials.streaming_profile_arn().as_deref())
+        transform_ide_api_body(body, ctx)
     }
 }
 
-/// 将 profile_arn 注入到请求体 JSON 根对象
+/// IDE 协议请求体加工：注入 profileArn + 校正 envState。
 ///
-/// runtime 端点（`runtime.rs`）与 ide 端点的请求体加工完全一致，直接复用本函数。
+/// 一次解析、一次序列化：请求体线上见过 5MB 量级，多一轮 parse/serialize 是实打实
+/// 的开销，所以两项改写合并在同一次解析里做。
+///
+/// `amazonq` / `codewhisperer` 与 ide 的加工完全一致，直接复用本函数。
+pub(crate) fn transform_ide_api_body(body: &str, ctx: &RequestContext<'_>) -> String {
+    let Ok(mut json) = serde_json::from_str::<serde_json::Value>(body) else {
+        return body.to_string();
+    };
+    apply_ide_body_patches(&mut json, ctx);
+    serde_json::to_string(&json).unwrap_or_else(|_| body.to_string())
+}
+
+/// 对已解析的请求体做 IDE 协议通用改写。供 runtime 端点在自己的加工里复用，
+/// 避免它为了同样的两件事再解析一遍。
+pub(crate) fn apply_ide_body_patches(
+    json: &mut serde_json::Value,
+    ctx: &RequestContext<'_>,
+) -> bool {
+    let mut changed = false;
+    if let Some(arn) = ctx.credentials.streaming_profile_arn() {
+        json["profileArn"] = serde_json::Value::String(arn);
+        changed = true;
+    }
+    let env = crate::kiro::client_identity::env_state_for(ctx.credentials, ctx.config);
+    changed |= crate::kiro::client_identity::patch_env_state(json, &env);
+    changed
+}
+
+/// 将 profile_arn 注入到请求体 JSON 根对象（仅 MCP 路径使用；API 路径走
+/// [`transform_ide_api_body`]，它同时校正 envState）。
 pub(crate) fn inject_profile_arn(request_body: &str, profile_arn: Option<&str>) -> String {
     if let Some(arn) = profile_arn {
         if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(request_body) {

@@ -15,7 +15,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use super::ide::inject_profile_arn;
-use super::rate_limit::kiro_attempt_header;
+use super::rate_limit::{amz_sdk_request_header, kiro_attempt_header};
 use super::{KiroEndpoint, RequestContext};
 use crate::kiro::kiro_version;
 use crate::kiro::region::{KiroService, data_plane_host};
@@ -63,8 +63,8 @@ impl RuntimeEndpoint {
     fn user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
             "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/kiroruntime#1.0.0 m/N {}",
-            ctx.config.system_version,
-            ctx.config.node_version,
+            ctx.system_version(),
+            ctx.node_version(),
             self.ide_tag(ctx)
         )
     }
@@ -130,7 +130,10 @@ impl KiroEndpoint for RuntimeEndpoint {
             .header("user-agent", self.user_agent(ctx))
             .header("host", self.host(ctx))
             .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
-            .header("amz-sdk-request", "attempt=1; max=3")
+            .header(
+                "amz-sdk-request",
+                amz_sdk_request_header(ctx.request_attempt, ctx.request_attempt_max),
+            )
             .header("Authorization", format!("Bearer {}", ctx.token));
         self.apply_token_type(req, ctx)
     }
@@ -152,7 +155,7 @@ impl KiroEndpoint for RuntimeEndpoint {
     }
 
     fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {
-        transform_runtime_api_body(body, ctx.credentials.streaming_profile_arn().as_deref())
+        transform_runtime_api_body(body, ctx)
     }
 
     fn transform_mcp_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {
@@ -160,15 +163,17 @@ impl KiroEndpoint for RuntimeEndpoint {
     }
 }
 
-/// 官方 Generate 请求体：profileArn + agentMode，并在缺失时补 rootConversationId。
-/// 已有 agentMode / rootConversationId 不覆盖（Continue 轮的 root 可能不同于 conversationId）。
-fn transform_runtime_api_body(request_body: &str, profile_arn: Option<&str>) -> String {
+/// 官方 Generate 请求体：profileArn + agentMode + envState，并在缺失时补
+/// rootConversationId。
+///
+/// 已有 agentMode / rootConversationId 不覆盖（Continue 轮的 root 可能不同于
+/// conversationId）。profileArn 与 envState 的改写与 ide 端点完全一致，复用
+/// [`super::ide::apply_ide_body_patches`]，共享同一次解析。
+fn transform_runtime_api_body(request_body: &str, ctx: &RequestContext<'_>) -> String {
     let Ok(mut json) = serde_json::from_str::<Value>(request_body) else {
         return request_body.to_string();
     };
-    if let Some(arn) = profile_arn {
-        json["profileArn"] = Value::String(arn.to_string());
-    }
+    super::ide::apply_ide_body_patches(&mut json, ctx);
     let agent_mode_empty = json
         .get("agentMode")
         .and_then(Value::as_str)
@@ -323,6 +328,9 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(header(&req, "x-kiro-attempt"), Some("2;max=3"));
+        // 两个头描述同一次重试，必须同步递增。此前 amz-sdk-request 写死 attempt=1，
+        // 第 2 跳时与 x-kiro-attempt 自相矛盾。
+        assert_eq!(header(&req, "amz-sdk-request"), Some("attempt=2; max=3"));
     }
 
     #[test]

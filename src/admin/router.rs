@@ -11,7 +11,8 @@ use super::{
     handlers::{
         add_credential, add_proxy, apply_image_update, apply_model_profile_preview,
         assign_proxies_round_robin, assign_proxy_to_credential, batch_add_proxies,
-        batch_import_credentials, batch_update_credentials, cancel_idc_login, cancel_social_login,
+        batch_delete_proxies, batch_import_credentials, batch_update_credentials, cancel_idc_login,
+        cancel_social_login,
         check_all_proxies, check_proxy, check_proxy_reputation, check_proxy_url, check_rate_limit,
         check_update,
         cleanup_error_snapshots, clear_cache_policy_entries, clear_throttle, clear_traces,
@@ -137,6 +138,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/proxy", post(assign_proxy_to_credential))
         .route("/proxy-pool", get(get_proxy_pool).post(add_proxy))
         .route("/proxy-pool/batch", post(batch_add_proxies))
+        .route("/proxy-pool/batch-delete", post(batch_delete_proxies))
         .route("/proxy-pool/check-url", post(check_proxy_url))
         .route("/proxy-pool/check-all", post(check_all_proxies))
         .route("/proxy-pool/ban-stats", get(get_proxy_ban_stats))

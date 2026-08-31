@@ -12,7 +12,7 @@
 use reqwest::RequestBuilder;
 use uuid::Uuid;
 
-use super::ide::inject_profile_arn;
+use super::ide::{inject_profile_arn, transform_ide_api_body};
 use super::{KiroEndpoint, RequestContext};
 use crate::kiro::kiro_version;
 use crate::kiro::region::{KiroService, data_plane_host};
@@ -52,8 +52,8 @@ impl CodeWhispererEndpoint {
     fn user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
             "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
-            ctx.config.system_version,
-            ctx.config.node_version,
+            ctx.system_version(),
+            ctx.node_version(),
             kiro_version::effective(&ctx.config.kiro_version),
             ctx.machine_id
         )
@@ -136,7 +136,7 @@ impl KiroEndpoint for CodeWhispererEndpoint {
     }
 
     fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {
-        inject_profile_arn(body, ctx.credentials.streaming_profile_arn().as_deref())
+        transform_ide_api_body(body, ctx)
     }
 }
 

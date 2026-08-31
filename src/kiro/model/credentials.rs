@@ -144,6 +144,20 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine_id: Option<String>,
 
+    /// 凭据级 OS 标识，拼进 UA 的 `os/` 段，形如 `win32#10.0.26200`。
+    ///
+    /// 与 [`Self::node_version`] 成组使用，首次加载时由
+    /// [`crate::kiro::client_identity::assign_missing`] 按号从白名单挑一套写入并落盘，
+    /// 之后不再变化——全池共用一套 OS 是跨号关联键，而每请求随机又会变成
+    /// 「一个号在多台机器间跳」，两者都比按号钉死更容易被识别。
+    /// 未配置时回退到 config.json 的 `systemVersion`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_version: Option<String>,
+
+    /// 凭据级 Node 版本，拼进 UA 的 `md/nodejs#` 段。见 [`Self::system_version`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_version: Option<String>,
+
     /// 用户邮箱（从 Anthropic API 获取）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
@@ -338,6 +352,8 @@ impl std::fmt::Debug for KiroCredentials {
             .field("auth_region", &self.auth_region)
             .field("api_region", &self.api_region)
             .field("machine_id", &fmt_redacted(&self.machine_id))
+            .field("system_version", &self.system_version)
+            .field("node_version", &self.node_version)
             .field("email", &self.email)
             .field("nickname", &self.nickname)
             .field("subscription_title", &self.subscription_title)
@@ -1154,6 +1170,8 @@ mod tests {
             auth_region: None,
             api_region: None,
             machine_id: None,
+            system_version: None,
+            node_version: None,
             email: None,
             nickname: None,
             subscription_title: None,
@@ -1406,6 +1424,8 @@ mod tests {
             auth_region: None,
             api_region: None,
             machine_id: None,
+            system_version: None,
+            node_version: None,
             email: None,
             nickname: None,
             subscription_title: None,
@@ -1457,6 +1477,8 @@ mod tests {
             auth_region: None,
             api_region: None,
             machine_id: None,
+            system_version: None,
+            node_version: None,
             email: None,
             nickname: None,
             subscription_title: None,
@@ -1591,6 +1613,8 @@ mod tests {
             auth_region: None,
             api_region: None,
             machine_id: Some("c".repeat(64)),
+            system_version: None,
+            node_version: None,
             email: None,
             nickname: None,
             subscription_title: None,

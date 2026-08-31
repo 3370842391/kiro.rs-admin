@@ -27,7 +27,8 @@ use super::{
     trace_db::TraceQuery,
     types::{
         AddCredentialRequest, AddProxyRequest, ApplyModelProfilesRequest, AssignProxyRequest,
-        AssignRoundRobinRequest, BatchAddProxyRequest, BatchImportEvent, BatchImportRequest,
+        AssignRoundRobinRequest, BatchAddProxyRequest, BatchDeleteProxyRequest, BatchImportEvent,
+        BatchImportRequest,
         BatchImportSummary, BatchUpdateCredentialsRequest, CacheHitRatePatch, ClientKeyItem,
         ClientKeysResponse, CompleteSocialLoginRequest, CreateClientKeyRequest,
         CreateClientKeyResponse, CredentialResponseTestRequest, FetchModelProfileRequest,
@@ -560,6 +561,18 @@ pub async fn batch_add_proxies(
         "proxies": added,
         "errorMessages": errors
     }))
+}
+
+/// POST /api/admin/proxy-pool/batch-delete
+/// 批量删除代理。缺省跳过仍被凭据绑定的出口，`force: true` 才强删。
+pub async fn batch_delete_proxies(
+    State(state): State<AdminState>,
+    Json(payload): Json<BatchDeleteProxyRequest>,
+) -> impl IntoResponse {
+    match state.service.batch_delete_proxies(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
 }
 
 /// DELETE /api/admin/proxy-pool/:id
