@@ -45,7 +45,22 @@ pub struct NewapiLogItem {
     pub group: String,
     #[serde(default)]
     pub quota: i64,
-    #[serde(default)]
+    /// 命中的上游渠道 ID。
+    ///
+    /// **必须带 `channel` 别名**：NewAPI 的 `/api/log/` 返回的字段名就叫 `channel`，
+    /// 没有 `channel_id`。只写 `channel_id` + `serde(default)` 时它会静默变成 0，
+    /// 而 0 在 [`aggregate_ledger_report`] 里是「渠道未知」的哨兵值——
+    /// `observed_channel_ids` 于是永远为空，`ledger_scope_confirmed` 永远 false，
+    /// 整份报表直接把所有行判为未匹配返回：收入 0、成本 0、利润「不可用」。
+    ///
+    /// 连锁后果是卖价永远测不出来（`record_sell_rate_from_report` 要求
+    /// scope_confirmed），号池收益的「已产生」因此恒为 ¥0，净利润恒等于负的总投入。
+    /// 2026-08-30 线上就是这个形态：5900 条流水里 5821 条带 upstream_request_id、
+    /// 其中 95% 能对上 trace，报表却显示 0 匹配。
+    ///
+    /// 保留 `channel_id` 作为字段名是为了兼容可能发送该名字的版本：serde 的
+    /// alias 让两种键名都能解析。
+    #[serde(default, alias = "channel")]
     pub channel_id: u64,
     #[serde(default)]
     pub upstream_request_id: String,
@@ -741,6 +756,70 @@ mod tests {
             username: "alice".to_string(),
             ..NewapiLogItem::default()
         }
+    }
+
+    /// 回归：NewAPI 的 `/api/log/` 用 `channel` 而不是 `channel_id`。
+    ///
+    /// 这条字段名一错，整份利润报表就废了：channel_id 落成 0 → observed_channel_ids
+    /// 为空 → ledger_scope_confirmed=false → 所有行判为未匹配、收入与成本都是 0、
+    /// 卖价永远测不出来。2026-08-30 线上 5900 条流水 0 匹配就是这个原因，
+    /// 而当时 5821 条是带 upstream_request_id 的、95% 能对上 trace。
+    ///
+    /// 字段清单取自生产实测响应。
+    #[test]
+    fn newapi_log_reads_channel_field_not_channel_id() {
+        let real_shape = serde_json::json!({
+            "channel": 40,
+            "channel_name": "kiro-rs",
+            "completion_tokens": 128,
+            "content": "",
+            "created_at": 1_788_000_000_i64,
+            "group": "default",
+            "id": 1,
+            "ip": "1.2.3.4",
+            "is_stream": true,
+            "model_name": "claude-opus-4-6",
+            "other": "{\"group_ratio\":1.0}",
+            "prompt_tokens": 2048,
+            "quota": 500_000,
+            "request_id": "202608311250255376935398268d9d6",
+            "token_id": 9,
+            "token_name": "次卡",
+            "type": 2,
+            "upstream_request_id": "78333c87-0000-4000-8000-000000000000",
+            "use_time": 12,
+            "user_id": 5274,
+            "username": "alice"
+        });
+
+        let item: NewapiLogItem = serde_json::from_value(real_shape).expect("应能解析真实响应");
+        assert_eq!(
+            item.channel_id, 40,
+            "必须从 `channel` 取到渠道号；落成 0 会让整份报表判为「范围未确认」"
+        );
+        assert_eq!(item.quota, 500_000);
+        assert_eq!(
+            item.upstream_request_id,
+            "78333c87-0000-4000-8000-000000000000"
+        );
+        assert_eq!(item.group_ratio(), Some(1.0));
+    }
+
+    /// 兼容仍然发送 `channel_id` 的版本。
+    #[test]
+    fn newapi_log_still_accepts_channel_id_field() {
+        let item: NewapiLogItem =
+            serde_json::from_value(serde_json::json!({ "channel_id": 19, "quota": 1 }))
+                .expect("应能解析");
+        assert_eq!(item.channel_id, 19);
+    }
+
+    /// 渠道号缺失时仍落 0——那是「渠道未知」的哨兵值，报表据此保守地不下结论。
+    #[test]
+    fn newapi_log_without_any_channel_key_falls_back_to_zero() {
+        let item: NewapiLogItem =
+            serde_json::from_value(serde_json::json!({ "quota": 1 })).expect("应能解析");
+        assert_eq!(item.channel_id, 0);
     }
 
     fn usage(trace_id: Option<&str>, key_id: u64, credits: f64, status: &str) -> UsageRecord {
