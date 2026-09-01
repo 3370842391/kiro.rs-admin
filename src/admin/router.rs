@@ -10,7 +10,7 @@ use axum::{
 use super::{
     handlers::{
         add_credential, add_proxy, apply_image_update, apply_model_profile_preview,
-        assign_proxies_round_robin, assign_proxy_to_credential, batch_add_proxies,
+        assign_proxies_round_robin, assign_proxy_to_credential, ban_postmortem, batch_add_proxies,
         batch_delete_proxies, batch_import_credentials, batch_update_credentials, cancel_idc_login,
         cancel_social_login,
         check_all_proxies, check_proxy, check_proxy_reputation, check_proxy_url, check_rate_limit,
@@ -30,7 +30,7 @@ use super::{
         get_retry_policy, get_update_config,
         list_client_keys, list_error_snapshots, list_groups, list_model_mappings, list_traces,
         patch_model_profile, pin_error_snapshot, poll_idc_login, poll_idc_relogin,
-        poll_social_login, poll_social_relogin, preview_model_profiles, profit_report,
+        poll_social_login, poll_social_relogin, pool_health, preview_model_profiles, profit_report,
         pull_update_image, replace_model_mappings, reset_all_success_count, reset_client_key_stats,
         simulate_pricing,
         reset_failure_count, reset_proxy_ban_stats, reset_success_count, rollback_image_update,
@@ -354,6 +354,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/stats/by-credential", get(stats_by_credential))
         .route("/traces/failure-stats", get(trace_failure_stats))
         .route("/traces/recent-activity", get(trace_recent_activity))
+        .route("/pool-health", get(pool_health))
+        .route("/ban-postmortem", get(ban_postmortem))
         .route("/traces", get(list_traces).delete(clear_traces))
         .route("/error-snapshots", get(list_error_snapshots))
         .route("/error-snapshots/storage", get(error_snapshot_storage))

@@ -2567,6 +2567,91 @@ pub async fn trace_recent_activity(
     }))
 }
 
+/// GET /api/admin/pool-health?windowMinutes=60
+///
+/// 号池风险体检：限流形态、出口集中度、批量清扫特征，外加一组「该做什么」的结论。
+/// 这些数此前只能 SSH 上服务器跑 SQL 才拿得到。
+pub async fn pool_health(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    use crate::admin::pool_health as ph;
+
+    let window_minutes = params
+        .get("windowMinutes")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(60)
+        .clamp(5, 1_440);
+
+    let end = chrono::Utc::now().timestamp();
+    // 截到整分：当前这一分钟还没走完，算进去会让「安静分钟」平白多一个
+    let end_minute = end - end.rem_euclid(60);
+    let start = end_minute - window_minutes * 60;
+    let buckets = state
+        .trace_store
+        .query_rpm_minute_buckets(start, end_minute);
+    let rate_limit = ph::rate_limit_shape(&buckets, window_minutes);
+
+    let snapshot = state.service.token_manager().snapshot();
+    let enabled: Vec<_> = snapshot.entries.iter().filter(|e| !e.disabled).collect();
+    let accounts: Vec<ph::AccountExit<'_>> = enabled
+        .iter()
+        .map(|entry| ph::AccountExit {
+            proxy_url: entry.proxy_url.as_deref(),
+        })
+        .collect();
+    let burned: std::collections::BTreeMap<String, u64> = state
+        .service
+        .token_manager()
+        .ban_ledger()
+        .map(|ledger| {
+            ledger
+                .all_summaries()
+                .into_iter()
+                .map(|(key, summary)| (key, summary.total_bans))
+                .collect()
+        })
+        .unwrap_or_default();
+    let exits = ph::exit_concentration(&accounts, &burned);
+
+    let sweep = state
+        .service
+        .token_manager()
+        .ban_ledger()
+        .and_then(|ledger| ledger.detect_sweep())
+        .map(ph::SweepView::from);
+
+    Json(ph::assess(rate_limit, exits, sweep))
+}
+
+/// GET /api/admin/ban-postmortem?limit=200
+///
+/// 封号复盘：把台账切成一波一波，每波给出出口分布与归因结论
+/// （批量清扫 / 单个脏出口 / 零散掉落）。
+pub async fn ban_postmortem(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(200)
+        .clamp(1, 1_000);
+
+    let events = state
+        .service
+        .token_manager()
+        .ban_ledger()
+        .map(|ledger| ledger.recent_events(limit))
+        .unwrap_or_default();
+    let waves = crate::admin::pool_health::build_waves(events);
+
+    Json(serde_json::json!({
+        "waves": waves,
+        "totalBans": waves.iter().map(|w| w.bans).sum::<usize>(),
+    }))
+}
+
 // ============ 账号分组（独立实体）============
 
 fn group_to_item(g: &super::groups::Group, state: &AdminState) -> super::types::GroupItem {

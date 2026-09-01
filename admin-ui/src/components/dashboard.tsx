@@ -9,6 +9,7 @@ import {
   RotateCcw,
   CheckCircle2,
   Globe,
+  ShieldAlert,
   SlidersHorizontal,
   LogIn,
   Key,
@@ -80,6 +81,8 @@ import {
   proxyExitHost,
 } from "@/components/credential-exit-badge";
 import { getProxyPool } from "@/api/credentials";
+import { getPoolHealth } from "@/api/traces";
+import { PoolHealthDialog } from "@/components/pool-health-dialog";
 import { useGroupOptions } from "@/hooks/use-groups";
 import { useRectSelect } from "@/hooks/use-rect-select";
 import { totalInFlight } from "@/lib/rpm-operations";
@@ -228,6 +231,16 @@ export function Dashboard({ onLogout }: DashboardProps) {
   // 近一小时的请求形态：排查封号时要看「这个号最近打了多少、多少被限流」，
   // 累计失败数只会单调增长，看不出号是刚被打爆还是一直很闲。
   const { data: recentActivity } = useRecentActivity(60);
+
+  // 号池体检。菜单上挂个数字，否则「有风险」这件事得先想起来点开才知道
+  const [poolHealthOpen, setPoolHealthOpen] = useState(false);
+  const { data: poolHealth } = useQuery({
+    queryKey: ["pool-health", 60],
+    queryFn: () => getPoolHealth(60),
+    refetchInterval: 60_000,
+  });
+  const poolRiskCount =
+    (poolHealth?.severityCounts.critical ?? 0) + (poolHealth?.severityCounts.warn ?? 0);
 
   // 出口视角：同一个 IP 上挂了几个启用中的号 + 这个 IP 历史烧过几个号。
   // 同出口的号会一起暴露，一个被标记容易连坐——这两个数要和账号并排显示才有用。
@@ -1539,6 +1552,18 @@ export function Dashboard({ onLogout }: DashboardProps) {
                       ? `刷新中… ${queryInfoProgress.current}/${queryInfoProgress.total}`
                       : "刷新当前页余额"}
                   </DropdownMenuItem>
+                  <DropdownMenuItem onSelect={() => setPoolHealthOpen(true)}>
+                    <ShieldAlert />
+                    号池体检
+                    {poolRiskCount > 0 && (
+                      <Badge
+                        variant="outline"
+                        className="ml-auto h-4 border-destructive/60 px-1 text-[10px] text-destructive"
+                      >
+                        {poolRiskCount}
+                      </Badge>
+                    )}
+                  </DropdownMenuItem>
                   <DropdownMenuItem
                     onSelect={() => dialogs.setProxyPoolOpen(true)}
                   >
@@ -1826,6 +1851,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
         open={dialogs.proxyPoolOpen}
         onOpenChange={dialogs.setProxyPoolOpen}
       />
+      <PoolHealthDialog open={poolHealthOpen} onOpenChange={setPoolHealthOpen} />
       <ImportDefaultsDialog
         open={dialogs.importDefaultsOpen}
         onOpenChange={dialogs.setImportDefaultsOpen}

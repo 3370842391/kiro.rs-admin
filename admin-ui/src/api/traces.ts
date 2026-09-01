@@ -1,7 +1,9 @@
 import axios from 'axios'
 import { storage } from '@/lib/storage'
 import type {
+  BanPostmortem,
   FailureStatsMap,
+  PoolHealth,
   RecentActivityResponse,
   TracePage,
   TraceQuery,
@@ -53,6 +55,24 @@ export async function getFailureStats(): Promise<FailureStatsMap> {
 export async function getRecentActivity(windowMinutes = 60): Promise<RecentActivityResponse> {
   const { data } = await api.get<RecentActivityResponse>('/traces/recent-activity', {
     params: { windowMinutes: String(windowMinutes) },
+  })
+  return data
+}
+
+/**
+ * 号池风险体检：限流形态、出口集中度、批量清扫特征 + 「该做什么」的结论。
+ */
+export async function getPoolHealth(windowMinutes = 60): Promise<PoolHealth> {
+  const { data } = await api.get<PoolHealth>('/pool-health', {
+    params: { windowMinutes: String(windowMinutes) },
+  })
+  return data
+}
+
+/** 封号复盘：把台账切成一波一波，每波给出出口分布与归因结论 */
+export async function getBanPostmortem(limit = 200): Promise<BanPostmortem> {
+  const { data } = await api.get<BanPostmortem>('/ban-postmortem', {
+    params: { limit: String(limit) },
   })
   return data
 }

@@ -1332,6 +1332,103 @@ export interface RecentActivityResponse {
   credentials: Record<string, RecentActivity>
 }
 
+// ============ 号池风险体检 ============
+
+/** 只有两档：没问题时不产出结论条目，所以不需要 ok */
+export type RiskSeverity = 'warn' | 'critical'
+
+export interface RiskFinding {
+  /** 稳定标识，决定图标与跳转目标 */
+  code: string
+  severity: RiskSeverity
+  title: string
+  /** 判据与建议动作 */
+  detail: string
+}
+
+export interface RateLimitShape {
+  windowMinutes: number
+  attempts: number
+  success: number
+  rateLimited: number
+  rateLimitedPct: number
+  minutesWithTraffic: number
+  /** 一个 429 都没有的分钟数。关键不在 429 总数，而在有没有喘息的时刻 */
+  quietMinutes: number
+  quietMinutePct: number
+}
+
+export interface CrowdedExit {
+  exit: string
+  accounts: number
+  /** 该出口历史累计烧号数 */
+  burned: number
+}
+
+export interface ExitConcentration {
+  accounts: number
+  exits: number
+  avgAccountsPerExit: number
+  crowded: CrowdedExit[]
+  /** 走直连的账号数，这些号暴露的是服务器本机 IP */
+  directAccounts: number
+}
+
+export interface SweepView {
+  bans: number
+  distinctExits: number
+  windowMinutes: number
+  credentials: number[]
+  survivalMinSecs?: number
+  survivalMaxSecs?: number
+}
+
+export interface PoolHealth {
+  severityCounts: { critical: number; warn: number }
+  findings: RiskFinding[]
+  rateLimit: RateLimitShape
+  exits: ExitConcentration
+  sweep?: SweepView
+}
+
+// ============ 封号复盘 ============
+
+export interface PostmortemEvent {
+  credentialId: number
+  exit: string
+  bannedAt: string
+  survivalSecs?: number
+  successesBeforeBan?: number
+  /** 上游封号措辞的归类 */
+  kind: string
+}
+
+export interface ExitBanCount {
+  exit: string
+  bans: number
+}
+
+export interface BanWave {
+  startedAt: string
+  endedAt: string
+  spanSecs: number
+  bans: number
+  distinctExits: number
+  /** 跨多个出口且存活时长差异大 = 不像各自到寿命 */
+  looksLikeSweep: boolean
+  survivalMinSecs?: number
+  survivalMaxSecs?: number
+  byExit: ExitBanCount[]
+  events: PostmortemEvent[]
+  /** 一句话归因结论 */
+  verdict: string
+}
+
+export interface BanPostmortem {
+  waves: BanWave[]
+  totalBans: number
+}
+
 // ============ 账号分组（独立实体）============
 
 export interface GroupItem {
