@@ -38,8 +38,27 @@ describe('credential metrics UI wiring', () => {
 
     expect(source).toContain('formatSuccessRate')
     expect(source).toContain('formatTokenState')
-    expect(source).toContain('connectionLabel')
     expect(source).toContain('formatBalanceFreshness')
+  })
+
+  test('出口与近期活跃度直接显示在卡片上，而不是一个「代理/直连」的字', async () => {
+    const source = await readSource('components/credential-card.tsx')
+
+    // connectionLabel 只能给出「代理」两个字，排查封号时完全不够用：
+    // 要知道是哪个 IP、这个 IP 上还挂着几个号、它烧过号没有。
+    expect(source).not.toContain('connectionLabel')
+    expect(source).toContain('CredentialExitBadge')
+    expect(source).toContain('exitPeers')
+    expect(source).toContain('exitBurnedAccounts')
+
+    // 近 1h 成功/429：累计失败数只会单调增长，看不出号是刚被打爆还是一直很闲
+    expect(source).toContain('CredentialActivityBadge')
+    expect(source).toContain('recentActivity')
+  })
+
+  test('出口徽章与活跃度在卡片视图与列表视图各渲染一次', async () => {
+    const source = await readSource('components/credential-card.tsx')
+    expect(source.match(/<CredentialMetaLine\b/g)?.length).toBe(2)
   })
 
   test('refreshes account state frequently enough for the one-minute RPM view', async () => {

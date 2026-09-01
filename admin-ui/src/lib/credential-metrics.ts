@@ -160,6 +160,11 @@ export function formatCleanupCountdown(
   return `${humanizeDuration(remaining)}后清理`
 }
 
+/**
+ * @deprecated 卡片已改用 `CredentialExitBadge` 直接显示出口 host:port、同出口账号数
+ * 与烧号数。「代理 / 直连」两个字在排查封号时不够用——真正要看的是哪个 IP。
+ * 保留仅为兼容可能的外部引用，新代码不要用。
+ */
 export function connectionLabel(hasProxy: boolean): string {
   return hasProxy ? '代理' : '直连'
 }

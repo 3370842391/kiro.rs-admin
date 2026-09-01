@@ -1,6 +1,11 @@
 import axios from 'axios'
 import { storage } from '@/lib/storage'
-import type { FailureStatsMap, TracePage, TraceQuery } from '@/types/api'
+import type {
+  FailureStatsMap,
+  RecentActivityResponse,
+  TracePage,
+  TraceQuery,
+} from '@/types/api'
 
 const api = axios.create({
   baseURL: '/api/admin',
@@ -36,6 +41,19 @@ export async function getTraces(query: TraceQuery): Promise<TracePage> {
 
 export async function getFailureStats(): Promise<FailureStatsMap> {
   const { data } = await api.get<FailureStatsMap>('/traces/failure-stats')
+  return data
+}
+
+/**
+ * 按凭据的近期请求形态（成功 / 429 / 其它失败）。
+ *
+ * 与 failure-stats 的区别是带时间窗且含成功数：排查封号时「这个号最近一小时
+ * 打了多少、其中多少被限流」比历史累计失败有用——累计值只会单调增长。
+ */
+export async function getRecentActivity(windowMinutes = 60): Promise<RecentActivityResponse> {
+  const { data } = await api.get<RecentActivityResponse>('/traces/recent-activity', {
+    params: { windowMinutes: String(windowMinutes) },
+  })
   return data
 }
 

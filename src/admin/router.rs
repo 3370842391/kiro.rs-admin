@@ -46,7 +46,8 @@ use super::{
         set_update_config,
         start_idc_login, start_idc_relogin, start_social_login, start_social_relogin,
         stats_by_credential, stats_by_model, stats_overview, stats_timeseries, sync_model_profiles,
-        test_credential_response, trace_failure_stats, unpin_error_snapshot, update_admin_key,
+        test_credential_response, trace_failure_stats, trace_recent_activity,
+        unpin_error_snapshot, update_admin_key,
         update_client_key, update_credential, update_group, update_refresh_token,
         upsert_model_mapping,
     },
@@ -352,6 +353,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/stats/by-model", get(stats_by_model))
         .route("/stats/by-credential", get(stats_by_credential))
         .route("/traces/failure-stats", get(trace_failure_stats))
+        .route("/traces/recent-activity", get(trace_recent_activity))
         .route("/traces", get(list_traces).delete(clear_traces))
         .route("/error-snapshots", get(list_error_snapshots))
         .route("/error-snapshots/storage", get(error_snapshot_storage))

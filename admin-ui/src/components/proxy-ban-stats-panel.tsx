@@ -255,72 +255,147 @@ function BanRow({ entry }: { entry: ProxyBanDetailEntry }) {
   const noisy = !entry.risk.abovePoolBaseline
   const level = noisy ? 'ok' : riskLevelOf(entry.risk)
 
+  const evidenceCount = entry.risk.reasons.length + entry.risk.blockers.length
+
   return (
     <div className="text-sm">
-      <div className="flex items-start gap-2 p-3">
-        <button
-          type="button"
-          className="shrink-0 text-muted-foreground hover:text-foreground mt-0.5"
-          onClick={() => setExpanded((v) => !v)}
-          aria-label={expanded ? '收起封号明细' : '展开封号明细'}
+      {/* 整行可点开合：判定依据与明细都藏在展开区。
+          此前每一行都把 4~6 条判定理由平铺出来，十几个出口叠起来就是一屏字，
+          真正要扫的「哪个 IP、烧了几个、近 24h 有没有在烧」反而被淹掉。 */}
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        aria-expanded={expanded}
+        className="flex w-full items-center gap-2.5 px-3 py-2.5 text-left transition-colors hover:bg-muted/40"
+      >
+        {expanded ? (
+          <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" />
+        ) : (
+          <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
+        )}
+
+        {/* 出口地址：这一行的主键，字号最大 */}
+        <span className="min-w-0 flex-1 truncate font-mono text-sm font-medium">
+          {entry.proxyKey}
+        </span>
+
+        {/* 烧号数：扫视时唯一必须看清的数字 */}
+        <span
+          className={cn(
+            'inline-flex shrink-0 items-center gap-1 text-base font-semibold tabular-nums',
+            noisy ? 'text-muted-foreground' : 'text-destructive',
+          )}
+          title={`历史累计烧掉 ${entry.totalBans} 个号，曾绑定过 ${entry.accountsSeen} 个`}
         >
-          {expanded ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
-        </button>
-        <div className="flex-1 min-w-0 space-y-1">
-          <div className="flex items-center gap-2 flex-wrap">
-            <span className="font-mono text-xs truncate">{entry.proxyKey}</span>
-            {!entry.inPool && (
-              <Badge variant="outline" className="text-xs text-muted-foreground">
-                已移出代理池
-              </Badge>
-            )}
-            <Badge variant="outline" className={cn('text-xs gap-1', LEVEL_CLASS[level])}>
-              <Flame className="h-3 w-3" />
-              {entry.totalBans} 个号
-            </Badge>
-            <Badge variant="outline" className={cn('text-xs', LEVEL_CLASS[level])}>
-              {noisy ? '清扫噪声' : LEVEL_LABEL[level]}
-            </Badge>
-            <ProxyWeightBadge risk={entry.risk} />
-            {entry.banRate != null && (
-              <span className="text-xs text-muted-foreground">
-                {entry.totalBans}/{entry.accountsSeen} = {Math.round(entry.banRate * 100)}%
-                <span className="ml-1">
-                  （下界 {Math.round(entry.risk.banRateLowerBound * 100)}% vs 基线{' '}
-                  {Math.round(entry.risk.pooledBanRate * 100)}%）
-                </span>
-              </span>
-            )}
-          </div>
-          <div className="flex items-center gap-3 text-xs text-muted-foreground flex-wrap">
-            {entry.bans24h > 0 && <span className="text-destructive">24h 内 {entry.bans24h}</span>}
-            {entry.bans7d > 0 && <span>7 天内 {entry.bans7d}</span>}
-            {entry.medianSurvivalSecs != null && (
-              <span>存活中位 {formatSurvival(entry.medianSurvivalSecs)}</span>
-            )}
-            {entry.medianSuccessesBeforeBan != null && (
-              <span>死前成功请求中位 {formatSuccesses(entry.medianSuccessesBeforeBan)}</span>
-            )}
-            <span>{entry.distinctBatchDays} 个批次</span>
-            {entry.lastBanAt && <span>最近 {new Date(entry.lastBanAt).toLocaleString()}</span>}
-          </div>
-          <RiskVerdict risk={entry.risk} />
-        </div>
-        <Button
-          size="sm"
-          variant="ghost"
-          className="h-7 text-xs shrink-0"
-          onClick={() => resetMutation.mutate()}
-          disabled={resetMutation.isPending}
-          title="机场换了出口 IP 后清零，重新开始计数"
-        >
-          <RotateCcw className="h-3 w-3 mr-1" />
-          清零
-        </Button>
-      </div>
+          <Flame className="h-4 w-4" />
+          {entry.totalBans}
+          {entry.banRate != null && (
+            <span className="text-xs font-normal text-muted-foreground">
+              /{entry.accountsSeen}
+            </span>
+          )}
+        </span>
+
+        {/* 近 24h 才是「现在还在不在烧」的判据，历史累计不是 */}
+        {entry.bans24h > 0 && (
+          <Badge
+            variant="outline"
+            className="shrink-0 border-destructive/60 text-xs text-destructive"
+            title="最近 24 小时内烧掉的号数。出口是会换 IP 的，近期数据比累计更能说明它现在的状态"
+          >
+            24h {entry.bans24h}
+          </Badge>
+        )}
+
+        {!noisy && (
+          <Badge variant="outline" className={cn('shrink-0 text-xs', LEVEL_CLASS[level])}>
+            {LEVEL_LABEL[level]}
+          </Badge>
+        )}
+        <ProxyWeightBadge risk={entry.risk} />
+        {!entry.inPool && (
+          <Badge variant="outline" className="shrink-0 text-xs text-muted-foreground">
+            已移出池
+          </Badge>
+        )}
+      </button>
 
       {expanded && (
-        <div className="border-t bg-muted/30 px-3 py-2 space-y-1 max-h-64 overflow-y-auto">
+        <div className="space-y-3 border-t bg-muted/30 px-3 py-3">
+          {/* 关键指标：展开后才需要逐个看，用标签-数值对而不是挤成一行灰字 */}
+          <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-xs sm:grid-cols-4">
+            <Metric
+              label="封号率"
+              value={entry.banRate != null ? `${Math.round(entry.banRate * 100)}%` : '-'}
+              hint={`${entry.totalBans} / ${entry.accountsSeen}。要和全池基线比才有意义`}
+            />
+            <Metric
+              label="置信下界 vs 基线"
+              value={`${Math.round(entry.risk.banRateLowerBound * 100)}% / ${Math.round(
+                entry.risk.pooledBanRate * 100,
+              )}%`}
+              hint="下界超过全池基线，才算这个出口自己的问题；否则只是赶上过全池清扫"
+              tone={entry.risk.abovePoolBaseline ? 'bad' : undefined}
+            />
+            <Metric
+              label="存活中位"
+              value={
+                entry.medianSurvivalSecs != null
+                  ? formatSurvival(entry.medianSurvivalSecs)
+                  : '-'
+              }
+              hint="被封账号从加入到判死的中位时长。越短说明这个 IP 越脏"
+            />
+            <Metric
+              label="死前成功中位"
+              value={
+                entry.medianSuccessesBeforeBan != null
+                  ? formatSuccesses(entry.medianSuccessesBeforeBan)
+                  : '-'
+              }
+              hint="接近 0 = 出口已被上游标记；很大 = 号是被打死的，换 IP 解决不了"
+            />
+            <Metric label="7 天内" value={String(entry.bans7d)} />
+            <Metric
+              label="批次数"
+              value={String(entry.distinctBatchDays)}
+              hint="被封账号横跨几个加入日。只有 1 说明全是同一批号，可能是料本身有问题"
+            />
+            <Metric
+              label="最近封号"
+              value={entry.lastBanAt ? new Date(entry.lastBanAt).toLocaleString() : '-'}
+              className="col-span-2"
+            />
+          </dl>
+
+          {evidenceCount > 0 && (
+            <div className="rounded-md border bg-background/60 p-2.5">
+              <div className="mb-1.5 text-xs font-medium">判定依据</div>
+              <RiskVerdict risk={entry.risk} />
+            </div>
+          )}
+
+          <div className="flex items-center justify-between gap-2">
+            <div className="text-xs font-medium">
+              封号明细
+              <span className="ml-1 font-normal text-muted-foreground">
+                {entry.events.length} 条
+              </span>
+            </div>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-7 shrink-0 text-xs"
+              onClick={() => resetMutation.mutate()}
+              disabled={resetMutation.isPending}
+              title="机场换了出口 IP 后清零，重新开始计数"
+            >
+              <RotateCcw className="mr-1 h-3 w-3" />
+              清零台账
+            </Button>
+          </div>
+
+          <div className="max-h-64 space-y-1 overflow-y-auto">
           {entry.events.length === 0 && (
             <div className="text-xs text-muted-foreground py-1">无明细记录</div>
           )}
@@ -352,8 +427,38 @@ function BanRow({ entry }: { entry: ProxyBanDetailEntry }) {
               )}
             </div>
           ))}
+          </div>
         </div>
       )}
+    </div>
+  )
+}
+
+/** 展开区里的「标签 + 数值」对。比一行挤满灰字好扫 */
+function Metric({
+  label,
+  value,
+  hint,
+  tone,
+  className,
+}: {
+  label: string
+  value: string
+  hint?: string
+  tone?: 'bad'
+  className?: string
+}) {
+  return (
+    <div className={cn('min-w-0', className)} title={hint}>
+      <dt className="truncate text-[11px] text-muted-foreground">{label}</dt>
+      <dd
+        className={cn(
+          'truncate font-medium tabular-nums',
+          tone === 'bad' && 'text-destructive',
+        )}
+      >
+        {value}
+      </dd>
     </div>
   )
 }
@@ -395,11 +500,14 @@ export function ProxyBanStatsPanel() {
             累计 {data?.totalBans ?? 0} 个号
           </Badge>
         </div>
-        <p className="text-xs text-muted-foreground">
-          按出口 <span className="font-mono">host:port</span> 归档，与账号生命周期解耦：死号被保留期清理掉之后，这里的历史计数依然保留。
-          烧号明显高于池内中位数的出口会被<span className="font-medium">自动降权</span>，
-          干净出口用尽前不会轮到它们；全池封号率一致时不降任何人（那说明根因在请求打法）。
-          降权只影响选择顺序，<span className="font-medium">不会禁用代理</span>。
+        <p className="text-xs leading-relaxed text-muted-foreground">
+          按出口 <span className="font-mono">host:port</span> 归档，死号被清理后计数依然保留。
+          封号率显著高于全池基线的出口会<span className="font-medium text-foreground">自动降权</span>，
+          干净出口用尽前不会轮到它们；<span className="font-medium text-foreground">不会禁用代理</span>。
+          全池封号率一致时不降任何人——那说明根因在请求打法，换 IP 无用。
+        </p>
+        <p className="text-[11px] text-muted-foreground/80">
+          点任意一行展开：判定依据、关键指标与逐条封号明细都在里面。
         </p>
         {recommended.length > 0 && (
           <div className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">

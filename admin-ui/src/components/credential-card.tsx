@@ -52,7 +52,6 @@ import {
 } from "@/lib/utils";
 import { rpmLoadState } from "@/lib/rpm-operations";
 import {
-  connectionLabel,
   formatBalanceFreshness,
   formatSuccessRate,
   formatTokenState,
@@ -84,6 +83,11 @@ import { UpdateTokenDialog } from "@/components/update-token-dialog";
 import { ReloginDialog } from "@/components/relogin-dialog";
 import { CredentialFailuresDialog } from "@/components/credential-failures-dialog";
 import { AvailableModelsDialog } from "@/components/available-models-dialog";
+import {
+  CredentialActivityBadge,
+  CredentialExitBadge,
+} from "@/components/credential-exit-badge";
+import type { RecentActivity } from "@/types/api";
 
 interface CredentialCardProps {
   credential: CredentialStatusItem;
@@ -94,6 +98,14 @@ interface CredentialCardProps {
   onRefreshBalance: () => void;
   /** 该凭据的失败分类计数（来自 trace 聚合）；无数据时回退 totalFailureCount */
   failureStats?: { auth: number; throttle: number; other: number };
+  /** 近 N 分钟的请求形态（成功 / 429），用于判断这个号是不是被打爆了 */
+  recentActivity?: RecentActivity;
+  /** recentActivity 的观察窗口 */
+  activityWindowMinutes?: number;
+  /** 同一出口上启用中的账号数（含自己）。同出口的号会一起暴露 */
+  exitPeers?: number;
+  /** 该出口历史累计烧号数；未知时不显示 */
+  exitBurnedAccounts?: number;
   /** 展示形态：卡片（默认）或紧凑列表行 */
   view?: "card" | "list";
   /** 打开响应测试弹窗 */
@@ -313,7 +325,19 @@ function ConcurrencyGauge({ inFlight, max }: { inFlight: number; max?: number })
  * 次要元信息单行 —— 从前是 5~7 个徽章挤在标题下换行成三排，
  * 这里压成一行低对比度文本，信息密度不减但视觉噪音大幅下降。
  */
-function CredentialMetaLine({ credential }: { credential: CredentialStatusItem }) {
+function CredentialMetaLine({
+  credential,
+  recentActivity,
+  activityWindowMinutes = 60,
+  exitPeers,
+  exitBurnedAccounts,
+}: {
+  credential: CredentialStatusItem;
+  recentActivity?: RecentActivity;
+  activityWindowMinutes?: number;
+  exitPeers?: number;
+  exitBurnedAccounts?: number;
+}) {
   // 共享 queryKey，多张卡片命中同一份缓存，不会各发一次请求
   const { data: deadConfig } = useDeadCredentialConfig();
   // 总闸关闭时不显示倒计时——死号不会被删，倒计时就是假信息
@@ -349,12 +373,6 @@ function CredentialMetaLine({ credential }: { credential: CredentialStatusItem }
   if (credential.hasProfileArn) {
     items.push({ text: "ARN", hint: "已配置 Profile ARN" });
   }
-  items.push({
-    text: connectionLabel(credential.hasProxy),
-    hint: credential.hasProxy
-      ? `经代理：${maskProxyUrl(credential.proxyUrl ?? "")}`
-      : "不经代理，直连上游",
-  });
   if (credential.authMethod !== "api_key") {
     items.push({
       text: `Token ${formatTokenState(credential.expiresAt)}`,
@@ -397,15 +415,23 @@ function CredentialMetaLine({ credential }: { credential: CredentialStatusItem }
   return (
     <div
       data-credential-meta
-      className="mt-1.5 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground"
+      className="mt-1.5 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground"
     >
+      {/* 出口与活跃度排在最前：排查封号时先看这两个，不该埋在一串灰字后面 */}
+      <CredentialExitBadge
+        proxyUrl={credential.hasProxy ? credential.proxyUrl : null}
+        peers={exitPeers}
+        burnedAccounts={exitBurnedAccounts}
+      />
+      <CredentialActivityBadge
+        activity={recentActivity}
+        windowMinutes={activityWindowMinutes}
+      />
       {items.map((item, index) => (
         <span key={`${item.text}-${index}`} className="flex min-w-0 items-center gap-2">
-          {index > 0 && (
-            <span aria-hidden="true" className="text-border">
-              ·
-            </span>
-          )}
+          <span aria-hidden="true" className="text-border">
+            ·
+          </span>
           <span className="min-w-0 truncate" title={item.hint}>
             {item.text}
           </span>
@@ -423,6 +449,10 @@ export function CredentialCard({
   loadingBalance,
   onRefreshBalance,
   failureStats,
+  recentActivity,
+  activityWindowMinutes = 60,
+  exitPeers,
+  exitBurnedAccounts,
   view = "card",
   onTestResponse,
   privacyMode = true,
@@ -900,7 +930,13 @@ export function CredentialCard({
           )}
           {badges}
         </div>
-        <CredentialMetaLine credential={credential} />
+        <CredentialMetaLine
+          credential={credential}
+          recentActivity={recentActivity}
+          activityWindowMinutes={activityWindowMinutes}
+          exitPeers={exitPeers}
+          exitBurnedAccounts={exitBurnedAccounts}
+        />
       </div>
 
       {/* 当前并发 —— 小屏起就常驻，是列表里最该一眼看到的实时量 */}
@@ -1202,7 +1238,13 @@ export function CredentialCard({
               <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 [&>*]:shrink-0">
                 {badges}
               </div>
-              <CredentialMetaLine credential={credential} />
+              <CredentialMetaLine
+                credential={credential}
+                recentActivity={recentActivity}
+                activityWindowMinutes={activityWindowMinutes}
+                exitPeers={exitPeers}
+                exitBurnedAccounts={exitBurnedAccounts}
+              />
             </div>
             <Switch
               className="mt-0.5"

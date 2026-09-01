@@ -1,5 +1,5 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { getTraces, getFailureStats, clearTraces } from '@/api/traces'
+import { getTraces, getFailureStats, getRecentActivity, clearTraces } from '@/api/traces'
 import type { TraceQuery } from '@/types/api'
 
 /**
@@ -25,6 +25,22 @@ export function useFailureStats() {
   return useQuery({
     queryKey: ['traces', 'failure-stats'],
     queryFn: getFailureStats,
+    refetchInterval: 30_000,
+    staleTime: 10_000,
+    refetchOnWindowFocus: false,
+  })
+}
+
+/**
+ * 按凭据的近一小时请求形态（成功 / 429 / 其它失败）。
+ *
+ * 排查封号时最需要的两个数：这个号最近打了多少、其中多少被限流。
+ * 30 秒一刷，与失败统计同频。
+ */
+export function useRecentActivity(windowMinutes = 60) {
+  return useQuery({
+    queryKey: ['traces', 'recent-activity', windowMinutes],
+    queryFn: () => getRecentActivity(windowMinutes),
     refetchInterval: 30_000,
     staleTime: 10_000,
     refetchOnWindowFocus: false,

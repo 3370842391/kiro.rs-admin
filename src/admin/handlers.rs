@@ -2541,6 +2541,32 @@ pub async fn trace_failure_stats(State(state): State<AdminState>) -> impl IntoRe
     Json(map)
 }
 
+/// GET /api/admin/traces/recent-activity?windowMinutes=60
+///
+/// 按凭据聚合最近一段时间的请求形态：成功 / 429 / 其它失败 / 总跳数。
+/// 排查封号用——累计失败数只会单调增长，看不出号是刚被打爆还是一直很闲。
+/// 返回 `{ windowMinutes, credentials: { "<id>": { success, rateLimited, ... } } }`
+pub async fn trace_recent_activity(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    // 1..=1440 分钟。窗口太大时 SQL 要扫的行数与保留期同量级，没有意义
+    let window_minutes = params
+        .get("windowMinutes")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(60)
+        .clamp(1, 1_440);
+    let stats = state
+        .trace_store
+        .recent_activity_by_credential(window_minutes * 60);
+    let map: std::collections::HashMap<String, crate::admin::trace_db::RecentActivity> =
+        stats.into_iter().map(|(id, s)| (id.to_string(), s)).collect();
+    Json(serde_json::json!({
+        "windowMinutes": window_minutes,
+        "credentials": map,
+    }))
+}
+
 // ============ 账号分组（独立实体）============
 
 fn group_to_item(g: &super::groups::Group, state: &AdminState) -> super::types::GroupItem {

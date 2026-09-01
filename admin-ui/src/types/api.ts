@@ -1314,6 +1314,24 @@ export interface FailureStats {
 /** credentialId(字符串) → 失败分类计数 */
 export type FailureStatsMap = Record<string, FailureStats>
 
+/** 单个凭据在观察窗口内的请求形态 */
+export interface RecentActivity {
+  /** 成功跳数 */
+  success: number
+  /** 被限流（HTTP 429）的跳数 */
+  rateLimited: number
+  /** 其余失败跳数 */
+  otherFailures: number
+  /** 总跳数 */
+  attempts: number
+}
+
+export interface RecentActivityResponse {
+  windowMinutes: number
+  /** credentialId(字符串) → 该窗口内的请求形态 */
+  credentials: Record<string, RecentActivity>
+}
+
 // ============ 账号分组（独立实体）============
 
 export interface GroupItem {

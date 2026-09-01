@@ -1232,6 +1232,82 @@ impl TraceStore {
         }
         out
     }
+
+    /// 按凭据聚合**最近一段时间**的请求形态：成功数、429 数、其它失败数。
+    ///
+    /// 与 [`Self::failure_stats`] 的区别是它带时间窗且包含成功数。排查封号时
+    /// 「这个号最近一小时打了多少、其中多少被限流」比「历史累计失败」有用得多：
+    /// 累计值只会单调增长，看不出号是刚被打爆还是一直很闲。
+    ///
+    /// 429 单独一列而不是并进失败：它是「打得太狠」的直接证据，与鉴权失败、
+    /// 网络错误完全是两回事。2026-08-31 的封号排查里，判断依据正是
+    /// 「单号每小时约 90 次 429、且没有一分钟是 0」。
+    pub fn recent_activity_by_credential(
+        &self,
+        window_secs: i64,
+    ) -> std::collections::HashMap<u64, RecentActivity> {
+        let mut out: std::collections::HashMap<u64, RecentActivity> =
+            std::collections::HashMap::new();
+        let since = Utc::now().timestamp() - window_secs.max(0);
+        let conn = self.conn.lock();
+        let mut stmt = match conn.prepare(
+            "SELECT a.credential_id, \
+                    SUM(CASE WHEN a.outcome = 'success' THEN 1 ELSE 0 END), \
+                    SUM(CASE WHEN a.http_status = 429 THEN 1 ELSE 0 END), \
+                    COUNT(*) \
+             FROM traces t JOIN trace_attempts a ON a.trace_id = t.trace_id \
+             WHERE t.ts_epoch >= ?1 AND a.credential_id != 0 \
+             GROUP BY a.credential_id",
+        ) {
+            Ok(s) => s,
+            Err(error) => {
+                tracing::warn!(%error, "recent_activity prepare 失败");
+                return out;
+            }
+        };
+        let rows = stmt.query_map([since], |row| {
+            Ok((
+                row.get::<_, i64>(0)? as u64,
+                row.get::<_, i64>(1)? as u64,
+                row.get::<_, i64>(2)? as u64,
+                row.get::<_, i64>(3)? as u64,
+            ))
+        });
+        let rows = match rows {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(%error, "recent_activity 查询失败");
+                return out;
+            }
+        };
+        for (credential_id, success, rate_limited, attempts) in rows.flatten() {
+            out.insert(
+                credential_id,
+                RecentActivity {
+                    success,
+                    rate_limited,
+                    // 其它失败 = 总跳数 − 成功 − 429。饱和减法防御脏数据。
+                    other_failures: attempts.saturating_sub(success).saturating_sub(rate_limited),
+                    attempts,
+                },
+            );
+        }
+        out
+    }
+}
+
+/// 单个凭据在观察窗口内的请求形态
+#[derive(Debug, Default, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentActivity {
+    /// 成功跳数
+    pub success: u64,
+    /// 被限流（HTTP 429）的跳数
+    pub rate_limited: u64,
+    /// 其余失败跳数
+    pub other_failures: u64,
+    /// 总跳数
+    pub attempts: u64,
 }
 
 /// 按凭据的失败分类计数（鉴权 / 账号风控 / 其他）
@@ -2044,6 +2120,106 @@ mod tests {
         );
         // 空库再清一次返回 0，不报错
         assert_eq!(store.clear_all(), 0);
+    }
+
+    /// 造一条只含单跳的 trace，跳明确挂在指定凭据上。
+    ///
+    /// 不用 `sample()`：它的第一跳把 credential_id 写死成 9，改它等于改别的号的
+    /// 统计——这里要验的恰恰是「按凭据分开计数」。
+    fn single_attempt_trace(
+        trace_id: &str,
+        credential_id: u64,
+        http_status: Option<u16>,
+        outcome_str: &str,
+    ) -> TraceRecord {
+        let mut rec = sample(TraceSample {
+            trace_id,
+            status: if outcome_str == outcome::SUCCESS {
+                "success"
+            } else {
+                "error"
+            },
+            credential_id,
+            model: "m",
+        });
+        rec.total_attempts = 1;
+        rec.attempts = vec![TraceAttempt {
+            attempt: 0,
+            credential_id,
+            endpoint: "runtime".to_string(),
+            http_status,
+            outcome: outcome_str.to_string(),
+            error_snippet: None,
+            duration_ms: 100,
+        }];
+        rec
+    }
+
+    #[test]
+    fn recent_activity_splits_success_rate_limited_and_other() {
+        let store = mem_store();
+        store.insert(single_attempt_trace("ok", 7, Some(200), outcome::SUCCESS));
+        store.insert(single_attempt_trace(
+            "throttled",
+            7,
+            Some(429),
+            outcome::TRANSIENT,
+        ));
+        store.insert(single_attempt_trace(
+            "broken",
+            7,
+            Some(500),
+            outcome::TRANSIENT,
+        ));
+        // 另一个号的 429 不能算到 7 头上
+        store.insert(single_attempt_trace(
+            "other-cred",
+            8,
+            Some(429),
+            outcome::TRANSIENT,
+        ));
+
+        let stats = store.recent_activity_by_credential(3600);
+        let a = stats.get(&7).copied().expect("凭据 7 应有统计");
+        assert_eq!(a.success, 1);
+        assert_eq!(a.rate_limited, 1, "429 必须单列，不能并进失败");
+        assert_eq!(a.other_failures, 1);
+        assert_eq!(a.attempts, 3);
+
+        let b = stats.get(&8).copied().expect("凭据 8 应有统计");
+        assert_eq!(b.rate_limited, 1);
+        assert_eq!(b.success, 0);
+    }
+
+    #[test]
+    fn recent_activity_respects_the_time_window() {
+        let store = mem_store();
+        let mut old = sample(TraceSample {
+            trace_id: "old",
+            status: "success",
+            credential_id: 8,
+            model: "m",
+        });
+        // 挪到两小时前
+        let two_hours_ago = Utc::now() - chrono::Duration::hours(2);
+        old.ts = two_hours_ago.to_rfc3339();
+        store.insert(old);
+
+        store.insert(sample(TraceSample {
+            trace_id: "fresh",
+            status: "success",
+            credential_id: 8,
+            model: "m",
+        }));
+
+        let one_hour = store.recent_activity_by_credential(3600);
+        assert_eq!(
+            one_hour.get(&8).map(|a| a.attempts),
+            Some(1),
+            "一小时窗口不应包含两小时前的记录"
+        );
+        let three_hours = store.recent_activity_by_credential(3 * 3600);
+        assert_eq!(three_hours.get(&8).map(|a| a.attempts), Some(2));
     }
 
     #[test]

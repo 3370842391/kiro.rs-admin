@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import {
   RefreshCw,
   Server,
@@ -74,7 +74,12 @@ import {
   useResetAllSuccessCount,
   useSetPriority,
 } from "@/hooks/use-credentials";
-import { useFailureStats } from "@/hooks/use-traces";
+import { useFailureStats, useRecentActivity } from "@/hooks/use-traces";
+import {
+  countExitUsage,
+  proxyExitHost,
+} from "@/components/credential-exit-badge";
+import { getProxyPool } from "@/api/credentials";
 import { useGroupOptions } from "@/hooks/use-groups";
 import { useRectSelect } from "@/hooks/use-rect-select";
 import { totalInFlight } from "@/lib/rpm-operations";
@@ -219,6 +224,33 @@ export function Dashboard({ onLogout }: DashboardProps) {
     queryFn: getEarningsSummary,
     refetchInterval: 60_000,
   });
+
+  // 近一小时的请求形态：排查封号时要看「这个号最近打了多少、多少被限流」，
+  // 累计失败数只会单调增长，看不出号是刚被打爆还是一直很闲。
+  const { data: recentActivity } = useRecentActivity(60);
+
+  // 出口视角：同一个 IP 上挂了几个启用中的号 + 这个 IP 历史烧过几个号。
+  // 同出口的号会一起暴露，一个被标记容易连坐——这两个数要和账号并排显示才有用。
+  const exitPeerCount = useMemo(
+    () => countExitUsage(data?.credentials ?? []),
+    [data?.credentials],
+  );
+  // 封号台账变化很慢（只在判死时才写），5 分钟刷一次足够
+  const { data: proxyPool } = useQuery({
+    queryKey: ["proxy-pool"],
+    queryFn: getProxyPool,
+    refetchInterval: 300_000,
+    staleTime: 120_000,
+  });
+  const exitBurnedCount = useMemo(() => {
+    const out = new Map<string, number>();
+    for (const proxy of proxyPool?.proxies ?? []) {
+      const host = proxyExitHost(proxy.url);
+      const burned = proxy.banStats?.totalBans ?? 0;
+      if (host && burned > 0) out.set(host, burned);
+    }
+    return out;
+  }, [proxyPool]);
 
   // 分组 / 订阅分级 / 模糊搜索：状态与过滤逻辑一起放在 hook 里
   const filters = useCredentialFilters();
@@ -1665,6 +1697,16 @@ export function Dashboard({ onLogout }: DashboardProps) {
                         handleRefreshBalance(credential.id)
                       }
                       failureStats={failureStatsMap?.[String(credential.id)]}
+                      recentActivity={
+                        recentActivity?.credentials?.[String(credential.id)]
+                      }
+                      activityWindowMinutes={recentActivity?.windowMinutes ?? 60}
+                      exitPeers={exitPeerCount.get(
+                        proxyExitHost(credential.proxyUrl) ?? "",
+                      )}
+                      exitBurnedAccounts={exitBurnedCount.get(
+                        proxyExitHost(credential.proxyUrl) ?? "",
+                      )}
                       onTestResponse={(id) => openResponseTest([id])}
                       privacyMode={privacyMode}
                     />
