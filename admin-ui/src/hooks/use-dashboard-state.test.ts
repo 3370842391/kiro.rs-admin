@@ -82,3 +82,36 @@ describe('filterCredentials', () => {
     expect(ids(input)).toEqual([1, 2, 3, 4])
   })
 })
+
+describe('订阅分级筛选', () => {
+  // 生产实测只出现过这三种标题；PRO+ / 裸 PRO 保留以兼容其它渠道
+  const tiered = [
+    credential({ id: 1, balance: { subscriptionTitle: 'KIRO FREE' } as never }),
+    credential({ id: 2, balance: { subscriptionTitle: 'KIRO POWER' } as never }),
+    credential({ id: 3, balance: { subscriptionTitle: 'KIRO PRO MAX' } as never }),
+    credential({ id: 4, balance: { subscriptionTitle: 'KIRO PRO+' } as never }),
+    credential({ id: 5, balance: { subscriptionTitle: 'KIRO PRO' } as never }),
+    credential({ id: 6 }),
+  ]
+  const ids = (list: CredentialStatusItem[]) => list.map((c) => c.id)
+  const byTier = (...tiers: Tier[]) =>
+    ids(filterCredentials(tiered, { ...NO_FILTER, tierFilter: new Set(tiers) }))
+
+  test('每个档位各自命中，PRO MAX 不再混进 PRO', () => {
+    // 回归：PRO MAX 自身含 "PRO"，判定顺序放错时 3 和 5 会一起被选中
+    expect(byTier('pro_max')).toEqual([3])
+    expect(byTier('pro')).toEqual([5])
+    expect(byTier('pro_plus')).toEqual([4])
+    expect(byTier('power')).toEqual([2])
+    expect(byTier('free')).toEqual([1])
+    expect(byTier('unknown')).toEqual([6])
+  })
+
+  test('多选取并集，方便一次挑出高档位的号', () => {
+    expect(byTier('power', 'pro_max')).toEqual([2, 3])
+  })
+
+  test('空集合等于不筛', () => {
+    expect(byTier()).toEqual([1, 2, 3, 4, 5, 6])
+  })
+})

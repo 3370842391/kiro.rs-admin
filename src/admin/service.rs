@@ -972,15 +972,21 @@ fn credential_to_export_account(cred: KiroCredentials) -> Option<ExportedAccount
 }
 
 /// 由订阅标题推断 `SubscriptionType`（粗粒度，导入方刷新后会自行校正）
+///
+/// 分支顺序即优先级，越具体的越靠前。`PRO MAX` 必须排在裸 `PRO` 之前——它自身
+/// 含 "PRO"，放在后面会被吞掉。生产实测出现过的标题只有 `KIRO FREE` /
+/// `KIRO POWER` / `KIRO PRO MAX` 三种，其中 PRO MAX 占 32 个号。
 fn subscription_type_from_title(title: Option<&str>) -> &'static str {
     let Some(title) = title else { return "Free" };
     let u = title.to_uppercase();
     if u.contains("FREE") {
         "Free"
-    } else if u.contains("PRO+") || u.contains("PRO PLUS") || u.contains("PRO_PLUS") {
-        "Pro_Plus"
     } else if u.contains("POWER") || u.contains("ENTERPRISE") || u.contains("TEAM") {
         "Enterprise"
+    } else if u.contains("PRO MAX") || u.contains("PROMAX") || u.contains("PRO_MAX") {
+        "Pro_Max"
+    } else if u.contains("PRO+") || u.contains("PRO PLUS") || u.contains("PRO_PLUS") {
+        "Pro_Plus"
     } else if u.contains("PRO") {
         "Pro"
     } else {
@@ -7068,5 +7074,21 @@ mod tests {
             "Enterprise"
         );
         assert_eq!(subscription_type_from_title(None), "Free");
+    }
+
+    /// 回归：`PRO MAX` 自身含 "PRO"，判定顺序放错就会被裸 PRO 分支吞掉。
+    /// 生产上 32 个 `KIRO PRO MAX` 曾全部被归成 Pro。
+    #[test]
+    fn pro_max_is_not_swallowed_by_the_bare_pro_branch() {
+        for title in ["KIRO PRO MAX", "Kiro Pro Max", "PROMAX", "kiro pro_max"] {
+            assert_eq!(
+                subscription_type_from_title(Some(title)),
+                "Pro_Max",
+                "标题 {title:?} 应判为 Pro_Max"
+            );
+        }
+        // 更具体的档位不能被 PRO MAX 抢走
+        assert_eq!(subscription_type_from_title(Some("KIRO PRO+")), "Pro_Plus");
+        assert_eq!(subscription_type_from_title(Some("KIRO PRO")), "Pro");
     }
 }

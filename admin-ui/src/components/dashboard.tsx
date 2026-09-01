@@ -123,18 +123,23 @@ interface DashboardProps {
 }
 
 // 订阅分级筛选的可选项（key 与 detectTier 返回值一致）
+//
+// 按档位从高到低排，整理号池时最常找的是「哪些是 POWER / PRO MAX」，
+// 排在最前少一次视线扫描。
 const TIER_OPTIONS: { value: Tier; label: string }[] = [
-  { value: "free", label: "FREE" },
-  { value: "pro", label: "PRO" },
-  { value: "pro_plus", label: "PRO+" },
   { value: "power", label: "POWER" },
+  { value: "pro_max", label: "PRO MAX" },
+  { value: "pro_plus", label: "PRO+" },
+  { value: "pro", label: "PRO" },
+  { value: "free", label: "FREE" },
   { value: "unknown", label: "未知/未查询" },
 ];
 const TIER_LABELS: Record<Tier, string> = {
-  free: "FREE",
-  pro: "PRO",
-  pro_plus: "PRO+",
   power: "POWER",
+  pro_max: "PRO MAX",
+  pro_plus: "PRO+",
+  pro: "PRO",
+  free: "FREE",
   unknown: "未知",
 };
 

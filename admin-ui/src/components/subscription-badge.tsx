@@ -8,7 +8,7 @@ interface SubscriptionBadgeProps {
   className?: string
 }
 
-export type Tier = 'free' | 'pro' | 'pro_plus' | 'power' | 'unknown'
+export type Tier = 'free' | 'pro' | 'pro_plus' | 'pro_max' | 'power' | 'unknown'
 
 interface TierStyle {
   /** 容器背景与文字颜色 */
@@ -19,12 +19,23 @@ interface TierStyle {
   label: string
 }
 
-/** 根据订阅标题推断分级（供列表筛选复用） */
+/** 根据订阅标题推断分级（供列表筛选复用）
+ *
+ * 判定顺序即优先级，越具体的写在越前面。`PRO MAX` 必须排在裸 `PRO` 之前——
+ * 它自身就含 "PRO"，放在后面会被吞掉，于是 32 个 `KIRO PRO MAX` 全都显示成
+ * PRO、也没法单独筛出来（2026-09-01 线上就是这个状态）。
+ *
+ * 生产实测出现过的标题只有三种：`KIRO FREE` / `KIRO POWER` / `KIRO PRO MAX`。
+ * PRO+ 与裸 PRO 保留，是为了兼容其它渠道的号。
+ */
 export function detectTier(title?: string | null): Tier {
   if (!title) return 'unknown'
   const upper = title.toUpperCase()
   if (upper.includes('POWER')) return 'power'
-  if (upper.includes('PRO+') || upper.includes('PRO PLUS')) return 'pro_plus'
+  if (upper.includes('PRO MAX') || upper.includes('PROMAX') || upper.includes('PRO_MAX'))
+    return 'pro_max'
+  if (upper.includes('PRO+') || upper.includes('PRO PLUS') || upper.includes('PRO_PLUS'))
+    return 'pro_plus'
   if (upper.includes('PRO')) return 'pro'
   if (upper.includes('FREE')) return 'free'
   return 'unknown'
@@ -40,6 +51,14 @@ function getTierStyle(tier: Tier, original?: string | null): TierStyle {
         label: 'POWER',
         container:
           'bg-gradient-to-br from-fuchsia-500 to-violet-600 text-white shadow-[0_2px_8px_-2px_rgba(168,85,247,0.5)] border-transparent',
+      }
+    case 'pro_max':
+      // 玫红渐变 — 与 POWER(紫) 和 PRO(蓝) 都拉开距离，一眼能分清
+      return {
+        Icon: Crown,
+        label: 'PRO MAX',
+        container:
+          'bg-gradient-to-br from-rose-500 to-pink-600 text-white shadow-[0_2px_8px_-2px_rgba(244,63,94,0.5)] border-transparent',
       }
     case 'pro_plus':
       // 金色渐变 — Pro+ 高级身份
