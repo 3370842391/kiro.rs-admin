@@ -16,6 +16,9 @@ import {
   ShieldAlert,
   Fingerprint,
   Search,
+  Users,
+  AlertTriangle,
+  Info,
 } from 'lucide-react'
 import {
   Dialog,
@@ -46,7 +49,7 @@ import {
   type ProxyBalancingMode,
 } from '@/api/credentials'
 import type { ProxyScheme } from '@/types/api'
-import { extractErrorMessage, maskProxyUrl } from '@/lib/utils'
+import { cn, extractErrorMessage, maskProxyUrl } from '@/lib/utils'
 import {
   ProxyBanBadge,
   ProxyBanStatsPanel,
@@ -88,6 +91,68 @@ function normalizeProxyCandidates(candidates: string[]): string[] {
 const PROXY_MODE_OPTIONS: ProxyBalancingMode[] = ['sticky', 'round_robin', 'least_load']
 type BatchAction = 'check' | 'enable' | 'disable' | 'global' | 'unglobal' | 'delete' | null
 type PoolTab = 'pool' | 'bans'
+
+/** 池级告警的一条。整条压成一行，长说明进 title */
+interface PoolAlert {
+  key: string
+  tone: 'danger' | 'warn' | 'info'
+  /** 一行以内说清「是什么」 */
+  text: string
+  /** 展开的完整说明，含为什么要管 */
+  hint: string
+  action?: { label: string; onClick: () => void; disabled?: boolean }
+}
+
+const ALERT_TONE: Record<PoolAlert['tone'], string> = {
+  danger: 'border-destructive/50 bg-destructive/10 text-destructive',
+  warn: 'border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300',
+  info: 'border-border bg-muted/40 text-muted-foreground',
+}
+
+/**
+ * 池级告警区。
+ *
+ * 此前每类问题各占一个整块彩色告警框，条件同时成立时列表上方会堆四五个框、
+ * 每个都是一段小字，真正要看的代理列表被挤到屏幕外——这是「界面乱」的主因。
+ * 现在压成每类一行：一行说清是什么、多少个、点哪个按钮，完整解释放 title。
+ */
+function PoolAlerts({ alerts }: { alerts: PoolAlert[] }) {
+  if (alerts.length === 0) return null
+  return (
+    <div className="divide-y overflow-hidden rounded-md border">
+      {alerts.map((alert) => (
+        <div
+          key={alert.key}
+          className={cn(
+            'flex items-center gap-2 px-2.5 py-1.5 text-xs',
+            ALERT_TONE[alert.tone],
+          )}
+          title={alert.hint}
+        >
+          {alert.tone === 'danger' ? (
+            <ShieldAlert className="h-3.5 w-3.5 shrink-0" />
+          ) : alert.tone === 'warn' ? (
+            <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+          ) : (
+            <Info className="h-3.5 w-3.5 shrink-0" />
+          )}
+          <span className="min-w-0 flex-1 truncate">{alert.text}</span>
+          {alert.action && (
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-6 shrink-0 px-2 text-[11px]"
+              onClick={alert.action.onClick}
+              disabled={alert.action.disabled}
+            >
+              {alert.action.label}
+            </Button>
+          )}
+        </div>
+      ))}
+    </div>
+  )
+}
 
 /**
  * 出口筛选条件。围绕「哪些是坏 IP」设计——挑出来批量删除是主要用途，
@@ -577,6 +642,88 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
     }
   }
 
+  /** 池级告警。按严重度排：直连兜底会暴露服务器 IP，是唯一会连锁烧号的一项 */
+  const preview = (list: ProxyPoolEntry[]) =>
+    list
+      .slice(0, 3)
+      .map((proxy) => maskProxyUrl(proxy.url))
+      .join('、') + (list.length > 3 ? ' 等' : '')
+
+  const poolAlerts: PoolAlert[] = []
+  if (directGlobalEnabled) {
+    poolAlerts.push({
+      key: 'direct',
+      tone: 'danger',
+      text: '已开启「直连兜底」：代理连不上时会用本机 IP 打上游',
+      hint:
+        '线上因此烧掉过一批号。服务器真实 IP 被上游记住后，从它出去过的号会接连被判死，' +
+        '而封号会记在各自的代理头上，很难查到根因。除非你确实需要，否则关掉。',
+      action: {
+        label: '立即关闭',
+        onClick: () => toggleDirectFallback(false),
+        disabled: setGlobalProxyMutation.isPending,
+      },
+    })
+  }
+  if (quarantinedProxies.length > 0) {
+    poolAlerts.push({
+      key: 'quarantined',
+      tone: 'danger',
+      text: `${quarantinedProxies.length} 个出口因烧号被隔离停用：${preview(quarantinedProxies)}`,
+      hint: '上面的号已改绑到干净出口。确认机场换过出口 IP 之后可手动重新启用。',
+      action: { label: '隔离设置', onClick: () => setGuardOpen(true) },
+    })
+  }
+  if (flaggedProxies.length > 0) {
+    poolAlerts.push({
+      key: 'flagged',
+      tone: 'danger',
+      text: `${flaggedProxies.length} 个出口被公开情报库标记为代理/VPN：${preview(flaggedProxies)}`,
+      hint:
+        '线上实测「被标记程度」直接决定账号寿命，这些出口优先淘汰。\n' +
+        '注意判据是有没有被标记，不是机房还是家宽——干净的机房 IP 是可用的。',
+    })
+  }
+  if (demotedProxies.length > 0) {
+    poolAlerts.push({
+      key: 'demoted',
+      tone: 'warn',
+      text: `${demotedProxies.length} 个出口已自动降权：${preview(demotedProxies)}`,
+      hint:
+        `封号率置信下界高于全池基线${
+          poolBaselineRate != null ? ` ${Math.round(poolBaselineRate * 100)}%` : ''
+        }。\n` +
+        '干净出口用尽前不会轮到它们。降权只影响选择顺序，代理本身仍处于启用状态。',
+      action: { label: '查看依据', onClick: () => setTab('bans') },
+    })
+  }
+  if (orphanGlobalCandidates.length > 0) {
+    poolAlerts.push({
+      key: 'orphan',
+      tone: 'warn',
+      text: `${orphanGlobalCandidates.length} 个旧全局代理还不在代理池里`,
+      hint: '它们仍会被当作全局候选使用，但没有健康检查、也不在封号统计里。建议移入池中统一管理。',
+      action: {
+        label: '移入代理池',
+        onClick: handleImportOrphanGlobalCandidates,
+        disabled: batchAction !== null,
+      },
+    })
+  }
+  if (uncheckedCount > 0 && proxies.length > 0) {
+    poolAlerts.push({
+      key: 'unchecked',
+      tone: 'info',
+      text: `${uncheckedCount} 个出口还没查过 IP 信誉`,
+      hint: '未检测不等于干净。检测会给出 ASN、是否机房、是否已被公开标记为代理。',
+      action: {
+        label: '立即检测',
+        onClick: () => reputationMutation.mutate(undefined),
+        disabled: reputationMutation.isPending,
+      },
+    })
+  }
+
   const renderHealthBadge = (proxy: ProxyPoolEntry) => {
     if (proxy.health === 'healthy') {
       return (
@@ -1014,130 +1161,7 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                   )}
                 </div>
               )}
-              {flaggedProxies.length > 0 && (
-                <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-xs text-destructive">
-                  <span>
-                    有 {flaggedProxies.length} 个出口已被公开情报库标记为代理/VPN（
-                    {flaggedProxies
-                      .slice(0, 3)
-                      .map((proxy) => maskProxyUrl(proxy.url))
-                      .join('、')}
-                    {flaggedProxies.length > 3 ? ' 等' : ''}
-                    ）。线上实测出口的「已被标记程度」直接决定账号寿命，
-                    这些出口优先淘汰；干净的机房 IP 是可用的，不必非要家宽。
-                  </span>
-                </div>
-              )}
-              {uncheckedCount > 0 && proxies.length > 0 && (
-                <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border px-3 py-2 text-xs text-muted-foreground">
-                  <span>
-                    有 {uncheckedCount} 个出口还没查过 IP 信誉。未检测不等于干净 ——
-                    点上面的「检测信誉」看它们的 ASN 与标记状态。
-                  </span>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    className="h-7 text-xs"
-                    onClick={() => reputationMutation.mutate(undefined)}
-                    disabled={reputationMutation.isPending}
-                  >
-                    立即检测
-                  </Button>
-                </div>
-              )}
-              {directGlobalEnabled && (
-                <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-destructive/60 bg-destructive/15 px-3 py-2 text-xs text-destructive">
-                  <span>
-                    已开启「直连兜底」：代理连不上时账号会改用<b>本机 IP</b> 直连上游。
-                    线上因此烧掉过一批号——真实 IP 被上游记住后，从它出去过的号会接连被判死，
-                    而封号会记在各自的代理头上，很难查。除非你确实需要，否则关掉。
-                  </span>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    className="h-7 text-xs"
-                    onClick={() => toggleDirectFallback(false)}
-                    disabled={setGlobalProxyMutation.isPending}
-                  >
-                    立即关闭
-                  </Button>
-                </div>
-              )}
-              {quarantinedProxies.length > 0 && (
-                <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-destructive/60 bg-destructive/15 px-3 py-2 text-xs text-destructive">
-                  <span>
-                    有 {quarantinedProxies.length} 个出口因烧号已被隔离停用（
-                    {quarantinedProxies
-                      .slice(0, 3)
-                      .map((proxy) => maskProxyUrl(proxy.url))
-                      .join('、')}
-                    {quarantinedProxies.length > 3 ? ' 等' : ''}
-                    ）。上面的号已改绑到干净出口；确认机场换过出口 IP 后可手动重新启用。
-                  </span>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    className="h-7 text-xs"
-                    onClick={() => setGuardOpen(true)}
-                  >
-                    隔离设置
-                  </Button>
-                </div>
-              )}
-              {demotedProxies.length > 0 && (
-                <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
-                  <span>
-                    有 {demotedProxies.length} 个出口的封号率置信下界高于全池基线
-                    {poolBaselineRate != null ? ` ${Math.round(poolBaselineRate * 100)}%` : ''}
-                    ，已自动降权（
-                    {demotedProxies
-                      .slice(0, 3)
-                      .map((proxy) => maskProxyUrl(proxy.url))
-                      .join('、')}
-                    {demotedProxies.length > 3 ? ' 等' : ''}
-                    ），干净出口用尽前不会轮到它们。代理本身仍处于启用状态。
-                  </span>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    className="h-7 text-xs"
-                    onClick={() => setTab('bans')}
-                  >
-                    查看依据
-                  </Button>
-                </div>
-              )}
-              {orphanGlobalCandidates.length > 0 && (
-                <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-yellow-500/40 bg-yellow-500/10 px-3 py-2 text-xs text-yellow-700 dark:text-yellow-300">
-                  <span>有 {orphanGlobalCandidates.length} 个旧全局代理还不在代理池里。</span>
-                  <div className="flex items-center gap-1">
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      className="h-7 text-xs"
-                      onClick={handleImportOrphanGlobalCandidates}
-                      disabled={batchAction !== null}
-                    >
-                      移入代理池
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      className="h-7 text-xs"
-                      onClick={() => {
-                        saveGlobalCandidates(
-                          globalProxyCandidates.filter(
-                            (candidate) => !orphanGlobalCandidates.includes(candidate)
-                          )
-                        ).catch(() => undefined)
-                      }}
-                      disabled={setGlobalProxyMutation.isPending}
-                    >
-                      移除旧项
-                    </Button>
-                  </div>
-                </div>
-              )}
+              <PoolAlerts alerts={poolAlerts} />
             </div>
 
             {isLoading && (
@@ -1170,26 +1194,30 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                       onCheckedChange={(checked) => toggleSelected(proxy.id, checked === true)}
                       title="选择此代理"
                     />
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2 flex-wrap">
-                        <span className="font-mono text-xs truncate">
+                    <div className="min-w-0 flex-1">
+                      {/* 第一行只放「这是哪个 IP、能不能用、脏不脏」——扫视时唯一要看的。
+                          备注、全局标记、检测时间这些属于查证信息，压到第二行。 */}
+                      <div className="flex min-w-0 items-center gap-2">
+                        <span className="min-w-0 flex-1 truncate font-mono text-sm">
                           {maskProxyUrl(proxy.url)}
                         </span>
-                        {proxy.label && (
-                          <Badge variant="secondary" className="text-xs">{proxy.label}</Badge>
-                        )}
-                        {isGlobal && (
-                          <Badge variant="secondary" className="text-xs gap-1">
-                            <Globe className="h-3 w-3" />
-                            全局
-                          </Badge>
+                        {proxy.credentialCount > 0 && (
+                          <span
+                            className="inline-flex shrink-0 items-center gap-0.5 rounded bg-secondary px-1.5 text-xs tabular-nums text-muted-foreground"
+                            title={`${proxy.credentialCount} 个凭据正绑在这个出口上。同出口的号会一起暴露，一个被标记容易连坐`}
+                          >
+                            <Users className="h-3 w-3" />
+                            {proxy.credentialCount}
+                          </span>
                         )}
                         {renderHealthBadge(proxy)}
+                        <ProxyBanBadge stats={proxy.banStats} risk={proxy.risk} />
+                      </div>
+                      <div className="mt-1 flex flex-wrap items-center gap-1.5">
                         <ProxyReputationBadge
                           grade={proxy.reputationGrade}
                           reputation={proxy.reputation}
                         />
-                        <ProxyBanBadge stats={proxy.banStats} risk={proxy.risk} />
                         <ProxyWeightBadge risk={proxy.risk} />
                         {!proxy.enabled && (
                           <Badge
@@ -1209,37 +1237,51 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                                 : '已禁用'}
                           </Badge>
                         )}
-                      </div>
-                      <div className="flex items-center gap-3 mt-0.5 flex-wrap">
-                        {proxy.credentialCount > 0 && (
-                          <span className="text-xs text-muted-foreground">
-                            {proxy.credentialCount} 个凭据使用中
-                          </span>
+                        {isGlobal && (
+                          <Badge variant="secondary" className="gap-1 text-xs">
+                            <Globe className="h-3 w-3" />
+                            全局
+                          </Badge>
+                        )}
+                        {proxy.label && (
+                          <Badge variant="secondary" className="text-xs">
+                            {proxy.label}
+                          </Badge>
                         )}
                         {proxy.banStats?.bans24h > 0 && (
-                          <span className="text-xs text-destructive">
-                            24h 内烧 {proxy.banStats.bans24h} 个
+                          <span
+                            className="text-xs font-medium text-destructive"
+                            title="最近 24 小时烧掉的号数。出口会换 IP，近期数据比累计更能说明它现在的状态"
+                          >
+                            24h 烧 {proxy.banStats.bans24h}
                           </span>
                         )}
                         {proxy.banStats?.medianSurvivalSecs != null && (
-                          <span className="text-xs text-muted-foreground">
-                            存活中位 {formatSurvival(proxy.banStats.medianSurvivalSecs)}
-                          </span>
-                        )}
-                        {proxy.risk?.blockers?.[0] && proxy.banStats?.totalBans > 0 && (
                           <span
-                            className="text-xs text-muted-foreground truncate max-w-[280px]"
-                            title={proxy.risk.blockers.join('\n')}
+                            className="text-xs text-muted-foreground"
+                            title="被封账号的存活中位时长。越短说明这个 IP 越脏"
                           >
-                            {proxy.risk.blockers[0]}
+                            存活 {formatSurvival(proxy.banStats.medianSurvivalSecs)}
                           </span>
                         )}
                         {proxy.lastCheckedAt && (
-                          <span className="text-xs text-muted-foreground">
-                            检测于 {new Date(proxy.lastCheckedAt).toLocaleString()}
+                          <span
+                            className="text-xs text-muted-foreground/70"
+                            title={`上次连通性检测：${new Date(proxy.lastCheckedAt).toLocaleString()}`}
+                          >
+                            {new Date(proxy.lastCheckedAt).toLocaleDateString()}
                           </span>
                         )}
                       </div>
+                      {/* 「为什么没判它有问题」只在确实烧过号时才说，且收进 title */}
+                      {proxy.risk?.blockers?.[0] && proxy.banStats?.totalBans > 0 && (
+                        <p
+                          className="mt-1 truncate text-[11px] text-muted-foreground/80"
+                          title={proxy.risk.blockers.join('\n')}
+                        >
+                          {proxy.risk.blockers[0]}
+                        </p>
+                      )}
                     </div>
                     <div className="flex items-center gap-1 shrink-0">
                       <label
