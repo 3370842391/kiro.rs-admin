@@ -2190,6 +2190,13 @@ impl KiroProvider {
                                     fb_name,
                                     fb_status
                                 );
+                                // 与主端点同样计入兜底闸，否则「主端点 429、备用桶吐一个
+                                // 认不出来的 400」这条路径会绕过熔断，留下一个死角。
+                                self.note_unrecognized_terminal_failure(
+                                    &fb_endpoint,
+                                    ctx.id,
+                                    &fb_body,
+                                );
                                 anyhow::bail!(
                                     "{} API 请求失败: {} {}",
                                     api_type,
@@ -3316,8 +3323,11 @@ mod tests {
         );
     }
 
-    /// 搭一个「单号 + 恒定 400」的池子，返回 (provider, manager)。
-    async fn single_credential_pool_against(
+    /// 搭一个「恒定返回同一个错 + 两张号」的池子，返回 (provider, manager)。
+    ///
+    /// 必须两张：熔断刻意不会摘掉最后一张能打的号，单号池测不出隔离行为。
+    /// 1 号优先级更高，会一直被选中。
+    async fn pool_against(
         status: &'static str,
         body: &'static str,
     ) -> (KiroProvider, Arc<MultiTokenManager>) {
@@ -3329,7 +3339,10 @@ mod tests {
         let manager = Arc::new(
             MultiTokenManager::new(
                 config,
-                vec![api_key_credential(1, "ksk_only", 0)],
+                vec![
+                    api_key_credential(1, "ksk_first", 0),
+                    api_key_credential(2, "ksk_second", 1),
+                ],
                 None,
                 None,
                 true,
@@ -3356,13 +3369,13 @@ mod tests {
     /// 报文，验证形态判据（连续失败且零成功）本身就足以把号摘出轮转。
     #[tokio::test]
     async fn repeated_unrecognized_400_quarantines_the_credential() {
-        let (provider, manager) = single_credential_pool_against(
+        let (provider, manager) = pool_against(
             "400 Bad Request",
             r#"{"__type":"com.amazon.kiro.runtimeservice#SomeFutureExceptionWeHaveNeverSeen"}"#,
         )
         .await;
 
-        assert_eq!(manager.available_count(), 1);
+        assert_eq!(manager.available_count(), 2);
         for _ in 0..5 {
             assert!(
                 provider
@@ -3374,12 +3387,17 @@ mod tests {
 
         assert_eq!(
             manager.available_count(),
-            0,
+            1,
             "连续 5 次确定性失败且零成功后，号必须被移出轮转，否则它会一直被选中"
         );
+        let entries = manager.snapshot().entries;
+        let burned = entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(
+            burned.quarantined_remaining_secs.unwrap_or(0) > 0,
+            "隔离必须在面板上看得见，否则号静默地不干活，没人查得出为什么"
+        );
         // 隔离不是禁用：这个错误我们没认出来，无从判断是否永久，只能低频复探
-        let entry = manager.snapshot().entries.into_iter().next().unwrap();
-        assert!(!entry.disabled, "熔断是临时隔离，不该把号禁掉");
+        assert!(!burned.disabled, "熔断是临时隔离，不该把号禁掉");
     }
 
     /// 请求本身有问题的 400 换哪张号都一样，不能算到号头上。
@@ -3387,7 +3405,7 @@ mod tests {
     /// 否则一个在死循环里发坏工具 schema 的客户端，能把整池好号刷进隔离。
     #[tokio::test]
     async fn repeated_client_side_400_never_quarantines_the_credential() {
-        let (provider, manager) = single_credential_pool_against(
+        let (provider, manager) = pool_against(
             "400 Bad Request",
             r#"{"__type":"ValidationException","message":"input_schema does not support oneOf","reason":"TOOL_SCHEMA_INVALID"}"#,
         )
@@ -3404,7 +3422,7 @@ mod tests {
 
         assert_eq!(
             manager.available_count(),
-            1,
+            2,
             "根因在请求侧的失败不该让好号进隔离"
         );
     }

@@ -3215,40 +3215,67 @@ impl MultiTokenManager {
     /// **调用方必须先排除「请求本身有问题」的失败**（工具 schema 违规、请求体过长）：
     /// 那类错误换任何号结果都一样，算到号头上会让一个坏客户端把整池好号刷进隔离。
     ///
+    /// 隔离永远会给池子留下至少一张能打的号，理由见函数内注释。
+    ///
     /// 返回该凭据是否因此被隔离。
     pub fn report_terminal_failure(&self, id: u64, error_snippet: &str) -> bool {
-        let mut entries = self.entries.lock();
-        let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
-            return false;
+        let quarantined = {
+            let mut entries = self.entries.lock();
+            let now = Instant::now();
+            // 全池都在吃同一种错时，根因在上游而不在某张号，这时候再摘掉最后一张
+            // 等于自己把服务停了——而且隔离要到期才恢复，上游即使立刻好了也得干等。
+            // 兜底闸的目的是「别让坏号拖累好号」，不是「上游挂了就一起躺下」。
+            let has_other_usable = entries
+                .iter()
+                .any(|e| e.id != id && !e.disabled && !is_cooling(e, now));
+
+            let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
+                return false;
+            };
+            if entry.disabled {
+                return false;
+            }
+
+            entry.total_failure_count += 1;
+            entry.last_used_at = Some(Utc::now().to_rfc3339());
+            entry.consecutive_terminal_failures += 1;
+
+            if entry.consecutive_terminal_failures < TERMINAL_FAILURES_BEFORE_QUARANTINE {
+                false
+            } else if !has_other_usable {
+                // 计数**不清零**：等别的号缓过来，下一次失败立刻隔离，不用重新攒。
+                tracing::warn!(
+                    "凭据 #{} 已连续 {} 次确定性失败，但它是当前唯一还能打的号，暂不隔离。\
+                     全池同时吃到同一种错通常意味着上游出问题了：{}",
+                    id,
+                    entry.consecutive_terminal_failures,
+                    crate::admin::trace_db::truncate_snippet(error_snippet).unwrap_or_default(),
+                );
+                false
+            } else {
+                entry.consecutive_terminal_failures = 0;
+                entry.terminal_quarantines += 1;
+                let cooldown = QUARANTINE_BASE
+                    .saturating_mul(1u32 << entry.terminal_quarantines.min(16).saturating_sub(1))
+                    .min(QUARANTINE_MAX);
+                entry.quarantined_until = Some(now + cooldown);
+
+                tracing::error!(
+                    "凭据 #{} 连续 {} 次确定性失败且期间没有一次成功，熔断隔离 {} 秒（第 {} 轮）。\
+                     这类失败没有被任何已知规则识别，请核对上游报文是否换了形态：{}",
+                    id,
+                    TERMINAL_FAILURES_BEFORE_QUARANTINE,
+                    cooldown.as_secs(),
+                    entry.terminal_quarantines,
+                    crate::admin::trace_db::truncate_snippet(error_snippet).unwrap_or_default(),
+                );
+                true
+            }
         };
-        if entry.disabled {
-            return false;
-        }
-
-        entry.total_failure_count += 1;
-        entry.last_used_at = Some(Utc::now().to_rfc3339());
-        entry.consecutive_terminal_failures += 1;
-        if entry.consecutive_terminal_failures < TERMINAL_FAILURES_BEFORE_QUARANTINE {
-            return false;
-        }
-
-        entry.consecutive_terminal_failures = 0;
-        entry.terminal_quarantines += 1;
-        let cooldown = QUARANTINE_BASE
-            .saturating_mul(1u32 << entry.terminal_quarantines.min(16).saturating_sub(1))
-            .min(QUARANTINE_MAX);
-        entry.quarantined_until = Some(Instant::now() + cooldown);
-
-        tracing::error!(
-            "凭据 #{} 连续 {} 次确定性失败且期间没有一次成功，熔断隔离 {} 秒（第 {} 轮）。\
-             这类失败没有被任何已知规则识别，请核对上游报文是否换了形态：{}",
-            id,
-            TERMINAL_FAILURES_BEFORE_QUARANTINE,
-            cooldown.as_secs(),
-            entry.terminal_quarantines,
-            crate::admin::trace_db::truncate_snippet(error_snippet).unwrap_or_default(),
-        );
-        true
+        // total_failure_count 会落进 kiro_stats.json，和其它 report_* 一样要触发保存；
+        // 必须在释放 entries 锁之后调用——save_stats 自己要拿这把锁，parking_lot 不可重入。
+        self.save_stats_debounced();
+        quarantined
     }
 
     /// 报告指定凭据刷新 Token 失败。
@@ -8980,12 +9007,87 @@ mod tests {
         assert!(!entry.disabled, "熔断是临时隔离，不是禁用");
     }
 
+    /// 熔断写统计不能死锁，且计数要真的落盘。
+    ///
+    /// `total_failure_count` 会进 kiro_stats.json，而 `save_stats` 自己要拿 entries 锁
+    /// （parking_lot 不可重入）。**没有 credentials_path 的用例根本走不到落盘分支**——
+    /// `stats_path()` 返回 None 就直接 return 了——所以其它熔断用例都测不出这条死锁风险，
+    /// 这里必须显式给一个真实路径。
+    #[test]
+    fn terminal_failure_persists_stats_without_deadlocking() {
+        // 独占目录：kiro_stats.json 落在 credentials 的同级目录，而 tmp_creds_path 用的是
+        // 共享的系统临时目录——跟别的用例挤在同一个 kiro_stats.json 上会互相读写，
+        // 并行跑的时候变成偶发失败。
+        let dir = std::env::temp_dir().join(format!("kiro_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("credentials.json");
+        let stats = dir.join("kiro_stats.json");
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                api_key_credential(1, "ksk_stats_a", false),
+                api_key_credential(2, "ksk_stats_b", false),
+            ],
+            None,
+            Some(path),
+            true,
+        )
+        .unwrap();
+
+        for _ in 0..TERMINAL_FAILURES_BEFORE_QUARANTINE {
+            manager.report_terminal_failure(1, "unknown upstream error");
+        }
+        assert_eq!(manager.available_count(), 1, "跑到这里说明没有死锁");
+        assert!(stats.exists(), "确定性失败计数必须落盘，否则重启就丢了");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 隔离永远给池子留一张能打的号。
+    ///
+    /// 全池同时吃到同一种没见过的错，根因几乎一定在上游。这时候还按号隔离，等于自己
+    /// 把服务停掉，而且要等隔离到期才恢复——上游即使立刻好了也得干等最长 2 小时。
+    #[test]
+    fn quarantine_never_takes_the_last_usable_credential_out() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 两张号一起吃同一种错：第一张可以隔离，最后一张必须留着
+        for _ in 0..TERMINAL_FAILURES_BEFORE_QUARANTINE {
+            manager.report_terminal_failure(1, "unknown upstream error");
+        }
+        assert_eq!(manager.available_count(), 1);
+
+        for _ in 0..(TERMINAL_FAILURES_BEFORE_QUARANTINE * 3) {
+            assert!(
+                !manager.report_terminal_failure(2, "unknown upstream error"),
+                "最后一张能打的号不得被隔离，否则上游故障会被放大成自己停服"
+            );
+        }
+        assert_eq!(manager.available_count(), 1, "池子不能被熔断清空");
+
+        // 计数没有清零：等有号顶上来，下一次失败就该立刻隔离，不用重新攒够 5 次
+        manager.report_success(1);
+        assert!(
+            manager.report_terminal_failure(2, "unknown upstream error"),
+            "有别的号可用之后应立即隔离，而不是从头再数"
+        );
+    }
+
     /// 隔离时长按熔断轮次递增并封顶，一次成功全部清零。
     #[test]
     fn quarantine_backoff_escalates_and_resets_on_success() {
         let manager = MultiTokenManager::new(
             Config::default(),
-            vec![KiroCredentials::default()],
+            // 第二张号只是让「留最后一张」的保护不生效，本例专测退避
+            vec![KiroCredentials::default(), KiroCredentials::default()],
             None,
             None,
             false,
@@ -9023,7 +9125,7 @@ mod tests {
             assert!(entry.quarantined_until.is_none(), "成功即解除隔离");
             assert_eq!(entry.terminal_quarantines, 0, "退避轮次也要清零");
         }
-        assert_eq!(manager.available_count(), 1);
+        assert_eq!(manager.available_count(), 2);
     }
 
     #[test]
