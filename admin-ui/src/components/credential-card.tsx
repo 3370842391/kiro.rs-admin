@@ -505,12 +505,25 @@ export function CredentialCard({
   const [rateLimitRemainingMs, setRateLimitRemainingMs] = useState<number>(
     credential.rateLimitedRemainingMs ?? 0,
   );
+  const [quarantineRemaining, setQuarantineRemaining] = useState<number>(
+    credential.quarantinedRemainingSecs ?? 0,
+  );
   useEffect(() => {
     setThrottleRemaining(credential.throttledRemainingSecs ?? 0);
   }, [credential.throttledRemainingSecs]);
   useEffect(() => {
     setRateLimitRemainingMs(credential.rateLimitedRemainingMs ?? 0);
   }, [credential.rateLimitedRemainingMs]);
+  useEffect(() => {
+    setQuarantineRemaining(credential.quarantinedRemainingSecs ?? 0);
+  }, [credential.quarantinedRemainingSecs]);
+  useEffect(() => {
+    if (quarantineRemaining <= 0) return;
+    const t = window.setInterval(() => {
+      setQuarantineRemaining((v) => (v > 0 ? v - 1 : 0));
+    }, 1000);
+    return () => window.clearInterval(t);
+  }, [quarantineRemaining]);
   useEffect(() => {
     if (throttleRemaining <= 0) return;
     const t = window.setInterval(() => {
@@ -644,6 +657,7 @@ export function CredentialCard({
   const reasonStyle = getDisabledReasonStyle(credential.disabledReason);
   const isThrottled = !credential.disabled && throttleRemaining > 0;
   const isRateLimited = !credential.disabled && rateLimitRemainingMs > 0;
+  const isQuarantined = !credential.disabled && quarantineRemaining > 0;
   const rpmCurrent = credential.rpmCurrent ?? 0;
   const rpmLimit = credential.rpmLimit ?? 10;
   const rpmState = rpmLoadState(rpmCurrent, rpmLimit);
@@ -756,6 +770,15 @@ export function CredentialCard({
           429 冷却 {formatThrottleCountdown(Math.ceil(rateLimitRemainingMs / 1000))}
         </Badge>
       )}
+      {isQuarantined && (
+        <Badge
+          variant="destructive"
+          title="连续多次吃到「认不出来的」确定性失败且期间一次没成功，已自动移出轮转。到期自动复探，一次成功即恢复；也可手动解除。请顺便查一下上游报文是不是换了形态。"
+        >
+          <Clock className="mr-1 h-3 w-3" />
+          熔断 {formatThrottleCountdown(quarantineRemaining)}
+        </Badge>
+      )}
       {credential.authMethod && <Badge variant="secondary">{authLabel}</Badge>}
       {/* 账号所属分组 */}
       {(credential.groups ?? []).map((g) => (
@@ -808,7 +831,9 @@ export function CredentialCard({
           <MessageCircle />
           测试响应
         </DropdownMenuItem>
-        {(throttleRemaining > 0 || rateLimitRemainingMs > 0) && (
+        {(throttleRemaining > 0 ||
+          rateLimitRemainingMs > 0 ||
+          quarantineRemaining > 0) && (
           <DropdownMenuItem
             onSelect={(e) => {
               e.preventDefault();

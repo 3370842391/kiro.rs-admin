@@ -453,6 +453,18 @@ mod tests {
         assert!(default_is_monthly_request_limit(body));
     }
 
+    /// 线上 runtime 端点真实下发的额度耗尽报文（逐字节抄自 traces.db）。
+    ///
+    /// 它以 **400** 而不是 402 返回，且带 `__type` 前缀。曾经因为判定被 402 门槛挡住，
+    /// 跑干的号一直留在池里，单日产生 3000+ 次硬失败。锁住这条原样报文。
+    #[test]
+    fn test_quota_exhausted_matches_live_runtime_overage_payload() {
+        let body = r#"{"__type":"com.amazon.kiro.runtimeservice#ServiceQuotaExceededException","message":"You have reached the limit for overages.","reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}"#;
+        assert!(default_is_monthly_request_limit(body));
+        // 额度耗尽不是「请求格式错误」，否则会走不重试的终止分支而不是禁号换号
+        assert!(!default_is_client_validation_error(body));
+    }
+
     #[test]
     fn test_default_quota_exhausted_substring_does_not_false_match() {
         // 关键字出现在普通字段而非 reason 字段：仍然命中（向后兼容旧行为）

@@ -96,6 +96,8 @@ export interface CredentialStatusItem {
   throttledRemainingSecs?: number
   /** 普通 429 策略冷却剩余毫秒数（>0 表示冷却中） */
   rateLimitedRemainingMs?: number
+  /** 熔断隔离剩余秒数（>0 表示隔离中）：连续吃到认不出来的确定性失败，已被移出轮转 */
+  quarantinedRemainingSecs?: number
   endpoint: string
   /** false = 跟随全局默认协议 */
   endpointPinned?: boolean

@@ -176,11 +176,19 @@ fn request_error_outcome(body: &str) -> &'static str {
     }
 }
 
+/// 降级链上的这一跳是否「确定性失败」——继续换桶或换号都不会有别的结果，应当立刻终止。
+///
+/// 额度耗尽是显式例外：它现在也以 400 下发，但根因是**这张号**跑干了而不是请求有问题，
+/// 换号就能继续服务。调用方有专门分支禁号并故障转移，这里必须放行，否则会把一次本可
+/// 恢复的请求判成终态失败。
 fn is_terminal_fallback_response(
     endpoint: &dyn KiroEndpoint,
     status: reqwest::StatusCode,
     body: &str,
 ) -> bool {
+    if endpoint.is_monthly_request_limit(body) {
+        return false;
+    }
     status == reqwest::StatusCode::BAD_REQUEST || endpoint.is_client_validation_error(body)
 }
 
@@ -490,6 +498,29 @@ impl KiroProvider {
         }
 
         self.token_manager.report_failure(credential_id)
+    }
+
+    /// 把一次「没有被任何已知规则认出来的确定性失败」记到凭据头上。
+    ///
+    /// 兜底闸的入口，防的是「判定规则被上游改坏后无人察觉」这一类问题——额度耗尽
+    /// 从 402 改成 400 那次就是：号一直算可用、被反复选中，单日烧掉 3005 次请求，
+    /// 却没有任何计数器增长。详见 [`MultiTokenManager::report_terminal_failure`]。
+    ///
+    /// 这里只负责一件事：**滤掉根因在请求侧的失败**。工具 schema 违规、请求体超长
+    /// 换哪张号都是同样结果，把它们算到号头上，一个坏客户端就能把整池好号刷进隔离。
+    fn note_unrecognized_terminal_failure(
+        &self,
+        endpoint: &Arc<dyn KiroEndpoint>,
+        credential_id: u64,
+        body: &str,
+    ) {
+        if endpoint.is_client_validation_error(body)
+            || request_error_outcome(body) == outcome::PAYLOAD_LIMIT_EXCEEDED
+        {
+            return;
+        }
+        self.token_manager
+            .report_terminal_failure(credential_id, body);
     }
 
     /// 创建带代理配置和端点注册表的 KiroProvider 实例
@@ -1474,8 +1505,9 @@ impl KiroProvider {
             // 失败响应
             let body = response.text().await.unwrap_or_default();
 
-            // 402 额度用尽
-            if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
+            // 额度用尽：只认响应体 `reason`，不绑状态码（上游用过 402，现在是 400）。
+            // 必须排在下方 400 分支之前，否则永远轮不到。
+            if endpoint.is_monthly_request_limit(&body) {
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
@@ -1638,7 +1670,7 @@ impl KiroProvider {
         let affinity_key = Self::extract_conversation_id_from_request(request_body)
             .map(|conversation_id| format!("{}\0{}", group.unwrap_or_default(), conversation_id));
 
-        for attempt in 0..max_retries {
+        'attempts: for attempt in 0..max_retries {
             let attempt_start = Instant::now();
             let mut excluded_ids = request_throttled_ids.clone();
             excluded_ids.extend(model_incompatible_ids.iter().copied());
@@ -1813,8 +1845,16 @@ impl KiroProvider {
                 });
             }
 
-            // 402 Payment Required 且额度用尽：禁用凭据并故障转移
-            if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
+            // 额度用尽：禁用凭据并故障转移。
+            //
+            // 不看状态码，只认响应体里的 `reason`。上游对这一类错误用过 402
+            // （`MONTHLY_REQUEST_COUNT`），现在 runtime 端点改用 400 +
+            // `ServiceQuotaExceededException` / `OVERAGE_REQUEST_LIMIT_EXCEEDED` 下发；
+            // 绑定状态码会让本分支在上游一改就整体失效，跑干的号留在池里被反复选中，
+            // 每次请求都硬失败（400 分支不重试、不换号）。`reason` 字段才是稳定契约。
+            //
+            // 必须排在下方 400 分支**之前**：400 会直接 bail，排在后面永远轮不到。
+            if endpoint.is_monthly_request_limit(&body) {
                 tracing::warn!(
                     "API 请求失败（额度已用尽，禁用凭据并切换，尝试 {}/{}）: {} {}",
                     attempt + 1,
@@ -1864,6 +1904,7 @@ impl KiroProvider {
                     Some(&body),
                     attempt_start,
                 );
+                self.note_unrecognized_terminal_failure(&endpoint, ctx.id, &body);
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
@@ -2089,6 +2130,44 @@ impl KiroProvider {
                                     status: fb_status.as_u16(),
                                     body: &fb_body,
                                 });
+                            }
+
+                            // 额度是按账号算的，不是按桶算的：某个备用桶报额度耗尽，说明这张号
+                            // 在本计费周期内已经跑干，继续换桶不会有别的结果。禁号后换号重试，
+                            // 而不是被下面的终态 400 判定当成「请求本身有问题」直接失败。
+                            if fb_endpoint.is_monthly_request_limit(&fb_body) {
+                                Self::emit_attempt(
+                                    sink,
+                                    attempt,
+                                    ctx.id,
+                                    fb_name,
+                                    Some(fb_status.as_u16()),
+                                    outcome::QUOTA_EXHAUSTED,
+                                    Some(&fb_body),
+                                    fb_start,
+                                );
+                                tracing::warn!(
+                                    "备用端点 [{}] 返回额度已用尽，禁用凭据 #{} 并切换: {} {}",
+                                    fb_name,
+                                    ctx.id,
+                                    fb_status,
+                                    fb_body
+                                );
+                                if !self.token_manager.report_quota_exhausted(ctx.id) {
+                                    anyhow::bail!(
+                                        "{} API 请求失败（所有凭据已用尽）: {} {}",
+                                        api_type,
+                                        fb_status,
+                                        fb_body
+                                    );
+                                }
+                                last_error = Some(anyhow::anyhow!(
+                                    "{} API 请求失败: {} {}",
+                                    api_type,
+                                    fb_status,
+                                    fb_body
+                                ));
+                                continue 'attempts;
                             }
 
                             if is_terminal_fallback_response(
@@ -2388,6 +2467,7 @@ impl KiroProvider {
                     Some(&body),
                     attempt_start,
                 );
+                self.note_unrecognized_terminal_failure(&endpoint, ctx.id, &body);
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
@@ -3028,6 +3108,305 @@ mod tests {
             reqwest::StatusCode::BAD_GATEWAY,
             "temporary upstream failure",
         ));
+    }
+
+    /// 额度耗尽虽然也是 400，但换号就能继续服务，不能被当成终态请求错误。
+    ///
+    /// 回归点：上游把额度耗尽从 402 改成 400 后，这条报文落进了「400 一律终止」的分支，
+    /// 号既不下线、请求也不故障转移，每次调用都直接失败。
+    #[test]
+    fn quota_exhausted_400_is_not_a_terminal_request_error() {
+        let endpoint = crate::kiro::endpoint::IdeEndpoint;
+        let body = r#"{"__type":"com.amazon.kiro.runtimeservice#ServiceQuotaExceededException","message":"You have reached the limit for overages.","reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}"#;
+
+        assert!(endpoint.is_monthly_request_limit(body));
+        assert!(!is_terminal_fallback_response(
+            &endpoint,
+            reqwest::StatusCode::BAD_REQUEST,
+            body,
+        ));
+        // 旧的 402 形态同样不受状态码约束
+        assert!(!is_terminal_fallback_response(
+            &endpoint,
+            reqwest::StatusCode::PAYMENT_REQUIRED,
+            r#"{"reason":"MONTHLY_REQUEST_COUNT"}"#,
+        ));
+    }
+
+    /// 线上 runtime 端点真实下发的额度耗尽报文。
+    const LIVE_OVERAGE_BODY: &str = r#"{"__type":"com.amazon.kiro.runtimeservice#ServiceQuotaExceededException","message":"You have reached the limit for overages.","reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}"#;
+
+    /// 只按 Authorization 区分好号/跑干号的最小上游，返回本地 URL。
+    async fn spawn_quota_upstream() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    // 读到 header 结束即可判定，请求体在本测试里用不上
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&buf).to_ascii_lowercase();
+                    let (status, body) = if request.contains("bearer ksk_exhausted") {
+                        ("400 Bad Request", LIVE_OVERAGE_BODY)
+                    } else {
+                        ("200 OK", r#"{"ok":true}"#)
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    /// 恒定返回同一个响应的最小上游。
+    async fn spawn_static_upstream(status: &'static str, body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    /// 打到本地上游的最小端点实现，只保留 Authorization。
+    struct LocalEndpoint {
+        url: String,
+    }
+
+    impl KiroEndpoint for LocalEndpoint {
+        fn name(&self) -> &'static str {
+            "ide"
+        }
+
+        fn protocol(&self) -> &'static str {
+            "ide"
+        }
+
+        fn api_url(&self, _ctx: &RequestContext<'_>) -> String {
+            self.url.clone()
+        }
+
+        fn mcp_url(&self, _ctx: &RequestContext<'_>) -> String {
+            self.url.clone()
+        }
+
+        fn decorate_api(
+            &self,
+            req: reqwest::RequestBuilder,
+            ctx: &RequestContext<'_>,
+        ) -> reqwest::RequestBuilder {
+            req.header("Authorization", format!("Bearer {}", ctx.token))
+        }
+
+        fn decorate_mcp(
+            &self,
+            req: reqwest::RequestBuilder,
+            ctx: &RequestContext<'_>,
+        ) -> reqwest::RequestBuilder {
+            req.header("Authorization", format!("Bearer {}", ctx.token))
+        }
+
+        fn transform_api_body(&self, body: &str, _ctx: &RequestContext<'_>) -> String {
+            body.to_string()
+        }
+    }
+
+    fn api_key_credential(id: u64, key: &str, priority: u32) -> KiroCredentials {
+        KiroCredentials {
+            id: Some(id),
+            auth_method: Some("api_key".to_string()),
+            kiro_api_key: Some(key.to_string()),
+            api_region: Some("us-east-1".to_string()),
+            priority,
+            ..Default::default()
+        }
+    }
+
+    /// 跑干的号必须当场下线，并把这次请求转移到还有额度的号上。
+    ///
+    /// 回归点：上游把额度耗尽从 402 改成 400 之后，判定被 `status == 402` 挡住，
+    /// 请求先落进「400 一律终止」分支直接失败。结果是号永远不下线、一直被选中，
+    /// 线上单日因此产生 3000+ 次本可故障转移的硬失败。
+    #[tokio::test]
+    async fn quota_exhausted_400_disables_credential_and_fails_over() {
+        let url = spawn_quota_upstream().await;
+
+        let mut config = crate::model::config::Config::default();
+        // 固定选号顺序，让「先撞上跑干的号」成为确定行为
+        config.load_balancing_mode = "priority".to_string();
+        config.endpoint_mode = EndpointMode::Manual;
+
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                config,
+                vec![
+                    api_key_credential(1, "ksk_exhausted", 0),
+                    api_key_credential(2, "ksk_healthy", 1),
+                ],
+                None,
+                None,
+                true,
+            )
+            .unwrap(),
+        );
+
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert("ide".to_string(), Arc::new(LocalEndpoint { url }));
+        let provider = KiroProvider::with_proxy(
+            Arc::clone(&manager),
+            None,
+            endpoints,
+            "ide".to_string(),
+            None,
+        );
+
+        let result = provider.call_api_with_retry("{}", false, None, None).await;
+
+        let call = result.expect("跑干一张号后应故障转移到有额度的号，而不是整个请求失败");
+        assert_eq!(call.credential_id, 2, "应由还有额度的号完成本次请求");
+
+        let entries = manager.snapshot().entries;
+        let exhausted = entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(exhausted.disabled, "额度耗尽的号必须被禁用");
+        assert_eq!(
+            exhausted.disabled_reason.as_deref(),
+            Some("QuotaExceeded"),
+            "禁用原因要能和手动禁用区分开，否则面板和补货判定都看不出是跑干了"
+        );
+
+        let healthy = entries.iter().find(|e| e.id == 2).unwrap();
+        assert!(!healthy.disabled, "有额度的号不能被连坐禁用");
+
+        let stored = manager.clone_all_credentials();
+        let exhausted = stored.iter().find(|c| c.id == Some(1)).unwrap();
+        assert!(
+            exhausted.quota_exhausted_at.is_some(),
+            "需要落 quota_exhausted_at，补货判定靠它识别「这号跑干了」"
+        );
+    }
+
+    /// 搭一个「单号 + 恒定 400」的池子，返回 (provider, manager)。
+    async fn single_credential_pool_against(
+        status: &'static str,
+        body: &'static str,
+    ) -> (KiroProvider, Arc<MultiTokenManager>) {
+        let url = spawn_static_upstream(status, body).await;
+        let mut config = crate::model::config::Config::default();
+        config.load_balancing_mode = "priority".to_string();
+        config.endpoint_mode = EndpointMode::Manual;
+
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                config,
+                vec![api_key_credential(1, "ksk_only", 0)],
+                None,
+                None,
+                true,
+            )
+            .unwrap(),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert("ide".to_string(), Arc::new(LocalEndpoint { url }));
+        let provider = KiroProvider::with_proxy(
+            Arc::clone(&manager),
+            None,
+            endpoints,
+            "ide".to_string(),
+            None,
+        );
+        (provider, manager)
+    }
+
+    /// 兜底闸：**没被任何规则认出来**的确定性失败，也不能让号无限烧请求。
+    ///
+    /// 这条测试防的不是某一种错误，而是「判定规则被上游改坏后无人察觉」这一整类问题——
+    /// 额度耗尽从 402 改成 400 那次就是如此：号一直算可用、被反复选中，单日 3005 次
+    /// 硬失败，`total_failure_count` 却始终是 0。所以这里刻意用一个我们**不认识**的
+    /// 报文，验证形态判据（连续失败且零成功）本身就足以把号摘出轮转。
+    #[tokio::test]
+    async fn repeated_unrecognized_400_quarantines_the_credential() {
+        let (provider, manager) = single_credential_pool_against(
+            "400 Bad Request",
+            r#"{"__type":"com.amazon.kiro.runtimeservice#SomeFutureExceptionWeHaveNeverSeen"}"#,
+        )
+        .await;
+
+        assert_eq!(manager.available_count(), 1);
+        for _ in 0..5 {
+            assert!(
+                provider
+                    .call_api_with_retry("{}", false, None, None)
+                    .await
+                    .is_err()
+            );
+        }
+
+        assert_eq!(
+            manager.available_count(),
+            0,
+            "连续 5 次确定性失败且零成功后，号必须被移出轮转，否则它会一直被选中"
+        );
+        // 隔离不是禁用：这个错误我们没认出来，无从判断是否永久，只能低频复探
+        let entry = manager.snapshot().entries.into_iter().next().unwrap();
+        assert!(!entry.disabled, "熔断是临时隔离，不该把号禁掉");
+    }
+
+    /// 请求本身有问题的 400 换哪张号都一样，不能算到号头上。
+    ///
+    /// 否则一个在死循环里发坏工具 schema 的客户端，能把整池好号刷进隔离。
+    #[tokio::test]
+    async fn repeated_client_side_400_never_quarantines_the_credential() {
+        let (provider, manager) = single_credential_pool_against(
+            "400 Bad Request",
+            r#"{"__type":"ValidationException","message":"input_schema does not support oneOf","reason":"TOOL_SCHEMA_INVALID"}"#,
+        )
+        .await;
+
+        for _ in 0..8 {
+            assert!(
+                provider
+                    .call_api_with_retry("{}", false, None, None)
+                    .await
+                    .is_err()
+            );
+        }
+
+        assert_eq!(
+            manager.available_count(),
+            1,
+            "根因在请求侧的失败不该让好号进隔离"
+        );
     }
 
     #[test]

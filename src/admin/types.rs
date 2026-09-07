@@ -129,6 +129,9 @@ pub struct CredentialStatusItem {
     /// 普通 429 策略冷却剩余毫秒数；冷却中且 `> 0` 才返回
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limited_remaining_ms: Option<u64>,
+    /// 熔断隔离剩余秒数；隔离中且 `> 0` 才返回
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quarantined_remaining_secs: Option<u64>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
     /// 是否在凭据上钉死了端点。false = 跟随全局默认协议。

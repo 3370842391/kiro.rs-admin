@@ -1127,6 +1127,13 @@ struct CredentialEntry {
     /// 普通 429 策略冷却到期时间。
     /// 仅在非默认普通 429 策略启用跨请求冷却时设置，不表示账号级风控或永久失败。
     rate_limited_until: Option<Instant>,
+    /// 熔断隔离到期时间：该号连续吃确定性失败且一次没成功过，先移出轮转。
+    /// 不持久化，进程重启清空。
+    quarantined_until: Option<Instant>,
+    /// 连续「确定性失败」次数（成功即清零）。见 [`MultiTokenManager::report_terminal_failure`]。
+    consecutive_terminal_failures: u32,
+    /// 已被熔断过几轮，用于隔离时长的递增退避。成功即清零。
+    terminal_quarantines: u32,
     /// 运行中（in-flight）请求计数。least_conn 负载均衡用。
     /// 凭据交给调用方时 +1，请求结束时 -1（由 InFlightGuard 负责）。
     /// 不持久化，进程重启归零（与 throttled_until 同类，纯运行时状态）。
@@ -1238,6 +1245,12 @@ pub struct CredentialEntrySnapshot {
     /// 普通 429 策略冷却剩余毫秒数；冷却中且 `> 0` 才返回
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limited_remaining_ms: Option<u64>,
+    /// 熔断隔离剩余秒数；隔离中且 `> 0` 才返回。
+    ///
+    /// 必须暴露出来：隔离会让号静默地不再被选中，面板上要是看不出来，
+    /// 就变成「这号怎么一直不干活」的无头案。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quarantined_remaining_secs: Option<u64>,
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
@@ -1342,7 +1355,7 @@ pub struct SupplierCredentialHealth {
     pub system_disabled: usize,
     /// 已判死（封号，`died_at` 有值）但尚未被保留期清理的凭据数。
     pub dead: usize,
-    /// 额度耗尽被禁（402 或一键超额，`quota_exhausted_at` 有值）的凭据数。
+    /// 额度耗尽被禁（上游报额度耗尽或一键超额，`quota_exhausted_at` 有值）的凭据数。
     pub quota_exhausted: usize,
     /// 剩余额度已跌到水位以下的凭据数。号还能用但快没了。
     pub low_quota: usize,
@@ -1569,6 +1582,21 @@ pub struct MultiTokenManager {
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
+
+/// 连续多少次「没被识别出来的确定性失败」触发熔断隔离。
+///
+/// 取 5 而不是 [`MAX_FAILURES_PER_CREDENTIAL`]：这是兜底闸，宁可晚一点也不能把
+/// 偶发坏请求算到好号头上。
+const TERMINAL_FAILURES_BEFORE_QUARANTINE: u32 = 5;
+
+/// 熔断隔离基础时长，每再次熔断翻一倍。
+const QUARANTINE_BASE: StdDuration = StdDuration::from_secs(60);
+
+/// 熔断隔离时长上限。
+///
+/// 封顶而不是无限翻倍、更不永久禁用：走到熔断说明这个错误我们**没认出来**，
+/// 那就无从判断它是永久的还是临时的，只能保持低频复探。一次成功即全部清零。
+const QUARANTINE_MAX: StdDuration = StdDuration::from_secs(2 * 60 * 60);
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 const SESSION_AFFINITY_TTL: StdDuration = StdDuration::from_secs(5 * 60);
@@ -1670,6 +1698,21 @@ fn is_rpm_exceeded(entry: &CredentialEntry, now: Instant) -> bool {
 fn is_concurrency_exceeded(entry: &CredentialEntry) -> bool {
     let limit = entry.credentials.max_concurrency;
     limit > 0 && entry.in_flight >= limit
+}
+
+/// 该凭据此刻是否处在任一种冷却中，冷却中的号不参与调度。
+///
+/// 所有「跳过冷却中的号」的判断都必须走这里。冷却种类是会增加的，而散落各处的
+/// 逐字段判断只要漏改一处，新加的那种冷却就静默失效——号照样被选中，还查不出来。
+fn is_cooling(entry: &CredentialEntry, now: Instant) -> bool {
+    [
+        entry.throttled_until,
+        entry.rate_limited_until,
+        entry.quarantined_until,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|until| until > now)
 }
 
 fn rate429_window_count(entry: &CredentialEntry, now: Instant) -> u32 {
@@ -1792,6 +1835,9 @@ impl MultiTokenManager {
                     last_used_at: None,
                     throttled_until: None,
                     rate_limited_until: None,
+                    quarantined_until: None,
+                    consecutive_terminal_failures: 0,
+                    terminal_quarantines: 0,
                     in_flight: 0,
                     recent_requests: VecDeque::new(),
                     recent_429s: VecDeque::new(),
@@ -2010,11 +2056,7 @@ impl MultiTokenManager {
         self.entries
             .lock()
             .iter()
-            .filter(|e| {
-                !e.disabled
-                    && !e.throttled_until.map(|t| t > now).unwrap_or(false)
-                    && !e.rate_limited_until.map(|t| t > now).unwrap_or(false)
-            })
+            .filter(|e| !e.disabled && !is_cooling(e, now))
             .count()
     }
 
@@ -2104,8 +2146,7 @@ impl MultiTokenManager {
             entry.id == candidate.credential_id
                 && !excluded_ids.contains(&entry.id)
                 && !entry.disabled
-                && !entry.throttled_until.map(|t| t > now).unwrap_or(false)
-                && !entry.rate_limited_until.map(|t| t > now).unwrap_or(false)
+                && !is_cooling(entry, now)
                 && !is_rpm_exceeded(entry, now)
                 && !is_rpm_nearly_full(entry, now)
                 && !is_affinity_429_hot(entry, now)
@@ -2208,12 +2249,8 @@ impl MultiTokenManager {
                 if e.disabled {
                     return false;
                 }
-                // 临时冷却中（账号级 429 风控）：跳过
-                if e.throttled_until.map(|t| t > now).unwrap_or(false) {
-                    return false;
-                }
-                // 普通 429 策略冷却中：跳过
-                if e.rate_limited_until.map(|t| t > now).unwrap_or(false) {
+                // 冷却中（账号级风控 / 普通 429 策略 / 熔断隔离）：跳过
+                if is_cooling(e, now) {
                     return false;
                 }
                 // 模型/分组隔离：请求模型必须由该账号支持，且账号必须匹配请求分组
@@ -2325,8 +2362,7 @@ impl MultiTokenManager {
         self.entries.lock().iter().any(|e| {
             !excluded_ids.contains(&e.id)
                 && !e.disabled
-                && !e.throttled_until.map(|t| t > now).unwrap_or(false)
-                && !e.rate_limited_until.map(|t| t > now).unwrap_or(false)
+                && !is_cooling(e, now)
                 && credential_matches_request(&e.credentials, model, group)
                 && !is_rpm_exceeded(e, now)
                 && !is_concurrency_exceeded(e)
@@ -2408,8 +2444,7 @@ impl MultiTokenManager {
                             e.id == current_id
                                 && !excluded_ids.contains(&e.id)
                                 && !e.disabled
-                                && !e.throttled_until.map(|t| t > now).unwrap_or(false)
-                                && !e.rate_limited_until.map(|t| t > now).unwrap_or(false)
+                                && !is_cooling(e, now)
                                 && !is_rpm_exceeded(e, now)
                                 && !is_concurrency_exceeded(e)
                                 && credential_matches_request(&e.credentials, model, group)
@@ -3022,6 +3057,10 @@ impl MultiTokenManager {
                 // 成功 = 风控已解除，提前结束冷却
                 entry.throttled_until = None;
                 entry.rate_limited_until = None;
+                // 号能打通，之前那串没认出来的失败就不成立了，熔断退避一并归零
+                entry.quarantined_until = None;
+                entry.consecutive_terminal_failures = 0;
+                entry.terminal_quarantines = 0;
                 // 刚 200 过就不要再被「429 过密」赶走，否则 helper 会拆号重写 cache。
                 entry.recent_429s.clear();
                 tracing::debug!(
@@ -3102,7 +3141,8 @@ impl MultiTokenManager {
 
     /// 报告指定凭据额度已用尽
     ///
-    /// 用于处理 402 Payment Required 且 reason 为 `MONTHLY_REQUEST_COUNT` 的场景：
+    /// 触发条件是响应体的 `reason` 命中额度耗尽取值（`MONTHLY_REQUEST_COUNT` /
+    /// `OVERAGE_REQUEST_LIMIT_EXCEEDED`），与状态码无关——上游用过 402，现在是 400。
     /// - 立即禁用该凭据（不等待连续失败阈值）
     /// - 切换到下一个可用凭据继续重试
     /// - 返回是否还有可用凭据
@@ -3155,6 +3195,60 @@ impl MultiTokenManager {
         self.persist_automatic_disable(id, DisabledReason::QuotaExceeded);
         self.save_stats_debounced();
         result
+    }
+
+    /// 报告一次「确定性失败」——上游明确拒绝，重试和换端点都不会改变结果。
+    ///
+    /// 这是兜底闸，不是分类器。已经认出来的失败各有各的处理路径（额度耗尽下线、
+    /// 封号判死、鉴权计失败），走到这里的是**我们没认出来**的那些。
+    ///
+    /// 需要这道闸是因为：额度耗尽从 402 改成 400 的那次，判定规则悄悄失效，跑干的号
+    /// 一直是「可用」状态被反复选中，单日烧掉 3005 次请求，而它的 `total_failure_count`
+    /// 始终是 0——当时没有任何计数器会因为「不认识的错误」而增长，于是也没有任何机制
+    /// 能把它移出轮转。规则总会被上游改坏，兜底闸不能依赖「我们认得出这个错」。
+    ///
+    /// 所以这里不看错误内容，只看形态：同一张号连续 [`TERMINAL_FAILURES_BEFORE_QUARANTINE`]
+    /// 次确定性失败、中间一次都没成功过，就先隔离。隔离时长按熔断轮次翻倍并封顶
+    /// （[`QUARANTINE_MAX`]），任何一次成功都清零。既挡住失效的号无限烧请求，
+    /// 又不会因为一阵上游抽风把好号永久踢出池子。
+    ///
+    /// **调用方必须先排除「请求本身有问题」的失败**（工具 schema 违规、请求体过长）：
+    /// 那类错误换任何号结果都一样，算到号头上会让一个坏客户端把整池好号刷进隔离。
+    ///
+    /// 返回该凭据是否因此被隔离。
+    pub fn report_terminal_failure(&self, id: u64, error_snippet: &str) -> bool {
+        let mut entries = self.entries.lock();
+        let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
+            return false;
+        };
+        if entry.disabled {
+            return false;
+        }
+
+        entry.total_failure_count += 1;
+        entry.last_used_at = Some(Utc::now().to_rfc3339());
+        entry.consecutive_terminal_failures += 1;
+        if entry.consecutive_terminal_failures < TERMINAL_FAILURES_BEFORE_QUARANTINE {
+            return false;
+        }
+
+        entry.consecutive_terminal_failures = 0;
+        entry.terminal_quarantines += 1;
+        let cooldown = QUARANTINE_BASE
+            .saturating_mul(1u32 << entry.terminal_quarantines.min(16).saturating_sub(1))
+            .min(QUARANTINE_MAX);
+        entry.quarantined_until = Some(Instant::now() + cooldown);
+
+        tracing::error!(
+            "凭据 #{} 连续 {} 次确定性失败且期间没有一次成功，熔断隔离 {} 秒（第 {} 轮）。\
+             这类失败没有被任何已知规则识别，请核对上游报文是否换了形态：{}",
+            id,
+            TERMINAL_FAILURES_BEFORE_QUARANTINE,
+            cooldown.as_secs(),
+            entry.terminal_quarantines,
+            crate::admin::trace_db::truncate_snippet(error_snippet).unwrap_or_default(),
+        );
+        true
     }
 
     /// 报告指定凭据刷新 Token 失败。
@@ -3328,9 +3422,9 @@ impl MultiTokenManager {
     /// 「不可用」有三种，都算进 `unusable`（= `dead` + `quota_exhausted` + `low_quota`）：
     ///
     /// 1. **封号**（`died_at` 有值）：上游 403 且命中封禁标记。终态。
-    /// 2. **额度耗尽**（`quota_exhausted_at` 有值）：上游 402，或「一键超额」判定余额归零。
+    /// 2. **额度耗尽**（`quota_exhausted_at` 有值）：上游报额度耗尽，或「一键超额」判定余额归零。
     /// 3. **额度低于水位**（`remaining <= low_quota_threshold`，阈值 > 0 时才判）：
-    ///    号还能用但快没了。这一条是必需的——只等 402 意味着必须先把号跑干才补货，
+    ///    号还能用但快没了。这一条是必需的——只等上游报额度耗尽意味着必须先把号跑干才补货，
     ///    中间那段就是服务空窗。
     ///
     /// **手动禁用不算不可用**：那是人主动暂停，不是号没了。把它算进去会让「暂停一个号」
@@ -3360,8 +3454,7 @@ impl MultiTokenManager {
                     disable_reason: entry.credentials.disable_reason,
                     died: entry.credentials.died_at.is_some(),
                     quota_exhausted: entry.credentials.quota_exhausted_at.is_some(),
-                    cooling: entry.throttled_until.is_some_and(|until| until > now)
-                        || entry.rate_limited_until.is_some_and(|until| until > now),
+                    cooling: is_cooling(entry, now),
                 })
                 .collect()
         };
@@ -3417,8 +3510,7 @@ impl MultiTokenManager {
                             disable_reason: entry.credentials.disable_reason,
                             died: entry.credentials.died_at.is_some(),
                             quota_exhausted: entry.credentials.quota_exhausted_at.is_some(),
-                            cooling: entry.throttled_until.is_some_and(|until| until > now)
-                                || entry.rate_limited_until.is_some_and(|until| until > now),
+                            cooling: is_cooling(entry, now),
                         },
                     ))
                 })
@@ -3447,8 +3539,7 @@ impl MultiTokenManager {
             .iter()
             .filter(|e| {
                 !e.disabled
-                    && !e.throttled_until.map(|t| t > now).unwrap_or(false)
-                    && !e.rate_limited_until.map(|t| t > now).unwrap_or(false)
+                    && !is_cooling(e, now)
             })
             .count();
 
@@ -3527,6 +3618,11 @@ impl MultiTokenManager {
                         .map(|d| d.as_secs())
                         .filter(|s| *s > 0),
                     rate_limited_remaining_ms: cooldown_remaining_ms(e.rate_limited_until, now),
+                    quarantined_remaining_secs: e
+                        .quarantined_until
+                        .and_then(|t| t.checked_duration_since(now))
+                        .map(|d| d.as_secs())
+                        .filter(|s| *s > 0),
                     endpoint: e.credentials.endpoint.clone(),
                     groups: e.credentials.groups.clone(),
                     source_channel: e.credentials.source_channel.clone(),
@@ -3672,6 +3768,11 @@ impl MultiTokenManager {
             .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
         entry.throttled_until = None;
         entry.rate_limited_until = None;
+        // 熔断隔离也一并解除：人已经看过这个号了，判断权交还给人。
+        // 退避轮次同时归零，避免刚放出来就按上一轮的时长重新关进去。
+        entry.quarantined_until = None;
+        entry.consecutive_terminal_failures = 0;
+        entry.terminal_quarantines = 0;
         tracing::info!("凭据 #{} 临时冷却已被手动解除", id);
         Ok(())
     }
@@ -4618,6 +4719,9 @@ impl MultiTokenManager {
                 last_used_at: None,
                 throttled_until: None,
                 rate_limited_until: None,
+                quarantined_until: None,
+                consecutive_terminal_failures: 0,
+                terminal_quarantines: 0,
                 in_flight: 0,
                 recent_requests: VecDeque::new(),
                 recent_429s: VecDeque::new(),
@@ -8837,6 +8941,89 @@ mod tests {
             "错误应提示所有凭据禁用，实际: {}",
             err
         );
+    }
+
+    /// 熔断只在「连续」失败时触发，成功会把计数清零。
+    ///
+    /// 没有这条，偶发失败会慢慢累加，最终把一张一直在正常服务的号踢进隔离。
+    #[test]
+    fn terminal_failures_quarantine_only_when_no_success_interleaves() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 差一次到阈值，然后成功一次：计数归零，再攒 4 次也不该熔断
+        for _ in 0..(TERMINAL_FAILURES_BEFORE_QUARANTINE - 1) {
+            assert!(!manager.report_terminal_failure(1, "unknown upstream error"));
+        }
+        manager.report_success(1);
+        for _ in 0..(TERMINAL_FAILURES_BEFORE_QUARANTINE - 1) {
+            assert!(!manager.report_terminal_failure(1, "unknown upstream error"));
+        }
+        assert_eq!(manager.available_count(), 2, "有成功穿插就不该被隔离");
+
+        // 补满一次连续序列才熔断
+        assert!(manager.report_terminal_failure(1, "unknown upstream error"));
+        assert_eq!(manager.available_count(), 1, "隔离中的号不参与调度");
+
+        let entry = manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|e| e.id == 1)
+            .unwrap();
+        assert!(!entry.disabled, "熔断是临时隔离，不是禁用");
+    }
+
+    /// 隔离时长按熔断轮次递增并封顶，一次成功全部清零。
+    #[test]
+    fn quarantine_backoff_escalates_and_resets_on_success() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let quarantine_once = || {
+            for _ in 0..TERMINAL_FAILURES_BEFORE_QUARANTINE {
+                manager.report_terminal_failure(1, "unknown");
+            }
+        };
+        let remaining = || {
+            let entries = manager.entries.lock();
+            let entry = entries.iter().find(|e| e.id == 1).unwrap();
+            entry
+                .quarantined_until
+                .map(|until| until.saturating_duration_since(Instant::now()))
+                .unwrap_or_default()
+        };
+
+        quarantine_once();
+        let first = remaining();
+        quarantine_once();
+        let second = remaining();
+        assert!(
+            second > first,
+            "反复熔断要拉长隔离，否则失效的号会以固定频率一直烧请求：{first:?} -> {second:?}"
+        );
+        assert!(second <= QUARANTINE_MAX, "隔离时长必须封顶");
+
+        manager.report_success(1);
+        {
+            let entries = manager.entries.lock();
+            let entry = entries.iter().find(|e| e.id == 1).unwrap();
+            assert!(entry.quarantined_until.is_none(), "成功即解除隔离");
+            assert_eq!(entry.terminal_quarantines, 0, "退避轮次也要清零");
+        }
+        assert_eq!(manager.available_count(), 1);
     }
 
     #[test]
