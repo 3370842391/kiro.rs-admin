@@ -68,29 +68,29 @@ export function EditCredentialDialog({
     enabled: open,
   })
 
-  // 每次打开时重置表单为当前凭据值
+  // 只在「打开弹窗」或「切换到另一个凭据 id」时重置表单。
+  // 不能依赖整个 credential 对象：列表每 10s 轮询会换引用，会把用户已选分组/已填字段冲掉。
   useEffect(() => {
-    if (open) {
-      setNickname(credential.nickname ?? '')
-      setApiRegion(credential.apiRegion ?? '')
-      setEmail(credential.email ?? '')
-      setProxyUrl(credential.proxyUrl ?? '')
-      setProxyUsername('')
-      setProxyPassword('')
-      setGroups(credential.groups ?? [])
-      setSourceChannel(credential.sourceChannel ?? '')
-      setRpmLimit(String(credential.rpmLimit ?? 10))
-      setMaxConcurrency(String(credential.maxConcurrency ?? 0))
-      setCostRmb(String(credential.earnings?.costRmb ?? ''))
-      setQuotaCredits(
-        credential.earnings?.quotaSource === 'manual'
-          ? String(credential.earnings.quotaCredits ?? '')
-          : ''
-      )
-      setManualMode(false)
-      setEndpoint(credential.endpointPinned ? (credential.endpoint ?? '') : '')
-    }
-  }, [open, credential])
+    if (!open) return
+    setNickname(credential.nickname ?? '')
+    setApiRegion(credential.apiRegion ?? '')
+    setEmail(credential.email ?? '')
+    setProxyUrl(credential.proxyUrl ?? '')
+    setProxyUsername('')
+    setProxyPassword('')
+    setGroups(credential.groups ?? [])
+    setSourceChannel(credential.sourceChannel ?? '')
+    setRpmLimit(String(credential.rpmLimit ?? 10))
+    setMaxConcurrency(String(credential.maxConcurrency ?? 0))
+    setCostRmb(String(credential.earnings?.costRmb ?? ''))
+    setQuotaCredits(
+      credential.earnings?.quotaSource === 'manual'
+        ? String(credential.earnings.quotaCredits ?? '')
+        : ''
+    )
+    setManualMode(false)
+    setEndpoint(credential.endpointPinned ? (credential.endpoint ?? '') : '')
+  }, [open, credential.id])
 
   const { mutate, isPending } = useUpdateCredential()
   const isApiKey = credential.authMethod === 'api_key'

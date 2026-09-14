@@ -10,6 +10,7 @@
   "updateAutoApplyTime": "03:00",
   "traceEnabled": true,
   "traceRetentionDays": 7,
+  "traceMaxStorageGb": 2,
   "usageLogRetentionDays": 31,
   "earlyStreamHandshake": false,
   "contextWindowSignalThresholdPct": 85,

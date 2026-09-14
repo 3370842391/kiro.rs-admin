@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { DollarSign, RefreshCw, Save, ShieldAlert, TriangleAlert } from 'lucide-react'
 import { toast } from 'sonner'
@@ -51,9 +51,12 @@ export function ProfitPage() {
   const [breakdown, setBreakdown] = useState<Breakdown>('group')
   const [calculatorOpen, setCalculatorOpen] = useState(false)
 
+  const hydratedRef = useRef(false)
+
   useEffect(() => {
     const config = configQuery.data
-    if (!config) return
+    if (!config || hydratedRef.current) return
+    hydratedRef.current = true
     setNewapiBase(config.newapiBase ?? '')
     setNewapiUser(config.newapiUser ?? '')
     setCreditPrice(config.creditPrice)

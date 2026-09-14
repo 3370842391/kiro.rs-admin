@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { Images, Save } from 'lucide-react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
@@ -38,12 +38,18 @@ export function ImageBudgetDialog({ open, onOpenChange }: ImageBudgetDialogProps
   const [draft, setDraft] = useState<ImageBudgetConfig>(DEFAULT_DRAFT)
   const [validationError, setValidationError] = useState<string | null>(null)
 
+  const hydratedRef = useRef(false)
+
   useEffect(() => {
-    if (data) {
-      setDraft(data)
-      setValidationError(null)
+    if (!open) {
+      hydratedRef.current = false
+      return
     }
-  }, [data])
+    if (!data || hydratedRef.current) return
+    hydratedRef.current = true
+    setDraft(data)
+    setValidationError(null)
+  }, [open, data])
 
   const setNumber = (key: keyof ImageBudgetConfig, raw: string) => {
     const value = Number(raw)

@@ -610,8 +610,8 @@ impl ProxyPoolManager {
     ///
     /// 给号绑定出口时必须用这个。用 [`Self::assignable_urls`] 做轮询分配会出事：
     /// 它只过滤连通性，下标轮询把烧号最多的出口和零封号出口同等对待。
-    /// 2026-09-01 线上一次加了 7 个号，其中一个被分到 `154.91.156.198`
-    /// （33 个号烧了 9 个），22 分钟即死；同批绑到零封号出口的号活了下来。
+    /// 线上曾出现：新号被轮询分到高封号率出口，十几分钟即死；
+    /// 同批绑到零封号出口的号活了下来。
     ///
     /// 这里**不**走 [`RISK_PROBE_RATE`] 那条随机翻身通道——那是给「每请求选候选」
     /// 用的，一次请求落在降权出口上代价很小。绑定是长期的，随机把一个新号
@@ -653,9 +653,8 @@ impl ProxyPoolManager {
     /// 分配排序键：档位 → 近 24h 封号 → 封号率 → 累计封号 → 负载 → 延迟。
     ///
     /// 档位是个**高门槛的统计判断**，只在有证据证明「显著差于全池平均」时才降档。
-    /// 线上 `205.179.215.73` 烧过 8 个号，但它也接过 43 个号，置信下界算下来
-    /// 恰好压在全池基线 9.9% 上，判不出显著性——只按档位排，它会和零封号的出口
-    /// 完全平起平坐。
+    /// 有的出口累计烧过不少号，但接过的号更多，置信下界可能刚好压在全池基线上，
+    /// 判不出显著性——只按档位排，它会和零封号的出口完全平起平坐。
     ///
     /// 所以同档内还要再比封号压力。这一层不下任何结论、不禁用任何出口，只是：
     /// 别的条件一样时，优先挑烧号更少的那个。近 24h 的权重高于累计，因为出口
@@ -1306,25 +1305,25 @@ mod tests {
         mgr
     }
 
-    /// 代理商导出的清单可以直接粘进来（数据取自 2026-09-01 一份真实住宅 IP 列表）。
+    /// 代理商导出的清单可以直接粘进来（host:port:user:pass）。
     #[test]
     fn provider_export_format_is_accepted_verbatim() {
         let cases = [
             (
-                "165.254.38.248:35435:tZy7bp8mE5Yj:G3ZDADS5SFNv",
-                "socks5://tZy7bp8mE5Yj:G3ZDADS5SFNv@165.254.38.248:35435",
+                "203.0.113.10:1080:user1:pass1",
+                "socks5://user1:pass1@203.0.113.10:1080",
             ),
             (
-                "165.254.38.246:42435:umMCpyljpZhP:m1EqL0NUP7ZH",
-                "socks5://umMCpyljpZhP:m1EqL0NUP7ZH@165.254.38.246:42435",
+                "203.0.113.11:1081:user2:pass2",
+                "socks5://user2:pass2@203.0.113.11:1081",
             ),
             (
-                "209.227.80.112:34971:dVWntzeItnPD:gHt8YIKlWRhQ",
-                "socks5://dVWntzeItnPD:gHt8YIKlWRhQ@209.227.80.112:34971",
+                "198.51.100.20:1080:user3:pass3",
+                "socks5://user3:pass3@198.51.100.20:1080",
             ),
             (
-                "216.42.134.253:38337:MToJhHuwbA0H:hUGXmjG8w8dH",
-                "socks5://MToJhHuwbA0H:hUGXmjG8w8dH@216.42.134.253:38337",
+                "198.51.100.21:1081:user4:pass4",
+                "socks5://user4:pass4@198.51.100.21:1081",
             ),
         ];
         for (raw, expected) in cases {
@@ -1400,9 +1399,9 @@ mod tests {
         let mgr = ProxyPoolManager::new(None, TlsBackend::Rustls);
         let (added, errors) = mgr.batch_add(
             vec![
-                "# 2026-09-01 住宅 IP".to_string(),
-                "165.254.38.248:35435:tZy7bp8mE5Yj:G3ZDADS5SFNv".to_string(),
-                "165.254.38.246:42435:umMCpyljpZhP:m1EqL0NUP7ZH".to_string(),
+                "# sample proxies".to_string(),
+                "203.0.113.10:1080:user1:pass1".to_string(),
+                "203.0.113.11:1081:user2:pass2".to_string(),
                 "socks5://already:scheme@9.9.9.9:1080".to_string(),
                 "坏数据".to_string(),
             ],
@@ -1413,7 +1412,7 @@ mod tests {
         assert!(
             added
                 .iter()
-                .any(|e| e.url == "socks5://tZy7bp8mE5Yj:G3ZDADS5SFNv@165.254.38.248:35435")
+                .any(|e| e.url == "socks5://user1:pass1@203.0.113.10:1080")
         );
     }
 
@@ -1519,7 +1518,7 @@ mod tests {
 
     /// 同档内也要挑更干净的。
     ///
-    /// 档位是高门槛的统计判断：线上 `205.179.215.73` 烧过 8 个号，但它接过 43 个，
+    /// 档位是高门槛的统计判断：有的出口累计烧过不少号，但接过的号更多，
     /// 置信下界恰好压在全池基线上，算不出显著性，仍是 Normal 档。只按档位排，
     /// 它就和零封号出口平起平坐——轮询照样可能把新号分给它。
     #[test]

@@ -171,7 +171,7 @@ export function CredentialFailuresDialog({
   credentialId,
   email,
 }: CredentialFailuresDialogProps) {
-  const { data, isLoading } = useTraces(
+  const { data, isLoading, isError } = useTraces(
     { failedAttemptCredentialId: credentialId, limit: 50 },
     open,
   )
@@ -189,6 +189,10 @@ export function CredentialFailuresDialog({
         <div className="max-h-[70vh] space-y-3 overflow-y-auto pr-1">
           {isLoading ? (
             <div className="py-6 text-center text-sm text-muted-foreground">加载中…</div>
+          ) : isError ? (
+            <div className="py-6 text-center text-sm text-destructive">
+              失败日志加载超时，请关闭后重试。
+            </div>
           ) : records.length === 0 ? (
             <div className="py-6 text-center text-sm text-muted-foreground">
               该凭据暂无失败记录（trace 关闭或近期无失败）。

@@ -19,7 +19,8 @@ use crate::admin::trace_db::{
 use crate::anthropic::converter::normalize_model_id;
 use crate::http_client::{ProxyConfig, build_client_with_read_timeout};
 use crate::kiro::endpoint::rate_limit::{
-    apply_bucket_mode, resolve_primary_endpoint, stay_on_same_endpoint,
+    apply_bucket_mode, enterprise_ide_runtime_hop, flip_ide_runtime, resolve_primary_endpoint,
+    stay_on_same_endpoint,
 };
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::image_budget::ImageBudgetPolicy;
@@ -1192,7 +1193,22 @@ impl KiroProvider {
 
     /// 根据凭据选择 endpoint 实现
 
-    fn endpoint_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
+    /// 企业号专项：一旦打到企业号并 429，钉死本号，只在 ide/runtime 换桶，不换其它号。
+    fn should_pin_enterprise_on_429(&self, credentials: &KiroCredentials) -> bool {
+        self.token_manager.enterprise_special_handling_enabled()
+            && credentials.is_enterprise_credential()
+    }
+
+    fn expand_pinned_enterprise_budget(&self, attempt: usize, max_retries: &mut usize) {
+        let budget = self.token_manager.enterprise_max_retries() as usize;
+        *max_retries = (*max_retries).max(attempt.saturating_add(budget));
+    }
+
+    fn endpoint_for(
+        &self,
+        credentials: &KiroCredentials,
+        force_name: Option<&str>,
+    ) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
         if credentials.is_api_key_credential() {
             let api_region = credentials
                 .api_region
@@ -1200,11 +1216,21 @@ impl KiroProvider {
                 .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少必填字段 apiRegion"))?;
             crate::kiro::region::validate_api_region(api_region)?;
         }
-        let configured_name = credentials.endpoint.as_deref();
-        let default_endpoint = self.token_manager.get_default_endpoint();
-        let name = resolve_primary_endpoint(configured_name, default_endpoint.as_str());
+        let name = if let Some(forced) = force_name.map(str::trim).filter(|name| !name.is_empty()) {
+            forced.to_string()
+        } else {
+            let configured_name = credentials.endpoint.as_deref();
+            let default_endpoint = if credentials.is_enterprise_credential()
+                && self.token_manager.enterprise_special_handling_enabled()
+            {
+                self.token_manager.get_enterprise_default_endpoint()
+            } else {
+                self.token_manager.get_default_endpoint()
+            };
+            resolve_primary_endpoint(configured_name, default_endpoint.as_str()).to_string()
+        };
         self.endpoints
-            .get(name)
+            .get(name.as_str())
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
     }
@@ -1363,7 +1389,7 @@ impl KiroProvider {
 
         let config = self.token_manager.config();
         let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
-        let endpoint = self.endpoint_for(&ctx.credentials)?;
+        let endpoint = self.endpoint_for(&ctx.credentials, None)?;
         let started = Instant::now();
 
         let response = match self
@@ -1420,16 +1446,22 @@ impl KiroProvider {
     async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
         let total_credentials = self.token_manager.total_count();
         let (retry_mode, retry_policy) = self.effective_retry_policy()?;
-        let max_retries = Self::max_retries(total_credentials, retry_mode, &retry_policy);
+        let mut max_retries = Self::max_retries(total_credentials, retry_mode, &retry_policy);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let mut request_throttled_ids: HashSet<u64> = HashSet::new();
+        let mut pinned_enterprise_id: Option<u64> = None;
         // 会话级 RPM 记账去重（同 call_api_with_retry）
         let mut rpm_recorded: HashSet<u64> = HashSet::new();
 
-        for attempt in 0..max_retries {
+        for attempt in 0..usize::MAX {
+            if attempt >= max_retries {
+                break;
+            }
             // MCP 调用（WebSearch 等工具）不涉及模型选择，也不参与分组隔离
-            let ctx_result = if request_throttled_ids.is_empty() {
+            let ctx_result = if let Some(id) = pinned_enterprise_id {
+                self.token_manager.acquire_context_for_id(id).await
+            } else if request_throttled_ids.is_empty() {
                 self.token_manager.acquire_context(None, None).await
             } else {
                 self.token_manager
@@ -1454,7 +1486,7 @@ impl KiroProvider {
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
 
-            let endpoint = match self.endpoint_for(&ctx.credentials) {
+            let endpoint = match self.endpoint_for(&ctx.credentials, None) {
                 Ok(e) => e,
                 Err(e) => {
                     last_error = Some(e);
@@ -1559,39 +1591,51 @@ impl KiroProvider {
                     let switch_on_ordinary_429 =
                         retry_mode == RetryMode::Failover || retry_policy.credential_switch_on_429;
                     if switch_on_ordinary_429 {
-                        request_throttled_ids.insert(ctx.id);
-                        if self.token_manager.has_available_excluding(
-                            None,
-                            None,
-                            &request_throttled_ids,
-                        ) {
-                            self.apply_ordinary_429_cooldown(
-                                ctx.id,
-                                retry_mode,
-                                &retry_policy,
-                                retry_after,
-                            );
-                            tracing::info!(
-                                "MCP 凭据 #{} 返回普通 429，按 {} 策略优先切换其它凭据",
-                                ctx.id,
-                                retry_mode
-                            );
-                            last_error = Some(anyhow::anyhow!(
-                                "MCP 请求失败（凭据 #{} 普通 429，已切换其它凭据重试）: {} {}",
-                                ctx.id,
-                                status,
-                                body
-                            ));
-                            continue;
-                        }
-                        if retry_mode == RetryMode::Failover && !request_throttled_ids.is_empty() {
-                            let keep_excluded = Some(ctx.id);
-                            request_throttled_ids.clear();
-                            if let Some(id) = keep_excluded {
-                                request_throttled_ids.insert(id);
+                        let pin_enterprise = self.should_pin_enterprise_on_429(&ctx.credentials);
+                        if !pin_enterprise {
+                            request_throttled_ids.insert(ctx.id);
+                            if self.token_manager.has_available_excluding(
+                                None,
+                                None,
+                                &request_throttled_ids,
+                            ) {
+                                self.apply_ordinary_429_cooldown(
+                                    ctx.id,
+                                    retry_mode,
+                                    &retry_policy,
+                                    retry_after,
+                                );
+                                tracing::info!(
+                                    "MCP 凭据 #{} 返回普通 429，按 {} 策略优先切换其它凭据",
+                                    ctx.id,
+                                    retry_mode
+                                );
+                                last_error = Some(anyhow::anyhow!(
+                                    "MCP 请求失败（凭据 #{} 普通 429，已切换其它凭据重试）: {} {}",
+                                    ctx.id,
+                                    status,
+                                    body
+                                ));
+                                continue;
                             }
-                        } else if retry_mode != RetryMode::Failover {
-                            request_throttled_ids.clear();
+                            if retry_mode == RetryMode::Failover && !request_throttled_ids.is_empty() {
+                                let keep_excluded = Some(ctx.id);
+                                request_throttled_ids.clear();
+                                if let Some(id) = keep_excluded {
+                                    request_throttled_ids.insert(id);
+                                }
+                            } else if retry_mode != RetryMode::Failover {
+                                request_throttled_ids.clear();
+                            }
+                        } else {
+                            pinned_enterprise_id = Some(ctx.id);
+                            request_throttled_ids.remove(&ctx.id);
+                            self.expand_pinned_enterprise_budget(attempt, &mut max_retries);
+                            tracing::info!(
+                                "MCP 企业号专项：凭据 #{} 429，钉死本号继续退避，不换其它号（预算 {}）",
+                                ctx.id,
+                                max_retries
+                            );
                         }
                     }
                 }
@@ -1650,7 +1694,7 @@ impl KiroProvider {
         // 重试预算按当前请求所属分组的账号数计算，避免小分组按全局账号数获得过多无效重试
         let total_credentials = self.token_manager.total_count_in_group(group).max(1);
         let (retry_mode, retry_policy) = self.effective_retry_policy()?;
-        let max_retries = Self::max_retries(total_credentials, retry_mode, &retry_policy);
+        let mut max_retries = Self::max_retries(total_credentials, retry_mode, &retry_policy);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let mut request_throttled_ids: HashSet<u64> = HashSet::new();
@@ -1658,6 +1702,8 @@ impl KiroProvider {
         // 会话级 RPM 记账去重：同一凭据在本会话（含 429 重试）只记 1 次 tick；
         // 故障转移到不同凭据时各记 1 次。
         let mut rpm_recorded: HashSet<u64> = HashSet::new();
+        let mut pinned_enterprise_id: Option<u64> = None;
+        let mut enterprise_force_endpoint: Option<String> = None;
         let api_type = if is_stream { "流式" } else { "非流式" };
 
         // 单请求内「备用桶尝试」总次数（跨 attempt 累计），受 max_bucket_attempts_per_request 限制，
@@ -1670,21 +1716,26 @@ impl KiroProvider {
         let affinity_key = Self::extract_conversation_id_from_request(request_body)
             .map(|conversation_id| format!("{}\0{}", group.unwrap_or_default(), conversation_id));
 
-        'attempts: for attempt in 0..max_retries {
+        'attempts: for attempt in 0..usize::MAX {
+            if attempt >= max_retries {
+                break;
+            }
             let attempt_start = Instant::now();
             let mut excluded_ids = request_throttled_ids.clone();
             excluded_ids.extend(model_incompatible_ids.iter().copied());
-            // 获取调用上下文（绑定 index、credentials、token）
-            let mut ctx = match self
-                .token_manager
-                .acquire_context_excluding_with_affinity(
-                    model.as_deref(),
-                    group,
-                    &excluded_ids,
-                    affinity_key.as_deref(),
-                )
-                .await
-            {
+            // 企业号专项一旦钉死，后续重试只拿这张号，不再走负载均衡换号。
+            let mut ctx = match if let Some(id) = pinned_enterprise_id {
+                self.token_manager.acquire_context_for_id(id).await
+            } else {
+                self.token_manager
+                    .acquire_context_excluding_with_affinity(
+                        model.as_deref(),
+                        group,
+                        &excluded_ids,
+                        affinity_key.as_deref(),
+                    )
+                    .await
+            } {
                 Ok(c) => c,
                 Err(e) => {
                     Self::emit_attempt(
@@ -1722,6 +1773,10 @@ impl KiroProvider {
                     "当前凭据不提供目标模型，切换凭据"
                 );
                 model_incompatible_ids.insert(ctx.id);
+                if pinned_enterprise_id == Some(ctx.id) {
+                    pinned_enterprise_id = None;
+                    enterprise_force_endpoint = None;
+                }
                 last_error = Some(anyhow::anyhow!(
                     "MODEL_NOT_AVAILABLE: credential #{} does not provide {}",
                     ctx.id,
@@ -1738,7 +1793,10 @@ impl KiroProvider {
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
 
-            let endpoint = match self.endpoint_for(&ctx.credentials) {
+            let endpoint = match self.endpoint_for(
+                &ctx.credentials,
+                enterprise_force_endpoint.as_deref(),
+            ) {
                 Ok(e) => e,
                 Err(e) => {
                     Self::emit_attempt(
@@ -2045,20 +2103,29 @@ impl KiroProvider {
                 // 沿降级链依次尝试每个备用桶（换桶不换号），命中第一个 2xx 即返回；
                 // 整条链都失败才落回下方的账号风控/瞬态重试逻辑。参考 demo 的多端点重试。
                 //
-                // 降级链来源见 resolve_fallback_chain：面板覆盖 > best 内置链 > 静态链。
-                let fallback_chain: Vec<String> = apply_bucket_mode(
-                    self.token_manager.get_rate_limit_bucket_mode(),
-                    resolve_fallback_chain(
-                        endpoint.name(),
-                        endpoint.fallback_chain(),
-                        self.token_manager.endpoint_chain_for(endpoint.name()),
-                        self.token_manager.get_endpoint_mode(),
-                    ),
-                );
+                // 企业号专项：无视全局 same-endpoint，强制 ide ↔ runtime。
+                // 其它账号：降级链来源见 resolve_fallback_chain：面板覆盖 > best 内置链 > 静态链。
+                let pin_enterprise = self.should_pin_enterprise_on_429(&ctx.credentials);
+                let fallback_chain: Vec<String> = if pin_enterprise {
+                    enterprise_ide_runtime_hop(endpoint.name())
+                } else {
+                    apply_bucket_mode(
+                        self.token_manager.get_rate_limit_bucket_mode(),
+                        resolve_fallback_chain(
+                            endpoint.name(),
+                            endpoint.fallback_chain(),
+                            self.token_manager.endpoint_chain_for(endpoint.name()),
+                            self.token_manager.get_endpoint_mode(),
+                        ),
+                    )
+                };
                 for fb_name in &fallback_chain {
                     // 单请求桶尝试总数硬上限（跨 attempt 累计）：防止「链长 × attempt 数」
                     // 把单请求放大成上百次上游调用。0 = 不限。
-                    if max_bucket_attempts > 0 && bucket_attempts >= max_bucket_attempts {
+                    if !pin_enterprise
+                        && max_bucket_attempts > 0
+                        && bucket_attempts >= max_bucket_attempts
+                    {
                         tracing::warn!(
                             "凭据 #{} 已达单请求桶尝试上限 {}，停止降级链",
                             ctx.id,
@@ -2244,6 +2311,7 @@ impl KiroProvider {
                 let max_same = self.token_manager.same_endpoint_attempts();
                 if status.as_u16() == 429
                     && !account_throttled
+                    && !pin_enterprise
                     && stay_on_same_endpoint(bucket_mode, 1, max_same, false)
                 {
                     for same_try in 2..=max_same {
@@ -2324,52 +2392,65 @@ impl KiroProvider {
                             .release_session_affinity(affinity_key.as_deref(), ctx.id);
                     }
                 }
-                if status.as_u16() == 429 && !account_throttled && switch_on_ordinary_429 {
-                    request_throttled_ids.insert(ctx.id);
-                    if self.token_manager.has_available_excluding(
-                        model.as_deref(),
-                        group,
-                        &request_throttled_ids,
-                    ) {
-                        self.apply_ordinary_429_cooldown(
-                            ctx.id,
-                            retry_mode,
-                            &retry_policy,
-                            retry_after,
-                        );
-                        last_error = Some(anyhow::anyhow!(
-                            "{} API 请求失败（凭据 #{} 429，备用端点也失败，已切换其它凭据重试）: {} {}",
-                            api_type,
-                            ctx.id,
-                            status,
-                            body
-                        ));
-                        tracing::info!(
-                            "凭据 #{} 主/备用端点均返回普通 429，按 {} 策略切换其它凭据",
-                            ctx.id,
-                            retry_mode
-                        );
-                        continue;
-                    }
-                    if retry_mode == RetryMode::Failover && !request_throttled_ids.is_empty() {
-                        let keep_excluded = Some(ctx.id);
-                        request_throttled_ids.clear();
-                        if let Some(id) = keep_excluded {
-                            request_throttled_ids.insert(id);
+                if status.as_u16() == 429 && !account_throttled && pin_enterprise {
+                    pinned_enterprise_id = Some(ctx.id);
+                    request_throttled_ids.remove(&ctx.id);
+                    enterprise_force_endpoint =
+                        Some(flip_ide_runtime(endpoint_name).to_string());
+                    self.expand_pinned_enterprise_budget(attempt, &mut max_retries);
+                    tracing::info!(
+                        "企业号专项：凭据 #{} 429，钉死本号并改打 [{}]，不换其它号（预算 {}）",
+                        ctx.id,
+                        enterprise_force_endpoint.as_deref().unwrap_or("runtime"),
+                        max_retries
+                    );
+                } else if status.as_u16() == 429 && !account_throttled && switch_on_ordinary_429 {
+                        request_throttled_ids.insert(ctx.id);
+                        if self.token_manager.has_available_excluding(
+                            model.as_deref(),
+                            group,
+                            &request_throttled_ids,
+                        ) {
+                            self.apply_ordinary_429_cooldown(
+                                ctx.id,
+                                retry_mode,
+                                &retry_policy,
+                                retry_after,
+                            );
+                            last_error = Some(anyhow::anyhow!(
+                                "{} API 请求失败（凭据 #{} 429，备用端点也失败，已切换其它凭据重试）: {} {}",
+                                api_type,
+                                ctx.id,
+                                status,
+                                body
+                            ));
+                            tracing::info!(
+                                "凭据 #{} 主/备用端点均返回普通 429，按 {} 策略切换其它凭据",
+                                ctx.id,
+                                retry_mode
+                            );
+                            continue;
                         }
-                        tracing::info!(
-                            "本轮可用凭据主/备用端点均返回普通 429，开启下一轮并暂避凭据 #{}。",
-                            ctx.id
-                        );
-                    } else if retry_mode != RetryMode::Failover {
-                        request_throttled_ids.clear();
-                    }
+                        if retry_mode == RetryMode::Failover && !request_throttled_ids.is_empty() {
+                            let keep_excluded = Some(ctx.id);
+                            request_throttled_ids.clear();
+                            if let Some(id) = keep_excluded {
+                                request_throttled_ids.insert(id);
+                            }
+                            tracing::info!(
+                                "本轮可用凭据主/备用端点均返回普通 429，开启下一轮并暂避凭据 #{}。",
+                                ctx.id
+                            );
+                        } else if retry_mode != RetryMode::Failover {
+                            request_throttled_ids.clear();
+                        }
                 }
             }
 
             // 429 + suspicious activity = 账号级临时风控
             // 仅当前凭据被针对，故障转移到其它凭据可立即恢复（受配置开关控制）。
             if status.as_u16() == 429
+                && !self.should_pin_enterprise_on_429(&ctx.credentials)
                 && self.token_manager.get_account_throttle_failover()
                 && endpoint.is_account_throttled(&body)
             {

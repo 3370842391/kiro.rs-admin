@@ -3,7 +3,7 @@ import { countExitUsage, proxyExitHost } from './credential-exit-badge'
 
 describe('proxyExitHost', () => {
   test('从各种写法里取出 host:port', () => {
-    expect(proxyExitHost('socks5://user:pass@154.91.153.139:7778')).toBe('154.91.153.139:7778')
+    expect(proxyExitHost('socks5://user:pass@203.0.113.10:1080')).toBe('203.0.113.10:1080')
     expect(proxyExitHost('http://1.2.3.4:8080')).toBe('1.2.3.4:8080')
     expect(proxyExitHost('1.2.3.4:8080')).toBe('1.2.3.4:8080')
   })

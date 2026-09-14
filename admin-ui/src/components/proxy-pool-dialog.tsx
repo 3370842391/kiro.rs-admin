@@ -870,7 +870,7 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                 placeholder={
                   '# 支持两种写法，可混用\n' +
                   '# 1) 代理商导出格式 host:端口:用户名:密码\n' +
-                  '165.254.38.248:35435:tZy7bp8mE5Yj:G3ZDADS5SFNv\n' +
+                  '203.0.113.10:1080:user:pass\n' +
                   '# 2) 完整 URL\n' +
                   'socks5://user:pass@host:1080'
                 }

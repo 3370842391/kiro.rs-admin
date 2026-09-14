@@ -926,6 +926,32 @@ impl KiroCredentials {
             .unwrap_or(false)
     }
 
+    /// 是否为 AWS IAM Identity Center / Enterprise 账号（含 IdC 登录与 POWER 订阅）。
+    pub fn is_enterprise_credential(&self) -> bool {
+        if self
+            .provider
+            .as_deref()
+            .is_some_and(|provider| provider.eq_ignore_ascii_case("Enterprise"))
+        {
+            return true;
+        }
+        if self.auth_method.as_deref() == Some("idc")
+            && self
+                .start_url
+                .as_ref()
+                .is_some_and(|url| !url.trim().is_empty())
+        {
+            return true;
+        }
+        if let Some(title) = self.subscription_title.as_deref() {
+            let upper = title.to_ascii_uppercase();
+            if upper.contains("ENTERPRISE") || upper.contains("POWER") || upper.contains("TEAM") {
+                return true;
+            }
+        }
+        false
+    }
+
     /// 返回该凭据在 CodeWhisperer 调用上应携带的 `tokentype` 头值（无则 None）。
     ///
     /// - API Key 凭据 → `"API_KEY"`
@@ -1966,6 +1992,24 @@ mod tests {
         assert_eq!(canonicalize_auth_method_value("social"), "social");
         assert_eq!(canonicalize_auth_method_value("builder-id"), "idc");
         assert_eq!(canonicalize_auth_method_value("apikey"), "api_key");
+    }
+
+    #[test]
+    fn test_is_enterprise_credential() {
+        let mut creds = KiroCredentials::default();
+        assert!(!creds.is_enterprise_credential());
+
+        creds.provider = Some("Enterprise".to_string());
+        assert!(creds.is_enterprise_credential());
+
+        creds.provider = None;
+        creds.auth_method = Some("idc".to_string());
+        creds.start_url = Some("https://d-123.awsapps.com/start".to_string());
+        assert!(creds.is_enterprise_credential());
+
+        creds.start_url = None;
+        creds.subscription_title = Some("KIRO POWER".to_string());
+        assert!(creds.is_enterprise_credential());
     }
 
     #[test]

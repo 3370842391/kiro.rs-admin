@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { Database, Gauge, HardDrive, Info, Trash2 } from 'lucide-react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
@@ -56,8 +56,15 @@ export function CachePolicyDialog({ open, onOpenChange }: CachePolicyDialogProps
   const [maxPct, setMaxPct] = useState(0)
   const [validationError, setValidationError] = useState<string | null>(null)
 
+  const hydratedRef = useRef(false)
+
   useEffect(() => {
-    if (!data) return
+    if (!open) {
+      hydratedRef.current = false
+      return
+    }
+    if (!data || hydratedRef.current) return
+    hydratedRef.current = true
     setEnabled(data.enabled)
     setDefaultTtlSecs(data.defaultTtlSecs)
     setAutoWithoutCacheControl(data.autoWithoutCacheControl)
@@ -68,7 +75,7 @@ export function CachePolicyDialog({ open, onOpenChange }: CachePolicyDialogProps
     setMinPct(data.minPct)
     setMaxPct(data.maxPct)
     setValidationError(null)
-  }, [data])
+  }, [open, data])
 
   const busy = saving || clearing
 

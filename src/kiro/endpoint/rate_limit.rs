@@ -19,6 +19,28 @@ pub fn resolve_primary_endpoint<'a>(
         .unwrap_or(default_endpoint)
 }
 
+/// 企业号专项：429 后只在 ide / runtime 之间换桶，不进 amazonq / codewhisperer。
+pub fn enterprise_ide_runtime_hop(primary: &str) -> Vec<String> {
+    match primary.trim() {
+        "ide" => vec!["runtime".to_string()],
+        "runtime" => vec!["ide".to_string()],
+        other => ["ide", "runtime"]
+            .into_iter()
+            .filter(|name| *name != other)
+            .map(str::to_string)
+            .collect(),
+    }
+}
+
+/// 本轮 ide/runtime 对打完后，下一轮从对面端点起手。
+pub fn flip_ide_runtime(current: &str) -> &'static str {
+    if current.trim() == "runtime" {
+        "ide"
+    } else {
+        "runtime"
+    }
+}
+
 /// `hop` 才使用解析好的降级链；其它策略显式空链（含面板覆盖）。
 pub fn apply_bucket_mode(mode: RateLimitBucketMode, hop_chain: Vec<String>) -> Vec<String> {
     match mode {
@@ -83,6 +105,17 @@ mod tests {
     }
 
     #[test]
+    fn enterprise_hop_only_swaps_ide_and_runtime() {
+        assert_eq!(enterprise_ide_runtime_hop("ide"), vec!["runtime".to_string()]);
+        assert_eq!(enterprise_ide_runtime_hop("runtime"), vec!["ide".to_string()]);
+        assert_eq!(
+            enterprise_ide_runtime_hop("amazonq"),
+            vec!["ide".to_string(), "runtime".to_string()]
+        );
+        assert_eq!(flip_ide_runtime("ide"), "runtime");
+        assert_eq!(flip_ide_runtime("runtime"), "ide");
+    }
+
     fn same_endpoint_and_none_drop_hop_chain() {
         let hop = vec!["runtime".into(), "codewhisperer".into()];
         assert_eq!(

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { AlertTriangle } from 'lucide-react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -65,8 +65,15 @@ export function ImportDefaultsDialog({ open, onOpenChange }: ImportDefaultsDialo
   const [costRmb, setCostRmb] = useState('')
   const [quotaCredits, setQuotaCredits] = useState('')
 
+  const hydratedRef = useRef(false)
+
   useEffect(() => {
-    if (!open || !data) return
+    if (!open) {
+      hydratedRef.current = false
+      return
+    }
+    if (!data || hydratedRef.current) return
+    hydratedRef.current = true
     setRpmLimit(String(data.rpmLimit))
     setMaxConcurrency(String(data.maxConcurrency))
     setPriority(String(data.priority))

@@ -1,4 +1,4 @@
-import { forwardRef, useEffect, useState, type ComponentPropsWithoutRef } from 'react'
+import { forwardRef, useEffect, useRef, useState, type ComponentPropsWithoutRef } from 'react'
 import {
   Activity, RefreshCw, UploadCloud, Settings, Key, Wand2, Eye, EyeOff, Copy,
   MoreHorizontal, ShieldAlert, ShieldCheck, Gauge, Shuffle, Brain, Images, Trash2,
@@ -457,13 +457,26 @@ function RetryPolicyButton({ controls }: { controls: ToolControls }) {
   const activeMode = controls.retryPolicy?.mode ?? 'failover'
   const effective = controls.retryPolicy?.effectivePolicy
 
+  const hydratedRef = useRef(false)
+
   useEffect(() => {
+    if (!open) {
+      hydratedRef.current = false
+      return
+    }
+    if (hydratedRef.current) return
+    hydratedRef.current = true
     if (controls.retryPolicy?.customPolicy) {
       setCustomPolicy(controls.retryPolicy.customPolicy)
     } else if (controls.retryPolicy?.mode === 'custom' && controls.retryPolicy.effectivePolicy) {
       setCustomPolicy(controls.retryPolicy.effectivePolicy)
     }
-  }, [controls.retryPolicy?.customPolicy, controls.retryPolicy?.effectivePolicy, controls.retryPolicy?.mode])
+  }, [
+    open,
+    controls.retryPolicy?.customPolicy,
+    controls.retryPolicy?.effectivePolicy,
+    controls.retryPolicy?.mode,
+  ])
 
   const updateNumber = (key: keyof RetryPolicy, value: string) => {
     const numeric = Number(value)

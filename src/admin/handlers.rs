@@ -2192,7 +2192,10 @@ pub async fn list_traces(
     });
 
     let query = trace_query_from_params(&params, credential_ids);
-    let (records, total) = state.trace_store.query_paged(&query);
+    let store = state.trace_store.clone();
+    let (records, total) = tokio::task::spawn_blocking(move || store.query_paged(&query))
+        .await
+        .unwrap_or_else(|_| (Vec::new(), 0));
 
     // 附加 credential email 方便前端展示（与 stats_by_credential 一致）
     let snapshot = state.service.get_all_credentials();
@@ -2524,7 +2527,10 @@ pub async fn clear_traces(State(state): State<AdminState>) -> impl IntoResponse 
 /// 按凭据聚合失败次数（鉴权 / 账号风控 / 其他三类），用于卡片分色展示。
 /// 返回 { "<credentialId>": { auth, throttle, other }, ... }
 pub async fn trace_failure_stats(State(state): State<AdminState>) -> impl IntoResponse {
-    let stats = state.trace_store.failure_stats();
+    let store = state.trace_store.clone();
+    let stats = tokio::task::spawn_blocking(move || store.failure_stats())
+        .await
+        .unwrap_or_default();
     let map: std::collections::HashMap<String, serde_json::Value> = stats
         .into_iter()
         .map(|(id, s)| {
@@ -2556,9 +2562,12 @@ pub async fn trace_recent_activity(
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(60)
         .clamp(1, 1_440);
-    let stats = state
-        .trace_store
-        .recent_activity_by_credential(window_minutes * 60);
+    let store = state.trace_store.clone();
+    let stats = tokio::task::spawn_blocking(move || {
+        store.recent_activity_by_credential(window_minutes * 60)
+    })
+    .await
+    .unwrap_or_default();
     let map: std::collections::HashMap<String, crate::admin::trace_db::RecentActivity> =
         stats.into_iter().map(|(id, s)| (id.to_string(), s)).collect();
     Json(serde_json::json!({

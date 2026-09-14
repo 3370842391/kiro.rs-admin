@@ -1009,6 +1009,11 @@ fn validate_log_governance_request(
             3650,
         ),
         (
+            "traceMaxStorageGb",
+            req.trace_max_storage_gb.map(u64::from),
+            64,
+        ),
+        (
             "errorSnapshotMaxStorageGb",
             req.error_snapshot_max_storage_gb,
             900,
@@ -2593,8 +2598,22 @@ impl AdminService {
         }
         self.save_balance_cache();
 
-        if let Some(trace_store) = &self.trace_store {
-            trace_store.delete_for_credential(id);
+        // traces.db 清理可能扫千万级 attempt，绝不能堵在 HTTP 线程上：
+        // 前端 15s 超时后继续删下一个，worker 会被同步 DELETE 占满，加号/改分组一起假死。
+        if let Some(trace_store) = self.trace_store.clone() {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    if let Err(e) = tokio::task::spawn_blocking(move || {
+                        trace_store.delete_for_credential(id);
+                    })
+                    .await
+                    {
+                        tracing::warn!("凭据 #{} 后台清理 trace 任务失败: {}", id, e);
+                    }
+                });
+            } else {
+                trace_store.delete_for_credential(id);
+            }
         }
 
         Ok(())
@@ -3457,6 +3476,9 @@ impl AdminService {
             default_endpoint: self.token_manager.get_default_endpoint(),
             rate_limit_bucket_mode: self.token_manager.get_rate_limit_bucket_mode().as_str().to_string(),
             same_endpoint_attempts: self.token_manager.same_endpoint_attempts(),
+            enterprise_special_handling: self.token_manager.enterprise_special_handling_enabled(),
+            enterprise_default_endpoint: self.token_manager.get_enterprise_default_endpoint(),
+            enterprise_max_retries: self.token_manager.enterprise_max_retries(),
         })
     }
 
@@ -3582,6 +3604,31 @@ impl AdminService {
         if let Some(attempts) = req.same_endpoint_attempts {
             self.token_manager
                 .set_same_endpoint_attempts(attempts)
+                .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+        }
+
+        if let Some(enabled) = req.enterprise_special_handling {
+            self.token_manager
+                .set_enterprise_special_handling(enabled)
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        }
+
+        if let Some(name) = req.enterprise_default_endpoint {
+            let name = name.trim().to_string();
+            if !self.known_endpoints.contains(&name) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "未知企业号默认端点: {}",
+                    name
+                )));
+            }
+            self.token_manager
+                .set_enterprise_default_endpoint(name)
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        }
+
+        if let Some(retries) = req.enterprise_max_retries {
+            self.token_manager
+                .set_enterprise_max_retries(retries)
                 .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
         }
 
@@ -3793,6 +3840,12 @@ impl AdminService {
                 .as_ref()
                 .map(|s| s.retention_days() as u32)
                 .unwrap_or(cfg.trace_retention_days),
+            trace_max_storage_gb: self
+                .trace_store
+                .as_ref()
+                .map(|s| (s.max_bytes() / (1024 * 1024 * 1024)) as u32)
+                .unwrap_or(cfg.trace_max_storage_gb)
+                .max(1),
             usage_log_retention_days: self
                 .usage_recorder
                 .as_ref()
@@ -3986,6 +4039,7 @@ impl AdminService {
         if req.trace_enabled.is_none()
             && req.auto_compact_diagnostics_enabled.is_none()
             && req.trace_retention_days.is_none()
+            && req.trace_max_storage_gb.is_none()
             && req.usage_log_retention_days.is_none()
             && req.dead_credential_retention_hours.is_none()
             && req.error_snapshot_enabled.is_none()
@@ -4038,6 +4092,11 @@ impl AdminService {
         if let Some(days) = req.trace_retention_days {
             if let Some(s) = &self.trace_store {
                 s.set_retention_days(days);
+            }
+        }
+        if let Some(gb) = req.trace_max_storage_gb {
+            if let Some(s) = &self.trace_store {
+                s.set_max_bytes(u64::from(gb).saturating_mul(1024 * 1024 * 1024));
             }
         }
         if let Some(days) = req.usage_log_retention_days {
@@ -4109,6 +4168,9 @@ impl AdminService {
         }
         if let Some(v) = req.trace_retention_days {
             config.trace_retention_days = v;
+        }
+        if let Some(v) = req.trace_max_storage_gb {
+            config.trace_max_storage_gb = v;
         }
         if let Some(v) = req.usage_log_retention_days {
             config.usage_log_retention_days = v;

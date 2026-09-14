@@ -8,9 +8,10 @@
 //! 不维护内存缓冲。后台任务定期清理超过保留天数的记录（保留天数与启用开关运行时可改）。
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use chrono::Utc;
 use parking_lot::Mutex;
@@ -294,14 +295,28 @@ const TRACE_QUEUE_CAPACITY: usize = 4096;
 /// 一条记录一个事务时，每次都要走一遍 WAL 追加 + 锁获取；批量合并后同样的锁只付
 /// 一次代价。上限存在是为了不让单次事务持锁过久，阻塞 Admin 页面的查询。
 const TRACE_BATCH_SIZE: usize = 256;
+/// 过期清理每批最多删多少条。整表一次 DELETE 会把写锁占住几十分钟，
+/// Admin 查询即使改走独立只读连接，写入器也会跟着饿死。
+const CLEANUP_BATCH_SIZE: usize = 2_000;
+/// traces.db 默认体积上限。3 天保留在高流量下能涨到 30GB+，管理端查询会被拖死。
+const DEFAULT_TRACE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// 删到上限的 90% 再停，避免每次写入都触发一轮清理。
+const TRACE_SIZE_WATERMARK_NUM: u64 = 9;
+const TRACE_SIZE_WATERMARK_DEN: u64 = 10;
+/// 只读查询等待写锁/检查点的上限。宁可返回空页，也不让管理端一直转圈。
+const READ_BUSY_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// SQLite 持久化存储
 pub struct TraceStore {
+    /// 文件库路径。`None` 表示内存库（单测 / 打开失败兜底），读写必须共用同一连接。
+    db_path: Option<PathBuf>,
     conn: Mutex<Connection>,
     /// 是否启用 trace 写入（运行时可改）。false 时 insert 直接短路。
     enabled: AtomicBool,
     /// 记录保留天数（运行时可改），cleanup 时读取。
     retention_days: AtomicU64,
+    /// traces.db（含 WAL/SHM）体积上限。超限后按时间从旧到新删，避免再涨到几十 GB。
+    max_bytes: AtomicU64,
     /// 异步写入队列的发送端。
     ///
     /// `None` 表示未启动后台写入器（单测、以及 `spawn_writer` 之前的窗口），
@@ -330,12 +345,15 @@ impl TraceStore {
         // WAL：并发读不阻塞写；synchronous=NORMAL：写吞吐与崩溃安全的平衡
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.busy_timeout(READ_BUSY_TIMEOUT)?;
         conn.execute_batch(SCHEMA)?;
         Self::migrate(&conn)?;
         Ok(Self {
+            db_path: Some(path),
             conn: Mutex::new(conn),
             enabled: AtomicBool::new(enabled),
             retention_days: AtomicU64::new(retention_days.max(1) as u64),
+            max_bytes: AtomicU64::new(DEFAULT_TRACE_MAX_BYTES),
             writer: Mutex::new(None),
             dropped: AtomicU64::new(0),
         })
@@ -361,12 +379,42 @@ impl TraceStore {
         conn.execute_batch(SCHEMA)?;
         Self::migrate(&conn)?;
         Ok(Self {
+            db_path: None,
             conn: Mutex::new(conn),
             enabled: AtomicBool::new(true),
             retention_days: AtomicU64::new(DEFAULT_RETENTION_DAYS),
+            max_bytes: AtomicU64::new(DEFAULT_TRACE_MAX_BYTES),
             writer: Mutex::new(None),
             dropped: AtomicU64::new(0),
         })
+    }
+
+    /// 为 Admin 查询打开一条独立只读连接。
+    ///
+    /// WAL 本来就允许读不堵写，但本 store 把写入连接收在一把全局 Mutex 里——
+    /// 高流量下写入器几乎一直握着它，`GET /traces` 只能排队，管理端 15s 超时后
+    /// 表现为「请求日志一直转圈」。只读连接走 WAL snapshot，不再跟写入抢那把锁。
+    fn open_read_conn(path: &Path) -> rusqlite::Result<Connection> {
+        let conn = Connection::open(path)?;
+        conn.busy_timeout(READ_BUSY_TIMEOUT)?;
+        let _ = conn.pragma_update(None, "query_only", true);
+        Ok(conn)
+    }
+
+    fn with_read_conn<T, F>(&self, op: F) -> rusqlite::Result<T>
+    where
+        F: FnOnce(&Connection) -> rusqlite::Result<T>,
+    {
+        match &self.db_path {
+            Some(path) => {
+                let conn = Self::open_read_conn(path)?;
+                op(&conn)
+            }
+            None => {
+                let conn = self.conn.lock();
+                op(&conn)
+            }
+        }
     }
 
     /// 旧库迁移：为 traces 表补齐新增列（幂等，缺哪列加哪列）。
@@ -452,6 +500,50 @@ impl TraceStore {
             .store(days.max(1) as u64, Ordering::Relaxed);
     }
 
+    /// traces.db 体积上限（字节，含 WAL/SHM）。
+    pub fn max_bytes(&self) -> u64 {
+        self.max_bytes.load(Ordering::Relaxed).max(1)
+    }
+
+    /// 设置体积上限。0 回落到默认 2GiB。
+    pub fn set_max_bytes(&self, bytes: u64) {
+        self.max_bytes.store(
+            if bytes == 0 {
+                DEFAULT_TRACE_MAX_BYTES
+            } else {
+                bytes
+            },
+            Ordering::Relaxed,
+        );
+    }
+
+    fn wal_bytes(&self) -> u64 {
+        let Some(path) = &self.db_path else {
+            return 0;
+        };
+        let mut wal = path.as_os_str().to_os_string();
+        wal.push("-wal");
+        std::fs::metadata(PathBuf::from(wal))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
+
+    /// 主库已用页 + WAL。DELETE 只增加 freelist，不缩文件，所以不能看文件长度。
+    fn used_bytes(&self) -> u64 {
+        let logical = self
+            .with_read_conn(|conn| {
+                let page_size: i64 = conn.pragma_query_value(None, "page_size", |row| row.get(0))?;
+                let page_count: i64 =
+                    conn.pragma_query_value(None, "page_count", |row| row.get(0))?;
+                let freelist: i64 =
+                    conn.pragma_query_value(None, "freelist_count", |row| row.get(0))?;
+                Ok((page_count.saturating_sub(freelist) as u64)
+                    .saturating_mul(page_size.max(0) as u64))
+            })
+            .unwrap_or(0);
+        logical.saturating_add(self.wal_bytes())
+    }
+
     /// 写入一条完整链路（traces + attempts 在一个事务里）。失败仅 warn，不阻塞请求。
     /// trace 关闭时直接短路。
     /// 启动后台写入器，把落库从请求路径上摘下来。
@@ -481,8 +573,11 @@ impl TraceStore {
                 // 阻塞式 SQLite 写必须离开 worker 线程，否则等于把问题从
                 // 请求路径挪到了后台任务，运行时照样会被堵住。
                 if let Err(error) =
-                    tokio::task::spawn_blocking(move || writer.insert_batch_blocking(&records))
-                        .await
+                    tokio::task::spawn_blocking(move || {
+                        writer.insert_batch_blocking(&records);
+                        writer.trim_to_max_bytes();
+                    })
+                    .await
                 {
                     tracing::warn!(%error, "trace 批量写入任务异常");
                 }
@@ -750,8 +845,7 @@ impl TraceStore {
 
     /// 分页查询：返回 (当前页记录, 符合条件的总数)。仅 warn 失败，返回 (空, 0)。
     pub fn query_paged(&self, q: &TraceQuery) -> (Vec<TraceRecord>, usize) {
-        let conn = self.conn.lock();
-        match Self::query_inner(&conn, q) {
+        match self.with_read_conn(|conn| Self::query_inner(conn, q)) {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!("trace 查询失败: {}", e);
@@ -780,7 +874,7 @@ impl TraceStore {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        let conn = self.conn.lock();
+        self.with_read_conn(|conn| {
         let mut records = Vec::new();
         for chunk in unique_ids.chunks(400) {
             let placeholders = std::iter::repeat_n("?", chunk.len())
@@ -808,6 +902,7 @@ impl TraceStore {
             records.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
         }
         Ok(records)
+        })
     }
 
     /// 按账号、按分钟汇总成功与 429，给 RPM 推算用。
@@ -823,38 +918,33 @@ impl TraceStore {
         if start_epoch >= end_epoch {
             return Vec::new();
         }
-        let conn = self.conn.lock();
-        let mut stmt = match conn.prepare(
-            "SELECT a.credential_id,
-                    (t.ts_epoch / 60) * 60,
-                    SUM(CASE WHEN a.outcome = 'success' THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN a.http_status = 429 THEN 1 ELSE 0 END)
-             FROM traces t
-             JOIN trace_attempts a ON a.trace_id = t.trace_id
-             WHERE t.ts_epoch >= ?1 AND t.ts_epoch < ?2 AND a.credential_id > 0
-             GROUP BY a.credential_id, (t.ts_epoch / 60) * 60",
-        ) {
-            Ok(stmt) => stmt,
-            Err(error) => {
-                tracing::warn!(%error, "RPM 分钟桶查询准备失败");
-                return Vec::new();
-            }
-        };
-        let rows = match stmt.query_map([start_epoch, end_epoch], |row| {
-            Ok(crate::admin::rpm_infer::RpmMinuteBucket {
-                credential_id: row.get::<_, i64>(0)? as u64,
-                minute_epoch: row.get(1)?,
-                successes: row.get::<_, i64>(2)? as u32,
-                rate_limited: row.get::<_, i64>(3)? as u32,
-            })
+        match self.with_read_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT a.credential_id,
+                        (t.ts_epoch / 60) * 60,
+                        SUM(CASE WHEN a.outcome = 'success' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN a.http_status = 429 THEN 1 ELSE 0 END)
+                 FROM traces t
+                 JOIN trace_attempts a ON a.trace_id = t.trace_id
+                 WHERE t.ts_epoch >= ?1 AND t.ts_epoch < ?2 AND a.credential_id > 0
+                 GROUP BY a.credential_id, (t.ts_epoch / 60) * 60",
+            )?;
+            let rows = stmt.query_map([start_epoch, end_epoch], |row| {
+                Ok(crate::admin::rpm_infer::RpmMinuteBucket {
+                    credential_id: row.get::<_, i64>(0)? as u64,
+                    minute_epoch: row.get(1)?,
+                    successes: row.get::<_, i64>(2)? as u32,
+                    rate_limited: row.get::<_, i64>(3)? as u32,
+                })
+            })?;
+            Ok(rows.filter_map(|row| row.ok()).collect::<Vec<_>>())
         }) {
-            Ok(rows) => rows,
+            Ok(buckets) => buckets,
             Err(error) => {
                 tracing::warn!(%error, "RPM 分钟桶查询失败");
-                return Vec::new();
+                Vec::new()
             }
-        };
-        rows.filter_map(|row| row.ok()).collect()
+        }
     }
 
     /// 按模型汇总「token 吞吐 ↔ credits 消耗」，供进价测算器估算一个号能产出多少 token。
@@ -871,24 +961,25 @@ impl TraceStore {
         if start_epoch >= end_epoch {
             return Ok(Vec::new());
         }
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT model, \
-                    SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0) \
-                        + COALESCE(cache_read_tokens,0) + COALESCE(cache_creation_tokens,0)), \
-                    SUM(COALESCE(credits,0)) \
-             FROM traces \
-             WHERE ts_epoch >= ? AND ts_epoch <= ? AND final_status = 'success' \
-             GROUP BY model",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![start_epoch, end_epoch], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, f64>(1).unwrap_or(0.0),
-                row.get::<_, f64>(2).unwrap_or(0.0),
-            ))
-        })?;
-        rows.collect()
+        self.with_read_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT model, \
+                        SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0) \
+                            + COALESCE(cache_read_tokens,0) + COALESCE(cache_creation_tokens,0)), \
+                        SUM(COALESCE(credits,0)) \
+                 FROM traces \
+                 WHERE ts_epoch >= ? AND ts_epoch <= ? AND final_status = 'success' \
+                 GROUP BY model",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![start_epoch, end_epoch], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, f64>(1).unwrap_or(0.0),
+                    row.get::<_, f64>(2).unwrap_or(0.0),
+                ))
+            })?;
+            rows.collect()
+        })
     }
 
     /// 测试辅助：仅取记录、忽略总数
@@ -918,11 +1009,13 @@ impl TraceStore {
             params.push(Box::new(k as i64));
         }
         if let Some(c) = q.failed_attempt_credential_id {
-            // 该凭据在某一跳失败过（不论 trace 最终成功与否）
+            // 该凭据在某一跳失败过（不论 trace 最终成功与否）。
+            // 必须用独立子查询而不是相关 EXISTS：后者会按时间索引从新到旧
+            // 逐条探测，失败很少的号凑不齐 LIMIT 就会扫完整张 traces（线上 25s+）。
+            // 从 attempt 表一次性筛出 trace_id 再回表，4s 内能结束。
             clauses.push(
-                "EXISTS (SELECT 1 FROM trace_attempts a \
-                 WHERE a.trace_id = traces.trace_id \
-                 AND a.credential_id = ? AND a.outcome != 'success')"
+                "trace_id IN (SELECT a.trace_id FROM trace_attempts a \
+                 WHERE a.credential_id = ? AND a.outcome != 'success')"
                     .to_string(),
             );
             params.push(Box::new(c as i64));
@@ -979,16 +1072,28 @@ impl TraceStore {
     ) -> rusqlite::Result<(Vec<TraceRecord>, usize)> {
         let (where_sql, params) = Self::build_where(q);
         let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
-
-        // 总数（用于前端分页）
-        let count_sql = format!("SELECT COUNT(*) FROM traces {}", where_sql);
-        let total: i64 = conn.query_row(&count_sql, param_refs.as_slice(), |row| row.get(0))?;
-
         let limit = if q.limit == 0 {
             DEFAULT_QUERY_LIMIT
         } else {
             q.limit
         };
+        // 失败日志弹框用 EXISTS 扫 attempt 表。线上 4300 万跳上做 COUNT(*)
+        // 要几十秒，前端 15s 超时后一直停在「加载中」。这类查询只要一页，
+        // 用 limit+1 判断是否还有下一页，不再精确计数。
+        let estimate_total = q.failed_attempt_credential_id.is_some();
+        let fetch_limit = if estimate_total {
+            limit.saturating_add(1)
+        } else {
+            limit
+        };
+
+        let exact_total = if estimate_total {
+            None
+        } else {
+            let count_sql = format!("SELECT COUNT(*) FROM traces {}", where_sql);
+            Some(conn.query_row(&count_sql, param_refs.as_slice(), |row| row.get::<_, i64>(0))? as usize)
+        };
+
         let sql = format!(
             "SELECT trace_id, ts, key_id, key_source, response_mode, model, is_stream, final_status, final_credential_id, \
              error_type, error_message, total_attempts, duration_ms, interrupted_after_bytes, \
@@ -998,7 +1103,7 @@ impl TraceStore {
              upstream_context_tokens, upstream_context_percentage, client_reported_tokens, \
              compaction_diagnostics_json \
              FROM traces {} ORDER BY ts_epoch DESC LIMIT {} OFFSET {}",
-            where_sql, limit, q.offset
+            where_sql, fetch_limit, q.offset
         );
 
         let mut stmt = conn.prepare(&sql)?;
@@ -1059,6 +1164,15 @@ impl TraceStore {
             })
         })?;
         let mut records: Vec<TraceRecord> = rows.collect::<rusqlite::Result<_>>()?;
+        let total = if let Some(total) = exact_total {
+            total
+        } else {
+            let has_more = records.len() > limit;
+            if has_more {
+                records.truncate(limit);
+            }
+            q.offset + records.len() + usize::from(has_more)
+        };
 
         // 批量取每条 trace 的 attempts
         let mut attempt_stmt = conn.prepare(
@@ -1079,78 +1193,196 @@ impl TraceStore {
             })?;
             rec.attempts = attempts.collect::<rusqlite::Result<_>>()?;
         }
-        Ok((records, total as usize))
+        Ok((records, total))
     }
 
     /// 删除超过保留期的记录（traces + 关联 attempts）。仅 warn 失败。
+    ///
+    /// 按批删除并在批次之间放开写锁，避免一次扫 27GB 库把写入器饿死。
     pub fn cleanup(&self) {
         let cutoff =
             (Utc::now() - chrono::Duration::days(self.retention_days() as i64)).timestamp();
-        let mut conn = self.conn.lock();
-        let tx = match conn.transaction() {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!("trace 清理事务失败: {}", e);
-                return;
-            }
-        };
-        let res = (|| -> rusqlite::Result<usize> {
-            tx.execute(
-                "DELETE FROM trace_attempts WHERE trace_id IN \
-                 (SELECT trace_id FROM traces WHERE ts_epoch < ?1)",
-                [cutoff],
-            )?;
-            let n = tx.execute("DELETE FROM traces WHERE ts_epoch < ?1", [cutoff])?;
-            Ok(n)
-        })();
-        match res {
-            Ok(n) => {
-                if let Err(e) = tx.commit() {
-                    tracing::warn!("trace 清理提交失败: {}", e);
-                } else if n > 0 {
-                    tracing::info!("已清理 {} 条过期 trace 记录", n);
+        let mut total = 0usize;
+        loop {
+            match self.cleanup_batch(cutoff, CLEANUP_BATCH_SIZE) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(e) => {
+                    tracing::warn!("trace 清理失败: {}", e);
+                    break;
                 }
             }
-            Err(e) => tracing::warn!("trace 清理失败: {}", e),
         }
+        if total > 0 {
+            tracing::info!("已清理 {} 条过期 trace 记录", total);
+        }
+        self.trim_to_max_bytes();
+    }
+
+    /// 体积超上限时，按 `ts_epoch` 从旧到新删，直到落到水位线以下。
+    ///
+    /// SQLite DELETE 不缩文件，但空页会被新写入复用，所以从空库开始能把体积钉在上限附近。
+    /// 已经膨胀到几十 GB 的库需要直接删文件重建，单靠本函数缩不回去。
+    pub fn trim_to_max_bytes(&self) {
+        let max = self.max_bytes();
+        if self.db_path.is_none() || self.used_bytes() <= max {
+            return;
+        }
+        let watermark = max.saturating_mul(TRACE_SIZE_WATERMARK_NUM) / TRACE_SIZE_WATERMARK_DEN;
+        let mut total = 0usize;
+        loop {
+            if self.used_bytes() <= watermark {
+                break;
+            }
+            match self.delete_oldest_batch(CLEANUP_BATCH_SIZE) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(e) => {
+                    tracing::warn!("trace 体积清理失败: {}", e);
+                    break;
+                }
+            }
+        }
+        if total > 0 {
+            tracing::info!(
+                trimmed = total,
+                bytes = self.used_bytes(),
+                max,
+                "traces.db 超过体积上限，已删除最旧记录"
+            );
+        }
+    }
+
+    fn delete_oldest_batch(&self, limit: usize) -> rusqlite::Result<usize> {
+        let mut conn = self.conn.lock();
+        conn.busy_timeout(Duration::from_secs(5))?;
+        let tx = conn.transaction()?;
+        let ids: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT trace_id FROM traces ORDER BY ts_epoch ASC LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![limit as i64], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        tx.execute(
+            &format!("DELETE FROM trace_attempts WHERE trace_id IN ({placeholders})"),
+            rusqlite::params_from_iter(ids.iter()),
+        )?;
+        let n = tx.execute(
+            &format!("DELETE FROM traces WHERE trace_id IN ({placeholders})"),
+            rusqlite::params_from_iter(ids.iter()),
+        )?;
+        tx.commit()?;
+        Ok(n)
+    }
+
+    fn cleanup_batch(&self, cutoff: i64, limit: usize) -> rusqlite::Result<usize> {
+        let mut conn = self.conn.lock();
+        conn.busy_timeout(Duration::from_secs(5))?;
+        let tx = conn.transaction()?;
+        let ids: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT trace_id FROM traces WHERE ts_epoch < ?1 LIMIT ?2")?;
+            let rows = stmt.query_map(rusqlite::params![cutoff, limit as i64], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        tx.execute(
+            &format!("DELETE FROM trace_attempts WHERE trace_id IN ({placeholders})"),
+            rusqlite::params_from_iter(ids.iter()),
+        )?;
+        let n = tx.execute(
+            &format!("DELETE FROM traces WHERE trace_id IN ({placeholders})"),
+            rusqlite::params_from_iter(ids.iter()),
+        )?;
+        tx.commit()?;
+        Ok(n)
     }
 
     /// 删除指定凭据关联的 trace 记录，避免删除账号后新账号复用同一 credential_id
     /// 时继承旧账号的失败统计。
+    ///
+    /// 先按 `idx_traces_cred` 分批删（批次之间放开写锁），再清该凭据残留在
+    /// 别人最终成功链路上的中间跳 attempt。原先一条
+    /// `DELETE … WHERE credential_id=? OR trace_id IN (…)` 没有 attempt 侧索引，
+    /// 会全表扫 ~4300 万行，单账号就能把写锁和 Tokio worker 占住十几秒。
     pub fn delete_for_credential(&self, credential_id: u64) {
         if credential_id == 0 {
             return;
         }
-        let mut conn = self.conn.lock();
-        let tx = match conn.transaction() {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!("trace 凭据清理事务失败: {}", e);
-                return;
-            }
-        };
-        let res = (|| -> rusqlite::Result<usize> {
-            tx.execute(
-                "DELETE FROM trace_attempts WHERE credential_id = ?1 \
-                 OR trace_id IN (SELECT trace_id FROM traces WHERE final_credential_id = ?1)",
-                [credential_id],
-            )?;
-            let n = tx.execute(
-                "DELETE FROM traces WHERE final_credential_id = ?1",
-                [credential_id],
-            )?;
-            Ok(n)
-        })();
-        match res {
-            Ok(n) => {
-                if let Err(e) = tx.commit() {
-                    tracing::warn!("trace 凭据清理提交失败: {}", e);
-                } else if n > 0 {
-                    tracing::info!("已清理凭据 #{} 的 {} 条 trace 记录", credential_id, n);
+        let mut total = 0usize;
+        loop {
+            match self.delete_final_traces_batch(credential_id, CLEANUP_BATCH_SIZE) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(e) => {
+                    tracing::warn!("trace 凭据清理失败: {}", e);
+                    break;
                 }
             }
-            Err(e) => tracing::warn!("trace 凭据清理失败: {}", e),
         }
+        if let Err(e) = self.delete_leftover_attempts_for_credential(credential_id) {
+            tracing::warn!("trace 凭据残留 attempt 清理失败: {}", e);
+        }
+        if total > 0 {
+            tracing::info!("已清理凭据 #{} 的 {} 条 trace 记录", credential_id, total);
+        }
+    }
+
+    fn delete_final_traces_batch(
+        &self,
+        credential_id: u64,
+        limit: usize,
+    ) -> rusqlite::Result<usize> {
+        let mut conn = self.conn.lock();
+        conn.busy_timeout(Duration::from_secs(5))?;
+        let tx = conn.transaction()?;
+        let ids: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT trace_id FROM traces WHERE final_credential_id = ?1 LIMIT ?2",
+            )?;
+            let rows =
+                stmt.query_map(rusqlite::params![credential_id, limit as i64], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        tx.execute(
+            &format!("DELETE FROM trace_attempts WHERE trace_id IN ({placeholders})"),
+            rusqlite::params_from_iter(ids.iter()),
+        )?;
+        let n = tx.execute(
+            &format!("DELETE FROM traces WHERE trace_id IN ({placeholders})"),
+            rusqlite::params_from_iter(ids.iter()),
+        )?;
+        tx.commit()?;
+        Ok(n)
+    }
+
+    fn delete_leftover_attempts_for_credential(
+        &self,
+        credential_id: u64,
+    ) -> rusqlite::Result<usize> {
+        let conn = self.conn.lock();
+        conn.busy_timeout(Duration::from_secs(15))?;
+        conn.execute(
+            "DELETE FROM trace_attempts WHERE credential_id = ?1",
+            [credential_id],
+        )
     }
 
     /// 清空全部 trace 记录（traces + 关联 attempts）。返回删除的 traces 行数。
@@ -1193,44 +1425,38 @@ impl TraceStore {
     /// 统计 trace_attempts 里 outcome != 'success' 的跳，按 credential_id + outcome 分组。
     /// 返回 credential_id → (auth, throttle, other)。仅 warn 失败，返回空。
     pub fn failure_stats(&self) -> std::collections::HashMap<u64, FailureStats> {
-        let conn = self.conn.lock();
-        let mut out: std::collections::HashMap<u64, FailureStats> =
-            std::collections::HashMap::new();
-        let mut stmt = match conn.prepare(
-            "SELECT credential_id, outcome, COUNT(*) FROM trace_attempts \
-             WHERE outcome != 'success' AND credential_id != 0 \
-             GROUP BY credential_id, outcome",
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("trace failure_stats prepare 失败: {}", e);
-                return out;
+        match self.with_read_conn(|conn| {
+            let mut out: std::collections::HashMap<u64, FailureStats> =
+                std::collections::HashMap::new();
+            let mut stmt = conn.prepare(
+                "SELECT credential_id, outcome, COUNT(*) FROM trace_attempts \
+                 WHERE outcome != 'success' AND credential_id != 0 \
+                 GROUP BY credential_id, outcome",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? as u64,
+                ))
+            })?;
+            for r in rows.flatten() {
+                let (cred, outcome_str, cnt) = r;
+                let s = out.entry(cred).or_default();
+                match outcome_str.as_str() {
+                    "auth_failed" => s.auth += cnt,
+                    "account_throttled" => s.throttle += cnt,
+                    _ => s.other += cnt,
+                }
             }
-        };
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)? as u64,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)? as u64,
-            ))
-        });
-        let rows = match rows {
-            Ok(r) => r,
+            Ok(out)
+        }) {
+            Ok(out) => out,
             Err(e) => {
                 tracing::warn!("trace failure_stats 查询失败: {}", e);
-                return out;
-            }
-        };
-        for r in rows.flatten() {
-            let (cred, outcome_str, cnt) = r;
-            let s = out.entry(cred).or_default();
-            match outcome_str.as_str() {
-                "auth_failed" => s.auth += cnt,
-                "account_throttled" => s.throttle += cnt,
-                _ => s.other += cnt,
+                std::collections::HashMap::new()
             }
         }
-        out
     }
 
     /// 按凭据聚合**最近一段时间**的请求形态：成功数、429 数、其它失败数。
@@ -1246,53 +1472,49 @@ impl TraceStore {
         &self,
         window_secs: i64,
     ) -> std::collections::HashMap<u64, RecentActivity> {
-        let mut out: std::collections::HashMap<u64, RecentActivity> =
-            std::collections::HashMap::new();
         let since = Utc::now().timestamp() - window_secs.max(0);
-        let conn = self.conn.lock();
-        let mut stmt = match conn.prepare(
-            "SELECT a.credential_id, \
-                    SUM(CASE WHEN a.outcome = 'success' THEN 1 ELSE 0 END), \
-                    SUM(CASE WHEN a.http_status = 429 THEN 1 ELSE 0 END), \
-                    COUNT(*) \
-             FROM traces t JOIN trace_attempts a ON a.trace_id = t.trace_id \
-             WHERE t.ts_epoch >= ?1 AND a.credential_id != 0 \
-             GROUP BY a.credential_id",
-        ) {
-            Ok(s) => s,
-            Err(error) => {
-                tracing::warn!(%error, "recent_activity prepare 失败");
-                return out;
+        match self.with_read_conn(|conn| {
+            let mut out: std::collections::HashMap<u64, RecentActivity> =
+                std::collections::HashMap::new();
+            let mut stmt = conn.prepare(
+                "SELECT a.credential_id, \
+                        SUM(CASE WHEN a.outcome = 'success' THEN 1 ELSE 0 END), \
+                        SUM(CASE WHEN a.http_status = 429 THEN 1 ELSE 0 END), \
+                        COUNT(*) \
+                 FROM traces t JOIN trace_attempts a ON a.trace_id = t.trace_id \
+                 WHERE t.ts_epoch >= ?1 AND a.credential_id != 0 \
+                 GROUP BY a.credential_id",
+            )?;
+            let rows = stmt.query_map([since], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, i64>(2)? as u64,
+                    row.get::<_, i64>(3)? as u64,
+                ))
+            })?;
+            for (credential_id, success, rate_limited, attempts) in rows.flatten() {
+                out.insert(
+                    credential_id,
+                    RecentActivity {
+                        success,
+                        rate_limited,
+                        // 其它失败 = 总跳数 − 成功 − 429。饱和减法防御脏数据。
+                        other_failures: attempts
+                            .saturating_sub(success)
+                            .saturating_sub(rate_limited),
+                        attempts,
+                    },
+                );
             }
-        };
-        let rows = stmt.query_map([since], |row| {
-            Ok((
-                row.get::<_, i64>(0)? as u64,
-                row.get::<_, i64>(1)? as u64,
-                row.get::<_, i64>(2)? as u64,
-                row.get::<_, i64>(3)? as u64,
-            ))
-        });
-        let rows = match rows {
-            Ok(rows) => rows,
+            Ok(out)
+        }) {
+            Ok(out) => out,
             Err(error) => {
                 tracing::warn!(%error, "recent_activity 查询失败");
-                return out;
+                std::collections::HashMap::new()
             }
-        };
-        for (credential_id, success, rate_limited, attempts) in rows.flatten() {
-            out.insert(
-                credential_id,
-                RecentActivity {
-                    success,
-                    rate_limited,
-                    // 其它失败 = 总跳数 − 成功 − 429。饱和减法防御脏数据。
-                    other_failures: attempts.saturating_sub(success).saturating_sub(rate_limited),
-                    attempts,
-                },
-            );
         }
-        out
     }
 }
 
@@ -1459,9 +1681,11 @@ mod tests {
         conn.execute_batch(SCHEMA).unwrap();
         // writer 为 None：单测走同步写路径，保证「insert 后立刻能查到」。
         TraceStore {
+            db_path: None,
             conn: Mutex::new(conn),
             enabled: AtomicBool::new(true),
             retention_days: AtomicU64::new(DEFAULT_RETENTION_DAYS),
+            max_bytes: AtomicU64::new(DEFAULT_TRACE_MAX_BYTES),
             writer: Mutex::new(None),
             dropped: AtomicU64::new(0),
         }
@@ -2015,6 +2239,36 @@ mod tests {
     }
 
     #[test]
+    fn delete_for_credential_removes_intermediate_attempts() {
+        let store = mem_store();
+        store.insert(sample(TraceSample {
+            trace_id: "hop",
+            status: "success",
+            credential_id: 5,
+            model: "m1",
+        }));
+
+        assert!(store.failure_stats().contains_key(&9));
+        store.delete_for_credential(9);
+
+        let stats = store.failure_stats();
+        assert!(
+            !stats.contains_key(&9),
+            "intermediate-hop attempts must not linger after the credential is deleted"
+        );
+        assert!(
+            !store
+                .query(&TraceQuery {
+                    credential_id: Some(5),
+                    limit: 50,
+                    ..Default::default()
+                })
+                .is_empty(),
+            "the winning credential's trace should survive"
+        );
+    }
+
+    #[test]
     fn filter_only_failed_and_status() {
         let store = mem_store();
         store.insert(sample(TraceSample {
@@ -2051,6 +2305,22 @@ mod tests {
         });
         assert_eq!(by_status.len(), 1);
         assert_eq!(by_status[0].trace_id, "cut");
+
+        let recovered = store.query_paged(&TraceQuery {
+            failed_attempt_credential_id: Some(9),
+            limit: 50,
+            ..Default::default()
+        });
+        assert_eq!(recovered.0.len(), 3, "中间跳失败的成功请求也要出现在失败详情里");
+        assert_eq!(recovered.1, 3);
+
+        let page = store.query_paged(&TraceQuery {
+            failed_attempt_credential_id: Some(9),
+            limit: 2,
+            ..Default::default()
+        });
+        assert_eq!(page.0.len(), 2);
+        assert_eq!(page.1, 3, "有下一页时用 limit+1 估总数，避免 COUNT(*) 扫全表");
 
         let by_model = store.query(&TraceQuery {
             model: Some("m2".to_string()),
@@ -2328,6 +2598,28 @@ mod wal_checkpoint_tests {
     }
 
     #[test]
+    fn file_backed_query_does_not_wait_on_the_write_lock() {
+        // 回归：管理端查 traces 若仍抢写入 Mutex，线上 27GB 库会把页面卡在骨架屏。
+        let dir = scratch_dir("read-conn");
+        let store = TraceStore::open(dir.join("traces.db"), true, 7).unwrap();
+        store.insert(super::tests::sample(super::tests::TraceSample {
+            trace_id: "visible-while-locked",
+            status: "success",
+            credential_id: 9,
+            model: "claude-sonnet-4-5",
+        }));
+
+        let _held = store.conn.lock();
+        let (records, total) = store.query_paged(&TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(total, 1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].trace_id, "visible-while-locked");
+    }
+
+    #[test]
     fn checkpoint_truncate_actually_shrinks_the_wal_file() {
         // 这是 Step 1 的全部意义所在。PASSIVE 自动检查点只把页搬回主库、从头复用
         // WAL，**不缩文件**；进程又一直硬退出，没人截断。线上 traces.db-wal 因此涨到
@@ -2360,6 +2652,35 @@ mod wal_checkpoint_tests {
         let (_, total) = reopened.query_paged(&TraceQuery::default());
         assert_eq!(total, 200, "截断不能丢数据，页应该已经搬回主库");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trim_to_max_bytes_deletes_oldest_first() {
+        let dir = scratch_dir("size-cap");
+        let store = TraceStore::open(dir.join("traces.db"), true, 7).unwrap();
+        for index in 0..8 {
+            store.insert(super::tests::sample(super::tests::TraceSample {
+                trace_id: &format!("t{index}"),
+                status: "success",
+                credential_id: 1,
+                model: "m1",
+            }));
+        }
+        store.set_max_bytes(1);
+        store.trim_to_max_bytes();
+        let ids: Vec<String> = store
+            .query(&TraceQuery {
+                limit: 50,
+                ..Default::default()
+            })
+            .into_iter()
+            .map(|r| r.trace_id)
+            .collect();
+        assert!(
+            ids.len() < 8,
+            "over-limit trim should drop oldest traces, kept {ids:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

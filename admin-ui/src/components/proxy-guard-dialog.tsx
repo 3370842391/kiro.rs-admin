@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { AlertTriangle, ShieldAlert } from 'lucide-react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -48,8 +48,15 @@ export function ProxyGuardDialog({ open, onOpenChange }: ProxyGuardDialogProps) 
   const [migrateSurvivors, setMigrateSurvivors] = useState(true)
   const [autoReleaseHours, setAutoReleaseHours] = useState('0')
 
+  const hydratedRef = useRef(false)
+
   useEffect(() => {
-    if (!open || !data) return
+    if (!open) {
+      hydratedRef.current = false
+      return
+    }
+    if (!data || hydratedRef.current) return
+    hydratedRef.current = true
     setEnabled(data.enabled)
     setBanThreshold(String(data.banThreshold))
     setWindowHours(String(data.windowHours))

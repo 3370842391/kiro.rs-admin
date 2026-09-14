@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Network, ArrowUp, ArrowDown, RotateCcw, ChevronDown } from 'lucide-react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Checkbox } from '@/components/ui/checkbox'
+import { Switch } from '@/components/ui/switch'
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter,
 } from '@/components/ui/dialog'
@@ -66,10 +67,21 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
   const [defaultEndpoint, setDefaultEndpoint] = useState('ide')
   const [bucketMode, setBucketMode] = useState<'same-endpoint' | 'hop' | 'none'>('same-endpoint')
   const [sameEndpointAttempts, setSameEndpointAttempts] = useState(3)
+  const [enterpriseSpecialHandling, setEnterpriseSpecialHandling] = useState(false)
+  const [enterpriseDefaultEndpoint, setEnterpriseDefaultEndpoint] = useState('ide')
+  const [enterpriseMaxRetries, setEnterpriseMaxRetries] = useState(32)
 
-  // 载入服务端当前值到编辑态
+  const hydratedRef = useRef(false)
+
+  // 仅在弹窗打开时灌入服务端值，避免 refetch 或窗口聚焦刷新把编辑中的桶链冲掉。
   useEffect(() => {
-    if (!data) return
+    if (!open) {
+      hydratedRef.current = false
+      setExpanded(null)
+      return
+    }
+    if (!data || hydratedRef.current) return
+    hydratedRef.current = true
     setDraft(JSON.parse(JSON.stringify(data.chains)))
     setMaxAttempts(data.maxBucketAttemptsPerRequest)
     setIdleTimeout(data.streamIdleTimeoutSecs)
@@ -80,7 +92,10 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
     setDefaultEndpoint(data.defaultEndpoint || 'ide')
     setBucketMode(data.rateLimitBucketMode || 'same-endpoint')
     setSameEndpointAttempts(data.sameEndpointAttempts || 3)
-  }, [data])
+    setEnterpriseSpecialHandling(data.enterpriseSpecialHandling ?? false)
+    setEnterpriseDefaultEndpoint(data.enterpriseDefaultEndpoint || 'ide')
+    setEnterpriseMaxRetries(data.enterpriseMaxRetries || 32)
+  }, [open, data])
 
   const primaries = useMemo(
     () => Object.keys(data?.availableBuckets ?? {}).sort(),
@@ -126,6 +141,9 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
         defaultEndpoint,
         rateLimitBucketMode: bucketMode,
         sameEndpointAttempts,
+        enterpriseSpecialHandling,
+        enterpriseDefaultEndpoint,
+        enterpriseMaxRetries,
       },
       {
         onSuccess: () => {
@@ -152,7 +170,8 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
           </DialogDescription>
         </DialogHeader>
 
-        <div className="shrink-0 rounded-lg border bg-muted/30 p-3">
+        <div className="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain pr-1">
+        <div className="rounded-lg border bg-muted/30 p-3">
           <div className="mb-2 text-sm font-medium">全局端点运行模式</div>
           <div className="flex flex-wrap gap-2">
             <Button
@@ -185,7 +204,7 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
           )}
         </div>
 
-        <div className="shrink-0 space-y-3 rounded-lg border bg-muted/30 p-3">
+        <div className="space-y-3 rounded-lg border bg-muted/30 p-3">
           <div>
             <div className="mb-2 text-sm font-medium">默认协议</div>
             <div className="flex flex-wrap gap-2">
@@ -234,12 +253,64 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
                   : '普通 429 后立刻换号或失败，同号不再打。'}
             </p>
           </div>
+          <div>
+            <div className="mb-2 flex items-center justify-between gap-3">
+              <div>
+                <div className="text-sm font-medium">企业号专项处理</div>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  打到企业号后若 429：只在本号上 ide ↔ runtime 来回打，绝不换到其它号。重试次数在下面设上限。
+                </p>
+              </div>
+              <Switch
+                checked={enterpriseSpecialHandling}
+                onCheckedChange={setEnterpriseSpecialHandling}
+                aria-label="企业号专项处理"
+              />
+            </div>
+            {enterpriseSpecialHandling && (
+              <div className="mt-2 rounded-md border bg-background/60 p-2.5">
+                <div className="mb-2 text-xs font-medium text-foreground">企业号默认端点</div>
+                <div className="flex flex-wrap gap-2">
+                  {(['ide', 'runtime'] as const).map((name) => (
+                    <Button
+                      key={name}
+                      type="button"
+                      size="sm"
+                      variant={enterpriseDefaultEndpoint === name ? 'default' : 'outline'}
+                      onClick={() => setEnterpriseDefaultEndpoint(name)}
+                    >
+                      {name === 'ide' ? 'q 端点 (ide)' : 'runtime'}
+                    </Button>
+                  ))}
+                </div>
+                <p className="mt-2 text-xs text-muted-foreground">
+                  仅对 Enterprise / IdC 且未单独钉端点的号生效。ide 即 q 区域域名（q.*.amazonaws.com）。
+                </p>
+                <label className="mt-3 flex items-center gap-2 text-sm">
+                  <span className="shrink-0 text-xs font-medium text-foreground">企业号重试次数</span>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={256}
+                    value={enterpriseMaxRetries}
+                    onChange={(e) =>
+                      setEnterpriseMaxRetries(
+                        Math.min(256, Math.max(1, Number(e.target.value) || 1)),
+                      )
+                    }
+                    className="h-8 w-20"
+                  />
+                  <span className="text-xs text-muted-foreground">1–256，默认 32</span>
+                </label>
+              </div>
+            )}
+          </div>
         </div>
 
         {isLoading ? (
           <div className="py-8 text-center text-sm text-muted-foreground">加载中…</div>
         ) : (
-          <div className="min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
+          <div className="space-y-2">
             {primaries.map((primary) => {
               const options: EndpointBucketOption[] = data?.availableBuckets[primary] ?? []
               const selected = draft[primary] ?? []
@@ -344,7 +415,7 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
           </div>
         )}
 
-        <div className="shrink-0 space-y-3 border-t pt-3">
+        <div className="space-y-3 border-t pt-3">
           <div className="grid gap-2 sm:grid-cols-2">
             <label className="flex items-center gap-2 text-sm">
               <span className="shrink-0 text-muted-foreground">单请求桶尝试上限</span>
@@ -432,6 +503,7 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
               </span>
             </div>
           </div>
+        </div>
         </div>
 
         <DialogFooter className="shrink-0 gap-2 sm:justify-between">

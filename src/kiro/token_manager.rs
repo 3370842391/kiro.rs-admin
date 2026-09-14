@@ -1540,6 +1540,12 @@ pub struct MultiTokenManager {
     rate_limit_bucket_mode: Mutex<RateLimitBucketMode>,
     /// 同端点最多尝试次数（含首次）。
     same_endpoint_attempts: AtomicU32,
+    /// 企业号专项 429： lone enterprise pool 时不暂避、继续同号退避。
+    enterprise_special_handling: AtomicBool,
+    /// 企业号未钉端点时的首跳协议（默认 ide = q）。
+    enterprise_default_endpoint: Mutex<String>,
+    /// 企业号专项钉死后的最大轮数。
+    enterprise_max_retries: AtomicU32,
     /// 会话到凭据的短期粘性，仅在默认最好模式使用，不写入凭据文件。
     /// 只在上游 200 之后写入；429 / RPM 将满 / 账号不可用时松开。
     session_affinity: Mutex<HashMap<String, SessionAffinity>>,
@@ -1913,6 +1919,9 @@ impl MultiTokenManager {
         // failover 的语义是短暂让位，配成分钟级会把号长时间移出轮转。
         let failover_rate_limit_cooldown_ms = config.failover_rate_limit_cooldown_ms.min(120_000);
         let same_endpoint_attempts = config.same_endpoint_attempts.max(1);
+        let enterprise_special_handling = config.enterprise_special_handling;
+        let enterprise_default_endpoint = config.enterprise_default_endpoint.clone();
+        let enterprise_max_retries = config.enterprise_max_retries.max(1);
         let max_bucket_attempts = config.max_bucket_attempts_per_request;
         let stream_idle_timeout_secs = config.stream_idle_timeout_secs;
         let auto_continue_enabled = config.auto_continue_enabled;
@@ -1959,6 +1968,9 @@ impl MultiTokenManager {
             rate_limit_bucket_mode: Mutex::new(rate_limit_bucket_mode),
             failover_rate_limit_cooldown_ms: AtomicU64::new(failover_rate_limit_cooldown_ms),
             same_endpoint_attempts: AtomicU32::new(same_endpoint_attempts),
+            enterprise_special_handling: AtomicBool::new(enterprise_special_handling),
+            enterprise_default_endpoint: Mutex::new(enterprise_default_endpoint),
+            enterprise_max_retries: AtomicU32::new(enterprise_max_retries),
             session_affinity: Mutex::new(HashMap::new()),
             max_bucket_attempts_per_request: AtomicUsize::new(max_bucket_attempts),
             stream_idle_timeout_secs: AtomicU64::new(stream_idle_timeout_secs),
@@ -5946,6 +5958,103 @@ impl MultiTokenManager {
         config
             .save()
             .with_context(|| format!("持久化同端点尝试次数失败: {}", path.display()))?;
+        Ok(())
+    }
+
+    pub fn enterprise_special_handling_enabled(&self) -> bool {
+        self.enterprise_special_handling.load(Ordering::Relaxed)
+    }
+
+    pub fn set_enterprise_special_handling(&self, enabled: bool) -> anyhow::Result<()> {
+        let previous = self.enterprise_special_handling.swap(enabled, Ordering::Relaxed);
+        if let Err(error) = self.persist_enterprise_special_handling(enabled) {
+            self.enterprise_special_handling
+                .store(previous, Ordering::Relaxed);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn persist_enterprise_special_handling(&self, enabled: bool) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let Some(path) = self.config.config_path() else {
+            tracing::warn!("配置文件路径未知，企业号专项 429 仅在当前进程生效");
+            return Ok(());
+        };
+        let mut config =
+            Config::load(path).with_context(|| format!("重新加载配置失败: {}", path.display()))?;
+        config.enterprise_special_handling = enabled;
+        config
+            .save()
+            .with_context(|| format!("持久化企业号专项 429 失败: {}", path.display()))?;
+        Ok(())
+    }
+
+    pub fn get_enterprise_default_endpoint(&self) -> String {
+        self.enterprise_default_endpoint.lock().clone()
+    }
+
+    pub fn set_enterprise_default_endpoint(&self, name: String) -> anyhow::Result<()> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            bail!("企业号默认端点不能为空");
+        }
+        let previous = self.enterprise_default_endpoint.lock().clone();
+        *self.enterprise_default_endpoint.lock() = trimmed.to_string();
+        if let Err(error) = self.persist_enterprise_default_endpoint(trimmed) {
+            *self.enterprise_default_endpoint.lock() = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn persist_enterprise_default_endpoint(&self, name: &str) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let Some(path) = self.config.config_path() else {
+            tracing::warn!("配置文件路径未知，企业号默认端点仅在当前进程生效");
+            return Ok(());
+        };
+        let mut config =
+            Config::load(path).with_context(|| format!("重新加载配置失败: {}", path.display()))?;
+        config.enterprise_default_endpoint = name.to_string();
+        config
+            .save()
+            .with_context(|| format!("持久化企业号默认端点失败: {}", path.display()))?;
+        Ok(())
+    }
+
+    pub fn enterprise_max_retries(&self) -> u32 {
+        self.enterprise_max_retries.load(Ordering::Relaxed).max(1)
+    }
+
+    pub fn set_enterprise_max_retries(&self, value: u32) -> anyhow::Result<()> {
+        if !(1..=256).contains(&value) {
+            bail!("企业号重试次数必须在 1..=256");
+        }
+        let previous = self.enterprise_max_retries.swap(value, Ordering::Relaxed);
+        if let Err(error) = self.persist_enterprise_max_retries(value) {
+            self.enterprise_max_retries
+                .store(previous, Ordering::Relaxed);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn persist_enterprise_max_retries(&self, value: u32) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let Some(path) = self.config.config_path() else {
+            tracing::warn!("配置文件路径未知，企业号重试次数仅在当前进程生效");
+            return Ok(());
+        };
+        let mut config =
+            Config::load(path).with_context(|| format!("重新加载配置失败: {}", path.display()))?;
+        config.enterprise_max_retries = value;
+        config
+            .save()
+            .with_context(|| format!("持久化企业号重试次数失败: {}", path.display()))?;
         Ok(())
     }
 

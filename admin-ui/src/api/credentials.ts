@@ -633,6 +633,9 @@ export interface EndpointChainsConfig {
   defaultEndpoint: string
   rateLimitBucketMode: 'same-endpoint' | 'hop' | 'none'
   sameEndpointAttempts: number
+  enterpriseSpecialHandling: boolean
+  enterpriseDefaultEndpoint: string
+  enterpriseMaxRetries: number
 }
 
 export interface SetEndpointChainsRequest {
@@ -646,6 +649,9 @@ export interface SetEndpointChainsRequest {
   defaultEndpoint?: string
   rateLimitBucketMode?: 'same-endpoint' | 'hop' | 'none'
   sameEndpointAttempts?: number
+  enterpriseSpecialHandling?: boolean
+  enterpriseDefaultEndpoint?: string
+  enterpriseMaxRetries?: number
 }
 
 export async function getEndpointChains(): Promise<EndpointChainsConfig> {
@@ -797,6 +803,7 @@ export interface LogGovernanceConfig {
   traceEnabled: boolean
   autoCompactDiagnosticsEnabled: boolean
   traceRetentionDays: number
+  traceMaxStorageGb: number
   usageLogRetentionDays: number
   errorSnapshotEnabled: boolean
   errorSnapshotRetentionDays: number

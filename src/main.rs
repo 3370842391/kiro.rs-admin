@@ -407,7 +407,12 @@ async fn main() {
         config.trace_enabled,
         config.trace_retention_days,
     ) {
-        Ok(s) => Some(std::sync::Arc::new(s)),
+        Ok(s) => {
+            s.set_max_bytes(
+                u64::from(config.trace_max_storage_gb).saturating_mul(1024 * 1024 * 1024),
+            );
+            Some(std::sync::Arc::new(s))
+        }
         Err(e) => {
             tracing::warn!("打开 traces.db 失败，请求链路追踪不可用: {}", e);
             None
@@ -481,14 +486,14 @@ async fn main() {
         let recorder = usage_recorder.clone();
         let trace_store = trace_store.clone();
         tokio::spawn(async move {
-            let day = std::time::Duration::from_secs(24 * 3600);
+            let interval = std::time::Duration::from_secs(30 * 60);
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             loop {
                 recorder.cleanup_old_logs();
-                if let Some(ts) = &trace_store {
-                    ts.cleanup();
+                if let Some(ts) = trace_store.clone() {
+                    let _ = tokio::task::spawn_blocking(move || ts.cleanup()).await;
                 }
-                tokio::time::sleep(day).await;
+                tokio::time::sleep(interval).await;
             }
         });
     }

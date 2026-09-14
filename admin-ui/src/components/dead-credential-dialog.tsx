@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { Trash2 } from 'lucide-react'
 import {
@@ -35,10 +35,17 @@ export function DeadCredentialDialog({ open, onOpenChange }: DeadCredentialDialo
   const { data: config, isLoading } = useDeadCredentialConfig()
   const { mutate: save, isPending } = useSetDeadCredentialConfig()
   const [hours, setHours] = useState('')
+  const hydratedRef = useRef(false)
 
-  // 弹窗打开时以服务端值为准，避免上次编辑的草稿残留
+  // 仅在弹窗打开时灌入服务端值；切换自动删除会 refetch config，不能因此冲掉未保存的小时数。
   useEffect(() => {
-    if (open && config) setHours(String(config.retentionHours))
+    if (!open) {
+      hydratedRef.current = false
+      return
+    }
+    if (!config || hydratedRef.current) return
+    hydratedRef.current = true
+    setHours(String(config.retentionHours))
   }, [open, config])
 
   const toggleAutoDelete = (enabled: boolean) => {

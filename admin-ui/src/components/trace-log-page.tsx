@@ -695,6 +695,7 @@ function GovernanceButton() {
   const { data: cfg, isLoading } = useLogGovernanceConfig()
   const { mutate, isPending } = useSetLogGovernanceConfig()
   const [traceDays, setTraceDays] = useState('')
+  const [traceMaxGb, setTraceMaxGb] = useState('')
   const [usageDays, setUsageDays] = useState('')
   const [snapshotDays, setSnapshotDays] = useState('')
   const [snapshotMaxGb, setSnapshotMaxGb] = useState('')
@@ -717,6 +718,7 @@ function GovernanceButton() {
     e: React.FormEvent,
     field:
       | 'traceRetentionDays'
+      | 'traceMaxStorageGb'
       | 'usageLogRetentionDays'
       | 'errorSnapshotRetentionDays'
       | 'errorSnapshotMaxStorageGb'
@@ -810,6 +812,27 @@ function GovernanceButton() {
             className="h-7 text-xs"
           />
           <Button type="submit" size="sm" variant="outline" className="h-7 text-xs" disabled={isPending || !traceDays.trim()}>
+            保存
+          </Button>
+        </form>
+        <DropdownMenuLabel className="pt-1">
+          traces.db 体积上限（当前 {cfg?.traceMaxStorageGb ?? '—'} GB）
+        </DropdownMenuLabel>
+        <form
+          onSubmit={(e) => submitNumber(e, 'traceMaxStorageGb', traceMaxGb, 64, 'traces.db 上限 GB', () => setTraceMaxGb(''))}
+          className="flex items-center gap-1.5 px-2 pb-2"
+        >
+          <Input
+            type="number"
+            min={1}
+            max={64}
+            placeholder="GB"
+            value={traceMaxGb}
+            onChange={(e) => setTraceMaxGb(e.target.value)}
+            disabled={isPending}
+            className="h-7 text-xs"
+          />
+          <Button type="submit" size="sm" variant="outline" className="h-7 text-xs" disabled={isPending || !traceMaxGb.trim()}>
             保存
           </Button>
         </form>

@@ -1035,6 +1035,18 @@ pub struct Config {
     #[serde(default = "default_same_endpoint_attempts")]
     pub same_endpoint_attempts: u32,
 
+    /// 企业号专项 429：打到企业号后钉死本号，只在 ide/runtime 换桶，不换其它号。
+    #[serde(default)]
+    pub enterprise_special_handling: bool,
+
+    /// 企业号未钉端点时的首跳协议。`ide` = q 协议（q.{region}.amazonaws.com）。
+    #[serde(default = "default_enterprise_endpoint")]
+    pub enterprise_default_endpoint: String,
+
+    /// 企业号专项：钉死后最多再打多少轮 ide/runtime（含当前这一轮）。默认 32。
+    #[serde(default = "default_enterprise_max_retries")]
+    pub enterprise_max_retries: u32,
+
     /// 端点路由模式：best（默认最好模式）或 manual（手动端点链）。
     #[serde(default)]
     pub endpoint_mode: EndpointMode,
@@ -1053,6 +1065,10 @@ pub struct Config {
     /// 请求链路追踪记录保留天数（默认 7）。后台任务每天清理超期记录。
     #[serde(default = "default_trace_retention_days")]
     pub trace_retention_days: u32,
+
+    /// traces.db 体积上限（GiB，默认 2）。超限后从最旧记录删起，避免再涨到几十 GB。
+    #[serde(default = "default_trace_max_storage_gb")]
+    pub trace_max_storage_gb: u32,
 
     /// 请求用量日志（usage_log.*.jsonl + 聚合桶）保留天数（默认 31）。
     #[serde(default = "default_usage_log_retention_days")]
@@ -1424,12 +1440,24 @@ fn default_same_endpoint_attempts() -> u32 {
     crate::kiro::endpoint::rate_limit::DEFAULT_SAME_ENDPOINT_ATTEMPTS
 }
 
+fn default_enterprise_endpoint() -> String {
+    crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
+}
+
+fn default_enterprise_max_retries() -> u32 {
+    32
+}
+
 fn default_trace_enabled() -> bool {
     true
 }
 
 fn default_trace_retention_days() -> u32 {
     7
+}
+
+fn default_trace_max_storage_gb() -> u32 {
+    2
 }
 
 fn default_error_snapshot_retention_days() -> u32 {
@@ -1579,10 +1607,14 @@ impl Default for Config {
             rate_limit_bucket_mode: RateLimitBucketMode::default(),
             failover_rate_limit_cooldown_ms: 0,
             same_endpoint_attempts: default_same_endpoint_attempts(),
+            enterprise_special_handling: false,
+            enterprise_default_endpoint: default_enterprise_endpoint(),
+            enterprise_max_retries: default_enterprise_max_retries(),
             endpoint_mode: EndpointMode::default(),
             trace_enabled: default_trace_enabled(),
             auto_compact_diagnostics_enabled: default_true(),
             trace_retention_days: default_trace_retention_days(),
+            trace_max_storage_gb: default_trace_max_storage_gb(),
             usage_log_retention_days: default_usage_log_retention_days(),
             profit_newapi_base: None,
             profit_newapi_token: None,
@@ -1879,6 +1911,7 @@ mod tests {
         let defaulted: Config = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(defaulted.error_snapshot_enabled);
         assert_eq!(defaulted.error_snapshot_retention_days, 7);
+        assert_eq!(defaulted.trace_max_storage_gb, 2);
         assert_eq!(defaulted.error_snapshot_max_storage_gb, 5);
         assert!(!defaulted.error_snapshot_capture_recovered);
         assert!(defaulted.error_snapshot_capture_bodies);

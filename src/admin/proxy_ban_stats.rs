@@ -812,11 +812,11 @@ pub fn assess_pool_risk(
             // `above_pool_baseline`（置信下界高过全池基线）加 `sample_ok`（样本够）
             // 给出了明确的**二值**结论。两者必须结合，否则会出现这种情况：
             //
-            // 2026-09-01 线上，`154.91.156.198` 是 33 个号烧了 9 个、置信下界 15%
-            // 对全池基线 10%，两项检验都通过，程序自己在理由里写着「确实比平均更容易
-            // 烧号」「样本足够」——但权重算下来 0.644，比 TIER_NORMAL_WEIGHT(0.6)
-            // 高一点点，于是判成 Normal，和零封号出口同档参与轮换。当晚新加的号
-            // 被轮询分到它上面，22 分钟即死。
+            // 线上曾出现：某出口 33 个号烧了 9 个、置信下界明显高于全池基线，
+            // 两项检验都通过，程序自己在理由里写着「确实比平均更容易烧号」
+            // 「样本足够」——但权重算下来只比 TIER_NORMAL_WEIGHT 高一点点，
+            // 于是判成 Normal，和零封号出口同档参与轮换。当晚新加的号
+            // 被轮询分到它上面，很快就死。
             //
             // 所以：一旦有证据认定它比全池平均更容易烧号，就至少降一档——干净出口
             // 还没用完之前不该轮到它。具体降到哪一档仍由权重决定。
@@ -1402,12 +1402,12 @@ mod tests {
     #[test]
     fn production_snapshot_does_not_recommend_quarantine() {
         let summaries = pool(&[
-            ("205.179.217.148:7139", summary(3, 8, 1, None, None)),
-            ("204.237.153.91:7571", summary(2, 7, 1, None, None)),
-            ("207.210.109.94:20000", summary(2, 5, 1, None, None)),
-            ("207.145.185.220:7183", summary(1, 7, 1, None, None)),
-            ("205.179.215.73:7129", summary(0, 6, 0, None, None)),
-            ("204.237.146.233:7443", summary(0, 6, 0, None, None)),
+            ("203.0.113.11:7139", summary(3, 8, 1, None, None)),
+            ("203.0.113.12:7571", summary(2, 7, 1, None, None)),
+            ("203.0.113.13:20000", summary(2, 5, 1, None, None)),
+            ("198.51.100.20:7183", summary(1, 7, 1, None, None)),
+            ("198.51.100.21:7129", summary(0, 6, 0, None, None)),
+            ("198.51.100.22:7443", summary(0, 6, 0, None, None)),
         ]);
         let risk = assess_pool_risk(&summaries, 6);
         for (key, assessment) in &risk {
@@ -1417,7 +1417,7 @@ mod tests {
                 key, assessment.reasons
             );
         }
-        let worst = &risk["205.179.217.148:7139"];
+        let worst = &risk["203.0.113.11:7139"];
         assert!(worst.ban_rate_lower_bound < BAN_RATE_LB_THRESHOLD);
         assert!(!worst.blockers.is_empty(), "必须说明为什么没下结论");
     }
@@ -1591,10 +1591,10 @@ mod tests {
 
     /// 回归：2026-09-01 线上形状——证据齐全但权重刚好压线，于是留在 Normal 档。
     ///
-    /// `154.91.156.198` 33 个号烧 9 个、置信下界 15% 对全池基线 10%，
+    /// 某出口 33 个号烧 9 个、置信下界明显高于全池基线，
     /// 两项检验都过，程序自己写着「确实比平均更容易烧号」「样本足够」，
-    /// 权重却是 0.644（TIER_NORMAL_WEIGHT = 0.6），判成 Normal，
-    /// 和零封号出口同档参与轮询。当晚新号被分到它上面，22 分钟即死。
+    /// 权重却刚好压在 TIER_NORMAL_WEIGHT 上，判成 Normal，
+    /// 和零封号出口同档参与轮询。当晚新号被分到它上面很快就死。
     #[test]
     fn confirmed_dirty_exit_is_never_left_in_normal_tier() {
         let summaries = pool(&[

@@ -807,6 +807,12 @@ pub struct EndpointChainsResponse {
     pub rate_limit_bucket_mode: String,
     /// 同端点最多尝试次数（含首次）。
     pub same_endpoint_attempts: u32,
+    /// 企业号专项 429：钉死本号，只在 ide/runtime 换桶。
+    pub enterprise_special_handling: bool,
+    /// 企业号未钉端点时的首跳协议（`ide` = q）。
+    pub enterprise_default_endpoint: String,
+    /// 企业号专项钉死后最多再打多少轮。
+    pub enterprise_max_retries: u32,
 }
 
 /// 更新 429 降级桶链配置
@@ -840,6 +846,15 @@ pub struct SetEndpointChainsRequest {
     /// 同端点尝试次数。省略则不改。
     #[serde(default)]
     pub same_endpoint_attempts: Option<u32>,
+    /// 企业号专项 429。省略则不改。
+    #[serde(default)]
+    pub enterprise_special_handling: Option<bool>,
+    /// 企业号默认首跳端点。省略则不改。
+    #[serde(default)]
+    pub enterprise_default_endpoint: Option<String>,
+    /// 企业号专项重试次数。省略则不改。
+    #[serde(default)]
+    pub enterprise_max_retries: Option<u32>,
 }
 
 /// 全局端点运行模式。
@@ -969,6 +984,8 @@ pub struct LogGovernanceConfigResponse {
     pub auto_compact_diagnostics_enabled: bool,
     /// trace 记录保留天数
     pub trace_retention_days: u32,
+    /// traces.db 体积上限（GiB）
+    pub trace_max_storage_gb: u32,
     /// 用量日志保留天数
     pub usage_log_retention_days: u32,
     /// 判死凭据的保留时长（小时）。403 封号后凭据先禁用留档，超过该时长才真正删除。
@@ -1020,6 +1037,9 @@ pub struct SetLogGovernanceConfigRequest {
     /// trace 保留天数，1..=365
     #[serde(default)]
     pub trace_retention_days: Option<u32>,
+    /// traces.db 体积上限（GiB），1..=64
+    #[serde(default)]
+    pub trace_max_storage_gb: Option<u32>,
     /// 用量日志保留天数，1..=365
     #[serde(default)]
     pub usage_log_retention_days: Option<u32>,

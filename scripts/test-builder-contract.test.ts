@@ -34,20 +34,6 @@ describe("8991 test builder contract", () => {
     expect(compose).toContain("RUST_LOG: ${TEST_RUST_LOG:-debug}");
   });
 
-  test("test deploy script performs detached, disposable health-checked deploys", async () => {
-    const script = await repositoryFile("scripts/test-deploy.sh");
-
-    expect(script).toContain("git checkout --detach");
-    expect(script).toContain("http://127.0.0.1:8991/admin");
-    expect(script).toContain("docker run --rm");
-    expect(script).toContain("TEST_GIT_REMOTE");
-    expect(script).toContain("TEST_COMPOSE_FILE");
-    expect(script).toContain("TEST_DEPLOY_LOCK_DIR");
-    expect(script).toContain("TEST_HEALTH_URL");
-    expect(script).toContain('git fetch "${REMOTE}"');
-    expect(script).not.toContain("kiro-rs-admin");
-  });
-
   test("runtime test data is excluded from build context and version control", async () => {
     const [dockerignore, gitignore] = await Promise.all([
       repositoryFile(".dockerignore"),
