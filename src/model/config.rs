@@ -252,6 +252,9 @@ pub struct KeySupplierConfig {
     /// 这是绝对值，不是百分比。
     #[serde(default)]
     pub low_quota_threshold: u32,
+    /// 91kiro / kiro-market 套餐。`企业号` 时自动采购带 tag，并按 OIDC JSON 入库。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub purchase_tag: String,
 }
 
 impl std::fmt::Debug for KeySupplierConfig {
@@ -322,6 +325,7 @@ impl Default for KeySupplierConfig {
             low_quota_threshold: 0,
             // 0 = 不限价，保持历史行为。
             max_unit_price: 0.0,
+            purchase_tag: String::new(),
         }
     }
 }

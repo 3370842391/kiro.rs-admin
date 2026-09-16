@@ -452,6 +452,8 @@ pub struct SupplierRuntimeConfig {
     pub low_quota_threshold: u32,
     /// 单价上限。0 = 不限。单位是**这家自己的计价单位**，不与别家可比。
     pub max_unit_price: f64,
+    /// 91kiro / kiro-market 套餐。空 = 普通 API Key；`企业号` 走 OIDC JSON。
+    pub purchase_tag: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -480,6 +482,8 @@ pub struct SupplierConfigView {
     pub target_usable: u32,
     pub low_quota_threshold: u32,
     pub max_unit_price: f64,
+    #[serde(default)]
+    pub purchase_tag: String,
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -525,6 +529,8 @@ pub struct SupplierConfigUpdate {
     pub max_unit_price: f64,
     #[serde(default)]
     pub low_quota_threshold: u64,
+    #[serde(default)]
+    pub purchase_tag: String,
 }
 
 impl std::fmt::Debug for SupplierRuntimeConfig {
@@ -564,6 +570,7 @@ impl std::fmt::Debug for SupplierRuntimeConfig {
             )
             .field("target_usable", &self.target_usable)
             .field("low_quota_threshold", &self.low_quota_threshold)
+            .field("purchase_tag", &self.purchase_tag)
             .finish()
     }
 }
@@ -608,6 +615,7 @@ impl std::fmt::Debug for SupplierConfigUpdate {
             )
             .field("target_usable", &self.target_usable)
             .field("low_quota_threshold", &self.low_quota_threshold)
+            .field("purchase_tag", &self.purchase_tag)
             .finish()
     }
 }
@@ -738,6 +746,7 @@ impl SupplierRuntimeConfig {
             target_usable: update.target_usable as u32,
             low_quota_threshold: update.low_quota_threshold as u32,
             max_unit_price: update.max_unit_price,
+            purchase_tag: normalize_text(&update.purchase_tag, "purchaseTag", 64)?,
         };
 
         Ok(runtime)
@@ -770,6 +779,7 @@ impl From<&SupplierRuntimeConfig> for KeySupplierConfig {
             target_usable: value.target_usable,
             low_quota_threshold: value.low_quota_threshold,
             max_unit_price: value.max_unit_price,
+            purchase_tag: value.purchase_tag.clone(),
         }
     }
 }
@@ -800,6 +810,7 @@ impl From<&SupplierRuntimeConfig> for SupplierConfigView {
             target_usable: value.target_usable,
             low_quota_threshold: value.low_quota_threshold,
             max_unit_price: value.max_unit_price,
+            purchase_tag: value.purchase_tag.clone(),
         }
     }
 }
@@ -1192,6 +1203,7 @@ fn normalize_persisted(
         target_usable: u64::from(value.target_usable),
         low_quota_threshold: u64::from(value.low_quota_threshold),
         max_unit_price: value.max_unit_price,
+        purchase_tag: value.purchase_tag.clone(),
     };
     SupplierRuntimeConfig::normalize(kind, None, update, false)
 }
@@ -1298,6 +1310,7 @@ mod tests {
             target_usable: 0,
             low_quota_threshold: 0,
             max_unit_price: 0.0,
+            purchase_tag: String::new(),
         }
     }
 

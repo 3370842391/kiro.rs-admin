@@ -479,6 +479,7 @@ mod tests {
             target_usable: 0,
             low_quota_threshold: 0,
             max_unit_price: 0.0,
+            purchase_tag: String::new(),
         }
     }
 
@@ -508,6 +509,7 @@ mod tests {
             target_usable: 0,
             low_quota_threshold: 0,
             max_unit_price: 0.0,
+            purchase_tag: String::new(),
         };
         let supplier = Arc::new(KeySupplierService::new(
             Arc::new(SupplierEventStore::open_in_memory().unwrap()),
@@ -1103,6 +1105,7 @@ mod tests {
                 target_usable: 0,
                 low_quota_threshold: 0,
                 max_unit_price: 0.0,
+                purchase_tag: String::new(),
             },
             Arc::new(AcceptingImporter),
         ));

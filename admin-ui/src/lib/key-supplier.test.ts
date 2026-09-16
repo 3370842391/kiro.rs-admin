@@ -38,6 +38,7 @@ const update: SupplierConfigUpdate = {
   groups: ['production'],
   sourceChannel: 'webhook',
   nicknamePrefix: 'supplier-',
+  purchaseTag: '',
   apiKey: '  supplier-secret  ',
   webhookToken: '  webhook-token  ',
 }
@@ -91,6 +92,7 @@ describe('key supplier helpers', () => {
       groups: ['production'],
       sourceChannel: 'webhook',
       nicknamePrefix: 'supplier-',
+      purchaseTag: '',
     })
   })
 
@@ -463,6 +465,20 @@ describe('multi-supplier helpers', () => {
     expect(payload.restockOnlyWhenExhausted).toBe(true)
     expect(payload.targetUsable).toBe(2)
     expect(payload.lowQuotaThreshold).toBe(500)
+  })
+
+  test('kiro-ceo enterprise purchase tag survives the payload round-trip', () => {
+    const payload = buildSupplierEntryPayload({
+      ...emptySupplierEntry('kiro-ceo'),
+      id: '91kiro',
+      name: '91kiro',
+      purchaseTag: '企业号',
+    })
+
+    expect(payload.kind).toBe('kiro-ceo')
+    expect(payload.purchaseTag).toBe('企业号')
+    expect(emptySupplierEntry('kiro-ceo').purchaseTag).toBe('')
+    expect(getSupplierKindLabel('kiro-ceo')).toContain('91kiro')
   })
 
   test('kiroapp.io round-trips through the entry payload builder', () => {

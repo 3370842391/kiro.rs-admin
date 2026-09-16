@@ -11,7 +11,9 @@ use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::Value;
 
 use crate::admin::key_supplier::capabilities::RegionSource;
-use crate::admin::key_supplier::client::{PurchaseContext, SupplierClient, SupplierSnapshot};
+use crate::admin::key_supplier::client::{
+    PurchaseContext, SupplierClient, SupplierItem, SupplierSnapshot,
+};
 use crate::admin::key_supplier::config::{
     MAX_SUPPLIERS, PoolConfigUpdate, PoolConfigView, PoolRuntimeConfig,
     ResolvedSupplierImportPreset, SupplierCommonConfigUpdate, SupplierCommonConfigView,
@@ -77,6 +79,14 @@ pub enum IncomingWebhook {
     Test {
         event_id: String,
         message: String,
+    },
+    /// 包量/预定已交付：钱已扣，拿 `order_id` 换企业号 JSON，禁止再 purchase。
+    ReservedKeysDelivered {
+        event_id: String,
+        order_id: String,
+        event_region: Option<SupplierRegion>,
+        message: String,
+        new_keys: u32,
     },
     /// 不触发采购的通知类事件（例如 `key_revoked_abuse`），以及**任何无法确定
     /// 是到货信号的事件**。落库留痕，但绝不下单。
@@ -301,7 +311,25 @@ impl IncomingWebhook {
                 // 对方带 `dead`，缺了也不算错——这个事件不花钱，只留痕。
                 dead: optional_quantity(object, &["dead"]).unwrap_or(0),
             }),
-            "test" => Ok(Self::Test { event_id, message }),
+            "test" | "webhook_test" => Ok(Self::Test { event_id, message }),
+            "reserved_keys_delivered" => {
+                let order_id = optional_id(object, &["order_id", "orderId"])
+                    .ok_or(SupplierServiceError::InvalidPayload)?;
+                Ok(Self::ReservedKeysDelivered {
+                    event_id,
+                    event_region: optional_region(object, &["zone", "region"]),
+                    message,
+                    new_keys: optional_quantity(object, &["new_keys", "newKeys", "count"])
+                        .unwrap_or(0),
+                    order_id,
+                })
+            }
+            "warranty_refund" => Ok(Self::Notice {
+                event_id,
+                event_type: "warranty_refund".to_owned(),
+                message,
+                quantity: optional_quantity(object, &["refunded_keys", "refundedKeys"]).unwrap_or(0),
+            }),
             _ => Err(SupplierServiceError::InvalidPayload),
         }
     }
@@ -407,6 +435,22 @@ impl IncomingWebhook {
                 event_region: None,
                 message: Some(message),
                 quantity: 0,
+            },
+            Self::ReservedKeysDelivered {
+                event_id,
+                order_id,
+                event_region,
+                message,
+                new_keys,
+            } => IncomingSupplierEvent {
+                supplier_id,
+                event_id,
+                event_type: "reserved_keys_delivered".to_string(),
+                purchase_order_id: Some(order_id),
+                supplier_batch_id: None,
+                event_region,
+                message: Some(message),
+                quantity: i64::from(new_keys),
             },
             Self::Notice {
                 event_id,
@@ -1709,6 +1753,91 @@ impl KeySupplierService {
         }
     }
 
+    async fn import_reserved_delivery(
+        &self,
+        event: &StoredSupplierEvent,
+    ) -> Result<ProcessAction, SupplierServiceError> {
+        let entry = self
+            .supplier(&event.supplier_id)
+            .ok_or(SupplierServiceError::SupplierNotFound)?;
+        let runtime = &entry.settings;
+        if !runtime.auto_purchase || !entry.enabled {
+            return Ok(ProcessAction::Skip);
+        }
+        let importer = self
+            .importer
+            .as_ref()
+            .ok_or(SupplierServiceError::ImporterUnavailable)?;
+        let order_id = event
+            .purchase_order_id
+            .as_deref()
+            .ok_or(SupplierServiceError::InvalidEvent)?;
+        let client = self.client_for(&entry)?;
+        let items = match client.fetch_delivered_oidc(order_id).await {
+            Ok(items) => items,
+            Err(error) => {
+                return Ok(ProcessAction::Failed {
+                    summary: empty_summary(),
+                    error: SupplierServiceError::supplier_api(error),
+                });
+            }
+        };
+        let (requested_region, requested_region_source) =
+            requested_purchase_region(runtime, event.event_region);
+        let credential_region = resolve_credential_region(
+            None,
+            None,
+            event.event_region,
+            requested_region,
+            runtime,
+        );
+        let mut summary = ProcessSummary {
+            purchased_count: i64::try_from(items.len()).unwrap_or(0),
+            ..ProcessSummary::default()
+        };
+        summary.decision_requested_region = requested_region;
+        summary.decision_requested_region_source = requested_region_source;
+        let mut import_failed = false;
+        for (index, item) in items.into_iter().enumerate() {
+            let price = item.price();
+            let credential = match credential_from_supplier_item(
+                item,
+                &entry.id,
+                &entry.name,
+                runtime,
+                order_id,
+                index + 1,
+                price,
+                &credential_region.api_region,
+            ) {
+                Ok(credential) => credential,
+                Err(_) => {
+                    summary.failed_count += 1;
+                    import_failed = true;
+                    continue;
+                }
+            };
+            match importer.import(credential).await {
+                Ok(()) => summary.imported_count += 1,
+                Err(error) if is_duplicate_error(&error.to_string()) => {
+                    summary.duplicate_count += 1
+                }
+                Err(_) => {
+                    summary.failed_count += 1;
+                    import_failed = true;
+                }
+            }
+        }
+        if import_failed {
+            Ok(ProcessAction::Failed {
+                summary,
+                error: SupplierServiceError::ImportFailed,
+            })
+        } else {
+            Ok(ProcessAction::Complete(summary))
+        }
+    }
+
     async fn execute_claimed(
         &self,
         event: &StoredSupplierEvent,
@@ -1716,9 +1845,14 @@ impl KeySupplierService {
         // 采购白名单：只有这两种事件会花钱。其它一切——`all_keys_dead`、`test`、
         // `key_revoked_abuse`、以及供货商将来新增的任何事件名——都只留痕不下单。
         //
+        // `reserved_keys_delivered` 钱已经扣过，只补拉 JSON，不进 purchase。
+        //
         // 这里用白名单而不是「排除已知的几种」是刻意的：过去宽容解析器把
         // 「不是 test 的一切」都当到货信号，`all_keys_dead` 这种事件会顶着
         // `max_purchase` 去买一车。默认必须是不买。
+        if event.event_type == "reserved_keys_delivered" {
+            return self.import_reserved_delivery(event).await;
+        }
         if !matches!(
             event.event_type.as_str(),
             "new_keys_available" | "manual_purchase"
@@ -2078,6 +2212,8 @@ impl KeySupplierService {
                     },
                     requested_region,
                     region_source: requested_region_source,
+                    purchase_tag: Some(runtime.purchase_tag.as_str())
+                        .filter(|tag| !tag.is_empty()),
                 },
             )
             .await
@@ -2174,10 +2310,10 @@ impl KeySupplierService {
             runtime,
         );
         let mut import_failed = false;
-        for (index, key) in purchase.keys.into_iter().enumerate() {
-            let price = key.price();
-            let credential = credential_from_supplier_key(
-                key.into_inner(),
+        for (index, item) in purchase.keys.into_iter().enumerate() {
+            let price = item.price();
+            let credential = match credential_from_supplier_item(
+                item,
                 &entry.id,
                 &entry.name,
                 runtime,
@@ -2185,7 +2321,14 @@ impl KeySupplierService {
                 index + 1,
                 price,
                 &credential_region.api_region,
-            );
+            ) {
+                Ok(credential) => credential,
+                Err(_) => {
+                    summary.failed_count += 1;
+                    import_failed = true;
+                    continue;
+                }
+            };
             match importer.import(credential).await {
                 Ok(()) => summary.imported_count += 1,
                 Err(error) if is_duplicate_error(&error.to_string()) => {
@@ -2418,6 +2561,94 @@ fn credential_from_supplier_key(
     }
 }
 
+fn credential_from_supplier_item(
+    item: SupplierItem,
+    supplier_id: &str,
+    supplier_name: &str,
+    runtime: &SupplierRuntimeConfig,
+    order_id: &str,
+    index: usize,
+    purchase_price: Option<f64>,
+    api_region: &str,
+) -> Result<KiroCredentials, SupplierServiceError> {
+    match item {
+        SupplierItem::ApiKey(key) => Ok(credential_from_supplier_key(
+            key.into_inner(),
+            supplier_id,
+            supplier_name,
+            runtime,
+            order_id,
+            index,
+            purchase_price,
+            api_region,
+        )),
+        SupplierItem::JsonCredential { value, price } => {
+            credential_from_supplier_json(
+                value,
+                supplier_id,
+                supplier_name,
+                runtime,
+                order_id,
+                index,
+                price.or(purchase_price),
+                api_region,
+            )
+        }
+    }
+}
+
+fn credential_from_supplier_json(
+    value: Value,
+    supplier_id: &str,
+    supplier_name: &str,
+    runtime: &SupplierRuntimeConfig,
+    order_id: &str,
+    index: usize,
+    purchase_price: Option<f64>,
+    api_region: &str,
+) -> Result<KiroCredentials, SupplierServiceError> {
+    let mut credential: KiroCredentials = serde_json::from_value(value)
+        .map_err(|_| SupplierServiceError::InvalidPayload)?;
+    credential.canonicalize_auth_method();
+    if credential.auth_method.as_deref().is_none_or(|method| method.is_empty()) {
+        credential.auth_method = Some("idc".to_owned());
+    }
+    credential.id = None;
+    credential.disabled = false;
+    credential.disable_reason = None;
+    credential.groups = runtime.groups.clone();
+    credential.source_channel = Some(runtime.source_channel.clone());
+    credential.supplier_id = Some(supplier_id.to_owned());
+    credential.rpm_limit = runtime.rpm_limit;
+    credential.max_concurrency = runtime.max_concurrency;
+    credential.priority = runtime.priority;
+    credential.delete_on_forbidden = runtime.auto_delete_forbidden;
+    credential.purchase_price = purchase_price;
+    let nickname_source = if supplier_name.trim().is_empty() {
+        supplier_id
+    } else {
+        supplier_name
+    };
+    credential.nickname = Some(supplier_credential_nickname(
+        nickname_source,
+        runtime,
+        order_id,
+        index,
+    ));
+    if credential
+        .api_region
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        credential.api_region = Some(api_region.to_owned());
+    }
+    if credential.refresh_token.as_deref().map(str::trim).is_none_or(str::is_empty) {
+        return Err(SupplierServiceError::InvalidPayload);
+    }
+    Ok(credential)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedCredentialRegion {
     api_region: String,
@@ -2607,6 +2838,7 @@ fn empty_runtime() -> SupplierRuntimeConfig {
         target_usable: 0,
         low_quota_threshold: 0,
         max_unit_price: 0.0,
+        purchase_tag: String::new(),
     }
 }
 
@@ -2918,6 +3150,7 @@ mod tests {
             target_usable: 0,
             low_quota_threshold: 0,
             max_unit_price: 0.0,
+            purchase_tag: String::new(),
         }
     }
 
@@ -2965,6 +3198,7 @@ mod tests {
             target_usable: u64::from(runtime.target_usable),
             low_quota_threshold: u64::from(runtime.low_quota_threshold),
             max_unit_price: runtime.max_unit_price,
+            purchase_tag: runtime.purchase_tag.clone(),
         }
     }
 
@@ -4612,6 +4846,27 @@ mod tests {
         assert_eq!(purchase_order_id, "7f3a9c2e1b4d5a6f8e9c0b1a2d3e4f5a");
         assert_eq!(new_keys, 20);
 
+        let reserved = IncomingWebhook::parse(
+            SupplierKind::KiroCeo,
+            r#"{"event":"reserved_keys_delivered","event_id":"evt_reserved_1",
+                "order_id":"ord-reserved-1","new_keys":1,"zone":"us",
+                "message":"reserved delivered"}"#
+                .as_bytes(),
+        )
+        .unwrap();
+        let IncomingWebhook::ReservedKeysDelivered {
+            order_id,
+            new_keys: reserved_count,
+            event_region,
+            ..
+        } = reserved
+        else {
+            panic!("reserved_keys_delivered must fetch json, not purchase");
+        };
+        assert_eq!(order_id, "ord-reserved-1");
+        assert_eq!(reserved_count, 1);
+        assert_eq!(event_region, Some(SupplierRegion::Us));
+
         // 名下号全灭是通知而非采购信号。
         assert!(matches!(
             IncomingWebhook::parse(
@@ -5076,6 +5331,158 @@ mod tests {
         assert_eq!(request["zone"], "eu", "必须显式带上有货的那个区");
         // 数量受该区单笔上限 2 夹逼，不是推送里的 20，也不是合计的那个数。
         assert_eq!(request["count"], 2);
+    }
+
+    #[tokio::test]
+    async fn reserved_keys_delivered_fetches_oidc_and_does_not_purchase() {
+        let purchase_hits = Arc::new(Mutex::new(0_usize));
+        let observed_purchase = purchase_hits.clone();
+        let app = Router::new()
+            .route(
+                "/api/my/purchase",
+                post(move || {
+                    let observed_purchase = observed_purchase.clone();
+                    async move {
+                        *observed_purchase.lock().unwrap() += 1;
+                        axum::Json(serde_json::json!({
+                            "purchased": 1,
+                            "keys": ["should-not-buy"]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/api/my/orders/{order_id}/kiro-oidc",
+                get(|| async {
+                    axum::Json(serde_json::json!([{
+                        "authMethod": "IdC",
+                        "idp": "Enterprise",
+                        "refreshToken": "rt-reserved-1",
+                        "startUrl": "https://start.example",
+                        "clientId": "cid",
+                        "clientSecret": "csec",
+                        "profileArn": "arn:aws:sso:::profile/p",
+                        "apiRegion": "us-east-1"
+                    }]))
+                }),
+            );
+        let token = "d".repeat(64);
+        let mut supplier = entry("ceo", SupplierKind::KiroCeo, &token);
+        supplier.settings.base_url = server(app).await;
+        supplier.settings.purchase_tag = "企业号".to_owned();
+        let store = Arc::new(SupplierEventStore::open_in_memory().unwrap());
+        let importer = Arc::new(FakeImporter::default());
+        let service = KeySupplierService::with_suppliers_and_importer(
+            store.clone(),
+            vec![supplier],
+            importer.clone(),
+        );
+
+        service
+            .ingest(
+                &token,
+                r#"{"event":"reserved_keys_delivered","event_id":"evt_reserved_oidc",
+                    "order_id":"ord-reserved-1","new_keys":1,"zone":"us"}"#,
+            )
+            .unwrap();
+        service.process_pending().await.unwrap();
+
+        let stored = &store.list(1, None, None).unwrap().items[0];
+        assert_eq!(
+            stored.status,
+            SupplierEventStatus::Succeeded,
+            "{:?}",
+            stored.message
+        );
+        assert_eq!(stored.imported_count, 1);
+        assert_eq!(*purchase_hits.lock().unwrap(), 0, "reserved delivery must not purchase");
+        let imported = importer.credentials.lock().unwrap();
+        assert_eq!(imported[0].auth_method.as_deref(), Some("idc"));
+        assert_eq!(imported[0].refresh_token.as_deref(), Some("rt-reserved-1"));
+        assert_eq!(imported[0].provider.as_deref(), Some("Enterprise"));
+    }
+
+    #[tokio::test]
+    async fn new_keys_available_with_enterprise_tag_purchases_oidc_json() {
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let observed = bodies.clone();
+        let app = Router::new()
+            .route(
+                "/api/my/stock",
+                get(|| async {
+                    axum::Json(serde_json::json!({
+                        "max": 1,
+                        "zones": [{"zone": "us", "enabled": true, "available": 1,
+                                   "max": 1, "unit_price": 22}]
+                    }))
+                }),
+            )
+            .route(
+                "/api/my/purchase",
+                post(move |body: axum::body::Bytes| {
+                    let observed = observed.clone();
+                    async move {
+                        let text = String::from_utf8(body.to_vec()).unwrap();
+                        observed.lock().unwrap().push(text.clone());
+                        axum::Json(serde_json::json!({
+                            "client_order_id": "7f3a9c2e1b4d5a6f8e9c0b1a2d3e4f5a",
+                            "purchased": 1,
+                            "remaining": 9,
+                            "keys": [{"key": ""}],
+                            "order_id": "ord-enterprise-buy",
+                            "kiro_oidc": [{
+                                "authMethod": "IdC",
+                                "provider": "Enterprise",
+                                "refreshToken": "rt-bought-1",
+                                "startUrl": "https://start.example",
+                                "clientId": "cid",
+                                "clientSecret": "csec",
+                                "profileArn": "arn:aws:sso:::profile/p",
+                                "apiRegion": "us-east-1"
+                            }],
+                            "zone": "us",
+                            "unit_price": 22,
+                            "total_credits": 22
+                        }))
+                    }
+                }),
+            );
+        let token = "e".repeat(64);
+        let mut supplier = entry("ceo", SupplierKind::KiroCeo, &token);
+        supplier.settings.base_url = server(app).await;
+        supplier.settings.purchase_tag = "企业号".to_owned();
+        let store = Arc::new(SupplierEventStore::open_in_memory().unwrap());
+        let importer = Arc::new(FakeImporter::default());
+        let service = KeySupplierService::with_suppliers_and_importer(
+            store.clone(),
+            vec![supplier],
+            importer.clone(),
+        );
+
+        service
+            .ingest(
+                &token,
+                r#"{"event":"new_keys_available","event_id":"7f3a9c2e1b4d5a6f8e9c0b1a2d3e4f5a",
+                    "purchase_order_id":"7f3a9c2e1b4d5a6f8e9c0b1a2d3e4f5a","new_keys":1,
+                    "zone":"us"}"#,
+            )
+            .unwrap();
+        service.process_pending().await.unwrap();
+
+        let stored = &store.list(1, None, None).unwrap().items[0];
+        assert_eq!(
+            stored.status,
+            SupplierEventStatus::Succeeded,
+            "{:?}",
+            stored.message
+        );
+        assert_eq!(stored.imported_count, 1);
+        let request: serde_json::Value = serde_json::from_str(&bodies.lock().unwrap()[0]).unwrap();
+        assert_eq!(request["tag"], "企业号");
+        let imported = importer.credentials.lock().unwrap();
+        assert_eq!(imported[0].auth_method.as_deref(), Some("idc"));
+        assert_eq!(imported[0].refresh_token.as_deref(), Some("rt-bought-1"));
+        assert!(imported[0].kiro_api_key.is_none());
     }
 
     /// kiro.ceo 的 409 不等于「原单已成交」。

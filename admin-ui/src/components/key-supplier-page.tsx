@@ -993,6 +993,20 @@ export function KeySupplierPage() {
                       {SUPPLIER_KINDS.map((kind) => <option key={kind} value={kind}>{getSupplierKindLabel(kind)}</option>)}
                     </select>
                   </Field>
+                  {config.kind === 'kiro-ceo' ? (
+                    <Field label="采购套餐（91kiro / kiro-market）">
+                      <select
+                        className="h-9 w-full border border-input bg-transparent px-3 text-sm"
+                        aria-label="采购套餐"
+                        value={config.purchaseTag}
+                        onChange={(event) => updateField('purchaseTag', event.target.value)}
+                        disabled={saveConfig.isPending}
+                      >
+                        <option value="">普通 API Key（ksk_）</option>
+                        <option value="企业号">企业号（OIDC JSON）</option>
+                      </select>
+                    </Field>
+                  ) : null}
                   <Field label="Supplier Base URL"><Input value={config.baseUrl} onChange={(event) => updateField('baseUrl', event.target.value)} disabled={saveConfig.isPending} /></Field>
                   <Field label="Public Base URL"><Input value={config.publicBaseUrl} onChange={(event) => updateField('publicBaseUrl', event.target.value)} disabled={saveConfig.isPending} /></Field>
                   <Field label="API Key（只写入）"><Input type="password" autoComplete="new-password" placeholder={selectedEntry?.apiKeyConfigured ? '已配置；留空则保持不变' : '仅保存时写入'} value={apiKey} onChange={(event) => setApiKey(event.target.value)} disabled={saveConfig.isPending} /></Field>

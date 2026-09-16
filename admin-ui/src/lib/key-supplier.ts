@@ -36,6 +36,7 @@ export function buildSupplierConfigPayload(update: SupplierConfigUpdate): Suppli
     targetUsable: update.targetUsable,
     lowQuotaThreshold: update.lowQuotaThreshold,
     maxUnitPrice: update.maxUnitPrice,
+    purchaseTag: update.purchaseTag ?? '',
   }
 
   const apiKey = update.apiKey?.trim()
@@ -76,7 +77,7 @@ const supplierKindLabels: Record<SupplierKind, string> = {
   'kiro-app': 'kiroapp.cc',
   'kiroapp-io': 'kiroapp.io',
   'kiro-drop': 'Kiro Drop',
-  'kiro-ceo': 'kiro.ceo',
+  'kiro-ceo': 'kiro.ceo / 91kiro',
 }
 
 /** Default base URL per protocol, so operators rarely have to type it. */
@@ -249,6 +250,7 @@ export function emptySupplierEntry(
     lowQuotaThreshold: 0,
     // 0 = 不限价。默认不限，避免新建的供货商因为对方不报价而一个都买不到。
     maxUnitPrice: 0,
+    purchaseTag: '',
   }
 }
 
@@ -283,6 +285,7 @@ export function toSupplierEntryUpdate(entry: SupplierEntryView): SupplierEntryUp
     targetUsable: entry.targetUsable,
     lowQuotaThreshold: entry.lowQuotaThreshold,
     maxUnitPrice: entry.maxUnitPrice,
+    purchaseTag: entry.purchaseTag ?? '',
   }
 }
 

@@ -76,6 +76,7 @@ pub struct KiroCredentials {
     pub auth_method: Option<String>,
 
     /// 身份提供商（BuilderId / Enterprise / Github / Google / IAM_SSO / AzureAD）
+    #[serde(alias = "idp")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
 
@@ -388,7 +389,10 @@ const EXTERNAL_IDP_ALIASES: &[&str] = &[
 ];
 
 pub(crate) fn canonicalize_auth_method_value(value: &str) -> &str {
-    if value.eq_ignore_ascii_case("builder-id") || value.eq_ignore_ascii_case("iam") {
+    if value.eq_ignore_ascii_case("idc")
+        || value.eq_ignore_ascii_case("builder-id")
+        || value.eq_ignore_ascii_case("iam")
+    {
         "idc"
     } else if value.eq_ignore_ascii_case("api_key") || value.eq_ignore_ascii_case("apikey") {
         "api_key"
@@ -1991,6 +1995,7 @@ mod tests {
         // 不误伤其它方式
         assert_eq!(canonicalize_auth_method_value("social"), "social");
         assert_eq!(canonicalize_auth_method_value("builder-id"), "idc");
+        assert_eq!(canonicalize_auth_method_value("IdC"), "idc");
         assert_eq!(canonicalize_auth_method_value("apikey"), "api_key");
     }
 

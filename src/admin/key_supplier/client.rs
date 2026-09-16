@@ -473,7 +473,7 @@ mod tests {
             purchase
                 .keys
                 .iter()
-                .map(SupplierKey::price)
+                .map(SupplierItem::price)
                 .collect::<Vec<_>>(),
             vec![Some(30.0), Some(38.0)]
         );
@@ -1344,6 +1344,147 @@ mod tests {
         }
     }
 
+    #[test]
+    fn oidc_items_from_value_accepts_enterprise_idc_array() {
+        let items = oidc_items_from_value(&serde_json::json!([{
+            "authMethod": "IdC",
+            "provider": "Enterprise",
+            "refreshToken": "rt-enterprise-1",
+            "startUrl": "https://start.example",
+            "clientId": "cid",
+            "clientSecret": "csec",
+            "profileArn": "arn:aws:sso:::profile/p",
+            "apiRegion": "us-east-1"
+        }]));
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            SupplierItem::JsonCredential { value, .. } => {
+                assert_eq!(value["refreshToken"], "rt-enterprise-1");
+                assert_eq!(value["authMethod"], "IdC");
+            }
+            SupplierItem::ApiKey(_) => panic!("enterprise json must not become an api key"),
+        }
+        assert!(oidc_items_from_value(&serde_json::json!([])).is_empty());
+        assert!(oidc_items_from_value(&serde_json::json!({"authMethod":"IdC"})).is_empty());
+    }
+
+    #[tokio::test]
+    async fn kiro_ceo_enterprise_purchase_sends_tag_and_reads_kiro_oidc() {
+        let payload = serde_json::json!({
+            "client_order_id": "0123456789abcdef0123456789abcdef",
+            "purchased": 1,
+            "remaining": 10,
+            "keys": [{"key": ""}],
+            "order_id": "ord-enterprise-1",
+            "kiro_oidc": [{
+                "authMethod": "IdC",
+                "idp": "Enterprise",
+                "refreshToken": "rt-enterprise-1",
+                "startUrl": "https://start.example",
+                "clientId": "cid",
+                "clientSecret": "csec",
+                "profileArn": "arn:aws:sso:::profile/p",
+                "apiRegion": "us-east-1"
+            }],
+            "zone": "us",
+            "unit_price": 22,
+            "total_credits": 22
+        });
+        let app = Router::new().route(
+            "/api/my/purchase",
+            post(move |request: axum::http::Request<axum::body::Body>| {
+                let payload = payload.clone();
+                async move {
+                    let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    let sent: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(sent["tag"], "企业号");
+                    assert_eq!(sent["count"], 1);
+                    axum::Json(payload)
+                }
+            }),
+        );
+        let client =
+            SupplierClient::with_kind(server(app).await, "ceo-secret", SupplierKind::KiroCeo)
+                .unwrap();
+        let purchase = client
+            .purchase_with_context(
+                1,
+                "0123456789abcdef0123456789abcdef",
+                PurchaseContext {
+                    purchase_tag: Some("企业号"),
+                    ..PurchaseContext::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(purchase.purchased, 1);
+        assert_eq!(purchase.keys.len(), 1);
+        match &purchase.keys[0] {
+            SupplierItem::JsonCredential { value, .. } => {
+                assert_eq!(value["refreshToken"], "rt-enterprise-1");
+            }
+            SupplierItem::ApiKey(_) => panic!("enterprise purchase must import oidc json"),
+        }
+    }
+
+    #[tokio::test]
+    async fn kiro_ceo_enterprise_falls_back_to_order_kiro_oidc() {
+        let fetched = Arc::new(Mutex::new(false));
+        let seen_fetch = fetched.clone();
+        let app = Router::new()
+            .route(
+                "/api/my/purchase",
+                post(|| async {
+                    axum::Json(serde_json::json!({
+                        "client_order_id": "0123456789abcdef0123456789abcdef",
+                        "purchased": 1,
+                        "remaining": 8,
+                        "keys": [{"key": ""}],
+                        "order_id": "ord-fallback-1",
+                        "zone": "us"
+                    }))
+                }),
+            )
+            .route(
+                "/api/my/orders/{order_id}/kiro-oidc",
+                get(move |request: axum::http::Request<axum::body::Body>| {
+                    let seen_fetch = seen_fetch.clone();
+                    async move {
+                        assert!(request.uri().path().ends_with("/ord-fallback-1/kiro-oidc"));
+                        *seen_fetch.lock().unwrap() = true;
+                        axum::Json(serde_json::json!([{
+                            "authMethod": "IdC",
+                            "provider": "Enterprise",
+                            "refreshToken": "rt-fallback-1"
+                        }]))
+                    }
+                }),
+            );
+        let client =
+            SupplierClient::with_kind(server(app).await, "ceo-secret", SupplierKind::KiroCeo)
+                .unwrap();
+        let purchase = client
+            .purchase_with_context(
+                1,
+                "0123456789abcdef0123456789abcdef",
+                PurchaseContext {
+                    purchase_tag: Some("企业号"),
+                    ..PurchaseContext::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(*fetched.lock().unwrap());
+        match &purchase.keys[0] {
+            SupplierItem::JsonCredential { value, .. } => {
+                assert_eq!(value["refreshToken"], "rt-fallback-1");
+            }
+            SupplierItem::ApiKey(_) => panic!("fallback must import oidc json"),
+        }
+    }
+
     #[tokio::test]
     async fn kiro_ceo_fixed_us_sends_zone_and_reports_actual_region() {
         let app = Router::new().route(
@@ -1375,6 +1516,7 @@ mod tests {
                     supplier_batch_id: None,
                     requested_region: Some(SupplierRegion::Us),
                     region_source: Some(RegionSource::Request),
+                    purchase_tag: None,
                 },
             )
             .await
@@ -1443,6 +1585,7 @@ mod tests {
                     supplier_batch_id: None,
                     requested_region: Some(SupplierRegion::Eu),
                     region_source: Some(RegionSource::Request),
+                    purchase_tag: None,
                 },
             )
             .await
@@ -1455,6 +1598,7 @@ mod tests {
                     supplier_batch_id: Some("batch-1"),
                     requested_region: Some(SupplierRegion::Eu),
                     region_source: Some(RegionSource::Webhook),
+                    purchase_tag: None,
                 },
             )
             .await
@@ -1879,7 +2023,7 @@ mod tests {
             replayed: false,
             actual_region: None,
             region_source: None,
-            keys: vec![key.clone()],
+            keys: vec![SupplierItem::ApiKey(key.clone())],
         };
         assert!(!format!("{key:?}").contains("ksk_private"));
         assert!(!format!("{purchase:?}").contains("ksk_private"));
@@ -2323,6 +2467,7 @@ impl SupplierClient {
                 supplier_batch_id,
                 requested_region,
                 region_source: requested_region.map(|_| RegionSource::Request),
+                purchase_tag: None,
             },
         )
         .await
@@ -2605,6 +2750,16 @@ impl SupplierClient {
         if let Some(region) = context.requested_region {
             body["zone"] = serde_json::Value::String(region.as_wire().to_owned());
         }
+        let enterprise = context
+            .purchase_tag
+            .is_some_and(is_enterprise_purchase_tag);
+        if let Some(tag) = context
+            .purchase_tag
+            .map(str::trim)
+            .filter(|tag| !tag.is_empty())
+        {
+            body["tag"] = serde_json::Value::String(tag.to_owned());
+        }
         let response: KiroCeoPurchase = self
             .request(
                 Method::POST,
@@ -2623,7 +2778,8 @@ impl SupplierClient {
                 "purchase response purchased exceeds count",
             ));
         }
-        if response.keys.len() != response.purchased as usize {
+        // 企业号 keys[].key 常为空，件数对不上 purchased 是正常的，下面改认 kiro_oidc。
+        if !enterprise && response.keys.len() != response.purchased as usize {
             return Err(SupplierError::invalid(
                 "purchase response key count mismatch",
             ));
@@ -2633,14 +2789,37 @@ impl SupplierClient {
         if response.purchased == 0 {
             return Err(SupplierError::OutOfStock);
         }
+        let supplier_order_id = response.order_id.filter(|id| !id.trim().is_empty());
+        let mut keys = oidc_items_from_value(&response.kiro_oidc);
+        if keys.is_empty() {
+            keys.extend(
+                response
+                    .keys
+                    .iter()
+                    .filter_map(KiroCeoKey::oidc_item),
+            );
+        }
+        if keys.is_empty() && enterprise {
+            if let Some(order_id) = supplier_order_id.as_deref() {
+                keys = self.fetch_delivered_oidc(order_id).await?;
+            }
+        }
+        if keys.is_empty() && !enterprise {
+            keys = accept_paid_keys(response.keys.into_iter().map(|key| (key.into_key(), None)))?;
+        }
+        if keys.is_empty() {
+            return Err(SupplierError::invalid(
+                "purchase response contains no credentials",
+            ));
+        }
         Ok(Purchase {
             client_order_id: client_order_id.to_owned(),
-            purchased: response.purchased,
+            purchased: response.purchased.max(keys.len() as u32),
             remaining: response.remaining,
             // `total_credits` 是本单权威扣费额，`unit_price` 是该区单价。
             points_cost: response.total_credits,
             unit_price: response.unit_price,
-            supplier_order_id: response.order_id.filter(|id| !id.trim().is_empty()),
+            supplier_order_id,
             replayed: response.replayed,
             actual_region: response.zone.or(context.requested_region),
             region_source: if response.zone.is_some() {
@@ -2648,10 +2827,33 @@ impl SupplierClient {
             } else {
                 context.requested_region.and(context.region_source)
             },
-            // 宽松前缀：kiro.ceo 的 key 不是 `ksk_` 前缀，而积分已经扣了。
-            // 按 kiro-rs 的严格校验会把整单已付费的 key 全判无效——钱花了 key 扔了。
-            keys: accept_paid_keys(response.keys.into_iter().map(|key| (key.into_key(), None)))?,
+            keys,
         })
+    }
+
+    /// `reserved_keys_delivered` 配套：钱已扣，拿订单号换企业号 JSON，禁止再 purchase。
+    pub async fn fetch_delivered_oidc(
+        &self,
+        order_id: &str,
+    ) -> Result<Vec<SupplierItem>, SupplierError> {
+        let order_id = order_id.trim();
+        if order_id.is_empty() {
+            return Err(SupplierError::invalid("delivered order_id is empty"));
+        }
+        let path = format!(
+            "/api/my/orders/{}/kiro-oidc",
+            urlencoding::encode(order_id)
+        );
+        let text = self
+            .send(Method::GET, &path, None, RetryPolicy::Retryable)
+            .await?;
+        let value: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|_| SupplierError::invalid("kiro-oidc response is not json"))?;
+        let items = oidc_items_from_value(&value);
+        if items.is_empty() {
+            return Err(SupplierError::invalid("kiro-oidc response contains no credentials"));
+        }
+        Ok(items)
     }
 
     async fn purchase_kiro_rs(
@@ -3104,6 +3306,8 @@ pub struct PurchaseContext<'a> {
     pub supplier_batch_id: Option<&'a str>,
     pub requested_region: Option<SupplierRegion>,
     pub region_source: Option<RegionSource>,
+    /// 91kiro / kiro-market 套餐。`企业号` 时下单带 tag，并按 OIDC JSON 入库。
+    pub purchase_tag: Option<&'a str>,
 }
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -3218,6 +3422,63 @@ impl fmt::Debug for SupplierKey {
     }
 }
 
+/// 采购/补拉交来的一件货：`ksk_` 或企业号 OIDC JSON。
+#[derive(Clone, PartialEq)]
+pub enum SupplierItem {
+    ApiKey(SupplierKey),
+    JsonCredential {
+        value: serde_json::Value,
+        price: Option<f64>,
+    },
+}
+
+impl SupplierItem {
+    pub fn price(&self) -> Option<f64> {
+        match self {
+            Self::ApiKey(key) => key.price(),
+            Self::JsonCredential { price, .. } => *price,
+        }
+    }
+}
+
+impl fmt::Debug for SupplierItem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+pub fn is_enterprise_purchase_tag(tag: &str) -> bool {
+    tag.trim() == "企业号"
+}
+
+pub fn oidc_items_from_value(value: &serde_json::Value) -> Vec<SupplierItem> {
+    match value {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(json_credential_item)
+            .collect(),
+        other => json_credential_item(other).into_iter().collect(),
+    }
+}
+
+fn json_credential_item(value: &serde_json::Value) -> Option<SupplierItem> {
+    let object = value.as_object()?;
+    let token = object
+        .get("refreshToken")
+        .or_else(|| object.get("refresh_token"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())?;
+    let _ = token;
+    Some(SupplierItem::JsonCredential {
+        value: value.clone(),
+        price: object
+            .get("price")
+            .or_else(|| object.get("paid"))
+            .and_then(serde_json::Value::as_f64),
+    })
+}
+
 #[derive(Clone, PartialEq)]
 pub struct Purchase {
     pub client_order_id: String,
@@ -3235,7 +3496,7 @@ pub struct Purchase {
     pub replayed: bool,
     pub actual_region: Option<SupplierRegion>,
     pub region_source: Option<RegionSource>,
-    pub keys: Vec<SupplierKey>,
+    pub keys: Vec<SupplierItem>,
 }
 
 impl fmt::Debug for Purchase {
@@ -3446,15 +3707,29 @@ fn pick_kiro_ceo_zone(zones: &[KiroCeoZone]) -> Option<&KiroCeoZone> {
 enum KiroCeoKey {
     /// 文档描述的形状。
     Plain(String),
-    /// 线上实际形状。只取 `key`；账号密码等字段由后续凭据导入自行处理。
-    Detailed { key: String },
+    /// 线上实际形状。API Key 看 `key`；企业号看 `oidc`。
+    Detailed {
+        #[serde(default)]
+        key: String,
+        #[serde(default)]
+        oidc: Option<serde_json::Value>,
+    },
 }
 
 impl KiroCeoKey {
     fn into_key(self) -> String {
         match self {
             Self::Plain(key) => key,
-            Self::Detailed { key } => key,
+            Self::Detailed { key, .. } => key,
+        }
+    }
+
+    fn oidc_item(&self) -> Option<SupplierItem> {
+        match self {
+            Self::Detailed {
+                oidc: Some(value), ..
+            } => json_credential_item(value),
+            _ => None,
         }
     }
 }
@@ -3485,6 +3760,9 @@ struct KiroCeoPurchase {
     replayed: bool,
     #[serde(default)]
     zone: Option<SupplierRegion>,
+    /// 企业号通用 JSON 数组。`keys[].key` 为空时看这个。
+    #[serde(default)]
+    kiro_oidc: serde_json::Value,
 }
 
 /// `GET /api/me/stock` → `{stock, price, price_min, price_max, balance}`。
@@ -3585,7 +3863,7 @@ fn error_type(body: &str) -> Option<String> {
 /// 严格校验：必须是 `ksk_` 前缀。用于 kiro-rs——它的响应格式已验证过。
 fn validate_keys(
     keys: impl IntoIterator<Item = (String, Option<f64>)>,
-) -> Result<Vec<SupplierKey>, SupplierError> {
+) -> Result<Vec<SupplierItem>, SupplierError> {
     keys.into_iter()
         .map(|(key, price)| {
             let key = key.trim().to_owned();
@@ -3594,7 +3872,7 @@ fn validate_keys(
                     "purchase response contains an invalid key",
                 ))
             } else {
-                Ok(SupplierKey { key, price })
+                Ok(SupplierItem::ApiKey(SupplierKey { key, price }))
             }
         })
         .collect()
@@ -3608,7 +3886,7 @@ fn validate_keys(
 /// 不能拿前缀当硬门槛——真正的有效性由后续凭据导入去判。
 fn accept_paid_keys(
     keys: impl IntoIterator<Item = (String, Option<f64>)>,
-) -> Result<Vec<SupplierKey>, SupplierError> {
+) -> Result<Vec<SupplierItem>, SupplierError> {
     let mut accepted = Vec::new();
     let mut unexpected_prefix = 0_usize;
     for (key, price) in keys {
@@ -3619,7 +3897,7 @@ fn accept_paid_keys(
         if !key.starts_with("ksk_") {
             unexpected_prefix += 1;
         }
-        accepted.push(SupplierKey { key, price });
+        accepted.push(SupplierItem::ApiKey(SupplierKey { key, price }));
     }
     if unexpected_prefix > 0 {
         // 只报个数，绝不打 key 本身。

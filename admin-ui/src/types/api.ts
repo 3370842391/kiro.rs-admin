@@ -1723,6 +1723,8 @@ export interface SupplierConfigView {
   webhookTokenConfigured: boolean
   /** HMAC signing key for `X-Kiro-Signature`. Blank means signatures are not checked. */
   webhookSecretConfigured: boolean
+  /** 91kiro / kiro-market 套餐。空 = API Key；`企业号` 走 OIDC JSON。 */
+  purchaseTag: string
 }
 
 /** Secrets are write-only and are never present in SupplierConfigView. */
@@ -1763,6 +1765,8 @@ export interface SupplierConfigUpdate {
   lowQuotaThreshold: number
   /** Skip auto-purchase above this unit price, in the vendor's own unit. 0 = no cap. */
   maxUnitPrice: number
+  /** 91kiro / kiro-market 套餐。空 = API Key；`企业号` 走 OIDC JSON。 */
+  purchaseTag: string
   apiKey?: string
   webhookToken?: string
   webhookSecret?: string
