@@ -19,6 +19,7 @@ use crate::kiro::image_budget::{
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
+use crate::kiro::token_manager::PoolUnavailableError;
 use crate::token;
 use anyhow::Error;
 use axum::{
@@ -620,13 +621,16 @@ fn record_strict_json_recovery(tracer: &RequestTracer, attempts: usize) {
     }
 }
 
-/// 从 provider 错误文本识别「请求根本没出站」的确定性终态。
+/// 从 provider 的可信错误类型（兼容旧错误文本）识别无可用候选等确定性终态。
 ///
 /// 这两类失败没有 attempt 可归类，此前一路落成 `unknown`，于是绕过了
 /// [`is_routine_trace_only_error`](super::error_snapshot) 的快照白名单：线上因此
 /// 攒下 3.1 GB 全是这两类的请求体快照，而它们的请求体对结论毫无帮助——一个是
 /// 号池空了，一个是没账号提供该模型，都跟请求内容无关。
 fn terminal_provider_outcome(err: &Error) -> Option<&'static str> {
+    if err.downcast_ref::<PoolUnavailableError>().is_some() {
+        return Some(outcome::NO_AVAILABLE_CREDENTIALS);
+    }
     let text = err.to_string();
     if text.contains("所有凭据均已禁用") {
         return Some(outcome::NO_AVAILABLE_CREDENTIALS);
@@ -742,17 +746,25 @@ struct ClassifiedProviderError {
 /// 号池耗尽时回给客户端的文案。也用作日志节流的判定键——它是这条链路上唯一
 /// 稳定可比的标识，`StreamStartFailure` 传到日志点时原始错误已经丢了。
 const POOL_EXHAUSTED_MESSAGE: &str =
-    "No upstream account is currently available. All credentials are disabled, throttled, or out of quota.";
+    "No upstream account is currently available. Please retry later.";
 
 /// 号池耗尽是运营状态不是缺陷，按请求刷 ERROR 会把真正的问题淹掉
 /// （线上 720 小时里它自己就刷了 6.2 万条）。首条与之后每 60 秒各记一条，
 /// 带上期间被压掉的条数；其余降到 DEBUG。
-fn log_pool_exhausted(err: &dyn std::fmt::Display) {
+fn log_pool_exhausted(
+    err: &dyn std::fmt::Display,
+    availability: Option<&PoolUnavailableError>,
+) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static LAST_LOGGED_SECS: AtomicU64 = AtomicU64::new(0);
     static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
     const INTERVAL_SECS: u64 = 60;
 
+    // anyhow 的外层 context 可能遮住快照；日志优先保留可信的锁内计数。
+    let diagnostic: &dyn std::fmt::Display = match availability {
+        Some(availability) => availability,
+        None => err,
+    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -764,11 +776,11 @@ fn log_pool_exhausted(err: &dyn std::fmt::Display) {
             .is_err()
     {
         SUPPRESSED.fetch_add(1, Ordering::Relaxed);
-        tracing::debug!(error = %err, "号池耗尽（已节流）");
+        tracing::debug!(error = %diagnostic, "无可调度凭据（已节流）");
         return;
     }
     let suppressed = SUPPRESSED.swap(0, Ordering::Relaxed);
-    tracing::error!(error = %err, suppressed, "号池耗尽：没有可用凭据");
+    tracing::error!(error = %diagnostic, suppressed, "无可调度凭据");
 }
 
 fn classify_provider_error(err: &Error) -> ClassifiedProviderError {
@@ -780,7 +792,9 @@ fn classify_provider_error(err: &Error) -> ClassifiedProviderError {
         };
     }
     let text = err.to_string();
-    if text.contains("所有凭据均已禁用") {
+    if err.downcast_ref::<PoolUnavailableError>().is_some()
+        || text.contains("所有凭据均已禁用")
+    {
         // 503 而不是笼统的 502：区别在于「上游挂了」还是「我们这边没号了」，
         // 客户端据此决定是重试还是告警，此前一律 502 分不出来。
         return ClassifiedProviderError {
@@ -890,7 +904,7 @@ fn map_provider_error_for_turns(err: Error, conversation_turn_count: usize) -> R
     if classified.http_status.is_client_error() {
         tracing::warn!(error = %err, "上游拒绝了客户端请求");
     } else if classified.public_message == POOL_EXHAUSTED_MESSAGE {
-        log_pool_exhausted(&err);
+        log_pool_exhausted(&err, err.downcast_ref::<PoolUnavailableError>());
     } else {
         tracing::error!(error = %err, "Kiro API 调用失败");
     }
@@ -3439,7 +3453,7 @@ fn stream_start_failure_response(failure: StreamStartFailure) -> Response {
     if failure.status.is_client_error() {
         tracing::warn!(error_type = %failure.error_type, message = %failure.message, "流式请求在发送响应前失败");
     } else if failure.message == POOL_EXHAUSTED_MESSAGE {
-        log_pool_exhausted(&failure.message);
+        log_pool_exhausted(&failure.message, None);
     } else {
         tracing::error!(error_type = %failure.error_type, message = %failure.message, "上游未产生可交付的助手内容");
     }
@@ -7912,6 +7926,115 @@ mod tests {
             terminal_provider_outcome(&err),
             Some(outcome::NO_AVAILABLE_CREDENTIALS)
         );
+    }
+
+    async fn busy_pool_error() -> Error {
+        let credential = crate::kiro::model::credentials::KiroCredentials {
+            access_token: Some("private-token".into()),
+            expires_at: Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+            groups: vec!["private-group".into()],
+            max_concurrency: 1,
+            ..Default::default()
+        };
+        let manager = Arc::new(
+            crate::kiro::token_manager::MultiTokenManager::new(
+                crate::model::config::Config::default(),
+                vec![credential],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        let ctx = manager
+            .acquire_context(None, Some("private-group"))
+            .await
+            .unwrap();
+        let _guard = manager.in_flight_guard(ctx.id);
+        manager
+            .acquire_context(None, Some("private-group"))
+            .await
+            .err()
+            .unwrap()
+            .context("outer request failed with private-token for private-group")
+    }
+
+    #[tokio::test]
+    async fn pool_unavailable_http_and_trace_preserve_typed_cause() {
+        let error = busy_pool_error().await;
+        let (tracer, _snapshots, trace_store) =
+            test_request_tracer_with_snapshot("pool-unavailable", false);
+        let outcome = provider_failure_outcome(&tracer, &error);
+        assert_eq!(outcome, Some(outcome::NO_AVAILABLE_CREDENTIALS));
+        tracer.finalize(
+            "error",
+            outcome,
+            Some(&error.to_string()),
+            None,
+            TraceUsage::zero(),
+        );
+        let records = trace_store.query_paged(&crate::admin::trace_db::TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(
+            records.0[0].error_type.as_deref(),
+            Some(outcome::NO_AVAILABLE_CREDENTIALS)
+        );
+
+        let response = map_provider_error(error);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), 16_384)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "api_error");
+        assert_eq!(
+            body["error"]["message"],
+            "No upstream account is currently available. Please retry later."
+        );
+        assert!(!body.to_string().contains("private-"));
+    }
+
+    #[tokio::test]
+    async fn pool_unavailable_prepared_stream_and_early_sse_use_safe_message() {
+        let error = busy_pool_error().await;
+        let classified = classify_provider_error(&error);
+        let response = stream_start_failure_response(StreamStartFailure {
+            status: classified.http_status,
+            error_type: classified.error_type.into(),
+            message: classified.public_message.into(),
+        });
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let stream = early_error_test_stream(error, None);
+        futures::pin_mut!(stream);
+        assert_eq!(
+            stream.next().await.unwrap().unwrap(),
+            Bytes::from_static(EARLY_CONNECTED_SSE)
+        );
+        let event = stream.next().await.unwrap().unwrap();
+        let text = String::from_utf8(event.to_vec()).unwrap();
+        assert!(text.contains("\"type\":\"api_error\""));
+        assert!(text.contains("No upstream account is currently available. Please retry later."));
+        assert!(!text.contains("private-"));
+        assert!(!text.contains("总数"));
+        assert!(!text.contains("message_start"));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn pool_unavailable_diagnostic_text_is_not_a_trusted_error() {
+        let error = busy_pool_error().await;
+        let copied_text = error
+            .downcast_ref::<PoolUnavailableError>()
+            .unwrap()
+            .to_string();
+        let untrusted_error = anyhow::anyhow!(copied_text);
+        assert_eq!(
+            classify_provider_error(&untrusted_error).http_status,
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(terminal_provider_outcome(&untrusted_error), None);
     }
 
     #[test]

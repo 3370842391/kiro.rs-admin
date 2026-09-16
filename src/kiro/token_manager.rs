@@ -1101,6 +1101,70 @@ pub(crate) async fn set_user_preference(
 // 多凭据 Token 管理器
 // ============================================================================
 
+/// 选号失败时、在 entries 锁内取得的请求范围快照。
+///
+/// total/enabled 使用与调度相同的分组和模型过滤。其余计数仅统计启用账号，
+/// 各原因独立计数，允许重叠；请求排除不能遮盖并发/RPM/冷却状态。
+/// 不保存账号、分组或模型标识，公开响应通过错误类型映射到固定文案。
+#[derive(Debug, Default)]
+pub(crate) struct PoolUnavailableError {
+    total: usize,
+    enabled: usize,
+    concurrency_limited: usize,
+    rpm_limited: usize,
+    cooling: usize,
+    request_excluded: usize,
+}
+
+impl PoolUnavailableError {
+    fn from_entries(
+        entries: &[CredentialEntry],
+        model: Option<&str>,
+        group: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+    ) -> Self {
+        let now = Instant::now();
+        let mut snapshot = Self::default();
+        for entry in entries
+            .iter()
+            .filter(|entry| credential_matches_request(&entry.credentials, model, group))
+        {
+            snapshot.total += 1;
+            if entry.disabled {
+                continue;
+            }
+            snapshot.enabled += 1;
+            snapshot.concurrency_limited += usize::from(is_concurrency_exceeded(entry));
+            snapshot.rpm_limited += usize::from(is_rpm_exceeded(entry, now));
+            snapshot.cooling += usize::from(is_cooling(entry, now));
+            snapshot.request_excluded += usize::from(excluded_ids.contains(&entry.id));
+        }
+        snapshot
+    }
+}
+
+impl fmt::Display for PoolUnavailableError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let reason = if self.total > 0 && self.enabled == 0 {
+            "所有凭据均已禁用"
+        } else {
+            "无可调度凭据"
+        };
+        write!(
+            f,
+            "{reason}（总数: {}, 启用: {}, 并发已满: {}, RPM已满: {}, 冷却: {}, 请求排除: {}）",
+            self.total,
+            self.enabled,
+            self.concurrency_limited,
+            self.rpm_limited,
+            self.cooling,
+            self.request_excluded,
+        )
+    }
+}
+
+impl std::error::Error for PoolUnavailableError {}
+
 /// 单个凭据条目的状态
 struct CredentialEntry {
     /// 凭据唯一 ID
@@ -2603,14 +2667,15 @@ impl MultiTokenManager {
                 }
 
                 let Some((id, credentials)) = best else {
-                    let available = entries.iter().filter(|e| !e.disabled).count();
+                    let unavailable =
+                        PoolUnavailableError::from_entries(&entries, model, group, excluded_ids);
                     drop(entries);
                     if recovered {
                         if let Err(error) = self.persist_credentials() {
                             tracing::warn!(%error, "自动禁用自愈状态持久化失败");
                         }
                     }
-                    anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
+                    return Err(unavailable.into());
                 };
                 // 选号和预约不可分离：其他 acquire 必须立即看到这次占用，
                 // 即使本请求随后还需要等待 Token 刷新。
@@ -9103,6 +9168,176 @@ mod tests {
         assert_eq!(entry.recent_requests, recent_requests_before);
         assert_eq!(entry.in_flight, 4);
         assert!(is_rpm_exceeded(entry, Instant::now()));
+    }
+
+    #[tokio::test]
+    async fn pool_unavailable_reports_enabled_credentials_at_capacity() {
+        let mut credentials = Vec::new();
+        for id in 0..9 {
+            let mut credential = grouped_cred("ready-token", &["busy-group"]);
+            credential.max_concurrency = 1;
+            credential.disabled = id >= 2;
+            credentials.push(credential);
+        }
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), credentials, None, None, false).unwrap(),
+        );
+        let mut guards = Vec::new();
+        for _ in 0..2 {
+            let ctx = manager
+                .acquire_context(None, Some("busy-group"))
+                .await
+                .unwrap();
+            guards.push(manager.in_flight_guard(ctx.id));
+        }
+
+        let error = manager
+            .acquire_context(None, Some("busy-group"))
+            .await
+            .err()
+            .unwrap();
+        let unavailable = error
+            .downcast_ref::<PoolUnavailableError>()
+            .expect("可信号池错误类型");
+        assert_eq!(
+            (
+                unavailable.total,
+                unavailable.enabled,
+                unavailable.concurrency_limited
+            ),
+            (9, 2, 2)
+        );
+        let message = error.to_string();
+        assert!(
+            !message.contains("所有凭据均已禁用"),
+            "启用但满载不能报全部禁用: {message}"
+        );
+        assert!(message.contains("总数: 9, 启用: 2"), "{message}");
+        assert!(message.contains("并发已满: 2"), "{message}");
+        assert!(!message.contains("busy-group"));
+        drop(guards);
+        assert!(
+            manager
+                .acquire_context(None, Some("busy-group"))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_unavailable_empty_group_does_not_count_other_groups() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("ready-token", &["other"])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let error = manager
+            .acquire_context(None, Some("missing"))
+            .await
+            .err()
+            .unwrap();
+        let unavailable = error
+            .downcast_ref::<PoolUnavailableError>()
+            .expect("可信号池错误类型");
+        assert_eq!((unavailable.total, unavailable.enabled), (0, 0));
+        let message = error.to_string();
+        assert!(message.contains("总数: 0, 启用: 0"), "{message}");
+        assert!(!message.contains("所有凭据均已禁用"), "空组不能报全部禁用");
+        assert!(manager.acquire_context(None, Some("other")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn pool_unavailable_counts_only_matching_models() {
+        let mut free = grouped_cred("free-token", &["model-group"]);
+        free.subscription_title = Some("FREE".into());
+        let mut paid = grouped_cred("paid-token", &["model-group"]);
+        paid.subscription_title = Some("PRO".into());
+        paid.disabled = true;
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![free, paid, grouped_cred("outside", &["other"])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let error = manager
+            .acquire_context(Some("claude-opus-4-6"), Some("model-group"))
+            .await
+            .err()
+            .unwrap();
+        let unavailable = error
+            .downcast_ref::<PoolUnavailableError>()
+            .expect("可信号池错误类型");
+        assert_eq!((unavailable.total, unavailable.enabled), (1, 0));
+        let message = error.to_string();
+        assert!(message.contains("总数: 1, 启用: 0"), "{message}");
+        assert!(
+            message.contains("所有凭据均已禁用"),
+            "匹配范围内确实全部禁用: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_unavailable_counts_overlapping_limits_even_when_excluded() {
+        let mut credential = grouped_cred("ready-token", &[]);
+        credential.max_concurrency = 1;
+        credential.rpm_limit = 1;
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap(),
+        );
+        let ctx = manager.acquire_context(None, None).await.unwrap();
+        let _guard = manager.in_flight_guard(ctx.id);
+        manager.record_request(ctx.id);
+        {
+            let mut entries = manager.entries.lock();
+            let until = Some(Instant::now() + StdDuration::from_secs(60));
+            entries[0].throttled_until = until;
+            entries[0].rate_limited_until = until;
+            entries[0].quarantined_until = until;
+        }
+        let error = manager
+            .acquire_context_excluding(None, None, &HashSet::from([ctx.id]))
+            .await
+            .err()
+            .unwrap();
+        let unavailable = error
+            .downcast_ref::<PoolUnavailableError>()
+            .expect("可信号池错误类型");
+        assert_eq!(
+            (
+                unavailable.concurrency_limited,
+                unavailable.rpm_limited,
+                unavailable.cooling,
+                unavailable.request_excluded
+            ),
+            (1, 1, 1, 1)
+        );
+        let message = error.to_string();
+        assert!(message.contains("总数: 1, 启用: 1"), "{message}");
+        for count in ["并发已满: 1", "RPM已满: 1", "冷却: 1", "请求排除: 1"] {
+            assert!(message.contains(count), "排除不能遮盖其他原因: {message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pool_unavailable_refresh_failure_keeps_legacy_terminal_error() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        // 缺少刷新 Token：本地校验失败直至真正全部禁用，不触发网络。
+        let error = manager.acquire_context(None, None).await.err().unwrap();
+        assert!(error.downcast_ref::<PoolUnavailableError>().is_none());
+        assert_eq!(error.to_string(), "所有凭据均已禁用（0/1）");
+        assert_eq!(manager.available_count(), 0);
     }
 
     #[tokio::test]
