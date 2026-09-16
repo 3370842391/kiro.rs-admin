@@ -504,6 +504,8 @@ pub async fn handle_websearch_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
     input_tokens: i32,
+    sink: Option<&dyn crate::admin::trace_db::TraceSink>,
+    group: Option<&str>,
 ) -> Response {
     // 1. 提取搜索查询
     let query = match extract_search_query(payload) {
@@ -526,11 +528,11 @@ pub async fn handle_websearch_request(
     let (tool_use_id, mcp_request) = create_mcp_request(&query);
 
     // 3. 调用 Kiro MCP API
-    let search_results = match call_mcp_api(&provider, &mcp_request).await {
+    let search_results = match call_mcp_api(&provider, &mcp_request, sink, group).await {
         Ok(response) => parse_search_results(&response),
         Err(e) => {
             tracing::warn!("MCP API 调用失败: {}", e);
-            None
+            return super::handlers::map_provider_error(e);
         }
     };
 
@@ -546,14 +548,16 @@ pub async fn handle_websearch_request(
 pub(crate) async fn call_mcp_api(
     provider: &crate::kiro::provider::KiroProvider,
     request: &McpRequest,
+    sink: Option<&dyn crate::admin::trace_db::TraceSink>,
+    group: Option<&str>,
 ) -> anyhow::Result<McpResponse> {
     let request_body = serde_json::to_string(request)?;
 
     tracing::debug!("MCP request: {}", request_body);
 
-    let response = provider.call_mcp(&request_body).await?;
+    let response = provider.call_mcp_traced(&request_body, sink, group).await?;
 
-    let body = response.text().await?;
+    let body = String::from_utf8(response.collect_bytes().await?.to_vec())?;
     tracing::debug!("MCP response: {}", body);
 
     let mcp_response: McpResponse = serde_json::from_str(&body)?;

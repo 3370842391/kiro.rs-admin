@@ -32,7 +32,12 @@ use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::kiro::region::{
     API_KEY_AUTH_REGION, KiroService, data_plane_host, rest_region_candidates, validate_api_region,
 };
-use crate::model::config::{Config, EndpointMode, RateLimitBucketMode, RetryMode, RetryPolicy};
+use crate::model::config::{
+    Config, EndpointMode, EnterpriseRetrySettings, RateLimitBucketMode, RetryMode, RetryPolicy,
+};
+
+mod enterprise_pacing;
+pub(crate) use enterprise_pacing::EnterpriseSendWaitTimeout;
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -1144,6 +1149,8 @@ struct CredentialEntry {
     /// 最近 60 秒内普通/账号级 429 时间戳。粘滞用：号已经在打 429，就不要再钉它。
     /// 不持久化，进程重启清空。
     recent_429s: VecDeque<Instant>,
+    /// 企业生成/MCP/换端点共用的真实发送节奏，随账号删除回收。
+    enterprise_pacing: enterprise_pacing::EnterprisePacing,
     /// 流式首字节延迟 EWMA，仅保存在进程内用于调度。
     first_byte_ewma_ms: Option<f64>,
 }
@@ -1540,12 +1547,14 @@ pub struct MultiTokenManager {
     rate_limit_bucket_mode: Mutex<RateLimitBucketMode>,
     /// 同端点最多尝试次数（含首次）。
     same_endpoint_attempts: AtomicU32,
-    /// 企业号专项 429： lone enterprise pool 时不暂避、继续同号退避。
+    /// 企业号专项：有空位的企业号优先；429 钉死本号轮询启用端点；用尽后改打个人号。
     enterprise_special_handling: AtomicBool,
-    /// 企业号未钉端点时的首跳协议（默认 ide = q）。
+    /// 企业号启用端点列表的轮询起点（默认 ide = q）。
     enterprise_default_endpoint: Mutex<String>,
-    /// 企业号专项钉死后的最大轮数。
+    /// 最大真实企业发送次数（含首次），同时受单请求备用尝试上限和总等待限制。
     enterprise_max_retries: AtomicU32,
+    /// 企业速打端点与超时配置；每条入站请求读取独立快照。
+    enterprise_retry: Mutex<EnterpriseRetrySettings>,
     /// 会话到凭据的短期粘性，仅在默认最好模式使用，不写入凭据文件。
     /// 只在上游 200 之后写入；429 / RPM 将满 / 账号不可用时松开。
     session_affinity: Mutex<HashMap<String, SessionAffinity>>,
@@ -1635,12 +1644,30 @@ pub struct InFlightGuard {
     id: u64,
 }
 
+/// Token 准备期间持有预约；成功后移交给调用方创建的 InFlightGuard。
+/// acquire future 被取消或刷新失败时自动归还，不要求调用方已经拿到上下文。
+struct InFlightReservation<'a> {
+    manager: &'a MultiTokenManager,
+    id: Option<u64>,
+}
+
+impl InFlightReservation<'_> {
+    fn hand_off(mut self) {
+        self.id = None;
+    }
+}
+
+impl Drop for InFlightReservation<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.id {
+            self.manager.release_in_flight(id);
+        }
+    }
+}
+
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        let mut entries = self.manager.entries.lock();
-        if let Some(e) = entries.iter_mut().find(|e| e.id == self.id) {
-            e.in_flight = e.in_flight.saturating_sub(1);
-        }
+        self.manager.release_in_flight(self.id);
     }
 }
 
@@ -1847,6 +1874,7 @@ impl MultiTokenManager {
                     in_flight: 0,
                     recent_requests: VecDeque::new(),
                     recent_429s: VecDeque::new(),
+                    enterprise_pacing: Default::default(),
                     first_byte_ewma_ms: None,
                 }
             })
@@ -1922,6 +1950,7 @@ impl MultiTokenManager {
         let enterprise_special_handling = config.enterprise_special_handling;
         let enterprise_default_endpoint = config.enterprise_default_endpoint.clone();
         let enterprise_max_retries = config.enterprise_max_retries.max(1);
+        let enterprise_retry = config.enterprise_retry.clone();
         let max_bucket_attempts = config.max_bucket_attempts_per_request;
         let stream_idle_timeout_secs = config.stream_idle_timeout_secs;
         let auto_continue_enabled = config.auto_continue_enabled;
@@ -1971,6 +2000,7 @@ impl MultiTokenManager {
             enterprise_special_handling: AtomicBool::new(enterprise_special_handling),
             enterprise_default_endpoint: Mutex::new(enterprise_default_endpoint),
             enterprise_max_retries: AtomicU32::new(enterprise_max_retries),
+            enterprise_retry: Mutex::new(enterprise_retry),
             session_affinity: Mutex::new(HashMap::new()),
             max_bucket_attempts_per_request: AtomicUsize::new(max_bucket_attempts),
             stream_idle_timeout_secs: AtomicU64::new(stream_idle_timeout_secs),
@@ -2136,8 +2166,9 @@ impl MultiTokenManager {
         }
     }
 
-    fn affinity_credential(
+    fn affinity_credential_from_entries(
         &self,
+        entries: &[CredentialEntry],
         key: &str,
         model: Option<&str>,
         group: Option<&str>,
@@ -2153,7 +2184,6 @@ impl MultiTokenManager {
             return None;
         }
 
-        let entries = self.entries.lock();
         let entry = entries.iter().find(|entry| {
             entry.id == candidate.credential_id
                 && !excluded_ids.contains(&entry.id)
@@ -2240,15 +2270,40 @@ impl MultiTokenManager {
         excluded_ids: &HashSet<u64>,
         affinity_key: Option<&str>,
     ) -> Option<(u64, KiroCredentials)> {
+        let entries = self.entries.lock();
+        self.select_next_credential_from_entries(&entries, model, group, excluded_ids, affinity_key)
+    }
+
+    /// 调用方持有 entries 锁，使选号结果可在同一临界区内预约。
+    fn select_next_credential_from_entries(
+        &self,
+        entries: &[CredentialEntry],
+        model: Option<&str>,
+        group: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+        affinity_key: Option<&str>,
+    ) -> Option<(u64, KiroCredentials)> {
         if self.get_endpoint_mode() == EndpointMode::Best {
             if let Some(key) = affinity_key {
-                if let Some(hit) = self.affinity_credential(key, model, group, excluded_ids) {
-                    return Some(hit);
+                if let Some(hit) =
+                    self.affinity_credential_from_entries(entries, key, model, group, excluded_ids)
+                {
+                    // 企业号专项：有空位的企业号时，不把会话粘在个人号上。
+                    let stick_to_personal = self.enterprise_special_handling_enabled()
+                        && !hit.1.is_enterprise_credential()
+                        && self.has_available_enterprise_from_entries(
+                            entries,
+                            model,
+                            group,
+                            excluded_ids,
+                        );
+                    if !stick_to_personal {
+                        return Some(hit);
+                    }
                 }
             }
         }
 
-        let entries = self.entries.lock();
         let now = Instant::now();
 
         // 过滤可用凭据
@@ -2285,7 +2340,26 @@ impl MultiTokenManager {
             return None;
         }
 
+        // 企业号专项：有 RPM 空位的企业号永远压过个人号。least_conn 不会因为
+        // 个人号 in-flight=0 就把流量先喂给兜底池。企业号 RPM 打满后 available
+        // 里只剩个人号，自然切兜底——这是预期，不是 bug。
+        let available = if self.enterprise_special_handling_enabled() {
+            let enterprise: Vec<_> = available
+                .iter()
+                .copied()
+                .filter(|entry| entry.credentials.is_enterprise_credential())
+                .collect();
+            if enterprise.is_empty() {
+                available
+            } else {
+                enterprise
+            }
+        } else {
+            available
+        };
+
         // Best：有更凉快的号就别再打 429 过密 / RPM 将满的号。全池都热才回退，避免选不出号。
+        // 只在当前这一层里挑凉快的，不会因为企业号「快满」就掉到个人号。
         let cool: Vec<_> = available
             .iter()
             .copied()
@@ -2381,6 +2455,38 @@ impl MultiTokenManager {
         })
     }
 
+    fn has_available_enterprise_from_entries(
+        &self,
+        entries: &[CredentialEntry],
+        model: Option<&str>,
+        group: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+    ) -> bool {
+        let now = Instant::now();
+        entries.iter().any(|e| {
+            e.credentials.is_enterprise_credential()
+                && !excluded_ids.contains(&e.id)
+                && !e.disabled
+                && !is_cooling(e, now)
+                && credential_matches_request(&e.credentials, model, group)
+                && !is_rpm_exceeded(e, now)
+                && !is_concurrency_exceeded(e)
+        })
+    }
+
+    pub fn enterprise_credential_ids(&self) -> Vec<u64> {
+        self.entries
+            .lock()
+            .iter()
+            .filter(|entry| entry.credentials.is_enterprise_credential())
+            .map(|entry| entry.id)
+            .collect()
+    }
+
+    pub(crate) fn has_available_enterprise(&self, model: Option<&str>, group: Option<&str>, excluded: &HashSet<u64>) -> bool {
+        self.has_available_enterprise_from_entries(&self.entries.lock(), model, group, excluded)
+    }
+
     /// 获取 API 调用上下文
     ///
     /// 返回绑定了 id、credentials 和 token 的调用上下文
@@ -2430,24 +2536,17 @@ impl MultiTokenManager {
                 );
             }
 
-            let (id, credentials) = {
+            let (id, credentials, recovered) = {
+                let mut entries = self.entries.lock();
                 // priority 模式固定 current_id；balanced / least_conn 每次重新选择
                 let re_select_each_request = self.get_endpoint_mode() == EndpointMode::Best
                     || self.load_balancing_mode.lock().as_str() != "priority";
 
                 // 非 priority 模式：每次请求都重新选择，不固定 current_id
                 // priority 模式：优先使用 current_id 指向的凭据
-                let affinity_hit = if self.get_endpoint_mode() == EndpointMode::Best {
-                    affinity_key
-                        .and_then(|key| self.affinity_credential(key, model, group, excluded_ids))
-                } else {
-                    None
-                };
-
-                let current_hit = if re_select_each_request || affinity_hit.is_some() {
+                let current_hit = if re_select_each_request {
                     None
                 } else {
-                    let entries = self.entries.lock();
                     let current_id = *self.current_id.lock();
                     let now = Instant::now();
                     entries
@@ -2464,76 +2563,83 @@ impl MultiTokenManager {
                         .map(|e| (e.id, e.credentials.clone()))
                 };
 
-                if let Some(hit) = affinity_hit.or(current_hit) {
-                    hit
-                } else {
-                    // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential_with_affinity(
+                let mut best = current_hit.or_else(|| {
+                    self.select_next_credential_from_entries(
+                        &entries,
+                        model,
+                        group,
+                        excluded_ids,
+                        affinity_key,
+                    )
+                });
+                let mut recovered = false;
+
+                // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈。
+                if best.is_none()
+                    && entries.iter().any(|e| {
+                        e.disabled
+                            && e.credentials.disable_reason == Some(DisabledReason::TooManyFailures)
+                    })
+                {
+                    tracing::warn!(
+                        "所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（等价于重启）"
+                    );
+                    for e in entries.iter_mut() {
+                        if e.credentials.disable_reason == Some(DisabledReason::TooManyFailures) {
+                            e.disabled = false;
+                            e.credentials.disabled = false;
+                            e.credentials.disable_reason = None;
+                            e.failure_count = 0;
+                        }
+                    }
+                    recovered = true;
+                    best = self.select_next_credential_from_entries(
+                        &entries,
                         model,
                         group,
                         excluded_ids,
                         affinity_key,
                     );
+                }
 
-                    // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
-                    if best.is_none() {
-                        let mut entries = self.entries.lock();
-                        if entries.iter().any(|e| {
-                            e.disabled
-                                && e.credentials.disable_reason
-                                    == Some(DisabledReason::TooManyFailures)
-                        }) {
-                            tracing::warn!(
-                                "所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（等价于重启）"
-                            );
-                            for e in entries.iter_mut() {
-                                if e.credentials.disable_reason
-                                    == Some(DisabledReason::TooManyFailures)
-                                {
-                                    e.disabled = false;
-                                    e.credentials.disabled = false;
-                                    e.credentials.disable_reason = None;
-                                    e.failure_count = 0;
-                                }
-                            }
-                            drop(entries);
-                            if let Err(error) = self.persist_credentials() {
-                                tracing::warn!(%error, "自动禁用自愈状态持久化失败");
-                            }
-                            best = self.select_next_credential_with_affinity(
-                                model,
-                                group,
-                                excluded_ids,
-                                affinity_key,
-                            );
+                let Some((id, credentials)) = best else {
+                    let available = entries.iter().filter(|e| !e.disabled).count();
+                    drop(entries);
+                    if recovered {
+                        if let Err(error) = self.persist_credentials() {
+                            tracing::warn!(%error, "自动禁用自愈状态持久化失败");
                         }
                     }
-
-                    if let Some((new_id, new_creds)) = best {
-                        // 更新 current_id
-                        let mut current_id = self.current_id.lock();
-                        *current_id = new_id;
-                        (new_id, new_creds)
-                    } else {
-                        let entries = self.entries.lock();
-                        // 注意：必须在 bail! 之前计算 available_count，
-                        // 因为 available_count() 会尝试获取 entries 锁，
-                        // 而此时我们已经持有该锁，会导致死锁
-                        let available = entries.iter().filter(|e| !e.disabled).count();
-                        anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
-                    }
-                }
+                    anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
+                };
+                // 选号和预约不可分离：其他 acquire 必须立即看到这次占用，
+                // 即使本请求随后还需要等待 Token 刷新。
+                let entry = entries
+                    .iter_mut()
+                    .find(|entry| entry.id == id)
+                    .expect("selected credential must exist while entries is locked");
+                entry.in_flight = entry.in_flight.saturating_add(1);
+                *self.current_id.lock() = id;
+                (id, credentials, recovered)
             };
+            let reservation = InFlightReservation {
+                manager: self,
+                id: Some(id),
+            };
+            if recovered {
+                if let Err(error) = self.persist_credentials() {
+                    tracing::warn!(%error, "自动禁用自愈状态持久化失败");
+                }
+            }
 
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
                 Ok(ctx) => {
-                    // 仅在最终把凭据交给调用方时 +1（least_conn 在途计数）。
-                    // 上面 token 重载的 continue 不会到达这里，故不会误增。
-                    self.inc_in_flight(ctx.id);
+                    reservation.hand_off();
                     return Ok(ctx);
                 }
                 Err(e) => {
+                    drop(reservation);
                     if let Some(key) = affinity_key {
                         self.forget_session_affinity(key, id);
                     }
@@ -2558,22 +2664,65 @@ impl MultiTokenManager {
         }
     }
 
-    /// 获取指定凭据的调用上下文，用于 Admin 显式测试等不参与负载均衡的请求。
-    pub async fn acquire_context_for_id(&self, id: u64) -> anyhow::Result<CallContext> {
+    fn validate_retry_entry(entry: &CredentialEntry) -> anyhow::Result<()> {
+        if entry.disabled {
+            anyhow::bail!("凭据 #{} 已禁用", entry.id);
+        }
+        if is_cooling(entry, Instant::now()) {
+            anyhow::bail!("凭据 #{} 正在冷却", entry.id);
+        }
+        Ok(())
+    }
+
+    /// 同一在途请求重试前只检查账号状态，不重复消耗或校验自身已占用的许可。
+    pub(crate) fn validate_retry_credential(&self, id: u64) -> anyhow::Result<()> {
+        let entries = self.entries.lock();
+        let entry = entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+        Self::validate_retry_entry(entry)
+    }
+
+    /// 复用原 InFlightGuard 重读 Token 刷新后的上下文，不新增或释放并发预约。
+    pub(crate) async fn reload_retry_context(&self, id: u64) -> anyhow::Result<CallContext> {
         let credentials = {
             let entries = self.entries.lock();
             let entry = entries
                 .iter()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            Self::validate_retry_entry(entry)?;
+            entry.credentials.clone()
+        };
+        let ctx = self.try_ensure_token(id, &credentials).await?;
+        // 等待刷新期间可能被管理端禁用或触发冷却，交回上下文前再次检查。
+        self.validate_retry_credential(id)?;
+        Ok(ctx)
+    }
+
+    /// 获取指定凭据的调用上下文，用于 Admin 显式测试等不参与负载均衡的请求。
+    pub async fn acquire_context_for_id(&self, id: u64) -> anyhow::Result<CallContext> {
+        let credentials = {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
             if entry.disabled {
                 anyhow::bail!("凭据 #{} 已禁用", id);
             }
-            entry.credentials.clone()
+            let credentials = entry.credentials.clone();
+            entry.in_flight = entry.in_flight.saturating_add(1);
+            credentials
         };
 
+        let reservation = InFlightReservation {
+            manager: self,
+            id: Some(id),
+        };
         let ctx = self.try_ensure_token(id, &credentials).await?;
-        self.inc_in_flight(ctx.id);
+        reservation.hand_off();
         Ok(ctx)
     }
 
@@ -3007,14 +3156,10 @@ impl MultiTokenManager {
         }
     }
 
-    /// 对指定凭据 `in_flight += 1`（饱和加）。
-    ///
-    /// 仅在 `acquire_context` 最终把凭据交给调用方时调用一次。必须在未持有
-    /// `entries` 锁时调用（parking_lot 非重入）；调用点见 `acquire_context` 的 Ok 返回处。
-    pub(crate) fn inc_in_flight(&self, id: u64) {
+    fn release_in_flight(&self, id: u64) {
         let mut entries = self.entries.lock();
         if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
-            e.in_flight = e.in_flight.saturating_add(1);
+            e.in_flight = e.in_flight.saturating_sub(1);
         }
     }
 
@@ -3043,7 +3188,7 @@ impl MultiTokenManager {
 
     /// 为指定凭据构造 in-flight RAII 守卫（provider 用其持有的 Arc 调用）。
     ///
-    /// 与 `inc_in_flight` 配对：`acquire_context` 内已 +1，本守卫负责在请求结束时 -1。
+    /// 与 acquire 的锁内预约配对：内部已 +1，本守卫负责在请求结束时 -1。
     pub(crate) fn in_flight_guard(self: &std::sync::Arc<Self>, id: u64) -> InFlightGuard {
         InFlightGuard {
             manager: std::sync::Arc::clone(self),
@@ -4764,6 +4909,7 @@ impl MultiTokenManager {
                 in_flight: 0,
                 recent_requests: VecDeque::new(),
                 recent_429s: VecDeque::new(),
+                enterprise_pacing: Default::default(),
                 first_byte_ewma_ms: None,
             });
         }
@@ -5979,7 +6125,7 @@ impl MultiTokenManager {
         use anyhow::Context;
 
         let Some(path) = self.config.config_path() else {
-            tracing::warn!("配置文件路径未知，企业号专项 429 仅在当前进程生效");
+            tracing::warn!("配置文件路径未知，企业号专项处理仅在当前进程生效");
             return Ok(());
         };
         let mut config =
@@ -6031,7 +6177,7 @@ impl MultiTokenManager {
 
     pub fn set_enterprise_max_retries(&self, value: u32) -> anyhow::Result<()> {
         if !(1..=256).contains(&value) {
-            bail!("企业号重试次数必须在 1..=256");
+            bail!("企业号最大发送次数（含首次）必须在 1..=256");
         }
         let previous = self.enterprise_max_retries.swap(value, Ordering::Relaxed);
         if let Err(error) = self.persist_enterprise_max_retries(value) {
@@ -6046,7 +6192,7 @@ impl MultiTokenManager {
         use anyhow::Context;
 
         let Some(path) = self.config.config_path() else {
-            tracing::warn!("配置文件路径未知，企业号重试次数仅在当前进程生效");
+            tracing::warn!("配置文件路径未知，企业号最大发送次数仅在当前进程生效");
             return Ok(());
         };
         let mut config =
@@ -6054,7 +6200,45 @@ impl MultiTokenManager {
         config.enterprise_max_retries = value;
         config
             .save()
-            .with_context(|| format!("持久化企业号重试次数失败: {}", path.display()))?;
+            .with_context(|| format!("持久化企业号最大发送次数失败: {}", path.display()))?;
+        Ok(())
+    }
+
+    pub fn get_enterprise_retry_settings(&self) -> EnterpriseRetrySettings {
+        self.enterprise_retry.lock().clone()
+    }
+
+    pub fn set_enterprise_retry_settings(
+        &self,
+        settings: EnterpriseRetrySettings,
+    ) -> anyhow::Result<()> {
+        settings.validate()?;
+        // 持锁直到写盘结果确定，避免并发更新时失败回滚覆盖另一份已保存的设置。
+        let mut current = self.enterprise_retry.lock();
+        let previous = std::mem::replace(&mut *current, settings);
+        if let Err(error) = self.persist_enterprise_retry_settings(&current) {
+            *current = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn persist_enterprise_retry_settings(
+        &self,
+        settings: &EnterpriseRetrySettings,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let Some(path) = self.config.config_path() else {
+            tracing::warn!("配置文件路径未知，企业速打设置仅在当前进程生效");
+            return Ok(());
+        };
+        let mut config =
+            Config::load(path).with_context(|| format!("重新加载配置失败: {}", path.display()))?;
+        config.enterprise_retry = settings.clone();
+        config
+            .save()
+            .with_context(|| format!("持久化企业速打设置失败: {}", path.display()))?;
         Ok(())
     }
 
@@ -8186,6 +8370,132 @@ mod tests {
         );
     }
 
+    fn poweruser_cred(token: &str) -> KiroCredentials {
+        let mut credential = grouped_cred(token, &[]);
+        credential.subscription_title = Some("POWERUSER".to_string());
+        credential
+    }
+
+    #[test]
+    fn enterprise_special_prefers_busy_enterprise_over_idle_personal() {
+        let mut enterprise = poweruser_cred("ent");
+        enterprise.priority = 10;
+        enterprise.rpm_limit = 100;
+        let mut personal = grouped_cred("per", &[]);
+        personal.priority = 0;
+        personal.rpm_limit = 100;
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![enterprise, personal],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.set_enterprise_special_handling(true).unwrap();
+        {
+            let mut entries = manager.entries.lock();
+            let enterprise = entries
+                .iter_mut()
+                .find(|entry| entry.credentials.is_enterprise_credential())
+                .unwrap();
+            enterprise.in_flight = 5;
+        }
+
+        let (_, picked) = manager.select_next_credential(None, None).unwrap();
+        assert!(
+            picked.is_enterprise_credential(),
+            "企业号专项打开时，有空位的企业号必须压过更空闲的个人号"
+        );
+    }
+
+    #[test]
+    fn enterprise_special_rpm_full_falls_to_personal() {
+        let mut enterprise = poweruser_cred("ent");
+        enterprise.rpm_limit = 100;
+        let mut personal = grouped_cred("per", &[]);
+        personal.rpm_limit = 100;
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![enterprise, personal],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.set_enterprise_special_handling(true).unwrap();
+        {
+            let mut entries = manager.entries.lock();
+            let now = Instant::now();
+            let enterprise = entries
+                .iter_mut()
+                .find(|entry| entry.credentials.is_enterprise_credential())
+                .unwrap();
+            for _ in 0..100 {
+                enterprise.recent_requests.push_back(now);
+            }
+        }
+
+        let (_, picked) = manager.select_next_credential(None, None).unwrap();
+        assert!(
+            !picked.is_enterprise_credential(),
+            "企业号 RPM 打满后应切个人号兜底"
+        );
+    }
+
+    #[test]
+    fn without_enterprise_special_least_conn_still_picks_idle_personal() {
+        let mut enterprise = poweruser_cred("ent");
+        enterprise.rpm_limit = 100;
+        let mut personal = grouped_cred("per", &[]);
+        personal.rpm_limit = 100;
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![enterprise, personal],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        {
+            let mut entries = manager.entries.lock();
+            let enterprise = entries
+                .iter_mut()
+                .find(|entry| entry.credentials.is_enterprise_credential())
+                .unwrap();
+            enterprise.in_flight = 5;
+        }
+
+        let (_, picked) = manager.select_next_credential(None, None).unwrap();
+        assert!(
+            !picked.is_enterprise_credential(),
+            "专项关闭时 least_conn 仍应把空闲个人号排在忙碌企业号前面"
+        );
+    }
+
+    #[test]
+    fn enterprise_credential_ids_lists_power_accounts() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![poweruser_cred("ent"), grouped_cred("per", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let ids = manager.enterprise_credential_ids();
+        assert_eq!(ids.len(), 1);
+        let entries = manager.entries.lock();
+        let enterprise = entries
+            .iter()
+            .find(|entry| entry.credentials.is_enterprise_credential())
+            .unwrap();
+        assert_eq!(ids[0], enterprise.id);
+    }
+
     #[test]
     fn test_default_credentials_rpm_limit_is_zero() {
         // 决策 5：保留 #[derive(Default)]，default() 的 rpm_limit=0（不限速，仅内部/测试用）。
@@ -8793,6 +9103,303 @@ mod tests {
         assert_eq!(entry.recent_requests, recent_requests_before);
         assert_eq!(entry.in_flight, 4);
         assert!(is_rpm_exceeded(entry, Instant::now()));
+    }
+
+    #[tokio::test]
+    async fn concurrent_acquire_reserves_capacity_before_token_refresh() {
+        for mode in ["best", "priority", "balanced", "least_conn"] {
+            let mut credential = grouped_cred("ready-token", &[]);
+            credential.max_concurrency = 2;
+            credential.expires_at = Some((Utc::now() - Duration::hours(1)).to_rfc3339());
+            let manager = Arc::new(
+                MultiTokenManager::new(Config::default(), vec![credential], None, None, false)
+                    .unwrap(),
+            );
+            if mode != "best" {
+                manager.set_endpoint_mode(EndpointMode::Manual).unwrap();
+                manager.set_load_balancing_mode(mode.to_string()).unwrap();
+            }
+
+            // 让真实 acquire 并发等待另一个刷新者；不依赖线程调度或网络时序。
+            let refresh = manager.refresh_lock.lock().await;
+            let mut requests = Box::pin(futures::future::join_all((0..16).map(|_| {
+                let manager = Arc::clone(&manager);
+                async move {
+                    manager
+                        .acquire_context(None, None)
+                        .await
+                        .map(|ctx| manager.in_flight_guard(ctx.id))
+                }
+            })));
+            assert!(futures::poll!(requests.as_mut()).is_pending());
+            {
+                let mut entries = manager.entries.lock();
+                entries[0].credentials.expires_at =
+                    Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+            }
+            drop(refresh);
+
+            let results = requests.await;
+            assert_eq!(
+                results.iter().filter(|result| result.is_ok()).count(),
+                2,
+                "{mode}: 并发 acquire 的成功数不能超过账号并发上限"
+            );
+            assert_eq!(manager.snapshot().entries[0].in_flight, 2);
+            drop(results);
+            assert_eq!(manager.snapshot().entries[0].in_flight, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_acquire_releases_capacity_during_token_refresh() {
+        let mut credential = grouped_cred("ready-token", &[]);
+        credential.max_concurrency = 1;
+        credential.expires_at = Some((Utc::now() - Duration::hours(1)).to_rfc3339());
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
+        let _refresh = manager.refresh_lock.lock().await;
+
+        let mut request = Box::pin(manager.acquire_context(None, None));
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        assert_eq!(
+            manager.snapshot().entries[0].in_flight,
+            1,
+            "等待 Token 刷新也必须预约并发许可"
+        );
+        drop(request);
+        assert_eq!(
+            manager.snapshot().entries[0].in_flight,
+            0,
+            "取消尚未返回的 acquire 必须释放许可"
+        );
+
+        let mut request = Box::pin(manager.acquire_context_for_id(1));
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        assert_eq!(manager.snapshot().entries[0].in_flight, 1);
+        drop(request);
+        assert_eq!(
+            manager.snapshot().entries[0].in_flight,
+            0,
+            "指定账号 acquire 被取消也必须释放预约"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_acquire_releases_capacity_after_token_refresh_error() {
+        for explicit_id in [false, true] {
+            let mut credential = grouped_cred("ready-token", &[]);
+            credential.max_concurrency = 1;
+            credential.expires_at = Some((Utc::now() - Duration::hours(1)).to_rfc3339());
+            // 本地 token 验证失败，不触发真实网络请求。
+            credential.refresh_token = None;
+            let manager =
+                MultiTokenManager::new(Config::default(), vec![credential], None, None, false)
+                    .unwrap();
+            let result = if explicit_id {
+                manager.acquire_context_for_id(1).await
+            } else {
+                manager.acquire_context(None, None).await
+            };
+            assert!(result.is_err());
+            assert_eq!(
+                manager.snapshot().entries[0].in_flight,
+                0,
+                "Token 刷新失败不能泄漏预约（explicit_id={explicit_id}）"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn acquire_affinity_prefers_available_enterprise_over_personal() {
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![poweruser_cred("enterprise"), grouped_cred("personal", &[])],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        manager.set_enterprise_special_handling(true).unwrap();
+        manager.remember_session_affinity("conversation", 2);
+
+        let ctx = manager
+            .acquire_context_excluding_with_affinity(
+                None,
+                None,
+                &HashSet::new(),
+                Some("conversation"),
+            )
+            .await
+            .unwrap();
+        let _guard = manager.in_flight_guard(ctx.id);
+        assert_eq!(ctx.id, 1, "真实 acquire 的粘性分支也必须遵守企业优先");
+    }
+
+    #[tokio::test]
+    async fn reload_retry_context_reads_latest_token_without_changing_permit() {
+        let mut credential = grouped_cred("original-token", &[]);
+        credential.max_concurrency = 1;
+        credential.rpm_limit = 1;
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap(),
+        );
+        let original = manager.acquire_context(None, None).await.unwrap();
+        let guard = manager.in_flight_guard(original.id);
+        manager.record_request(original.id);
+        {
+            let mut entries = manager.entries.lock();
+            entries[0].credentials.access_token = Some("refreshed-token".to_string());
+            entries[0].credentials.profile_arn = Some("refreshed-profile".to_string());
+        }
+
+        let refreshed = manager.reload_retry_context(original.id).await.unwrap();
+        assert_eq!(refreshed.id, original.id);
+        assert_eq!(refreshed.token, "refreshed-token");
+        assert_eq!(
+            refreshed.credentials.access_token.as_deref(),
+            Some("refreshed-token")
+        );
+        assert_eq!(
+            refreshed.credentials.profile_arn.as_deref(),
+            Some("refreshed-profile")
+        );
+        assert_eq!(original.token, "original-token");
+        assert_eq!(manager.snapshot().entries[0].in_flight, 1);
+        assert_eq!(manager.entries.lock()[0].recent_requests.len(), 1);
+        drop(refreshed);
+        assert_eq!(manager.snapshot().entries[0].in_flight, 1);
+        drop(guard);
+        assert_eq!(manager.snapshot().entries[0].in_flight, 0);
+    }
+
+    #[tokio::test]
+    async fn reload_retry_context_rejects_unavailable_credentials_without_releasing_permit() {
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![grouped_cred("token", &[])],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        let original = manager.acquire_context(None, None).await.unwrap();
+        let guard = manager.in_flight_guard(original.id);
+        assert!(manager.reload_retry_context(99).await.is_err());
+        manager.entries.lock()[0].disabled = true;
+        assert!(manager.reload_retry_context(original.id).await.is_err());
+        manager.entries.lock()[0].disabled = false;
+
+        let until = Instant::now() + StdDuration::from_secs(60);
+        for reason in ["throttle", "rate_limit", "quarantine"] {
+            {
+                let mut entries = manager.entries.lock();
+                let entry = &mut entries[0];
+                entry.throttled_until = (reason == "throttle").then_some(until);
+                entry.rate_limited_until = (reason == "rate_limit").then_some(until);
+                entry.quarantined_until = (reason == "quarantine").then_some(until);
+            }
+            assert!(
+                manager.reload_retry_context(original.id).await.is_err(),
+                "{reason} 冷却必须阻止重载重试上下文"
+            );
+            assert_eq!(manager.snapshot().entries[0].in_flight, 1);
+        }
+        drop(guard);
+        assert_eq!(manager.snapshot().entries[0].in_flight, 0);
+    }
+
+    #[tokio::test]
+    async fn reload_retry_context_keeps_original_permit_on_cancellation_and_refresh_error() {
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![grouped_cred("token", &[])],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        let original = manager.acquire_context(None, None).await.unwrap();
+        let guard = manager.in_flight_guard(original.id);
+        {
+            let mut entries = manager.entries.lock();
+            entries[0].credentials.expires_at =
+                Some((Utc::now() - Duration::hours(1)).to_rfc3339());
+            entries[0].credentials.refresh_token = None;
+        }
+        let refresh = manager.refresh_lock.lock().await;
+        let mut pending = Box::pin(manager.reload_retry_context(original.id));
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        assert_eq!(manager.snapshot().entries[0].in_flight, 1);
+        drop(pending);
+        assert_eq!(manager.snapshot().entries[0].in_flight, 1);
+        drop(refresh);
+
+        assert!(manager.reload_retry_context(original.id).await.is_err());
+        assert_eq!(manager.snapshot().entries[0].in_flight, 1);
+
+        let refresh = manager.refresh_lock.lock().await;
+        let mut pending = Box::pin(manager.reload_retry_context(original.id));
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        {
+            let mut entries = manager.entries.lock();
+            entries[0].credentials.expires_at =
+                Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+            entries[0].disabled = true;
+        }
+        drop(refresh);
+        assert!(
+            pending.await.is_err(),
+            "等待刷新期间账号被禁用后不能交回上下文"
+        );
+        assert_eq!(manager.snapshot().entries[0].in_flight, 1);
+        drop(guard);
+        assert_eq!(manager.snapshot().entries[0].in_flight, 0);
+    }
+
+    #[test]
+    fn retry_credential_validation_ignores_own_capacity_but_checks_live_state() {
+        let mut credential = grouped_cred("ready-token", &[]);
+        credential.max_concurrency = 1;
+        credential.rpm_limit = 1;
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
+        {
+            let mut entries = manager.entries.lock();
+            entries[0].in_flight = 1;
+            entries[0].recent_requests.push_back(Instant::now());
+        }
+        assert!(
+            manager.validate_retry_credential(1).is_ok(),
+            "同号重试必须复用已占用的并发和 RPM 许可"
+        );
+        assert!(manager.validate_retry_credential(99).is_err());
+
+        manager.entries.lock()[0].disabled = true;
+        assert!(manager.validate_retry_credential(1).is_err());
+        manager.entries.lock()[0].disabled = false;
+        let until = Instant::now() + StdDuration::from_secs(60);
+        for reason in ["throttle", "rate_limit", "quarantine"] {
+            {
+                let mut entries = manager.entries.lock();
+                let entry = &mut entries[0];
+                entry.throttled_until = (reason == "throttle").then_some(until);
+                entry.rate_limited_until = (reason == "rate_limit").then_some(until);
+                entry.quarantined_until = (reason == "quarantine").then_some(until);
+            }
+            assert!(
+                manager.validate_retry_credential(1).is_err(),
+                "{reason} 冷却必须阻止同号继续发送"
+            );
+        }
+        manager.entries.lock()[0].quarantined_until = Some(Instant::now());
+        assert!(manager.validate_retry_credential(1).is_ok());
     }
 
     #[tokio::test]
@@ -10959,6 +11566,75 @@ mod tests {
         assert!(persisted.endpoint_chains.is_none());
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn enterprise_retry_settings_initializes_and_returns_independent_snapshots() {
+        let initial = EnterpriseRetrySettings {
+            endpoints: vec!["runtime".to_string()],
+            first_event_timeout_ms: 250,
+            total_timeout_ms: 1_200,
+        };
+        let mut config = Config::default();
+        config.enterprise_retry = initial.clone();
+        let manager = MultiTokenManager::new(config, Vec::new(), None, None, false).unwrap();
+        let snapshot = manager.get_enterprise_retry_settings();
+        assert_eq!(snapshot, initial);
+
+        let updated = EnterpriseRetrySettings::default();
+        manager.set_enterprise_retry_settings(updated.clone()).unwrap();
+        assert_eq!(manager.get_enterprise_retry_settings(), updated);
+        assert_eq!(snapshot, initial, "既有请求持有的快照不可被后续更新改变");
+    }
+
+    #[test]
+    fn enterprise_retry_settings_invalid_update_preserves_runtime_and_disk() {
+        let path = tmp_creds_path("enterprise_retry_settings_validation");
+        let config = Config::load(&path).unwrap();
+        config.save().unwrap();
+        let manager = MultiTokenManager::new(config, Vec::new(), None, None, false).unwrap();
+        let original = manager.get_enterprise_retry_settings();
+        let original_file = std::fs::read(&path).unwrap();
+        let invalid = EnterpriseRetrySettings {
+            endpoints: vec!["ide".to_string(), "ide".to_string()],
+            ..original.clone()
+        };
+
+        assert!(manager.set_enterprise_retry_settings(invalid).is_err());
+        assert_eq!(manager.get_enterprise_retry_settings(), original);
+        assert_eq!(std::fs::read(&path).unwrap(), original_file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn enterprise_retry_settings_save_failure_rolls_back_and_allows_retry() {
+        let parent = std::env::temp_dir().join(format!("kiro-enterprise-settings-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&parent).unwrap();
+        let path = parent.join("config.json");
+        let config = Config::load(&path).unwrap();
+        config.save().unwrap();
+        let manager = MultiTokenManager::new(config, Vec::new(), None, None, false).unwrap();
+        let original = manager.get_enterprise_retry_settings();
+        let updated = EnterpriseRetrySettings {
+            endpoints: vec!["amazonq".to_string()],
+            first_event_timeout_ms: 100,
+            total_timeout_ms: 600,
+        };
+
+        // load 对不存在的配置文件会成功；移除空目录使真正的原子保存失败。
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&parent).unwrap();
+        let error = manager.set_enterprise_retry_settings(updated.clone()).unwrap_err();
+        assert!(error.to_string().contains("持久化企业速打设置失败"));
+        assert_eq!(manager.get_enterprise_retry_settings(), original);
+        assert!(!path.exists());
+
+        std::fs::create_dir(&parent).unwrap();
+        manager.set_enterprise_retry_settings(updated.clone()).unwrap();
+        assert_eq!(manager.get_enterprise_retry_settings(), updated);
+        assert_eq!(Config::load(&path).unwrap().enterprise_retry, updated);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(parent).unwrap();
     }
 
     #[test]

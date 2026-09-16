@@ -3479,6 +3479,7 @@ impl AdminService {
             enterprise_special_handling: self.token_manager.enterprise_special_handling_enabled(),
             enterprise_default_endpoint: self.token_manager.get_enterprise_default_endpoint(),
             enterprise_max_retries: self.token_manager.enterprise_max_retries(),
+            enterprise_retry: self.token_manager.get_enterprise_retry_settings(),
         })
     }
 
@@ -3493,7 +3494,29 @@ impl AdminService {
         let protocols = provider.endpoint_protocols();
         let defaults = provider.default_endpoint_chains();
 
-        if let Some(chains) = req.chains.as_ref() {
+        // 企业设置在任何写盘前完成校验，避免非法参数造成其它字段部分更新。
+        if let Some(settings) = req.enterprise_retry.as_ref() {
+            settings
+                .validate()
+                .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+        }
+        if let Some(retries) = req.enterprise_max_retries {
+            if !(1..=256).contains(&retries) {
+                return Err(AdminServiceError::InvalidCredential(
+                    "企业号最大发送次数（含首次）必须在 1..=256".to_string(),
+                ));
+            }
+        }
+        if let Some(name) = req.enterprise_default_endpoint.as_ref() {
+            if !self.known_endpoints.contains(&name.trim().to_string()) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "未知企业号默认端点: {}",
+                    name.trim()
+                )));
+            }
+        }
+
+        if let Some(chains) = req.chains.as_ref().and_then(Option::as_ref) {
             for (primary, buckets) in chains.iter() {
                 // 主端点必须是「有静态降级链」的合法主端点
                 let Some(primary_proto) = protocols.get(primary) else {
@@ -3543,10 +3566,11 @@ impl AdminService {
         }
 
         // 空 map 等价清除覆盖（回退静态默认）
-        let normalized = req.chains.filter(|m| !m.is_empty());
-        self.token_manager
-            .set_endpoint_chains(normalized)
-            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        if let Some(chains) = req.chains {
+            self.token_manager
+                .set_endpoint_chains(chains.filter(|m| !m.is_empty()))
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        }
 
         if let Some(cap) = req.max_bucket_attempts_per_request {
             self.token_manager
@@ -3630,6 +3654,12 @@ impl AdminService {
             self.token_manager
                 .set_enterprise_max_retries(retries)
                 .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+        }
+
+        if let Some(settings) = req.enterprise_retry {
+            self.token_manager
+                .set_enterprise_retry_settings(settings)
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
         }
 
         self.get_endpoint_chains()
@@ -6310,6 +6340,66 @@ mod tests {
             history_jpeg_quality: 72,
             retry_history_max_dimension: 960,
             retry_history_jpeg_quality: 60,
+        }
+    }
+
+    #[tokio::test]
+    async fn enterprise_retry_settings_admin_update_persists_and_reads_back() {
+        let (service, _provider, config_path, _temp) = image_budget_test_service(1_000_000);
+        let chains = HashMap::from([("ide".to_string(), vec!["runtime".to_string()])]);
+        service.token_manager.set_endpoint_chains(Some(chains.clone())).unwrap();
+        let settings = serde_json::json!({
+            "endpoints": ["runtime", "ide"],
+            "firstEventTimeoutMs": 250,
+            "totalTimeoutMs": 1200
+        });
+        let request = serde_json::from_value(serde_json::json!({
+            "enterpriseRetry": settings
+        })).unwrap();
+
+        let response = service.set_endpoint_chains(request).unwrap();
+        assert_eq!(serde_json::to_value(response).unwrap()["enterpriseRetry"], settings);
+        let persisted = Config::load(&config_path).unwrap();
+        assert_eq!(persisted.endpoint_chains, Some(chains), "仅更新企业设置必须保留普通桶链");
+        assert_eq!(serde_json::to_value(persisted.enterprise_retry).unwrap(), settings);
+        let response = service.get_endpoint_chains().unwrap();
+        assert_eq!(serde_json::to_value(response).unwrap()["enterpriseRetry"], settings);
+        // 显式 null 仍支持原有重置入口，与字段缺省严格区分。
+        let reset = serde_json::from_value(serde_json::json!({"chains": null})).unwrap();
+        service.set_endpoint_chains(reset).unwrap();
+        assert!(Config::load(&config_path).unwrap().endpoint_chains.is_none());
+    }
+
+    #[tokio::test]
+    async fn enterprise_retry_settings_admin_rejects_invalid_before_any_write() {
+        let (service, _provider, config_path, _temp) = image_budget_test_service(1_000_000);
+        service.token_manager.set_endpoint_chains(Some(HashMap::from([
+            ("ide".to_string(), vec!["runtime".to_string()]),
+        ]))).unwrap();
+        let original_file = std::fs::read(&config_path).unwrap();
+        let original_chains = service.token_manager.get_endpoint_chains();
+
+        for settings in [
+            serde_json::json!({ "endpoints": [] }),
+            serde_json::json!({ "endpoints": ["ide", "ide"] }),
+            serde_json::json!({ "endpoints": ["cli"] }),
+            serde_json::json!({ "firstEventTimeoutMs": 9 }),
+            serde_json::json!({ "firstEventTimeoutMs": 120001, "totalTimeoutMs": 150000 }),
+            serde_json::json!({ "firstEventTimeoutMs": 20, "totalTimeoutMs": 29 }),
+            serde_json::json!({ "totalTimeoutMs": 300001 }),
+            serde_json::json!({ "firstEventTimeoutMs": 1500, "totalTimeoutMs": 1000 }),
+        ] {
+            let request = serde_json::from_value(serde_json::json!({
+                "enterpriseSpecialHandling": true,
+                "enterpriseRetry": settings
+            })).unwrap();
+            assert!(matches!(
+                service.set_endpoint_chains(request),
+                Err(AdminServiceError::InvalidCredential(_))
+            ), "应拒绝无效企业重试设置: {settings}");
+            assert_eq!(std::fs::read(&config_path).unwrap(), original_file);
+            assert_eq!(service.token_manager.get_endpoint_chains(), original_chains);
+            assert!(!service.token_manager.enterprise_special_handling_enabled());
         }
     }
 

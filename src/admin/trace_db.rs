@@ -249,6 +249,8 @@ pub enum TraceDiagnosticEvent<'a> {
 pub trait TraceSink: Send + Sync {
     fn on_attempt(&self, attempt: TraceAttempt);
     fn on_diagnostic(&self, _event: TraceDiagnosticEvent<'_>) {}
+    fn on_upstream_first_byte(&self) {}
+    fn enterprise_request_control(&self) -> Option<&crate::kiro::provider::EnterpriseRequestControl> { None }
 }
 
 /// 查询过滤条件

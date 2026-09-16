@@ -45,6 +45,7 @@ pub(crate) mod tool_schema;
 pub mod types;
 pub(crate) mod usage;
 mod websearch;
+pub(crate) use websearch::McpResponse;
 mod websearch_loop;
 
 // `create_router_with_provider` 是公开扩展点（允许外部以自定义 provider 构造路由），

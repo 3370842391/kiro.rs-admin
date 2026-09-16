@@ -1,3 +1,12 @@
+export type EnterpriseRetryEndpoint = 'ide' | 'runtime' | 'amazonq' | 'codewhisperer'
+
+/** 企业速打参数；每条请求读取一份设置快照。 */
+export interface EnterpriseRetrySettings {
+  endpoints: EnterpriseRetryEndpoint[]
+  firstEventTimeoutMs: number
+  totalTimeoutMs: number
+}
+
 // 凭据状态响应
 export interface RpmSummary {
   windowSeconds: number

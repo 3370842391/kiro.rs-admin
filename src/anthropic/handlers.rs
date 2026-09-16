@@ -197,6 +197,7 @@ impl UsageRecordHook {
 ///
 /// `store` 为 None（未启用 Admin / trace）时所有方法都是空操作，零开销。
 pub(crate) struct RequestTracer {
+    enterprise_control: crate::kiro::provider::EnterpriseRequestControl,
     store: Option<SharedTraceStore>,
     snapshot: Option<std::sync::Arc<super::error_snapshot::ErrorSnapshotContext>>,
     finalized: std::sync::atomic::AtomicBool,
@@ -283,6 +284,7 @@ impl RequestTracer {
             .is_some_and(|provider| provider.auto_compact_diagnostics_enabled());
         Self {
             store: state.trace_store.clone(),
+            enterprise_control: Default::default(),
             snapshot,
             finalized: std::sync::atomic::AtomicBool::new(false),
             trace_id,
@@ -439,6 +441,7 @@ impl RequestTracer {
             return;
         }
         let compaction = self.compaction.finalize(CompactionFinalize {
+            // 账号成功只在有效业务响应完整完成时确认。
             final_status,
             error_type,
             error_message,
@@ -446,6 +449,9 @@ impl RequestTracer {
             usage_input_tokens: usage.input_tokens,
         });
         let attempts = std::mem::take(&mut *self.attempts.lock());
+        self.enterprise_control.complete(final_status == "success");
+        tracing::info!(request_id = %self.trace_id, upstream_call_count = self.enterprise_control.upstream_call_count(),
+            final_status, "上游真实发送次数汇总（含重试）");
         // 最终凭据：最后一跳的命中凭据（成功跳即命中凭据，失败跳即最后尝试的凭据）
         let final_credential_id = attempts.last().map(|a| a.credential_id).unwrap_or(0);
         let first_token_ms = self
@@ -510,6 +516,10 @@ impl RequestTracer {
 }
 
 impl TraceSink for RequestTracer {
+    fn on_upstream_first_byte(&self) { self.mark_upstream_first_byte(); }
+    fn enterprise_request_control(&self) -> Option<&crate::kiro::provider::EnterpriseRequestControl> {
+        Some(&self.enterprise_control)
+    }
     fn on_attempt(&self, attempt: TraceAttempt) {
         if let Some(snapshot) = &self.snapshot {
             snapshot.record_attempt_status(attempt.attempt, attempt.http_status, &attempt.outcome);
@@ -762,6 +772,13 @@ fn log_pool_exhausted(err: &dyn std::fmt::Display) {
 }
 
 fn classify_provider_error(err: &Error) -> ClassifiedProviderError {
+    if err.downcast_ref::<crate::kiro::provider::EnterpriseRateLimitError>().is_some() {
+        return ClassifiedProviderError {
+            http_status: StatusCode::TOO_MANY_REQUESTS,
+            error_type: "rate_limit_error",
+            public_message: "The upstream request rate limit was exceeded. Please retry later.",
+        };
+    }
     let text = err.to_string();
     if text.contains("所有凭据均已禁用") {
         // 503 而不是笼统的 502：区别在于「上游挂了」还是「我们这边没号了」，
@@ -1190,7 +1207,10 @@ async fn collect_buffered_attempt(
         )
         .await?;
     let credential_id = call_result.credential_id;
-    let body = call_result.response.bytes().await?;
+    let timeout_secs = provider.stream_idle_timeout_secs();
+    let body = collect_body_stream_with_idle_timeout(call_result.into_byte_stream(),
+        (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs))).await
+        .map_err(|error| anyhow::anyhow!("strict JSON response read failed: {error:?}"))?;
     tracer.mark_upstream_first_byte();
     tracer.record_stream_chunk(&body);
     tracer.record_upstream_body(attempt_index as u32, &body);
@@ -1199,6 +1219,7 @@ async fn collect_buffered_attempt(
     if let Err(error) = decoder.feed(&body) {
         tracing::warn!(error = %error, "strict JSON attempt decoder buffer overflow");
         tracer.record_protocol_error("sse_state_error", &error.to_string());
+        return Err(error.into());
     }
     let mut context = BufferedStreamContext::new_with_constraints(
         model,
@@ -1227,14 +1248,17 @@ async fn collect_buffered_attempt(
                 Err(error) => {
                     tracing::warn!(error = %error, "strict JSON attempt event decode failed");
                     tracer.record_protocol_error("sse_state_error", &error.to_string());
+        return Err(error.into());
                 }
             },
             Err(error) => {
                 tracing::warn!(error = %error, "strict JSON attempt frame decode failed");
                 tracer.record_protocol_error("sse_state_error", &error.to_string());
+        return Err(error.into());
             }
         }
     }
+    anyhow::ensure!(!decoder.has_pending_bytes(), "upstream truncated frame");
     let events = context.finish_and_get_all_events();
     let terminal_error = context.terminal_error_message();
     let attempt_failure = context.terminal_attempt_failure().cloned();
@@ -2525,7 +2549,7 @@ pub async fn post_messages(
             payload.tools.clone(),
         ) as i32;
 
-        let resp = websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        let resp = websearch::handle_websearch_request(provider, &payload, input_tokens, Some(tracer.as_ref()), key_ctx.group.as_deref()).await;
         // WebSearch 路径走 MCP 端点，没有 credential_id 上下文，统一记 0
         let status = if resp.status().is_success() {
             "success"
@@ -3096,7 +3120,15 @@ fn create_early_sse_stream(
     };
 
     tokio::spawn(async move {
-        match call.await {
+        let result = tokio::select! {
+            biased;
+            _ = sender.closed() => {
+                finalize_client_disconnected(setup.tracer.as_ref(), 0, TraceUsage::zero());
+                return;
+            },
+            result = call => result,
+        };
+        match result {
             Ok(call_result) => {
                 run_realtime_sse_attempts(
                     call_result,
@@ -3933,7 +3965,7 @@ async fn read_continuation_round(
     continuation_round: u32,
 ) -> ContinuationReadResult {
     let credential_id = call_result.credential_id;
-    let mut body_stream = Box::pin(call_result.response.bytes_stream());
+    let mut body_stream = Box::pin(call_result.into_byte_stream());
     let mut decoder = EventStreamDecoder::new();
     let mut ping_interval = interval(Duration::from_secs(PING_INTERVAL_SECS));
     let mut received_bytes = 0_u64;
@@ -3941,7 +3973,7 @@ async fn read_continuation_round(
     let stream_round_started = TokioInstant::now();
     let mut idle_deadline = TokioInstant::now() + Duration::from_secs(idle_timeout_secs.max(1));
 
-    let termination = loop {
+    let termination = 'upstream_read: loop {
         let idle_fut = async {
             if idle_timeout_secs == 0 {
                 std::future::pending::<()>().await;
@@ -3960,6 +3992,7 @@ async fn read_continuation_round(
                     if let Err(error) = decoder.feed(&chunk) {
                         tracing::warn!(%error, continuation_round, "续写流解码缓冲区溢出");
                         tracer.record_protocol_error("sse_state_error", &error.to_string());
+                                    break 'upstream_read AttemptTermination::ReadError(format!("upstream protocol error: {error}"));
                     }
                     let mut events = Vec::new();
                     for result in decoder.decode_iter() {
@@ -3972,11 +4005,13 @@ async fn read_continuation_round(
                                 Err(error) => {
                                     tracing::warn!(%error, continuation_round, "续写流事件解码失败");
                                     tracer.record_protocol_error("sse_state_error", &error.to_string());
+                                    break 'upstream_read AttemptTermination::ReadError(format!("upstream protocol error: {error}"));
                                 }
                             },
                             Err(error) => {
                                 tracing::warn!(%error, continuation_round, "续写流 frame 解码失败");
                                 tracer.record_protocol_error("sse_state_error", &error.to_string());
+                                    break 'upstream_read AttemptTermination::ReadError(format!("upstream protocol error: {error}"));
                             }
                         }
                     }
@@ -4005,7 +4040,7 @@ async fn read_continuation_round(
                     );
                     break AttemptTermination::ReadError(error.to_string());
                 }
-                None => break AttemptTermination::Eof,
+                None => break if decoder.has_pending_bytes() { AttemptTermination::ReadError("upstream truncated frame".into()) } else { AttemptTermination::Eof },
             },
             _ = ping_interval.tick() => {
                 if sender.send(Ok(create_ping_sse())).await.is_err() {
@@ -4020,7 +4055,7 @@ async fn read_continuation_round(
                 // 刻意**不**再要求「所有块已闭合」：Kiro 的文本块只在我们自己收尾时才关，
                 // 上游从不发对应事件，加上那个条件这条分支一次都走不到（见 `upstream_settled`）。
                 if ctx.upstream_settled() {
-                    break AttemptTermination::Eof;
+                    break if decoder.has_pending_bytes() { AttemptTermination::ReadError("upstream truncated frame".into()) } else { AttemptTermination::Eof };
                 }
                 tracer.record_protocol_error(
                     "stream_idle_timeout",
@@ -4134,7 +4169,7 @@ async fn run_realtime_sse_attempts(
             }
         };
         let mut credential_id = call_result.credential_id;
-        let mut body_stream = Box::pin(call_result.response.bytes_stream());
+        let mut body_stream = Box::pin(call_result.into_byte_stream());
         let mut ctx = setup.new_context();
         let mut probation = ProbationBuffer::default();
         let initial_events = probation.push_all(ctx.generate_initial_events());
@@ -4149,7 +4184,7 @@ async fn run_realtime_sse_attempts(
         let stream_round_started = TokioInstant::now();
         let mut idle_deadline = TokioInstant::now() + Duration::from_secs(idle_timeout_secs.max(1));
 
-        let mut termination = loop {
+        let mut termination = 'upstream_read: loop {
             let idle_fut = async {
                 if idle_timeout_secs == 0 {
                     std::future::pending::<()>().await;
@@ -4173,6 +4208,7 @@ async fn run_realtime_sse_attempts(
                         if let Err(error) = decoder.feed(&chunk) {
                             tracing::warn!(%error, attempt = attempt_index + 1, "流式解码缓冲区溢出");
                             tracer.record_protocol_error("sse_state_error", &error.to_string());
+                                    break 'upstream_read AttemptTermination::ReadError(format!("upstream protocol error: {error}"));
                         }
                         let mut events = Vec::new();
                         for result in decoder.decode_iter() {
@@ -4188,11 +4224,13 @@ async fn run_realtime_sse_attempts(
                                     Err(error) => {
                                         tracing::warn!(%error, attempt = attempt_index + 1, "流式事件解码失败");
                                         tracer.record_protocol_error("sse_state_error", &error.to_string());
+                                    break 'upstream_read AttemptTermination::ReadError(format!("upstream protocol error: {error}"));
                                     }
                                 },
                                 Err(error) => {
                                     tracing::warn!(%error, attempt = attempt_index + 1, "流式 frame 解码失败");
                                     tracer.record_protocol_error("sse_state_error", &error.to_string());
+                                    break 'upstream_read AttemptTermination::ReadError(format!("upstream protocol error: {error}"));
                                 }
                             }
                         }
@@ -4234,7 +4272,7 @@ async fn run_realtime_sse_attempts(
                     );
                         break AttemptTermination::ReadError(error.to_string());
                     }
-                    None => break AttemptTermination::Eof,
+                    None => break if decoder.has_pending_bytes() { AttemptTermination::ReadError("upstream truncated frame".into()) } else { AttemptTermination::Eof },
                 },
                 _ = ping_interval.tick() => {
                     if start_tx.is_none()
@@ -4258,7 +4296,7 @@ async fn run_realtime_sse_attempts(
                     // 刻意**不**再要求「所有块已闭合」：Kiro 的文本块只在我们自己收尾时才关，
                     // 上游从不发对应事件，加上那个条件这条分支一次都走不到（见 `upstream_settled`）。
                     if ctx.upstream_settled() {
-                        break AttemptTermination::Eof;
+                        break if decoder.has_pending_bytes() { AttemptTermination::ReadError("upstream truncated frame".into()) } else { AttemptTermination::Eof };
                     }
                     tracing::warn!(attempt = attempt_index + 1, received_bytes, idle_timeout_secs, "流式空闲超时，主动收尾");
                     tracer.record_protocol_error(
@@ -4281,6 +4319,8 @@ async fn run_realtime_sse_attempts(
             return;
         }
 
+        // 此轮已终止；续写前释放旧流，否则单并发账号会阻塞自己的恢复请求。
+        drop(body_stream);
         let final_events = ctx.generate_final_events_for(&termination);
         let mut visible = probation.push_all(final_events);
         let mut round_credits = ctx.credits;
@@ -4829,7 +4869,7 @@ async fn collect_non_stream_tool_attempt(
     let idle_timeout_secs = provider.stream_idle_timeout_secs();
     let idle_timeout = (idle_timeout_secs > 0).then(|| Duration::from_secs(idle_timeout_secs));
     let body_bytes =
-        collect_body_stream_with_idle_timeout(call_result.response.bytes_stream(), idle_timeout)
+        collect_body_stream_with_idle_timeout(call_result.into_byte_stream(), idle_timeout)
             .await
             .map_err(|failure| match failure {
                 NonStreamBodyReadFailure::Read {
@@ -4849,10 +4889,14 @@ async fn collect_non_stream_tool_attempt(
                 }
             })?;
 
+    let protocol_failure = |message: String| NonStreamCollectError::Body {
+        credential_id, message, received_bytes: body_bytes.len() as u64,
+    };
     let mut decoder = EventStreamDecoder::new();
     if let Err(error) = decoder.feed(&body_bytes) {
         tracing::warn!(%error, attempt = attempt_index + 1, "非流式响应解码缓冲区溢出");
         tracer.record_protocol_error("sse_state_error", &error.to_string());
+                    return Err(protocol_failure(error.to_string()));
     }
 
     let mut text_content = String::new();
@@ -4969,15 +5013,18 @@ async fn collect_non_stream_tool_attempt(
                 Err(error) => {
                     tracing::warn!(%error, attempt = attempt_index + 1, "事件帧解码失败");
                     tracer.record_protocol_error("sse_state_error", &error.to_string());
+                    return Err(protocol_failure(error.to_string()));
                 }
             },
             Err(error) => {
                 tracing::warn!(%error, attempt = attempt_index + 1, "解码事件失败");
                 tracer.record_protocol_error("sse_state_error", &error.to_string());
+                    return Err(protocol_failure(error.to_string()));
             }
         }
     }
 
+    if decoder.has_pending_bytes() { return Err(protocol_failure("upstream truncated frame".into())); }
     if tool_json_error.is_none() {
         let (completed, error) = tool_accumulator.finish(tool_name_map, tool_contracts);
         if error.is_none() {
@@ -5847,7 +5894,7 @@ pub async fn post_messages_cc(
             payload.tools.clone(),
         ) as i32;
 
-        let resp = websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        let resp = websearch::handle_websearch_request(provider, &payload, input_tokens, Some(tracer.as_ref()), key_ctx.group.as_deref()).await;
         let status = if resp.status().is_success() {
             "success"
         } else {
@@ -6252,7 +6299,7 @@ async fn run_buffered_sse_attempts(
             }
         };
         let credential_id = call_result.credential_id;
-        let mut body_stream = Box::pin(call_result.response.bytes_stream());
+        let mut body_stream = Box::pin(call_result.into_byte_stream());
         let mut ctx = setup.new_buffered_context();
         let mut decoder = EventStreamDecoder::new();
         let mut ping_interval = interval(Duration::from_secs(PING_INTERVAL_SECS));
@@ -6260,7 +6307,7 @@ async fn run_buffered_sse_attempts(
         let stream_round_started = TokioInstant::now();
         let mut idle_deadline = TokioInstant::now() + Duration::from_secs(idle_timeout_secs.max(1));
 
-        let termination = loop {
+        let termination = 'upstream_read: loop {
             let deadline = idle_deadline;
             let idle_fut = async move {
                 if idle_timeout_secs == 0 {
@@ -6294,7 +6341,7 @@ async fn run_buffered_sse_attempts(
                     // 刻意**不**再要求「所有块已闭合」：Kiro 的文本块只在我们自己收尾时才关，
                     // 上游从不发对应事件，加上那个条件这条分支一次都走不到（见 `upstream_settled`）。
                     if ctx.upstream_settled() {
-                        break AttemptTermination::Eof;
+                        break if decoder.has_pending_bytes() { AttemptTermination::ReadError("upstream truncated frame".into()) } else { AttemptTermination::Eof };
                     }
                     tracing::warn!(attempt = attempt_index + 1, received_bytes, idle_timeout_secs, "缓冲流空闲超时，主动收尾");
                     tracer.record_protocol_error(
@@ -6316,6 +6363,7 @@ async fn run_buffered_sse_attempts(
                         if let Err(error) = decoder.feed(&chunk) {
                             tracing::warn!(%error, attempt = attempt_index + 1, "缓冲流解码缓冲区溢出");
                             tracer.record_protocol_error("sse_state_error", &error.to_string());
+                                    break 'upstream_read AttemptTermination::ReadError(format!("upstream protocol error: {error}"));
                         }
                         for result in decoder.decode_iter() {
                             match result {
@@ -6327,9 +6375,15 @@ async fn run_buffered_sse_attempts(
                                         );
                                         ctx.process_and_buffer(&event);
                                     }
-                                    Err(error) => tracing::warn!(%error, attempt = attempt_index + 1, "缓冲流事件解码失败"),
+                                    Err(error) => {
+                                        tracer.record_protocol_error("sse_state_error", &error.to_string());
+                                        break 'upstream_read AttemptTermination::ReadError(format!("upstream protocol error: {error}"));
+                                    },
                                 },
-                                Err(error) => tracing::warn!(%error, attempt = attempt_index + 1, "缓冲流 frame 解码失败"),
+                                Err(error) => {
+                                        tracer.record_protocol_error("sse_state_error", &error.to_string());
+                                        break 'upstream_read AttemptTermination::ReadError(format!("upstream protocol error: {error}"));
+                                    },
                             }
                         }
                         if ctx.repetition_guard_tripped() {
@@ -6356,7 +6410,7 @@ async fn run_buffered_sse_attempts(
                     );
                         break AttemptTermination::ReadError(error.to_string());
                     }
-                    None => break AttemptTermination::Eof,
+                    None => break if decoder.has_pending_bytes() { AttemptTermination::ReadError("upstream truncated frame".into()) } else { AttemptTermination::Eof },
                 }
             }
         };
@@ -6372,6 +6426,7 @@ async fn run_buffered_sse_attempts(
             return;
         }
 
+        drop(body_stream);
         let all_events = ctx.finish_and_get_all_events_for(&termination);
         let mut probation = ProbationBuffer::default();
         let visible = probation.push_all(all_events);
@@ -7006,6 +7061,7 @@ mod tests {
         (
             RequestTracer {
                 store: Some(trace_store.clone()),
+                enterprise_control: Default::default(),
                 snapshot: Some(snapshot),
                 finalized: std::sync::atomic::AtomicBool::new(false),
                 trace_id: trace_id.to_string(),
@@ -8879,6 +8935,104 @@ mod tests {
             "ValidationException: transient backend issue".to_string()
         ));
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn enterprise_rate_limit_error_preserves_real_http_429_for_api_and_mcp() {
+        for mcp in [false, true] {
+            let error = crate::kiro::provider::enterprise_tests::single_enterprise_error_for_test(
+                429, b"USER_REQUEST_RATE_EXCEEDED Bearer private-token", mcp,
+            ).await;
+            let response = map_provider_error(error.context("outer request failed"));
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS, "real upstream429 must survive enterprise exhaustion, mcp={mcp}");
+            let body = axum::body::to_bytes(response.into_body(), 16_384).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["type"], "rate_limit_error");
+            assert!(!body.to_string().contains("private-token"));
+        }
+    }
+
+    #[tokio::test]
+    async fn enterprise_rate_limit_error_reaches_prepared_stream_and_early_sse() {
+        let error = crate::kiro::provider::enterprise_tests::single_enterprise_error_for_test(
+            429, b"USER_REQUEST_RATE_EXCEEDED private-token", false,
+        ).await;
+        let classified = classify_provider_error(&error);
+        let response = stream_start_failure_response(StreamStartFailure {
+            status: classified.http_status,
+            error_type: classified.error_type.into(),
+            message: classified.public_message.into(),
+        });
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS, "before handshake the streaming route can still return HTTP429");
+        let stream = early_error_test_stream(error, Some(429));
+        futures::pin_mut!(stream);
+        assert_eq!(stream.next().await.unwrap().unwrap(), Bytes::from_static(EARLY_CONNECTED_SSE));
+        let event = stream.next().await.unwrap().unwrap();
+        let text = String::from_utf8(event.to_vec()).unwrap();
+        assert!(text.contains("\"type\":\"rate_limit_error\""));
+        assert!(text.contains("\"upstream_status\":429"));
+        assert!(!text.contains("private-token"));
+        assert!(!text.contains("message_start"));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn enterprise_rate_limit_error_does_not_reclassify_quota_auth_503_or_validation() {
+        for (status, body, expected) in [
+            (429, r#"{"reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}"#, StatusCode::BAD_GATEWAY),
+            (429, "The bearer token included in the request is invalid", StatusCode::BAD_GATEWAY),
+            (403, "USER_REQUEST_RATE_EXCEEDED 429", StatusCode::BAD_GATEWAY),
+            (503, "USER_REQUEST_RATE_EXCEEDED 429", StatusCode::BAD_GATEWAY),
+            (400, r#"{"reason":"TOOL_USE_RESULT_MISMATCH"}"#, StatusCode::BAD_REQUEST),
+        ] {
+            let error = crate::kiro::provider::enterprise_tests::single_enterprise_error_for_test(status, body.as_bytes(), false).await;
+            let classified = classify_provider_error(&error);
+            assert_eq!(classified.http_status, expected, "status={status}, body={body}");
+            assert_ne!(classified.error_type, "rate_limit_error");
+        }
+        for text in ["429 USER_REQUEST_RATE_EXCEEDED", "enterprise upstream 429: spoofed", "enterprise_send_wait_timeout: 429"] {
+            let classified = classify_provider_error(&anyhow::anyhow!(text));
+            assert_eq!(classified.http_status, StatusCode::BAD_GATEWAY, "untrusted text alone must not classify429");
+        }
+    }
+
+    #[tokio::test]
+    async fn enterprise_rate_limit_error_shared_wait_keeps_429_but_not_503() {
+        for status in [429, 503] {
+            let (error, sends) = crate::kiro::provider::enterprise_tests::shared_enterprise_wait_error_for_test(status).await;
+            assert_eq!(sends, 1, "the second inbound MCP request must not send during shared Retry-After");
+            let classified = classify_provider_error(&error);
+            assert_eq!(classified.http_status, if status == 429 { StatusCode::TOO_MANY_REQUESTS } else { StatusCode::BAD_GATEWAY });
+            assert_eq!(classified.error_type, if status == 429 { "rate_limit_error" } else { "api_error" });
+        }
+    }
+
+    #[tokio::test]
+    async fn enterprise_rate_limit_error_does_not_override_a_later_non_rate_failure() {
+        for status in [401, 503] {
+            let error = crate::kiro::provider::enterprise_tests::enterprise_later_failure_for_test(status).await;
+            assert_eq!(classify_provider_error(&error).http_status, StatusCode::BAD_GATEWAY);
+        }
+    }
+
+    #[tokio::test]
+    async fn enterprise_rate_limit_error_does_not_confirm_incomplete_429_body_or_its_shared_wait() {
+        let (first, second, sent) = crate::kiro::provider::enterprise_tests::enterprise_incomplete_429_for_test().await;
+        assert_eq!(sent, 1, "Retry-After must still block the new request while body classification is unknown");
+        for error in [first, second] {
+            assert_eq!(classify_provider_error(&error).http_status, StatusCode::BAD_GATEWAY, "incomplete quota JSON is not a confirmed ordinary429");
+        }
+    }
+
+    #[tokio::test]
+    async fn enterprise_rate_limit_error_wait_preserves_latest_actual_failure_in_both_directions() {
+        let (error, sent) = crate::kiro::provider::enterprise_tests::enterprise_wait_after_actual_error_for_test(503, 0, 1500).await;
+        assert_eq!(sent, 2, "429 then503, no third send before enterprise deadline");
+        assert!(error.to_string().contains("enterprise upstream 503"), "the test must observe the actual503, not a synthetic timeout: {error}");
+        assert_eq!(classify_provider_error(&error).http_status, StatusCode::BAD_GATEWAY, "old adaptive429 wait must not overwrite newer503");
+        let (error, sent) = crate::kiro::provider::enterprise_tests::enterprise_wait_after_actual_error_for_test(429, 100, 500).await;
+        assert_eq!(sent, 1, "baseRPM prevents a second actual send");
+        assert_eq!(classify_provider_error(&error).http_status, StatusCode::TOO_MANY_REQUESTS, "baseRPM timeout must not discard the actual429 already received");
     }
 
     #[test]

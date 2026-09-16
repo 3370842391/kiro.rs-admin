@@ -1,6 +1,7 @@
 import axios from 'axios'
 import { storage } from '@/lib/storage'
 import type {
+  EnterpriseRetrySettings,
   CredentialsStatusResponse,
   BalanceResponse,
   AvailableModelsResponse,
@@ -635,7 +636,9 @@ export interface EndpointChainsConfig {
   sameEndpointAttempts: number
   enterpriseSpecialHandling: boolean
   enterpriseDefaultEndpoint: string
+  /** 最大真实企业发送次数，含首次；同时受备用尝试上限 + 1 和总等待限制。 */
   enterpriseMaxRetries: number
+  enterpriseRetry: EnterpriseRetrySettings
 }
 
 export interface SetEndpointChainsRequest {
@@ -652,6 +655,7 @@ export interface SetEndpointChainsRequest {
   enterpriseSpecialHandling?: boolean
   enterpriseDefaultEndpoint?: string
   enterpriseMaxRetries?: number
+  enterpriseRetry?: EnterpriseRetrySettings
 }
 
 export async function getEndpointChains(): Promise<EndpointChainsConfig> {

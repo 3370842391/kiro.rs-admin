@@ -7,7 +7,10 @@
 
 use reqwest::{Client, header};
 use sha2::{Digest as _, Sha256};
+use bytes::Bytes;
+use futures::stream::{self, Stream, StreamExt};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -19,7 +22,7 @@ use crate::admin::trace_db::{
 use crate::anthropic::converter::normalize_model_id;
 use crate::http_client::{ProxyConfig, build_client_with_read_timeout};
 use crate::kiro::endpoint::rate_limit::{
-    apply_bucket_mode, enterprise_ide_runtime_hop, flip_ide_runtime, resolve_primary_endpoint,
+    apply_bucket_mode, resolve_primary_endpoint,
     stay_on_same_endpoint,
 };
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
@@ -38,6 +41,25 @@ use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::{EndpointMode, RetryMode, RetryPolicy, TlsBackend};
 use crate::wholesale::health::AccountHealth;
 use parking_lot::{Mutex, RwLock};
+
+mod enterprise;
+pub use enterprise::EnterpriseRequestControl;
+use enterprise::{EnterprisePhaseResult, EnterprisePolicy};
+
+/// 仅由企业路径已确认的普通 HTTP429 或其共享等待产生，不能由上游正文伪造。
+#[derive(Debug)]
+pub(crate) struct EnterpriseRateLimitError;
+
+impl std::fmt::Display for EnterpriseRateLimitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("enterprise upstream request rate limited")
+    }
+}
+
+impl std::error::Error for EnterpriseRateLimitError {}
+
+#[cfg(test)]
+pub(crate) mod enterprise_tests;
 
 /// 每个凭据的最大重试次数
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
@@ -271,8 +293,46 @@ impl ClientCache {
 /// API 调用结果，附带本次实际命中的上游凭据 ID（用于用量统计）
 pub struct KiroCallResult {
     pub response: reqwest::Response,
+    /// 企业号专项等首字节时已经读走的 body 前缀，消费时必须拼回。
+    pub body_prefix: Option<Bytes>,
     pub credential_id: u64,
+    in_flight: Option<crate::kiro::token_manager::InFlightGuard>,
+    terminal_prefix: bool,
 }
+
+impl KiroCallResult {
+    pub fn into_byte_stream(self) -> impl Stream<Item = Result<Bytes, reqwest::Error>> {
+        let prefix = self.body_prefix;
+        let rest = if self.terminal_prefix {
+            drop(self.response);
+            stream::empty().boxed()
+        } else { self.response.bytes_stream().boxed() };
+        let held = self.in_flight;
+        stream::unfold((Box::pin(stream::iter(prefix.map(Ok)).chain(rest)), held), |(mut stream, held)| async move {
+            stream.next().await.map(|item| (item, (stream, held)))
+        })
+    }
+
+    pub async fn collect_bytes(self) -> Result<Bytes, reqwest::Error> {
+        let _held = self.in_flight;
+        let rest = if self.terminal_prefix { Bytes::new() } else { self.response.bytes().await? };
+        Ok(match self.body_prefix {
+            Some(prefix) if !prefix.is_empty() => {
+                let mut out = bytes::BytesMut::with_capacity(prefix.len() + rest.len());
+                out.extend_from_slice(&prefix);
+                out.extend_from_slice(&rest);
+                out.freeze()
+            }
+            _ => rest,
+        })
+    }
+
+    fn with_permit(mut self, permit: crate::kiro::token_manager::InFlightGuard) -> Self {
+        self.in_flight = Some(permit);
+        self
+    }
+}
+
 
 /// Admin 手动响应测试结果。
 pub struct CredentialTestResult {
@@ -447,6 +507,8 @@ pub struct KiroProvider {
     profile_resolution_attempted: Mutex<HashSet<u64>>,
     model_catalog: DynamicModelCatalog,
     image_budget_policy: RwLock<ImageBudgetPolicy>,
+    /// 企业号专项：跨请求轮询四个独立桶的起点下标。
+    enterprise_rr_seq: AtomicU32,
 }
 
 impl KiroProvider {
@@ -578,6 +640,7 @@ impl KiroProvider {
             profile_resolution_attempted: Mutex::new(HashSet::new()),
             model_catalog: DynamicModelCatalog::default(),
             image_budget_policy: RwLock::new(image_budget_policy),
+            enterprise_rr_seq: AtomicU32::new(0),
         }
     }
 
@@ -886,12 +949,8 @@ impl KiroProvider {
         }
     }
 
-    /// 用指定 endpoint 构造并发送一次 API 请求，返回原始响应（不读取 body）。
-    ///
-    /// 从 `call_api_with_retry` 抽出，供主端点与 429 降级后的备用端点共用：
-    /// 两者除 endpoint 实现不同外，凭据 / token / machineId / 请求体来源完全一致。
-    /// 仅负责「构造 URL/body/header → execute」，成功/失败语义由调用方处理。
-    async fn execute_api_request(
+    /// 完成同步请求准备，供企业路径在真正发送前取得共享节奏许可。
+    fn prepare_api_request(
         &self,
         endpoint: &Arc<dyn KiroEndpoint>,
         ctx: &crate::kiro::token_manager::CallContext,
@@ -903,7 +962,7 @@ impl KiroProvider {
         attempt: u32,
         request_attempt: u32,
         request_attempt_max: u32,
-    ) -> anyhow::Result<reqwest::Response> {
+    ) -> anyhow::Result<(Client, reqwest::Request)> {
         let rctx = RequestContext {
             credentials: &ctx.credentials,
             token: &ctx.token,
@@ -992,9 +1051,44 @@ impl KiroProvider {
                 );
             }
         }
+        Ok((client, request))
+    }
+
+    /// 用指定 endpoint 构造并发送一次 API 请求，不读取响应体。
+    /// 普通路径与企业路径共用请求准备，成功/失败语义仍由调用方处理。
+    async fn execute_api_request(
+        &self,
+        endpoint: &Arc<dyn KiroEndpoint>,
+        ctx: &crate::kiro::token_manager::CallContext,
+        machine_id: &str,
+        config: &crate::model::config::Config,
+        request_body: &str,
+        proxy: Option<ProxyConfig>,
+        sink: Option<&dyn TraceSink>,
+        attempt: u32,
+        request_attempt: u32,
+        request_attempt_max: u32,
+    ) -> anyhow::Result<reqwest::Response> {
+        let (client, request) = self.prepare_api_request(
+            endpoint,
+            ctx,
+            machine_id,
+            config,
+            request_body,
+            proxy,
+            sink,
+            attempt,
+            request_attempt,
+            request_attempt_max,
+        )?;
         let header_timeout_secs = self.stream_idle_timeout_secs();
         let header_timeout =
             (header_timeout_secs > 0).then(|| Duration::from_secs(header_timeout_secs));
+        if let Some(control) = sink.and_then(TraceSink::enterprise_request_control) {
+            let upstream_call_seq = control.note_upstream_send();
+            tracing::info!(upstream_call_seq, credential_id = ctx.id,
+                endpoint = endpoint.name(), "实际发送上游请求");
+        }
         match await_response_headers(client.execute(request), header_timeout).await {
             Ok(response) => Ok(response),
             Err(error) => {
@@ -1112,6 +1206,7 @@ impl KiroProvider {
         machine_id: &str,
         config: &crate::model::config::Config,
         request_body: &str,
+        sink: Option<&dyn TraceSink>,
     ) -> anyhow::Result<ProxyAttemptResult> {
         let rctx = RequestContext {
             credentials: &ctx.credentials,
@@ -1148,6 +1243,10 @@ impl KiroProvider {
                 .header("content-type", endpoint.content_type())
                 .header("Connection", "close");
             let request = endpoint.decorate_mcp(base, &rctx);
+            if let Some(control) = sink.and_then(TraceSink::enterprise_request_control) {
+                let upstream_call_seq = control.note_upstream_send();
+                tracing::info!(upstream_call_seq, credential_id = ctx.id, endpoint = endpoint.name(), "实际发送 MCP 请求");
+            }
             let header_timeout_secs = self.stream_idle_timeout_secs();
             let header_timeout =
                 (header_timeout_secs > 0).then(|| Duration::from_secs(header_timeout_secs));
@@ -1193,15 +1292,11 @@ impl KiroProvider {
 
     /// 根据凭据选择 endpoint 实现
 
-    /// 企业号专项：一旦打到企业号并 429，钉死本号，只在 ide/runtime 换桶，不换其它号。
-    fn should_pin_enterprise_on_429(&self, credentials: &KiroCredentials) -> bool {
-        self.token_manager.enterprise_special_handling_enabled()
-            && credentials.is_enterprise_credential()
-    }
-
-    fn expand_pinned_enterprise_budget(&self, attempt: usize, max_retries: &mut usize) {
-        let budget = self.token_manager.enterprise_max_retries() as usize;
-        *max_retries = (*max_retries).max(attempt.saturating_add(budget));
+    #[cfg(test)]
+    fn take_enterprise_rr_node(&self) -> &'static str {
+        let default = self.token_manager.get_enterprise_default_endpoint();
+        let index = self.enterprise_rr_seq.fetch_add(1, Ordering::Relaxed);
+        crate::kiro::endpoint::rate_limit::enterprise_node_from_default(default.as_str(), index)
     }
 
     fn endpoint_for(
@@ -1352,8 +1447,20 @@ impl KiroProvider {
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
-    pub async fn call_mcp(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_mcp_with_retry(request_body).await
+    pub async fn call_mcp(&self, request_body: &str) -> anyhow::Result<KiroCallResult> {
+        self.call_mcp_traced(request_body, None, None).await
+    }
+
+    pub async fn call_mcp_traced(&self, request_body: &str, sink: Option<&dyn TraceSink>, group: Option<&str>) -> anyhow::Result<KiroCallResult> {
+        let local_control = EnterpriseRequestControl::default();
+        let control = sink.and_then(TraceSink::enterprise_request_control).unwrap_or(&local_control);
+        let policy = control.policy(self, None, group)?;
+        control.clear_accepted();
+        let call = self.call_mcp_with_retry(request_body, policy.as_ref(), control, sink, group);
+        if let Some(policy) = &policy {
+            tokio::time::timeout_at(policy.deadline, call).await
+                .map_err(|_| anyhow::anyhow!("enterprise_request_timeout: MCP 总等待预算耗尽"))?
+        } else { call.await }
     }
 
     /// 使用指定凭据发送一次 `hello` 响应测试，不参与凭据故障转移。
@@ -1443,34 +1550,41 @@ impl KiroProvider {
     }
 
     /// 内部方法：带重试逻辑的 MCP API 调用
-    async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        let total_credentials = self.token_manager.total_count();
+    async fn call_mcp_with_retry(&self, request_body: &str, policy: Option<&EnterprisePolicy>, control: &EnterpriseRequestControl,
+        sink: Option<&dyn TraceSink>, group: Option<&str>) -> anyhow::Result<KiroCallResult> {
+        let total_credentials = self.token_manager.total_count_in_group(group).max(1);
         let (retry_mode, retry_policy) = self.effective_retry_policy()?;
         let mut max_retries = Self::max_retries(total_credentials, retry_mode, &retry_policy);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let mut request_throttled_ids: HashSet<u64> = HashSet::new();
-        let mut pinned_enterprise_id: Option<u64> = None;
         // 会话级 RPM 记账去重（同 call_api_with_retry）
         let mut rpm_recorded: HashSet<u64> = HashSet::new();
 
         for attempt in 0..usize::MAX {
-            if attempt >= max_retries {
-                break;
-            }
-            // MCP 调用（WebSearch 等工具）不涉及模型选择，也不参与分组隔离
-            let ctx_result = if let Some(id) = pinned_enterprise_id {
-                self.token_manager.acquire_context_for_id(id).await
-            } else if request_throttled_ids.is_empty() {
-                self.token_manager.acquire_context(None, None).await
-            } else {
-                self.token_manager
-                    .acquire_context_excluding(None, None, &request_throttled_ids)
-                    .await
-            };
+            if attempt >= max_retries { break; }
+            let attempt_start = Instant::now();
+            let mut excluded = request_throttled_ids.clone();
+            if control.finished.load(Ordering::Relaxed) { excluded.extend(self.token_manager.enterprise_credential_ids()); }
+            let acquiring = self.token_manager.acquire_context_excluding(None, group, &excluded);
+            let ctx_result = if let Some(policy) = policy.filter(|_| !control.finished.load(Ordering::Relaxed)) {
+                match tokio::time::timeout_at(policy.enterprise_deadline, acquiring).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        control.finished.store(true, Ordering::Relaxed);
+                        max_retries = attempt + 1 + Self::max_retries(total_credentials, retry_mode, &retry_policy);
+                        last_error = Some(anyhow::anyhow!("enterprise_prepare_timeout"));
+                        continue;
+                    }
+                }
+            } else { acquiring.await };
             let ctx = match ctx_result {
                 Ok(c) => c,
                 Err(e) => {
+                    if control.finished.load(Ordering::Relaxed) {
+                        if last_error.is_none() { last_error = Some(e); }
+                        break;
+                    }
                     last_error = Some(e);
                     continue;
                 }
@@ -1483,6 +1597,22 @@ impl KiroProvider {
                 self.token_manager.record_request(ctx.id);
             }
 
+            if let Some(policy) = policy.filter(|_| ctx.credentials.is_enterprise_credential()) {
+                match tokio::time::timeout_at(policy.enterprise_deadline,
+                    self.run_enterprise_phase(&ctx, request_body, sink, policy, control, true)).await {
+                    Ok(EnterprisePhaseResult::Accepted(result)) => {
+                        if sink.is_none() { control.complete(true); }
+                        return Ok(result.with_permit(_in_flight));
+                    }
+                    Ok(EnterprisePhaseResult::Rejected(error)) => return Err(error),
+                    other => {
+                        control.finished.store(true, Ordering::Relaxed);
+                        last_error = Some(match other { Ok(EnterprisePhaseResult::Failover(error)) => error, _ => anyhow::anyhow!("enterprise_mcp_phase_timeout") });
+                        max_retries = attempt + 1 + Self::max_retries(total_credentials, retry_mode, &retry_policy);
+                        continue;
+                    }
+                }
+            }
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
 
@@ -1503,6 +1633,7 @@ impl KiroProvider {
                     &machine_id,
                     config,
                     request_body,
+                    sink,
                 )
                 .await
             {
@@ -1514,6 +1645,7 @@ impl KiroProvider {
                         max_retries,
                         e
                     );
+                    Self::emit_attempt(sink, attempt, ctx.id, endpoint.name(), None, outcome::NETWORK_ERROR, Some(&e.to_string()), attempt_start);
                     last_error = Some(e);
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
@@ -1530,12 +1662,20 @@ impl KiroProvider {
 
             // 成功响应
             if status.is_success() {
+                let deadline = policy.map(|policy| policy.deadline).unwrap_or_else(|| {
+                    let idle = self.stream_idle_timeout_secs();
+                    tokio::time::Instant::now() + Duration::from_secs(if idle == 0 { 720 } else { idle.min(720) })
+                });
+                let accepted = enterprise::mcp_success(response, ctx.id, deadline).await?;
+                Self::emit_attempt(sink, attempt, ctx.id, endpoint.name(), Some(status.as_u16()), outcome::SUCCESS, None, attempt_start);
                 self.token_manager.report_success(ctx.id);
-                return Ok(response);
+                return Ok(accepted.with_permit(_in_flight));
             }
 
             // 失败响应
             let body = response.text().await.unwrap_or_default();
+            Self::emit_attempt(sink, attempt, ctx.id, endpoint.name(), Some(status.as_u16()),
+                if endpoint.is_monthly_request_limit(&body) { outcome::QUOTA_EXHAUSTED } else { outcome::TRANSIENT }, Some(&body), attempt_start);
 
             // 额度用尽：只认响应体 `reason`，不绑状态码（上游用过 402，现在是 400）。
             // 必须排在下方 400 分支之前，否则永远轮不到。
@@ -1591,8 +1731,7 @@ impl KiroProvider {
                     let switch_on_ordinary_429 =
                         retry_mode == RetryMode::Failover || retry_policy.credential_switch_on_429;
                     if switch_on_ordinary_429 {
-                        let pin_enterprise = self.should_pin_enterprise_on_429(&ctx.credentials);
-                        if !pin_enterprise {
+                        {
                             request_throttled_ids.insert(ctx.id);
                             if self.token_manager.has_available_excluding(
                                 None,
@@ -1627,15 +1766,6 @@ impl KiroProvider {
                             } else if retry_mode != RetryMode::Failover {
                                 request_throttled_ids.clear();
                             }
-                        } else {
-                            pinned_enterprise_id = Some(ctx.id);
-                            request_throttled_ids.remove(&ctx.id);
-                            self.expand_pinned_enterprise_budget(attempt, &mut max_retries);
-                            tracing::info!(
-                                "MCP 企业号专项：凭据 #{} 429，钉死本号继续退避，不换其它号（预算 {}）",
-                                ctx.id,
-                                max_retries
-                            );
                         }
                     }
                 }
@@ -1691,6 +1821,24 @@ impl KiroProvider {
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
+        let local_control = EnterpriseRequestControl::default();
+        let control = sink.and_then(TraceSink::enterprise_request_control).unwrap_or(&local_control);
+        let requested_model = Self::extract_model_from_request(request_body);
+        let policy = control.policy(self, requested_model.as_deref(), group)?;
+        control.clear_accepted();
+        let call = self.call_api_attempts(request_body, is_stream, sink, group, policy.as_ref(), control);
+        if let Some(policy) = &policy {
+            tokio::time::timeout_at(policy.deadline, call).await
+                .map_err(|_| anyhow::anyhow!("enterprise_request_timeout: 请求总等待预算已耗尽"))?
+        } else {
+            call.await
+        }
+    }
+
+    async fn call_api_attempts(
+        &self, request_body: &str, is_stream: bool, sink: Option<&dyn TraceSink>, group: Option<&str>,
+        enterprise_policy: Option<&EnterprisePolicy>, control: &EnterpriseRequestControl,
+    ) -> anyhow::Result<KiroCallResult> {
         // 重试预算按当前请求所属分组的账号数计算，避免小分组按全局账号数获得过多无效重试
         let total_credentials = self.token_manager.total_count_in_group(group).max(1);
         let (retry_mode, retry_policy) = self.effective_retry_policy()?;
@@ -1702,8 +1850,6 @@ impl KiroProvider {
         // 会话级 RPM 记账去重：同一凭据在本会话（含 429 重试）只记 1 次 tick；
         // 故障转移到不同凭据时各记 1 次。
         let mut rpm_recorded: HashSet<u64> = HashSet::new();
-        let mut pinned_enterprise_id: Option<u64> = None;
-        let mut enterprise_force_endpoint: Option<String> = None;
         let api_type = if is_stream { "流式" } else { "非流式" };
 
         // 单请求内「备用桶尝试」总次数（跨 attempt 累计），受 max_bucket_attempts_per_request 限制，
@@ -1717,27 +1863,32 @@ impl KiroProvider {
             .map(|conversation_id| format!("{}\0{}", group.unwrap_or_default(), conversation_id));
 
         'attempts: for attempt in 0..usize::MAX {
-            if attempt >= max_retries {
-                break;
-            }
+            if attempt >= max_retries { break; }
             let attempt_start = Instant::now();
             let mut excluded_ids = request_throttled_ids.clone();
             excluded_ids.extend(model_incompatible_ids.iter().copied());
-            // 企业号专项一旦钉死，后续重试只拿这张号，不再走负载均衡换号。
-            let mut ctx = match if let Some(id) = pinned_enterprise_id {
-                self.token_manager.acquire_context_for_id(id).await
-            } else {
-                self.token_manager
-                    .acquire_context_excluding_with_affinity(
-                        model.as_deref(),
-                        group,
-                        &excluded_ids,
-                        affinity_key.as_deref(),
-                    )
-                    .await
-            } {
+            if control.finished.load(Ordering::Relaxed) {
+                excluded_ids.extend(self.token_manager.enterprise_credential_ids());
+            }
+            let acquiring = self.token_manager.acquire_context_excluding_with_affinity(model.as_deref(), group, &excluded_ids, affinity_key.as_deref());
+            let acquired = if let Some(policy) = enterprise_policy.filter(|_| !control.finished.load(Ordering::Relaxed)) {
+                match tokio::time::timeout_at(policy.enterprise_deadline, acquiring).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        control.finished.store(true, Ordering::Relaxed);
+                        max_retries = attempt + 1 + Self::max_retries(total_credentials, retry_mode, &retry_policy);
+                        last_error = Some(anyhow::anyhow!("enterprise_prepare_timeout"));
+                        continue;
+                    }
+                }
+            } else { acquiring.await };
+            let mut ctx = match acquired {
                 Ok(c) => c,
                 Err(e) => {
+                    if control.finished.load(Ordering::Relaxed) {
+                        if last_error.is_none() { last_error = Some(e); }
+                        break;
+                    }
                     Self::emit_attempt(
                         sink,
                         attempt,
@@ -1761,11 +1912,25 @@ impl KiroProvider {
                 self.token_manager.record_request(ctx.id);
             }
 
-            // 确保 Enterprise / IdC 账号的真实 profileArn 已解析（流式端点强制要求）
-            self.ensure_profile_arn(&mut ctx).await;
-
+            let is_enterprise = ctx.credentials.is_enterprise_credential();
+            let preparation = async {
+                self.ensure_profile_arn(&mut ctx).await;
+                if let Some(model) = model.as_deref() { self.model_availability_for(ctx.id, model).await }
+                else { ModelAvailability::Unknown }
+            };
+            let availability = if let Some(policy) = enterprise_policy.filter(|_| is_enterprise) {
+                match tokio::time::timeout_at(policy.enterprise_deadline, preparation).await {
+                    Ok(availability) => availability,
+                    Err(_) => {
+                        control.finished.store(true, Ordering::Relaxed);
+                        max_retries = attempt + 1 + Self::max_retries(total_credentials, retry_mode, &retry_policy);
+                        last_error = Some(anyhow::anyhow!("enterprise_prepare_timeout"));
+                        continue;
+                    }
+                }
+            } else { preparation.await };
             if let Some(model) = model.as_deref()
-                && self.model_availability_for(ctx.id, model).await == ModelAvailability::Missing
+                && availability == ModelAvailability::Missing
             {
                 tracing::warn!(
                     credential_id = ctx.id,
@@ -1773,10 +1938,6 @@ impl KiroProvider {
                     "当前凭据不提供目标模型，切换凭据"
                 );
                 model_incompatible_ids.insert(ctx.id);
-                if pinned_enterprise_id == Some(ctx.id) {
-                    pinned_enterprise_id = None;
-                    enterprise_force_endpoint = None;
-                }
                 last_error = Some(anyhow::anyhow!(
                     "MODEL_NOT_AVAILABLE: credential #{} does not provide {}",
                     ctx.id,
@@ -1790,12 +1951,35 @@ impl KiroProvider {
                 continue;
             }
 
+            if let Some(policy) = enterprise_policy.filter(|_| ctx.credentials.is_enterprise_credential()) {
+                let phase = tokio::time::timeout_at(policy.enterprise_deadline,
+                    self.run_enterprise_phase(&ctx, request_body, sink, policy, control, false)).await;
+                match phase {
+                    Ok(EnterprisePhaseResult::Accepted(result)) => {
+                        self.token_manager.confirm_session_affinity(affinity_key.as_deref(), ctx.id);
+                        return Ok(result.with_permit(_in_flight));
+                    }
+                    Ok(EnterprisePhaseResult::Rejected(error)) => return Err(error),
+                    other => {
+                        control.finished.store(true, Ordering::Relaxed);
+                        request_throttled_ids.extend(self.token_manager.enterprise_credential_ids());
+                        self.token_manager.release_session_affinity(affinity_key.as_deref(), ctx.id);
+                        last_error = Some(match other {
+                            Ok(EnterprisePhaseResult::Failover(error)) => error,
+                            _ => anyhow::anyhow!("enterprise_phase_timeout"),
+                        });
+                        max_retries = attempt.saturating_add(1).saturating_add(Self::max_retries(total_credentials, retry_mode, &retry_policy));
+                        continue;
+                    }
+                }
+            }
+
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
 
             let endpoint = match self.endpoint_for(
                 &ctx.credentials,
-                enterprise_force_endpoint.as_deref(),
+                None,
             ) {
                 Ok(e) => e,
                 Err(e) => {
@@ -1859,39 +2043,14 @@ impl KiroProvider {
             };
             let selected_proxy = attempt_result.proxy.clone();
             let response = attempt_result.response;
-
             let status = response.status();
             let retry_after = Self::retry_after_delay(response.headers(), &retry_policy);
-
-            // 成功响应
             if status.is_success() {
-                tracing::info!(
-                    "API 请求成功：凭据 #{} 端点 [{}]（尝试 {}/{}）",
-                    ctx.id,
-                    endpoint_name,
-                    attempt + 1,
-                    max_retries
-                );
-                Self::emit_attempt(
-                    sink,
-                    attempt,
-                    ctx.id,
-                    endpoint_name,
-                    Some(status.as_u16()),
-                    outcome::SUCCESS,
-                    None,
-                    attempt_start,
-                );
+                Self::emit_attempt(sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()), outcome::SUCCESS, None, attempt_start);
                 self.token_manager.report_success(ctx.id);
-                self.token_manager
-                    .confirm_session_affinity(affinity_key.as_deref(), ctx.id);
-                return Ok(KiroCallResult {
-                    response,
-                    credential_id: ctx.id,
-                });
+                self.token_manager.confirm_session_affinity(affinity_key.as_deref(), ctx.id);
+                return Ok(KiroCallResult { response, credential_id: ctx.id, body_prefix: None, terminal_prefix: false, in_flight: Some(_in_flight) });
             }
-
-            // 失败响应：读取 body 用于日志/错误信息
             let body = response.text().await.unwrap_or_default();
             if let Some(sink) = sink {
                 sink.on_diagnostic(TraceDiagnosticEvent::UpstreamResponse {
@@ -2085,45 +2244,34 @@ impl KiroProvider {
                 let account_throttled = status.as_u16() == 429
                     && self.token_manager.get_account_throttle_failover()
                     && endpoint.is_account_throttled(&body);
-                Self::emit_attempt(
-                    sink,
-                    attempt,
-                    ctx.id,
-                    endpoint_name,
-                    Some(status.as_u16()),
-                    if account_throttled {
-                        outcome::ACCOUNT_THROTTLED
-                    } else {
-                        outcome::TRANSIENT
-                    },
-                    Some(&body),
-                    attempt_start,
-                );
+                    Self::emit_attempt(
+                        sink,
+                        attempt,
+                        ctx.id,
+                        endpoint_name,
+                        Some(status.as_u16()),
+                        if account_throttled {
+                            outcome::ACCOUNT_THROTTLED
+                        } else {
+                            outcome::TRANSIENT
+                        },
+                        Some(&body),
+                        attempt_start,
+                    );
 
                 // 沿降级链依次尝试每个备用桶（换桶不换号），命中第一个 2xx 即返回；
                 // 整条链都失败才落回下方的账号风控/瞬态重试逻辑。参考 demo 的多端点重试。
                 //
-                // 企业号专项：无视全局 same-endpoint，强制 ide ↔ runtime。
-                // 其它账号：降级链来源见 resolve_fallback_chain：面板覆盖 > best 内置链 > 静态链。
-                let pin_enterprise = self.should_pin_enterprise_on_429(&ctx.credentials);
-                let fallback_chain: Vec<String> = if pin_enterprise {
-                    enterprise_ide_runtime_hop(endpoint.name())
-                } else {
-                    apply_bucket_mode(
-                        self.token_manager.get_rate_limit_bucket_mode(),
-                        resolve_fallback_chain(
-                            endpoint.name(),
-                            endpoint.fallback_chain(),
-                            self.token_manager.endpoint_chain_for(endpoint.name()),
-                            self.token_manager.get_endpoint_mode(),
-                        ),
-                    )
-                };
+                // 普通账号降级链：面板覆盖 > best 内置链 > 静态链。
+                let fallback_chain = apply_bucket_mode(
+                    self.token_manager.get_rate_limit_bucket_mode(),
+                    resolve_fallback_chain(endpoint.name(), endpoint.fallback_chain(),
+                        self.token_manager.endpoint_chain_for(endpoint.name()), self.token_manager.get_endpoint_mode()),
+                );
                 for fb_name in &fallback_chain {
                     // 单请求桶尝试总数硬上限（跨 attempt 累计）：防止「链长 × attempt 数」
                     // 把单请求放大成上百次上游调用。0 = 不限。
-                    if !pin_enterprise
-                        && max_bucket_attempts > 0
+                    if max_bucket_attempts > 0
                         && bucket_attempts >= max_bucket_attempts
                     {
                         tracing::warn!(
@@ -2162,29 +2310,10 @@ impl KiroProvider {
                     {
                         Ok(fb_resp) if fb_resp.status().is_success() => {
                             let fb_status = fb_resp.status();
-                            Self::emit_attempt(
-                                sink,
-                                attempt,
-                                ctx.id,
-                                fb_name,
-                                Some(fb_status.as_u16()),
-                                outcome::SUCCESS,
-                                None,
-                                fb_start,
-                            );
+                            Self::emit_attempt(sink, attempt, ctx.id, fb_name, Some(fb_status.as_u16()), outcome::SUCCESS, None, fb_start);
                             self.token_manager.report_success(ctx.id);
-                            self.token_manager
-                                .confirm_session_affinity(affinity_key.as_deref(), ctx.id);
-                            tracing::info!(
-                                "凭据 #{} 在备用端点 [{}] 成功（主端点 [{}] 此前 429）",
-                                ctx.id,
-                                fb_name,
-                                endpoint_name
-                            );
-                            return Ok(KiroCallResult {
-                                response: fb_resp,
-                                credential_id: ctx.id,
-                            });
+                            self.token_manager.confirm_session_affinity(affinity_key.as_deref(), ctx.id);
+                            return Ok(KiroCallResult { response: fb_resp, credential_id: ctx.id, body_prefix: None, terminal_prefix: false, in_flight: Some(_in_flight) });
                         }
                         Ok(fb_resp) => {
                             let fb_status = fb_resp.status();
@@ -2311,7 +2440,6 @@ impl KiroProvider {
                 let max_same = self.token_manager.same_endpoint_attempts();
                 if status.as_u16() == 429
                     && !account_throttled
-                    && !pin_enterprise
                     && stay_on_same_endpoint(bucket_mode, 1, max_same, false)
                 {
                     for same_try in 2..=max_same {
@@ -2360,6 +2488,8 @@ impl KiroProvider {
                                     .confirm_session_affinity(affinity_key.as_deref(), ctx.id);
                                 return Ok(KiroCallResult {
                                     response: retry_result.response,
+                                    body_prefix: None,
+                                    terminal_prefix: false, in_flight: Some(_in_flight),
                                     credential_id: ctx.id,
                                 });
                             }
@@ -2392,19 +2522,7 @@ impl KiroProvider {
                             .release_session_affinity(affinity_key.as_deref(), ctx.id);
                     }
                 }
-                if status.as_u16() == 429 && !account_throttled && pin_enterprise {
-                    pinned_enterprise_id = Some(ctx.id);
-                    request_throttled_ids.remove(&ctx.id);
-                    enterprise_force_endpoint =
-                        Some(flip_ide_runtime(endpoint_name).to_string());
-                    self.expand_pinned_enterprise_budget(attempt, &mut max_retries);
-                    tracing::info!(
-                        "企业号专项：凭据 #{} 429，钉死本号并改打 [{}]，不换其它号（预算 {}）",
-                        ctx.id,
-                        enterprise_force_endpoint.as_deref().unwrap_or("runtime"),
-                        max_retries
-                    );
-                } else if status.as_u16() == 429 && !account_throttled && switch_on_ordinary_429 {
+                if status.as_u16() == 429 && !account_throttled && switch_on_ordinary_429 {
                         request_throttled_ids.insert(ctx.id);
                         if self.token_manager.has_available_excluding(
                             model.as_deref(),
@@ -2450,7 +2568,6 @@ impl KiroProvider {
             // 429 + suspicious activity = 账号级临时风控
             // 仅当前凭据被针对，故障转移到其它凭据可立即恢复（受配置开关控制）。
             if status.as_u16() == 429
-                && !self.should_pin_enterprise_on_429(&ctx.credentials)
                 && self.token_manager.get_account_throttle_failover()
                 && endpoint.is_account_throttled(&body)
             {
@@ -3339,6 +3456,40 @@ mod tests {
             priority,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn enterprise_rr_walks_four_nodes_from_configured_default() {
+        let mut config = crate::model::config::Config::default();
+        config.enterprise_special_handling = true;
+        config.enterprise_default_endpoint = "runtime".to_string();
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                config,
+                vec![api_key_credential(1, "ksk_enterprise", 0)],
+                None,
+                None,
+                true,
+            )
+            .unwrap(),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert(
+            "ide".to_string(),
+            Arc::new(crate::kiro::endpoint::IdeEndpoint::new()),
+        );
+        let provider = KiroProvider::with_proxy(
+            Arc::clone(&manager),
+            None,
+            endpoints,
+            "ide".to_string(),
+            None,
+        );
+        assert_eq!(provider.take_enterprise_rr_node(), "runtime");
+        assert_eq!(provider.take_enterprise_rr_node(), "amazonq");
+        assert_eq!(provider.take_enterprise_rr_node(), "codewhisperer");
+        assert_eq!(provider.take_enterprise_rr_node(), "ide");
+        assert_eq!(provider.take_enterprise_rr_node(), "runtime");
     }
 
     /// 跑干的号必须当场下线，并把这次请求转移到还有额度的号上。

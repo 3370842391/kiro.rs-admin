@@ -26,7 +26,7 @@ use crate::kiro::image_budget::{
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
-use crate::kiro::provider::KiroProvider;
+use crate::kiro::provider::{KiroCallResult, KiroProvider};
 use crate::token;
 
 use super::converter::{ConversionError, convert_request_with_mode};
@@ -140,13 +140,13 @@ fn should_search_round(round_idx: usize, tool_uses: &[CompletedToolUse]) -> bool
 
 /// Buffer-decode one round of the upstream streaming response
 async fn decode_round(
-    response: reqwest::Response,
+    call_result: KiroCallResult,
     context_window_size: i32,
     tool_name_map: &std::collections::HashMap<String, String>,
     idle_timeout: Option<std::time::Duration>,
     tracer: &RequestTracer,
 ) -> RoundOutcome {
-    let mut body_stream = response.bytes_stream();
+    let mut body_stream = std::pin::pin!(call_result.into_byte_stream());
     let mut decoder = EventStreamDecoder::new();
 
     let mut text = String::new();
@@ -159,9 +159,10 @@ async fn decode_round(
     let mut credits = 0.0;
     let mut stop_reason_override: Option<String> = None;
     let mut stream_error = false;
+    let mut content_filtered = false;
     let mut tool_json_error = None;
 
-    loop {
+    'upstream_read: loop {
         let next = match next_stream_item_with_idle_timeout(&mut body_stream, idle_timeout).await {
             Ok(next) => next,
             Err(()) => {
@@ -171,6 +172,7 @@ async fn decode_round(
             }
         };
         let Some(chunk) = next else {
+            stream_error |= decoder.has_pending_bytes();
             break;
         };
         let chunk = match chunk {
@@ -183,18 +185,21 @@ async fn decode_round(
         };
         if let Err(e) = decoder.feed(&chunk) {
             tracing::warn!("buffer overflow: {}", e);
+            stream_error = true;
+            break;
         }
         for result in decoder.decode_iter() {
             let frame = match result {
                 Ok(f) => f,
                 Err(e) => {
                     tracing::warn!("failed to decode event: {}", e);
-                    continue;
+                    stream_error = true;
+                    break 'upstream_read;
                 }
             };
             let event = match Event::from_frame(frame) {
                 Ok(ev) => ev,
-                Err(_) => continue,
+                Err(_) => { stream_error = true; break 'upstream_read; },
             };
             tracer.observe_upstream_event(&event, context_window_size);
             match event {
@@ -221,12 +226,16 @@ async fn decode_round(
                 Event::Exception { exception_type, .. } => {
                     if exception_type == "ContentLengthExceededException" {
                         stop_reason_override = Some("max_tokens".to_string());
-                    }
+                    } else { stream_error = true; break 'upstream_read; }
                 }
+                Event::Metadata(event) if event.stop_reason.eq_ignore_ascii_case("CONTENT_FILTERED") => content_filtered = true,
+                Event::Error { .. } => { stream_error = true; break 'upstream_read; }
                 _ => {}
             }
         }
     }
+
+    if content_filtered && text.is_empty() && buffers.is_empty() { stream_error = true; }
 
     // Assemble the complete tool_use in order of appearance (restoring the tool_name_map short name)
     for id in order {
@@ -365,7 +374,7 @@ async fn run_round(
     };
     let credential_id = call_result.credential_id;
     let mut outcome = decode_round(
-        call_result.response,
+        call_result,
         context_window_size,
         &conversion.tool_name_map,
         round_idle_timeout(provider.stream_idle_timeout_secs()),
@@ -781,7 +790,7 @@ pub(super) async fn run_web_search_loop(
                 Vec::with_capacity(round.tool_uses.len());
             for tu in &round.tool_uses {
                 let (_id, mcp_request) = websearch::create_mcp_request(&tool_query(tu));
-                match websearch::call_mcp_api(&provider, &mcp_request).await {
+                match websearch::call_mcp_api(&provider, &mcp_request, Some(tracer.as_ref()), group.as_deref()).await {
                     Ok(resp) => searched.push(websearch::parse_search_results(&resp)),
                     Err(e) => {
                         tracing::warn!("web_search MCP call failed: {}", e);
@@ -817,6 +826,8 @@ pub(super) async fn run_web_search_loop(
         // presented as server_tool_use + web_search_tool_result while client tools
         // (exec, etc.) are returned verbatim.
         let search_provider = provider.clone();
+        let search_tracer = tracer.clone();
+        let search_group = group.clone();
         let searched = match search_final_round_after_preflight(
             &round.text,
             &round.tool_uses,
@@ -825,9 +836,11 @@ pub(super) async fn run_web_search_loop(
             &round.tool_contracts,
             move |query| {
                 let provider = search_provider.clone();
+                let tracer = search_tracer.clone();
+                let group = search_group.clone();
                 async move {
                     let (_id, mcp_request) = websearch::create_mcp_request(&query);
-                    let response = websearch::call_mcp_api(&provider, &mcp_request).await?;
+                    let response = websearch::call_mcp_api(&provider, &mcp_request, Some(tracer.as_ref()), group.as_deref()).await?;
                     Ok::<_, anyhow::Error>(websearch::parse_search_results(&response))
                 }
             },

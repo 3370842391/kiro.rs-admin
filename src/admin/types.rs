@@ -4,7 +4,7 @@ use crate::admin::credential_earnings::CredentialEarnings;
 use crate::admin::proxy_ban_stats::{ProxyBanEvent, ProxyBanSummary, ProxyRiskAssessment};
 use crate::admin::proxy_pool::ProxyHealth;
 use crate::admin::proxy_reputation::{ProxyReputation, ReputationGrade};
-use crate::model::config::RetryPolicy;
+use crate::model::config::{EnterpriseRetrySettings, RetryPolicy};
 use serde::{Deserialize, Serialize};
 
 use super::client_keys::{CacheHitRateBounds, ClientResponseMode};
@@ -789,7 +789,7 @@ pub struct EndpointChainsResponse {
     pub defaults: std::collections::HashMap<String, Vec<String>>,
     /// 每个可作为主端点的端点 → 该协议下可选的备用桶清单（前端多选数据源）。
     pub available_buckets: std::collections::HashMap<String, Vec<EndpointBucketOption>>,
-    /// 单请求桶尝试总数硬上限（0 = 不限）。
+    /// 单请求备用尝试上限（0 = 不限）；企业真实发送最多为该值 + 1（含首次）。
     pub max_bucket_attempts_per_request: usize,
     /// 流式空闲超时（秒，0 = 关闭）。上游返回 200 后连续该秒数无字节即主动收尾。
     pub stream_idle_timeout_secs: u64,
@@ -807,23 +807,25 @@ pub struct EndpointChainsResponse {
     pub rate_limit_bucket_mode: String,
     /// 同端点最多尝试次数（含首次）。
     pub same_endpoint_attempts: u32,
-    /// 企业号专项 429：钉死本号，只在 ide/runtime 换桶。
+    /// 企业号专项：企业号优先，429 钉死本号，用尽后同一请求改打个人号。
     pub enterprise_special_handling: bool,
-    /// 企业号未钉端点时的首跳协议（`ide` = q）。
+    /// 企业号启用端点列表的轮询起点（`ide` = q）；未启用时从列表首项开始。
     pub enterprise_default_endpoint: String,
-    /// 企业号专项钉死后最多再打多少轮。
+    /// 最大真实企业发送次数（含首次，默认 32）；还受备用尝试上限 + 1 和总等待限制。
     pub enterprise_max_retries: u32,
+    /// 企业速打启用端点及首事件、总等待超时。
+    pub enterprise_retry: EnterpriseRetrySettings,
 }
 
 /// 更新 429 降级桶链配置
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetEndpointChainsRequest {
-    /// 运行时覆盖。传 null / 省略 = 清除覆盖回退静态默认；传空 map 也等价清除。
+    /// 运行时覆盖。省略保留；显式 null / 空 map 清除覆盖，回退静态默认。
     /// 键 = 主端点名，值 = 有序备用桶名（空数组 = 该主端点不降级）。
-    #[serde(default)]
-    pub chains: Option<std::collections::HashMap<String, Vec<String>>>,
-    /// 单请求桶尝试总数硬上限（0 = 不限）；省略则不改。
+    #[serde(default, deserialize_with = "deserialize_endpoint_chains_patch")]
+    pub chains: Option<Option<std::collections::HashMap<String, Vec<String>>>>,
+    /// 单请求备用尝试上限（0 = 不限）；省略则不改。
     #[serde(default)]
     pub max_bucket_attempts_per_request: Option<usize>,
     /// 流式空闲超时（秒，0 = 关闭）；省略则不改。
@@ -849,12 +851,20 @@ pub struct SetEndpointChainsRequest {
     /// 企业号专项 429。省略则不改。
     #[serde(default)]
     pub enterprise_special_handling: Option<bool>,
-    /// 企业号默认首跳端点。省略则不改。
+    /// 企业号启用列表的轮询起点。省略则不改。
     #[serde(default)]
     pub enterprise_default_endpoint: Option<String>,
-    /// 企业号专项重试次数。省略则不改。
+    /// 最大真实企业发送次数（含首次）。省略则不改。
     #[serde(default)]
     pub enterprise_max_retries: Option<u32>,
+    /// 企业速打设置整体替换；省略则不改。
+    #[serde(default)]
+    pub enterprise_retry: Option<EnterpriseRetrySettings>,
+}
+
+fn deserialize_endpoint_chains_patch<'de, D>(deserializer: D) -> Result<Option<Option<std::collections::HashMap<String, Vec<String>>>>, D::Error>
+where D: serde::Deserializer<'de> {
+    Option::<std::collections::HashMap<String, Vec<String>>>::deserialize(deserializer).map(Some)
 }
 
 /// 全局端点运行模式。
@@ -2456,6 +2466,24 @@ mod tests {
             Some("same-endpoint")
         );
         assert_eq!(request.same_endpoint_attempts, Some(3));
+    }
+
+    #[test]
+    fn enterprise_retry_settings_request_accepts_camel_case_and_omission() {
+        let request: SetEndpointChainsRequest = serde_json::from_value(serde_json::json!({
+            "enterpriseRetry": {
+                "endpoints": ["codewhisperer"],
+                "firstEventTimeoutMs": 500,
+                "totalTimeoutMs": 1500
+            }
+        })).unwrap();
+        assert_eq!(request.enterprise_retry, Some(EnterpriseRetrySettings {
+            endpoints: vec!["codewhisperer".to_string()],
+            first_event_timeout_ms: 500,
+            total_timeout_ms: 1500,
+        }));
+        let omitted: SetEndpointChainsRequest = serde_json::from_str("{}").unwrap();
+        assert!(omitted.enterprise_retry.is_none());
     }
 
     #[test]

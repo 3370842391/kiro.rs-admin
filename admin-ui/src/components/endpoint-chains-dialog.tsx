@@ -12,6 +12,7 @@ import {
   useEndpointChains, useSetEndpointChains, useEndpointMode, useSetEndpointMode,
 } from '@/hooks/use-credentials'
 import type { EndpointBucketOption } from '@/api/credentials'
+import type { EnterpriseRetryEndpoint, EnterpriseRetrySettings } from '@/types/api'
 import { cn, extractErrorMessage } from '@/lib/utils'
 
 interface EndpointChainsDialogProps {
@@ -25,14 +26,14 @@ const PRIMARY_LABEL: Record<string, string> = {
   cli: 'CLI 协议',
 }
 
-/** 备用桶说明（把 Kiro-Go 生产实测结论写进 UI，引导正确选择） */
+/** 备用端点说明；不同入口不代表限流额度相互独立。 */
 const BUCKET_HINT: Record<string, string> = {
   runtime:
-    'runtime.kiro.dev — 独立限流桶（独立域名），Kiro-Go 实测最有效的跨桶救援目标，建议保留。',
+    'runtime.kiro.dev — Kiro Runtime 服务入口；是否与其它入口共享限流以实际返回为准。',
   codewhisperer:
-    'codewhisperer — 与 q 同 host 不同服务。Kiro-Go 实测与 q 共用账号级桶，降级到它大概率仍 429，且可能加重风控。',
+    'codewhisperer — 与 q 使用同一 host 的不同服务入口。',
   amazonq:
-    'amazonq — 与 q 同 host 不同服务。同上，Kiro-Go 实测与 q 共用账号级桶，收益存疑。',
+    'amazonq — 与 q 使用同一 host 的不同服务入口。',
   runtime_cli: 'runtime_cli — CLI 协议的 runtime 桶。',
   cli: 'cli — CLI 协议主端点桶。',
   ide: 'ide — Kiro IDE 主端点桶。',
@@ -43,6 +44,13 @@ const ENDPOINT_LABEL: Record<string, string> = {
   ide: 'Legacy Kiro IDE',
   codewhisperer: 'Legacy CodeWhisperer',
   amazonq: 'Legacy Amazon Q',
+}
+
+const ENTERPRISE_ENDPOINTS: EnterpriseRetryEndpoint[] = ['ide', 'runtime', 'amazonq', 'codewhisperer']
+const DEFAULT_ENTERPRISE_RETRY: EnterpriseRetrySettings = {
+  endpoints: ENTERPRISE_ENDPOINTS,
+  firstEventTimeoutMs: 10_000,
+  totalTimeoutMs: 30_000,
 }
 
 /**
@@ -70,6 +78,7 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
   const [enterpriseSpecialHandling, setEnterpriseSpecialHandling] = useState(false)
   const [enterpriseDefaultEndpoint, setEnterpriseDefaultEndpoint] = useState('ide')
   const [enterpriseMaxRetries, setEnterpriseMaxRetries] = useState(32)
+  const [enterpriseRetry, setEnterpriseRetry] = useState<EnterpriseRetrySettings>(DEFAULT_ENTERPRISE_RETRY)
 
   const hydratedRef = useRef(false)
 
@@ -95,6 +104,7 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
     setEnterpriseSpecialHandling(data.enterpriseSpecialHandling ?? false)
     setEnterpriseDefaultEndpoint(data.enterpriseDefaultEndpoint || 'ide')
     setEnterpriseMaxRetries(data.enterpriseMaxRetries || 32)
+    setEnterpriseRetry(data.enterpriseRetry ?? DEFAULT_ENTERPRISE_RETRY)
   }, [open, data])
 
   const primaries = useMemo(
@@ -129,6 +139,27 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
   }
 
   const handleSave = () => {
+    if (!Number.isInteger(enterpriseMaxRetries) || enterpriseMaxRetries < 1 || enterpriseMaxRetries > 256) {
+      toast.error('企业最大发送次数必须为 1–256 的整数，包含首次发送')
+      return
+    }
+    if (enterpriseRetry.endpoints.length === 0) {
+      toast.error('企业速打至少启用 1 个端点')
+      return
+    }
+    if (!Number.isInteger(enterpriseRetry.firstEventTimeoutMs)
+      || enterpriseRetry.firstEventTimeoutMs < 10
+      || enterpriseRetry.firstEventTimeoutMs > 120_000) {
+      toast.error('企业首事件超时必须为 10–120000 毫秒的整数')
+      return
+    }
+    if (!Number.isInteger(enterpriseRetry.totalTimeoutMs)
+      || enterpriseRetry.totalTimeoutMs < 30
+      || enterpriseRetry.totalTimeoutMs > 300_000
+      || enterpriseRetry.totalTimeoutMs < enterpriseRetry.firstEventTimeoutMs) {
+      toast.error('企业总等待必须为 30–300000 毫秒的整数，且不小于首事件超时')
+      return
+    }
     save(
       {
         chains: draft,
@@ -144,6 +175,7 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
         enterpriseSpecialHandling,
         enterpriseDefaultEndpoint,
         enterpriseMaxRetries,
+        enterpriseRetry,
       },
       {
         onSuccess: () => {
@@ -258,7 +290,7 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
               <div>
                 <div className="text-sm font-medium">企业号专项处理</div>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  打到企业号后若 429：只在本号上 ide ↔ runtime 来回打，绝不换到其它号。重试次数在下面设上限。
+                  有可用额度的企业号优先于个人号。选中企业号后，在本号启用的端点间轮询；429 或首事件超时会尝试下一个端点，并遵守同账号共享的发送节奏、429 退避和 Retry-After。达到次数、总等待或账号额度限制后，同一请求由个人号兜底。
                 </p>
               </div>
               <Switch
@@ -269,9 +301,29 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
             </div>
             {enterpriseSpecialHandling && (
               <div className="mt-2 rounded-md border bg-background/60 p-2.5">
+                <div className="mb-2 text-xs font-medium text-foreground">启用企业端点（至少 1 个）</div>
+                <div className="flex flex-wrap gap-x-4 gap-y-2">
+                  {ENTERPRISE_ENDPOINTS.map((name, index) => (
+                    <label key={name} className="flex items-center gap-2 text-xs">
+                      <Checkbox
+                        checked={enterpriseRetry.endpoints.includes(name)}
+                        onCheckedChange={(checked) => setEnterpriseRetry((previous) => ({
+                          ...previous,
+                          endpoints: checked === true
+                            ? [...previous.endpoints.filter((endpoint) => endpoint !== name), name]
+                            : previous.endpoints.filter((endpoint) => endpoint !== name),
+                        }))}
+                      />
+                      <span>企业{index + 1}（{name}）</span>
+                    </label>
+                  ))}
+                </div>
+                <p className="mt-2 mb-3 text-xs text-muted-foreground">
+                  启用顺序：{enterpriseRetry.endpoints.join(' → ') || '尚未选择'}。不同端点不代表拥有独立限流额度。
+                </p>
                 <div className="mb-2 text-xs font-medium text-foreground">企业号默认端点</div>
                 <div className="flex flex-wrap gap-2">
-                  {(['ide', 'runtime'] as const).map((name) => (
+                  {ENTERPRISE_ENDPOINTS.map((name) => (
                     <Button
                       key={name}
                       type="button"
@@ -279,15 +331,15 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
                       variant={enterpriseDefaultEndpoint === name ? 'default' : 'outline'}
                       onClick={() => setEnterpriseDefaultEndpoint(name)}
                     >
-                      {name === 'ide' ? 'q 端点 (ide)' : 'runtime'}
+                      {name === 'ide' ? 'q 端点 (ide)' : name}
                     </Button>
                   ))}
                 </div>
                 <p className="mt-2 text-xs text-muted-foreground">
-                  仅对 Enterprise / IdC 且未单独钉端点的号生效。ide 即 q 区域域名（q.*.amazonaws.com）。
+                  默认端点仅决定启用列表的轮询起点；未启用该端点时从列表首项开始，不会额外发送。ide 即 q 区域域名（q.*.amazonaws.com）。
                 </p>
-                <label className="mt-3 flex items-center gap-2 text-sm">
-                  <span className="shrink-0 text-xs font-medium text-foreground">企业号重试次数</span>
+                <label className="mt-3 flex flex-wrap items-center gap-2 text-sm">
+                  <span className="shrink-0 text-xs font-medium text-foreground">企业最大发送次数</span>
                   <Input
                     type="number"
                     min={1}
@@ -300,8 +352,47 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
                     }
                     className="h-8 w-20"
                   />
-                  <span className="text-xs text-muted-foreground">1–256，默认 32</span>
+                  <span className="text-xs text-muted-foreground">含首次，1–256，默认 32</span>
                 </label>
+                <p className="mt-2 text-xs text-muted-foreground">
+                  同时受「单请求备用尝试上限 + 1」（0 表示该项不限）和总等待限制。
+                  当前最多 {maxAttempts === 0 ? enterpriseMaxRetries : Math.min(enterpriseMaxRetries, maxAttempts + 1)} 次真实企业发送，可能因超时或账号额度提前结束。
+                </p>
+                <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                  <label className="flex items-center gap-2 text-xs">
+                    <span className="shrink-0 font-medium">首事件超时（ms）</span>
+                    <Input
+                      type="number"
+                      min={10}
+                      max={120_000}
+                      step={1}
+                      value={enterpriseRetry.firstEventTimeoutMs}
+                      onChange={(event) => {
+                        const value = Number(event.target.value)
+                        setEnterpriseRetry((previous) => ({ ...previous, firstEventTimeoutMs: value }))
+                      }}
+                      className="h-8 w-24"
+                    />
+                  </label>
+                  <label className="flex items-center gap-2 text-xs">
+                    <span className="shrink-0 font-medium">总等待（ms）</span>
+                    <Input
+                      type="number"
+                      min={30}
+                      max={300_000}
+                      step={1}
+                      value={enterpriseRetry.totalTimeoutMs}
+                      onChange={(event) => {
+                        const value = Number(event.target.value)
+                        setEnterpriseRetry((previous) => ({ ...previous, totalTimeoutMs: value }))
+                      }}
+                      className="h-8 w-24"
+                    />
+                  </label>
+                </div>
+                <p className="mt-2 text-xs text-muted-foreground">
+                  默认首事件 10000 ms、总等待 30000 ms；总等待不得小于首事件超时。
+                </p>
               </div>
             )}
           </div>
@@ -418,7 +509,7 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
         <div className="space-y-3 border-t pt-3">
           <div className="grid gap-2 sm:grid-cols-2">
             <label className="flex items-center gap-2 text-sm">
-              <span className="shrink-0 text-muted-foreground">单请求桶尝试上限</span>
+              <span className="shrink-0 text-muted-foreground">单请求备用尝试上限</span>
               <Input
                 type="number"
                 min={0}

@@ -19,26 +19,60 @@ pub fn resolve_primary_endpoint<'a>(
         .unwrap_or(default_endpoint)
 }
 
-/// 企业号专项：429 后只在 ide / runtime 之间换桶，不进 amazonq / codewhisperer。
-pub fn enterprise_ide_runtime_hop(primary: &str) -> Vec<String> {
-    match primary.trim() {
-        "ide" => vec!["runtime".to_string()],
-        "runtime" => vec!["ide".to_string()],
-        other => ["ide", "runtime"]
-            .into_iter()
-            .filter(|name| *name != other)
-            .map(str::to_string)
-            .collect(),
-    }
+/// 企业号专项轮询的四个候选端点（同一 IDE 协议族，不含 CLI）。
+///
+/// 顺序：Legacy Kiro IDE → Kiro Runtime → Legacy Amazon Q → Legacy CodeWhisperer。
+pub const ENTERPRISE_ROUND_ROBIN_NODES: &[&str] = &["ide", "runtime", "amazonq", "codewhisperer"];
+
+/// 从 `start` 起按轮询环旋转，下标 `index` 取节点。
+pub fn enterprise_node_from_default(start: &str, index: u32) -> &'static str {
+    let nodes = enterprise_nodes_rotated(start);
+    nodes[(index as usize) % nodes.len()]
 }
 
-/// 本轮 ide/runtime 对打完后，下一轮从对面端点起手。
+pub fn enterprise_nodes_rotated(start: &str) -> [&'static str; 4] {
+    let start_idx = ENTERPRISE_ROUND_ROBIN_NODES
+        .iter()
+        .position(|n| *n == start.trim())
+        .unwrap_or(0);
+    std::array::from_fn(|i| {
+        ENTERPRISE_ROUND_ROBIN_NODES[(start_idx + i) % ENTERPRISE_ROUND_ROBIN_NODES.len()]
+    })
+}
+
+/// 当前桶之后按 ide → runtime → amazonq → codewhisperer 环进一格。
+pub fn next_enterprise_node(current: &str) -> &'static str {
+    let trimmed = current.trim();
+    let idx = ENTERPRISE_ROUND_ROBIN_NODES
+        .iter()
+        .position(|n| *n == trimmed)
+        .unwrap_or(0);
+    ENTERPRISE_ROUND_ROBIN_NODES[(idx + 1) % ENTERPRISE_ROUND_ROBIN_NODES.len()]
+}
+
+/// 本跳之后按轮询顺序试剩下 3 个桶。
+pub fn enterprise_round_robin_hop(primary: &str) -> Vec<String> {
+    let trimmed = primary.trim();
+    let start = ENTERPRISE_ROUND_ROBIN_NODES
+        .iter()
+        .position(|n| *n == trimmed)
+        .unwrap_or(0);
+    (1..ENTERPRISE_ROUND_ROBIN_NODES.len())
+        .map(|off| {
+            ENTERPRISE_ROUND_ROBIN_NODES[(start + off) % ENTERPRISE_ROUND_ROBIN_NODES.len()]
+                .to_string()
+        })
+        .collect()
+}
+
+/// 企业号专项：四个候选端点轮询（旧名保留，避免漏改调用点）。
+pub fn enterprise_ide_runtime_hop(primary: &str) -> Vec<String> {
+    enterprise_round_robin_hop(primary)
+}
+
+/// 本轮四个桶走完后，下一轮从环上下一个端点起手。
 pub fn flip_ide_runtime(current: &str) -> &'static str {
-    if current.trim() == "runtime" {
-        "ide"
-    } else {
-        "runtime"
-    }
+    next_enterprise_node(current)
 }
 
 /// `hop` 才使用解析好的降级链；其它策略显式空链（含面板覆盖）。
@@ -105,17 +139,65 @@ mod tests {
     }
 
     #[test]
-    fn enterprise_hop_only_swaps_ide_and_runtime() {
-        assert_eq!(enterprise_ide_runtime_hop("ide"), vec!["runtime".to_string()]);
-        assert_eq!(enterprise_ide_runtime_hop("runtime"), vec!["ide".to_string()]);
+    fn enterprise_round_robin_walks_four_ide_buckets() {
         assert_eq!(
-            enterprise_ide_runtime_hop("amazonq"),
-            vec!["ide".to_string(), "runtime".to_string()]
+            enterprise_round_robin_hop("ide"),
+            vec![
+                "runtime".to_string(),
+                "amazonq".to_string(),
+                "codewhisperer".to_string()
+            ]
         );
-        assert_eq!(flip_ide_runtime("ide"), "runtime");
-        assert_eq!(flip_ide_runtime("runtime"), "ide");
+        assert_eq!(
+            enterprise_round_robin_hop("runtime"),
+            vec![
+                "amazonq".to_string(),
+                "codewhisperer".to_string(),
+                "ide".to_string()
+            ]
+        );
+        assert_eq!(
+            enterprise_round_robin_hop("amazonq"),
+            vec![
+                "codewhisperer".to_string(),
+                "ide".to_string(),
+                "runtime".to_string()
+            ]
+        );
+        assert_eq!(
+            enterprise_round_robin_hop("codewhisperer"),
+            vec![
+                "ide".to_string(),
+                "runtime".to_string(),
+                "amazonq".to_string()
+            ]
+        );
+        assert_eq!(next_enterprise_node("ide"), "runtime");
+        assert_eq!(next_enterprise_node("runtime"), "amazonq");
+        assert_eq!(next_enterprise_node("amazonq"), "codewhisperer");
+        assert_eq!(next_enterprise_node("codewhisperer"), "ide");
+        assert_eq!(next_enterprise_node("unknown"), "runtime");
+        assert_eq!(flip_ide_runtime("codewhisperer"), "ide");
+        assert_eq!(
+            enterprise_ide_runtime_hop("ide"),
+            enterprise_round_robin_hop("ide")
+        );
     }
 
+    #[test]
+    fn enterprise_start_rotates_from_configured_default() {
+        assert_eq!(enterprise_node_from_default("ide", 0), "ide");
+        assert_eq!(enterprise_node_from_default("ide", 1), "runtime");
+        assert_eq!(enterprise_node_from_default("runtime", 0), "runtime");
+        assert_eq!(enterprise_node_from_default("runtime", 1), "amazonq");
+        assert_eq!(enterprise_node_from_default("amazonq", 3), "runtime");
+        assert_eq!(
+            enterprise_nodes_rotated("codewhisperer"),
+            ["codewhisperer", "ide", "runtime", "amazonq"]
+        );
+    }
+
+    #[test]
     fn same_endpoint_and_none_drop_hop_chain() {
         let hop = vec!["runtime".into(), "codewhisperer".into()];
         assert_eq!(

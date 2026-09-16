@@ -6,6 +6,38 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+/// 企业速打的实验参数；每条入站请求使用一份快照。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct EnterpriseRetrySettings {
+    pub endpoints: Vec<String>,
+    pub first_event_timeout_ms: u64,
+    pub total_timeout_ms: u64,
+}
+
+impl Default for EnterpriseRetrySettings {
+    fn default() -> Self {
+        Self {
+            endpoints: ["ide", "runtime", "amazonq", "codewhisperer"].map(str::to_owned).to_vec(),
+            first_event_timeout_ms: 10_000,
+            total_timeout_ms: 30_000,
+        }
+    }
+}
+
+impl EnterpriseRetrySettings {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.endpoints.is_empty() && self.endpoints.len() <= 4, "企业端点数量必须为 1–4");
+        let mut seen = std::collections::HashSet::new();
+        for endpoint in &self.endpoints {
+            anyhow::ensure!(["ide", "runtime", "amazonq", "codewhisperer"].contains(&endpoint.as_str()) && seen.insert(endpoint), "企业端点无效或重复: {endpoint}");
+        }
+        anyhow::ensure!((10..=120_000).contains(&self.first_event_timeout_ms), "企业首事件超时必须为 10–120000 毫秒");
+        anyhow::ensure!((30..=300_000).contains(&self.total_timeout_ms) && self.total_timeout_ms >= self.first_event_timeout_ms, "企业总等待超时必须为 30–300000 毫秒且不小于首事件超时");
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum TlsBackend {
@@ -1035,7 +1067,7 @@ pub struct Config {
     #[serde(default = "default_same_endpoint_attempts")]
     pub same_endpoint_attempts: u32,
 
-    /// 企业号专项 429：打到企业号后钉死本号，只在 ide/runtime 换桶，不换其它号。
+    /// 企业号优先，按企业端点列表进行有界同号重试；耗尽后个人号兜底。
     #[serde(default)]
     pub enterprise_special_handling: bool,
 
@@ -1043,9 +1075,12 @@ pub struct Config {
     #[serde(default = "default_enterprise_endpoint")]
     pub enterprise_default_endpoint: String,
 
-    /// 企业号专项：钉死后最多再打多少轮 ide/runtime（含当前这一轮）。默认 32。
+    /// 企业阶段最大真实发送次数（含首次），同时受备用尝试上限和总等待时间约束。默认 32。
     #[serde(default = "default_enterprise_max_retries")]
     pub enterprise_max_retries: u32,
+
+    #[serde(default)]
+    pub enterprise_retry: EnterpriseRetrySettings,
 
     /// 端点路由模式：best（默认最好模式）或 manual（手动端点链）。
     #[serde(default)]
@@ -1610,6 +1645,7 @@ impl Default for Config {
             enterprise_special_handling: false,
             enterprise_default_endpoint: default_enterprise_endpoint(),
             enterprise_max_retries: default_enterprise_max_retries(),
+            enterprise_retry: EnterpriseRetrySettings::default(),
             endpoint_mode: EndpointMode::default(),
             trace_enabled: default_trace_enabled(),
             auto_compact_diagnostics_enabled: default_true(),
