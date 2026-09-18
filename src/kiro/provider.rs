@@ -1457,7 +1457,9 @@ impl KiroProvider {
         let policy = control.policy(self, None, group)?;
         control.clear_accepted();
         let call = self.call_mcp_with_retry(request_body, policy.as_ref(), control, sink, group);
-        if let Some(policy) = &policy {
+        if let Some(policy) = &policy
+            && self.token_manager.enterprise_selection_policy() == "enterprise-first"
+        {
             tokio::time::timeout_at(policy.deadline, call).await
                 .map_err(|_| anyhow::anyhow!("enterprise_request_timeout: MCP 总等待预算耗尽"))?
         } else { call.await }
@@ -1608,7 +1610,12 @@ impl KiroProvider {
                     other => {
                         control.finished.store(true, Ordering::Relaxed);
                         last_error = Some(match other { Ok(EnterprisePhaseResult::Failover(error)) => error, _ => anyhow::anyhow!("enterprise_mcp_phase_timeout") });
-                        max_retries = attempt + 1 + Self::max_retries(total_credentials, retry_mode, &retry_policy);
+                        let fallback_retries = if self.token_manager.enterprise_selection_policy() == "priority" {
+                            1
+                        } else {
+                            Self::max_retries(total_credentials, retry_mode, &retry_policy)
+                        };
+                        max_retries = attempt + 1 + fallback_retries;
                         continue;
                     }
                 }
@@ -1827,7 +1834,9 @@ impl KiroProvider {
         let policy = control.policy(self, requested_model.as_deref(), group)?;
         control.clear_accepted();
         let call = self.call_api_attempts(request_body, is_stream, sink, group, policy.as_ref(), control);
-        if let Some(policy) = &policy {
+        if let Some(policy) = &policy
+            && self.token_manager.enterprise_selection_policy() == "enterprise-first"
+        {
             tokio::time::timeout_at(policy.deadline, call).await
                 .map_err(|_| anyhow::anyhow!("enterprise_request_timeout: 请求总等待预算已耗尽"))?
         } else {
@@ -1968,7 +1977,12 @@ impl KiroProvider {
                             Ok(EnterprisePhaseResult::Failover(error)) => error,
                             _ => anyhow::anyhow!("enterprise_phase_timeout"),
                         });
-                        max_retries = attempt.saturating_add(1).saturating_add(Self::max_retries(total_credentials, retry_mode, &retry_policy));
+                        let fallback_retries = if self.token_manager.enterprise_selection_policy() == "priority" {
+                            1
+                        } else {
+                            Self::max_retries(total_credentials, retry_mode, &retry_policy)
+                        };
+                        max_retries = attempt.saturating_add(1).saturating_add(fallback_retries);
                         continue;
                     }
                 }

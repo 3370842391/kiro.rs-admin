@@ -288,6 +288,7 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
           <DialogTitle>Kiro Hosted 登录（Google / GitHub / 企业 SSO）</DialogTitle>
           <DialogDescription>
             通过 Kiro 网页端完成账号登录；企业账号会进入 Entra ID / Azure AD 二段授权。
+            新增账号会自动使用“导入默认值”中的优先级、RPM、并发、分组和代理设置。
           </DialogDescription>
         </DialogHeader>
 

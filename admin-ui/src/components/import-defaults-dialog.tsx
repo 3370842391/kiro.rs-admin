@@ -125,7 +125,8 @@ export function ImportDefaultsDialog({ open, onOpenChange }: ImportDefaultsDialo
         <div className="flex-1 overflow-y-auto space-y-4 py-2">
           <p className="text-xs text-muted-foreground">
             批量导入与单个添加打开时会预填这些值，当次仍可改。与 Key Supplier 的
-            「公共导入设置」相互独立——那份只管 webhook 自动采购。
+            「公共导入设置」相互独立——那份只管 webhook 自动采购。JSON 内的 priority
+            会被忽略，统一使用这里的默认优先级；Hosted 登录新增账号也使用这套默认值。
           </p>
 
           {isLoading && (
@@ -211,7 +212,7 @@ export function ImportDefaultsDialog({ open, onOpenChange }: ImportDefaultsDialo
                 placeholder="0"
                 inputMode="numeric"
               />
-              <p className="text-xs text-muted-foreground">数值越小越优先。</p>
+              <p className="text-xs text-muted-foreground">数值越小越优先；JSON priority 不生效。</p>
             </div>
             <div className="space-y-1">
               <label className="text-sm font-medium">来源渠道</label>

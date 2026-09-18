@@ -12,7 +12,7 @@ import {
   useEndpointChains, useSetEndpointChains, useEndpointMode, useSetEndpointMode,
 } from '@/hooks/use-credentials'
 import type { EndpointBucketOption } from '@/api/credentials'
-import type { EnterpriseRetryEndpoint, EnterpriseRetrySettings } from '@/types/api'
+import type { EnterpriseRetryEndpoint, EnterpriseRetrySettings, EnterpriseSelectionPolicy } from '@/types/api'
 import { cn, extractErrorMessage } from '@/lib/utils'
 
 interface EndpointChainsDialogProps {
@@ -76,6 +76,7 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
   const [bucketMode, setBucketMode] = useState<'same-endpoint' | 'hop' | 'none'>('same-endpoint')
   const [sameEndpointAttempts, setSameEndpointAttempts] = useState(3)
   const [enterpriseSpecialHandling, setEnterpriseSpecialHandling] = useState(false)
+  const [enterpriseSelectionPolicy, setEnterpriseSelectionPolicy] = useState<EnterpriseSelectionPolicy>('priority')
   const [enterpriseDefaultEndpoint, setEnterpriseDefaultEndpoint] = useState('ide')
   const [enterpriseMaxRetries, setEnterpriseMaxRetries] = useState(32)
   const [enterpriseRetry, setEnterpriseRetry] = useState<EnterpriseRetrySettings>(DEFAULT_ENTERPRISE_RETRY)
@@ -102,6 +103,7 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
     setBucketMode(data.rateLimitBucketMode || 'same-endpoint')
     setSameEndpointAttempts(data.sameEndpointAttempts || 3)
     setEnterpriseSpecialHandling(data.enterpriseSpecialHandling ?? false)
+    setEnterpriseSelectionPolicy(data.enterpriseSelectionPolicy ?? 'priority')
     setEnterpriseDefaultEndpoint(data.enterpriseDefaultEndpoint || 'ide')
     setEnterpriseMaxRetries(data.enterpriseMaxRetries || 32)
     setEnterpriseRetry(data.enterpriseRetry ?? DEFAULT_ENTERPRISE_RETRY)
@@ -173,6 +175,7 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
         rateLimitBucketMode: bucketMode,
         sameEndpointAttempts,
         enterpriseSpecialHandling,
+        enterpriseSelectionPolicy,
         enterpriseDefaultEndpoint,
         enterpriseMaxRetries,
         enterpriseRetry,
@@ -290,7 +293,7 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
               <div>
                 <div className="text-sm font-medium">企业号专项处理</div>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  有可用额度的企业号优先于个人号。选中企业号后，在本号启用的端点间轮询；429 或首事件超时会尝试下一个端点，并遵守同账号共享的发送节奏、429 退避和 Retry-After。达到次数、总等待或账号额度限制后，同一请求由个人号兜底。
+                  只控制企业账号的端点轮询、首事件等待、429 退避和共享发送节奏；同一会话仍保留粘滞以命中缓存。
                 </p>
               </div>
               <Switch
@@ -301,6 +304,29 @@ export function EndpointChainsDialog({ open, onOpenChange }: EndpointChainsDialo
             </div>
             {enterpriseSpecialHandling && (
               <div className="mt-2 rounded-md border bg-background/60 p-2.5">
+                <div className="mb-2 text-xs font-medium text-foreground">企业账号选择策略</div>
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={enterpriseSelectionPolicy === 'priority' ? 'default' : 'outline'}
+                    onClick={() => setEnterpriseSelectionPolicy('priority')}
+                  >
+                    遵循账号优先级
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={enterpriseSelectionPolicy === 'enterprise-first' ? 'default' : 'outline'}
+                    onClick={() => setEnterpriseSelectionPolicy('enterprise-first')}
+                  >
+                    企业账号优先
+                  </Button>
+                </div>
+                <p className="mt-2 mb-3 text-xs text-muted-foreground">
+                  推荐“遵循账号优先级”：优先级数字越小越先用；高优先级账号满并发、满 RPM 或冷却时，才使用低优先级企业账号作为替补。
+                  同一会话的可用粘滞账号仍优先命中缓存。
+                </p>
                 <div className="mb-2 text-xs font-medium text-foreground">启用企业端点（至少 1 个）</div>
                 <div className="flex flex-wrap gap-x-4 gap-y-2">
                   {ENTERPRISE_ENDPOINTS.map((name, index) => (

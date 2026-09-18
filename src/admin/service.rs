@@ -1045,6 +1045,41 @@ fn validate_log_governance_request(
 }
 
 impl AdminService {
+    /// 为 Hosted/IdC 新登录挑选导入代理：把已有凭据与待完成登录都计入负载，
+    /// 避免连续点登录时所有新号都落到排序第一的出口。
+    fn import_proxy(&self, auto_assign: bool) -> Option<ProxyConfig> {
+        if !auto_assign {
+            return None;
+        }
+        let urls = self.proxy_pool.assignable_urls_ranked();
+        if urls.is_empty() {
+            return None;
+        }
+        let mut loads: HashMap<String, usize> = self
+            .token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .filter_map(|entry| entry.proxy_url.map(|url| (url, 1usize)))
+            .fold(HashMap::new(), |mut loads, (url, count)| {
+                *loads.entry(url).or_default() += count;
+                loads
+            });
+        for session in self.social_sessions.lock().values() {
+            if let Some(proxy) = &session.proxy {
+                *loads.entry(proxy.url.clone()).or_default() += 1;
+            }
+        }
+        for session in self.idc_sessions.lock().values() {
+            if let Some(proxy) = &session.proxy {
+                *loads.entry(proxy.url.clone()).or_default() += 1;
+            }
+        }
+        urls.into_iter()
+            .min_by_key(|url| loads.get(url).copied().unwrap_or(0))
+            .map(|url| ProxyConfig::new(url))
+    }
+
     pub fn new(
         token_manager: Arc<MultiTokenManager>,
         known_endpoints: impl IntoIterator<Item = String>,
@@ -2445,9 +2480,11 @@ impl AdminService {
     /// 全部在服务端完成，便于在 `buffer_unordered` 下有界并发。
     pub async fn import_one_credential(
         &self,
-        req: AddCredentialRequest,
+        mut req: AddCredentialRequest,
         verify: bool,
     ) -> ImportItemResult {
+        // 批量 JSON 的 priority 不参与调度层级，统一使用管理面板配置的导入默认值。
+        req.priority = self.import_defaults.lock().priority;
         // 1. add：去重 / 未知端点 / token 刷新失败在此暴露，未插入即无需回滚。
         //    verify=false 时跳过内部余额拉取。
         let resp = match self.add_credential_inner(req, verify).await {
@@ -3477,6 +3514,7 @@ impl AdminService {
             rate_limit_bucket_mode: self.token_manager.get_rate_limit_bucket_mode().as_str().to_string(),
             same_endpoint_attempts: self.token_manager.same_endpoint_attempts(),
             enterprise_special_handling: self.token_manager.enterprise_special_handling_enabled(),
+            enterprise_selection_policy: self.token_manager.enterprise_selection_policy(),
             enterprise_default_endpoint: self.token_manager.get_enterprise_default_endpoint(),
             enterprise_max_retries: self.token_manager.enterprise_max_retries(),
             enterprise_retry: self.token_manager.get_enterprise_retry_settings(),
@@ -3514,6 +3552,13 @@ impl AdminService {
                     name.trim()
                 )));
             }
+        }
+        if let Some(policy) = req.enterprise_selection_policy.as_ref()
+            && !["priority", "enterprise-first"].contains(&policy.trim())
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "企业账号选择策略必须是 priority 或 enterprise-first".to_string(),
+            ));
         }
 
         if let Some(chains) = req.chains.as_ref().and_then(Option::as_ref) {
@@ -3635,6 +3680,12 @@ impl AdminService {
             self.token_manager
                 .set_enterprise_special_handling(enabled)
                 .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        }
+
+        if let Some(policy) = req.enterprise_selection_policy {
+            self.token_manager
+                .set_enterprise_selection_policy(policy)
+                .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
         }
 
         if let Some(name) = req.enterprise_default_endpoint {
@@ -5304,11 +5355,16 @@ impl AdminService {
         &self,
         req: StartSocialLoginRequest,
     ) -> Result<StartSocialLoginResponse, AdminServiceError> {
+        // 兼容旧前端字段；新账号统一由导入默认值决定 priority。
+        let _ = req.priority;
+        let import_defaults = self.import_defaults.lock().clone();
+        let auto_proxy = self.import_proxy(import_defaults.auto_assign_proxy);
         let global_proxy = self.token_manager.proxy();
         let proxy = req
             .proxy_url
             .as_deref()
             .map(ProxyConfig::new)
+            .or(auto_proxy)
             .or(global_proxy);
 
         let auth_endpoint = req
@@ -5333,10 +5389,18 @@ impl AdminService {
 
         let cred_template = KiroCredentials {
             auth_method: Some("social".to_string()),
-            priority: req.priority,
-            rpm_limit: 10, // 默认每分钟 10 次（与普通添加一致；用户可在面板调整）
+            priority: import_defaults.priority,
+            rpm_limit: import_defaults.rpm_limit,
+            max_concurrency: import_defaults.max_concurrency,
             email: req.email,
-            proxy_url: req.proxy_url,
+            proxy_url: proxy.as_ref().map(|value| value.url.clone()),
+            proxy_username: proxy.as_ref().and_then(|value| value.username.clone()),
+            proxy_password: proxy.as_ref().and_then(|value| value.password.clone()),
+            groups: import_defaults.groups,
+            source_channel: (!import_defaults.source_channel.trim().is_empty())
+                .then_some(import_defaults.source_channel),
+            cost_rmb: import_defaults.cost_rmb,
+            quota_credits: import_defaults.quota_credits,
             ..Default::default()
         };
 
@@ -5826,7 +5890,11 @@ impl AdminService {
         &self,
         req: StartIdcLoginRequest,
     ) -> Result<StartIdcLoginResponse, AdminServiceError> {
+        // 兼容旧前端字段；新账号统一由导入默认值决定 priority。
+        let _ = req.priority;
+        let import_defaults = self.import_defaults.lock().clone();
         let config = self.token_manager.config();
+        let auto_proxy = self.import_proxy(import_defaults.auto_assign_proxy);
         let global_proxy = self.token_manager.proxy();
 
         // 代理：优先用请求级，否则回退全局
@@ -5834,6 +5902,7 @@ impl AdminService {
             .proxy_url
             .as_deref()
             .map(ProxyConfig::new)
+            .or(auto_proxy)
             .or(global_proxy);
 
         let issuer = Self::resolve_idc_issuer(&req)?;
@@ -5876,10 +5945,18 @@ impl AdminService {
             start_url: Some(start_url.to_string()),
             region: Some(auth_region.to_string()),
             auth_region: Some(auth_region.to_string()),
-            priority: req.priority,
-            rpm_limit: 10, // 默认每分钟 10 次（与普通添加一致；用户可在面板调整）
+            priority: import_defaults.priority,
+            rpm_limit: import_defaults.rpm_limit,
+            max_concurrency: import_defaults.max_concurrency,
             email: req.email,
-            proxy_url: req.proxy_url,
+            proxy_url: proxy.as_ref().map(|value| value.url.clone()),
+            proxy_username: proxy.as_ref().and_then(|value| value.username.clone()),
+            proxy_password: proxy.as_ref().and_then(|value| value.password.clone()),
+            groups: import_defaults.groups,
+            source_channel: (!import_defaults.source_channel.trim().is_empty())
+                .then_some(import_defaults.source_channel),
+            cost_rmb: import_defaults.cost_rmb,
+            quota_credits: import_defaults.quota_credits,
             ..Default::default()
         };
 
@@ -6114,11 +6191,20 @@ impl AdminService {
             }
         }
 
+        let existing_proxy = self
+            .token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == target_id)
+            .and_then(|entry| entry.proxy_url)
+            .map(ProxyConfig::new);
         let global_proxy = self.token_manager.proxy();
         let proxy = req
             .proxy_url
             .as_deref()
             .map(ProxyConfig::new)
+            .or(existing_proxy)
             .or(global_proxy);
 
         let auth_endpoint = req
@@ -6179,12 +6265,21 @@ impl AdminService {
         }
 
         let config = self.token_manager.config();
+        let existing_proxy = self
+            .token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == target_id)
+            .and_then(|entry| entry.proxy_url)
+            .map(ProxyConfig::new);
         let global_proxy = self.token_manager.proxy();
 
         let proxy = req
             .proxy_url
             .as_deref()
             .map(ProxyConfig::new)
+            .or(existing_proxy)
             .or(global_proxy);
 
         let issuer = Self::resolve_idc_issuer(&req)?;
@@ -6509,6 +6604,72 @@ mod tests {
             Some("profit-service-trace")
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn login_import_defaults_apply_metadata_and_distribute_pending_sessions() {
+        let service = auth_test_service();
+        *service.import_defaults.lock() = CredentialImportDefaults {
+            priority: 12, rpm_limit: 27, max_concurrency: 3,
+            groups: vec!["primary".into()], source_channel: "manual".into(),
+            cost_rmb: Some(60.0), quota_credits: Some(10000.0),
+            ..Default::default()
+        };
+        service.proxy_pool.add("http://127.0.0.1:19001".into(), None).unwrap();
+        service.proxy_pool.add("http://127.0.0.1:19002".into(), None).unwrap();
+        let mut proxies = Vec::new();
+        for _ in 0..2 {
+            let session = service.start_social_login(serde_json::from_value(
+                serde_json::json!({"priority": 0, "email": "test@example.invalid"})
+            ).unwrap()).await.unwrap();
+            let sessions = service.social_sessions.lock();
+            let login = &sessions[&session.session_id];
+            let c = &login.cred_template;
+            assert_eq!((c.priority, c.rpm_limit, c.max_concurrency), (12, 27, 3));
+            assert_eq!(c.groups, ["primary"]);
+        assert_eq!(c.source_channel.as_deref(), Some("manual"));
+            assert_eq!((c.cost_rmb, c.quota_credits), (Some(60.0), Some(10000.0)));
+            assert_eq!(c.proxy_url.as_deref(), login.proxy.as_ref().map(|p| p.url.as_str()));
+            proxies.push(c.proxy_url.clone().unwrap());
+        }
+        assert_ne!(proxies[0], proxies[1], "待完成登录也计入出口负载");
+    }
+
+    #[tokio::test]
+    async fn login_import_defaults_respect_proxy_toggle_and_explicit_direct() {
+        let service = auth_test_service();
+        service.proxy_pool.add("http://127.0.0.1:19001".into(), None).unwrap();
+        service.import_defaults.lock().auto_assign_proxy = false;
+        let session = service.start_social_login(serde_json::from_str("{}").unwrap()).await.unwrap();
+        assert!(service.social_sessions.lock()[&session.session_id].proxy.is_none());
+        service.cancel_social_login(&session.session_id);
+        service.import_defaults.lock().auto_assign_proxy = true;
+        let session = service.start_social_login(serde_json::from_value(
+            serde_json::json!({"proxyUrl": "direct"})
+        ).unwrap()).await.unwrap();
+        let sessions = service.social_sessions.lock();
+        let login = &sessions[&session.session_id];
+        assert_eq!(login.proxy.as_ref().map(|p| p.url.as_str()), Some("direct"));
+        assert_eq!(login.cred_template.proxy_url.as_deref(), Some("direct"));
+    }
+
+    #[tokio::test]
+    async fn login_import_defaults_override_json_priority_on_all_manual_add_paths() {
+        let service = auth_test_service();
+        service.import_defaults.lock().priority = 23;
+        service.import_defaults.lock().groups = vec!["default-group".into()];
+        for i in 0..1 {
+            let request: AddCredentialRequest = serde_json::from_value(serde_json::json!({
+                "authMethod": "api_key", "kiroApiKey": format!("ksk_import_priority_test_{i}"),
+                "apiRegion": "us-east-1", "priority": 999, "groups": ["json-group"]
+            })).unwrap();
+            let result = service.import_one_credential(request, false).await;
+            assert!(result.credential_id.is_some(), "{:?}", result.error);
+        }
+        for c in service.token_manager.clone_all_credentials() {
+            assert_eq!(c.priority, 23);
+            assert_eq!(c.priority, 23);
+        }
     }
 
     #[tokio::test]

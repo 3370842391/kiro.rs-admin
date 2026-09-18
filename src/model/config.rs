@@ -1075,6 +1075,10 @@ pub struct Config {
     #[serde(default)]
     pub enterprise_special_handling: bool,
 
+    /// 企业账号选择策略：`priority` 遵循账号优先级；`enterprise-first` 保留旧行为。
+    #[serde(default = "default_enterprise_selection_policy")]
+    pub enterprise_selection_policy: String,
+
     /// 企业号未钉端点时的首跳协议。`ide` = q 协议（q.{region}.amazonaws.com）。
     #[serde(default = "default_enterprise_endpoint")]
     pub enterprise_default_endpoint: String,
@@ -1439,6 +1443,10 @@ fn default_load_balancing_mode() -> String {
     "least_conn".to_string()
 }
 
+fn default_enterprise_selection_policy() -> String {
+    "priority".to_string()
+}
+
 fn default_proxy_balancing_mode() -> String {
     "sticky".to_string()
 }
@@ -1647,6 +1655,7 @@ impl Default for Config {
             failover_rate_limit_cooldown_ms: 0,
             same_endpoint_attempts: default_same_endpoint_attempts(),
             enterprise_special_handling: false,
+            enterprise_selection_policy: default_enterprise_selection_policy(),
             enterprise_default_endpoint: default_enterprise_endpoint(),
             enterprise_max_retries: default_enterprise_max_retries(),
             enterprise_retry: EnterpriseRetrySettings::default(),

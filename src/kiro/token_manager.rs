@@ -1613,6 +1613,8 @@ pub struct MultiTokenManager {
     same_endpoint_attempts: AtomicU32,
     /// 企业号专项：有空位的企业号优先；429 钉死本号轮询启用端点；用尽后改打个人号。
     enterprise_special_handling: AtomicBool,
+    /// 企业账号选择策略：priority 遵循账号优先级，enterprise-first 保留旧行为。
+    enterprise_selection_policy: Mutex<String>,
     /// 企业号启用端点列表的轮询起点（默认 ide = q）。
     enterprise_default_endpoint: Mutex<String>,
     /// 最大真实企业发送次数（含首次），同时受单请求备用尝试上限和总等待限制。
@@ -2012,6 +2014,11 @@ impl MultiTokenManager {
         let failover_rate_limit_cooldown_ms = config.failover_rate_limit_cooldown_ms.min(120_000);
         let same_endpoint_attempts = config.same_endpoint_attempts.max(1);
         let enterprise_special_handling = config.enterprise_special_handling;
+        let enterprise_selection_policy = if config.enterprise_selection_policy == "enterprise-first" {
+            "enterprise-first".to_string()
+        } else {
+            "priority".to_string()
+        };
         let enterprise_default_endpoint = config.enterprise_default_endpoint.clone();
         let enterprise_max_retries = config.enterprise_max_retries.max(1);
         let enterprise_retry = config.enterprise_retry.clone();
@@ -2062,6 +2069,7 @@ impl MultiTokenManager {
             failover_rate_limit_cooldown_ms: AtomicU64::new(failover_rate_limit_cooldown_ms),
             same_endpoint_attempts: AtomicU32::new(same_endpoint_attempts),
             enterprise_special_handling: AtomicBool::new(enterprise_special_handling),
+            enterprise_selection_policy: Mutex::new(enterprise_selection_policy),
             enterprise_default_endpoint: Mutex::new(enterprise_default_endpoint),
             enterprise_max_retries: AtomicU32::new(enterprise_max_retries),
             enterprise_retry: Mutex::new(enterprise_retry),
@@ -2354,6 +2362,7 @@ impl MultiTokenManager {
                 {
                     // 企业号专项：有空位的企业号时，不把会话粘在个人号上。
                     let stick_to_personal = self.enterprise_special_handling_enabled()
+                        && self.enterprise_selection_policy() == "enterprise-first"
                         && !hit.1.is_enterprise_credential()
                         && self.has_available_enterprise_from_entries(
                             entries,
@@ -2407,7 +2416,9 @@ impl MultiTokenManager {
         // 企业号专项：有 RPM 空位的企业号永远压过个人号。least_conn 不会因为
         // 个人号 in-flight=0 就把流量先喂给兜底池。企业号 RPM 打满后 available
         // 里只剩个人号，自然切兜底——这是预期，不是 bug。
-        let available = if self.enterprise_special_handling_enabled() {
+        let available = if self.enterprise_special_handling_enabled()
+            && self.enterprise_selection_policy() == "enterprise-first"
+        {
             let enterprise: Vec<_> = available
                 .iter()
                 .copied()
@@ -2422,9 +2433,22 @@ impl MultiTokenManager {
             available
         };
 
-        // Best：有更凉快的号就别再打 429 过密 / RPM 将满的号。全池都热才回退，避免选不出号。
-        // 只在当前这一层里挑凉快的，不会因为企业号「快满」就掉到个人号。
-        let cool: Vec<_> = available
+        // Best：先锁定最高优先级层，再在该层里避开 429 过密 / RPM 将满的号。
+        // 不能先把全池的热号过滤掉，否则低优先级冷号会绕过高优先级账号。
+        let priority_tier = if self.get_endpoint_mode() == EndpointMode::Best {
+            let priority = available
+                .iter()
+                .map(|entry| entry.credentials.priority)
+                .min()
+                .expect("available credentials must not be empty");
+            available
+                .into_iter()
+                .filter(|entry| entry.credentials.priority == priority)
+                .collect::<Vec<_>>()
+        } else {
+            available
+        };
+        let cool: Vec<_> = priority_tier
             .iter()
             .copied()
             .filter(|entry| !is_rpm_nearly_full(entry, now) && !is_affinity_429_hot(entry, now))
@@ -2432,7 +2456,7 @@ impl MultiTokenManager {
         let available = if self.get_endpoint_mode() == EndpointMode::Best && !cool.is_empty() {
             cool
         } else {
-            available
+            priority_tier
         };
 
         let configured_mode = self.load_balancing_mode.lock().clone();
@@ -2602,12 +2626,11 @@ impl MultiTokenManager {
 
             let (id, credentials, recovered) = {
                 let mut entries = self.entries.lock();
-                // priority 模式固定 current_id；balanced / least_conn 每次重新选择
-                let re_select_each_request = self.get_endpoint_mode() == EndpointMode::Best
-                    || self.load_balancing_mode.lock().as_str() != "priority";
+                // 跨请求的会话粘滞由 conversation affinity 单独负责；current_id
+                // 只是面板展示与启动初值，不能让一次临时降级永久绕过 priority。
+                let re_select_each_request = true;
 
-                // 非 priority 模式：每次请求都重新选择，不固定 current_id
-                // priority 模式：优先使用 current_id 指向的凭据
+                // 每次新请求都重新选择；同一会话需要粘滞时走 affinity_key。
                 let current_hit = if re_select_each_request {
                     None
                 } else {
@@ -6176,6 +6199,39 @@ impl MultiTokenManager {
         self.enterprise_special_handling.load(Ordering::Relaxed)
     }
 
+    pub fn enterprise_selection_policy(&self) -> String {
+        self.enterprise_selection_policy.lock().clone()
+    }
+
+    pub fn set_enterprise_selection_policy(&self, policy: String) -> anyhow::Result<()> {
+        let normalized = policy.trim();
+        if normalized != "priority" && normalized != "enterprise-first" {
+            bail!("企业账号选择策略必须是 priority 或 enterprise-first");
+        }
+        let previous = self.enterprise_selection_policy.lock().clone();
+        *self.enterprise_selection_policy.lock() = normalized.to_string();
+        if let Err(error) = self.persist_enterprise_selection_policy(normalized) {
+            *self.enterprise_selection_policy.lock() = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn persist_enterprise_selection_policy(&self, policy: &str) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let Some(path) = self.config.config_path() else {
+            tracing::warn!("配置文件路径未知，企业账号选择策略仅在当前进程生效");
+            return Ok(());
+        };
+        let mut config = Config::load(path)
+            .with_context(|| format!("重新加载配置失败: {}", path.display()))?;
+        config.enterprise_selection_policy = policy.to_string();
+        config
+            .save()
+            .with_context(|| format!("持久化企业账号选择策略失败: {}", path.display()))?;
+        Ok(())
+    }
+
     pub fn set_enterprise_special_handling(&self, enabled: bool) -> anyhow::Result<()> {
         let previous = self.enterprise_special_handling.swap(enabled, Ordering::Relaxed);
         if let Err(error) = self.persist_enterprise_special_handling(enabled) {
@@ -8459,6 +8515,9 @@ mod tests {
         )
         .unwrap();
         manager.set_enterprise_special_handling(true).unwrap();
+        manager
+            .set_enterprise_selection_policy("enterprise-first".to_string())
+            .unwrap();
         {
             let mut entries = manager.entries.lock();
             let enterprise = entries
@@ -8473,6 +8532,41 @@ mod tests {
             picked.is_enterprise_credential(),
             "企业号专项打开时，有空位的企业号必须压过更空闲的个人号"
         );
+    }
+
+    #[test]
+    fn enterprise_special_respects_priority_policy_and_uses_enterprise_as_fallback() {
+        let mut enterprise = poweruser_cred("ent");
+        enterprise.priority = 10;
+        enterprise.rpm_limit = 100;
+        let mut personal = grouped_cred("per", &[]);
+        personal.priority = 0;
+        personal.rpm_limit = 100;
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![enterprise, personal],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.set_enterprise_special_handling(true).unwrap();
+
+        let (_, picked) = manager.select_next_credential(None, None).unwrap();
+        assert!(!picked.is_enterprise_credential(), "默认策略应遵循账号优先级");
+
+        {
+            let mut entries = manager.entries.lock();
+            let personal = entries
+                .iter_mut()
+                .find(|entry| !entry.credentials.is_enterprise_credential())
+                .unwrap();
+            personal.in_flight = 1;
+            personal.credentials.max_concurrency = 1;
+        }
+        let (_, fallback) = manager.select_next_credential(None, None).unwrap();
+        assert!(fallback.is_enterprise_credential(), "高优先级账号满载后应使用企业替补");
     }
 
     #[test]
@@ -9458,6 +9552,9 @@ mod tests {
             .unwrap(),
         );
         manager.set_enterprise_special_handling(true).unwrap();
+        manager
+            .set_enterprise_selection_policy("enterprise-first".to_string())
+            .unwrap();
         manager.remember_session_affinity("conversation", 2);
 
         let ctx = manager
@@ -12097,6 +12194,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(next.id, 2);
+    }
+
+    #[tokio::test]
+    async fn priority_mode_does_not_keep_low_priority_current_after_recovery() {
+        let mut high = grouped_cred("high", &[]);
+        high.priority = 0;
+        high.max_concurrency = 1;
+        let mut low = grouped_cred("low", &[]);
+        low.priority = 10;
+        let mut config = Config::default();
+        config.endpoint_mode = EndpointMode::Manual;
+        config.load_balancing_mode = "priority".to_string();
+        let manager = Arc::new(
+            MultiTokenManager::new(config, vec![high, low], None, None, false).unwrap(),
+        );
+        let first = manager.acquire_context(None, None).await.unwrap();
+        let high_guard = manager.in_flight_guard(first.id);
+        let fallback = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(fallback.id, 2);
+        let low_guard = manager.in_flight_guard(fallback.id);
+        drop(high_guard);
+        let recovered = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(recovered.id, 1, "高优先级账号恢复后不能被旧 current_id 绕过");
+        drop(low_guard);
+        drop(manager.in_flight_guard(recovered.id));
     }
 
     #[test]

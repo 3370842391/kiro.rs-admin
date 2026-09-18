@@ -631,7 +631,9 @@ export function BatchImportDialog({
               authMethod: 'api_key',
               kiroApiKey: apiKey,
               nickname: cred.nickname?.trim() || undefined,
-              priority: cred.priority ?? defaultPriority,
+              // priority 由导入默认值统一控制，忽略 JSON 内自带值，避免导入文件
+              // 悄悄改变账号池的调度层级。
+              priority: defaultPriority,
               rpmLimit,
               maxConcurrency,
               costRmb: costRmb && costRmb > 0 ? costRmb : undefined,
@@ -714,7 +716,8 @@ export function BatchImportDialog({
               tokenEndpoint: isExternalIdp ? tokenEndpoint : undefined,
               issuerUrl: isExternalIdp ? issuerUrl : undefined,
               scopes: isExternalIdp ? scopes : undefined,
-              priority: cred.priority ?? defaultPriority,
+              // priority 由导入默认值统一控制，忽略 JSON 内自带值。
+              priority: defaultPriority,
               rpmLimit,
               maxConcurrency,
               costRmb: costRmb && costRmb > 0 ? costRmb : undefined,

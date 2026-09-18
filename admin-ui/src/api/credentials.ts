@@ -635,6 +635,7 @@ export interface EndpointChainsConfig {
   rateLimitBucketMode: 'same-endpoint' | 'hop' | 'none'
   sameEndpointAttempts: number
   enterpriseSpecialHandling: boolean
+  enterpriseSelectionPolicy: 'priority' | 'enterprise-first'
   enterpriseDefaultEndpoint: string
   /** 最大真实企业发送次数，含首次；同时受备用尝试上限 + 1 和总等待限制。 */
   enterpriseMaxRetries: number
@@ -653,6 +654,7 @@ export interface SetEndpointChainsRequest {
   rateLimitBucketMode?: 'same-endpoint' | 'hop' | 'none'
   sameEndpointAttempts?: number
   enterpriseSpecialHandling?: boolean
+  enterpriseSelectionPolicy?: 'priority' | 'enterprise-first'
   enterpriseDefaultEndpoint?: string
   enterpriseMaxRetries?: number
   enterpriseRetry?: EnterpriseRetrySettings

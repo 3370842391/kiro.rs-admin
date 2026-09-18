@@ -45,10 +45,12 @@ impl EnterpriseRequestControl {
             return Ok(policy.clone());
         }
         let enabled = provider.token_manager.enterprise_special_handling_enabled();
+        let priority_selection = provider.token_manager.enterprise_selection_policy() == "priority";
         let policy = if enabled
-            && provider
-                .token_manager
-                .has_available_enterprise(model, group, &HashSet::new())
+            && (priority_selection
+                || provider
+                    .token_manager
+                    .has_available_enterprise(model, group, &HashSet::new()))
         {
             let settings = provider.token_manager.get_enterprise_retry_settings();
             settings.validate()?;
@@ -72,7 +74,10 @@ impl EnterpriseRequestControl {
             None
         };
         // 初次未进入专项的请求保持个人路径，容量恢复不能让它绕过专项进入企业号。
-        if enabled && policy.is_none() {
+        if enabled
+            && policy.is_none()
+            && provider.token_manager.enterprise_selection_policy() == "enterprise-first"
+        {
             self.finished.store(true, Ordering::Relaxed);
         }
         let _ = self.policy.set(policy);

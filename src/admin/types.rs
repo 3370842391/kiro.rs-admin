@@ -809,6 +809,8 @@ pub struct EndpointChainsResponse {
     pub same_endpoint_attempts: u32,
     /// 企业号专项：企业号优先，429 钉死本号，用尽后同一请求改打个人号。
     pub enterprise_special_handling: bool,
+    /// 企业账号选择策略：priority 遵循账号优先级；enterprise-first 保留旧行为。
+    pub enterprise_selection_policy: String,
     /// 企业号启用端点列表的轮询起点（`ide` = q）；未启用时从列表首项开始。
     pub enterprise_default_endpoint: String,
     /// 最大真实企业发送次数（含首次，默认 32）；还受备用尝试上限 + 1 和总等待限制。
@@ -851,6 +853,9 @@ pub struct SetEndpointChainsRequest {
     /// 企业号专项 429。省略则不改。
     #[serde(default)]
     pub enterprise_special_handling: Option<bool>,
+    /// 企业账号选择策略。省略则不改。
+    #[serde(default)]
+    pub enterprise_selection_policy: Option<String>,
     /// 企业号启用列表的轮询起点。省略则不改。
     #[serde(default)]
     pub enterprise_default_endpoint: Option<String>,

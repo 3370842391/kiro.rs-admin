@@ -7,6 +7,8 @@ export interface EnterpriseRetrySettings {
   totalTimeoutMs: number
 }
 
+export type EnterpriseSelectionPolicy = 'priority' | 'enterprise-first'
+
 // 凭据状态响应
 export interface RpmSummary {
   windowSeconds: number

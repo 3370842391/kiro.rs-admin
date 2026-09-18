@@ -538,7 +538,10 @@ async fn enterprise_slow_headers_and_partial_body_share_first_event_deadline() {
 #[tokio::test]
 async fn enterprise_exhaustion_survives_personal_429_and_handler_reentry() {
     let (url, calls) = server(429, b"rate limited".to_vec(), 429).await;
-    let (provider, _) = provider_with_settings(&url, true, true, short_settings());
+    let (provider, manager) = provider_with_settings(&url, true, true, short_settings());
+    manager
+        .set_enterprise_selection_policy("enterprise-first".to_string())
+        .unwrap();
     let sink = RequestSink::default();
     for _ in 0..2 {
         let result = tokio::time::timeout(
@@ -953,6 +956,9 @@ async fn enterprise_terminal_metadata_before_refusal_text_is_not_chunk_sensitive
 async fn enterprise_capacity_recovery_cannot_bypass_cached_request_policy() {
     let (url, calls) = server(200, Vec::new(), 200).await;
     let (provider, manager) = provider(&url, true, true);
+    manager
+        .set_enterprise_selection_policy("enterprise-first".to_string())
+        .unwrap();
     let held = manager.acquire_context_for_id(1).await.unwrap();
     let permit = manager.in_flight_guard(held.id);
     let sink = RequestSink::default();
