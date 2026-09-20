@@ -32,6 +32,7 @@ pub mod credential_earnings;
 pub mod pool_health;
 pub mod pricing_calc;
 pub mod proxy_ban_stats;
+pub mod proxy_exclusive;
 pub mod proxy_pool;
 pub mod proxy_rebind;
 pub mod proxy_reputation;

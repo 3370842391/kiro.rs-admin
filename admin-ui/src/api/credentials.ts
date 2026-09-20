@@ -528,7 +528,7 @@ export async function checkProxyReputation(
   return data
 }
 
-// 轮询批量分配可用代理给凭据
+// 给个人号分配独立 IP；不够则禁用，分到则启用。企业号不参与。
 export async function assignProxiesRoundRobin(
   credentialIds?: number[] | null
 ): Promise<AssignRoundRobinResponse> {

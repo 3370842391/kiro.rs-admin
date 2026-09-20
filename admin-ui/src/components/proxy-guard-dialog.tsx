@@ -42,7 +42,7 @@ export function ProxyGuardDialog({ open, onOpenChange }: ProxyGuardDialogProps) 
   })
 
   const [enabled, setEnabled] = useState(true)
-  const [banThreshold, setBanThreshold] = useState('2')
+  const [banThreshold, setBanThreshold] = useState('1')
   const [windowHours, setWindowHours] = useState('24')
   const [minAssignable, setMinAssignable] = useState('3')
   const [migrateSurvivors, setMigrateSurvivors] = useState(true)
@@ -82,9 +82,6 @@ export function ProxyGuardDialog({ open, onOpenChange }: ProxyGuardDialogProps) 
       if (res.quarantined.length > 0) parts.push(`隔离 ${res.quarantined.length} 个出口`)
       if (res.migrated > 0) parts.push(`迁移 ${res.migrated} 个号`)
       if (res.released.length > 0) parts.push(`解除 ${res.released.length} 个`)
-      if (res.skippedForCapacity.length > 0) {
-        parts.push(`${res.skippedForCapacity.length} 个因出口不足跳过`)
-      }
       toast.success(parts.length > 0 ? parts.join('，') : '没有出口达到隔离阈值')
       queryClient.invalidateQueries({ queryKey: ['proxy-pool'] })
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
@@ -119,8 +116,8 @@ export function ProxyGuardDialog({ open, onOpenChange }: ProxyGuardDialogProps) 
 
         <div className="flex-1 overflow-y-auto space-y-4 py-2">
           <p className="text-xs text-muted-foreground">
-            窗口内封够指定数量的号，就直接停用这个出口，并把它上面还活着的号改绑到干净出口。
-            与代理池的「降权」不同：降权只是排序靠后，钉死在某个出口上的号照样会走它。
+            默认封 1 个号就立刻停用这个 IP。个人号已经一号一 IP，等第二个号等于永远不隔离。
+            被停用出口上还活着的个人号只改绑到空闲独立 IP，没有空位就禁用。
           </p>
 
           {isLoading && (
@@ -143,12 +140,12 @@ export function ProxyGuardDialog({ open, onOpenChange }: ProxyGuardDialogProps) 
               <Input
                 value={banThreshold}
                 onChange={(e) => setBanThreshold(e.target.value)}
-                placeholder="2"
+                placeholder="1"
                 inputMode="numeric"
                 disabled={!enabled}
               />
               <p className="text-xs text-muted-foreground">
-                窗口内封够几个号就隔离。取 2 是因为单个号被封可能是这个号自己的问题。
+                窗口内封够几个号就立刻停用该 IP。默认 1。
               </p>
             </div>
             <div className="space-y-1">
@@ -177,7 +174,7 @@ export function ProxyGuardDialog({ open, onOpenChange }: ProxyGuardDialogProps) 
                 disabled={!enabled}
               />
               <p className="text-xs text-muted-foreground">
-                隔离后池里至少要剩这么多可分配出口，否则跳过隔离只告警。
+                只作告警参考。封号出口仍会立刻停用，不会因为池子不够就放过脏 IP。
               </p>
             </div>
             <div className="space-y-1">

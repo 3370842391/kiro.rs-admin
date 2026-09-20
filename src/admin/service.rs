@@ -44,7 +44,7 @@ use super::pricing_calc;
 use super::profit::ProfitConfig;
 use super::proxy_ban_stats;
 use super::proxy_pool::{self, GetUrlResult, ProxyEntry, ProxyHealth, ProxyPoolManager};
-use super::proxy_rebind;
+use super::proxy_exclusive;
 use super::credential_earnings::{self, SellRateStore};
 use super::proxy_reputation::{ProxyReputationStore, ReputationGrade};
 use super::types::{
@@ -1045,11 +1045,29 @@ fn validate_log_governance_request(
 }
 
 impl AdminService {
+    fn pending_personal_proxy_reservations(&self) -> HashSet<String> {
+        let social = self.social_sessions.lock();
+        social
+            .values()
+            .filter_map(|session| session.proxy.as_ref())
+            .map(|proxy| proxy_ban_stats::normalize_proxy_key(Some(&proxy.url)))
+            .collect()
+    }
+
     /// 为 Hosted/IdC 新登录挑选导入代理：把已有凭据与待完成登录都计入负载，
     /// 避免连续点登录时所有新号都落到排序第一的出口。
-    fn import_proxy(&self, auto_assign: bool) -> Option<ProxyConfig> {
+    fn import_proxy(&self, auto_assign: bool, personal: bool) -> Option<ProxyConfig> {
         if !auto_assign {
             return None;
+        }
+        if personal {
+            let reserved = self.pending_personal_proxy_reservations();
+            return proxy_exclusive::pick_free_personal_proxy_with_reserved(
+                &self.token_manager,
+                &self.proxy_pool,
+                &reserved,
+            )
+            .map(ProxyConfig::new);
         }
         let urls = self.proxy_pool.assignable_urls_ranked();
         if urls.is_empty() {
@@ -1092,7 +1110,16 @@ impl AdminService {
         let balance_cache = Self::load_balance_cache_from(&cache_path);
         let update_config = RuntimeUpdateConfig::from_config(token_manager.config());
         let import_defaults = token_manager.config().credential_import_defaults.clone();
-        let proxy_guard = token_manager.config().proxy_guard.clone();
+        let mut proxy_guard = token_manager.config().proxy_guard.clone();
+        // 旧默认是 2。个人号一号一 IP 之后等不到第二个号，首次启动把遗留的 2 改成 1；
+        // 迁移完成后允许运营手动调回 2/3，不再每次重启覆盖。
+        let migrate_ban_threshold = !proxy_guard.threshold_migration_done;
+        if migrate_ban_threshold {
+            if proxy_guard.ban_threshold == 2 {
+                proxy_guard.ban_threshold = 1;
+            }
+            proxy_guard.threshold_migration_done = true;
+        }
 
         let svc = Self {
             token_manager,
@@ -1121,6 +1148,11 @@ impl AdminService {
             pricing_coefficients: OnceLock::new(),
             rpm_infer: OnceLock::new(),
         };
+
+        if migrate_ban_threshold {
+            let value = svc.proxy_guard.lock().clone();
+            svc.update_config_file(move |c| c.proxy_guard = value);
+        }
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
         {
@@ -1800,6 +1832,16 @@ impl AdminService {
             .set_disabled(id, disabled)
             .map_err(|e| self.classify_error(e, id))?;
 
+        if !disabled && !self.token_manager.is_enterprise_credential(id) {
+            // 手动点启用不能绕过个人号独占出口约束；没有空闲 IP 时分配器会
+            // 立即恢复 MissingExclusiveProxy 并保持禁用。
+            let _ = proxy_exclusive::assign_exclusive_personal_proxies(
+                &self.token_manager,
+                &self.proxy_pool,
+                Some(&HashSet::from([id])),
+            );
+        }
+
         // 只有禁用的是当前凭据时才尝试切换到下一个
         if disabled && id == current_id {
             let _ = self.token_manager.switch_to_next();
@@ -2080,7 +2122,7 @@ impl AdminService {
                 if !summary.disabled_urls.is_empty() {
                     let mut migrated = 0usize;
                     for url in &summary.disabled_urls {
-                        migrated += proxy_rebind::migrate_live_off_proxy(
+                        migrated += proxy_exclusive::migrate_live_off_proxy_exclusive(
                             &svc.token_manager,
                             &svc.proxy_pool,
                             url,
@@ -2110,14 +2152,36 @@ impl AdminService {
     /// ——同一出口上两个号只隔了 84 秒——纯轮询的间隔就是白送给脏出口的额度。
     /// 定时唤醒只为兜住两件事：到期自动解除隔离，以及重启后立刻按现有台账做一次判定。
     pub fn start_proxy_guard(self: &Arc<Self>) {
-        let Some(ledger) = self.token_manager.ban_ledger() else {
-            return;
-        };
-        let signal = ledger.ban_signal();
         let svc = Arc::clone(self);
         tokio::spawn(async move {
             // 启动时先让代理池健康检查跑一轮，避免拿「尚未探测」的状态做容量判断
             tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+
+            // 冷启动补偿：把历史上多个个人号共用一个出口的旧状态拆开，
+            // 并把没有独立 IP 的个人号置为 MissingExclusiveProxy。企业号不参与。
+            let assignment = proxy_exclusive::assign_exclusive_personal_proxies(
+                &svc.token_manager,
+                &svc.proxy_pool,
+                None,
+            );
+            if assignment.assigned > 0
+                || assignment.disabled > 0
+                || assignment.enabled > 0
+                || assignment.stripped_extra > 0
+            {
+                tracing::info!(
+                    assigned = assignment.assigned,
+                    enabled = assignment.enabled,
+                    disabled = assignment.disabled,
+                    stripped_extra = assignment.stripped_extra,
+                    "启动时完成个人号独立 IP 补偿分配"
+                );
+            }
+
+            let Some(ledger) = svc.token_manager.ban_ledger() else {
+                return;
+            };
+            let signal = ledger.ban_signal();
             loop {
                 let outcome = svc.enforce_proxy_guard();
                 if !outcome.quarantined.is_empty()
@@ -2128,7 +2192,6 @@ impl AdminService {
                         quarantined = outcome.quarantined.len(),
                         migrated = outcome.migrated,
                         released = outcome.released.len(),
-                        skipped = outcome.skipped_for_capacity.len(),
                         "烧号隔离守卫完成一轮处置"
                     );
                 }
@@ -2462,6 +2525,11 @@ impl AdminService {
                 tracing::warn!("添加凭据后刷新余额失败（不影响凭据添加）: {}", e);
             }
         }
+        let _ = proxy_exclusive::assign_exclusive_personal_proxies(
+            &self.token_manager,
+            &self.proxy_pool,
+            Some(&std::collections::HashSet::from([credential_id])),
+        );
 
         Ok(AddCredentialResponse {
             success: true,
@@ -2617,6 +2685,16 @@ impl AdminService {
             self.token_manager
                 .set_credential_endpoint(id, endpoint)
                 .map_err(|e| self.classify_error(e, id))?;
+        }
+
+        if !self.token_manager.is_enterprise_credential(id) {
+            // 凭据编辑同样不能绕开一号一出口约束；清空或改到已占用出口时，
+            // 分配器会选择空闲出口，实在没有就置为 MissingExclusiveProxy。
+            let _ = proxy_exclusive::assign_exclusive_personal_proxies(
+                &self.token_manager,
+                &self.proxy_pool,
+                Some(&HashSet::from([id])),
+            );
         }
 
         Ok(())
@@ -4578,23 +4656,20 @@ impl AdminService {
                 cfg.window_hours, bans_now, cfg.ban_threshold
             );
 
-            // 容量闸门：宁可让一个脏出口继续跑，也不能把池子抽干让号退化成直连
             if assignable.saturating_sub(1) < cfg.min_assignable {
                 tracing::warn!(
                     proxy = %redacted,
                     bans = bans_now,
                     assignable,
                     min_assignable = cfg.min_assignable,
-                    "出口烧号超阈值但可分配出口不足，跳过隔离"
+                    "出口烧号，可分配出口已低于保底，仍隔离该 IP，幸存个人号只改绑到空闲独立 IP"
                 );
-                outcome.skipped_for_capacity.push(redacted);
-                continue;
             }
 
             if !self.proxy_pool.quarantine(&offender.url, reason.clone()) {
                 continue;
             }
-            assignable -= 1;
+            assignable = assignable.saturating_sub(1);
             tracing::error!(proxy = %redacted, bans = bans_now, "{}，已隔离该出口", reason);
             outcome.quarantined.push(ProxyGuardQuarantineItem {
                 proxy: redacted,
@@ -4603,123 +4678,15 @@ impl AdminService {
             });
 
             if cfg.migrate_survivors {
-                outcome.migrated += self.migrate_off_proxy(&offender.url, &bans, cfg.ban_threshold);
+                outcome.migrated += proxy_exclusive::migrate_live_off_proxy_exclusive(
+                    &self.token_manager,
+                    &self.proxy_pool,
+                    &offender.url,
+                );
             }
         }
 
         outcome
-    }
-
-    /// 把某个出口上还活着的号改绑到干净出口。返回迁移成功的账号数。
-    ///
-    /// 只迁未判死的号：死号改绑只会污染新出口的 `accountsSeen` 分母，把它的封号率
-    /// 摊薄成假的好看数字。
-    fn migrate_off_proxy(
-        &self,
-        from_url: &str,
-        bans: &std::collections::BTreeMap<String, u64>,
-        ban_threshold: u32,
-    ) -> usize {
-        let from_key = proxy_ban_stats::normalize_proxy_key(Some(from_url));
-        let survivors: Vec<(u64, Option<String>)> = self
-            .token_manager
-            .snapshot()
-            .entries
-            .into_iter()
-            .filter(|c| c.died_at.is_none())
-            .filter(|c| {
-                c.proxy_url
-                    .as_deref()
-                    .is_some_and(|u| proxy_ban_stats::normalize_proxy_key(Some(u)) == from_key)
-            })
-            .map(|c| (c.id, c.email))
-            .collect();
-        if survivors.is_empty() {
-            return 0;
-        }
-
-        // 目标只从「窗口内封号数低于阈值」的出口里挑，否则只是把号从一个正在烧号的
-        // 出口搬到另一个，下一轮又得搬一次
-        let mut targets: Vec<(String, usize)> = {
-            let counts = self.credential_count_by_proxy();
-            self.proxy_pool
-                .assignable_urls()
-                .into_iter()
-                .filter(|url| {
-                    let key = proxy_ban_stats::normalize_proxy_key(Some(url));
-                    key != from_key
-                        && bans.get(&key).copied().unwrap_or(0) < ban_threshold as u64
-                })
-                .map(|url| {
-                    let key = proxy_ban_stats::normalize_proxy_key(Some(&url));
-                    let load = counts.get(&key).copied().unwrap_or(0);
-                    (url, load)
-                })
-                .collect()
-        };
-        if targets.is_empty() {
-            tracing::error!(
-                proxy = %proxy_ban_stats::redact_proxy_url(from_url),
-                stranded = survivors.len(),
-                "没有干净出口可迁移，这些号仍绑在被隔离的出口上（不会直连，但也打不通）"
-            );
-            return 0;
-        }
-
-        let mut migrated = 0usize;
-        for (credential_id, email) in survivors {
-            // 每次都挑当前负载最低的，避免把一批号全塞给同一个出口——同出口并发
-            // 正是这轮封号里最可疑的特征
-            targets.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-            let (target_url, load) = &mut targets[0];
-            let target_url = target_url.clone();
-            *load += 1;
-
-            match self.token_manager.update_credential(
-                credential_id,
-                None,
-                None,
-                Some(Some(target_url.clone())),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            ) {
-                Ok(()) => {
-                    migrated += 1;
-                    tracing::warn!(
-                        credential_id,
-                        email = email.as_deref().unwrap_or("-"),
-                        from = %proxy_ban_stats::redact_proxy_url(from_url),
-                        to = %proxy_ban_stats::redact_proxy_url(&target_url),
-                        "出口被隔离，账号已改绑到干净出口"
-                    );
-                }
-                Err(error) => {
-                    tracing::warn!(credential_id, %error, "账号改绑代理失败");
-                }
-            }
-        }
-        migrated
-    }
-
-    /// 每个出口当前绑了多少个活号，键为归一化 `host:port`
-    fn credential_count_by_proxy(&self) -> std::collections::HashMap<String, usize> {
-        let mut counts: std::collections::HashMap<String, usize> = Default::default();
-        for c in self.token_manager.snapshot().entries {
-            if c.died_at.is_some() {
-                continue;
-            }
-            if let Some(url) = c.proxy_url.as_deref() {
-                *counts
-                    .entry(proxy_ban_stats::normalize_proxy_key(Some(url)))
-                    .or_default() += 1;
-            }
-        }
-        counts
     }
 
     /// 获取代理池列表（含凭据引用计数与历史封号统计）
@@ -4767,7 +4734,8 @@ impl AdminService {
                     .unwrap_or(ReputationGrade::Unknown);
                 ProxyPoolEntry {
                     id: p.id,
-                    url: p.url,
+                    url: p.url.clone(),
+                    host: proxy_ban_stats::normalize_proxy_key(Some(&p.url)),
                     label: p.label,
                     enabled: p.enabled,
                     credential_count: count,
@@ -4887,7 +4855,8 @@ impl AdminService {
             .unwrap_or_default();
         Ok(ProxyPoolEntry {
             id: entry.id,
-            url: entry.url,
+            url: entry.url.clone(),
+            host: proxy_ban_stats::normalize_proxy_key(Some(&entry.url)),
             label: entry.label,
             enabled: entry.enabled,
             credential_count: 0,
@@ -4921,7 +4890,8 @@ impl AdminService {
                 let ban_stats = ledger.map(|l| l.summary_for(Some(&e.url))).unwrap_or_default();
                 ProxyPoolEntry {
                     id: e.id,
-                    url: e.url,
+                    url: e.url.clone(),
+                    host: proxy_ban_stats::normalize_proxy_key(Some(&e.url)),
                     label: e.label,
                     enabled: e.enabled,
                     credential_count: 0,
@@ -5100,7 +5070,18 @@ impl AdminService {
                 } else {
                     AdminServiceError::InternalError(msg)
                 }
-            })
+            })?;
+
+        // 手动绑定/清除也必须经过同一套个人号互斥规则：不能因为 UI 入口绕过
+        // 分配器，让两个个人号重新共用出口，或清除后退回服务器 IP。
+        if !self.token_manager.is_enterprise_credential(credential_id) {
+            let _ = proxy_exclusive::assign_exclusive_personal_proxies(
+                &self.token_manager,
+                &self.proxy_pool,
+                Some(&HashSet::from([credential_id])),
+            );
+        }
+        Ok(())
     }
 
     /// 即时探测单个代理的连通性（供 UI「测试」按钮调用）
@@ -5111,7 +5092,11 @@ impl AdminService {
             .await
             .map_err(|_| AdminServiceError::NotFound { id })?;
         if entry.auto_disabled && !entry.enabled {
-            proxy_rebind::migrate_live_off_proxy(&self.token_manager, &self.proxy_pool, &entry.url);
+            proxy_exclusive::migrate_live_off_proxy_exclusive(
+                &self.token_manager,
+                &self.proxy_pool,
+                &entry.url,
+            );
         }
         Ok(ProxyCheckResponse {
             id: entry.id,
@@ -5147,7 +5132,11 @@ impl AdminService {
     pub async fn check_all_proxies(&self) -> ProxyCheckAllResponse {
         let summary = self.proxy_pool.check_all().await;
         for url in &summary.disabled_urls {
-            proxy_rebind::migrate_live_off_proxy(&self.token_manager, &self.proxy_pool, url);
+            proxy_exclusive::migrate_live_off_proxy_exclusive(
+                &self.token_manager,
+                &self.proxy_pool,
+                url,
+            );
         }
         ProxyCheckAllResponse {
             healthy: summary.healthy,
@@ -5156,65 +5145,34 @@ impl AdminService {
         }
     }
 
-    /// 将可用代理按轮询方式批量分配给凭据，**干净的出口先分**。
+    /// 给个人号互斥分配独立出口：一张号一个 IP，企业号不参与。
     ///
-    /// - `credential_ids` 为 None 时对全部凭据分配
-    /// - 无可用代理时返回错误
-    ///
-    /// 候选顺序取自 [`ProxyPoolManager::assignable_urls_ranked`]（封号风险档位优先），
-    /// 不是 `assignable_urls()`。后者只过滤连通性，`urls[i % len]` 会把烧号最多的
-    /// 出口和零封号出口一视同仁——2026-09-01 线上一次导入 7 个号，其中一个被分到
-    /// 33 个号烧了 9 个的出口上，22 分钟即死。要分配 N 个号时，排序后拿到的是
-    /// 当前最干净的前 N 个。
+    /// IP 不够的个人号写成 `MissingExclusiveProxy` 并禁用；分到后自动启用。
+    /// 候选顺序仍走 [`ProxyPoolManager::assignable_urls_ranked`]（干净出口优先）。
     pub fn assign_proxies_round_robin(
         &self,
         credential_ids: Option<Vec<u64>>,
     ) -> Result<AssignRoundRobinResponse, AdminServiceError> {
-        let urls = self.proxy_pool.assignable_urls_ranked();
-        if urls.is_empty() {
+        let only = credential_ids
+            .filter(|ids| !ids.is_empty())
+            .map(|ids| ids.into_iter().collect());
+        let result = proxy_exclusive::assign_exclusive_personal_proxies(
+            &self.token_manager,
+            &self.proxy_pool,
+            only.as_ref(),
+        );
+        if result.proxy_count == 0 && result.assigned == 0 && result.disabled == 0 {
             return Err(AdminServiceError::InvalidCredential(
                 "没有可用代理（需已启用且健康检查未失败）".to_string(),
             ));
         }
-
-        let target_ids: Vec<u64> = match credential_ids {
-            Some(ids) if !ids.is_empty() => ids,
-            _ => self
-                .token_manager
-                .snapshot()
-                .entries
-                .iter()
-                .map(|c| c.id)
-                .collect(),
-        };
-
-        let mut assigned = 0;
-        for (i, cred_id) in target_ids.iter().enumerate() {
-            let url = urls[i % urls.len()].clone();
-            if self
-                .token_manager
-                .update_credential(
-                    *cred_id,
-                    None,
-                    None,
-                    Some(Some(url)),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-                .is_ok()
-            {
-                assigned += 1;
-            }
-        }
-
         Ok(AssignRoundRobinResponse {
-            assigned,
-            proxy_count: urls.len(),
+            assigned: result.assigned,
+            enabled: result.enabled,
+            disabled: result.disabled,
+            skipped_enterprise: result.skipped_enterprise,
+            proxy_count: result.proxy_count,
+            unassigned: result.unassigned,
         })
     }
 
@@ -5317,7 +5275,14 @@ impl AdminService {
 
         let retry_candidate = credential.clone();
         match self.token_manager.add_credential(credential).await {
-            Ok(id) => Ok(LoginCredentialResult::Added(id)),
+            Ok(id) => {
+                let _ = proxy_exclusive::assign_exclusive_personal_proxies(
+                    &self.token_manager,
+                    &self.proxy_pool,
+                    Some(&std::collections::HashSet::from([id])),
+                );
+                Ok(LoginCredentialResult::Added(id))
+            }
             Err(error) => {
                 if let Some(id) = self
                     .token_manager
@@ -5355,17 +5320,18 @@ impl AdminService {
         &self,
         req: StartSocialLoginRequest,
     ) -> Result<StartSocialLoginResponse, AdminServiceError> {
+        // 选择独占 IP 到写入待登录会话必须是一个临界区，否则两个同时点击的登录
+        // 都会在凭据表里看不到对方，拿到同一个个人出口。
+        let _login_guard = self.login_credential_lock.lock().await;
         // 兼容旧前端字段；新账号统一由导入默认值决定 priority。
         let _ = req.priority;
         let import_defaults = self.import_defaults.lock().clone();
-        let auto_proxy = self.import_proxy(import_defaults.auto_assign_proxy);
-        let global_proxy = self.token_manager.proxy();
+        let auto_proxy = self.import_proxy(import_defaults.auto_assign_proxy, true);
         let proxy = req
             .proxy_url
             .as_deref()
             .map(ProxyConfig::new)
-            .or(auto_proxy)
-            .or(global_proxy);
+            .or(auto_proxy);
 
         let auth_endpoint = req
             .auth_endpoint
@@ -5890,14 +5856,17 @@ impl AdminService {
         &self,
         req: StartIdcLoginRequest,
     ) -> Result<StartIdcLoginResponse, AdminServiceError> {
+        // IdC 是企业号，但登录期间同样要让待完成会话参与负载统计，避免并发登录
+        // 全部落到同一个出口。
+        let _login_guard = self.login_credential_lock.lock().await;
         // 兼容旧前端字段；新账号统一由导入默认值决定 priority。
         let _ = req.priority;
         let import_defaults = self.import_defaults.lock().clone();
         let config = self.token_manager.config();
-        let auto_proxy = self.import_proxy(import_defaults.auto_assign_proxy);
+        let auto_proxy = self.import_proxy(import_defaults.auto_assign_proxy, false);
         let global_proxy = self.token_manager.proxy();
 
-        // 代理：优先用请求级，否则回退全局
+        // 代理：优先用请求级，否则回退全局。企业号仍可共享出口。
         let proxy = req
             .proxy_url
             .as_deref()

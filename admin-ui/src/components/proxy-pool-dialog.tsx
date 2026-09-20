@@ -19,6 +19,7 @@ import {
   Users,
   AlertTriangle,
   Info,
+  Copy,
 } from 'lucide-react'
 import {
   Dialog,
@@ -49,7 +50,7 @@ import {
   type ProxyBalancingMode,
 } from '@/api/credentials'
 import type { ProxyScheme } from '@/types/api'
-import { cn, extractErrorMessage, maskProxyUrl } from '@/lib/utils'
+import { cn, extractErrorMessage, proxyDisplayHost, proxySchemeLabel } from '@/lib/utils'
 import {
   ProxyBanBadge,
   ProxyBanStatsPanel,
@@ -65,6 +66,20 @@ interface ProxyPoolDialogProps {
   onOpenChange: (open: boolean) => void
   /** 点击"分配"按钮时的回调（传入代理 URL，用于编辑凭据） */
   onSelectProxy?: (url: string) => void
+}
+
+function entryHost(proxy: ProxyPoolEntry): string {
+  return proxy.host || proxyDisplayHost(proxy.url)
+}
+
+async function copyProxyHost(host: string) {
+  if (!host) return
+  try {
+    await navigator.clipboard.writeText(host)
+    toast.success(`已复制 ${host}`)
+  } catch {
+    toast.error('复制失败，请手动选择地址')
+  }
 }
 
 function splitProxyCandidates(raw: string): string[] {
@@ -307,7 +322,7 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
   const keyword = search.trim().toLowerCase()
   const visibleProxies = proxies.filter((proxy) => {
     if (keyword) {
-      const haystack = `${proxy.url} ${proxy.label ?? ''}`.toLowerCase()
+      const haystack = `${entryHost(proxy)} ${proxy.url} ${proxy.label ?? ''}`.toLowerCase()
       if (!haystack.includes(keyword)) return false
     }
     for (const filter of PROXY_FILTERS) {
@@ -354,7 +369,7 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
   const addMutation = useMutation({
     mutationFn: () => addProxy({ url: newUrl.trim(), label: newLabel.trim() || undefined }),
     onSuccess: (entry) => {
-      toast.success(`代理已添加：${entry.url}`)
+      toast.success(`代理已添加：${entryHost(entry)}`)
       setNewUrl('')
       setNewLabel('')
       queryClient.invalidateQueries({ queryKey: ['proxy-pool'] })
@@ -384,7 +399,9 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
   const assignRoundRobinMutation = useMutation({
     mutationFn: () => assignProxiesRoundRobin(null),
     onSuccess: (res) => {
-      toast.success(`已用 ${res.proxyCount} 个代理轮询分配给 ${res.assigned} 个凭据`)
+      toast.success(
+        `独立IP：新分配 ${res.assigned}，启用 ${res.enabled ?? 0}，禁用无IP ${res.disabled ?? 0}（可用出口 ${res.proxyCount}）`
+      )
       queryClient.invalidateQueries({ queryKey: ['proxy-pool'] })
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
@@ -646,7 +663,7 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
   const preview = (list: ProxyPoolEntry[]) =>
     list
       .slice(0, 3)
-      .map((proxy) => maskProxyUrl(proxy.url))
+      .map((proxy) => entryHost(proxy))
       .join('、') + (list.length > 3 ? ' 等' : '')
 
   const poolAlerts: PoolAlert[] = []
@@ -1077,10 +1094,10 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                       className="h-7 text-xs"
                       onClick={() => assignRoundRobinMutation.mutate()}
                       disabled={assignRoundRobinMutation.isPending}
-                      title="将可用代理轮询分配给所有凭据"
+                      title="给未分配独立IP的个人号各绑一个出口并启用；IP不够的个人号自动禁用。企业号不参与。"
                     >
                       <Shuffle className="h-3 w-3 mr-1" />
-                      轮询分配
+                      {assignRoundRobinMutation.isPending ? '分配中...' : '分配独立IP'}
                     </Button>
                     <Button
                       size="sm"
@@ -1198,9 +1215,29 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                       {/* 第一行只放「这是哪个 IP、能不能用、脏不脏」——扫视时唯一要看的。
                           备注、全局标记、检测时间这些属于查证信息，压到第二行。 */}
                       <div className="flex min-w-0 items-center gap-2">
-                        <span className="min-w-0 flex-1 truncate font-mono text-sm">
-                          {maskProxyUrl(proxy.url)}
-                        </span>
+                        <button
+                          type="button"
+                          className="min-w-0 flex-1 truncate text-left font-mono text-sm font-medium hover:text-primary"
+                          title="点击复制 IP"
+                          onClick={() => copyProxyHost(entryHost(proxy))}
+                        >
+                          {entryHost(proxy)}
+                        </button>
+                        {proxySchemeLabel(proxy.url) && (
+                          <span className="shrink-0 text-[11px] uppercase text-muted-foreground/80">
+                            {proxySchemeLabel(proxy.url)}
+                          </span>
+                        )}
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="ghost"
+                          className="h-7 w-7 shrink-0 p-0"
+                          title="复制 IP"
+                          onClick={() => copyProxyHost(entryHost(proxy))}
+                        >
+                          <Copy className="h-3.5 w-3.5" />
+                        </Button>
                         {proxy.credentialCount > 0 && (
                           <span
                             className="inline-flex shrink-0 items-center gap-0.5 rounded bg-secondary px-1.5 text-xs tabular-nums text-muted-foreground"

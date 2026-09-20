@@ -32,6 +32,8 @@ pub enum CredentialDisableReason {
     InvalidRefreshToken,
     InvalidConfig,
     Forbidden,
+    /// 个人号没有独占出口。IP 不够时自动禁用，分到独立 IP 后自动启用。
+    MissingExclusiveProxy,
 }
 
 impl CredentialDisableReason {
@@ -44,7 +46,25 @@ impl CredentialDisableReason {
             Self::InvalidRefreshToken => "InvalidRefreshToken",
             Self::InvalidConfig => "InvalidConfig",
             Self::Forbidden => "Forbidden",
+            Self::MissingExclusiveProxy => "MissingExclusiveProxy",
         }
+    }
+
+    pub fn is_missing_exclusive_proxy(self) -> bool {
+        matches!(self, Self::MissingExclusiveProxy)
+    }
+
+    /// 账号已经无法继续承载请求，不能占用个人号的独立出口。
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Forbidden
+                | Self::TooManyFailures
+                | Self::TooManyRefreshFailures
+                | Self::QuotaExceeded
+                | Self::InvalidRefreshToken
+                | Self::InvalidConfig
+        )
     }
 }
 
@@ -930,7 +950,10 @@ impl KiroCredentials {
             .unwrap_or(false)
     }
 
-    /// 是否为 AWS IAM Identity Center / Enterprise 账号（含 IdC 登录与 POWER 订阅）。
+    /// 是否为 AWS IAM Identity Center / Enterprise 账号。
+    ///
+    /// 订阅标题里的 POWER 不能作为企业号判据：Social/Google 个人 Power 账号也会
+    /// 带这个标题。必须优先依赖认证方式或显式 provider，避免个人号错误回退到服务器 IP。
     pub fn is_enterprise_credential(&self) -> bool {
         if self
             .provider
@@ -939,19 +962,32 @@ impl KiroCredentials {
         {
             return true;
         }
-        if self.auth_method.as_deref() == Some("idc")
-            && self
-                .start_url
-                .as_ref()
-                .is_some_and(|url| !url.trim().is_empty())
+        let auth_method = self
+            .auth_method
+            .as_deref()
+            .map(canonicalize_auth_method_value);
+        if auth_method.as_deref() == Some("idc")
+            && self.start_url.as_ref().is_some_and(|url| !url.trim().is_empty())
         {
             return true;
         }
-        if let Some(title) = self.subscription_title.as_deref() {
-            let upper = title.to_ascii_uppercase();
-            if upper.contains("ENTERPRISE") || upper.contains("POWER") || upper.contains("TEAM") {
-                return true;
-            }
+        if auth_method.as_deref() == Some("external_idp") {
+            return true;
+        }
+        // 企业 API key 没有 IdC startUrl，保留订阅标题作为兼容判据；但明确的
+        // Social/Google 个人 Power 不能因此被归到企业池。
+        let explicit_personal_social = auth_method.as_deref() == Some("social")
+            || self
+                .provider
+                .as_deref()
+                .is_some_and(|provider| provider.eq_ignore_ascii_case("Google"));
+        if !explicit_personal_social
+            && self.subscription_title.as_deref().is_some_and(|title| {
+                let upper = title.to_ascii_uppercase();
+                upper.contains("ENTERPRISE") || upper.contains("POWER") || upper.contains("TEAM")
+            })
+        {
+            return true;
         }
         false
     }
@@ -1067,6 +1103,34 @@ mod tests {
             decoded.disable_reason,
             Some(CredentialDisableReason::TooManyFailures)
         );
+    }
+
+    #[test]
+    fn social_power_subscription_is_still_personal() {
+        let credentials = KiroCredentials {
+            auth_method: Some("social".to_string()),
+            provider: Some("Google".to_string()),
+            subscription_title: Some("Kiro Power".to_string()),
+            ..Default::default()
+        };
+
+        assert!(!credentials.is_enterprise_credential());
+    }
+
+    #[test]
+    fn idc_and_external_idp_are_enterprise_even_without_subscription_title() {
+        let idc = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            start_url: Some("https://sso.example/start".to_string()),
+            ..Default::default()
+        };
+        let external_idp = KiroCredentials {
+            auth_method: Some("external_idp".to_string()),
+            ..Default::default()
+        };
+
+        assert!(idc.is_enterprise_credential());
+        assert!(external_idp.is_enterprise_credential());
     }
     use crate::model::config::Config;
 
@@ -2013,6 +2077,8 @@ mod tests {
         assert!(creds.is_enterprise_credential());
 
         creds.start_url = None;
+        creds.auth_method = Some("api_key".to_string());
+        creds.kiro_api_key = Some("ksk_enterprise".to_string());
         creds.subscription_title = Some("KIRO POWER".to_string());
         assert!(creds.is_enterprise_credential());
     }

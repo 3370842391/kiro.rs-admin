@@ -543,8 +543,8 @@ impl Default for CredentialImportDefaults {
 /// 导入的批次。等它凑齐证据的代价是继续烧号。
 ///
 /// 这份配置是运营要的钝器：**窗口内封够 N 个就直接停用这个出口**，不问置信区间。
-/// 代价是可能误伤一个恰好接了脏料的干净出口——用 `min_assignable` 保证不会把池子
-/// 抽干，用手动重新启用兜住误判。
+/// 代价是可能误伤一个恰好接了脏料的干净出口——`min_assignable` 只用于告警，
+/// 不会为了保留容量而继续放行已经烧号的出口。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProxyGuardConfig {
@@ -552,17 +552,17 @@ pub struct ProxyGuardConfig {
     pub enabled: bool,
     /// 观察窗口内封号数达到此值即隔离该出口。
     ///
-    /// 默认 2 而不是 1：单个号被封可能是这个号本身有问题（注册资料、付款方式），
-    /// 同一出口连着死两个才说明问题在出口这一侧。
+    /// 默认 1：个人号已经一号一 IP，再等第二个号等于永远不隔离。
     #[serde(default = "default_proxy_guard_ban_threshold")]
     pub ban_threshold: u32,
+    /// 兼容旧配置的一次性迁移标记。旧版本默认阈值为 2，迁移后不再覆盖运营手动设置的值。
+    #[serde(default)]
+    pub threshold_migration_done: bool,
     /// 观察窗口（小时）。只看近期封号——机场的出口 IP 会轮换，
     /// 上周脏过的线路今天可能已经换了干净 IP。
     #[serde(default = "default_proxy_guard_window_hours")]
     pub window_hours: u32,
-    /// 隔离后池中必须仍有这么多可分配出口，否则跳过本次隔离只告警。
-    ///
-    /// 没有这道闸，一次全池普遍封号会把所有出口连锁停用，号全部退化成直连。
+    /// 隔离后希望池中仍有这么多可分配出口。低于此值只告警，不再放过脏 IP。
     #[serde(default = "default_proxy_guard_min_assignable")]
     pub min_assignable: usize,
     /// 隔离时是否把该出口上还活着的号迁到干净出口。
@@ -581,7 +581,7 @@ pub struct ProxyGuardConfig {
 }
 
 fn default_proxy_guard_ban_threshold() -> u32 {
-    2
+    1
 }
 
 fn default_proxy_guard_window_hours() -> u32 {
@@ -597,6 +597,7 @@ impl Default for ProxyGuardConfig {
         Self {
             enabled: true,
             ban_threshold: default_proxy_guard_ban_threshold(),
+            threshold_migration_done: true,
             window_hours: default_proxy_guard_window_hours(),
             min_assignable: default_proxy_guard_min_assignable(),
             migrate_survivors: true,
@@ -1782,6 +1783,18 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_proxy_guard_threshold_is_marked_for_one_time_migration() {
+        let config: Config = serde_json::from_str(
+            r#"{"proxyGuard":{"banThreshold":2}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.proxy_guard.ban_threshold, 2);
+        assert!(!config.proxy_guard.threshold_migration_done);
+        assert!(Config::default().proxy_guard.threshold_migration_done);
+    }
 
     #[test]
     fn key_supplier_defaults_keep_legacy_config_compatible() {

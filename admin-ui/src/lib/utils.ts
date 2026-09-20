@@ -395,6 +395,23 @@ export function maskProxyUrl(url: string): string {
   return `${scheme}${mask(user)}:${mask(pass)}@${host}`
 }
 
+/** 列表扫视用的 `host:port`，不含账号密码。 */
+export function proxyDisplayHost(url: string): string {
+  const raw = url.trim()
+  if (!raw || raw.toLowerCase() === 'direct') return 'direct'
+  const afterScheme = raw.includes('://') ? raw.slice(raw.indexOf('://') + 3) : raw
+  const at = afterScheme.lastIndexOf('@')
+  const hostPort = (at >= 0 ? afterScheme.slice(at + 1) : afterScheme)
+    .split(/[/?#]/)[0]
+    .trim()
+  return hostPort || raw
+}
+
+export function proxySchemeLabel(url: string): string {
+  const sep = url.indexOf('://')
+  return sep > 0 ? url.slice(0, sep).toLowerCase() : ''
+}
+
 export function maskEmailAddress(email: string): string {
   if (!email || !email.includes('@')) return email
   const [local, domain] = email.split('@')

@@ -1111,6 +1111,8 @@ pub struct ProxyPoolEntry {
     pub id: u64,
     /// 代理 URL（如 socks5://user:pass@host:port）
     pub url: String,
+    /// 给列表扫视用的 `host:port`，不含账号密码。
+    pub host: String,
     /// 备注标签（可选）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
@@ -1192,7 +1194,7 @@ pub struct ProxyGuardRunResponse {
     pub migrated: usize,
     /// 隔离到期被放回来的出口
     pub released: Vec<String>,
-    /// 超阈值但因可分配出口不足而跳过的出口
+    /// 兼容旧前端的字段；当前策略不会因出口不足跳过隔离，因此始终为空。
     pub skipped_for_capacity: Vec<String>,
 }
 
@@ -1288,14 +1290,26 @@ pub struct AssignRoundRobinRequest {
     pub credential_ids: Option<Vec<u64>>,
 }
 
-/// 轮询批量分配响应
+/// 个人号独占出口分配响应（旧路径名保留）。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssignRoundRobinResponse {
-    /// 成功分配的凭据数
+    /// 新分到独立 IP 的个人号数
     pub assigned: usize,
-    /// 参与轮询的可用代理数
+    /// 因分到 IP 而自动启用的数
+    #[serde(default)]
+    pub enabled: usize,
+    /// 因没有空闲 IP 被禁用的个人号数
+    #[serde(default)]
+    pub disabled: usize,
+    /// 未参与互斥的企业号数
+    #[serde(default)]
+    pub skipped_enterprise: usize,
+    /// 当前可分配代理数
     pub proxy_count: usize,
+    /// 仍没有独立 IP 的个人号数
+    #[serde(default)]
+    pub unassigned: usize,
 }
 
 /// 添加代理请求

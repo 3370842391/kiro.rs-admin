@@ -566,11 +566,10 @@ export function BatchImportDialog({
       const proxyLoad = new Map(enabledProxies.map(p => [p.url, p.credentialCount]))
       const pickLeastLoadedProxy = (): string | undefined => {
         if (enabledProxies.length === 0) return undefined
-        const minLoad = Math.min(...enabledProxies.map(p => proxyLoad.get(p.url) ?? 0))
-        // 同负载的出口之间随机，避免每次导入都从同一个出口开始堆
-        const tied = enabledProxies.filter(p => (proxyLoad.get(p.url) ?? 0) === minLoad)
-        const picked = tied[Math.floor(Math.random() * tied.length)]
-        proxyLoad.set(picked.url, minLoad + 1)
+        const free = enabledProxies.filter(p => (proxyLoad.get(p.url) ?? 0) === 0)
+        if (free.length === 0) return undefined
+        const picked = free[Math.floor(Math.random() * free.length)]
+        proxyLoad.set(picked.url, 1)
         return picked.url
       }
 

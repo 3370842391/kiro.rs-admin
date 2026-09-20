@@ -880,14 +880,30 @@ impl KiroProvider {
         credential_id: u64,
         credentials: &KiroCredentials,
     ) -> Vec<Option<ProxyConfig>> {
+        let is_personal = !credentials.is_enterprise_credential();
+        // 只有接入代理池的主服务才启用个人号独占策略。无代理池是库的兼容/测试
+        // 模式，沿用旧的直连行为；主服务始终在 main 中注入代理池。
+        let strict_personal = is_personal && self.proxy_pool.is_some();
         let global_proxy = self.token_manager.proxy();
+        // 个人号禁止继承全局出口：全局列表是共享的，一退回去就会再次连杀。
         let (configured_proxies, has_direct) = configured_proxy_intent(
             credentials.proxy_url.as_deref(),
-            global_proxy.as_ref().map(|p| p.url.as_str()),
+            if strict_personal {
+                None
+            } else {
+                global_proxy.as_ref().map(|p| p.url.as_str())
+            },
         );
 
-        let global = self.global_proxy_candidates();
+        let global = if strict_personal {
+            Vec::new()
+        } else {
+            self.global_proxy_candidates()
+        };
         let mut candidates = credentials.effective_proxy_candidates(&global);
+        if strict_personal {
+            candidates.truncate(1);
+        }
         candidates.retain(|candidate| candidate.is_some());
         let proxy_candidates: Vec<ProxyConfig> = candidates.into_iter().flatten().collect();
         let ordered = if let Some(pool) = &self.proxy_pool {
@@ -903,10 +919,18 @@ impl KiroProvider {
             ordered.rotate_left(offset);
         }
 
-        let candidates = assemble_proxy_candidates(ordered, has_direct, configured_proxies);
+        let candidates = assemble_proxy_candidates(
+            ordered,
+            if strict_personal { false } else { has_direct },
+            if strict_personal {
+                configured_proxies.max(1)
+            } else {
+                configured_proxies
+            },
+        );
         if candidates.is_empty() {
             if let Some(pool) = self.proxy_pool.as_ref() {
-                if let Some(url) = crate::admin::proxy_rebind::rebind_credential_to_healthy_proxy(
+                if let Some(url) = crate::admin::proxy_exclusive::rebind_personal_exclusive(
                     &self.token_manager,
                     pool,
                     credential_id,
@@ -940,7 +964,7 @@ impl KiroProvider {
     fn report_proxy_failure(&self, credential_id: u64, proxy: Option<&ProxyConfig>) {
         if let (Some(pool), Some(proxy)) = (&self.proxy_pool, proxy) {
             if let Some(url) = pool.report_proxy_failure(credential_id, proxy) {
-                crate::admin::proxy_rebind::migrate_live_off_proxy(
+                crate::admin::proxy_exclusive::migrate_live_off_proxy_exclusive(
                     &self.token_manager,
                     pool,
                     &url,
@@ -3063,6 +3087,97 @@ mod tests {
                 .proxy_url
                 .as_deref(),
             Some("http://ok:8080")
+        );
+    }
+
+    #[test]
+    fn personal_without_exclusive_proxy_never_uses_global_server_proxy() {
+        use crate::kiro::endpoint::{IdeEndpoint, KiroEndpoint};
+        use crate::kiro::model::credentials::KiroCredentials;
+        use crate::kiro::token_manager::MultiTokenManager;
+        use crate::http_client::ProxyConfig;
+        use crate::model::config::Config;
+        use crate::model::config::TlsBackend;
+
+        let mut config = Config::default();
+        config.proxy_url = Some("http://server-shared:8080".to_string());
+        let credentials = KiroCredentials {
+            id: Some(1),
+            auth_method: Some("social".to_string()),
+            subscription_title: Some("Kiro Power".to_string()),
+            proxy_url: None,
+            ..Default::default()
+        };
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                config,
+                vec![credentials],
+                Some(ProxyConfig::new("http://server-shared:8080")),
+                None,
+                true,
+            )
+            .unwrap(),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert("ide".into(), Arc::new(IdeEndpoint::new()));
+        let provider = KiroProvider::with_proxy(
+            Arc::clone(&manager),
+            None,
+            endpoints,
+            "ide".into(),
+            Some(Arc::new(ProxyPoolManager::new(None, TlsBackend::Rustls))),
+        );
+        let creds = manager.clone_all_credentials().pop().unwrap();
+
+        let candidates = provider.proxy_candidates_for(1, &creds);
+        assert!(candidates.is_empty(), "个人号没有独立 IP 时不得回退服务器代理");
+    }
+
+    #[test]
+    fn enterprise_without_personal_ip_may_use_global_server_proxy() {
+        use crate::kiro::endpoint::{IdeEndpoint, KiroEndpoint};
+        use crate::kiro::model::credentials::KiroCredentials;
+        use crate::kiro::token_manager::MultiTokenManager;
+        use crate::http_client::ProxyConfig;
+        use crate::model::config::Config;
+
+        let mut config = Config::default();
+        config.proxy_url = Some("http://server-shared:8080".to_string());
+        let credentials = KiroCredentials {
+            id: Some(1),
+            auth_method: Some("idc".to_string()),
+            start_url: Some("https://sso.example/start".to_string()),
+            proxy_url: None,
+            ..Default::default()
+        };
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                config,
+                vec![credentials],
+                Some(ProxyConfig::new("http://server-shared:8080")),
+                None,
+                true,
+            )
+            .unwrap(),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert("ide".into(), Arc::new(IdeEndpoint::new()));
+        let provider = KiroProvider::with_proxy(
+            Arc::clone(&manager),
+            None,
+            endpoints,
+            "ide".into(),
+            None,
+        );
+        let creds = manager.clone_all_credentials().pop().unwrap();
+
+        let candidates = provider.proxy_candidates_for(1, &creds);
+        assert_eq!(
+            candidates
+                .first()
+                .and_then(|candidate| candidate.as_ref())
+                .map(|proxy| proxy.url.as_str()),
+            Some("http://server-shared:8080")
         );
     }
 

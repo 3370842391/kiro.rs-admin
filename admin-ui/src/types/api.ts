@@ -617,6 +617,8 @@ export interface ProxyReputationCheckResponse {
 export interface ProxyPoolEntry {
   id: number
   url: string
+  /** 出口 host:port，不含账号密码 */
+  host?: string
   label?: string
   enabled: boolean
   credentialCount: number
@@ -756,10 +758,14 @@ export interface AssignRoundRobinRequest {
   credentialIds?: number[] | null
 }
 
-// 轮询批量分配响应
+// 个人号独占出口分配响应
 export interface AssignRoundRobinResponse {
   assigned: number
+  enabled?: number
+  disabled?: number
+  skippedEnterprise?: number
   proxyCount: number
+  unassigned?: number
 }
 
 // 全局代理配置

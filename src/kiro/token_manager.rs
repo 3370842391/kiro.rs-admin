@@ -1237,6 +1237,22 @@ struct StatsEntry {
     last_used_at: Option<String>,
 }
 
+/// 个人号独占出口的一次补丁：可改绑定、可按「缺独立 IP」启停。
+#[derive(Debug, Clone)]
+pub struct ExclusiveProxyPatch {
+    pub id: u64,
+    pub proxy_url: Option<Option<String>>,
+    pub disable: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExclusivePersonalAccount {
+    pub id: u64,
+    pub proxy_url: Option<String>,
+    pub disabled: bool,
+    pub disable_reason: Option<crate::kiro::model::credentials::CredentialDisableReason>,
+}
+
 // ============================================================================
 // Admin API 公开结构
 // ============================================================================
@@ -1463,6 +1479,7 @@ impl SupplierCredentialHealth {
                     | DisabledReason::TooManyRefreshFailures
                     | DisabledReason::InvalidRefreshToken
                     | DisabledReason::InvalidConfig
+                    | DisabledReason::MissingExclusiveProxy
             )
         ) {
             self.system_disabled += 1;
@@ -3935,6 +3952,110 @@ impl MultiTokenManager {
         // 持久化更改
         self.persist_credentials()?;
         Ok(())
+    }
+
+    /// 未判死的个人号，供独占出口分配扫描。第二个数是企业号数量（不参与互斥）。
+    pub fn exclusive_personal_accounts(&self) -> (Vec<ExclusivePersonalAccount>, usize) {
+        let entries = self.entries.lock();
+        let skipped_enterprise = entries
+            .iter()
+            .filter(|entry| entry.credentials.is_enterprise_credential())
+            .count();
+        let accounts = entries
+            .iter()
+            .filter(|entry| !entry.credentials.is_enterprise_credential())
+            .filter(|entry| entry.credentials.died_at.is_none())
+            .filter(|entry| {
+                !entry
+                    .credentials
+                    .disable_reason
+                    .is_some_and(DisabledReason::is_terminal)
+            })
+            .map(|entry| ExclusivePersonalAccount {
+                id: entry.id,
+                proxy_url: entry.credentials.proxy_url.clone(),
+                disabled: entry.disabled,
+                disable_reason: entry.credentials.disable_reason,
+            })
+            .collect();
+        (accounts, skipped_enterprise)
+    }
+
+    pub fn is_enterprise_credential(&self, id: u64) -> bool {
+        self.entries
+            .lock()
+            .iter()
+            .find(|entry| entry.id == id)
+            .is_some_and(|entry| entry.credentials.is_enterprise_credential())
+    }
+
+    /// 个人号独占出口：一次锁内改代理并按原因启停，只落盘一次。
+    pub fn apply_exclusive_proxy_patches(
+        &self,
+        patches: &[ExclusiveProxyPatch],
+    ) -> anyhow::Result<usize> {
+        if patches.is_empty() {
+            return Ok(0);
+        }
+        let mut changed = 0usize;
+        {
+            let mut entries = self.entries.lock();
+            for patch in patches {
+                let Some(entry) = entries.iter_mut().find(|entry| entry.id == patch.id) else {
+                    continue;
+                };
+                let mut dirty = false;
+                if let Some(proxy_url) = &patch.proxy_url {
+                    let next = proxy_url
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|url| !url.is_empty())
+                        .map(str::to_string);
+                    if entry.credentials.proxy_url != next {
+                        entry.credentials.proxy_url = next;
+                        dirty = true;
+                    }
+                }
+                match patch.disable {
+                    Some(true) => {
+                        if !entry.disabled
+                            || entry.credentials.disable_reason
+                                != Some(DisabledReason::MissingExclusiveProxy)
+                        {
+                            entry.disabled = true;
+                            entry.credentials.disabled = true;
+                            entry.credentials.disable_reason =
+                                Some(DisabledReason::MissingExclusiveProxy);
+                            dirty = true;
+                        }
+                    }
+                    Some(false) => {
+                        let can_enable = entry
+                            .credentials
+                            .disable_reason
+                            .is_some_and(DisabledReason::is_missing_exclusive_proxy)
+                            || (!entry.disabled
+                                && entry.credentials.disable_reason.is_none());
+                        if can_enable && entry.disabled {
+                            entry.disabled = false;
+                            entry.credentials.disabled = false;
+                            entry.credentials.disable_reason = None;
+                            entry.failure_count = 0;
+                            entry.refresh_failure_count = 0;
+                            dirty = true;
+                        }
+                    }
+                    None => {}
+                }
+                if dirty {
+                    changed += 1;
+                }
+            }
+        }
+        if changed > 0 {
+            self.persist_credentials()?;
+        }
+        Ok(changed)
     }
 
     /// 标记凭据进入临时冷却期（账号级 429 风控触发）

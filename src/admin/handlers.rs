@@ -694,7 +694,7 @@ pub async fn reset_proxy_ban_stats(
 }
 
 /// POST /api/admin/proxy-pool/assign-round-robin
-/// 将可用代理轮询批量分配给凭据
+/// 给个人号分配独立 IP；不够则禁用，分到则启用。企业号不参与。
 pub async fn assign_proxies_round_robin(
     State(state): State<AdminState>,
     Json(payload): Json<AssignRoundRobinRequest>,

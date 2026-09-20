@@ -242,6 +242,8 @@ function getDisabledReasonStyle(reason?: string | null): {
       return { label: "已封号", variant: "destructive" };
     case "Manual":
       return { label: "手动禁用", variant: "secondary" };
+    case "MissingExclusiveProxy":
+      return { label: "未分配独立IP", variant: "warning" };
     default:
       return { label: reason, variant: "outline" };
   }
