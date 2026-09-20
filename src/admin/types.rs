@@ -469,6 +469,9 @@ pub struct BatchImportRequest {
     /// 顶层统一并发覆盖；缺省时尊重单条凭据字段
     #[serde(default)]
     pub max_concurrency: Option<u32>,
+    /// 本批次统一优先级；数字越小越优先。缺省沿用导入默认值。
+    #[serde(default)]
+    pub priority: Option<u32>,
     /// 并发度，缺省 8，服务端 clamp 到 [1, 16]
     #[serde(default)]
     pub concurrency: Option<u8>,

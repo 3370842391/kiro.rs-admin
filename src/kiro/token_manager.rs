@@ -1251,6 +1251,7 @@ pub struct ExclusivePersonalAccount {
     pub proxy_url: Option<String>,
     pub disabled: bool,
     pub disable_reason: Option<crate::kiro::model::credentials::CredentialDisableReason>,
+    pub proxy_manual_binding: bool,
 }
 
 // ============================================================================
@@ -3976,6 +3977,7 @@ impl MultiTokenManager {
                 proxy_url: entry.credentials.proxy_url.clone(),
                 disabled: entry.disabled,
                 disable_reason: entry.credentials.disable_reason,
+                proxy_manual_binding: entry.credentials.proxy_manual_binding,
             })
             .collect();
         (accounts, skipped_enterprise)
@@ -4056,6 +4058,19 @@ impl MultiTokenManager {
             self.persist_credentials()?;
         }
         Ok(changed)
+    }
+
+    /// 记录运营是否明确要求该凭据使用当前代理。手动绑定允许共享，自动分配不改写。
+    pub fn set_proxy_manual_binding(&self, id: u64, manual: bool) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.proxy_manual_binding = manual;
+        }
+        self.persist_credentials().map(|_| ())
     }
 
     /// 标记凭据进入临时冷却期（账号级 429 风控触发）

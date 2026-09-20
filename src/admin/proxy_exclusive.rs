@@ -62,6 +62,12 @@ fn occupancy(accounts: &[ExclusivePersonalAccount]) -> HashMap<String, Vec<u64>>
     used
 }
 
+fn manual_binding(account: &ExclusivePersonalAccount, assignable: &[String]) -> bool {
+    account.proxy_manual_binding && account.proxy_url.as_deref().is_some_and(|url| {
+        first_proxy_url(Some(url)).is_some_and(|first| assignable.iter().any(|candidate| candidate == &first))
+    })
+}
+
 /// 给个人号互斥分配可用出口。已占用的独占绑定保留；共享出口只留一张号。
 /// IP 不够的个人号写成 `MissingExclusiveProxy` 并禁用；分到的自动启用。
 pub fn assign_exclusive_personal_proxies(
@@ -95,6 +101,20 @@ pub fn assign_exclusive_personal_proxies(
 
     for account in &targets {
         let first = first_proxy_url(account.proxy_url.as_deref());
+        if account.proxy_manual_binding
+            && !manual_binding(account, &ranked)
+        {
+            patches.push(ExclusiveProxyPatch {
+                id: account.id,
+                proxy_url: Some(None),
+                disable: Some(true),
+            });
+            disabled += 1;
+            continue;
+        }
+        if manual_binding(account, &ranked) {
+            continue;
+        }
         let extras = account
             .proxy_url
             .as_deref()
@@ -218,6 +238,14 @@ pub fn rebind_personal_exclusive(
     let current = first_proxy_url(live.proxy_url.as_deref()).or_else(|| {
         stale_url.and_then(|url| first_proxy_url(Some(url)))
     });
+    if live.proxy_manual_binding
+        && manual_binding(&live, &pool.assignable_urls())
+        && current.as_deref().is_some_and(|url| {
+            pool.assignable_urls().iter().any(|candidate| candidate == url)
+        })
+    {
+        return current;
+    }
     if let Some(url) = current.as_deref()
         && pool.assignable_urls().iter().any(|candidate| candidate == url)
         && token_manager
@@ -558,5 +586,43 @@ mod tests {
         assert_eq!(result.assigned, 1);
         assert_eq!(bound(&manager, 1).as_deref(), Some("http://a:8080"));
         assert_eq!(bound(&manager, 2).as_deref(), Some("http://a:8080"));
+    }
+
+    #[test]
+    fn manual_shared_binding_survives_reconciliation_and_reload() {
+        let mut raw = serde_json::to_value(personal(1, Some("http://a:8080"))).unwrap();
+        raw["proxyManualBinding"] = serde_json::json!(true);
+        let manual = serde_json::from_value(raw).unwrap();
+        let mut manual2 = personal(2, Some("http://a:8080"));
+        manual2.proxy_manual_binding = true;
+        let (manager, pool) = setup(vec![manual, manual2, personal(3, None)]);
+        pool.add("http://a:8080".into(), None).unwrap();
+        for _ in 0..2 {
+            assign_exclusive_personal_proxies(&manager, &pool, None);
+            assert_eq!(bound(&manager, 1).as_deref(), Some("http://a:8080"));
+            assert_eq!(bound(&manager, 2).as_deref(), Some("http://a:8080"));
+            assert!(disabled(&manager, 3), "自动分配不能挤入手动共享的出口");
+        }
+        assert_eq!(rebind_personal_exclusive(&manager, &pool, 1, None).as_deref(), Some("http://a:8080"));
+        let json = serde_json::to_string(&manager.clone_all_credentials()).unwrap();
+        let (reloaded, _) = setup(serde_json::from_str(&json).unwrap());
+        assign_exclusive_personal_proxies(&reloaded, &pool, None);
+        assert_eq!(bound(&reloaded, 1), bound(&reloaded, 2));
+        assert!(!disabled(&reloaded, 2));
+    }
+
+    #[test]
+    fn manual_binding_never_accepts_direct_or_disabled_proxy() {
+        for proxy in ["direct", "http://a:8080"] {
+            let mut raw = serde_json::to_value(personal(1, Some(proxy))).unwrap();
+            raw["proxyManualBinding"] = serde_json::json!(true);
+            let (manager, pool) = setup(vec![serde_json::from_value(raw).unwrap()]);
+            let entry = pool.add("http://a:8080".into(), None).unwrap();
+            pool.set_enabled(entry.id, false).unwrap();
+            assign_exclusive_personal_proxies(&manager, &pool, None);
+            let snapshot = manager.snapshot().entries.into_iter().find(|entry| entry.id == 1).unwrap();
+            assert!(snapshot.disabled, "proxy={proxy} reason={:?} bound={:?}", snapshot.disabled_reason, snapshot.proxy_url);
+            assert!(snapshot.proxy_url.is_none());
+        }
     }
 }

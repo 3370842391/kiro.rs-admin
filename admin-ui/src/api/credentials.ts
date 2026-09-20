@@ -249,6 +249,8 @@ export interface BatchImportCredentialsRequest {
   rpmLimit?: number
   /** 顶层统一并发覆盖；缺省时尊重每条凭据字段 */
   maxConcurrency?: number
+  /** 本批次统一优先级；数字越小越优先 */
+  priority?: number
   /** 并发度，缺省 8，服务端 clamp 到 [1, 16] */
   concurrency?: number
   /** 是否验活。true（缺省）：add 后取余额校验 + 失败回滚；false：仅 add 落库（直接导入） */

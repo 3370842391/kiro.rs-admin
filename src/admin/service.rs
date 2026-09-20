@@ -2487,6 +2487,7 @@ impl AdminService {
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
+            proxy_manual_binding: false,
             disabled: false, // 新添加的凭据默认启用
             disable_reason: None,
             kiro_api_key: req.kiro_api_key,
@@ -2548,11 +2549,23 @@ impl AdminService {
     /// 全部在服务端完成，便于在 `buffer_unordered` 下有界并发。
     pub async fn import_one_credential(
         &self,
-        mut req: AddCredentialRequest,
+        req: AddCredentialRequest,
         verify: bool,
     ) -> ImportItemResult {
+        let priority = self.import_defaults.lock().priority;
+        self.import_one_credential_with_priority(req, verify, Some(priority))
+            .await
+    }
+
+    /// 批量导入的单条处理，允许本批次 UI 显式覆盖优先级；JSON 自带的 priority 永远不参与。
+    pub async fn import_one_credential_with_priority(
+        &self,
+        mut req: AddCredentialRequest,
+        verify: bool,
+        priority: Option<u32>,
+    ) -> ImportItemResult {
         // 批量 JSON 的 priority 不参与调度层级，统一使用管理面板配置的导入默认值。
-        req.priority = self.import_defaults.lock().priority;
+        req.priority = priority.unwrap_or_else(|| self.import_defaults.lock().priority);
         // 1. add：去重 / 未知端点 / token 刷新失败在此暴露，未插入即无需回滚。
         //    verify=false 时跳过内部余额拉取。
         let resp = match self.add_credential_inner(req, verify).await {
@@ -2626,6 +2639,7 @@ impl AdminService {
         id: u64,
         req: UpdateCredentialRequest,
     ) -> Result<(), AdminServiceError> {
+        let manual_binding = req.proxy_url.is_some();
         let proxy_url = match req.proxy_url {
             Some(raw) => Some(normalize_proxy_list(&raw)?),
             None => None,
@@ -2688,6 +2702,9 @@ impl AdminService {
         }
 
         if !self.token_manager.is_enterprise_credential(id) {
+            self.token_manager
+                .set_proxy_manual_binding(id, manual_binding)
+                .map_err(|e| self.classify_error(e, id))?;
             // 凭据编辑同样不能绕开一号一出口约束；清空或改到已占用出口时，
             // 分配器会选择空闲出口，实在没有就置为 MissingExclusiveProxy。
             let _ = proxy_exclusive::assign_exclusive_personal_proxies(
@@ -5048,6 +5065,7 @@ impl AdminService {
             }
             None => None, // 清除代理
         };
+        let manual_binding = proxy_url.is_some();
 
         self.token_manager
             .update_credential(
@@ -5071,6 +5089,10 @@ impl AdminService {
                     AdminServiceError::InternalError(msg)
                 }
             })?;
+
+        self.token_manager
+            .set_proxy_manual_binding(credential_id, manual_binding)
+            .map_err(|e| self.classify_error(e, credential_id))?;
 
         // 手动绑定/清除也必须经过同一套个人号互斥规则：不能因为 UI 入口绕过
         // 分配器，让两个个人号重新共用出口，或清除后退回服务器 IP。

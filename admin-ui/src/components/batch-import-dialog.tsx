@@ -30,8 +30,8 @@ import {
   completeExternalIdpImportFields,
   deriveEmailFromAccessToken,
   extractErrorMessage,
-  maskProxyUrl,
   normalizeImportAuthMethod,
+  proxyDisplayHost,
   sha256Hex,
 } from '@/lib/utils'
 import { unwrapCredentialImportPayload } from '@/lib/credential-import'
@@ -295,10 +295,6 @@ function parseUniformCosting(raw: string, label: string): number | undefined {
   return parsed > 0 ? parsed : undefined
 }
 
-function maskProxyCandidate(candidate: string): string {
-  return candidate.toLowerCase() === 'direct' ? 'direct' : maskProxyUrl(candidate)
-}
-
 function toApiKeyCredentials(
   entries: ReturnType<typeof parseApiKeyLines>['entries'],
 ): CredentialInput[] {
@@ -333,6 +329,7 @@ export function BatchImportDialog({
   const [uniformProxyUrl, setUniformProxyUrl] = useState('')
   const [uniformRpmLimit, setUniformRpmLimit] = useState('')
   const [uniformMaxConcurrency, setUniformMaxConcurrency] = useState('')
+  const [uniformPriority, setUniformPriority] = useState('1')
   const [uniformCostRmb, setUniformCostRmb] = useState('')
   const [uniformQuotaCredits, setUniformQuotaCredits] = useState('')
   const groupOptions = useGroupOptions()
@@ -392,6 +389,7 @@ export function BatchImportDialog({
     setUniformProxyUrl('')
     setUniformRpmLimit(importDefaults ? String(importDefaults.rpmLimit) : '')
     setUniformMaxConcurrency(importDefaults ? String(importDefaults.maxConcurrency) : '')
+    setUniformPriority('1')
     setUniformCostRmb(
       importDefaults?.costRmb != null && importDefaults.costRmb > 0
         ? String(importDefaults.costRmb)
@@ -495,6 +493,11 @@ export function BatchImportDialog({
       toast.error(extractErrorMessage(error))
       return
     }
+    const priorityOverride = Number(uniformPriority)
+    if (!Number.isInteger(priorityOverride) || priorityOverride < 0) {
+      toast.error('优先级必须是大于等于 0 的整数')
+      return
+    }
     let costOverride: number | undefined
     try {
       costOverride = parseUniformCosting(uniformCostRmb, '买入价')
@@ -546,10 +549,6 @@ export function BatchImportDialog({
           ? allEnabledProxies
           : allEnabledProxies
               .filter(p => (p.risk?.selectionTier ?? 'normal') === 'normal')
-              // 同时避开已被公开情报库标记为代理的出口。线上实测出口的「已被标记
-              // 程度」直接决定账号寿命（本机 VPS IP 中位存活 8 分钟 vs 租用机房
-              // 63 分钟），新号最经不起这个。
-              .filter(p => p.reputationGrade !== 'flaggedProxy')
       const assignableProxies = cleanProxies.length > 0 ? cleanProxies : allEnabledProxies
       const enabledProxies = importDefaults?.autoAssignProxy === false ? [] : assignableProxies
       const skippedRiskyCount = allEnabledProxies.length - assignableProxies.length
@@ -756,6 +755,7 @@ export function BatchImportDialog({
             proxyUrl: proxyOverride,
             rpmLimit: rpmOverride,
             maxConcurrency: maxConcurrencyOverride,
+            priority: priorityOverride,
             concurrency: 8,
             verify,
           },
@@ -1180,7 +1180,7 @@ export function BatchImportDialog({
                     <option value="direct">direct（直连）</option>
                     {enabledProxyOptions.map((proxy) => (
                       <option key={proxy.id} value={proxy.url}>
-                        {proxy.label ? `${proxy.label} | ` : ''}{maskProxyCandidate(proxy.url)}
+                        {proxy.label ? `${proxy.label} | ` : ''}{proxyDisplayHost(proxy.url)} · {proxy.credentialCount} 个账号使用
                       </option>
                     ))}
                   </select>
@@ -1252,6 +1252,20 @@ export function BatchImportDialog({
                 <p className="text-xs text-muted-foreground">
                   填写后会覆盖所有导入账号的 maxConcurrency；留空时 JSON 内有值就使用该值，否则默认 0（不限）。
                 </p>
+              </div>
+              <div className="space-y-2">
+                <label htmlFor="uniform-priority" className="text-sm text-muted-foreground">统一优先级</label>
+                <input
+                  id="uniform-priority"
+                  type="number"
+                  min="0"
+                  step="1"
+                  value={uniformPriority}
+                  onChange={(e) => setUniformPriority(e.target.value)}
+                  disabled={importing}
+                  className="h-9 w-full rounded-lg border border-input bg-background px-3 text-sm font-mono focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-50"
+                />
+                <p className="text-xs text-muted-foreground">默认 1；数字越小越优先，忽略 JSON 内自带优先级。</p>
               </div>
             </div>
           </div>

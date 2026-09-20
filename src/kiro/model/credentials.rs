@@ -207,6 +207,10 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_password: Option<String>,
 
+    /// 手动绑定代理。开启后允许运营明确让多个账号共用该出口，自动独占分配不改写。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub proxy_manual_binding: bool,
+
     /// 凭据是否被禁用（默认为 false）
     #[serde(default)]
     pub disabled: bool,
@@ -333,6 +337,10 @@ pub struct KiroCredentials {
 /// 判断是否为零（用于跳过序列化）
 fn is_zero(value: &u32) -> bool {
     *value == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// rpm_limit 缺省值：默认每分钟 10 次。
@@ -1272,6 +1280,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_manual_binding: false,
             disabled: false,
             disable_reason: None,
             kiro_api_key: None,
@@ -1526,6 +1535,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_manual_binding: false,
             disabled: false,
             disable_reason: None,
             kiro_api_key: None,
@@ -1579,6 +1589,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_manual_binding: false,
             disabled: false,
             disable_reason: None,
             kiro_api_key: None,
@@ -1715,6 +1726,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_manual_binding: false,
             disabled: false,
             disable_reason: None,
             kiro_api_key: None,

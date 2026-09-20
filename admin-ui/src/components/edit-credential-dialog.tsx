@@ -23,7 +23,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { useUpdateCredential } from '@/hooks/use-credentials'
 import { useGroupOptions } from '@/hooks/use-groups'
 import { getProxyPool } from '@/api/credentials'
-import { extractErrorMessage, maskProxyUrl } from '@/lib/utils'
+import { extractErrorMessage, proxyDisplayHost } from '@/lib/utils'
 import { GroupMultiSelect } from '@/components/group-select'
 import type { CredentialStatusItem } from '@/types/api'
 
@@ -395,7 +395,7 @@ export function EditCredentialDialog({
                       <SelectLabel>代理池</SelectLabel>
                       {enabledProxies.map((p) => (
                         <SelectItem key={p.id} value={p.url}>
-                          {p.label ? `${p.label} | ${maskProxyUrl(p.url)}` : maskProxyUrl(p.url)}
+                          {p.label ? `${p.label} | ` : ''}{proxyDisplayHost(p.url)} · {p.credentialCount} 个账号使用
                         </SelectItem>
                       ))}
                     </SelectGroup>
