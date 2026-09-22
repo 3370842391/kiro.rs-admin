@@ -6190,13 +6190,26 @@ impl AdminService {
             .find(|entry| entry.id == target_id)
             .and_then(|entry| entry.proxy_url)
             .map(ProxyConfig::new);
-        let global_proxy = self.token_manager.proxy();
-        let proxy = req
-            .proxy_url
-            .as_deref()
-            .map(ProxyConfig::new)
-            .or(existing_proxy)
-            .or(global_proxy);
+        let enterprise = self.token_manager.is_enterprise_credential(target_id);
+        let proxy = if enterprise {
+            let global_proxy = self.token_manager.proxy();
+            req.proxy_url
+                .as_deref()
+                .map(ProxyConfig::new)
+                .or(existing_proxy)
+                .or(global_proxy)
+        } else {
+            req.proxy_url
+                .as_deref()
+                .map(ProxyConfig::new)
+                .or(existing_proxy)
+                .or_else(|| self.import_proxy(true, true))
+        };
+        if !enterprise && proxy.is_none() {
+            return Err(AdminServiceError::InvalidCredential(
+                "个人号重新登录需要可用的独立代理".to_string(),
+            ));
+        }
 
         let auth_endpoint = req
             .auth_endpoint

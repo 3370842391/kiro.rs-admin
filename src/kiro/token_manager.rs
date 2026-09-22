@@ -24,6 +24,7 @@ use crate::kiro::machine_id;
 use crate::kiro::model::available_models::ListAvailableModelsResponse;
 use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
 use crate::kiro::model::credentials::{CredentialDisableReason as DisabledReason, KiroCredentials};
+use crate::kiro::proxy_policy::{self, ProxyPurpose};
 use crate::kiro::model::token_refresh::{
     ExternalIdpRefreshResponse, IdcRefreshRequest, IdcRefreshResponse, RefreshRequest,
     RefreshResponse,
@@ -2901,7 +2902,7 @@ impl MultiTokenManager {
             if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                 // 确实需要刷新
                 let global_proxy = self.proxy.lock().clone();
-                let effective_proxy = current_creds.effective_proxy(global_proxy.as_ref());
+                let effective_proxy = proxy_policy::require_auxiliary_proxy(&current_creds, ProxyPurpose::Refresh, global_proxy.as_ref())?;
                 let new_creds =
                     refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
 
@@ -4329,7 +4330,7 @@ impl MultiTokenManager {
         }
 
         let global_proxy = self.proxy.lock().clone();
-        let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
+        let effective_proxy = proxy_policy::require_auxiliary_proxy(&credentials, ProxyPurpose::Refresh, global_proxy.as_ref())?;
         let profiles =
             list_available_profiles(&credentials, &self.config, token, effective_proxy.as_ref())
                 .await?;
@@ -4447,7 +4448,7 @@ impl MultiTokenManager {
 
                 if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                     let global_proxy = self.proxy.lock().clone();
-                    let effective_proxy = current_creds.effective_proxy(global_proxy.as_ref());
+                    let effective_proxy = proxy_policy::require_auxiliary_proxy(&current_creds, ProxyPurpose::Refresh, global_proxy.as_ref())?;
                     let new_creds =
                         refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
                             .await?;
@@ -4489,7 +4490,7 @@ impl MultiTokenManager {
             .await?;
 
         let global_proxy = self.proxy.lock().clone();
-        let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
+        let effective_proxy = proxy_policy::require_auxiliary_proxy(&credentials, ProxyPurpose::Refresh, global_proxy.as_ref())?;
         let usage_limits =
             get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
 
@@ -4590,7 +4591,7 @@ impl MultiTokenManager {
 
             if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                 let global_proxy = self.proxy.lock().clone();
-                let effective_proxy = current_creds.effective_proxy(global_proxy.as_ref());
+                let effective_proxy = proxy_policy::require_auxiliary_proxy(&current_creds, ProxyPurpose::Refresh, global_proxy.as_ref())?;
                 let new_creds =
                     refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
                 {
@@ -4686,7 +4687,7 @@ impl MultiTokenManager {
             .credentials_with_resolved_profile(id, &token, credentials)
             .await?;
         let global_proxy = self.proxy.lock().clone();
-        let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
+        let effective_proxy = proxy_policy::require_auxiliary_proxy(&credentials, ProxyPurpose::Refresh, global_proxy.as_ref())?;
         get_available_models(&credentials, &self.config, &token, effective_proxy.as_ref()).await
     }
 
@@ -4714,7 +4715,7 @@ impl MultiTokenManager {
             .unwrap_or_else(|| "us-east-1".to_string());
 
         let global_proxy = self.proxy.lock().clone();
-        let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
+        let effective_proxy = proxy_policy::require_auxiliary_proxy(&credentials, ProxyPurpose::Refresh, global_proxy.as_ref())?;
 
         create_kiro_api_key(
             &self.config,
@@ -4775,7 +4776,7 @@ impl MultiTokenManager {
 
                 if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                     let global_proxy = self.proxy.lock().clone();
-                    let effective_proxy = current_creds.effective_proxy(global_proxy.as_ref());
+                    let effective_proxy = proxy_policy::require_auxiliary_proxy(&current_creds, ProxyPurpose::Refresh, global_proxy.as_ref())?;
                     let new_creds =
                         refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
                             .await?;
@@ -4814,7 +4815,7 @@ impl MultiTokenManager {
         };
 
         let global_proxy = self.proxy.lock().clone();
-        let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
+        let effective_proxy = proxy_policy::require_auxiliary_proxy(&credentials, ProxyPurpose::Refresh, global_proxy.as_ref())?;
         set_user_preference(
             &credentials,
             &self.config,
@@ -4994,7 +4995,7 @@ impl MultiTokenManager {
             new_cred.clone()
         } else {
             let global_proxy = self.proxy.lock().clone();
-            let effective_proxy = new_cred.effective_proxy(global_proxy.as_ref());
+            let effective_proxy = proxy_policy::require_auxiliary_proxy(&new_cred, ProxyPurpose::Refresh, global_proxy.as_ref())?;
             refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?
         };
 
@@ -6049,7 +6050,7 @@ impl MultiTokenManager {
 
         // 无条件调用 refresh_token
         let global_proxy = self.proxy.lock().clone();
-        let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
+        let effective_proxy = proxy_policy::require_auxiliary_proxy(&credentials, ProxyPurpose::Refresh, global_proxy.as_ref())?;
         let new_creds = refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
 
         // 更新 entries 中对应凭据

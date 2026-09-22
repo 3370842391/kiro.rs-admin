@@ -11,5 +11,6 @@ pub mod model_capabilities;
 pub mod model_catalog;
 pub mod parser;
 pub mod provider;
+pub mod proxy_policy;
 pub mod region;
 pub mod token_manager;
