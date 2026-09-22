@@ -589,6 +589,23 @@ mod tests {
     }
 
     #[test]
+    fn quota_exhaustion_frees_ip_and_enables_waiting_personal_account() {
+        let mut waiting = personal(2, None);
+        waiting.disabled = true;
+        waiting.disable_reason = Some(CredentialDisableReason::MissingExclusiveProxy);
+        let (manager, pool) = setup(vec![personal(1, Some("http://a:8080")), waiting]);
+        pool.add("http://a:8080".into(), None).unwrap();
+
+        assert!(!manager.report_quota_exhausted(1));
+        let result = assign_exclusive_personal_proxies(&manager, &pool, None);
+
+        assert_eq!(result.assigned, 1);
+        assert_eq!(bound(&manager, 2).as_deref(), Some("http://a:8080"));
+        assert!(!disabled(&manager, 2));
+        assert!(disabled(&manager, 1));
+    }
+
+    #[test]
     fn manual_shared_binding_survives_reconciliation_and_reload() {
         let mut raw = serde_json::to_value(personal(1, Some("http://a:8080"))).unwrap();
         raw["proxyManualBinding"] = serde_json::json!(true);

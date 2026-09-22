@@ -1833,6 +1833,20 @@ impl AdminService {
             let _ = self.token_manager.switch_to_next();
         }
 
+        if !disabled_ids.is_empty() {
+            let assignment = proxy_exclusive::assign_exclusive_personal_proxies(
+                &self.token_manager,
+                &self.proxy_pool,
+                None,
+            );
+            tracing::info!(
+                exhausted = disabled_ids.len(),
+                assigned = assignment.assigned,
+                enabled = assignment.enabled,
+                "一键禁用超额账号后完成个人号独占 IP 重平衡"
+            );
+        }
+
         QuotaExceededResult {
             disabled_ids,
             skipped_ids,

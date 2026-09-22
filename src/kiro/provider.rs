@@ -1025,6 +1025,28 @@ impl KiroProvider {
         }
     }
 
+    /// 额度耗尽会让个人号立即退出独占出口占用集合；趁同一请求故障转移期间
+    /// 把释放出的健康 IP 分给等待中的 MissingExclusiveProxy 账号，并自动启用。
+    /// 没有代理池时保持旧行为，不允许个人号回退到服务器 IP。
+    fn rebalance_personal_exclusive_proxies(&self) {
+        let Some(pool) = self.proxy_pool.as_ref() else {
+            return;
+        };
+        let result = crate::admin::proxy_exclusive::assign_exclusive_personal_proxies(
+            &self.token_manager,
+            pool,
+            None,
+        );
+        if result.assigned > 0 || result.enabled > 0 {
+            tracing::info!(
+                assigned = result.assigned,
+                enabled = result.enabled,
+                disabled = result.disabled,
+                "额度账号退出后完成个人号独占 IP 重平衡"
+            );
+        }
+    }
+
     /// 完成同步请求准备，供企业路径在真正发送前取得共享节奏许可。
     fn prepare_api_request(
         &self,
@@ -1766,6 +1788,7 @@ impl KiroProvider {
             // 必须排在下方 400 分支之前，否则永远轮不到。
             if endpoint.is_monthly_request_limit(&body) {
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
+                self.rebalance_personal_exclusive_proxies();
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
                 }
@@ -2182,6 +2205,7 @@ impl KiroProvider {
                 );
 
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
+                self.rebalance_personal_exclusive_proxies();
                 if !has_available {
                     anyhow::bail!(
                         "{} API 请求失败（所有凭据已用尽）: {} {}",
@@ -2439,7 +2463,9 @@ impl KiroProvider {
                                     fb_status,
                                     fb_body
                                 );
-                                if !self.token_manager.report_quota_exhausted(ctx.id) {
+                                let has_available = self.token_manager.report_quota_exhausted(ctx.id);
+                                self.rebalance_personal_exclusive_proxies();
+                                if !has_available {
                                     anyhow::bail!(
                                         "{} API 请求失败（所有凭据已用尽）: {} {}",
                                         api_type,

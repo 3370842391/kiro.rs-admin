@@ -604,6 +604,7 @@ impl KiroProvider {
             }
             if quota {
                 self.token_manager.report_quota_exhausted(ctx.id);
+                self.rebalance_personal_exclusive_proxies();
                 break;
             }
             if throttled {
