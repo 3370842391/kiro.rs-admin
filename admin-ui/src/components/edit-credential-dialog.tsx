@@ -42,6 +42,7 @@ export function EditCredentialDialog({
   const [apiRegion, setApiRegion] = useState(credential.apiRegion ?? '')
   const [email, setEmail] = useState(credential.email ?? '')
   const [proxyUrl, setProxyUrl] = useState(credential.proxyUrl ?? '')
+  const [proxyId, setProxyId] = useState<number | null>(credential.proxyId ?? null)
   const [proxyUsername, setProxyUsername] = useState('')
   const [proxyPassword, setProxyPassword] = useState('')
   const [groups, setGroups] = useState<string[]>(credential.groups ?? [])
@@ -76,6 +77,7 @@ export function EditCredentialDialog({
     setApiRegion(credential.apiRegion ?? '')
     setEmail(credential.email ?? '')
     setProxyUrl(credential.proxyUrl ?? '')
+    setProxyId(credential.proxyId ?? null)
     setProxyUsername('')
     setProxyPassword('')
     setGroups(credential.groups ?? [])
@@ -114,7 +116,8 @@ export function EditCredentialDialog({
           nickname: nickname.trim(),
           apiRegion: isApiKey ? apiRegion : undefined,
           email: email,
-          proxyUrl: proxyUrl,
+          proxyUrl: proxyUrl === 'direct' || proxyId == null ? proxyUrl : undefined,
+          proxyId: proxyId,
           proxyUsername: proxyUsername || undefined,
           proxyPassword: proxyPassword || undefined,
           groups: groups,
@@ -142,13 +145,13 @@ export function EditCredentialDialog({
   const enabledProxies = proxyPool?.proxies.filter(p => p.enabled) ?? []
 
   // 当前 proxyUrl 是否是自定义值（不匹配任何标准选项）
-  const isCustomUrl = proxyUrl !== '' && proxyUrl !== 'direct' &&
+  const isCustomUrl = proxyId == null && proxyUrl !== '' && proxyUrl !== 'direct' &&
     !enabledProxies.some(p => p.url === proxyUrl)
 
   // 显示手动输入框：明确进入手动模式，或当前值就是自定义值
   const showManualInput = manualMode || isCustomUrl
 
-  const selectValue = showManualInput ? '__custom__' : proxyUrl
+  const selectValue = showManualInput ? '__custom__' : (proxyId != null ? String(proxyId) : proxyUrl)
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -383,7 +386,16 @@ export function EditCredentialDialog({
                     // 保留当前 proxyUrl 作为初始值让用户编辑
                   } else {
                     setManualMode(false)
-                    setProxyUrl(val === '__global__' ? '' : val)
+                    if (val === '__global__') {
+                      setProxyId(null)
+                      setProxyUrl('')
+                    } else if (val === 'direct') {
+                      setProxyId(null)
+                      setProxyUrl('direct')
+                    } else {
+                      setProxyId(Number(val))
+                      setProxyUrl(enabledProxies.find((p) => String(p.id) === val)?.url ?? '')
+                    }
                   }
                 }}
                 disabled={isPending}
@@ -402,7 +414,7 @@ export function EditCredentialDialog({
                     <SelectGroup>
                       <SelectLabel>代理池</SelectLabel>
                       {enabledProxies.map((p) => (
-                        <SelectItem key={p.id} value={p.url}>
+                        <SelectItem key={p.id} value={String(p.id)}>
                           {p.label ? `${p.label} | ` : ''}{proxyDisplayHost(p.url)} · {p.enabledCredentialCount ?? p.credentialCount} 个启用账号
                         </SelectItem>
                       ))}

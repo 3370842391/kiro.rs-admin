@@ -39,6 +39,10 @@ pub struct CredentialsStatusResponse {
 pub struct RpmSummary {
     pub window_seconds: u64,
     pub current: u64,
+    /// 当前已占用账号调度槽位；包含 Token 准备、上游响应读取和客户端背压期间。
+    pub in_flight: u64,
+    /// 已达到账号 maxConcurrency 的启用账号数；这是瞬时快照，不是累计拒绝次数。
+    pub concurrency_limited: u64,
     pub limited_capacity: u64,
     pub remaining_limited_capacity: u64,
     pub unlimited_accounts: u64,
@@ -115,6 +119,9 @@ pub struct CredentialStatusItem {
     pub died_at: Option<String>,
     /// 是否配置了凭据级代理
     pub has_proxy: bool,
+    /// 代理池条目 ID；有值时前端应通过 ID 保存，避免回写脱敏 URL。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_id: Option<u64>,
     /// 代理 URL（用于前端展示）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
@@ -292,6 +299,13 @@ pub struct AddCredentialRequest {
     #[serde(alias = "proxy_url")]
     pub proxy_url: Option<String>,
 
+    /// 代理池条目 ID。提供后由服务端解析真实认证 URL，优先于 proxyUrl。
+    #[serde(default)]
+    pub proxy_id: Option<u64>,
+    /// 是否由运营明确绑定。自动从代理池分配时应传 false。
+    #[serde(default)]
+    pub proxy_manual_binding: Option<bool>,
+
     /// 凭据级代理认证用户名（可选）
     #[serde(alias = "proxy_username")]
     pub proxy_username: Option<String>,
@@ -355,6 +369,9 @@ pub struct UpdateCredentialRequest {
     pub email: Option<String>,
     /// 凭据级代理 URL（空字符串表示清除）
     pub proxy_url: Option<String>,
+    /// 代理池条目 ID；`null` 清除代理，缺省表示不改变代理池绑定。
+    #[serde(default)]
+    pub proxy_id: Option<Option<u64>>,
     /// 凭据级代理认证用户名
     pub proxy_username: Option<String>,
     /// 凭据级代理认证密码
@@ -870,8 +887,12 @@ pub struct SetEndpointChainsRequest {
     pub enterprise_retry: Option<EnterpriseRetrySettings>,
 }
 
-fn deserialize_endpoint_chains_patch<'de, D>(deserializer: D) -> Result<Option<Option<std::collections::HashMap<String, Vec<String>>>>, D::Error>
-where D: serde::Deserializer<'de> {
+fn deserialize_endpoint_chains_patch<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<std::collections::HashMap<String, Vec<String>>>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
     Option::<std::collections::HashMap<String, Vec<String>>>::deserialize(deserializer).map(Some)
 }
 
@@ -1112,8 +1133,10 @@ pub struct SetImportDefaultsRequest {
 pub struct ProxyPoolEntry {
     /// 唯一 ID（自增）
     pub id: u64,
-    /// 代理 URL（如 socks5://user:pass@host:port）
+    /// 脱敏代理 URL（如 socks5://host:port；认证信息只在服务端保存）
     pub url: String,
+    /// 代理协议（socks5/socks4/http/https），不含认证信息。
+    pub scheme: String,
     /// 给列表扫视用的 `host:port`，不含账号密码。
     pub host: String,
     /// 备注标签（可选）
@@ -1406,6 +1429,12 @@ pub struct AssignProxyRequest {
 pub struct GlobalProxyResponse {
     /// 当前全局代理 URL（null 表示未配置）
     pub proxy_url: Option<String>,
+    /// 当前全局候选对应的代理池 ID；前端保存时应使用该字段。
+    #[serde(default)]
+    pub proxy_ids: Vec<u64>,
+    /// 是否包含显式 direct 候选。
+    #[serde(default)]
+    pub direct: bool,
 }
 
 /// 设置全局代理请求
@@ -1414,6 +1443,11 @@ pub struct GlobalProxyResponse {
 pub struct SetGlobalProxyRequest {
     /// 代理 URL，null 表示清除全局代理
     pub proxy_url: Option<String>,
+    /// 代理池候选 ID。提供后由服务端解析真实 URL。
+    #[serde(default)]
+    pub proxy_ids: Option<Vec<u64>>,
+    #[serde(default)]
+    pub direct: Option<bool>,
 }
 
 // ============ 在线更新配置 ============
@@ -2259,6 +2293,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn proxy_pool_and_global_payloads_use_ids_without_auth_fields() {
+        let pool = ProxyPoolEntry {
+            id: 7,
+            url: "socks5://10.0.0.1:1080".to_string(),
+            scheme: "socks5".to_string(),
+            host: "10.0.0.1:1080".to_string(),
+            label: None,
+            enabled: true,
+            credential_count: 0,
+            enabled_credential_count: 0,
+            manual_shared_count: 0,
+            health: ProxyHealth::Unknown,
+            latency_ms: None,
+            last_checked_at: None,
+            consecutive_failures: 0,
+            auto_disabled: false,
+            quarantined_at: None,
+            quarantine_reason: None,
+            ban_stats: Default::default(),
+            risk: Default::default(),
+            reputation: None,
+            reputation_grade: ReputationGrade::Unknown,
+        };
+        let value = serde_json::to_value(pool).unwrap();
+        assert_eq!(value["id"], 7);
+        assert_eq!(value["scheme"], "socks5");
+        assert!(!value["url"].as_str().unwrap().contains("user"));
+        assert!(!value["url"].as_str().unwrap().contains("pass"));
+
+        let global = serde_json::to_value(GlobalProxyResponse {
+            proxy_url: Some("socks5://10.0.0.1:1080".to_string()),
+            proxy_ids: vec![7],
+            direct: true,
+        })
+        .unwrap();
+        assert_eq!(global["proxyIds"][0], 7);
+        assert_eq!(global["direct"], true);
+    }
+
+    #[test]
     fn structured_admin_error_keeps_legacy_fields_and_adds_auth_metadata() {
         let value = serde_json::to_value(AdminErrorResponse::structured(
             "invalid_request",
@@ -2504,12 +2578,16 @@ mod tests {
                 "firstEventTimeoutMs": 500,
                 "totalTimeoutMs": 1500
             }
-        })).unwrap();
-        assert_eq!(request.enterprise_retry, Some(EnterpriseRetrySettings {
-            endpoints: vec!["codewhisperer".to_string()],
-            first_event_timeout_ms: 500,
-            total_timeout_ms: 1500,
-        }));
+        }))
+        .unwrap();
+        assert_eq!(
+            request.enterprise_retry,
+            Some(EnterpriseRetrySettings {
+                endpoints: vec!["codewhisperer".to_string()],
+                first_event_timeout_ms: 500,
+                total_timeout_ms: 1500,
+            })
+        );
         let omitted: SetEndpointChainsRequest = serde_json::from_str("{}").unwrap();
         assert!(omitted.enterprise_retry.is_none());
     }

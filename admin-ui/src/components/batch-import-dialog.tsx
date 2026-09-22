@@ -81,6 +81,7 @@ interface CredentialInput {
   email?: string
   proxyUrl?: string
   proxy_url?: string
+  proxyId?: number
   proxyUsername?: string
   proxy_username?: string
   proxyPassword?: string
@@ -327,6 +328,7 @@ export function BatchImportDialog({
   const [groups, setGroups] = useState<string[]>([])
   // 统一覆盖导入账号的代理与 RPM；留空表示保留 JSON/现有自动分配逻辑。
   const [uniformProxyUrl, setUniformProxyUrl] = useState('')
+  const [uniformProxyId, setUniformProxyId] = useState<number | null>(null)
   const [uniformRpmLimit, setUniformRpmLimit] = useState('')
   const [uniformMaxConcurrency, setUniformMaxConcurrency] = useState('')
   const [uniformPriority, setUniformPriority] = useState('1')
@@ -387,6 +389,7 @@ export function BatchImportDialog({
     setResults([])
     setGroups(importDefaults?.groups ?? [])
     setUniformProxyUrl('')
+    setUniformProxyId(null)
     setUniformRpmLimit(importDefaults ? String(importDefaults.rpmLimit) : '')
     setUniformMaxConcurrency(importDefaults ? String(importDefaults.maxConcurrency) : '')
     setUniformPriority('1')
@@ -562,14 +565,14 @@ export function BatchImportDialog({
       // 同出口并发是我们这边唯一能控的变量，没有理由白白让它发生。
       // 起始负载取代理池上报的 credentialCount（已有的活号），再叠加本次导入
       // 已分配的数量，这样跨多次导入也不会往同一个出口上堆。
-      const proxyLoad = new Map(enabledProxies.map(p => [p.url, p.enabledCredentialCount ?? p.credentialCount]))
-      const pickLeastLoadedProxy = (): string | undefined => {
+      const proxyLoad = new Map(enabledProxies.map(p => [p.id, p.enabledCredentialCount ?? p.credentialCount]))
+      const pickLeastLoadedProxy = (): number | undefined => {
         if (enabledProxies.length === 0) return undefined
-        const free = enabledProxies.filter(p => (proxyLoad.get(p.url) ?? 0) === 0)
+        const free = enabledProxies.filter(p => (proxyLoad.get(p.id) ?? 0) === 0)
         if (free.length === 0) return undefined
         const picked = free[Math.floor(Math.random() * free.length)]
-        proxyLoad.set(picked.url, 1)
-        return picked.url
+        proxyLoad.set(picked.id, 1)
+        return picked.id
       }
 
       const defaultPriority = importDefaults?.priority ?? 0
@@ -590,8 +593,9 @@ export function BatchImportDialog({
         // 统一代理优先级最高；否则沿用 JSON 内单条代理；都没有时从代理池按负载最低分配。
         if (proxyOverride) {
           cred.proxyUrl = proxyOverride
+          cred.proxyId = uniformProxyId ?? undefined
         } else if (!cred.proxyUrl?.trim()) {
-          cred.proxyUrl = pickLeastLoadedProxy() ?? cred.proxyUrl
+          cred.proxyId = pickLeastLoadedProxy() ?? cred.proxyId
         }
         // 兜底取全局导入默认值而不是 0：0 在凭据侧的语义是「不限速 / 不限并发」，
         // 让新号裸奔正是账号级风控最容易抓的行为。
@@ -642,7 +646,9 @@ export function BatchImportDialog({
               machineId: cred.machineId?.trim() || undefined,
               endpoint: cred.endpoint?.trim() || undefined,
               email: cred.email?.trim() || undefined,
-              proxyUrl: cred.proxyUrl?.trim() || undefined,
+              proxyUrl: cred.proxyId == null ? (cred.proxyUrl?.trim() || undefined) : undefined,
+              proxyId: cred.proxyId,
+              proxyManualBinding: cred.proxyId != null ? Boolean(uniformProxyUrl) : Boolean(cred.proxyUrl),
               proxyUsername: cred.proxyUsername?.trim() || undefined,
               proxyPassword: cred.proxyPassword?.trim() || undefined,
               groups: mergeGroups(groups, cred.groups),
@@ -725,7 +731,9 @@ export function BatchImportDialog({
               endpoint: cred.endpoint?.trim() || undefined,
               nickname: cred.nickname?.trim() || undefined,
               email: cred.email?.trim() || undefined,
-              proxyUrl: cred.proxyUrl?.trim() || undefined,
+              proxyUrl: cred.proxyId == null ? (cred.proxyUrl?.trim() || undefined) : undefined,
+              proxyId: cred.proxyId,
+              proxyManualBinding: cred.proxyId != null ? Boolean(uniformProxyUrl) : Boolean(cred.proxyUrl),
               proxyUsername: cred.proxyUsername?.trim() || undefined,
               proxyPassword: cred.proxyPassword?.trim() || undefined,
               groups: mergeGroups(groups, cred.groups),
@@ -1162,7 +1170,10 @@ export function BatchImportDialog({
                   <input
                     type="text"
                     value={uniformProxyUrl}
-                    onChange={(e) => setUniformProxyUrl(e.target.value)}
+                    onChange={(e) => {
+                      setUniformProxyUrl(e.target.value)
+                      setUniformProxyId(null)
+                    }}
                     disabled={importing}
                     placeholder="不填则保留 JSON/自动分配；direct 为直连"
                     className="h-9 w-full rounded-lg border border-input bg-background px-3 text-sm font-mono placeholder:text-muted-foreground/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-50"
@@ -1171,7 +1182,14 @@ export function BatchImportDialog({
                     value=""
                     onChange={(e) => {
                       if (!e.target.value) return
-                      setUniformProxyUrl(e.target.value)
+                      if (e.target.value === 'direct') {
+                        setUniformProxyUrl('direct')
+                        setUniformProxyId(null)
+                      } else {
+                        const selected = enabledProxyOptions.find((proxy) => String(proxy.id) === e.target.value)
+                        setUniformProxyUrl(selected?.url ?? '')
+                        setUniformProxyId(selected?.id ?? null)
+                      }
                     }}
                     disabled={importing}
                     className="h-9 w-full rounded-lg border border-input bg-background px-3 text-sm"
@@ -1179,7 +1197,7 @@ export function BatchImportDialog({
                     <option value="">从代理池选择...</option>
                     <option value="direct">direct（直连）</option>
                     {enabledProxyOptions.map((proxy) => (
-                      <option key={proxy.id} value={proxy.url}>
+                      <option key={proxy.id} value={proxy.id}>
                         {proxy.label ? `${proxy.label} | ` : ''}{proxyDisplayHost(proxy.url)} · {proxy.enabledCredentialCount ?? proxy.credentialCount} 个启用账号
                       </option>
                     ))}

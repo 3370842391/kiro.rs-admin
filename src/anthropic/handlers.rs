@@ -517,8 +517,12 @@ impl RequestTracer {
 }
 
 impl TraceSink for RequestTracer {
-    fn on_upstream_first_byte(&self) { self.mark_upstream_first_byte(); }
-    fn enterprise_request_control(&self) -> Option<&crate::kiro::provider::EnterpriseRequestControl> {
+    fn on_upstream_first_byte(&self) {
+        self.mark_upstream_first_byte();
+    }
+    fn enterprise_request_control(
+        &self,
+    ) -> Option<&crate::kiro::provider::EnterpriseRequestControl> {
         Some(&self.enterprise_control)
     }
     fn on_attempt(&self, attempt: TraceAttempt) {
@@ -751,10 +755,7 @@ const POOL_EXHAUSTED_MESSAGE: &str =
 /// 号池耗尽是运营状态不是缺陷，按请求刷 ERROR 会把真正的问题淹掉
 /// （线上 720 小时里它自己就刷了 6.2 万条）。首条与之后每 60 秒各记一条，
 /// 带上期间被压掉的条数；其余降到 DEBUG。
-fn log_pool_exhausted(
-    err: &dyn std::fmt::Display,
-    availability: Option<&PoolUnavailableError>,
-) {
+fn log_pool_exhausted(err: &dyn std::fmt::Display, availability: Option<&PoolUnavailableError>) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static LAST_LOGGED_SECS: AtomicU64 = AtomicU64::new(0);
     static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
@@ -784,7 +785,10 @@ fn log_pool_exhausted(
 }
 
 fn classify_provider_error(err: &Error) -> ClassifiedProviderError {
-    if err.downcast_ref::<crate::kiro::provider::EnterpriseRateLimitError>().is_some() {
+    if err
+        .downcast_ref::<crate::kiro::provider::EnterpriseRateLimitError>()
+        .is_some()
+    {
         return ClassifiedProviderError {
             http_status: StatusCode::TOO_MANY_REQUESTS,
             error_type: "rate_limit_error",
@@ -792,8 +796,7 @@ fn classify_provider_error(err: &Error) -> ClassifiedProviderError {
         };
     }
     let text = err.to_string();
-    if err.downcast_ref::<PoolUnavailableError>().is_some()
-        || text.contains("所有凭据均已禁用")
+    if err.downcast_ref::<PoolUnavailableError>().is_some() || text.contains("所有凭据均已禁用")
     {
         // 503 而不是笼统的 502：区别在于「上游挂了」还是「我们这边没号了」，
         // 客户端据此决定是重试还是告警，此前一律 502 分不出来。
@@ -1222,9 +1225,12 @@ async fn collect_buffered_attempt(
         .await?;
     let credential_id = call_result.credential_id;
     let timeout_secs = provider.stream_idle_timeout_secs();
-    let body = collect_body_stream_with_idle_timeout(call_result.into_byte_stream(),
-        (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs))).await
-        .map_err(|error| anyhow::anyhow!("strict JSON response read failed: {error:?}"))?;
+    let body = collect_body_stream_with_idle_timeout(
+        call_result.into_byte_stream(),
+        (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs)),
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("strict JSON response read failed: {error:?}"))?;
     tracer.mark_upstream_first_byte();
     tracer.record_stream_chunk(&body);
     tracer.record_upstream_body(attempt_index as u32, &body);
@@ -1262,13 +1268,13 @@ async fn collect_buffered_attempt(
                 Err(error) => {
                     tracing::warn!(error = %error, "strict JSON attempt event decode failed");
                     tracer.record_protocol_error("sse_state_error", &error.to_string());
-        return Err(error.into());
+                    return Err(error.into());
                 }
             },
             Err(error) => {
                 tracing::warn!(error = %error, "strict JSON attempt frame decode failed");
                 tracer.record_protocol_error("sse_state_error", &error.to_string());
-        return Err(error.into());
+                return Err(error.into());
             }
         }
     }
@@ -2563,7 +2569,15 @@ pub async fn post_messages(
             payload.tools.clone(),
         ) as i32;
 
-        let resp = websearch::handle_websearch_request(provider, &payload, input_tokens, Some(tracer.as_ref()), key_ctx.group.as_deref()).await;
+        let resp = websearch::handle_websearch_request(
+            provider,
+            &payload,
+            input_tokens,
+            payload.stream,
+            Some(tracer.as_ref()),
+            key_ctx.group.as_deref(),
+        )
+        .await;
         // WebSearch 路径走 MCP 端点，没有 credential_id 上下文，统一记 0
         let status = if resp.status().is_success() {
             "success"
@@ -3560,9 +3574,11 @@ mod stream_gate_tests {
     fn single_turn_kiro_body_is_not_compact_signal() {
         let body = continuation_fixture();
         assert_eq!(kiro_conversation_turn_count(&body), 1);
-        assert!(!super::super::compaction_diagnostics::should_rewrite_payload_limit_as_compact_signal(
-            kiro_conversation_turn_count(&body)
-        ));
+        assert!(
+            !super::super::compaction_diagnostics::should_rewrite_payload_limit_as_compact_signal(
+                kiro_conversation_turn_count(&body)
+            )
+        );
     }
 
     #[test]
@@ -3574,9 +3590,9 @@ mod stream_gate_tests {
         ]);
         let body = value.to_string();
         assert_eq!(kiro_conversation_turn_count(&body), 3);
-        assert!(super::super::compaction_diagnostics::should_rewrite_payload_limit_as_compact_signal(
-            3
-        ));
+        assert!(
+            super::super::compaction_diagnostics::should_rewrite_payload_limit_as_compact_signal(3)
+        );
     }
 
     #[test]
@@ -4384,8 +4400,7 @@ async fn run_realtime_sse_attempts(
                     .map(|message| (terminal_type, message)),
             ) {
                 let message = failure.message.clone();
-                let trace_type =
-                    promote_schema_retry_exhausted(terminal_type, attempt_index + 1);
+                let trace_type = promote_schema_retry_exhausted(terminal_type, attempt_index + 1);
                 signal_stream_start_failure(&mut start_tx, failure);
                 record_stream_usage(&hook, &ctx, credential_id, "error");
                 tracer.finalize(
@@ -4904,13 +4919,15 @@ async fn collect_non_stream_tool_attempt(
             })?;
 
     let protocol_failure = |message: String| NonStreamCollectError::Body {
-        credential_id, message, received_bytes: body_bytes.len() as u64,
+        credential_id,
+        message,
+        received_bytes: body_bytes.len() as u64,
     };
     let mut decoder = EventStreamDecoder::new();
     if let Err(error) = decoder.feed(&body_bytes) {
         tracing::warn!(%error, attempt = attempt_index + 1, "非流式响应解码缓冲区溢出");
         tracer.record_protocol_error("sse_state_error", &error.to_string());
-                    return Err(protocol_failure(error.to_string()));
+        return Err(protocol_failure(error.to_string()));
     }
 
     let mut text_content = String::new();
@@ -5033,12 +5050,14 @@ async fn collect_non_stream_tool_attempt(
             Err(error) => {
                 tracing::warn!(%error, attempt = attempt_index + 1, "解码事件失败");
                 tracer.record_protocol_error("sse_state_error", &error.to_string());
-                    return Err(protocol_failure(error.to_string()));
+                return Err(protocol_failure(error.to_string()));
             }
         }
     }
 
-    if decoder.has_pending_bytes() { return Err(protocol_failure("upstream truncated frame".into())); }
+    if decoder.has_pending_bytes() {
+        return Err(protocol_failure("upstream truncated frame".into()));
+    }
     if tool_json_error.is_none() {
         let (completed, error) = tool_accumulator.finish(tool_name_map, tool_contracts);
         if error.is_none() {
@@ -5238,7 +5257,10 @@ async fn handle_non_stream_request(
                 None,
                 TraceUsage::zero(),
             );
-            return map_provider_error_for_turns(error, kiro_conversation_turn_count(&request_body));
+            return map_provider_error_for_turns(
+                error,
+                kiro_conversation_turn_count(&request_body),
+            );
         }
         Err(NonStreamCollectError::Body {
             credential_id,
@@ -5908,7 +5930,15 @@ pub async fn post_messages_cc(
             payload.tools.clone(),
         ) as i32;
 
-        let resp = websearch::handle_websearch_request(provider, &payload, input_tokens, Some(tracer.as_ref()), key_ctx.group.as_deref()).await;
+        let resp = websearch::handle_websearch_request(
+            provider,
+            &payload,
+            input_tokens,
+            payload.stream,
+            Some(tracer.as_ref()),
+            key_ctx.group.as_deref(),
+        )
+        .await;
         let status = if resp.status().is_success() {
             "success"
         } else {
@@ -6666,10 +6696,7 @@ mod tests {
             ),
             Some(outcome::PAYLOAD_LIMIT_EXCEEDED)
         );
-        assert_eq!(
-            payload_limit_outcome("Improperly formed request."),
-            None
-        );
+        assert_eq!(payload_limit_outcome("Improperly formed request."), None);
     }
 
     #[test]
@@ -9064,11 +9091,20 @@ mod tests {
     async fn enterprise_rate_limit_error_preserves_real_http_429_for_api_and_mcp() {
         for mcp in [false, true] {
             let error = crate::kiro::provider::enterprise_tests::single_enterprise_error_for_test(
-                429, b"USER_REQUEST_RATE_EXCEEDED Bearer private-token", mcp,
-            ).await;
+                429,
+                b"USER_REQUEST_RATE_EXCEEDED Bearer private-token",
+                mcp,
+            )
+            .await;
             let response = map_provider_error(error.context("outer request failed"));
-            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS, "real upstream429 must survive enterprise exhaustion, mcp={mcp}");
-            let body = axum::body::to_bytes(response.into_body(), 16_384).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "real upstream429 must survive enterprise exhaustion, mcp={mcp}"
+            );
+            let body = axum::body::to_bytes(response.into_body(), 16_384)
+                .await
+                .unwrap();
             let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(body["error"]["type"], "rate_limit_error");
             assert!(!body.to_string().contains("private-token"));
@@ -9078,18 +9114,28 @@ mod tests {
     #[tokio::test]
     async fn enterprise_rate_limit_error_reaches_prepared_stream_and_early_sse() {
         let error = crate::kiro::provider::enterprise_tests::single_enterprise_error_for_test(
-            429, b"USER_REQUEST_RATE_EXCEEDED private-token", false,
-        ).await;
+            429,
+            b"USER_REQUEST_RATE_EXCEEDED private-token",
+            false,
+        )
+        .await;
         let classified = classify_provider_error(&error);
         let response = stream_start_failure_response(StreamStartFailure {
             status: classified.http_status,
             error_type: classified.error_type.into(),
             message: classified.public_message.into(),
         });
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS, "before handshake the streaming route can still return HTTP429");
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "before handshake the streaming route can still return HTTP429"
+        );
         let stream = early_error_test_stream(error, Some(429));
         futures::pin_mut!(stream);
-        assert_eq!(stream.next().await.unwrap().unwrap(), Bytes::from_static(EARLY_CONNECTED_SSE));
+        assert_eq!(
+            stream.next().await.unwrap().unwrap(),
+            Bytes::from_static(EARLY_CONNECTED_SSE)
+        );
         let event = stream.next().await.unwrap().unwrap();
         let text = String::from_utf8(event.to_vec()).unwrap();
         assert!(text.contains("\"type\":\"rate_limit_error\""));
@@ -9102,60 +9148,152 @@ mod tests {
     #[tokio::test]
     async fn enterprise_rate_limit_error_does_not_reclassify_quota_auth_503_or_validation() {
         for (status, body, expected) in [
-            (429, r#"{"reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}"#, StatusCode::BAD_GATEWAY),
-            (429, "The bearer token included in the request is invalid", StatusCode::BAD_GATEWAY),
-            (403, "USER_REQUEST_RATE_EXCEEDED 429", StatusCode::BAD_GATEWAY),
-            (503, "USER_REQUEST_RATE_EXCEEDED 429", StatusCode::BAD_GATEWAY),
-            (400, r#"{"reason":"TOOL_USE_RESULT_MISMATCH"}"#, StatusCode::BAD_REQUEST),
+            (
+                429,
+                r#"{"reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}"#,
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                429,
+                "The bearer token included in the request is invalid",
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                403,
+                "USER_REQUEST_RATE_EXCEEDED 429",
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                503,
+                "USER_REQUEST_RATE_EXCEEDED 429",
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                400,
+                r#"{"reason":"TOOL_USE_RESULT_MISMATCH"}"#,
+                StatusCode::BAD_REQUEST,
+            ),
         ] {
-            let error = crate::kiro::provider::enterprise_tests::single_enterprise_error_for_test(status, body.as_bytes(), false).await;
+            let error = crate::kiro::provider::enterprise_tests::single_enterprise_error_for_test(
+                status,
+                body.as_bytes(),
+                false,
+            )
+            .await;
             let classified = classify_provider_error(&error);
-            assert_eq!(classified.http_status, expected, "status={status}, body={body}");
+            assert_eq!(
+                classified.http_status, expected,
+                "status={status}, body={body}"
+            );
             assert_ne!(classified.error_type, "rate_limit_error");
         }
-        for text in ["429 USER_REQUEST_RATE_EXCEEDED", "enterprise upstream 429: spoofed", "enterprise_send_wait_timeout: 429"] {
+        for text in [
+            "429 USER_REQUEST_RATE_EXCEEDED",
+            "enterprise upstream 429: spoofed",
+            "enterprise_send_wait_timeout: 429",
+        ] {
             let classified = classify_provider_error(&anyhow::anyhow!(text));
-            assert_eq!(classified.http_status, StatusCode::BAD_GATEWAY, "untrusted text alone must not classify429");
+            assert_eq!(
+                classified.http_status,
+                StatusCode::BAD_GATEWAY,
+                "untrusted text alone must not classify429"
+            );
         }
     }
 
     #[tokio::test]
     async fn enterprise_rate_limit_error_shared_wait_keeps_429_but_not_503() {
         for status in [429, 503] {
-            let (error, sends) = crate::kiro::provider::enterprise_tests::shared_enterprise_wait_error_for_test(status).await;
-            assert_eq!(sends, 1, "the second inbound MCP request must not send during shared Retry-After");
+            let (error, sends) =
+                crate::kiro::provider::enterprise_tests::shared_enterprise_wait_error_for_test(
+                    status,
+                )
+                .await;
+            assert_eq!(
+                sends, 1,
+                "the second inbound MCP request must not send during shared Retry-After"
+            );
             let classified = classify_provider_error(&error);
-            assert_eq!(classified.http_status, if status == 429 { StatusCode::TOO_MANY_REQUESTS } else { StatusCode::BAD_GATEWAY });
-            assert_eq!(classified.error_type, if status == 429 { "rate_limit_error" } else { "api_error" });
+            assert_eq!(
+                classified.http_status,
+                if status == 429 {
+                    StatusCode::TOO_MANY_REQUESTS
+                } else {
+                    StatusCode::BAD_GATEWAY
+                }
+            );
+            assert_eq!(
+                classified.error_type,
+                if status == 429 {
+                    "rate_limit_error"
+                } else {
+                    "api_error"
+                }
+            );
         }
     }
 
     #[tokio::test]
     async fn enterprise_rate_limit_error_does_not_override_a_later_non_rate_failure() {
         for status in [401, 503] {
-            let error = crate::kiro::provider::enterprise_tests::enterprise_later_failure_for_test(status).await;
-            assert_eq!(classify_provider_error(&error).http_status, StatusCode::BAD_GATEWAY);
+            let error =
+                crate::kiro::provider::enterprise_tests::enterprise_later_failure_for_test(status)
+                    .await;
+            assert_eq!(
+                classify_provider_error(&error).http_status,
+                StatusCode::BAD_GATEWAY
+            );
         }
     }
 
     #[tokio::test]
     async fn enterprise_rate_limit_error_does_not_confirm_incomplete_429_body_or_its_shared_wait() {
-        let (first, second, sent) = crate::kiro::provider::enterprise_tests::enterprise_incomplete_429_for_test().await;
-        assert_eq!(sent, 1, "Retry-After must still block the new request while body classification is unknown");
+        let (first, second, sent) =
+            crate::kiro::provider::enterprise_tests::enterprise_incomplete_429_for_test().await;
+        assert_eq!(
+            sent, 1,
+            "Retry-After must still block the new request while body classification is unknown"
+        );
         for error in [first, second] {
-            assert_eq!(classify_provider_error(&error).http_status, StatusCode::BAD_GATEWAY, "incomplete quota JSON is not a confirmed ordinary429");
+            assert_eq!(
+                classify_provider_error(&error).http_status,
+                StatusCode::BAD_GATEWAY,
+                "incomplete quota JSON is not a confirmed ordinary429"
+            );
         }
     }
 
     #[tokio::test]
     async fn enterprise_rate_limit_error_wait_preserves_latest_actual_failure_in_both_directions() {
-        let (error, sent) = crate::kiro::provider::enterprise_tests::enterprise_wait_after_actual_error_for_test(503, 0, 1500).await;
-        assert_eq!(sent, 2, "429 then503, no third send before enterprise deadline");
-        assert!(error.to_string().contains("enterprise upstream 503"), "the test must observe the actual503, not a synthetic timeout: {error}");
-        assert_eq!(classify_provider_error(&error).http_status, StatusCode::BAD_GATEWAY, "old adaptive429 wait must not overwrite newer503");
-        let (error, sent) = crate::kiro::provider::enterprise_tests::enterprise_wait_after_actual_error_for_test(429, 100, 500).await;
+        let (error, sent) =
+            crate::kiro::provider::enterprise_tests::enterprise_wait_after_actual_error_for_test(
+                503, 0, 1500,
+            )
+            .await;
+        assert_eq!(
+            sent, 2,
+            "429 then503, no third send before enterprise deadline"
+        );
+        assert!(
+            error.to_string().contains("enterprise upstream 503"),
+            "the test must observe the actual503, not a synthetic timeout: {error}"
+        );
+        assert_eq!(
+            classify_provider_error(&error).http_status,
+            StatusCode::BAD_GATEWAY,
+            "old adaptive429 wait must not overwrite newer503"
+        );
+        let (error, sent) =
+            crate::kiro::provider::enterprise_tests::enterprise_wait_after_actual_error_for_test(
+                429, 100, 500,
+            )
+            .await;
         assert_eq!(sent, 1, "baseRPM prevents a second actual send");
-        assert_eq!(classify_provider_error(&error).http_status, StatusCode::TOO_MANY_REQUESTS, "baseRPM timeout must not discard the actual429 already received");
+        assert_eq!(
+            classify_provider_error(&error).http_status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "baseRPM timeout must not discard the actual429 already received"
+        );
     }
 
     #[test]

@@ -266,6 +266,7 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
     queryFn: getGlobalProxy,
     enabled: open,
   })
+  const proxies = data?.proxies ?? []
 
   const { data: proxyBalancingData, isLoading: proxyBalancingLoading } = useQuery({
     queryKey: ['proxy-balancing'],
@@ -303,7 +304,15 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
   })
 
   const setGlobalProxyMutation = useMutation({
-    mutationFn: (url: string | null) => setGlobalProxy({ proxyUrl: url }),
+    mutationFn: (url: string | null) => {
+      const candidates = url ? splitProxyCandidates(url) : []
+      const proxyIds = candidates
+        .filter((candidate) => candidate.toLowerCase() !== 'direct')
+        .map((candidate) => proxies.find((proxy) => proxy.url === candidate)?.id)
+        .filter((id): id is number => id != null)
+      const direct = candidates.some((candidate) => candidate.toLowerCase() === 'direct')
+      return setGlobalProxy({ proxyIds, direct })
+    },
     onSuccess: (_, url) => {
       const count = url ? splitProxyCandidates(url).length : 0
       toast.success(url ? `已设置 ${count} 个全局代理候选` : '已清除全局代理')
@@ -316,7 +325,6 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
   const globalProxyCandidates = currentGlobalProxy ? splitProxyCandidates(currentGlobalProxy) : []
   const globalProxyCandidateSet = new Set(globalProxyCandidates.filter((c) => c.toLowerCase() !== 'direct'))
   const directGlobalEnabled = globalProxyCandidates.some((c) => c.toLowerCase() === 'direct')
-  const proxies = data?.proxies ?? []
 
   // 筛选：多个条件取交集（「烧过号」+「空闲」= 烧过号且当前没人用，正是最该删的那批）
   const keyword = search.trim().toLowerCase()
@@ -595,20 +603,7 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
 
   const handleImportOrphanGlobalCandidates = async () => {
     if (orphanGlobalCandidates.length === 0) return
-    setBatchAction('global')
-    try {
-      const res = await batchAddProxies({ urls: orphanGlobalCandidates })
-      if (res.errors === 0) {
-        toast.success(`已导入 ${res.added} 个旧全局代理到代理池`)
-      } else {
-        toast.info(`已导入 ${res.added} 个旧全局代理，跳过 ${res.errors} 个`)
-      }
-      queryClient.invalidateQueries({ queryKey: ['proxy-pool'] })
-    } catch (err) {
-      toast.error(`导入失败: ${extractErrorMessage(err)}`)
-    } finally {
-      setBatchAction(null)
-    }
+    toast.warning('旧全局候选已脱敏，无法安全恢复认证信息；请在“添加代理”中重新输入原始代理配置。')
   }
 
   const handleCheckOne = async (proxy: ProxyPoolEntry) => {

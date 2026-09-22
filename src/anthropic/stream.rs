@@ -1281,7 +1281,11 @@ impl CompletedToolUse {
     ) -> Self {
         let (name, input) =
             super::converter::restore_tool_use_for_client(kiro_name, input, tool_name_map);
-        Self { id, name, input }
+        Self {
+            id: client_tool_id(&id),
+            name,
+            input,
+        }
     }
 
     /// 产出非流式 Anthropic `tool_use` 内容块。**唯一的非流式块拼装点。**
@@ -1292,6 +1296,16 @@ impl CompletedToolUse {
             "name": self.name,
             "input": self.input,
         })
+    }
+}
+
+fn client_tool_id(id: &str) -> String {
+    if id.starts_with("toolu_") {
+        id.to_string()
+    } else if let Some(suffix) = id.strip_prefix("tooluse_") {
+        format!("toolu_{suffix}")
+    } else {
+        id.to_string()
     }
 }
 

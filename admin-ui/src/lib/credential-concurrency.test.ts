@@ -27,7 +27,7 @@ describe('concurrencyHint', () => {
   })
 
   test('轻载不加告警后缀', () => {
-    expect(concurrencyHint(2)).toBe('当前有 2 个请求正在这个账号上执行')
+    expect(concurrencyHint(2)).toBe('当前有 2 个请求占用这个账号的调度槽位')
   })
 
   test('偏忙与明显被压给出不同提示', () => {

@@ -186,6 +186,7 @@ async fn first_effective_event(
                     body_prefix: Some(prefix.freeze()),
                     in_flight: None,
                     terminal_prefix: true,
+                    deferred_success: None,
                 });
             }
             Ok(Ok(None)) => anyhow::bail!("enterprise_first_event_empty"),
@@ -211,6 +212,7 @@ async fn first_effective_event(
                 body_prefix: Some(prefix.freeze()),
                 in_flight: None,
                 terminal_prefix: false,
+                deferred_success: None,
             });
         }
     }
@@ -303,6 +305,7 @@ pub(super) async fn mcp_success(
         body_prefix: Some(body.freeze()),
         in_flight: None,
         terminal_prefix: true,
+        deferred_success: None,
     })
 }
 
@@ -446,6 +449,11 @@ impl KiroProvider {
             };
             node_index += 1;
             let started = Instant::now();
+            // 只有真实拿到发送时隙后才计入 RPM；在企业节奏队列中被取消的请求
+            // 不应占用额度。一个入站请求的后续端点尝试以 sequence 去重。
+            if sequence == 0 {
+                self.token_manager.record_request(ctx.id);
+            }
             let deadline = (Deadline::now()
                 + Duration::from_millis(policy.settings.first_event_timeout_ms))
             .min(policy.enterprise_deadline);

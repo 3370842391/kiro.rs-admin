@@ -198,6 +198,26 @@ pub const DEFAULT_PROXY_SCHEME: &str = "socks5";
 /// 支持的 scheme。
 pub const PROXY_SCHEMES: [&str; 4] = ["socks5", "socks4", "http", "https"];
 
+/// 脱敏用户输入；同时覆盖代理商常见的 `host:port:user:pass` 裸格式。
+pub fn redact_proxy_input(raw: &str) -> String {
+    let value = raw.trim();
+    if value.contains("://") || value.contains('@') {
+        return crate::admin::proxy_ban_stats::redact_proxy_url(value);
+    }
+    let mut parts = value.splitn(4, ':');
+    let host = parts.next().unwrap_or_default();
+    let port = parts.next().unwrap_or_default();
+    if !host.is_empty() && parts.next().is_some() {
+        return format!("{host}:{port}");
+    }
+    value.to_string()
+}
+
+fn redact_proxy_error(raw: &str, error: anyhow::Error) -> anyhow::Error {
+    let safe = redact_proxy_input(raw);
+    anyhow::anyhow!(error.to_string().replace(raw, &safe))
+}
+
 /// 把一条代理配置规范化成带 scheme 的 URL。
 ///
 /// 接受三种写法：
@@ -228,7 +248,10 @@ pub fn normalize_proxy_entry(raw: &str, scheme: &str) -> anyhow::Result<String> 
         } else if PROXY_SCHEMES.contains(&s.as_str()) {
             s
         } else {
-            anyhow::bail!("不支持的代理协议: {scheme}（支持 {}）", PROXY_SCHEMES.join("/"))
+            anyhow::bail!(
+                "不支持的代理协议: {scheme}（支持 {}）",
+                PROXY_SCHEMES.join("/")
+            )
         }
     };
 
@@ -404,12 +427,16 @@ impl ProxyPoolManager {
         }
         // 单条添加同样接受 host:port:user:pass 裸写法：从代理商列表里复制一行粘进来
         // 是最自然的操作，没理由只在批量导入里支持。
-        let url = normalize_proxy_entry(&url, DEFAULT_PROXY_SCHEME)?;
+        let url = normalize_proxy_entry(&url, DEFAULT_PROXY_SCHEME)
+            .map_err(|error| redact_proxy_error(&url, error))?;
 
         let mut entries = self.entries.lock();
 
         if entries.iter().any(|e| e.url == url) {
-            anyhow::bail!("代理 URL 已存在: {}", url);
+            anyhow::bail!(
+                "代理 URL 已存在: {}",
+                crate::admin::proxy_ban_stats::redact_proxy_url(&url)
+            );
         }
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -438,12 +465,15 @@ impl ProxyPoolManager {
             let url = match normalize_proxy_entry(&raw, scheme) {
                 Ok(url) => url,
                 Err(e) => {
-                    errors.push(e.to_string());
+                    errors.push(redact_proxy_error(&raw, e).to_string());
                     continue;
                 }
             };
             if entries.iter().any(|e| e.url == url) {
-                errors.push(format!("代理 URL 已存在: {}", url));
+                errors.push(format!(
+                    "代理 URL 已存在: {}",
+                    crate::admin::proxy_ban_stats::redact_proxy_url(&url)
+                ));
                 continue;
             }
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -672,7 +702,8 @@ impl ProxyPoolManager {
             .copied()
             .unwrap_or(SelectionTier::Normal)
             .rank();
-        let (bans_24h, rate_permille, total_bans) = pressure.get(&key).copied().unwrap_or((0, 0, 0));
+        let (bans_24h, rate_permille, total_bans) =
+            pressure.get(&key).copied().unwrap_or((0, 0, 0));
         (
             tier,
             bans_24h,
@@ -1277,7 +1308,13 @@ mod tests {
         let ledger = Arc::new(ProxyBanLedger::new(None));
         let mut next_id = 1u64;
         for (url, banned, seen) in bans {
-            let ids: Vec<u64> = (0..*seen).map(|_| { let i = next_id; next_id += 1; i }).collect();
+            let ids: Vec<u64> = (0..*seen)
+                .map(|_| {
+                    let i = next_id;
+                    next_id += 1;
+                    i
+                })
+                .collect();
             ledger.observe_bindings(ids.iter().map(|id| (Some(url.to_string()), *id)));
             for (n, id) in ids.iter().take(*banned as usize).enumerate() {
                 ledger.record_ban(BanObservation {
@@ -1380,10 +1417,10 @@ mod tests {
     #[test]
     fn malformed_entries_are_rejected_with_actionable_messages() {
         for bad in [
-            "1.2.3.4",              // 缺端口
-            "1.2.3.4:notaport",     // 端口非数字
-            "1.2.3.4:99999",        // 端口越界
-            ":8080",                // 缺主机
+            "1.2.3.4",               // 缺端口
+            "1.2.3.4:notaport",      // 端口非数字
+            "1.2.3.4:99999",         // 端口越界
+            ":8080",                 // 缺主机
             "1.2.3.4:8080:onlyuser", // 只有用户名没有密码
         ] {
             assert!(
@@ -1391,7 +1428,15 @@ mod tests {
                 "应当拒绝: {bad}"
             );
         }
-        assert!(normalize_proxy_entry("1.2.3.4:8080", "ftp").is_err(), "不支持的协议应报错");
+        assert!(
+            normalize_proxy_entry("1.2.3.4:8080", "ftp").is_err(),
+            "不支持的协议应报错"
+        );
+        let (_, errors) = ProxyPoolManager::new(None, TlsBackend::Rustls).batch_add(
+            vec!["1.2.3.4:99999:user:pass".to_string()],
+            "socks5",
+        );
+        assert!(!errors[0].contains("user:pass"), "裸格式错误不能回显认证");
     }
 
     #[test]
@@ -1429,6 +1474,7 @@ mod tests {
         );
         assert_eq!(added.len(), 1, "规范化之后是同一条，不该重复入池");
         assert_eq!(errors.len(), 1);
+        assert!(!errors[0].contains("u:p@"), "错误消息不能回显代理认证");
     }
 
     #[test]
@@ -1686,7 +1732,10 @@ mod tests {
         let proxy_b = ProxyConfig::new("http://proxy-b:8080");
         let _guard = mgr.in_flight_guard(&proxy_a);
         let ordered = mgr.order_candidates(1, vec![proxy_a, proxy_b.clone()], "least_load");
-        assert_eq!(ordered.first().map(|p| p.url.as_str()), Some(proxy_b.url.as_str()));
+        assert_eq!(
+            ordered.first().map(|p| p.url.as_str()),
+            Some(proxy_b.url.as_str())
+        );
     }
 
     #[test]
@@ -1708,9 +1757,7 @@ mod tests {
     #[test]
     fn pick_replacement_skips_unusable_and_prefers_lower_load() {
         let mgr = ProxyPoolManager::new(None, TlsBackend::Rustls);
-        let dead = mgr
-            .add("http://dead:8080".to_string(), None)
-            .unwrap();
+        let dead = mgr.add("http://dead:8080".to_string(), None).unwrap();
         mgr.add("http://busy:8080".to_string(), None).unwrap();
         mgr.add("http://free:8080".to_string(), None).unwrap();
         mgr.set_enabled(dead.id, false).unwrap();
@@ -1728,11 +1775,12 @@ mod tests {
     #[test]
     fn pick_replacement_returns_none_when_pool_has_nothing_else() {
         let mgr = ProxyPoolManager::new(None, TlsBackend::Rustls);
-        let dead = mgr
-            .add("http://dead:8080".to_string(), None)
-            .unwrap();
+        let dead = mgr.add("http://dead:8080".to_string(), None).unwrap();
         mgr.set_enabled(dead.id, false).unwrap();
-        assert!(mgr.pick_replacement_url(Some("http://dead:8080"), &HashMap::new()).is_none());
+        assert!(
+            mgr.pick_replacement_url(Some("http://dead:8080"), &HashMap::new())
+                .is_none()
+        );
     }
 
     #[test]

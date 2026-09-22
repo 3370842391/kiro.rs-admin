@@ -13,6 +13,10 @@ export type EnterpriseSelectionPolicy = 'priority' | 'enterprise-first'
 export interface RpmSummary {
   windowSeconds: number
   current: number
+  /** 当前账号调度占用，覆盖 Token 准备、上游响应读取和客户端背压。 */
+  inFlight: number
+  /** 当前达到 maxConcurrency 的启用账号数。 */
+  concurrencyLimited: number
   limitedCapacity: number
   remainingLimitedCapacity: number
   unlimitedAccounts: number
@@ -100,6 +104,7 @@ export interface CredentialStatusItem {
   /** 判死时间（RFC3339）。非空即代表该号已被上游封禁。 */
   diedAt?: string
   hasProxy: boolean
+  proxyId?: number
   proxyUrl?: string
   refreshFailureCount: number
   disabledReason?: string
@@ -385,6 +390,8 @@ export interface AddCredentialRequest {
   apiRegion?: string
   machineId?: string
   proxyUrl?: string
+  proxyId?: number | null
+  proxyManualBinding?: boolean
   proxyUsername?: string
   proxyPassword?: string
   kiroApiKey?: string
@@ -409,6 +416,7 @@ export interface UpdateCredentialRequest {
   apiRegion?: string
   email?: string
   proxyUrl?: string
+  proxyId?: number | null
   proxyUsername?: string
   proxyPassword?: string
   /** 账号所属分组（undefined 表示不修改，数组表示整体替换） */
@@ -617,6 +625,7 @@ export interface ProxyReputationCheckResponse {
 export interface ProxyPoolEntry {
   id: number
   url: string
+  scheme: ProxyScheme
   /** 出口 host:port，不含账号密码 */
   host?: string
   label?: string
@@ -773,10 +782,14 @@ export interface AssignRoundRobinResponse {
 // 全局代理配置
 export interface GlobalProxyResponse {
   proxyUrl: string | null
+  proxyIds: number[]
+  direct: boolean
 }
 
 export interface SetGlobalProxyRequest {
-  proxyUrl: string | null
+  proxyUrl?: string | null
+  proxyIds?: number[] | null
+  direct?: boolean
 }
 
 // 在线更新配置

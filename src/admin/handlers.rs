@@ -28,22 +28,20 @@ use super::{
     types::{
         AddCredentialRequest, AddProxyRequest, ApplyModelProfilesRequest, AssignProxyRequest,
         AssignRoundRobinRequest, BatchAddProxyRequest, BatchDeleteProxyRequest, BatchImportEvent,
-        BatchImportRequest,
-        BatchImportSummary, BatchUpdateCredentialsRequest, CacheHitRatePatch, ClientKeyItem,
-        ClientKeysResponse, CompleteSocialLoginRequest, CreateClientKeyRequest,
+        BatchImportRequest, BatchImportSummary, BatchUpdateCredentialsRequest, CacheHitRatePatch,
+        ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest, CreateClientKeyRequest,
         CreateClientKeyResponse, CredentialResponseTestRequest, FetchModelProfileRequest,
         GlobalProxyResponse, PatchModelProfileRequest, PreviewModelProfilesRequest,
         ProxyCheckUrlRequest, RevisionRequest, SetAccountThrottleConfigRequest,
         SetCacheHitRateRequest, SetCachePolicyRequest, SetCompatibilityConfigRequest,
         SetDeadCredentialConfigRequest, SetDisabledRequest, SetEndpointChainsRequest,
-        SetMaxCreditsRequest,
         SetEndpointModeRequest, SetGlobalProxyRequest, SetImageBudgetRequest,
-        SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetModelProfileSettingsRequest,
-        SetPriorityRequest, SetProfitConfigRequest, SetProxyBalancingModeRequest,
-        SetRetryPolicyRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
-        StartSocialLoginRequest, SuccessResponse, SyncModelProfilesRequest, UpdateAdminKeyRequest,
-        UpdateClientKeyRequest, UpdateClientKeyResponse, UpdateCredentialRequest,
-        UpdateRefreshTokenRequest,
+        SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetMaxCreditsRequest,
+        SetModelProfileSettingsRequest, SetPriorityRequest, SetProfitConfigRequest,
+        SetProxyBalancingModeRequest, SetRetryPolicyRequest, SetUpdateConfigRequest,
+        StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse, SyncModelProfilesRequest,
+        UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateClientKeyResponse,
+        UpdateCredentialRequest, UpdateRefreshTokenRequest,
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
 };
@@ -938,11 +936,13 @@ pub async fn profit_report(
             credits,
         })
         .collect();
-    state.service.record_pricing_coefficients(pricing_calc::measure(
-        &revenue_samples,
-        &token_samples,
-        u64::from(payload.minutes),
-    ));
+    state
+        .service
+        .record_pricing_coefficients(pricing_calc::measure(
+            &revenue_samples,
+            &token_samples,
+            u64::from(payload.minutes),
+        ));
 
     let report = aggregate_ledger_report(logs, usage_read.records, traces, keys, config.clone());
     // 顺手把「1 个 credit 卖了多少钱」实测下来，供每号收益核算使用。
@@ -1290,8 +1290,41 @@ pub async fn complete_social_login(
 /// GET /api/admin/config/global-proxy
 /// 获取当前全局代理配置
 pub async fn get_global_proxy(State(state): State<AdminState>) -> impl IntoResponse {
+    let raw = state.service.get_global_proxy();
+    let candidates = raw
+        .as_deref()
+        .map(crate::http_client::ProxyConfig::split_candidates)
+        .unwrap_or_default();
+    let pool = state.service.proxy_pool().list();
+    let proxy_ids = candidates
+        .iter()
+        .filter(|candidate| !candidate.eq_ignore_ascii_case("direct"))
+        .filter_map(|candidate| {
+            pool.iter()
+                .find(|entry| entry.url == *candidate)
+                .map(|entry| entry.id)
+        })
+        .collect();
+    let direct = candidates
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case("direct"));
+    let display = raw.map(|value| {
+        crate::http_client::ProxyConfig::split_candidates(&value)
+            .into_iter()
+            .map(|candidate| {
+                if candidate.eq_ignore_ascii_case("direct") {
+                    candidate
+                } else {
+                    crate::admin::proxy_ban_stats::redact_proxy_url(&candidate)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    });
     Json(GlobalProxyResponse {
-        proxy_url: state.service.get_global_proxy(),
+        proxy_url: display,
+        proxy_ids,
+        direct,
     })
 }
 
@@ -1301,7 +1334,35 @@ pub async fn set_global_proxy(
     State(state): State<AdminState>,
     Json(payload): Json<SetGlobalProxyRequest>,
 ) -> impl IntoResponse {
-    match state.service.set_global_proxy(payload.proxy_url) {
+    let url = if let Some(ids) = payload.proxy_ids {
+        let mut urls = Vec::new();
+        for id in ids {
+            match state.service.proxy_pool().get_url(id) {
+                crate::admin::proxy_pool::GetUrlResult::Ok(url) => urls.push(url),
+                crate::admin::proxy_pool::GetUrlResult::NotFound => {
+                    return (
+                        axum::http::StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({ "error": format!("代理 #{} 不存在", id) })),
+                    )
+                        .into_response();
+                }
+                crate::admin::proxy_pool::GetUrlResult::Disabled => {
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": format!("代理 #{} 已禁用", id) })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        if payload.direct.unwrap_or(false) {
+            urls.push("direct".to_string());
+        }
+        (!urls.is_empty()).then(|| urls.join("\n"))
+    } else {
+        payload.proxy_url
+    };
+    match state.service.set_global_proxy(url) {
         Ok(_) => Json(SuccessResponse::new("全局代理已更新")).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
@@ -2571,8 +2632,10 @@ pub async fn trace_recent_activity(
     })
     .await
     .unwrap_or_default();
-    let map: std::collections::HashMap<String, crate::admin::trace_db::RecentActivity> =
-        stats.into_iter().map(|(id, s)| (id.to_string(), s)).collect();
+    let map: std::collections::HashMap<String, crate::admin::trace_db::RecentActivity> = stats
+        .into_iter()
+        .map(|(id, s)| (id.to_string(), s))
+        .collect();
     Json(serde_json::json!({
         "windowMinutes": window_minutes,
         "credentials": map,

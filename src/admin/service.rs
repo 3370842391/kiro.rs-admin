@@ -36,6 +36,7 @@ use crate::model::config::{
     RetryMode,
 };
 
+use super::credential_earnings::{self, SellRateStore};
 use super::error::AdminServiceError;
 use super::model_profile_sync::{
     ModelProfileSyncService, PreviewCacheError, SyncCollection, SyncError,
@@ -43,38 +44,36 @@ use super::model_profile_sync::{
 use super::pricing_calc;
 use super::profit::ProfitConfig;
 use super::proxy_ban_stats;
-use super::proxy_pool::{self, GetUrlResult, ProxyEntry, ProxyHealth, ProxyPoolManager};
 use super::proxy_exclusive;
-use super::credential_earnings::{self, SellRateStore};
+use super::proxy_pool::{self, GetUrlResult, ProxyEntry, ProxyHealth, ProxyPoolManager};
 use super::proxy_reputation::{ProxyReputationStore, ReputationGrade};
 use super::types::{
     AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse,
     ApplyModelProfilesRequest, AssignProxyRequest, AssignRoundRobinResponse, AvailableModelItem,
     AvailableModelsResponse, BalanceResponse, BatchAddProxyRequest, BatchDeleteProxyRequest,
-    BatchDeleteProxyResponse, BatchGroupMode,
-    BatchImportEvent, BatchUpdateCredentialsRequest, BatchUpdateCredentialsResponse,
-    CacheHitRateResponse, CachePolicyResponse, CancelLoginResponse, CheckRateLimitRequest,
-    ClearCacheResponse, CompatibilityConfigResponse, CompleteSocialLoginRequest,
-    CredentialResponseTestResponse, CredentialStatusItem, CredentialsExportResponse,
-    CredentialsStatusResponse, DeadCredentialConfigResponse, EnableOverageAllResult,
-    EndpointBucketOption, EndpointChainsResponse, EndpointModeResponse, ExportedAccount,
-    ExportedCredentials, FetchModelProfileRequest, GitHubRateLimitInfo, ImageBudgetResponse,
-    ImageUpdateResponse, LoadBalancingModeResponse, LogGovernanceConfigResponse,
-    ModelProfileFieldRefResponse, ModelProfileFieldResponse, ModelProfilePreviewChangeResponse,
-    ModelProfilePreviewResponse, ModelProfileSettingsResponse, ModelProfileSourceSummaryResponse,
-    ModelProfileSyncResponse, ModelProfileSyncSummaryResponse, ModelProfileViewResponse,
-    ModelProfilesResponse, PatchModelProfileRequest, PollIdcLoginResponse,
-    PreviewModelProfilesRequest, ProfitConfigResponse, ProxyBalancingModeResponse,
-    ProxyBanDetailEntry, ProxyBanStatsResponse, ProxyBanTimelineItem, ProxyCheckAllResponse,
-    ProxyCheckResponse, ProxyCheckUrlRequest, ProxyGuardQuarantineItem, ProxyGuardRunResponse,
-    ProxyInUseSkip, ProxyPoolEntry, ProxyReputationCheckResponse,
-    ProxyPoolResponse, QuotaExceededResult, ResolvedModelProfileResponse, RetryPolicyResponse,
-    RevisionRequest, RpmSummary, SetAccountThrottleConfigRequest, SetCacheHitRateRequest,
-    SetCachePolicyRequest, SetCompatibilityConfigRequest, SetDeadCredentialConfigRequest,
-    SetEndpointChainsRequest, SetEndpointModeRequest, SetImageBudgetRequest,
-    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetModelProfileSettingsRequest,
-    SetImportDefaultsRequest, SetProfitConfigRequest, SetProxyBalancingModeRequest,
-    SetProxyGuardRequest, SetRetryPolicyRequest,
+    BatchDeleteProxyResponse, BatchGroupMode, BatchImportEvent, BatchUpdateCredentialsRequest,
+    BatchUpdateCredentialsResponse, CacheHitRateResponse, CachePolicyResponse, CancelLoginResponse,
+    CheckRateLimitRequest, ClearCacheResponse, CompatibilityConfigResponse,
+    CompleteSocialLoginRequest, CredentialResponseTestResponse, CredentialStatusItem,
+    CredentialsExportResponse, CredentialsStatusResponse, DeadCredentialConfigResponse,
+    EnableOverageAllResult, EndpointBucketOption, EndpointChainsResponse, EndpointModeResponse,
+    ExportedAccount, ExportedCredentials, FetchModelProfileRequest, GitHubRateLimitInfo,
+    ImageBudgetResponse, ImageUpdateResponse, LoadBalancingModeResponse,
+    LogGovernanceConfigResponse, ModelProfileFieldRefResponse, ModelProfileFieldResponse,
+    ModelProfilePreviewChangeResponse, ModelProfilePreviewResponse, ModelProfileSettingsResponse,
+    ModelProfileSourceSummaryResponse, ModelProfileSyncResponse, ModelProfileSyncSummaryResponse,
+    ModelProfileViewResponse, ModelProfilesResponse, PatchModelProfileRequest,
+    PollIdcLoginResponse, PreviewModelProfilesRequest, ProfitConfigResponse,
+    ProxyBalancingModeResponse, ProxyBanDetailEntry, ProxyBanStatsResponse, ProxyBanTimelineItem,
+    ProxyCheckAllResponse, ProxyCheckResponse, ProxyCheckUrlRequest, ProxyGuardQuarantineItem,
+    ProxyGuardRunResponse, ProxyInUseSkip, ProxyPoolEntry, ProxyPoolResponse,
+    ProxyReputationCheckResponse, QuotaExceededResult, ResolvedModelProfileResponse,
+    RetryPolicyResponse, RevisionRequest, RpmSummary, SetAccountThrottleConfigRequest,
+    SetCacheHitRateRequest, SetCachePolicyRequest, SetCompatibilityConfigRequest,
+    SetDeadCredentialConfigRequest, SetEndpointChainsRequest, SetEndpointModeRequest,
+    SetImageBudgetRequest, SetImportDefaultsRequest, SetLoadBalancingModeRequest,
+    SetLogGovernanceConfigRequest, SetModelProfileSettingsRequest, SetProfitConfigRequest,
+    SetProxyBalancingModeRequest, SetProxyGuardRequest, SetRetryPolicyRequest,
     SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
     StartSocialLoginResponse, SyncModelProfilesRequest, UpdateCheckInfo, UpdateConfigResponse,
     UpdateCredentialRequest, UpdateRefreshTokenRequest,
@@ -287,8 +286,11 @@ fn normalize_proxy_list(raw: &str) -> Result<Option<String>, AdminServiceError> 
         match proxy_pool::normalize_proxy_entry(candidate, proxy_pool::DEFAULT_PROXY_SCHEME) {
             Ok(url) => normalized.push(url),
             Err(error) => {
+                let safe_error = error
+                    .to_string()
+                    .replace(candidate, &proxy_pool::redact_proxy_input(candidate));
                 return Err(AdminServiceError::InvalidCredential(format!(
-                    "{error}。支持 http://、https://、socks5://、socks4:// 完整 URL，\
+                    "{safe_error}。支持 http://、https://、socks5://、socks4:// 完整 URL，\
                      也支持代理商导出的 host:port:用户名:密码；多个代理用逗号/空格/换行分隔，\
                      direct 表示直连候选"
                 )));
@@ -297,6 +299,12 @@ fn normalize_proxy_list(raw: &str) -> Result<Option<String>, AdminServiceError> 
     }
 
     Ok(Some(normalized.join("\n")))
+}
+
+fn proxy_scheme(url: &str) -> String {
+    url.split_once("://")
+        .map(|(scheme, _)| scheme.to_ascii_lowercase())
+        .unwrap_or_else(|| "direct".to_string())
 }
 
 fn calculate_rpm_summary(entries: &[CredentialEntrySnapshot]) -> RpmSummary {
@@ -322,6 +330,15 @@ fn calculate_rpm_summary(entries: &[CredentialEntrySnapshot]) -> RpmSummary {
     RpmSummary {
         window_seconds: RPM_WINDOW_SECONDS,
         current,
+        in_flight: entries.iter().map(|entry| u64::from(entry.in_flight)).sum(),
+        concurrency_limited: entries
+            .iter()
+            .filter(|entry| {
+                !entry.disabled
+                    && entry.max_concurrency > 0
+                    && entry.in_flight >= entry.max_concurrency
+            })
+            .count() as u64,
         limited_capacity,
         remaining_limited_capacity,
         unlimited_accounts: entries
@@ -1213,10 +1230,7 @@ impl AdminService {
     }
 
     /// 注入进价测算系数缓存，开启测算器。
-    pub fn set_pricing_coefficient_store(
-        &self,
-        store: Arc<pricing_calc::PricingCoefficientStore>,
-    ) {
+    pub fn set_pricing_coefficient_store(&self, store: Arc<pricing_calc::PricingCoefficientStore>) {
         let _ = self.pricing_coefficients.set(store);
     }
 
@@ -1229,7 +1243,9 @@ impl AdminService {
 
     /// 当前实测系数；从未跑过利润报表时为 `None`。
     pub fn get_pricing_coefficients(&self) -> Option<pricing_calc::PricingCoefficients> {
-        self.pricing_coefficients.get().and_then(|store| store.get())
+        self.pricing_coefficients
+            .get()
+            .and_then(|store| store.get())
     }
 
     /// 进价测算：给定买入价与额度，算该设多少倍率、能赚多少、能产出多少 token。
@@ -1295,8 +1311,9 @@ impl AdminService {
         let Some(store) = self.proxy_reputation.get() else {
             return ProxyReputationCheckResponse::default();
         };
-        let wanted: Option<std::collections::HashSet<u64>> =
-            ids.filter(|v| !v.is_empty()).map(|v| v.into_iter().collect());
+        let wanted: Option<std::collections::HashSet<u64>> = ids
+            .filter(|v| !v.is_empty())
+            .map(|v| v.into_iter().collect());
         let urls: Vec<String> = self
             .proxy_pool
             .list()
@@ -1590,6 +1607,12 @@ impl AdminService {
             cache.clone()
         };
         let now_ts = Utc::now().timestamp() as f64;
+        let proxy_ids_by_key: HashMap<String, u64> = self
+            .proxy_pool
+            .list()
+            .into_iter()
+            .map(|p| (proxy_ban_stats::normalize_proxy_key(Some(&p.url)), p.id))
+            .collect();
 
         // 收益核算的两个外部输入：实测卖价（¥/credit）与本地计量到的 credits 消耗。
         // 两者都可能缺失——没跑过利润报表就没有卖价，聚合器没注入就没有计量数据——
@@ -1656,23 +1679,31 @@ impl AdminService {
                     delete_on_forbidden: entry.delete_on_forbidden,
                     died_at: entry.died_at.clone(),
                     has_proxy: entry.has_proxy,
-                    proxy_url: entry.proxy_url,
+                    proxy_id: entry.proxy_url.as_deref().and_then(|url| {
+                        proxy_ids_by_key
+                            .get(&proxy_ban_stats::normalize_proxy_key(Some(url)))
+                            .copied()
+                    }),
+                    proxy_url: entry
+                        .proxy_url
+                        .as_deref()
+                        .map(proxy_ban_stats::redact_proxy_url),
                     refresh_failure_count: entry.refresh_failure_count,
                     disabled_reason: entry.disabled_reason,
                     throttled_remaining_secs: entry.throttled_remaining_secs,
                     rate_limited_remaining_ms: entry.rate_limited_remaining_ms,
                     quarantined_remaining_secs: entry.quarantined_remaining_secs,
-                    endpoint: entry.endpoint.clone().unwrap_or_else(|| default_endpoint.clone()),
+                    endpoint: entry
+                        .endpoint
+                        .clone()
+                        .unwrap_or_else(|| default_endpoint.clone()),
                     endpoint_pinned: entry.endpoint.is_some(),
                     groups: entry.groups,
                     source_channel: entry.source_channel,
                     balance,
                     balance_updated_at,
                     earnings,
-                    inferred_rpm: self
-                        .rpm_infer
-                        .get()
-                        .and_then(|store| store.get(entry.id)),
+                    inferred_rpm: self.rpm_infer.get().and_then(|store| store.get(entry.id)),
                 }
             })
             .collect();
@@ -2071,11 +2102,10 @@ impl AdminService {
         let now = Utc::now().timestamp();
         let end = (now / 60) * 60;
         let start = end - crate::admin::rpm_infer::WINDOW_MINUTES * 60;
-        let buckets = tokio::task::spawn_blocking(move || {
-            trace_store.query_rpm_minute_buckets(start, end)
-        })
-        .await
-        .unwrap_or_else(|_| Vec::new());
+        let buckets =
+            tokio::task::spawn_blocking(move || trace_store.query_rpm_minute_buckets(start, end))
+                .await
+                .unwrap_or_else(|_| Vec::new());
         let inferred = crate::admin::rpm_infer::infer_all(&buckets, Utc::now());
         let accounts = inferred.len();
         infer_store.replace(inferred);
@@ -2447,11 +2477,28 @@ impl AdminService {
             }
         }
 
-        req.proxy_url = match req.proxy_url.take() {
-            Some(raw) => normalize_proxy_list(&raw)?,
-            None => None,
-        };
-        let proxy_manual_binding = req.proxy_url.is_some();
+        let requested_manual_binding = req.proxy_manual_binding;
+        let proxy_id = req.proxy_id.take();
+        let had_proxy_id = proxy_id.is_some();
+        if let Some(proxy_id) = proxy_id {
+            req.proxy_url = match self.proxy_pool.get_url(proxy_id) {
+                GetUrlResult::Ok(url) => Some(url),
+                GetUrlResult::NotFound => return Err(AdminServiceError::NotFound { id: proxy_id }),
+                GetUrlResult::Disabled => {
+                    return Err(AdminServiceError::InvalidCredential(format!(
+                        "代理 #{} 已被禁用，请先启用后再分配",
+                        proxy_id
+                    )));
+                }
+            };
+        } else {
+            req.proxy_url = match req.proxy_url.take() {
+                Some(raw) => normalize_proxy_list(&raw)?,
+                None => None,
+            };
+        }
+        let proxy_manual_binding =
+            requested_manual_binding.unwrap_or_else(|| req.proxy_url.is_some() && !had_proxy_id);
 
         // 构建凭据对象。部分导出格式不带 email，但 accessToken 里通常有
         // preferred_username / email / upn，可在导入时最佳努力补齐。
@@ -2640,14 +2687,32 @@ impl AdminService {
         id: u64,
         req: UpdateCredentialRequest,
     ) -> Result<(), AdminServiceError> {
-        let manual_binding = req.proxy_url.is_some();
-        let proxy_url = match req.proxy_url {
-            Some(raw) => Some(normalize_proxy_list(&raw)?),
-            None => None,
+        let manual_binding = req.proxy_id.is_some() || req.proxy_url.is_some();
+        let proxy_url = if let Some(proxy_id) = req.proxy_id {
+            match proxy_id {
+                Some(id) => match self.proxy_pool.get_url(id) {
+                    GetUrlResult::Ok(url) => Some(Some(url)),
+                    GetUrlResult::NotFound => return Err(AdminServiceError::NotFound { id }),
+                    GetUrlResult::Disabled => {
+                        return Err(AdminServiceError::InvalidCredential(format!(
+                            "代理 #{} 已被禁用，请先启用后再分配",
+                            id
+                        )));
+                    }
+                },
+                None => Some(None),
+            }
+        } else {
+            req.proxy_url
+                .map(|raw| normalize_proxy_list(&raw))
+                .transpose()?
         };
 
         if req.cost_rmb.is_some() || req.quota_credits.is_some() {
-            for (value, label) in [(req.cost_rmb, "costRmb"), (req.quota_credits, "quotaCredits")] {
+            for (value, label) in [
+                (req.cost_rmb, "costRmb"),
+                (req.quota_credits, "quotaCredits"),
+            ] {
                 if let Some(v) = value
                     && (v < 0.0 || !v.is_finite())
                 {
@@ -2688,7 +2753,8 @@ impl AdminService {
                 None
             } else {
                 if !self.known_endpoints.contains(trimmed) {
-                    let mut known: Vec<&str> = self.known_endpoints.iter().map(|s| s.as_str()).collect();
+                    let mut known: Vec<&str> =
+                        self.known_endpoints.iter().map(|s| s.as_str()).collect();
                     known.sort();
                     return Err(AdminServiceError::InvalidCredential(format!(
                         "未知端点 \"{}\"，已注册端点: {:?}",
@@ -2774,6 +2840,11 @@ impl AdminService {
     /// 获取全局代理 URL
     pub fn get_global_proxy(&self) -> Option<String> {
         self.token_manager.proxy().map(|p| p.url.clone())
+    }
+
+    /// 代理池只读句柄，供 handler 将不透明 ID 解析为内部认证 URL。
+    pub fn proxy_pool(&self) -> &ProxyPoolManager {
+        &self.proxy_pool
     }
 
     /// 设置全局代理 URL（None 表示清除）并持久化到配置文件
@@ -3607,7 +3678,11 @@ impl AdminService {
                 .token_manager
                 .partial_stream_recovery_window_ms(),
             default_endpoint: self.token_manager.get_default_endpoint(),
-            rate_limit_bucket_mode: self.token_manager.get_rate_limit_bucket_mode().as_str().to_string(),
+            rate_limit_bucket_mode: self
+                .token_manager
+                .get_rate_limit_bucket_mode()
+                .as_str()
+                .to_string(),
             same_endpoint_attempts: self.token_manager.same_endpoint_attempts(),
             enterprise_special_handling: self.token_manager.enterprise_special_handling_enabled(),
             enterprise_selection_policy: self.token_manager.enterprise_selection_policy(),
@@ -4718,11 +4793,7 @@ impl AdminService {
         // 顺手把当前绑定关系登记进台账，为封号率提供分母。号被删后集合不回退，
         // 所以「这个代理一共用过多少号」是累积的真实值。
         if let Some(ledger) = self.token_manager.ban_ledger() {
-            ledger.observe_bindings(
-                credentials
-                    .iter()
-                    .map(|c| (c.proxy_url.clone(), c.id)),
-            );
+            ledger.observe_bindings(credentials.iter().map(|c| (c.proxy_url.clone(), c.id)));
         }
 
         let risk_map = self.proxy_risk_map();
@@ -4733,27 +4804,27 @@ impl AdminService {
                 let count = credentials
                     .iter()
                     .filter(|c| {
-                        c.proxy_url
-                            .as_deref()
-                            .is_some_and(|u| proxy_ban_stats::normalize_proxy_key(Some(u)) == proxy_key)
+                        c.proxy_url.as_deref().is_some_and(|u| {
+                            proxy_ban_stats::normalize_proxy_key(Some(u)) == proxy_key
+                        })
                     })
                     .count() as u32;
                 let enabled_count = credentials
                     .iter()
                     .filter(|c| !c.disabled)
                     .filter(|c| {
-                        c.proxy_url
-                            .as_deref()
-                            .is_some_and(|u| proxy_ban_stats::normalize_proxy_key(Some(u)) == proxy_key)
+                        c.proxy_url.as_deref().is_some_and(|u| {
+                            proxy_ban_stats::normalize_proxy_key(Some(u)) == proxy_key
+                        })
                     })
                     .count() as u32;
                 let manual_shared_count = credentials
                     .iter()
                     .filter(|c| c.proxy_manual_binding && !c.disabled)
                     .filter(|c| {
-                        c.proxy_url
-                            .as_deref()
-                            .is_some_and(|u| proxy_ban_stats::normalize_proxy_key(Some(u)) == proxy_key)
+                        c.proxy_url.as_deref().is_some_and(|u| {
+                            proxy_ban_stats::normalize_proxy_key(Some(u)) == proxy_key
+                        })
                     })
                     .count() as u32;
                 let ban_stats = self
@@ -4775,7 +4846,8 @@ impl AdminService {
                     .unwrap_or(ReputationGrade::Unknown);
                 ProxyPoolEntry {
                     id: p.id,
-                    url: p.url.clone(),
+                    url: proxy_ban_stats::redact_proxy_url(&p.url),
+                    scheme: proxy_scheme(&p.url),
                     host: proxy_ban_stats::normalize_proxy_key(Some(&p.url)),
                     label: p.label,
                     enabled: p.enabled,
@@ -4898,7 +4970,8 @@ impl AdminService {
             .unwrap_or_default();
         Ok(ProxyPoolEntry {
             id: entry.id,
-            url: entry.url.clone(),
+            url: proxy_ban_stats::redact_proxy_url(&entry.url),
+            scheme: proxy_scheme(&entry.url),
             host: proxy_ban_stats::normalize_proxy_key(Some(&entry.url)),
             label: entry.label,
             enabled: entry.enabled,
@@ -4926,16 +4999,22 @@ impl AdminService {
         &self,
         req: BatchAddProxyRequest,
     ) -> (Vec<ProxyPoolEntry>, Vec<String>) {
-        let scheme = req.scheme.as_deref().unwrap_or(proxy_pool::DEFAULT_PROXY_SCHEME);
+        let scheme = req
+            .scheme
+            .as_deref()
+            .unwrap_or(proxy_pool::DEFAULT_PROXY_SCHEME);
         let (added, errors) = self.proxy_pool.batch_add(req.urls, scheme);
         let ledger = self.token_manager.ban_ledger();
         let result = added
             .into_iter()
             .map(|e| {
-                let ban_stats = ledger.map(|l| l.summary_for(Some(&e.url))).unwrap_or_default();
+                let ban_stats = ledger
+                    .map(|l| l.summary_for(Some(&e.url)))
+                    .unwrap_or_default();
                 ProxyPoolEntry {
                     id: e.id,
-                    url: e.url.clone(),
+                    url: proxy_ban_stats::redact_proxy_url(&e.url),
+                    scheme: proxy_scheme(&e.url),
                     host: proxy_ban_stats::normalize_proxy_key(Some(&e.url)),
                     label: e.label,
                     enabled: e.enabled,
@@ -6119,11 +6198,8 @@ impl AdminService {
     fn resolve_idc_issuer(
         req: &StartIdcLoginRequest,
     ) -> Result<idc::NormalizedIdcIssuer, AdminServiceError> {
-        let issuer = idc::normalize_idc_issuer(
-            req.start_url.as_deref().unwrap_or(""),
-            &req.region,
-        )
-        .map_err(AdminServiceError::InvalidCredential)?;
+        let issuer = idc::normalize_idc_issuer(req.start_url.as_deref().unwrap_or(""), &req.region)
+            .map_err(AdminServiceError::InvalidCredential)?;
         if issuer.rewritten_from_ipv4 {
             tracing::info!(
                 from = %req.start_url.as_deref().unwrap_or(""),
@@ -6478,7 +6554,10 @@ mod tests {
     async fn enterprise_retry_settings_admin_update_persists_and_reads_back() {
         let (service, _provider, config_path, _temp) = image_budget_test_service(1_000_000);
         let chains = HashMap::from([("ide".to_string(), vec!["runtime".to_string()])]);
-        service.token_manager.set_endpoint_chains(Some(chains.clone())).unwrap();
+        service
+            .token_manager
+            .set_endpoint_chains(Some(chains.clone()))
+            .unwrap();
         let settings = serde_json::json!({
             "endpoints": ["runtime", "ide"],
             "firstEventTimeoutMs": 250,
@@ -6486,27 +6565,50 @@ mod tests {
         });
         let request = serde_json::from_value(serde_json::json!({
             "enterpriseRetry": settings
-        })).unwrap();
+        }))
+        .unwrap();
 
         let response = service.set_endpoint_chains(request).unwrap();
-        assert_eq!(serde_json::to_value(response).unwrap()["enterpriseRetry"], settings);
+        assert_eq!(
+            serde_json::to_value(response).unwrap()["enterpriseRetry"],
+            settings
+        );
         let persisted = Config::load(&config_path).unwrap();
-        assert_eq!(persisted.endpoint_chains, Some(chains), "仅更新企业设置必须保留普通桶链");
-        assert_eq!(serde_json::to_value(persisted.enterprise_retry).unwrap(), settings);
+        assert_eq!(
+            persisted.endpoint_chains,
+            Some(chains),
+            "仅更新企业设置必须保留普通桶链"
+        );
+        assert_eq!(
+            serde_json::to_value(persisted.enterprise_retry).unwrap(),
+            settings
+        );
         let response = service.get_endpoint_chains().unwrap();
-        assert_eq!(serde_json::to_value(response).unwrap()["enterpriseRetry"], settings);
+        assert_eq!(
+            serde_json::to_value(response).unwrap()["enterpriseRetry"],
+            settings
+        );
         // 显式 null 仍支持原有重置入口，与字段缺省严格区分。
         let reset = serde_json::from_value(serde_json::json!({"chains": null})).unwrap();
         service.set_endpoint_chains(reset).unwrap();
-        assert!(Config::load(&config_path).unwrap().endpoint_chains.is_none());
+        assert!(
+            Config::load(&config_path)
+                .unwrap()
+                .endpoint_chains
+                .is_none()
+        );
     }
 
     #[tokio::test]
     async fn enterprise_retry_settings_admin_rejects_invalid_before_any_write() {
         let (service, _provider, config_path, _temp) = image_budget_test_service(1_000_000);
-        service.token_manager.set_endpoint_chains(Some(HashMap::from([
-            ("ide".to_string(), vec!["runtime".to_string()]),
-        ]))).unwrap();
+        service
+            .token_manager
+            .set_endpoint_chains(Some(HashMap::from([(
+                "ide".to_string(),
+                vec!["runtime".to_string()],
+            )])))
+            .unwrap();
         let original_file = std::fs::read(&config_path).unwrap();
         let original_chains = service.token_manager.get_endpoint_chains();
 
@@ -6523,11 +6625,15 @@ mod tests {
             let request = serde_json::from_value(serde_json::json!({
                 "enterpriseSpecialHandling": true,
                 "enterpriseRetry": settings
-            })).unwrap();
-            assert!(matches!(
-                service.set_endpoint_chains(request),
-                Err(AdminServiceError::InvalidCredential(_))
-            ), "应拒绝无效企业重试设置: {settings}");
+            }))
+            .unwrap();
+            assert!(
+                matches!(
+                    service.set_endpoint_chains(request),
+                    Err(AdminServiceError::InvalidCredential(_))
+                ),
+                "应拒绝无效企业重试设置: {settings}"
+            );
             assert_eq!(std::fs::read(&config_path).unwrap(), original_file);
             assert_eq!(service.token_manager.get_endpoint_chains(), original_chains);
             assert!(!service.token_manager.enterprise_special_handling_enabled());
@@ -6646,26 +6752,45 @@ mod tests {
     async fn login_import_defaults_apply_metadata_and_distribute_pending_sessions() {
         let service = auth_test_service();
         *service.import_defaults.lock() = CredentialImportDefaults {
-            priority: 12, rpm_limit: 27, max_concurrency: 3,
-            groups: vec!["primary".into()], source_channel: "manual".into(),
-            cost_rmb: Some(60.0), quota_credits: Some(10000.0),
+            priority: 12,
+            rpm_limit: 27,
+            max_concurrency: 3,
+            groups: vec!["primary".into()],
+            source_channel: "manual".into(),
+            cost_rmb: Some(60.0),
+            quota_credits: Some(10000.0),
             ..Default::default()
         };
-        service.proxy_pool.add("http://127.0.0.1:19001".into(), None).unwrap();
-        service.proxy_pool.add("http://127.0.0.1:19002".into(), None).unwrap();
+        service
+            .proxy_pool
+            .add("http://127.0.0.1:19001".into(), None)
+            .unwrap();
+        service
+            .proxy_pool
+            .add("http://127.0.0.1:19002".into(), None)
+            .unwrap();
         let mut proxies = Vec::new();
         for _ in 0..2 {
-            let session = service.start_social_login(serde_json::from_value(
-                serde_json::json!({"priority": 0, "email": "test@example.invalid"})
-            ).unwrap()).await.unwrap();
+            let session = service
+                .start_social_login(
+                    serde_json::from_value(
+                        serde_json::json!({"priority": 0, "email": "test@example.invalid"}),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
             let sessions = service.social_sessions.lock();
             let login = &sessions[&session.session_id];
             let c = &login.cred_template;
             assert_eq!((c.priority, c.rpm_limit, c.max_concurrency), (12, 27, 3));
             assert_eq!(c.groups, ["primary"]);
-        assert_eq!(c.source_channel.as_deref(), Some("manual"));
+            assert_eq!(c.source_channel.as_deref(), Some("manual"));
             assert_eq!((c.cost_rmb, c.quota_credits), (Some(60.0), Some(10000.0)));
-            assert_eq!(c.proxy_url.as_deref(), login.proxy.as_ref().map(|p| p.url.as_str()));
+            assert_eq!(
+                c.proxy_url.as_deref(),
+                login.proxy.as_ref().map(|p| p.url.as_str())
+            );
             proxies.push(c.proxy_url.clone().unwrap());
         }
         assert_ne!(proxies[0], proxies[1], "待完成登录也计入出口负载");
@@ -6674,15 +6799,28 @@ mod tests {
     #[tokio::test]
     async fn login_import_defaults_respect_proxy_toggle_and_explicit_direct() {
         let service = auth_test_service();
-        service.proxy_pool.add("http://127.0.0.1:19001".into(), None).unwrap();
+        service
+            .proxy_pool
+            .add("http://127.0.0.1:19001".into(), None)
+            .unwrap();
         service.import_defaults.lock().auto_assign_proxy = false;
-        let session = service.start_social_login(serde_json::from_str("{}").unwrap()).await.unwrap();
-        assert!(service.social_sessions.lock()[&session.session_id].proxy.is_none());
+        let session = service
+            .start_social_login(serde_json::from_str("{}").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            service.social_sessions.lock()[&session.session_id]
+                .proxy
+                .is_none()
+        );
         service.cancel_social_login(&session.session_id);
         service.import_defaults.lock().auto_assign_proxy = true;
-        let session = service.start_social_login(serde_json::from_value(
-            serde_json::json!({"proxyUrl": "direct"})
-        ).unwrap()).await.unwrap();
+        let session = service
+            .start_social_login(
+                serde_json::from_value(serde_json::json!({"proxyUrl": "direct"})).unwrap(),
+            )
+            .await
+            .unwrap();
         let sessions = service.social_sessions.lock();
         let login = &sessions[&session.session_id];
         assert_eq!(login.proxy.as_ref().map(|p| p.url.as_str()), Some("direct"));
@@ -6698,7 +6836,8 @@ mod tests {
             let request: AddCredentialRequest = serde_json::from_value(serde_json::json!({
                 "authMethod": "api_key", "kiroApiKey": format!("ksk_import_priority_test_{i}"),
                 "apiRegion": "us-east-1", "priority": 999, "groups": ["json-group"]
-            })).unwrap();
+            }))
+            .unwrap();
             let result = service.import_one_credential(request, false).await;
             assert!(result.credential_id.is_some(), "{:?}", result.error);
         }
@@ -7123,10 +7262,7 @@ mod tests {
             endpoint: Some(" runtime ".to_string()),
         })
         .unwrap();
-        assert_eq!(
-            pinned.patch.endpoint,
-            Some(Some("runtime".to_string()))
-        );
+        assert_eq!(pinned.patch.endpoint, Some(Some("runtime".to_string())));
 
         let cleared = normalize_batch_update_request(BatchUpdateCredentialsRequest {
             ids: vec![4],

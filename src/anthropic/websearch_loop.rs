@@ -413,7 +413,8 @@ async fn run_round(
 }
 
 /// Feeds one round of assistant(text + web_search tool_use) + user(tool_result) back into payload.messages,
-/// and appends server_tool_use + web_search_tool_result blocks (Contract A fields) to the presentation.
+/// and appends server_tool_use + web_search_tool_result blocks using the
+/// Anthropic server-tool response shape to the presentation.
 ///
 /// `searched` corresponds one-to-one (same order) to `round.tool_uses`; the search has already been completed.
 fn append_search_round(
@@ -444,15 +445,15 @@ fn append_search_round(
             "type": "tool_result", "tool_use_id": tu.id, "content": summary
         }));
 
-        // Client presentation: server_tool_use + web_search_tool_result (Contract A)
+        // Client presentation: server_tool_use + web_search_tool_result.
         let (srv_id, _mcp) = websearch::create_mcp_request(&query);
         presentation.push(json!({
             "type": "server_tool_use", "id": srv_id, "name": "web_search",
             "input": {"query": query}
         }));
-        // Contract A: web_search_tool_result has only type + content (no tool_use_id), consistent with generate_websearch_events
         presentation.push(json!({
             "type": "web_search_tool_result",
+            "tool_use_id": srv_id,
             "content": build_result_block(results)
         }));
     }
@@ -462,7 +463,7 @@ fn append_search_round(
     });
 }
 
-/// Converts search results into an array of web_search_result blocks (Contract A fields)
+/// Converts search results into an array of web_search_result blocks.
 fn build_result_block(results: &Option<WebSearchResults>) -> Vec<Value> {
     match results {
         Some(r) => r
@@ -644,6 +645,7 @@ fn build_flush_content(
             let results: &Option<WebSearchResults> = searched.get(idx).unwrap_or(&None);
             content.push(json!({
                 "type": "web_search_tool_result",
+                "tool_use_id": srv_id,
                 "content": build_result_block(results)
             }));
         } else {
@@ -791,7 +793,21 @@ pub(super) async fn run_web_search_loop(
             for tu in &round.tool_uses {
                 let (_id, mcp_request) = websearch::create_mcp_request(&tool_query(tu));
                 match websearch::call_mcp_api(&provider, &mcp_request, Some(tracer.as_ref()), group.as_deref()).await {
-                    Ok(resp) => searched.push(websearch::parse_search_results(&resp)),
+                    Ok(resp) => match websearch::parse_search_results_checked(&resp) {
+                        Ok(results) => searched.push(Some(results)),
+                        Err(error) => {
+                            tracing::warn!(error_code = %error.error_code, "web_search MCP returned an error result");
+                            hook.record(last_credential_id, fallback_input_tokens, 0, 0, 0, total_credits, "error");
+                            return (
+                                StatusCode::BAD_GATEWAY,
+                                Json(ErrorResponse::new(
+                                    "web_search_error",
+                                    error.message.as_deref().unwrap_or(&error.error_code),
+                                )),
+                            )
+                                .into_response();
+                        }
+                    },
                     Err(e) => {
                         tracing::warn!("web_search MCP call failed: {}", e);
                         hook.record(
@@ -841,7 +857,10 @@ pub(super) async fn run_web_search_loop(
                 async move {
                     let (_id, mcp_request) = websearch::create_mcp_request(&query);
                     let response = websearch::call_mcp_api(&provider, &mcp_request, Some(tracer.as_ref()), group.as_deref()).await?;
-                    Ok::<_, anyhow::Error>(websearch::parse_search_results(&response))
+                    Ok::<_, anyhow::Error>(Some(
+                        websearch::parse_search_results_checked(&response)
+                            .map_err(|error| anyhow::anyhow!("{}", error.error_code))?,
+                    ))
                 }
             },
         )
@@ -1106,7 +1125,35 @@ fn build_sse_events(
                     }),
                 ));
             }
-            "server_tool_use" | "web_search_tool_result" => {
+            "server_tool_use" => {
+                let mut start_block = block.clone();
+                let input = start_block
+                    .as_object_mut()
+                    .and_then(|object| object.remove("input"))
+                    .unwrap_or_else(|| json!({}));
+                let partial = serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
+                events.push(SseEvent::new(
+                    "content_block_start",
+                    json!({
+                        "type": "content_block_start", "index": index,
+                        "content_block": start_block
+                    }),
+                ));
+                events.push(SseEvent::new(
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta", "index": index,
+                        "delta": {"type": "input_json_delta", "partial_json": partial}
+                    }),
+                ));
+                events.push(SseEvent::new(
+                    "content_block_stop",
+                    json!({
+                        "type": "content_block_stop", "index": index
+                    }),
+                ));
+            }
+            "web_search_tool_result" => {
                 events.push(SseEvent::new(
                     "content_block_start",
                     json!({

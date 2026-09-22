@@ -118,6 +118,8 @@ export function RpmStatusBar({
   const remainingLimitedCapacity = summary?.remainingLimitedCapacity ?? 0
   const unlimitedAccounts = summary?.unlimitedAccounts ?? 0
   const saturatedAccounts = summary?.saturatedAccounts ?? 0
+  const concurrencyLimited = summary?.concurrencyLimited ?? 0
+  const occupiedSlots = summary?.inFlight ?? totalInFlight
   const hasUnlimitedCapacity = unlimitedAccounts > 0
   const creditDisplay = formatAvailableCreditSummary(availableCreditSummary)
   const burnRate = Number.isFinite(creditsPerMinute) ? Math.max(0, creditsPerMinute) : 0
@@ -149,14 +151,21 @@ export function RpmStatusBar({
         />
       </MetricCard>
 
-      <MetricCard title="实时负载与额度" columns={3}>
+      <MetricCard title="实时负载与额度" columns={4}>
         <Metric
-          label="进行中"
-          value={String(totalInFlight)}
+          label="调度占用"
+          value={String(occupiedSlots)}
           unit="请求"
-          tone={totalInFlight > 0 ? 'warning' : 'neutral'}
-          detail="全池在飞"
+          tone={occupiedSlots > 0 ? 'warning' : 'neutral'}
+          detail="含准备与响应读取"
           live
+        />
+        <Metric
+          label="并发已满"
+          value={String(concurrencyLimited)}
+          unit="账号"
+          tone={concurrencyLimited > 0 ? 'danger' : 'ok'}
+          detail="瞬时快照"
         />
         {/* 可用积分与消耗速率相邻：余量 ÷ 速率 = 还能撑多久。
             两者同为「积分」量纲，之前余量带 $ 而速率是裸数字，这个换算读起来不成立。 */}

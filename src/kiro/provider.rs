@@ -298,6 +298,14 @@ pub struct KiroCallResult {
     pub credential_id: u64,
     in_flight: Option<crate::kiro::token_manager::InFlightGuard>,
     terminal_prefix: bool,
+    /// 2xx 只代表响应头已到达；完整 body 成功读完后才计入账号成功数。
+    deferred_success: Option<DeferredSuccess>,
+}
+
+struct DeferredSuccess {
+    manager: Arc<MultiTokenManager>,
+    id: u64,
+    affinity_key: Option<String>,
 }
 
 impl KiroCallResult {
@@ -308,14 +316,44 @@ impl KiroCallResult {
             stream::empty().boxed()
         } else { self.response.bytes_stream().boxed() };
         let held = self.in_flight;
-        stream::unfold((Box::pin(stream::iter(prefix.map(Ok)).chain(rest)), held), |(mut stream, held)| async move {
-            stream.next().await.map(|item| (item, (stream, held)))
-        })
+        let deferred_success = self.deferred_success;
+        stream::unfold(
+            (Box::pin(stream::iter(prefix.map(Ok)).chain(rest)), held, deferred_success),
+            |(mut stream, held, mut deferred_success)| async move {
+                match stream.next().await {
+                    Some(item) => {
+                        // reqwest 的 body stream 出现读取错误时，后续 EOF 不能再被
+                        // 当作完整成功；清掉延迟记账，避免断流误增 success_count。
+                        if item.is_err() {
+                            deferred_success = None;
+                        }
+                        Some((item, (stream, held, deferred_success)))
+                    }
+                    None => {
+                        if let Some(deferred) = deferred_success.take() {
+                            deferred.manager.report_success(deferred.id);
+                            deferred.manager.confirm_session_affinity(
+                                deferred.affinity_key.as_deref(),
+                                deferred.id,
+                            );
+                        }
+                        None
+                    }
+                }
+            },
+        )
     }
 
     pub async fn collect_bytes(self) -> Result<Bytes, reqwest::Error> {
         let _held = self.in_flight;
         let rest = if self.terminal_prefix { Bytes::new() } else { self.response.bytes().await? };
+        if let Some(deferred) = self.deferred_success {
+            deferred.manager.report_success(deferred.id);
+            deferred.manager.confirm_session_affinity(
+                deferred.affinity_key.as_deref(),
+                deferred.id,
+            );
+        }
         Ok(match self.body_prefix {
             Some(prefix) if !prefix.is_empty() => {
                 let mut out = bytes::BytesMut::with_capacity(prefix.len() + rest.len());
@@ -329,6 +367,20 @@ impl KiroCallResult {
 
     fn with_permit(mut self, permit: crate::kiro::token_manager::InFlightGuard) -> Self {
         self.in_flight = Some(permit);
+        self
+    }
+
+    fn with_deferred_success(
+        mut self,
+        manager: Arc<MultiTokenManager>,
+        id: u64,
+        affinity_key: Option<String>,
+    ) -> Self {
+        self.deferred_success = Some(DeferredSuccess {
+            manager,
+            id,
+            affinity_key,
+        });
         self
     }
 }
@@ -1517,12 +1569,12 @@ impl KiroProvider {
             .acquire_context_for_id(credential_id)
             .await?;
         let _in_flight = self.token_manager.in_flight_guard(ctx.id);
-        self.token_manager.record_request(ctx.id);
         self.ensure_profile_arn(&mut ctx).await;
 
         let config = self.token_manager.config();
         let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
         let endpoint = self.endpoint_for(&ctx.credentials, None)?;
+        self.token_manager.record_request(ctx.id);
         let started = Instant::now();
 
         let response = match self
@@ -1618,11 +1670,6 @@ impl KiroProvider {
             // least_conn 在途计数守卫：随本次迭代作用域结束自动 -1（具名绑定，勿用裸 `_`）。
             let _in_flight = self.token_manager.in_flight_guard(ctx.id);
 
-            // RPM 记账：本会话首次用到该凭据才记 1 次。
-            if rpm_recorded.insert(ctx.id) {
-                self.token_manager.record_request(ctx.id);
-            }
-
             if let Some(policy) = policy.filter(|_| ctx.credentials.is_enterprise_credential()) {
                 match tokio::time::timeout_at(policy.enterprise_deadline,
                     self.run_enterprise_phase(&ctx, request_body, sink, policy, control, true)).await {
@@ -1656,6 +1703,12 @@ impl KiroProvider {
                     continue;
                 }
             };
+
+            // 准备完成后才计 RPM；企业节奏等待在 run_enterprise_phase 内部，
+            // 取消等待不会消耗本次 RPM。
+            if rpm_recorded.insert(ctx.id) {
+                self.token_manager.record_request(ctx.id);
+            }
 
             let attempt_result = match self
                 .execute_mcp_request_with_proxy_failover(
@@ -1699,8 +1752,9 @@ impl KiroProvider {
                 });
                 let accepted = enterprise::mcp_success(response, ctx.id, deadline).await?;
                 Self::emit_attempt(sink, attempt, ctx.id, endpoint.name(), Some(status.as_u16()), outcome::SUCCESS, None, attempt_start);
-                self.token_manager.report_success(ctx.id);
-                return Ok(accepted.with_permit(_in_flight));
+                return Ok(accepted
+                    .with_permit(_in_flight)
+                    .with_deferred_success(self.token_manager.clone(), ctx.id, None));
             }
 
             // 失败响应
@@ -1940,11 +1994,6 @@ impl KiroProvider {
             // （return/continue/bail!/? 早退）。必须具名绑定，裸 `_` 会立即 Drop。
             let _in_flight = self.token_manager.in_flight_guard(ctx.id);
 
-            // RPM 记账：本会话首次用到该凭据才记 1 次（同凭据重试不再记）。
-            if rpm_recorded.insert(ctx.id) {
-                self.token_manager.record_request(ctx.id);
-            }
-
             let is_enterprise = ctx.credentials.is_enterprise_credential();
             let preparation = async {
                 self.ensure_profile_arn(&mut ctx).await;
@@ -2038,6 +2087,11 @@ impl KiroProvider {
             };
             let endpoint_name = endpoint.name();
 
+            // Profile/model 准备完成后才计 RPM；同一逻辑请求的换端点和重试由集合去重。
+            if rpm_recorded.insert(ctx.id) {
+                self.token_manager.record_request(ctx.id);
+            }
+
             let attempt_result = match self
                 .execute_api_request_with_proxy_failover(
                     &endpoint,
@@ -2085,9 +2139,8 @@ impl KiroProvider {
             let retry_after = Self::retry_after_delay(response.headers(), &retry_policy);
             if status.is_success() {
                 Self::emit_attempt(sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()), outcome::SUCCESS, None, attempt_start);
-                self.token_manager.report_success(ctx.id);
-                self.token_manager.confirm_session_affinity(affinity_key.as_deref(), ctx.id);
-                return Ok(KiroCallResult { response, credential_id: ctx.id, body_prefix: None, terminal_prefix: false, in_flight: Some(_in_flight) });
+                return Ok(KiroCallResult { response, credential_id: ctx.id, body_prefix: None, terminal_prefix: false, in_flight: Some(_in_flight), deferred_success: None }
+                    .with_deferred_success(self.token_manager.clone(), ctx.id, affinity_key.clone()));
             }
             let body = response.text().await.unwrap_or_default();
             if let Some(sink) = sink {
@@ -2349,9 +2402,8 @@ impl KiroProvider {
                         Ok(fb_resp) if fb_resp.status().is_success() => {
                             let fb_status = fb_resp.status();
                             Self::emit_attempt(sink, attempt, ctx.id, fb_name, Some(fb_status.as_u16()), outcome::SUCCESS, None, fb_start);
-                            self.token_manager.report_success(ctx.id);
-                            self.token_manager.confirm_session_affinity(affinity_key.as_deref(), ctx.id);
-                            return Ok(KiroCallResult { response: fb_resp, credential_id: ctx.id, body_prefix: None, terminal_prefix: false, in_flight: Some(_in_flight) });
+                            return Ok(KiroCallResult { response: fb_resp, credential_id: ctx.id, body_prefix: None, terminal_prefix: false, in_flight: Some(_in_flight), deferred_success: None }
+                                .with_deferred_success(self.token_manager.clone(), ctx.id, affinity_key.clone()));
                         }
                         Ok(fb_resp) => {
                             let fb_status = fb_resp.status();
@@ -2521,15 +2573,14 @@ impl KiroProvider {
                                     None,
                                     Instant::now(),
                                 );
-                                self.token_manager.report_success(ctx.id);
-                                self.token_manager
-                                    .confirm_session_affinity(affinity_key.as_deref(), ctx.id);
                                 return Ok(KiroCallResult {
                                     response: retry_result.response,
                                     body_prefix: None,
                                     terminal_prefix: false, in_flight: Some(_in_flight),
                                     credential_id: ctx.id,
-                                });
+                                    deferred_success: None,
+                                }
+                                .with_deferred_success(self.token_manager.clone(), ctx.id, affinity_key.clone()));
                             }
                             Ok(retry_result)
                                 if retry_result.response.status().as_u16() == 429 =>

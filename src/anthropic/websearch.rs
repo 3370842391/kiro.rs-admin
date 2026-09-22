@@ -85,6 +85,12 @@ pub struct WebSearchResults {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebSearchError {
+    pub error_code: String,
+    pub message: Option<String>,
+}
+
 /// 单个搜索结果
 #[derive(Debug, Deserialize, Clone)]
 #[allow(dead_code)]
@@ -121,8 +127,20 @@ pub fn has_web_search_tool(req: &MessagesRequest) -> bool {
         return false;
     }
     req.tools.as_ref().is_some_and(|tools| {
-        tools.len() == 1 && tools.first().is_some_and(is_native_web_search_tool)
+        tools.len() == 1
+            && tools.first().is_some_and(is_native_web_search_tool)
+            && web_search_tool_choice_allows(req, "web_search")
     })
+}
+
+fn web_search_tool_choice_allows(req: &MessagesRequest, tool_name: &str) -> bool {
+    match req.tool_choice.as_ref() {
+        None
+        | Some(crate::anthropic::types::ToolChoice::Auto { .. })
+        | Some(crate::anthropic::types::ToolChoice::Any { .. }) => true,
+        Some(crate::anthropic::types::ToolChoice::Tool { name, .. }) => name == tool_name,
+        Some(crate::anthropic::types::ToolChoice::None { .. }) => false,
+    }
 }
 
 /// Checks whether the request is a "mixed-tools set that contains web_search" case
@@ -136,29 +154,30 @@ pub(crate) fn has_web_search_among_tools(req: &MessagesRequest) -> bool {
         // 常规：web_search 与其他工具混用（len>1）走 loop。
         // force_web_search_loop 时：即便只有一个 web_search 也走 loop（OpenAI/Codex 场景，
         // 纯快速路径已被 has_web_search_tool 短路），保证内部搜索 + 模型合成答案。
-        has_native && (tools.len() > 1 || req.force_web_search_loop)
+        has_native
+            && (tools.len() > 1 || req.force_web_search_loop)
+            && web_search_tool_choice_allows(req, "web_search")
     })
 }
 
 /// 从消息中提取搜索查询
 ///
-/// 读取 messages 的第一条消息的第一个内容块
+/// 读取本轮最后一条 user 消息的文本内容
 /// 并去除 "Perform a web search for the query: " 前缀
 pub fn extract_search_query(req: &MessagesRequest) -> Option<String> {
-    // 获取第一条消息
-    let first_msg = req.messages.first()?;
+    // 多轮请求中第一条消息通常是历史问题，必须取本轮最后一条 user 消息。
+    let first_msg = req.messages.iter().rev().find(|msg| msg.role == "user")?;
 
     // 提取文本内容
     let text = match &first_msg.content {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Array(arr) => {
-            // 获取第一个内容块
-            let first_block = arr.first()?;
-            if first_block.get("type")?.as_str()? == "text" {
-                first_block.get("text")?.as_str()?.to_string()
-            } else {
-                return None;
-            }
+            // 内容块可能先出现图片等非文本块，取最后一个文本块。
+            let text_block = arr
+                .iter()
+                .rev()
+                .find(|block| block.get("type").and_then(|value| value.as_str()) == Some("text"))?;
+            text_block.get("text")?.as_str()?.to_string()
         }
         _ => return None,
     };
@@ -231,15 +250,72 @@ pub fn create_mcp_request(query: &str) -> (String, McpRequest) {
 }
 
 /// 解析 MCP 响应中的搜索结果
-pub fn parse_search_results(mcp_response: &McpResponse) -> Option<WebSearchResults> {
-    let result = mcp_response.result.as_ref()?;
-    let content = result.content.first()?;
+pub fn parse_search_results_checked(
+    mcp_response: &McpResponse,
+) -> Result<WebSearchResults, WebSearchError> {
+    let result = mcp_response.result.as_ref().ok_or_else(|| WebSearchError {
+        error_code: "unavailable".to_string(),
+        message: Some("web search returned no result".to_string()),
+    })?;
+    let content = result.content.first().ok_or_else(|| WebSearchError {
+        error_code: "unavailable".to_string(),
+        message: Some("web search returned empty content".to_string()),
+    })?;
 
     if content.content_type != "text" {
-        return None;
+        return Err(WebSearchError {
+            error_code: "unavailable".to_string(),
+            message: Some("web search returned unsupported content".to_string()),
+        });
     }
 
-    serde_json::from_str(&content.text).ok()
+    let value: serde_json::Value =
+        serde_json::from_str(&content.text).map_err(|_| WebSearchError {
+            error_code: "unavailable".to_string(),
+            message: Some("web search returned malformed content".to_string()),
+        })?;
+    if value.get("type").and_then(|v| v.as_str()) == Some("web_search_tool_result_error") {
+        return Err(WebSearchError {
+            error_code: value
+                .get("error_code")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unavailable")
+                .to_string(),
+            message: value
+                .get("message")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        });
+    }
+
+    if result.is_error {
+        return Err(WebSearchError {
+            error_code: "unavailable".to_string(),
+            message: value
+                .get("message")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .or_else(|| Some("web search provider returned an error".to_string())),
+        });
+    }
+
+    let parsed: WebSearchResults = serde_json::from_value(value).map_err(|_| WebSearchError {
+        error_code: "unavailable".to_string(),
+        message: Some("web search returned an invalid result shape".to_string()),
+    })?;
+    if let Some(error) = parsed.error.clone() {
+        return Err(WebSearchError {
+            error_code: error,
+            message: None,
+        });
+    }
+    Ok(parsed)
+}
+
+/// 兼容内部 agentic loop 的历史 Option 接口；新路由必须使用 checked 版本，
+/// 不能把 MCP 错误降级成“没有搜索结果”。
+pub fn parse_search_results(mcp_response: &McpResponse) -> Option<WebSearchResults> {
+    parse_search_results_checked(mcp_response).ok()
 }
 
 /// 生成 WebSearch SSE 响应流
@@ -258,6 +334,93 @@ pub fn create_websearch_sse_stream(
             .into_iter()
             .map(|e| Ok(Bytes::from(e.to_sse_string()))),
     )
+}
+
+pub fn create_websearch_json_body(
+    model: &str,
+    query: &str,
+    tool_use_id: &str,
+    search_results: &Option<WebSearchResults>,
+    input_tokens: i32,
+) -> serde_json::Value {
+    let summary = generate_search_summary(query, search_results);
+    let output_tokens = (summary.len() as i32 + 3) / 4;
+    let result_content = search_result_blocks(search_results);
+    json!({
+        "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [
+            {"type": "text", "text": format!("I'll search for \"{}\".", query)},
+            {"type": "server_tool_use", "id": tool_use_id, "name": "web_search", "input": {"query": query}},
+            {"type": "web_search_tool_result", "tool_use_id": tool_use_id, "content": result_content},
+            {"type": "text", "text": summary}
+        ],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "server_tool_use": {"web_search_requests": 1}
+        }
+    })
+}
+
+fn create_websearch_error_body(
+    model: &str,
+    tool_use_id: &str,
+    error: &WebSearchError,
+    input_tokens: i32,
+) -> serde_json::Value {
+    json!({
+        "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [{
+            "type": "web_search_tool_result_error",
+            "tool_use_id": tool_use_id,
+            "error_code": error.error_code,
+            "message": error.message
+        }],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "server_tool_use": {"web_search_requests": 1}
+        }
+    })
+}
+
+fn search_result_blocks(search_results: &Option<WebSearchResults>) -> Vec<serde_json::Value> {
+    search_results
+        .as_ref()
+        .map(|results| {
+            results
+                .results
+                .iter()
+                .map(|r| {
+                    let page_age = r.published_date.and_then(|ms| {
+                        chrono::DateTime::from_timestamp_millis(ms)
+                            .map(|dt| dt.format("%B %-d, %Y").to_string())
+                    });
+                    json!({
+                        "type": "web_search_result",
+                        "title": r.title,
+                        "url": r.url,
+                        "encrypted_content": r.snippet.clone().unwrap_or_default(),
+                        "page_age": page_age
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// 生成 WebSearch SSE 事件序列
@@ -331,8 +494,8 @@ fn generate_websearch_events(
     ));
 
     // 3. content_block_start (server_tool_use, index 1)
-    // server_tool_use 是服务端工具，input 在 content_block_start 中一次性完整发送，
-    // 不像客户端 tool_use 需要通过 input_json_delta 增量传输。
+    // Anthropic 流式协议要求 start 只携带 id/type/name，输入通过
+    // input_json_delta 传输；把完整 input 塞进 start 会导致 streaming_shape 失败。
     events.push(SseEvent::new(
         "content_block_start",
         json!({
@@ -341,8 +504,19 @@ fn generate_websearch_events(
             "content_block": {
                 "id": tool_use_id,
                 "type": "server_tool_use",
-                "name": "web_search",
-                "input": {"query": query}
+                "name": "web_search"
+            }
+        }),
+    ));
+
+    events.push(SseEvent::new(
+        "content_block_delta",
+        json!({
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": serde_json::to_string(&json!({"query": query})).unwrap_or_else(|_| "{}".to_string())
             }
         }),
     ));
@@ -357,29 +531,6 @@ fn generate_websearch_events(
     ));
 
     // 5. content_block_start (web_search_tool_result, index 2)
-    // 官方 API 的 web_search_tool_result 没有 tool_use_id 字段
-    let search_content = if let Some(ref results) = search_results {
-        results
-            .results
-            .iter()
-            .map(|r| {
-                let page_age = r.published_date.and_then(|ms| {
-                    chrono::DateTime::from_timestamp_millis(ms)
-                        .map(|dt| dt.format("%B %-d, %Y").to_string())
-                });
-                json!({
-                    "type": "web_search_result",
-                    "title": r.title,
-                    "url": r.url,
-                    "encrypted_content": r.snippet.clone().unwrap_or_default(),
-                    "page_age": page_age
-                })
-            })
-            .collect::<Vec<_>>()
-    } else {
-        vec![]
-    };
-
     events.push(SseEvent::new(
         "content_block_start",
         json!({
@@ -387,7 +538,8 @@ fn generate_websearch_events(
             "index": 2,
             "content_block": {
                 "type": "web_search_tool_result",
-                "content": search_content
+                "tool_use_id": tool_use_id,
+                "content": search_result_blocks(&search_results)
             }
         }),
     ));
@@ -504,6 +656,7 @@ pub async fn handle_websearch_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
     input_tokens: i32,
+    stream_client: bool,
     sink: Option<&dyn crate::admin::trace_db::TraceSink>,
     group: Option<&str>,
 ) -> Response {
@@ -527,21 +680,64 @@ pub async fn handle_websearch_request(
     // 2. 创建 MCP 请求
     let (tool_use_id, mcp_request) = create_mcp_request(&query);
 
-    // 3. 调用 Kiro MCP API
+    // 3. max_uses=0 明确禁止搜索；本快速路径一次请求只会发起一次 MCP 调用。
+    if payload
+        .tools
+        .as_ref()
+        .and_then(|tools| tools.first())
+        .and_then(|tool| tool.max_uses)
+        .is_some_and(|max_uses| max_uses <= 0)
+    {
+        let error = WebSearchError {
+            error_code: "max_uses_exceeded".to_string(),
+            message: Some("web search max_uses must be at least 1".to_string()),
+        };
+        let body = create_websearch_error_body(&payload.model, &tool_use_id, &error, input_tokens);
+        return (StatusCode::OK, Json(body)).into_response();
+    }
+
+    // 4. 调用 Kiro MCP API
     let search_results = match call_mcp_api(&provider, &mcp_request, sink, group).await {
-        Ok(response) => parse_search_results(&response),
+        Ok(response) => match parse_search_results_checked(&response) {
+            Ok(results) => Some(results),
+            Err(error) => {
+                if stream_client {
+                    let body = create_websearch_error_body(
+                        &payload.model,
+                        &tool_use_id,
+                        &error,
+                        input_tokens,
+                    );
+                    return (StatusCode::OK, Json(body)).into_response();
+                }
+                let body =
+                    create_websearch_error_body(&payload.model, &tool_use_id, &error, input_tokens);
+                return (StatusCode::OK, Json(body)).into_response();
+            }
+        },
         Err(e) => {
             tracing::warn!("MCP API 调用失败: {}", e);
-            return super::handlers::map_provider_error(e);
+            let error = WebSearchError {
+                error_code: "unavailable".to_string(),
+                message: Some(e.to_string()),
+            };
+            let body =
+                create_websearch_error_body(&payload.model, &tool_use_id, &error, input_tokens);
+            return (StatusCode::OK, Json(body)).into_response();
         }
     };
 
-    // 4. 生成 SSE 响应
+    // 4. 按客户端 stream 形态返回响应；不能把非流请求强制变成 SSE。
     let model = payload.model.clone();
-    let stream =
-        create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
-
-    crate::common::sse::sse_response(Body::from_stream(stream))
+    if stream_client {
+        let stream =
+            create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
+        crate::common::sse::sse_response(Body::from_stream(stream))
+    } else {
+        let body =
+            create_websearch_json_body(&model, &query, &tool_use_id, &search_results, input_tokens);
+        (StatusCode::OK, Json(body)).into_response()
+    }
 }
 
 /// 调用 Kiro MCP API
@@ -606,6 +802,89 @@ mod tests {
         };
 
         assert!(has_web_search_tool(&req));
+    }
+
+    #[test]
+    fn web_search_tool_choice_is_respected() {
+        use crate::anthropic::types::{Message, Tool, ToolChoice};
+
+        let mut req = MessagesRequest {
+            force_web_search_loop: false,
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+            }],
+            stream: true,
+            system: None,
+            tools: Some(vec![Tool {
+                tool_type: Some("web_search_20250305".to_string()),
+                name: "web_search".to_string(),
+                description: String::new(),
+                input_schema: Default::default(),
+                max_uses: Some(1),
+                cache_control: None,
+            }]),
+            tool_choice: Some(ToolChoice::None {
+                disable_parallel_tool_use: false,
+            }),
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        assert!(!has_web_search_tool(&req));
+        req.tool_choice = Some(ToolChoice::Tool {
+            name: "other".to_string(),
+            disable_parallel_tool_use: false,
+        });
+        assert!(!has_web_search_tool(&req));
+        req.tool_choice = Some(ToolChoice::Tool {
+            name: "web_search".to_string(),
+            disable_parallel_tool_use: false,
+        });
+        assert!(has_web_search_tool(&req));
+    }
+
+    #[test]
+    fn non_stream_websearch_body_uses_anthropic_message_envelope() {
+        let results = WebSearchResults {
+            results: vec![WebSearchResult {
+                title: "Rust".to_string(),
+                url: "https://www.rust-lang.org".to_string(),
+                snippet: Some("safe systems language".to_string()),
+                published_date: None,
+                id: None,
+                domain: None,
+                max_verbatim_word_limit: None,
+                public_domain: None,
+            }],
+            total_results: Some(1),
+            query: Some("rust".to_string()),
+            error: None,
+        };
+        let body = create_websearch_json_body(
+            "claude-opus-5",
+            "rust latest version",
+            "srvtoolu_test",
+            &Some(results),
+            12,
+        );
+
+        assert_eq!(body["type"], "message");
+        assert_eq!(body["role"], "assistant");
+        assert_eq!(body["stop_reason"], "end_turn");
+        let content = body["content"].as_array().unwrap();
+        assert_eq!(content[1]["type"], "server_tool_use");
+        assert_eq!(content[1]["id"], "srvtoolu_test");
+        assert_eq!(content[2]["type"], "web_search_tool_result");
+        assert_eq!(content[2]["tool_use_id"], "srvtoolu_test");
+        assert!(
+            content
+                .iter()
+                .any(|block| { block["type"] == "text" && block["text"].as_str().is_some() })
+        );
+        assert_eq!(body["usage"]["server_tool_use"]["web_search_requests"], 1);
     }
 
     #[test]
@@ -750,6 +1029,68 @@ mod tests {
     }
 
     #[test]
+    fn extract_search_query_uses_latest_user_text_block() {
+        use crate::anthropic::types::Message;
+
+        let req = MessagesRequest {
+            force_web_search_loop: false,
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("old question"),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("old answer"),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "image", "source": {"type": "base64"}},
+                        {"type": "text", "text": "latest question"}
+                    ]),
+                },
+            ],
+            stream: true,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        assert_eq!(extract_search_query(&req), Some("latest question".to_string()));
+    }
+
+    #[test]
+    fn web_search_stream_uses_input_delta_and_result_tool_id() {
+        let events = generate_websearch_events(
+            "claude-opus-5",
+            "rust",
+            "srvtoolu_test",
+            None,
+            1,
+        );
+        let start = events
+            .iter()
+            .find(|event| event.event == "content_block_start" && event.data["index"] == 1)
+            .unwrap();
+        assert!(start.data["content_block"]["input"].is_null());
+        let delta = events
+            .iter()
+            .find(|event| event.event == "content_block_delta" && event.data["index"] == 1)
+            .unwrap();
+        assert_eq!(delta.data["delta"]["type"], "input_json_delta");
+        let result = events
+            .iter()
+            .find(|event| event.event == "content_block_start" && event.data["index"] == 2)
+            .unwrap();
+        assert_eq!(result.data["content_block"]["tool_use_id"], "srvtoolu_test");
+    }
+
+    #[test]
     fn test_create_mcp_request() {
         let (tool_use_id, request) = create_mcp_request("test query");
 
@@ -806,11 +1147,28 @@ mod tests {
             }),
         };
 
-        let results = parse_search_results(&response);
-        assert!(results.is_some());
-        let results = results.unwrap();
+        let results = parse_search_results_checked(&response).unwrap();
         assert_eq!(results.results.len(), 1);
         assert_eq!(results.results[0].title, "Test");
+    }
+
+    #[test]
+    fn search_errors_are_not_silently_mapped_to_empty_results() {
+        let response = McpResponse {
+            error: None,
+            id: "test_id".to_string(),
+            jsonrpc: "2.0".to_string(),
+            result: Some(McpResult {
+                content: vec![McpContent {
+                    content_type: "text".to_string(),
+                    text: r#"{"type":"web_search_tool_result_error","error_code":"max_uses_exceeded"}"#.to_string(),
+                }],
+                is_error: true,
+            }),
+        };
+
+        let error = parse_search_results_checked(&response).unwrap_err();
+        assert_eq!(error.error_code, "max_uses_exceeded");
     }
 
     #[test]

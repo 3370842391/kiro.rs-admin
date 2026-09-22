@@ -1,8 +1,8 @@
 /**
  * 单账号"当前被打了多少并发"的展示语义。
  *
- * 后端 `inFlight` 是该凭据此刻未结束的上游请求数（`in_flight_guard` 进出成对增减），
- * 是判断"这个号正被打多狠"的唯一实时信号，因此在账号列表里当一等公民展示。
+ * 后端 `inFlight` 是该凭据此刻占用的调度槽位（`in_flight_guard` 进出成对增减），
+ * 覆盖 Token 准备、上游响应读取和客户端背压；它不是单纯的 RPM 计数。
  */
 export type ConcurrencyTone = 'idle' | 'active' | 'busy' | 'hot'
 
@@ -20,14 +20,14 @@ export function concurrencyTone(inFlight: number): ConcurrencyTone {
 /** 悬浮说明：把数字翻译成"这号现在什么处境"。 */
 export function concurrencyHint(inFlight: number): string {
   const value = Number.isFinite(inFlight) && inFlight > 0 ? Math.floor(inFlight) : 0
-  if (value === 0) return '当前没有请求打在这个账号上'
+  if (value === 0) return '当前没有请求占用这个账号的调度槽位'
   const suffix =
     value > BUSY_LIMIT
       ? '，明显被压，考虑加号或降低该号优先级'
       : value > LIGHT_LOAD
         ? '，同一会话的 helper 仍会粘在这个号上'
         : ''
-  return `当前有 ${value} 个请求正在这个账号上执行${suffix}`
+  return `当前有 ${value} 个请求占用这个账号的调度槽位${suffix}`
 }
 
 /**
