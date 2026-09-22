@@ -4729,9 +4729,32 @@ impl AdminService {
         let pool: Vec<ProxyPoolEntry> = proxies
             .into_iter()
             .map(|p| {
+                let proxy_key = proxy_ban_stats::normalize_proxy_key(Some(&p.url));
                 let count = credentials
                     .iter()
-                    .filter(|c| c.proxy_url.as_deref().map(|u| u == p.url).unwrap_or(false))
+                    .filter(|c| {
+                        c.proxy_url
+                            .as_deref()
+                            .is_some_and(|u| proxy_ban_stats::normalize_proxy_key(Some(u)) == proxy_key)
+                    })
+                    .count() as u32;
+                let enabled_count = credentials
+                    .iter()
+                    .filter(|c| !c.disabled)
+                    .filter(|c| {
+                        c.proxy_url
+                            .as_deref()
+                            .is_some_and(|u| proxy_ban_stats::normalize_proxy_key(Some(u)) == proxy_key)
+                    })
+                    .count() as u32;
+                let manual_shared_count = credentials
+                    .iter()
+                    .filter(|c| c.proxy_manual_binding && !c.disabled)
+                    .filter(|c| {
+                        c.proxy_url
+                            .as_deref()
+                            .is_some_and(|u| proxy_ban_stats::normalize_proxy_key(Some(u)) == proxy_key)
+                    })
                     .count() as u32;
                 let ban_stats = self
                     .token_manager
@@ -4757,6 +4780,8 @@ impl AdminService {
                     label: p.label,
                     enabled: p.enabled,
                     credential_count: count,
+                    enabled_credential_count: enabled_count,
+                    manual_shared_count,
                     health: p.health,
                     latency_ms: p.latency_ms,
                     last_checked_at: p.last_checked_at,
@@ -4878,6 +4903,8 @@ impl AdminService {
             label: entry.label,
             enabled: entry.enabled,
             credential_count: 0,
+            enabled_credential_count: 0,
+            manual_shared_count: 0,
             health: entry.health,
             latency_ms: entry.latency_ms,
             last_checked_at: entry.last_checked_at,
@@ -4913,6 +4940,8 @@ impl AdminService {
                     label: e.label,
                     enabled: e.enabled,
                     credential_count: 0,
+                    enabled_credential_count: 0,
+                    manual_shared_count: 0,
                     health: e.health,
                     latency_ms: e.latency_ms,
                     last_checked_at: e.last_checked_at,
@@ -6787,6 +6816,7 @@ mod tests {
             died_at: None,
             has_proxy: false,
             proxy_url: None,
+            proxy_manual_binding: false,
             refresh_failure_count: 0,
             disabled_reason: None,
             throttled_remaining_secs: None,

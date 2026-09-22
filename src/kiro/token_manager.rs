@@ -1323,6 +1323,9 @@ pub struct CredentialEntrySnapshot {
     /// 代理 URL（用于前端展示）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
+    /// 是否由运营明确手动绑定代理
+    #[serde(default)]
+    pub proxy_manual_binding: bool,
     /// Token 刷新连续失败次数
     pub refresh_failure_count: u32,
     /// 禁用原因
@@ -3894,6 +3897,7 @@ impl MultiTokenManager {
                     last_used_at: e.last_used_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
+                    proxy_manual_binding: e.credentials.proxy_manual_binding,
                     refresh_failure_count: e.refresh_failure_count,
                     disabled_reason: e
                         .credentials
@@ -4330,7 +4334,7 @@ impl MultiTokenManager {
         }
 
         let global_proxy = self.proxy.lock().clone();
-        let effective_proxy = proxy_policy::require_auxiliary_proxy(&credentials, ProxyPurpose::Refresh, global_proxy.as_ref())?;
+        let effective_proxy = proxy_policy::require_auxiliary_proxy(&credentials, ProxyPurpose::Profile, global_proxy.as_ref())?;
         let profiles =
             list_available_profiles(&credentials, &self.config, token, effective_proxy.as_ref())
                 .await?;
@@ -4490,7 +4494,7 @@ impl MultiTokenManager {
             .await?;
 
         let global_proxy = self.proxy.lock().clone();
-        let effective_proxy = proxy_policy::require_auxiliary_proxy(&credentials, ProxyPurpose::Refresh, global_proxy.as_ref())?;
+        let effective_proxy = proxy_policy::require_auxiliary_proxy(&credentials, ProxyPurpose::Usage, global_proxy.as_ref())?;
         let usage_limits =
             get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
 
@@ -4687,7 +4691,7 @@ impl MultiTokenManager {
             .credentials_with_resolved_profile(id, &token, credentials)
             .await?;
         let global_proxy = self.proxy.lock().clone();
-        let effective_proxy = proxy_policy::require_auxiliary_proxy(&credentials, ProxyPurpose::Refresh, global_proxy.as_ref())?;
+        let effective_proxy = proxy_policy::require_auxiliary_proxy(&credentials, ProxyPurpose::Profile, global_proxy.as_ref())?;
         get_available_models(&credentials, &self.config, &token, effective_proxy.as_ref()).await
     }
 
@@ -4715,7 +4719,7 @@ impl MultiTokenManager {
             .unwrap_or_else(|| "us-east-1".to_string());
 
         let global_proxy = self.proxy.lock().clone();
-        let effective_proxy = proxy_policy::require_auxiliary_proxy(&credentials, ProxyPurpose::Refresh, global_proxy.as_ref())?;
+        let effective_proxy = proxy_policy::require_auxiliary_proxy(&credentials, ProxyPurpose::Login, global_proxy.as_ref())?;
 
         create_kiro_api_key(
             &self.config,

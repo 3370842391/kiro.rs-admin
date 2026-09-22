@@ -229,7 +229,7 @@ const PROXY_FILTERS: {
     key: 'idle',
     label: '空闲',
     hint: '当前没有凭据绑定，删掉不影响在跑的号',
-    match: (p) => p.credentialCount === 0,
+    match: (p) => (p.enabledCredentialCount ?? p.credentialCount) === 0,
   },
   {
     key: 'clean',
@@ -345,7 +345,7 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
   } else if (visibleSelectedCount > 0) {
     allProxyCheckboxState = 'indeterminate'
   }
-  const selectedInUseCount = selectedProxies.filter((proxy) => proxy.credentialCount > 0).length
+  const selectedInUseCount = selectedProxies.filter((proxy) => (proxy.enabledCredentialCount ?? proxy.credentialCount) > 0).length
   const globalPoolCount = proxies.filter((proxy) => globalProxyCandidateSet.has(proxy.url)).length
   // 全池累计封号，含已从池中删除的代理，所以用后端汇总而不是当前列表求和
   const poolTotalBans = data?.totalBans ?? 0
@@ -695,10 +695,9 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
     poolAlerts.push({
       key: 'flagged',
       tone: 'danger',
-      text: `${flaggedProxies.length} 个出口被公开情报库标记为代理/VPN：${preview(flaggedProxies)}`,
+      text: `${flaggedProxies.length} 个出口已标记（可手动使用）：${preview(flaggedProxies)}`,
       hint:
-        '线上实测「被标记程度」直接决定账号寿命，这些出口优先淘汰。\n' +
-        '注意判据是有没有被标记，不是机房还是家宽——干净的机房 IP 是可用的。',
+        '已标记只影响自动分配排序，不阻止运营手动绑定。请结合账号表现和封号统计决定是否继续使用。',
     })
   }
   if (demotedProxies.length > 0) {
@@ -1238,13 +1237,13 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                         >
                           <Copy className="h-3.5 w-3.5" />
                         </Button>
-                        {proxy.credentialCount > 0 && (
+                        {(proxy.enabledCredentialCount ?? proxy.credentialCount) > 0 && (
                           <span
                             className="inline-flex shrink-0 items-center gap-0.5 rounded bg-secondary px-1.5 text-xs tabular-nums text-muted-foreground"
-                            title={`${proxy.credentialCount} 个凭据正绑在这个出口上。同出口的号会一起暴露，一个被标记容易连坐`}
+                            title={`${proxy.enabledCredentialCount ?? proxy.credentialCount} 个启用凭据正绑在这个出口上`}
                           >
                             <Users className="h-3 w-3" />
-                            {proxy.credentialCount}
+                            {proxy.enabledCredentialCount ?? proxy.credentialCount}
                           </span>
                         )}
                         {renderHealthBadge(proxy)}

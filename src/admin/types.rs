@@ -1123,6 +1123,12 @@ pub struct ProxyPoolEntry {
     pub enabled: bool,
     /// 使用此代理的凭据数量
     pub credential_count: u32,
+    /// 当前仍启用且绑定此代理的凭据数量
+    #[serde(default)]
+    pub enabled_credential_count: u32,
+    /// 明确由运营设置为人工共享的凭据数量
+    #[serde(default)]
+    pub manual_shared_count: u32,
     /// 健康状态
     pub health: ProxyHealth,
     /// 最近一次成功探测的延迟（毫秒）

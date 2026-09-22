@@ -562,7 +562,7 @@ export function BatchImportDialog({
       // 同出口并发是我们这边唯一能控的变量，没有理由白白让它发生。
       // 起始负载取代理池上报的 credentialCount（已有的活号），再叠加本次导入
       // 已分配的数量，这样跨多次导入也不会往同一个出口上堆。
-      const proxyLoad = new Map(enabledProxies.map(p => [p.url, p.credentialCount]))
+      const proxyLoad = new Map(enabledProxies.map(p => [p.url, p.enabledCredentialCount ?? p.credentialCount]))
       const pickLeastLoadedProxy = (): string | undefined => {
         if (enabledProxies.length === 0) return undefined
         const free = enabledProxies.filter(p => (proxyLoad.get(p.url) ?? 0) === 0)
@@ -1180,7 +1180,7 @@ export function BatchImportDialog({
                     <option value="direct">direct（直连）</option>
                     {enabledProxyOptions.map((proxy) => (
                       <option key={proxy.id} value={proxy.url}>
-                        {proxy.label ? `${proxy.label} | ` : ''}{proxyDisplayHost(proxy.url)} · {proxy.credentialCount} 个账号使用
+                        {proxy.label ? `${proxy.label} | ` : ''}{proxyDisplayHost(proxy.url)} · {proxy.enabledCredentialCount ?? proxy.credentialCount} 个启用账号
                       </option>
                     ))}
                   </select>

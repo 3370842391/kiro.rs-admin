@@ -622,6 +622,8 @@ export interface ProxyPoolEntry {
   label?: string
   enabled: boolean
   credentialCount: number
+  enabledCredentialCount?: number
+  manualSharedCount?: number
   health: ProxyHealth
   latencyMs?: number
   lastCheckedAt?: string

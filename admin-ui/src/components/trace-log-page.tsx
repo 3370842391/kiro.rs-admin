@@ -1079,7 +1079,7 @@ export function TraceLogPage() {
             options={STATUS_OPTIONS}
           />
           <Select
-            label="按错误类型筛选（中断≠上游断流）"
+            label="按错误类型筛选"
             value={errorType}
             onChange={resetTo(setErrorType)}
             options={[...ERROR_TYPE_OPTIONS]}

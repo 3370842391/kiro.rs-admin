@@ -147,7 +147,7 @@ export function PricingCalculatorDialog({
           </Field>
           <Field label="模型口径">
             <Select value={model} onValueChange={setModel}>
-              <SelectTrigger>
+              <SelectTrigger aria-label="模型口径">
                 <SelectValue placeholder="混合口径" />
               </SelectTrigger>
               <SelectContent>

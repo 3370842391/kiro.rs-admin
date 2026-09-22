@@ -94,6 +94,10 @@ export function EditCredentialDialog({
 
   const { mutate, isPending } = useUpdateCredential()
   const isApiKey = credential.authMethod === 'api_key'
+  const isEnterprise =
+    credential.authMethod === 'idc' ||
+    credential.authMethod === 'external_idp' ||
+    credential.provider?.toLowerCase() === 'enterprise'
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
@@ -388,14 +392,18 @@ export function EditCredentialDialog({
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="__global__">使用全局代理配置</SelectItem>
-                  <SelectItem value="direct">直连（不使用代理）</SelectItem>
+                  {isEnterprise ? (
+                    <SelectItem value="__global__">使用全局代理配置</SelectItem>
+                  ) : (
+                    <SelectItem value="__global__">自动分配个人独立 IP</SelectItem>
+                  )}
+                  {isEnterprise && <SelectItem value="direct">直连（不使用代理）</SelectItem>}
                   {enabledProxies.length > 0 && (
                     <SelectGroup>
                       <SelectLabel>代理池</SelectLabel>
                       {enabledProxies.map((p) => (
                         <SelectItem key={p.id} value={p.url}>
-                          {p.label ? `${p.label} | ` : ''}{proxyDisplayHost(p.url)} · {p.credentialCount} 个账号使用
+                          {p.label ? `${p.label} | ` : ''}{proxyDisplayHost(p.url)} · {p.enabledCredentialCount ?? p.credentialCount} 个启用账号
                         </SelectItem>
                       ))}
                     </SelectGroup>
