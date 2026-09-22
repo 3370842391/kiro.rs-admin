@@ -2451,6 +2451,7 @@ impl AdminService {
             Some(raw) => normalize_proxy_list(&raw)?,
             None => None,
         };
+        let proxy_manual_binding = req.proxy_url.is_some();
 
         // 构建凭据对象。部分导出格式不带 email，但 accessToken 里通常有
         // preferred_username / email / upn，可在导入时最佳努力补齐。
@@ -2487,7 +2488,7 @@ impl AdminService {
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
-            proxy_manual_binding: false,
+            proxy_manual_binding,
             disabled: false, // 新添加的凭据默认启用
             disable_reason: None,
             kiro_api_key: req.kiro_api_key,
@@ -5349,6 +5350,7 @@ impl AdminService {
         let _ = req.priority;
         let import_defaults = self.import_defaults.lock().clone();
         let auto_proxy = self.import_proxy(import_defaults.auto_assign_proxy, true);
+        let explicit_proxy = req.proxy_url.is_some();
         let proxy = req
             .proxy_url
             .as_deref()
@@ -5384,6 +5386,7 @@ impl AdminService {
             proxy_url: proxy.as_ref().map(|value| value.url.clone()),
             proxy_username: proxy.as_ref().and_then(|value| value.username.clone()),
             proxy_password: proxy.as_ref().and_then(|value| value.password.clone()),
+            proxy_manual_binding: explicit_proxy,
             groups: import_defaults.groups,
             source_channel: (!import_defaults.source_channel.trim().is_empty())
                 .then_some(import_defaults.source_channel),
@@ -6674,6 +6677,29 @@ mod tests {
             assert_eq!(c.priority, 23);
             assert_eq!(c.priority, 23);
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_import_proxy_is_marked_as_manual_binding() {
+        let service = auth_test_service();
+        let request: AddCredentialRequest = serde_json::from_value(serde_json::json!({
+            "authMethod": "api_key",
+            "kiroApiKey": "ksk_manual_proxy_test",
+            "apiRegion": "us-east-1",
+            "proxyUrl": "http://manual-proxy:8080"
+        }))
+        .unwrap();
+
+        let result = service.import_one_credential(request, false).await;
+        let id = result.credential_id.unwrap();
+        let credential = service
+            .token_manager
+            .clone_all_credentials()
+            .into_iter()
+            .find(|credential| credential.id == Some(id))
+            .unwrap();
+
+        assert!(credential.proxy_manual_binding);
     }
 
     #[tokio::test]
