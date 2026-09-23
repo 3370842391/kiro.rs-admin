@@ -866,16 +866,18 @@ impl ClientKeyManager {
     /// 常量时间匹配所有启用 Key；命中后若已达积分上限则返回 [`KeyAuth::OverLimit`]，
     /// 否则累加调用次数并返回 [`KeyAuth::Ok`]。
     pub fn verify_and_touch_ex(&self, presented: &str) -> KeyAuth {
-        if !presented.starts_with(CLIENT_KEY_PREFIX) {
-            return KeyAuth::NotFound;
-        }
+        // 新分发 Key 使用 csk_，但 config.apiKey bootstrap 的系统 Key 可以是旧版
+        // sk-kiro-rs- 前缀。不能在读取 Key 表前按新前缀拒绝它。
+        let client_prefix = presented.starts_with(CLIENT_KEY_PREFIX);
         let mut inner = self.inner.write();
         let mut hit_id: Option<u64> = None;
         for (id, ck) in inner.entries.iter() {
             if ck.disabled {
                 continue;
             }
-            if ck.key.as_bytes().ct_eq(presented.as_bytes()).into() {
+            if (client_prefix || ck.is_system)
+                && ck.key.as_bytes().ct_eq(presented.as_bytes()).into()
+            {
                 hit_id = Some(*id);
                 // 不 break，继续完整扫描以保持常量时间
             }
@@ -1048,6 +1050,22 @@ mod tests {
         assert_eq!(mgr.verify_and_touch(&entry.key), Some(entry.id));
         // 不带前缀的拒绝
         assert_eq!(mgr.verify_and_touch("nope"), None);
+    }
+
+    #[test]
+    fn legacy_config_system_key_without_client_prefix_authenticates() {
+        let mgr = ClientKeyManager::new();
+        mgr.ensure_system_key(
+            "默认密钥".to_string(),
+            None,
+            "sk-kiro-rs-existing-config-key".to_string(),
+        );
+
+        assert!(matches!(
+            mgr.verify_and_touch_ex("sk-kiro-rs-existing-config-key"),
+            KeyAuth::Ok(authorized) if authorized.id == 0
+        ));
+        assert!(matches!(mgr.verify_and_touch_ex("sk-kiro-rs-wrong"), KeyAuth::NotFound));
     }
 
     #[test]
