@@ -171,8 +171,8 @@ pub fn chat_to_anthropic(
         openai_reasoning_to_anthropic(req.reasoning_effort.as_deref(), req.reasoning.as_ref());
 
     let tools = convert_openai_tools(&req.tools);
-    // OpenAI/Codex 客户端带 web_search 时强制走 agentic loop：纯快速路径恒返回 SSE 且
-    // 只吐原始 web_search_tool_result 块，OpenAI 层既无法解析（非流式 502）也无法合成答案。
+    // 标记 OpenAI/Codex 的 WebSearch 请求，避免本地精确回答捷径提前消费；
+    // Anthropic 与 OpenAI 的原生 WebSearch 均由模型工具循环决定搜索词。
     let force_web_search_loop = tools
         .as_ref()
         .is_some_and(|list| list.iter().any(|t| t.name == "web_search"));

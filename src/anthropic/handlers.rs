@@ -1316,7 +1316,6 @@ fn strict_json_route_allowed(payload: &MessagesRequest) -> bool {
             .is_some_and(|tools| !tools.is_empty())
         || payload.tool_choice.is_some()
         || payload.thinking.as_ref().is_some_and(Thinking::is_enabled)
-        || websearch::has_web_search_tool(payload)
         || websearch::has_web_search_among_tools(payload)
     {
         return false;
@@ -2557,45 +2556,10 @@ pub async fn post_messages(
         return response;
     }
 
-    // 检查是否为 WebSearch 请求
-    if websearch::has_web_search_tool(&payload) {
-        tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
-
-        // 估算输入 tokens
-        let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
-        ) as i32;
-
-        let resp = websearch::handle_websearch_request(
-            provider,
-            &payload,
-            input_tokens,
-            payload.stream,
-            Some(tracer.as_ref()),
-            key_ctx.group.as_deref(),
-        )
-        .await;
-        // WebSearch 路径走 MCP 端点，没有 credential_id 上下文，统一记 0
-        let status = if resp.status().is_success() {
-            "success"
-        } else {
-            "error"
-        };
-        hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
-        finalize_immediate_response(&tracer, &resp, "websearch_error");
-        return resp;
-    }
-
     let payload_stream = payload.stream;
-    // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
-    // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
+    // 原生 web_search 无论单独还是与其它工具共存，都由模型决定是否搜索及搜索词。
     if websearch::has_web_search_among_tools(&payload) {
-        tracing::info!(
-            "detected mixed tools containing web_search, entering the web_search agentic loop"
-        );
+        tracing::info!("native web_search tool declared, entering model tool loop");
         let response = super::websearch_loop::run_web_search_loop(
             provider,
             payload,
@@ -5918,44 +5882,10 @@ pub async fn post_messages_cc(
         return response;
     }
 
-    // 检查是否为 WebSearch 请求
-    if websearch::has_web_search_tool(&payload) {
-        tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
-
-        // 估算输入 tokens
-        let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
-        ) as i32;
-
-        let resp = websearch::handle_websearch_request(
-            provider,
-            &payload,
-            input_tokens,
-            payload.stream,
-            Some(tracer.as_ref()),
-            key_ctx.group.as_deref(),
-        )
-        .await;
-        let status = if resp.status().is_success() {
-            "success"
-        } else {
-            "error"
-        };
-        hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
-        finalize_immediate_response(&tracer, &resp, "websearch_error");
-        return resp;
-    }
-
     let payload_stream = payload.stream;
-    // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
-    // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
+    // 原生 web_search 无论单独还是与其它工具共存，都由模型决定是否搜索及搜索词。
     if websearch::has_web_search_among_tools(&payload) {
-        tracing::info!(
-            "detected mixed tools containing web_search, entering the web_search agentic loop"
-        );
+        tracing::info!("native web_search tool declared, entering model tool loop");
         let response = super::websearch_loop::run_web_search_loop(
             provider,
             payload,

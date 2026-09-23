@@ -115,24 +115,6 @@ fn is_native_web_search_tool(t: &crate::anthropic::types::Tool) -> bool {
             .is_some_and(|typ| typ.starts_with("web_search_"))
 }
 
-/// 检查请求是否为纯 WebSearch 请求
-///
-/// 条件：tools 有且只有一个，且为 Anthropic 原生 web_search 工具。
-///
-/// `force_web_search_loop`（OpenAI 兼容层置位）时一律返回 false：纯快速路径恒返回 SSE
-/// 且只吐原始 web_search_tool_result 块，OpenAI/Codex 客户端无法消费，须改走 agentic loop
-/// （见 [`has_web_search_among_tools`]）。
-pub fn has_web_search_tool(req: &MessagesRequest) -> bool {
-    if req.force_web_search_loop {
-        return false;
-    }
-    req.tools.as_ref().is_some_and(|tools| {
-        tools.len() == 1
-            && tools.first().is_some_and(is_native_web_search_tool)
-            && web_search_tool_choice_allows(req, "web_search")
-    })
-}
-
 fn web_search_tool_choice_allows(req: &MessagesRequest, tool_name: &str) -> bool {
     match req.tool_choice.as_ref() {
         None
@@ -143,20 +125,12 @@ fn web_search_tool_choice_allows(req: &MessagesRequest, tool_name: &str) -> bool
     }
 }
 
-/// Checks whether the request is a "mixed-tools set that contains web_search" case
-///
-/// Mutually exclusive with [`has_web_search_tool`]: that one is the pure single-tool fast path, while this one detects
-/// the case where native web_search coexists with other tools (exec, etc.) - such a request falls onto the normal chat
-/// path, where the upstream may return a tool_use with name=web_search, requiring the internal agentic loop.
+/// 原生 WebSearch 都进入模型工具循环。仅声明这个工具不等于客户端已经要求调用它；
+/// 先让模型决定是否搜索及搜索词，避免把整条用户正文直接当成 MCP query。
 pub(crate) fn has_web_search_among_tools(req: &MessagesRequest) -> bool {
     req.tools.as_ref().is_some_and(|tools| {
         let has_native = tools.iter().any(is_native_web_search_tool);
-        // 常规：web_search 与其他工具混用（len>1）走 loop。
-        // force_web_search_loop 时：即便只有一个 web_search 也走 loop（OpenAI/Codex 场景，
-        // 纯快速路径已被 has_web_search_tool 短路），保证内部搜索 + 模型合成答案。
-        has_native
-            && (tools.len() > 1 || req.force_web_search_loop)
-            && web_search_tool_choice_allows(req, "web_search")
+        has_native && web_search_tool_choice_allows(req, "web_search")
     })
 }
 
@@ -675,7 +649,7 @@ pub async fn handle_websearch_request(
         }
     };
 
-    tracing::info!(query = %query, "处理 WebSearch 请求");
+    tracing::info!(query_chars = query.chars().count(), "处理 WebSearch 请求");
 
     // 2. 创建 MCP 请求
     let (tool_use_id, mcp_request) = create_mcp_request(&query);
@@ -749,12 +723,12 @@ pub(crate) async fn call_mcp_api(
 ) -> anyhow::Result<McpResponse> {
     let request_body = serde_json::to_string(request)?;
 
-    tracing::debug!("MCP request: {}", request_body);
+    tracing::debug!(request_bytes = request_body.len(), "MCP request prepared");
 
     let response = provider.call_mcp_traced(&request_body, sink, group).await?;
 
     let body = String::from_utf8(response.collect_bytes().await?.to_vec())?;
-    tracing::debug!("MCP response: {}", body);
+    tracing::debug!(response_bytes = body.len(), "MCP response received");
 
     let mcp_response: McpResponse = serde_json::from_str(&body)?;
 
@@ -774,7 +748,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_has_web_search_tool_only_one() {
+    fn pure_native_websearch_routes_through_model_loop() {
         use crate::anthropic::types::{Message, Tool};
 
         let req = MessagesRequest {
@@ -801,7 +775,7 @@ mod tests {
             metadata: None,
         };
 
-        assert!(has_web_search_tool(&req));
+        assert!(has_web_search_among_tools(&req));
     }
 
     #[test]
@@ -833,17 +807,17 @@ mod tests {
             output_config: None,
             metadata: None,
         };
-        assert!(!has_web_search_tool(&req));
+        assert!(!has_web_search_among_tools(&req));
         req.tool_choice = Some(ToolChoice::Tool {
             name: "other".to_string(),
             disable_parallel_tool_use: false,
         });
-        assert!(!has_web_search_tool(&req));
+        assert!(!has_web_search_among_tools(&req));
         req.tool_choice = Some(ToolChoice::Tool {
             name: "web_search".to_string(),
             disable_parallel_tool_use: false,
         });
-        assert!(has_web_search_tool(&req));
+        assert!(has_web_search_among_tools(&req));
     }
 
     #[test]
@@ -925,8 +899,7 @@ mod tests {
             metadata: None,
         };
 
-        // 多个工具时不应该被识别为纯 websearch 请求
-        assert!(!has_web_search_tool(&req));
+        // 多个工具时同样走模型工具循环。
         assert!(has_web_search_among_tools(&req));
     }
 
@@ -970,7 +943,6 @@ mod tests {
 
         // A regular client-defined tool can be named web_search, but only
         // Anthropic's native web search tool has type=web_search_*.
-        assert!(!has_web_search_tool(&req));
         assert!(!has_web_search_among_tools(&req));
     }
 

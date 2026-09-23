@@ -1,6 +1,8 @@
 //! web_search local agentic loop
 //!
-//! Handles the case "after mixed tools (web_search + exec...) fall onto the normal chat path, the upstream returns a tool_use with name=web_search":
+//! Handles native web_search whether it is the only declared tool or appears with client tools.
+//! The model first decides whether to search and produces a focused query; then this loop
+//! calls Kiro MCP and feeds the result back to the model.
 //! kiro-rs internally calls /mcp to search -> feeds the results back as a tool_result -> reconverts and resends -> loops until the upstream stops asking to search;
 //! tool_use calls other than web_search (exec, etc.) are returned to the client as usual: they do not enter the loop and are not swallowed.
 //!

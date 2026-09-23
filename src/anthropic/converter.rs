@@ -2024,8 +2024,12 @@ fn convert_tools(
             continue;
         }
 
-        let is_builtin =
-            is_claude_code_mode(mode) && claude_code_tool_name_to_kiro(&t.name).is_some();
+        let is_native_web_search = t.name == "web_search"
+            && t.tool_type
+                .as_deref()
+                .is_some_and(|kind| kind.starts_with("web_search_"));
+        let is_builtin = is_native_web_search
+            || (is_claude_code_mode(mode) && claude_code_tool_name_to_kiro(&t.name).is_some());
 
         let description = if is_builtin {
             kiro_builtin_tool_description(&mapped_name, &t.description)
@@ -3495,6 +3499,21 @@ mod tests {
             Some("web_search")
         );
         assert_eq!(claude_code_tool_name_to_kiro("MyTool"), None);
+    }
+
+    #[test]
+    fn native_web_search_tool_gets_query_schema_in_model_loop() {
+        let mut tool = cc_tool("web_search");
+        tool.tool_type = Some("web_search_20250305".to_string());
+        let out = convert_tools(
+            &Some(vec![tool]),
+            &mut HashMap::new(),
+            ToolCompatibilityMode::Raw,
+        )
+        .unwrap();
+        let schema = &out[0].tool_specification.input_schema.json;
+        assert_eq!(schema["properties"]["query"]["type"], "string");
+        assert_eq!(schema["required"], serde_json::json!(["query"]));
     }
 
     #[test]
